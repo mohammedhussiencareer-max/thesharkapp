@@ -46,6 +46,7 @@ jobs:
       - name: Start Supabase
         run: supabase start --exclude studio,imgproxy,mailpit,edge-runtime,vector,logflare,realtime,storage-api
       - run: pnpm db:reset
+      - run: pnpm db:lint
       - run: pnpm db:test
       - run: pnpm db:types:check
       - name: Stop Supabase

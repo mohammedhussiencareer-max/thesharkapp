@@ -23,6 +23,7 @@ pnpm e2e
 pnpm db:start
 pnpm db:stop
 pnpm db:reset
+pnpm db:lint
 pnpm db:test
 pnpm db:types
 pnpm db:types:check
