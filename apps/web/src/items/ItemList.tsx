@@ -25,7 +25,7 @@ function ItemCard({
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusy: (busy: boolean) => void;
-  onItemStale?: () => void | Promise<void>;
+  onItemStale?: (itemId: string) => void | Promise<void>;
 }) {
   return (
     <article
@@ -121,7 +121,7 @@ export function ItemList({
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusyChange?: (busy: boolean) => void;
-  onItemStale?: () => void | Promise<void>;
+  onItemStale?: (itemId: string) => void | Promise<void>;
 }) {
   const [conversionsBusy, setConversionsBusyState] = useState(false);
   // The page also locks controls that would unmount an open panel (the inactive filter).

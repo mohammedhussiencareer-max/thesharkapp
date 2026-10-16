@@ -64,7 +64,6 @@ export function ItemsPage() {
   );
   const formModeRef = useRef<ItemEditor | null>(null);
   const expectedRef = useRef<ItemExpectation | null>(null);
-  const openConversionsRef = useRef<string | null>(null);
   const catalogSeqRef = useRef(0);
   const catalogLoadsRef = useRef(0);
 
@@ -299,19 +298,17 @@ export function ItemsPage() {
               openConversionsId={openConversionsId}
               editsDisabled={busy}
               onEdit={openEdit}
-              onToggleConversions={(itemId) => {
-                const next = openConversionsId === itemId ? null : itemId;
-                openConversionsRef.current = next;
-                setOpenConversionsId(next);
-              }}
+              onToggleConversions={(itemId) =>
+                setOpenConversionsId((current) =>
+                  current === itemId ? null : itemId,
+                )
+              }
               onConversionsBusyChange={setConversionsBusy}
-              onItemStale={() => {
-                const id = openConversionsRef.current;
-                if (!id) return;
-                return reloadCatalog(id).catch((error: unknown) => {
+              onItemStale={(itemId) =>
+                reloadCatalog(itemId).catch((error: unknown) => {
                   setLoadError(messageFrom(error));
-                });
-              }}
+                })
+              }
             />
           )}
         </>

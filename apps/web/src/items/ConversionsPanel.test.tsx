@@ -313,4 +313,61 @@ describe('ConversionsPanel', () => {
     expect(await screen.findByText('1 كيس = 2 لتر')).toBeInTheDocument();
     expect(screen.getByLabelText('معامل كيس')).toHaveValue('2');
   });
+
+  it('ignores a snapshot that lands after the panel unmounts', async () => {
+    let resolveLoad: (value: ReturnType<typeof snapshot>) => void = () =>
+      undefined;
+    vi.mocked(listConversions).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveLoad = resolve;
+      }),
+    );
+    const onItemStale = vi.fn();
+
+    const view = render(
+      <ConversionsPanel item={item} onItemStale={onItemStale} />,
+    );
+    view.unmount();
+    resolveLoad(snapshot([], 'liter'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(onItemStale).not.toHaveBeenCalled();
+  });
+
+  it('ignores a retry that lands after the panel unmounts', async () => {
+    vi.mocked(listConversions).mockRejectedValueOnce(
+      new Error('حصل خطأ. حاول تاني.'),
+    );
+    let resolveRetry: (value: ReturnType<typeof snapshot>) => void = () =>
+      undefined;
+    vi.mocked(listConversions).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveRetry = resolve;
+      }),
+    );
+    const onItemStale = vi.fn();
+
+    const view = render(
+      <ConversionsPanel item={item} onItemStale={onItemStale} />,
+    );
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'إعادة المحاولة' }),
+    );
+    view.unmount();
+    resolveRetry(snapshot([], 'liter'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(onItemStale).not.toHaveBeenCalled();
+  });
+
+  it('reports the stale item by its own id', async () => {
+    vi.mocked(listConversions).mockResolvedValueOnce(snapshot([], 'liter'));
+    const onItemStale = vi.fn();
+
+    render(<ConversionsPanel item={item} onItemStale={onItemStale} />);
+
+    await waitFor(() => {
+      expect(onItemStale).toHaveBeenCalledWith('oil');
+    });
+  });
 });

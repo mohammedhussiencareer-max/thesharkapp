@@ -108,9 +108,12 @@ export function ConversionsPanel({
   locked?: boolean;
   onBusyChange?: (busy: boolean) => void;
   /** The snapshot base unit no longer matches the item the page rendered. */
-  onItemStale?: () => void | Promise<void>;
+  onItemStale?: (itemId: string) => void | Promise<void>;
 }) {
   const requestRef = useRef(0);
+  // Cleared on unmount or item change: late results of any request (initial
+  // load, retry, or the reload after a write) are then ignored entirely.
+  const aliveRef = useRef(false);
   const onItemStaleRef = useRef(onItemStale);
   const itemBaseUnitRef = useRef(item.baseUnit);
   useEffect(() => {
@@ -127,26 +130,36 @@ export function ConversionsPanel({
 
   const applySnapshot = useCallback(
     async (
+      itemId: string,
       next: ConversionList,
       requestId: number,
       cancelled: () => boolean,
     ) => {
-      if (cancelled() || requestId !== requestRef.current) return;
+      if (!aliveRef.current || cancelled() || requestId !== requestRef.current)
+        return;
       setRows(next.rows);
       setBaseUnit(next.baseUnit);
       setLoadError(null);
       if (next.baseUnit !== itemBaseUnitRef.current) {
-        await onItemStaleRef.current?.();
+        await onItemStaleRef.current?.(itemId);
       }
     },
     [],
   );
 
   const failLoad = useCallback(
-    async (error: unknown, requestId: number, cancelled: () => boolean) => {
-      if (cancelled() || requestId !== requestRef.current) return;
+    async (
+      itemId: string,
+      error: unknown,
+      requestId: number,
+      cancelled: () => boolean,
+    ) => {
+      if (!aliveRef.current || cancelled() || requestId !== requestRef.current)
+        return;
       setLoadError(messageFrom(error));
-      if (error instanceof StaleWriteError) await onItemStaleRef.current?.();
+      if (error instanceof StaleWriteError) {
+        await onItemStaleRef.current?.(itemId);
+      }
     },
     [],
   );
@@ -155,27 +168,29 @@ export function ConversionsPanel({
     const requestId = ++requestRef.current;
     try {
       const next = await listConversions(item.id);
-      await applySnapshot(next, requestId, () => false);
+      await applySnapshot(item.id, next, requestId, () => false);
     } catch (error) {
-      await failLoad(error, requestId, () => false);
+      await failLoad(item.id, error, requestId, () => false);
     }
   }, [applySnapshot, failLoad, item.id]);
 
   useEffect(() => {
     const requestId = ++requestRef.current;
     let cancelled = false;
+    aliveRef.current = true;
 
     void (async () => {
       try {
         const next = await listConversions(item.id);
-        await applySnapshot(next, requestId, () => cancelled);
+        await applySnapshot(item.id, next, requestId, () => cancelled);
       } catch (error) {
-        await failLoad(error, requestId, () => cancelled);
+        await failLoad(item.id, error, requestId, () => cancelled);
       }
     })();
 
     return () => {
       cancelled = true;
+      aliveRef.current = false;
     };
   }, [applySnapshot, failLoad, item.id]);
 

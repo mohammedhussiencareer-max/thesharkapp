@@ -76,7 +76,7 @@ describe('catalog api', () => {
     mocks.schema.mockReset();
   });
 
-  it('lists items with a zero balance when no balance row exists', async () => {
+  it('lists items with their balances from one request', async () => {
     const items = query({
       data: [
         {
@@ -89,6 +89,11 @@ describe('catalog api', () => {
           loss_pct_text: '0.12500',
           parent_item_id: null,
           active: true,
+          item_balances: {
+            on_hand_qty: '1.500000',
+            avg_cost: '80.5',
+            on_hand_value: '120.75',
+          },
         },
         {
           id: 'b',
@@ -100,24 +105,16 @@ describe('catalog api', () => {
           loss_pct_text: '0.00000',
           parent_item_id: null,
           active: false,
+          item_balances: null,
         },
       ],
       error: null,
     });
-    const balances = query({
-      data: [
-        {
-          item_id: 'a',
-          on_hand_qty: '1.500000',
-          avg_cost: '80.5',
-          on_hand_value: '120.75',
-        },
-      ],
-      error: null,
-    });
+    const tables: string[] = [];
     mocks.schema.mockReturnValue({
       from(table: string) {
-        return table === 'item_balances' ? balances.chain : items.chain;
+        tables.push(table);
+        return items.chain;
       },
     });
 
@@ -152,8 +149,9 @@ describe('catalog api', () => {
       },
     ]);
     expect(items.captured.select).toBe(
-      'id, name, kind, base_unit, count_frequency, loss_pct, loss_pct_text:loss_pct::text, parent_item_id, active',
+      'id, name, kind, base_unit, count_frequency, loss_pct, loss_pct_text:loss_pct::text, parent_item_id, active, item_balances(on_hand_qty, avg_cost, on_hand_value)',
     );
+    expect(tables).toEqual(['stock_items']);
   });
 
   it('trims the name and does not send id or created_at', async () => {

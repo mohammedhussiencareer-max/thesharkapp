@@ -85,27 +85,36 @@ function itemPayload(draft: ItemDraft) {
   };
 }
 
+function itemBalance(value: unknown): {
+  on_hand_qty: unknown;
+  avg_cost: unknown;
+  on_hand_value: unknown;
+} | null {
+  // One-to-one embed: PostgREST returns the row object or null.
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(genericCatalogError);
+  }
+  const record = value as Record<string, unknown>;
+  return {
+    on_hand_qty: record.on_hand_qty,
+    avg_cost: record.avg_cost,
+    on_hand_value: record.on_hand_value,
+  };
+}
+
 export async function listItems(): Promise<CatalogItem[]> {
-  const db = appDb();
-  const [itemsResult, balancesResult] = await Promise.all([
-    db
-      .from('stock_items')
-      .select(
-        'id, name, kind, base_unit, count_frequency, loss_pct, loss_pct_text:loss_pct::text, parent_item_id, active',
-      )
-      .order('name'),
-    db
-      .from('item_balances')
-      .select('item_id, on_hand_qty, avg_cost, on_hand_value'),
-  ]);
-  throwIfError(itemsResult.error);
-  throwIfError(balancesResult.error);
+  // Items and their balances come from ONE request, so a balance is always
+  // shown in the base unit it was read with.
+  const { data, error } = await appDb()
+    .from('stock_items')
+    .select(
+      'id, name, kind, base_unit, count_frequency, loss_pct, loss_pct_text:loss_pct::text, parent_item_id, active, item_balances(on_hand_qty, avg_cost, on_hand_value)',
+    )
+    .order('name');
+  throwIfError(error);
 
-  const balances = new Map(
-    (balancesResult.data ?? []).map((row) => [row.item_id, row]),
-  );
-
-  return (itemsResult.data ?? []).map((row) => {
+  return (data ?? []).map((row) => {
     const storedLossPct = exactDecimal(row.loss_pct_text);
     if (
       !isStockKind(row.kind) ||
@@ -114,7 +123,7 @@ export async function listItems(): Promise<CatalogItem[]> {
     ) {
       throw new Error(genericCatalogError);
     }
-    const balance = balances.get(row.id);
+    const balance = itemBalance(row.item_balances);
     return {
       id: row.id,
       name: row.name,
