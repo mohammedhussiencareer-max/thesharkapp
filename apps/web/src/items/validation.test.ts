@@ -27,13 +27,20 @@ function values(overrides: Partial<ItemFormValues> = {}): ItemFormValues {
 }
 
 describe('loss percent', () => {
+  it('moves the percent decimal point to an exact fraction string', () => {
+    expect(lossPercentToFraction('12.5')).toBe('0.125');
+    expect(lossPercentToFraction('0.001')).toBe('0.00001');
+    expect(lossPercentToFraction('99.999')).toBe('0.99999');
+    expect(lossPercentToFraction('0')).toBe('0');
+  });
+
   it('stores 12.5% as the fraction 0.125', () => {
     expect(parseLossPercent('12.5')).toBe(12.5);
-    expect(lossPercentToFraction(12.5)).toBe(0.125);
+    expect(lossPercentToFraction('12.5')).toBe('0.125');
   });
 
   it('stores 99.999% inside the database fraction limit', () => {
-    expect(lossPercentToFraction(99.999)).toBe(0.99999);
+    expect(lossPercentToFraction('99.999')).toBe('0.99999');
   });
 
   it('accepts a comma decimal and rejects 100', () => {
@@ -54,7 +61,7 @@ describe('loss percent', () => {
       );
     }
     expect(parseLossPercent('12.345')).toBe(12.345);
-    expect(lossPercentToFraction(12.345)).toBe(0.12345);
+    expect(lossPercentToFraction('12.345')).toBe('0.12345');
   });
 });
 
@@ -72,11 +79,15 @@ describe('validateConversion', () => {
       ok: false,
       error: 'معامل التحويل لازم يكون رقم أكبر من صفر',
     });
-    const accepted = validateConversion('كيس', '123456789.123456789', 'kg');
-    expect(accepted).toEqual({
+    expect(validateConversion('كيس', '+12345678.123456789', 'kg')).toEqual({
       ok: true,
       unit: 'كيس',
-      factor: Number('123456789.123456789'),
+      factor: '12345678.123456789',
+    });
+    expect(validateConversion('كيس', '999999999.999999999', 'kg')).toEqual({
+      ok: true,
+      unit: 'كيس',
+      factor: '999999999.999999999',
     });
   });
 });
@@ -109,7 +120,7 @@ describe('validateItemForm', () => {
         kind: 'fish_size',
         baseUnit: 'kg',
         countFrequency: 'daily',
-        lossPct: 0.125,
+        lossPct: '0.125',
         parentItemId: 'mixed',
         active: true,
       },

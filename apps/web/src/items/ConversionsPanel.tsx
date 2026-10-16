@@ -35,7 +35,7 @@ function ConversionRow({
   baseLabel: string;
   baseUnit: CatalogItem['baseUnit'];
   disabled: boolean;
-  onSave: (factor: number) => Promise<void>;
+  onSave: (factor: string) => Promise<void>;
   onDelete: () => Promise<void>;
 }) {
   const [factor, setFactor] = useState(() =>

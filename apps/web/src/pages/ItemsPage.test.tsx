@@ -280,7 +280,7 @@ describe('ItemsPage', () => {
         kind: 'seafood',
         baseUnit: 'kg',
         countFrequency: 'daily',
-        lossPct: 0.125,
+        lossPct: '0.125',
         parentItemId: null,
         active: true,
       });
@@ -312,7 +312,7 @@ describe('ItemsPage', () => {
           name: 'بوري وسط',
           kind: 'fish_size',
           parentItemId: 'mixed',
-          lossPct: 0,
+          lossPct: '0',
         }),
       );
     });
@@ -372,7 +372,12 @@ describe('ItemsPage', () => {
       Promise.resolve([...rows]),
     );
     vi.mocked(addConversion).mockImplementation((itemId, unit, factor) => {
-      rows.push({ itemId, unit, factorToBase: factor, storedFactor: factor });
+      rows.push({
+        itemId,
+        unit,
+        factorToBase: Number(factor),
+        storedFactor: factor,
+      });
       return Promise.resolve();
     });
 
@@ -405,7 +410,7 @@ describe('ItemsPage', () => {
     expect(
       await within(box).findByText('1 كرتونة = 12 قطعة'),
     ).toBeInTheDocument();
-    expect(addConversion).toHaveBeenCalledWith('box', 'كرتونة', 12);
+    expect(addConversion).toHaveBeenCalledWith('box', 'كرتونة', '12');
   });
 
   it('locks the inactive filter while an inactive item conversion saves', async () => {
@@ -693,7 +698,7 @@ describe('ItemsPage', () => {
   it('refuses a stale factor save after leaving and reopening the page', async () => {
     let releaseFirst: () => void = () => undefined;
     vi.mocked(updateConversion).mockImplementation((_id, _unit, factor) => {
-      if (factor === 2) {
+      if (factor === '2') {
         return new Promise<void>((resolve) => {
           releaseFirst = () => resolve();
         });
@@ -772,7 +777,7 @@ describe('ItemsPage', () => {
     expect(vi.mocked(updateConversion).mock.calls[1]).toEqual([
       'box',
       'كرتونة',
-      3,
+      '3',
       1,
     ]);
   });

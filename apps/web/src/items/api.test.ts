@@ -65,7 +65,7 @@ const draft: ItemDraft = {
   kind: 'seafood',
   baseUnit: 'kg',
   countFrequency: 'weekly',
-  lossPct: 0.125,
+  lossPct: '0.125',
   parentItemId: null,
   active: true,
 };
@@ -168,7 +168,7 @@ describe('catalog api', () => {
       kind: 'seafood',
       base_unit: 'kg',
       count_frequency: 'weekly',
-      loss_pct: 0.125,
+      loss_pct: '0.125',
       parent_item_id: null,
       active: true,
     });
@@ -259,9 +259,9 @@ describe('catalog api', () => {
     mocks.schema.mockReturnValue({ from: () => rows.chain });
 
     await expect(
-      updateConversion('oil', 'كيس', 3, '1.000000000'),
+      updateConversion('oil', 'كيس', '3', '1.000000000'),
     ).rejects.toBeInstanceOf(StaleWriteError);
-    expect(rows.captured.update).toEqual({ factor_to_base: 3 });
+    expect(rows.captured.update).toEqual({ factor_to_base: '3' });
     expect(rows.captured.filters).toEqual([
       { op: 'eq', column: 'item_id', value: 'oil' },
       { op: 'eq', column: 'unit', value: 'كيس' },
@@ -307,7 +307,7 @@ describe('catalog api', () => {
 
     const updated = query({ data: [{ unit: 'كيس' }], error: null });
     mocks.schema.mockReturnValue({ from: () => updated.chain });
-    await updateConversion('oil', 'كيس', 2, row?.storedFactor ?? '');
+    await updateConversion('oil', 'كيس', '2', row?.storedFactor ?? '');
 
     expect(updated.captured.filters).toEqual([
       { op: 'eq', column: 'item_id', value: 'oil' },
@@ -333,6 +333,47 @@ describe('catalog api', () => {
     await expect(listConversions('oil')).rejects.toThrow('حصل خطأ. حاول تاني.');
   });
 
+  it('writes factor_to_base and loss_pct as exact decimal strings', async () => {
+    const items = query({ data: [{ id: 'a' }], error: null });
+    mocks.schema.mockReturnValue({ from: () => items.chain });
+    const expected: ItemExpectation = {
+      name: 'جمبري',
+      kind: 'seafood',
+      baseUnit: 'kg',
+      countFrequency: 'weekly',
+      lossPct: '0.00001',
+      parentItemId: null,
+      active: true,
+    };
+
+    await createItem({ ...draft, lossPct: '0.00001' });
+    expect(items.captured.insert).toMatchObject({ loss_pct: '0.00001' });
+
+    await updateItem('a', { ...draft, lossPct: '0.99999' }, expected);
+    expect(items.captured.update).toMatchObject({ loss_pct: '0.99999' });
+
+    const rows = query({ data: [{ unit: 'كيس' }], error: null });
+    mocks.schema.mockReturnValue({ from: () => rows.chain });
+
+    await addConversion('oil', 'كيس', '12345678.123456789');
+    expect(rows.captured.insert).toMatchObject({
+      factor_to_base: '12345678.123456789',
+    });
+    await addConversion('oil', 'كيس', '999999999.999999999');
+    expect(rows.captured.insert).toMatchObject({
+      factor_to_base: '999999999.999999999',
+    });
+
+    await updateConversion('oil', 'كيس', '12345678.123456789', '1');
+    expect(rows.captured.update).toEqual({
+      factor_to_base: '12345678.123456789',
+    });
+    await updateConversion('oil', 'كيس', '999999999.999999999', '1');
+    expect(rows.captured.update).toEqual({
+      factor_to_base: '999999999.999999999',
+    });
+  });
+
   it('maps a duplicate conversion unit from the insert', async () => {
     const rows = query({
       data: null,
@@ -344,7 +385,7 @@ describe('catalog api', () => {
     });
     mocks.schema.mockReturnValue({ from: () => rows.chain });
 
-    await expect(addConversion('oil', 'كيس', 2)).rejects.toThrow(
+    await expect(addConversion('oil', 'كيس', '2')).rejects.toThrow(
       'الوحدة دي موجودة قبل كده',
     );
   });

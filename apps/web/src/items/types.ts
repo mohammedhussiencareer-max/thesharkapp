@@ -37,7 +37,8 @@ export type ItemDraft = {
   kind: StockKind;
   baseUnit: BaseUnit;
   countFrequency: CountFrequency;
-  lossPct: number;
+  /** Exact `loss_pct` decimal text, never a binary float. */
+  lossPct: string;
   parentItemId: string | null;
   active: boolean;
 };

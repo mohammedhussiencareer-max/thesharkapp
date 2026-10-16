@@ -69,10 +69,51 @@ export function itemToFormValues(item: CatalogItem): ItemFormValues {
   };
 }
 
-function decimalText(raw: string): string | null {
-  const trimmed = raw.trim().replace(',', '.');
-  if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
-  return trimmed;
+/**
+ * Trim, drop a leading `+`, and turn a comma into a dot.
+ * Western digits only — the form does not accept Arabic-Indic digits.
+ * No exponent notation. Leading integer zeros and trailing fraction zeros
+ * are removed so the text is the exact value we can write.
+ */
+function normalizeDecimal(raw: string): string | null {
+  let text = raw.trim().replace(',', '.');
+  if (text.startsWith('+')) text = text.slice(1).trim();
+  if (!/^\d+(\.\d+)?$/.test(text)) return null;
+  const parts = text.split('.');
+  const whole = (parts[0] ?? '0').replace(/^0+/, '') || '0';
+  const fraction = (parts[1] ?? '').replace(/0+$/, '');
+  return fraction.length > 0 ? `${whole}.${fraction}` : whole;
+}
+
+function compareDecimal(left: string, right: string): number {
+  const [leftWhole = '0', leftFraction = ''] = left.split('.');
+  const [rightWhole = '0', rightFraction = ''] = right.split('.');
+  if (leftWhole.length !== rightWhole.length) {
+    return leftWhole.length - rightWhole.length;
+  }
+  if (leftWhole !== rightWhole) return leftWhole < rightWhole ? -1 : 1;
+  const width = Math.max(leftFraction.length, rightFraction.length);
+  const leftPadded = leftFraction.padEnd(width, '0');
+  const rightPadded = rightFraction.padEnd(width, '0');
+  if (leftPadded === rightPadded) return 0;
+  return leftPadded < rightPadded ? -1 : 1;
+}
+
+/** Move the decimal point left by shifting digits, not by dividing a float. */
+function shiftDecimalLeft(text: string, places: number): string {
+  const parts = text.split('.');
+  const whole = parts[0] ?? '0';
+  const fraction = parts[1] ?? '';
+  const digits = whole === '0' ? fraction : `${whole}${fraction}`;
+  const scale = fraction.length + places;
+  if (digits.length <= scale) {
+    const padded = digits.padStart(scale, '0').replace(/0+$/, '');
+    return padded.length > 0 ? `0.${padded}` : '0';
+  }
+  const splitAt = digits.length - scale;
+  const integer = digits.slice(0, splitAt).replace(/^0+/, '') || '0';
+  const rest = digits.slice(splitAt).replace(/0+$/, '');
+  return rest.length > 0 ? `${integer}.${rest}` : integer;
 }
 
 /** Decimal places of `percent / 100` after trailing zeros are removed. */
@@ -90,26 +131,31 @@ function fractionScale(percentText: string): number {
 }
 
 export function parseLossPercent(raw: string): number | null {
-  const trimmed = decimalText(raw);
-  if (trimmed === null || fractionScale(trimmed) > 5) return null;
-  const percent = Number(trimmed);
-  if (!Number.isFinite(percent) || percent < 0 || percent > 99.999) return null;
-  return percent;
+  const trimmed = normalizeDecimal(raw);
+  if (
+    trimmed === null ||
+    fractionScale(trimmed) > 5 ||
+    compareDecimal(trimmed, '99.999') > 0
+  ) {
+    return null;
+  }
+  return Number(trimmed);
 }
 
 function lossPercentMessage(raw: string): string | null {
-  const trimmed = decimalText(raw);
-  if (trimmed === null) return lossRangeMessage;
-  const percent = Number(trimmed);
-  if (!Number.isFinite(percent) || percent < 0 || percent > 99.999) {
+  const trimmed = normalizeDecimal(raw);
+  if (trimmed === null || compareDecimal(trimmed, '99.999') > 0) {
     return lossRangeMessage;
   }
   if (fractionScale(trimmed) > 5) return lossPrecisionMessage;
   return null;
 }
 
-export function lossPercentToFraction(percent: number): number {
-  return Math.round(percent * 1000) / 100000;
+/** Percent text to `loss_pct` text. "12.5" → "0.125", "0.001" → "0.00001". */
+export function lossPercentToFraction(percentText: string): string {
+  const trimmed = normalizeDecimal(percentText);
+  if (trimmed === null) return '0';
+  return shiftDecimalLeft(trimmed, 2);
 }
 
 export function validateItemForm(
@@ -132,10 +178,10 @@ export function validateItemForm(
   }
 
   const lossMessage = lossPercentMessage(values.lossPercent);
-  const percent =
-    lossMessage === null ? parseLossPercent(values.lossPercent) : null;
-  const lossPct = percent === null ? null : lossPercentToFraction(percent);
-  if (lossMessage !== null || lossPct === null || lossPct >= 1) {
+  const lossPct =
+    lossMessage === null ? lossPercentToFraction(values.lossPercent) : null;
+  const lossWhole = lossPct?.split('.')[0] ?? '1';
+  if (lossMessage !== null || lossPct === null || lossWhole !== '0') {
     errors.lossPercent = lossMessage ?? lossRangeMessage;
   }
 
@@ -192,30 +238,28 @@ export function validateConversion(
   unitRaw: string,
   factorRaw: string,
   baseUnit: BaseUnit,
-): { ok: true; unit: string; factor: number } | { ok: false; error: string } {
+): { ok: true; unit: string; factor: string } | { ok: false; error: string } {
   const unit = unitRaw.trim();
   if (unit.length === 0) return { ok: false, error: 'اكتب اسم الوحدة' };
   if (unit === baseUnit) {
     return { ok: false, error: 'مينفعش التحويل يبقى بنفس الوحدة الأساسية' };
   }
 
-  const factorText = decimalText(factorRaw);
+  const factorText = normalizeDecimal(factorRaw);
   if (factorText === null) {
     return { ok: false, error: factorPositiveMessage };
   }
   const parts = factorText.split('.');
   const whole = parts[0] ?? '0';
   const fraction = parts[1] ?? '';
-  const integerDigits = whole.replace(/^0+/, '');
-  if (integerDigits.length > 9) {
+  if (whole.length > 9) {
     return { ok: false, error: factorIntegerDigitsMessage };
   }
-  if (fraction.replace(/0+$/, '').length > 9) {
+  if (fraction.length > 9) {
     return { ok: false, error: factorDecimalDigitsMessage };
   }
-  const factor = Number(factorText);
-  if (!Number.isFinite(factor) || factor <= 0) {
+  if (factorText === '0') {
     return { ok: false, error: factorPositiveMessage };
   }
-  return { ok: true, unit, factor };
+  return { ok: true, unit, factor: factorText };
 }

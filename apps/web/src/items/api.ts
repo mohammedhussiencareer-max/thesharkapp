@@ -49,13 +49,18 @@ function exactDecimal(value: unknown): string {
   return text;
 }
 
+/** PostgREST accepts a JSON decimal string for a numeric column. */
+function numericColumn(value: string): number {
+  return value as unknown as number;
+}
+
 function itemPayload(draft: ItemDraft) {
   return {
     name: draft.name.trim(),
     kind: draft.kind,
     base_unit: draft.baseUnit,
     count_frequency: draft.countFrequency,
-    loss_pct: draft.lossPct,
+    loss_pct: numericColumn(draft.lossPct),
     parent_item_id: draft.parentItemId,
     active: draft.active,
   };
@@ -161,14 +166,14 @@ export async function listConversions(
 export async function addConversion(
   itemId: string,
   unit: string,
-  factorToBase: number,
+  factorToBase: string,
 ): Promise<void> {
   const { data, error } = await appDb()
     .from('item_unit_conversions')
     .insert({
       item_id: itemId,
       unit: unit.trim(),
-      factor_to_base: factorToBase,
+      factor_to_base: numericColumn(factorToBase),
     })
     .select('unit');
   throwIfError(error);
@@ -178,12 +183,12 @@ export async function addConversion(
 export async function updateConversion(
   itemId: string,
   unit: string,
-  factorToBase: number,
+  factorToBase: string,
   expectedFactor: number | string,
 ): Promise<void> {
   const { data, error } = await appDb()
     .from('item_unit_conversions')
-    .update({ factor_to_base: factorToBase })
+    .update({ factor_to_base: numericColumn(factorToBase) })
     .eq('item_id', itemId)
     .eq('unit', unit)
     .eq('factor_to_base', expectedFactor as number)

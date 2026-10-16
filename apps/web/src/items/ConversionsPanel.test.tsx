@@ -1,6 +1,6 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { addConversion, listConversions } from '@/items/api';
+import { addConversion, listConversions, updateConversion } from '@/items/api';
 import { ConversionsPanel } from '@/items/ConversionsPanel';
 import type { CatalogItem } from '@/items/types';
 
@@ -69,6 +69,34 @@ describe('ConversionsPanel', () => {
       screen.getByText('1 طن = 12345678.123456789 كيلو'),
     ).toBeInTheDocument();
     expect(screen.queryByText(/0\.008/)).not.toBeInTheDocument();
+  });
+
+  it('saves an unchanged high-precision factor as the same text', async () => {
+    vi.mocked(listConversions).mockResolvedValue([
+      {
+        itemId: 'oil',
+        unit: 'طن',
+        factorToBase: 0,
+        storedFactor: '12345678.123456789',
+      },
+    ]);
+    vi.mocked(updateConversion).mockResolvedValue(undefined);
+
+    render(<ConversionsPanel item={item} />);
+
+    expect(
+      await screen.findByText('1 طن = 12345678.123456789 كيلو'),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+
+    await waitFor(() => {
+      expect(updateConversion).toHaveBeenCalledWith(
+        'oil',
+        'طن',
+        '12345678.123456789',
+        '12345678.123456789',
+      );
+    });
   });
 
   it('shows a reload error and retry when refreshing after a save fails', async () => {
