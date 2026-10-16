@@ -246,6 +246,43 @@ describe('runPosSync', () => {
     },
   );
 
+  it('fails a full run without a scope when a list page has an unknown key', async () => {
+    const ingestCalls: unknown[] = [];
+    let finished: { status: string; error: string | null } | undefined;
+    const db: PosDb = {
+      async startRun() {
+        return 43;
+      },
+      async ingest(_runId, _shifts, _batch, scope) {
+        ingestCalls.push(scope);
+        return zeroCounts();
+      },
+      async finishRun(_runId, status, _counts, error) {
+        finished = { status, error };
+      },
+    };
+    const firestore = createPosFirestore('test-token', async () => {
+      return new Response(JSON.stringify({ message: 'failed' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    await expect(
+      runPosSync({
+        mode: 'full',
+        supabaseUrl: 'http://127.0.0.1:55421',
+        serviceRoleKey: 'local-test-key',
+        reader: createPosReader(firestore),
+        db,
+      }),
+    ).rejects.toThrow(/^Firestore read failed: invalid response$/);
+    expect(ingestCalls).toEqual([]);
+    expect(finished).toEqual({
+      status: 'failed',
+      error: 'Firestore read failed: invalid response',
+    });
+  });
+
   it('fails the run and does not send a scope when a list document is null', async () => {
     const ingestCalls: unknown[] = [];
     let finished: { status: string; error: string | null } | undefined;

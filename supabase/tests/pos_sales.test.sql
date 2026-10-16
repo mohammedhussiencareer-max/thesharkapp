@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (141);
+  plan (142);
 
 -- Synthetic users only. No POS documents and no customer data.
 delete from app.owner;
@@ -2449,14 +2449,14 @@ select
 select
   throws_ok (
     $$select app.ingest_pos_batch(
-        (select n from pos_test_ids where k = 'run-a'),
+        (select n from pos_test_ids where k = 'run-reappear'),
         '[]'::jsonb,
         '[]'::jsonb,
         '{"all":true}'::jsonb
       )$$,
     '22023'::char(5),
-    null::text,
-    'a recent run rejects an all scope'
+    'p_scope does not match the sync run mode',
+    'a running recent run rejects an all scope'
   );
 
 select
@@ -2473,24 +2473,36 @@ select
           from
             pos_test_ids
           where
-            k = 'run-a'
+            k = 'run-reappear'
         )
     ),
     false,
     'a rejected scope is not recorded'
   );
 
+-- A shift that has no orders, so applying the scope marks nothing missing.
+select
+  lives_ok (
+    $$select app.ingest_pos_batch(
+        (select n from pos_test_ids where k = 'run-reappear'),
+        '[]'::jsonb,
+        '[]'::jsonb,
+        jsonb_build_object('shift_ids', jsonb_build_array('shift-test-no-orders'))
+      )$$,
+    'a running recent run applies its first scope'
+  );
+
 select
   throws_ok (
     $$select app.ingest_pos_batch(
-        (select n from pos_test_ids where k = 'run-chunk-2'),
+        (select n from pos_test_ids where k = 'run-reappear'),
         '[]'::jsonb,
         '[]'::jsonb,
-        jsonb_build_object('shift_ids', jsonb_build_array('shift-test-chunk'))
+        jsonb_build_object('shift_ids', jsonb_build_array('shift-test-no-orders'))
       )$$,
     '22023'::char(5),
-    null::text,
-    'a run rejects a second scope'
+    'scope already applied for this run',
+    'a running run rejects a second scope'
   );
 
 do $finish_run_reappear$

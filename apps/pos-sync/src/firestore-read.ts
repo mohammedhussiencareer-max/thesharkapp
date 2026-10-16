@@ -316,9 +316,17 @@ function assertQueryValue(value: unknown): void {
   }
 }
 
+// ListDocumentsResponse has only these keys; an empty page is `{}`.
+const LIST_KEYS = new Set(['documents', 'nextPageToken']);
+
 export function parseListResponse(payload: unknown): ListPage {
-  if (!isRecord(payload) || 'error' in payload) {
+  if (!isRecord(payload)) {
     throw new Error('Firestore read failed: invalid response');
+  }
+  for (const key of Object.keys(payload)) {
+    if (!LIST_KEYS.has(key)) {
+      throw new Error('Firestore read failed: invalid response');
+    }
   }
   const documents: FirestoreRestDocument[] = [];
   if (payload.documents !== undefined) {

@@ -254,6 +254,18 @@ describe('parsers', () => {
     ).toHaveLength(1);
   });
 
+  it('accepts only the documented list response keys', () => {
+    const invalid = 'Firestore read failed: invalid response';
+    expect(() => parseListResponse({ message: 'failed' })).toThrow(invalid);
+    expect(() =>
+      parseListResponse({ documents: [], nextPageToken: '', extra: 1 }),
+    ).toThrow(invalid);
+    expect(parseListResponse({})).toEqual({
+      documents: [],
+      nextPageToken: undefined,
+    });
+  });
+
   it('accepts a runQuery page that is only a readTime', () => {
     expect(
       parseRunQueryResponse([{ readTime: '2026-10-16T00:00:00Z' }]),
