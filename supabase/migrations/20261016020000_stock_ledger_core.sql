@@ -45,6 +45,37 @@ set
 declare
   v_parent_kind text;
 begin
+  -- Concurrency protection between child insert/update and parent kind change:
+  -- 1. When a parent's kind is updated away from 'fish_mixed', Postgres holds an
+  --    exclusive row lock on the parent tuple for the duration of the transaction,
+  --    and we check for any existing fish_size children across ALL target kinds
+  --    (including when new.kind = 'fish_size').
+  -- 2. When inserting or updating a 'fish_size' child, we lock the referenced parent
+  --    row with FOR SHARE before reading its kind. FOR SHARE conflicts with the
+  --    exclusive lock held by a concurrent UPDATE on the parent row, serializing the
+  --    two transactions so neither can commit an invalid parent-child state.
+  if tg_op = 'UPDATE' and old.kind = 'fish_mixed' and new.kind <> 'fish_mixed' then
+    perform
+      1
+    from
+      app.stock_items si
+    where
+      si.id = new.id
+    for update;
+
+    if exists (
+      select
+        1
+      from
+        app.stock_items c
+      where
+        c.parent_item_id = new.id
+    ) then
+      raise exception 'cannot change kind of fish_mixed item that has fish_size children'
+        using errcode = '23514';
+    end if;
+  end if;
+
   if new.kind = 'fish_size' then
     if new.parent_item_id is null then
       raise exception 'fish_size item requires parent_item_id'
@@ -57,7 +88,8 @@ begin
     from
       app.stock_items si
     where
-      si.id = new.parent_item_id;
+      si.id = new.parent_item_id
+    for share;
 
     if v_parent_kind is distinct from 'fish_mixed' then
       raise exception 'parent_item_id for fish_size must reference a fish_mixed item'
@@ -67,20 +99,6 @@ begin
     if new.parent_item_id is not null then
       raise exception 'parent_item_id must be null for non-fish_size items'
         using errcode = '23514';
-    end if;
-
-    if tg_op = 'UPDATE' and old.kind = 'fish_mixed' and new.kind <> 'fish_mixed' then
-      if exists (
-        select
-          1
-        from
-          app.stock_items c
-        where
-          c.parent_item_id = new.id
-      ) then
-        raise exception 'cannot change kind of fish_mixed item that has fish_size children'
-          using errcode = '23514';
-      end if;
     end if;
   end if;
 
@@ -102,7 +120,10 @@ execute function app.trg_validate_stock_item_parent ();
 create table app.item_unit_conversions (
   item_id uuid not null references app.stock_items (id) on delete cascade,
   unit text not null check (length(btrim(unit)) > 0),
-  factor_to_base numeric(18, 9) not null check (factor_to_base > 0),
+  factor_to_base numeric(18, 9) not null check (
+    factor_to_base <> 'NaN'::numeric
+    and factor_to_base > 0
+  ),
   primary key (item_id, unit)
 );
 
@@ -141,6 +162,11 @@ create table app.stock_movements (
   note text null,
   created_at timestamptz not null default now(),
   created_by uuid null default auth.uid (),
+  constraint stock_movements_finite_chk check (
+    quantity <> 'NaN'::numeric
+    and unit_cost <> 'NaN'::numeric
+    and total_cost <> 'NaN'::numeric
+  ),
   constraint stock_movements_cost_adj_chk check (
     (
       movement_type = 'cost_adjustment'
@@ -196,9 +222,17 @@ create table app.item_balances (
   item_id uuid primary key references app.stock_items (id) on delete restrict,
   on_hand_qty numeric(20, 6) not null default 0,
   on_hand_value numeric(14, 2) not null default 0,
-  avg_cost numeric(20, 6) not null default 0 check (avg_cost >= 0),
+  avg_cost numeric(20, 6) not null default 0 check (
+    avg_cost <> 'NaN'::numeric
+    and avg_cost >= 0
+  ),
   last_occurred_at timestamptz null,
-  has_uncovered_deficit boolean not null default false
+  has_uncovered_deficit boolean not null default false,
+  constraint item_balances_finite_chk check (
+    on_hand_qty <> 'NaN'::numeric
+    and on_hand_value <> 'NaN'::numeric
+    and avg_cost <> 'NaN'::numeric
+  )
 );
 
 comment on table app.item_balances is 'Derived per-item stock balance and moving average cost, maintained solely by the posting functions.';
@@ -206,8 +240,14 @@ comment on table app.item_balances is 'Derived per-item stock balance and moving
 create table app.provisional_deficits (
   movement_id bigint primary key references app.stock_movements (id) on delete restrict,
   item_id uuid not null references app.stock_items (id) on delete restrict,
-  qty_uncovered numeric(20, 6) not null check (qty_uncovered >= 0),
-  provisional_unit_cost numeric(20, 6) not null check (provisional_unit_cost >= 0)
+  qty_uncovered numeric(20, 6) not null check (
+    qty_uncovered <> 'NaN'::numeric
+    and qty_uncovered >= 0
+  ),
+  provisional_unit_cost numeric(20, 6) not null check (
+    provisional_unit_cost <> 'NaN'::numeric
+    and provisional_unit_cost >= 0
+  )
 );
 
 comment on table app.provisional_deficits is 'Tracks uncovered negative-stock outflow movements until subsequent inflows cover them.';
@@ -223,20 +263,26 @@ create function app.assert_ledger_write_allowed () returns void language plpgsql
 set
   search_path = '' as $$
 declare
+  v_is_owner boolean;
+  v_db_role text;
   v_jwt_role text;
 begin
+  v_is_owner := coalesce(app.is_owner (), false);
+  v_db_role := coalesce(nullif(pg_catalog.current_setting('role', true), ''), '');
   v_jwt_role := coalesce(
     (
       select
         nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
     ),
-    nullif(pg_catalog.current_setting('request.jwt.claim.role', true), '')
+    nullif(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
+    ''
   );
 
-  if not (
-    app.is_owner ()
-    or pg_catalog.current_setting('role', true) = 'service_role'
-    or v_jwt_role = 'service_role'
+  if not coalesce(
+    v_is_owner is true
+    or v_db_role = 'service_role'
+    or v_jwt_role = 'service_role',
+    false
   ) then
     raise exception 'insufficient_privilege'
       using errcode = '42501';
@@ -317,7 +363,8 @@ create function app.apply_outflow_movement (
   p_shift_id text,
   p_source_type text,
   p_source_id text,
-  p_note text
+  p_note text,
+  p_override_total_cost numeric(14, 2) default null
 ) returns void language plpgsql security definer
 set
   search_path = '' as $$
@@ -332,8 +379,16 @@ declare
   v_prov_movement_id bigint;
   v_has_deficit boolean;
 begin
-  if p_out_qty is null or p_out_qty <= 0 then
-    raise exception 'outflow quantity must be > 0'
+  if p_out_qty is null
+  or p_out_qty in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+  or p_out_qty <= 0 then
+    raise exception 'outflow quantity must be a finite number > 0'
+      using errcode = '22023';
+  end if;
+
+  if p_override_total_cost is not null
+  and p_override_total_cost in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) then
+    raise exception 'outflow total_cost must be a finite number'
       using errcode = '22023';
   end if;
 
@@ -344,7 +399,16 @@ begin
   v_prov_qty := p_out_qty - v_normal_qty;
 
   if v_normal_qty > 0 then
-    v_normal_cost := -pg_catalog.round(v_normal_qty * v_unit_cost, 2);
+    if p_override_total_cost is not null then
+      v_normal_cost := p_override_total_cost;
+    elsif v_normal_qty = v_bal.on_hand_qty then
+      v_normal_cost := -v_bal.on_hand_value;
+    else
+      v_normal_cost := -pg_catalog.round(
+        v_bal.on_hand_value * v_normal_qty / v_bal.on_hand_qty,
+        2
+      );
+    end if;
 
     insert into
       app.stock_movements (
@@ -466,7 +530,8 @@ revoke all on function app.apply_outflow_movement (
   text,
   text,
   text,
-  text
+  text,
+  numeric
 )
 from
   public,
@@ -484,7 +549,8 @@ create function app.apply_inflow_movement (
   p_shift_id text,
   p_source_type text,
   p_source_id text,
-  p_note text
+  p_note text,
+  p_in_total_cost numeric(14, 2) default null
 ) returns void language plpgsql security definer
 set
   search_path = '' as $$
@@ -494,16 +560,21 @@ declare
   v_inflow_total_cost numeric(14, 2);
   v_delta_value numeric(14, 2);
   v_remaining_qty numeric(20, 6);
+  v_remaining_inflow_value numeric(14, 2);
   v_covered_qty numeric(20, 6);
+  v_covered_inflow_value numeric(14, 2);
   v_adj_unit_cost numeric(20, 6);
   v_adj_total_cost numeric(14, 2);
   v_prior_pos_qty numeric(20, 6);
+  v_on_hand_value_after_cover numeric(14, 2);
   v_new_avg_cost numeric(20, 6);
   v_has_deficit boolean;
   r_def record;
 begin
-  if p_in_qty is null or p_in_qty <= 0 then
-    raise exception 'inflow quantity must be > 0'
+  if p_in_qty is null
+  or p_in_qty in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+  or p_in_qty <= 0 then
+    raise exception 'inflow quantity must be a finite number > 0'
       using errcode = '22023';
   end if;
 
@@ -515,12 +586,23 @@ begin
     v_inflow_unit_cost := p_in_unit_cost;
   end if;
 
-  if v_inflow_unit_cost is null or v_inflow_unit_cost < 0 then
-    raise exception 'inflow unit_cost must be >= 0'
+  if v_inflow_unit_cost is null
+  or v_inflow_unit_cost in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+  or v_inflow_unit_cost < 0 then
+    raise exception 'inflow unit_cost must be a finite number >= 0'
       using errcode = '22023';
   end if;
 
-  v_inflow_total_cost := pg_catalog.round(p_in_qty * v_inflow_unit_cost, 2);
+  if p_in_total_cost is not null then
+    if p_in_total_cost in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+    or p_in_total_cost < 0 then
+      raise exception 'inflow total_cost must be a finite number >= 0'
+        using errcode = '22023';
+    end if;
+    v_inflow_total_cost := p_in_total_cost;
+  else
+    v_inflow_total_cost := pg_catalog.round(p_in_qty * v_inflow_unit_cost, 2);
+  end if;
 
   insert into
     app.stock_movements (
@@ -555,6 +637,7 @@ begin
 
   v_delta_value := v_inflow_total_cost;
   v_remaining_qty := p_in_qty;
+  v_remaining_inflow_value := v_inflow_total_cost;
 
   -- Cover uncovered deficits oldest-first.
   for r_def in
@@ -576,8 +659,20 @@ begin
     exit when v_remaining_qty <= 0;
 
     v_covered_qty := least(v_remaining_qty, r_def.qty_uncovered);
+
+    if v_covered_qty = v_remaining_qty then
+      v_covered_inflow_value := v_remaining_inflow_value;
+    else
+      v_covered_inflow_value := pg_catalog.round(
+        v_remaining_inflow_value * v_covered_qty / v_remaining_qty,
+        2
+      );
+    end if;
+
     v_adj_unit_cost := v_inflow_unit_cost - r_def.provisional_unit_cost;
-    v_adj_total_cost := -pg_catalog.round(v_covered_qty * v_adj_unit_cost, 2);
+    v_adj_total_cost := -(
+      v_covered_inflow_value - pg_catalog.round(v_covered_qty * r_def.provisional_unit_cost, 2)
+    );
 
     insert into
       app.stock_movements (
@@ -619,14 +714,19 @@ begin
       movement_id = r_def.movement_id;
 
     v_remaining_qty := v_remaining_qty - v_covered_qty;
+    v_remaining_inflow_value := v_remaining_inflow_value - v_covered_inflow_value;
     v_delta_value := v_delta_value + v_adj_total_cost;
   end loop;
 
   v_prior_pos_qty := greatest(v_bal.on_hand_qty, 0::numeric(20, 6));
+  v_on_hand_value_after_cover := case
+    when v_bal.on_hand_qty > 0 then greatest(v_bal.on_hand_value, 0::numeric(14, 2))
+    else 0::numeric(14, 2)
+  end;
 
   if v_prior_pos_qty + v_remaining_qty > 0 then
     v_new_avg_cost := pg_catalog.round(
-      (v_prior_pos_qty * v_bal.avg_cost + v_remaining_qty * v_inflow_unit_cost) / (v_prior_pos_qty + v_remaining_qty),
+      (v_on_hand_value_after_cover + v_remaining_inflow_value) / (v_prior_pos_qty + v_remaining_qty),
       6
     );
   elsif p_movement_type in ('purchase', 'sort_in')
@@ -674,7 +774,8 @@ revoke all on function app.apply_inflow_movement (
   text,
   text,
   text,
-  text
+  text,
+  numeric
 )
 from
   public,
@@ -705,6 +806,7 @@ declare
   v_base_unit text;
   v_factor numeric(18, 9);
   v_qty numeric(20, 6);
+  v_total_cost numeric(14, 2);
   v_unit_cost numeric(20, 6);
 begin
   perform app.assert_ledger_write_allowed ();
@@ -742,6 +844,17 @@ begin
 
     if v_item_id is null or v_type_text is null or v_occurred_at is null or v_raw_qty is null then
       raise exception 'item_id, movement_type, occurred_at, and quantity are required'
+        using errcode = '22023';
+    end if;
+
+    if v_raw_qty in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) then
+      raise exception 'movement quantity must be a finite number'
+        using errcode = '22023';
+    end if;
+
+    if v_raw_unit_cost is not null
+    and v_raw_unit_cost in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) then
+      raise exception 'movement unit_cost must be a finite number'
         using errcode = '22023';
     end if;
 
@@ -807,7 +920,14 @@ begin
           using errcode = '22023';
       end if;
 
-      v_unit_cost := pg_catalog.round(v_raw_unit_cost / v_factor, 6);
+      v_total_cost := pg_catalog.round(v_raw_qty * v_raw_unit_cost, 2);
+
+      if v_total_cost <= 0 then
+        raise exception 'purchase total_cost must be > 0'
+          using errcode = '22023';
+      end if;
+
+      v_unit_cost := pg_catalog.round(v_total_cost / v_qty, 6);
 
       if v_unit_cost <= 0 then
         raise exception 'converted purchase unit_cost must be > 0'
@@ -824,7 +944,8 @@ begin
         v_shift_id,
         v_source_type,
         v_source_id,
-        v_note
+        v_note,
+        v_total_cost
       );
     elsif v_movement_type = 'opening' then
       if v_qty <= 0 then
@@ -837,7 +958,8 @@ begin
           using errcode = '22023';
       end if;
 
-      v_unit_cost := pg_catalog.round(v_raw_unit_cost / v_factor, 6);
+      v_total_cost := pg_catalog.round(v_raw_qty * v_raw_unit_cost, 2);
+      v_unit_cost := pg_catalog.round(v_total_cost / v_qty, 6);
 
       perform app.apply_inflow_movement (
         v_batch_id,
@@ -849,7 +971,8 @@ begin
         v_shift_id,
         v_source_type,
         v_source_id,
-        v_note
+        v_note,
+        v_total_cost
       );
     elsif v_movement_type in ('sale', 'waste') then
       if v_qty <= 0 then
@@ -927,12 +1050,20 @@ declare
   v_mixed_kind text;
   v_mixed_unit text;
   v_mixed_bal app.item_balances;
-  v_mixed_unit_cost numeric(20, 6);
   v_qty_taken numeric(20, 6);
   v_sum_sizes numeric(20, 6) := 0;
   v_loss_qty numeric(20, 6);
+  v_value_taken numeric(14, 2);
+  v_loss_value numeric(14, 2);
+  v_sort_out_value numeric(14, 2);
+  v_allocated_value numeric(14, 2) := 0;
+  v_size_value numeric(14, 2);
+  v_size_unit_cost numeric(20, 6);
+  v_num_sizes int;
   v_elem jsonb;
+  v_ord bigint;
   v_size_id uuid;
+  v_raw_size_qty numeric;
   v_size_qty numeric(20, 6);
   v_size_kind text;
   v_size_parent uuid;
@@ -942,6 +1073,11 @@ begin
 
   if p_mixed_item is null or p_occurred_at is null or p_qty_taken is null then
     raise exception 'p_mixed_item, p_occurred_at, and p_qty_taken are required'
+      using errcode = '22023';
+  end if;
+
+  if p_qty_taken in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) then
+    raise exception 'p_qty_taken must be a finite number'
       using errcode = '22023';
   end if;
 
@@ -975,6 +1111,8 @@ begin
       using errcode = '22023';
   end if;
 
+  v_num_sizes := pg_catalog.jsonb_array_length(p_sizes);
+
   for v_elem in
     select
       e.value
@@ -987,9 +1125,21 @@ begin
     end if;
 
     v_size_id := (v_elem ->> 'item_id')::uuid;
-    v_size_qty := pg_catalog.round((v_elem ->> 'quantity')::numeric, 6);
+    v_raw_size_qty := (v_elem ->> 'quantity')::numeric;
 
-    if v_size_id is null or v_size_qty is null or v_size_qty <= 0 then
+    if v_size_id is null or v_raw_size_qty is null then
+      raise exception 'each size entry requires item_id and quantity > 0'
+        using errcode = '22023';
+    end if;
+
+    if v_raw_size_qty in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) then
+      raise exception 'size quantity must be a finite number'
+        using errcode = '22023';
+    end if;
+
+    v_size_qty := pg_catalog.round(v_raw_size_qty, 6);
+
+    if v_size_qty <= 0 then
       raise exception 'each size entry requires item_id and quantity > 0'
         using errcode = '22023';
     end if;
@@ -1030,9 +1180,37 @@ begin
   v_batch_id := pg_catalog.gen_random_uuid();
 
   v_mixed_bal := app.lock_and_validate_item_balance (p_mixed_item, p_occurred_at);
-  v_mixed_unit_cost := v_mixed_bal.avg_cost;
 
-  -- 1. sort_out of sum(sizes) from mixed item at its avg cost.
+  if v_mixed_bal.has_uncovered_deficit
+  or v_mixed_bal.on_hand_qty <= 0
+  or v_qty_taken > v_mixed_bal.on_hand_qty then
+    raise exception 'not enough stock to sort: on_hand_qty %, requested %',
+      v_mixed_bal.on_hand_qty,
+      v_qty_taken
+      using errcode = '22023';
+  end if;
+
+  -- Compute value taken from mixed item once from book value (rule 2).
+  if v_qty_taken = v_mixed_bal.on_hand_qty then
+    v_value_taken := v_mixed_bal.on_hand_value;
+  else
+    v_value_taken := pg_catalog.round(
+      v_mixed_bal.on_hand_value * v_qty_taken / v_mixed_bal.on_hand_qty,
+      2
+    );
+  end if;
+
+  v_loss_qty := v_qty_taken - v_sum_sizes;
+
+  if v_loss_qty > 0 then
+    v_loss_value := pg_catalog.round(v_value_taken * v_loss_qty / v_qty_taken, 2);
+  else
+    v_loss_value := 0;
+  end if;
+
+  v_sort_out_value := v_value_taken - v_loss_value;
+
+  -- 1. sort_out of sum(sizes) from mixed item removing v_sort_out_value.
   perform app.apply_outflow_movement (
     v_batch_id,
     p_mixed_item,
@@ -1042,12 +1220,11 @@ begin
     p_shift_id,
     'sort',
     v_batch_id::text,
-    null
+    null,
+    -v_sort_out_value
   );
 
-  -- 2. sort_loss of p_qty_taken - sum(sizes) (if > 0) from mixed item at the same cost.
-  v_loss_qty := v_qty_taken - v_sum_sizes;
-
+  -- 2. sort_loss of p_qty_taken - sum(sizes) (if > 0) removing v_loss_value.
   if v_loss_qty > 0 then
     perform app.apply_outflow_movement (
       v_batch_id,
@@ -1058,19 +1235,30 @@ begin
       p_shift_id,
       'sort',
       v_batch_id::text,
-      null
+      null,
+      -v_loss_value
     );
   end if;
 
-  -- 3. sort_in for each size at the same per-kg cost.
-  for v_elem in
+  -- 3. sort_in for each size, splitting proportionally and giving rounding remainder to last size.
+  for v_elem, v_ord in
     select
-      e.value
+      e.value,
+      e.ord
     from
-      pg_catalog.jsonb_array_elements(p_sizes) as e (value)
+      pg_catalog.jsonb_array_elements(p_sizes) with ordinality as e (value, ord)
   loop
     v_size_id := (v_elem ->> 'item_id')::uuid;
     v_size_qty := pg_catalog.round((v_elem ->> 'quantity')::numeric, 6);
+
+    if v_ord < v_num_sizes then
+      v_size_value := pg_catalog.round(v_value_taken * v_size_qty / v_qty_taken, 2);
+      v_allocated_value := v_allocated_value + v_size_value;
+    else
+      v_size_value := v_value_taken - v_loss_value - v_allocated_value;
+    end if;
+
+    v_size_unit_cost := pg_catalog.round(v_size_value / v_size_qty, 6);
 
     perform app.apply_inflow_movement (
       v_batch_id,
@@ -1078,11 +1266,12 @@ begin
       'sort_in',
       p_occurred_at,
       v_size_qty,
-      v_mixed_unit_cost,
+      v_size_unit_cost,
       p_shift_id,
       'sort',
       v_batch_id::text,
-      null
+      null,
+      v_size_value
     );
   end loop;
 

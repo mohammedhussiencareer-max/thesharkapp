@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (57);
+  plan (85);
 
 -- Clean up any existing test rows in the transaction.
 delete from app.provisional_deficits;
@@ -247,6 +247,56 @@ values
     'weekly',
     0,
     null
+  ),
+  -- Sort stock guard mixed item
+  (
+    '10000000-0000-4000-8000-000000000013',
+    'لوت مخلوط',
+    'fish_mixed',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  -- Outflow drift item (100 x 0.01 kg)
+  (
+    '10000000-0000-4000-8000-000000000016',
+    'فلفل أسود',
+    'ingredient',
+    'kg',
+    'weekly',
+    0,
+    null
+  ),
+  -- Sort value conservation mixed item
+  (
+    '10000000-0000-4000-8000-000000000017',
+    'مرجان مخلوط',
+    'fish_mixed',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  -- Carton unit conversion item (144 pieces/carton)
+  (
+    '10000000-0000-4000-8000-000000000020',
+    'أكواب ورقية',
+    'packaging',
+    'piece',
+    'weekly',
+    0,
+    null
+  ),
+  -- Two provisional deficits FIFO item
+  (
+    '10000000-0000-4000-8000-000000000021',
+    'وقار بلدي',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
   );
 
 insert into
@@ -295,6 +345,42 @@ values
     'daily',
     0,
     '10000000-0000-4000-8000-000000000009'
+  ),
+  (
+    '10000000-0000-4000-8000-000000000014',
+    'لوت كبير',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    '10000000-0000-4000-8000-000000000013'
+  ),
+  (
+    '10000000-0000-4000-8000-000000000015',
+    'لوت وسط',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    '10000000-0000-4000-8000-000000000013'
+  ),
+  (
+    '10000000-0000-4000-8000-000000000018',
+    'مرجان كبير',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    '10000000-0000-4000-8000-000000000017'
+  ),
+  (
+    '10000000-0000-4000-8000-000000000019',
+    'مرجان وسط',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    '10000000-0000-4000-8000-000000000017'
   );
 
 insert into
@@ -304,10 +390,15 @@ values
     '10000000-0000-4000-8000-000000000011',
     'g',
     0.001
+  ),
+  (
+    '10000000-0000-4000-8000-000000000020',
+    'carton',
+    144
   );
 
 -- ============================================================================
--- 9..12: stock_items parent_item_id constraints
+-- 9..13: stock_items parent_item_id constraints
 -- ============================================================================
 -- 9
 select
@@ -348,6 +439,18 @@ select
     '23514'::char(5),
     null::text,
     'changing kind of fish_mixed item that has fish_size children is rejected'
+  );
+
+-- 13
+select
+  throws_ok (
+    $$update app.stock_items
+      set kind = 'fish_size',
+          parent_item_id = '10000000-0000-4000-8000-000000000009'
+      where id = '10000000-0000-4000-8000-000000000005'$$,
+    '23514'::char(5),
+    null::text,
+    'changing kind of fish_mixed item with children to fish_size with a new parent is rejected'
   );
 
 -- ============================================================================
@@ -988,7 +1091,7 @@ select
   );
 
 -- ============================================================================
--- 36..37: Rounding: values producing piaster remainders tie ledger sum to on_hand_value
+-- Rounding & Book-value WAC (Item 4): piaster remainders tie ledger sum to on_hand_value
 -- ============================================================================
 select
   app.post_movements (
@@ -1025,7 +1128,7 @@ select
         'occurred_at',
         '2026-10-16T08:20:00Z',
         'quantity',
-        1
+        1.6
       ),
       jsonb_build_object(
         'item_id',
@@ -1035,22 +1138,22 @@ select
         'occurred_at',
         '2026-10-16T08:30:00Z',
         'quantity',
-        1
+        0.4
       )
     )
   );
 
--- 36
+-- 37
 select
   results_eq (
     $$select on_hand_qty, on_hand_value, avg_cost
       from app.item_balances
       where item_id = '10000000-0000-4000-8000-000000000012'$$,
     $$values (1.000000::numeric(20,6), 100.34::numeric(14,2), 100.333333::numeric(20,6))$$,
-    'Rounding: piaster remainder stays on on_hand_value (100.34 = 301.00 - 100.33 - 100.33)'
+    'Rounding: piaster remainder stays on on_hand_value (100.34 = 301.00 - 160.53 - 40.13)'
   );
 
--- 37
+-- 38
 select
   is (
     (
@@ -1072,10 +1175,548 @@ select
     'Rounding conservation: every item_balances.on_hand_value equals sum(stock_movements.total_cost)'
   );
 
+-- Item 4: Buy 1 L @ 100 when on_hand_qty = 1 and on_hand_value = 100.34 -> avg_cost = 100.17
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000012',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:40:00Z',
+        'quantity',
+        1,
+        'unit_cost',
+        100
+      )
+    )
+  );
+
+-- 39
+select
+  results_eq (
+    $$select on_hand_qty, on_hand_value, avg_cost
+      from app.item_balances
+      where item_id = '10000000-0000-4000-8000-000000000012'$$,
+    $$values (2.000000::numeric(20,6), 200.34::numeric(14,2), 100.170000::numeric(20,6))$$,
+    'Book-value WAC: 1 L with book value 100.34 + 1 L @ 100 gives avg_cost 100.170000 and value 200.34'
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000012',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-10-16T08:50:00Z',
+        'quantity',
+        2
+      )
+    )
+  );
+
+-- 40
+select
+  results_eq (
+    $$select on_hand_qty, on_hand_value, avg_cost
+      from app.item_balances
+      where item_id = '10000000-0000-4000-8000-000000000012'$$,
+    $$values (0.000000::numeric(20,6), 0.00::numeric(14,2), 100.170000::numeric(20,6))$$,
+    'Book-value WAC: selling all 2 L after 100.17 avg leaves on_hand_qty 0 and on_hand_value 0.00'
+  );
+
 -- ============================================================================
--- 38..43: Guards
+-- Item 1: Sorting a raw item that has no stock / insufficient stock
 -- ============================================================================
--- 38: Back-dated movement against existing item_balances.last_occurred_at
+-- 41: Never-costed mixed item -> sort raises 'not enough stock to sort...'
+select
+  throws_ok (
+    $$select app.post_sort(
+      '10000000-0000-4000-8000-000000000013',
+      '2026-10-16T08:00:00Z',
+      1,
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000014',
+          'quantity', 1
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'not enough stock to sort: on_hand_qty 0.000000, requested 1.000000',
+    'Sort stock guard: sorting a never-costed mixed item raises not enough stock to sort'
+  );
+
+-- Buy 3 kg @ 100 on mixed item 0013
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000013',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T09:00:00Z',
+        'quantity',
+        3,
+        'unit_cost',
+        100
+      )
+    )
+  );
+
+-- 42: Mixed with 3 kg -> sorting 5 kg raises 'not enough stock to sort...'
+select
+  throws_ok (
+    $$select app.post_sort(
+      '10000000-0000-4000-8000-000000000013',
+      '2026-10-16T09:05:00Z',
+      5,
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000014',
+          'quantity', 5
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'not enough stock to sort: on_hand_qty 3.000000, requested 5.000000',
+    'Sort stock guard: sorting 5 kg when mixed item has 3 kg raises not enough stock to sort'
+  );
+
+-- Sorting exactly the 3 kg on-hand works
+select
+  app.post_sort (
+    '10000000-0000-4000-8000-000000000013',
+    '2026-10-16T09:10:00Z',
+    3,
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000014',
+        'quantity',
+        2.8
+      )
+    )
+  );
+
+-- 43
+select
+  results_eq (
+    $$select item_id, on_hand_qty, on_hand_value
+      from app.item_balances
+      where item_id in (
+        '10000000-0000-4000-8000-000000000013',
+        '10000000-0000-4000-8000-000000000014'
+      )
+      order by item_id$$,
+    $$values
+      ('10000000-0000-4000-8000-000000000013'::uuid, 0.000000::numeric(20,6), 0.00::numeric(14,2)),
+      ('10000000-0000-4000-8000-000000000014'::uuid, 2.800000::numeric(20,6), 280.00::numeric(14,2))$$,
+    'Sort stock guard: sorting exactly the 3 kg on-hand succeeds and leaves 0 on mixed item'
+  );
+
+-- Oversell mixed item 0013 by 2 kg so it has an uncovered deficit
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000013',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-10-16T09:20:00Z',
+        'quantity',
+        2
+      )
+    )
+  );
+
+-- 44: Mixed item with uncovered deficit -> sort raises 'not enough stock to sort...'
+select
+  throws_ok (
+    $$select app.post_sort(
+      '10000000-0000-4000-8000-000000000013',
+      '2026-10-16T09:30:00Z',
+      1,
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000014',
+          'quantity', 1
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'not enough stock to sort: on_hand_qty -2.000000, requested 1.000000',
+    'Sort stock guard: sorting a mixed item with uncovered deficit raises not enough stock to sort'
+  );
+
+-- ============================================================================
+-- Item 2: Rounding drift on outflows (1 kg @ 100.50 then 100 outflows of 0.01 kg)
+-- ============================================================================
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000016',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:00:00Z',
+        'quantity',
+        1,
+        'unit_cost',
+        100.50
+      )
+    ) || (
+      select
+        jsonb_agg(
+          jsonb_build_object(
+            'item_id',
+            '10000000-0000-4000-8000-000000000016',
+            'movement_type',
+            'sale',
+            'occurred_at',
+            (
+              '2026-10-16T08:00:00Z'::timestamptz + make_interval(mins => g.i)
+            )::text,
+            'quantity',
+            0.01
+          )
+          order by
+            g.i
+        )
+      from
+        generate_series(1, 100) as g (i)
+    )
+  );
+
+-- 45
+select
+  results_eq (
+    $$select count(*)::int, -sum(total_cost)::numeric(14,2)
+      from app.stock_movements
+      where item_id = '10000000-0000-4000-8000-000000000016'
+        and movement_type = 'sale'$$,
+    $$values (100, 100.50::numeric(14,2))$$,
+    'Outflow rounding drift: 100 sales of 0.01 kg from 1 kg @ 100.50 have total outflow cost 100.50'
+  );
+
+-- 46
+select
+  results_eq (
+    $$select on_hand_qty, on_hand_value
+      from app.item_balances
+      where item_id = '10000000-0000-4000-8000-000000000016'$$,
+    $$values (0.000000::numeric(20,6), 0.00::numeric(14,2))$$,
+    'Outflow rounding drift: final on_hand_qty is 0 and final on_hand_value is 0.00'
+  );
+
+-- ============================================================================
+-- Item 3: Sorting must conserve value exactly (0.2 kg @ 50.55 sorted into 0.1 + 0.1)
+-- ============================================================================
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000017',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:00:00Z',
+        'quantity',
+        0.2,
+        'unit_cost',
+        50.55
+      )
+    )
+  );
+
+select
+  app.post_sort (
+    '10000000-0000-4000-8000-000000000017',
+    '2026-10-16T08:30:00Z',
+    0.2,
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000018',
+        'quantity',
+        0.1
+      ),
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000019',
+        'quantity',
+        0.1
+      )
+    )
+  );
+
+-- 47
+select
+  results_eq (
+    $$select item_id, on_hand_qty, on_hand_value
+      from app.item_balances
+      where item_id in (
+        '10000000-0000-4000-8000-000000000017',
+        '10000000-0000-4000-8000-000000000018',
+        '10000000-0000-4000-8000-000000000019'
+      )
+      order by item_id$$,
+    $$values
+      ('10000000-0000-4000-8000-000000000017'::uuid, 0.000000::numeric(20,6), 0.00::numeric(14,2)),
+      ('10000000-0000-4000-8000-000000000018'::uuid, 0.100000::numeric(20,6), 5.06::numeric(14,2)),
+      ('10000000-0000-4000-8000-000000000019'::uuid, 0.100000::numeric(20,6), 5.05::numeric(14,2))$$,
+    'Sort value conservation: 0.2 kg @ 50.55 (value 10.11) splits into 5.06 + 5.05 with 0.00 remaining on mixed'
+  );
+
+-- 48
+select
+  results_eq (
+    $$select
+        -sum(total_cost) filter (where movement_type in ('sort_out', 'sort_loss'))::numeric(14,2),
+        sum(total_cost) filter (where movement_type = 'sort_in')::numeric(14,2)
+      from app.stock_movements
+      where item_id in (
+        '10000000-0000-4000-8000-000000000017',
+        '10000000-0000-4000-8000-000000000018',
+        '10000000-0000-4000-8000-000000000019'
+      )$$,
+    $$values (10.11::numeric(14,2), 10.11::numeric(14,2))$$,
+    'Sort value conservation: total sort_in value (10.11) equals total sort_out + sort_loss value (10.11)'
+  );
+
+-- ============================================================================
+-- Item 5: Unit conversion must not change purchase totals (100 cartons x 144 @ 100/carton)
+-- ============================================================================
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000020',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:00:00Z',
+        'quantity',
+        100,
+        'unit',
+        'carton',
+        'unit_cost',
+        100
+      )
+    )
+  );
+
+-- 49
+select
+  results_eq (
+    $$select sm.quantity, sm.unit_cost, sm.total_cost, ib.on_hand_qty, ib.avg_cost, ib.on_hand_value
+      from app.stock_movements sm
+      join app.item_balances ib on ib.item_id = sm.item_id
+      where sm.item_id = '10000000-0000-4000-8000-000000000020'$$,
+    $$values (
+      14400.000000::numeric(20,6),
+      0.694444::numeric(20,6),
+      10000.00::numeric(14,2),
+      14400.000000::numeric(20,6),
+      0.694444::numeric(20,6),
+      10000.00::numeric(14,2)
+    )$$,
+    'Unit conversion total: 100 cartons x 144 pieces at 100/carton has exact total_cost 10000.00'
+  );
+
+-- ============================================================================
+-- Item 10: Two separate provisional deficits covered oldest-first + positive count_adjustment
+-- ============================================================================
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000021',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:00:00Z',
+        'quantity',
+        2,
+        'unit_cost',
+        100,
+        'shift_id',
+        'shift-A'
+      ),
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000021',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-10-16T09:00:00Z',
+        'quantity',
+        5,
+        'shift_id',
+        'shift-A'
+      ),
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000021',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-10-16T10:00:00Z',
+        'quantity',
+        4,
+        'shift_id',
+        'shift-B'
+      ),
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000021',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T11:00:00Z',
+        'quantity',
+        5,
+        'unit_cost',
+        120,
+        'shift_id',
+        'shift-C'
+      )
+    )
+  );
+
+-- 50
+select
+  results_eq (
+    $$select
+        ca.total_cost,
+        ca.shift_id,
+        ca.adjusts_movement_id = s.id as points_to_expected_sale
+      from app.stock_movements ca
+      join app.stock_movements s on s.id = ca.adjusts_movement_id
+      where ca.item_id = '10000000-0000-4000-8000-000000000021'
+        and ca.movement_type = 'cost_adjustment'
+      order by ca.id$$,
+    $$values
+      (-60.00::numeric(14,2), 'shift-A'::text, true),
+      (-40.00::numeric(14,2), 'shift-B'::text, true)$$,
+    'Two provisional deficits: covered oldest-first with cost_adjustments -60.00 (shift-A) and -40.00 (shift-B)'
+  );
+
+-- 51
+select
+  results_eq (
+    $$select
+        array(
+          select pd.qty_uncovered
+          from app.provisional_deficits pd
+          where pd.item_id = '10000000-0000-4000-8000-000000000021'
+          order by pd.movement_id
+        ),
+        ib.on_hand_qty,
+        ib.on_hand_value,
+        ib.has_uncovered_deficit
+      from app.item_balances ib
+      where ib.item_id = '10000000-0000-4000-8000-000000000021'$$,
+    $$values (
+      array[0.000000::numeric(20,6), 2.000000::numeric(20,6)],
+      -2.000000::numeric(20,6),
+      -200.00::numeric(14,2),
+      true
+    )$$,
+    'Two provisional deficits: first deficit fully covered (0 remaining), second has 2 kg remaining'
+  );
+
+-- Positive count_adjustment on item 0001 at avg 150. Capture the balance first so the
+-- expectation does not depend on how earlier scenarios left the item.
+create temp table pre_count_adjustment on
+commit
+drop as
+select
+  on_hand_qty,
+  on_hand_value
+from
+  app.item_balances
+where
+  item_id = '10000000-0000-4000-8000-000000000001';
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000001',
+        'movement_type',
+        'count_adjustment',
+        'occurred_at',
+        '2026-10-16T10:30:00Z',
+        'quantity',
+        2,
+        'note',
+        'جرد فعلي زيادة 2 كجم'
+      )
+    )
+  );
+
+-- 52
+select
+  results_eq (
+    $$select sm.quantity, sm.unit_cost, sm.total_cost, ib.on_hand_qty, ib.avg_cost, ib.on_hand_value
+      from app.stock_movements sm
+      join app.item_balances ib on ib.item_id = sm.item_id
+      where sm.item_id = '10000000-0000-4000-8000-000000000001'
+        and sm.movement_type = 'count_adjustment'
+        and sm.quantity > 0$$,
+    $$select
+      2.000000::numeric(20,6),
+      150.000000::numeric(20,6),
+      300.00::numeric(14,2),
+      (on_hand_qty + 2)::numeric(20,6),
+      150.000000::numeric(20,6),
+      (on_hand_value + 300.00)::numeric(14,2)
+    from pre_count_adjustment$$,
+    'Positive count_adjustment: +2 kg enters at current avg_cost 150 (+300.00) and adds 2 kg and 300.00 to the balance'
+  );
+
+-- 53: Conservation invariant across all items after all new scenarios
+select
+  is (
+    (
+      select
+        count(*)::int
+      from
+        app.item_balances ib
+      where
+        ib.on_hand_value <> (
+          select
+            coalesce(sum(sm.total_cost), 0)
+          from
+            app.stock_movements sm
+          where
+            sm.item_id = ib.item_id
+        )
+    ),
+    0,
+    'Ledger invariant after new scenarios: every item_balances.on_hand_value equals sum(stock_movements.total_cost)'
+  );
+
+-- ============================================================================
+-- 54..67: Guards (including non-finite numbers)
+-- ============================================================================
+-- 54: Back-dated movement against existing item_balances.last_occurred_at
 select
   throws_ok (
     $$select app.post_movements(
@@ -1093,7 +1734,7 @@ select
     'Guard: back-dated movement raises P0001 with required message'
   );
 
--- 39: Back-dated movement within the same batch array
+-- 55: Back-dated movement within the same batch array
 select
   throws_ok (
     $$select app.post_movements(
@@ -1117,7 +1758,7 @@ select
     'Guard: out-of-order timestamps for the same item inside a single batch raise P0001'
   );
 
--- 39: Sort with a size of the wrong parent
+-- 56: Sort with a size of the wrong parent
 select
   throws_ok (
     $$select app.post_sort(
@@ -1136,7 +1777,7 @@ select
     'Guard: post_sort with a fish_size of the wrong parent raises'
   );
 
--- 40: Sort with sizes summing above qty taken
+-- 57: Sort with sizes summing above qty taken
 select
   throws_ok (
     $$select app.post_sort(
@@ -1159,7 +1800,7 @@ select
     'Guard: post_sort with sizes summing above p_qty_taken raises'
   );
 
--- 41: Unknown unit
+-- 58: Unknown unit
 select
   throws_ok (
     $$select app.post_movements(
@@ -1179,7 +1820,7 @@ select
     'Guard: post_movements with unknown unit raises'
   );
 
--- 42: Disallowed input movement_type (cost_adjustment)
+-- 59: Disallowed input movement_type (cost_adjustment)
 select
   throws_ok (
     $$select app.post_movements(
@@ -1198,10 +1839,159 @@ select
     'Guard: post_movements with disallowed movement_type cost_adjustment raises'
   );
 
+-- 60: Item 6 - post_movements rejects quantity = NaN
+select
+  throws_ok (
+    $$select app.post_movements(
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000001',
+          'movement_type', 'sale',
+          'occurred_at', '2026-10-16T12:00:00Z',
+          'quantity', 'NaN'
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'movement quantity must be a finite number',
+    'Guard: post_movements rejects quantity = NaN'
+  );
+
+-- 61: Item 6 - post_movements rejects quantity = Infinity
+select
+  throws_ok (
+    $$select app.post_movements(
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000001',
+          'movement_type', 'sale',
+          'occurred_at', '2026-10-16T12:00:00Z',
+          'quantity', 'Infinity'
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'movement quantity must be a finite number',
+    'Guard: post_movements rejects quantity = Infinity'
+  );
+
+-- 62: Item 6 - post_movements rejects quantity = -Infinity
+select
+  throws_ok (
+    $$select app.post_movements(
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000001',
+          'movement_type', 'sale',
+          'occurred_at', '2026-10-16T12:00:00Z',
+          'quantity', '-Infinity'
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'movement quantity must be a finite number',
+    'Guard: post_movements rejects quantity = -Infinity'
+  );
+
+-- 63: Item 6 - post_movements rejects unit_cost = NaN
+select
+  throws_ok (
+    $$select app.post_movements(
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000001',
+          'movement_type', 'purchase',
+          'occurred_at', '2026-10-16T12:00:00Z',
+          'quantity', 1,
+          'unit_cost', 'NaN'
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'movement unit_cost must be a finite number',
+    'Guard: post_movements rejects unit_cost = NaN'
+  );
+
+-- 64: Item 6 - post_movements rejects unit_cost = Infinity
+select
+  throws_ok (
+    $$select app.post_movements(
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000001',
+          'movement_type', 'purchase',
+          'occurred_at', '2026-10-16T12:00:00Z',
+          'quantity', 1,
+          'unit_cost', 'Infinity'
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'movement unit_cost must be a finite number',
+    'Guard: post_movements rejects unit_cost = Infinity'
+  );
+
+-- 65: Item 6 - post_sort rejects p_qty_taken = NaN
+select
+  throws_ok (
+    $$select app.post_sort(
+      '10000000-0000-4000-8000-000000000005',
+      '2026-10-16T12:00:00Z',
+      'NaN'::numeric,
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000006',
+          'quantity', 1
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'p_qty_taken must be a finite number',
+    'Guard: post_sort rejects p_qty_taken = NaN'
+  );
+
+-- 66: Item 6 - post_sort rejects p_qty_taken = Infinity
+select
+  throws_ok (
+    $$select app.post_sort(
+      '10000000-0000-4000-8000-000000000005',
+      '2026-10-16T12:00:00Z',
+      'Infinity'::numeric,
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000006',
+          'quantity', 1
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'p_qty_taken must be a finite number',
+    'Guard: post_sort rejects p_qty_taken = Infinity'
+  );
+
+-- 67: Item 6 - post_sort rejects size quantity = NaN
+select
+  throws_ok (
+    $$select app.post_sort(
+      '10000000-0000-4000-8000-000000000005',
+      '2026-10-16T12:00:00Z',
+      10,
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000006',
+          'quantity', 'NaN'
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'size quantity must be a finite number',
+    'Guard: post_sort rejects size quantity = NaN'
+  );
+
 -- ============================================================================
--- 43..46: Append-only protection on app.stock_movements
+-- 68..73: Append-only protection & table finite CHECK constraints
 -- ============================================================================
--- 43: Owner (authenticated) cannot UPDATE app.stock_movements
+-- 68: Owner (authenticated) cannot UPDATE app.stock_movements
 select
   throws_ok (
     $$update app.stock_movements set note = 'tampered'$$,
@@ -1210,7 +2000,7 @@ select
     'Append-only: authenticated owner cannot UPDATE app.stock_movements'
   );
 
--- 44: Owner (authenticated) cannot DELETE from app.stock_movements
+-- 69: Owner (authenticated) cannot DELETE from app.stock_movements
 select
   throws_ok (
     $$delete from app.stock_movements$$,
@@ -1221,7 +2011,7 @@ select
 
 reset role;
 
--- 45: Even table owner (postgres) cannot UPDATE app.stock_movements due to trigger
+-- 70: Even table owner (postgres) cannot UPDATE app.stock_movements due to trigger
 select
   throws_ok (
     $$update app.stock_movements set note = 'tampered'$$,
@@ -1230,7 +2020,7 @@ select
     'Append-only: trigger blocks UPDATE on app.stock_movements even for table owner'
   );
 
--- 46: Even table owner (postgres) cannot DELETE from app.stock_movements due to trigger
+-- 71: Even table owner (postgres) cannot DELETE from app.stock_movements due to trigger
 select
   throws_ok (
     $$delete from app.stock_movements$$,
@@ -1239,13 +2029,42 @@ select
     'Append-only: trigger blocks DELETE on app.stock_movements even for table owner'
   );
 
+-- 72: Item 6 - item_balances table CHECK constraint rejects NaN
+select
+  throws_ok (
+    $$insert into app.item_balances (item_id, on_hand_qty)
+      values ('10000000-0000-4000-8000-000000000015', 'NaN'::numeric)$$,
+    '23514'::char(5),
+    null::text,
+    'Check constraint: app.item_balances rejects NaN in numeric columns'
+  );
+
+-- 73: Item 6 - stock_movements table CHECK constraint rejects NaN
+select
+  throws_ok (
+    $$insert into app.stock_movements (
+        batch_id, item_id, movement_type, occurred_at, quantity, unit_cost, total_cost
+      ) values (
+        gen_random_uuid(),
+        '10000000-0000-4000-8000-000000000015',
+        'purchase',
+        '2026-10-16T16:00:00Z',
+        'NaN'::numeric,
+        10,
+        10
+      )$$,
+    '23514'::char(5),
+    null::text,
+    'Check constraint: app.stock_movements rejects NaN in numeric columns'
+  );
+
 -- ============================================================================
--- 47..56: Authorization & RLS
+-- 74..85: Authorization & RLS
 -- ============================================================================
 set
   local role anon;
 
--- 47
+-- 74
 select
   throws_ok (
     $$select app.post_movements('[]'::jsonb)$$,
@@ -1254,7 +2073,7 @@ select
     'Auth: anon cannot execute app.post_movements'
   );
 
--- 48
+-- 75
 select
   throws_ok (
     $$select app.post_sort('10000000-0000-4000-8000-000000000005', now(), 1, '[]'::jsonb, null)$$,
@@ -1263,13 +2082,59 @@ select
     'Auth: anon cannot execute app.post_sort'
   );
 
--- 49
+-- 76
 select
   throws_ok (
     $$select * from app.stock_movements$$,
     '42501'::char(5),
     null::text,
     'Auth: anon cannot select from app.stock_movements'
+  );
+
+reset role;
+
+-- Item 9: Session with no role claim and no owner gets insufficient_privilege
+select
+  set_config('request.jwt.claims', '', true);
+
+set
+  local role authenticated;
+
+-- 77
+select
+  throws_ok (
+    $$select app.post_movements(
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000001',
+          'movement_type', 'sale',
+          'occurred_at', '2026-10-16T15:00:00Z',
+          'quantity', 1
+        )
+      )
+    )$$,
+    '42501'::char(5),
+    'insufficient_privilege',
+    'Auth: session with no role claim and no owner gets insufficient_privilege on app.post_movements'
+  );
+
+-- 78
+select
+  throws_ok (
+    $$select app.post_sort(
+      '10000000-0000-4000-8000-000000000005',
+      '2026-10-16T15:00:00Z',
+      1,
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000006',
+          'quantity', 1
+        )
+      )
+    )$$,
+    '42501'::char(5),
+    'insufficient_privilege',
+    'Auth: session with no role claim and no owner gets insufficient_privilege on app.post_sort'
   );
 
 reset role;
@@ -1290,7 +2155,7 @@ select
 set
   local role authenticated;
 
--- 50
+-- 79
 select
   throws_ok (
     $$select app.post_movements(
@@ -1308,7 +2173,7 @@ select
     'Auth: non-owner authenticated user gets insufficient_privilege on app.post_movements'
   );
 
--- 51
+-- 80
 select
   throws_ok (
     $$select app.post_sort(
@@ -1327,21 +2192,21 @@ select
     'Auth: non-owner authenticated user gets insufficient_privilege on app.post_sort'
   );
 
--- 52
+-- 81
 select
   is_empty (
     $$select id from app.stock_items$$,
     'RLS: non-owner authenticated user sees zero rows in app.stock_items'
   );
 
--- 53
+-- 82
 select
   is_empty (
     $$select id from app.stock_movements$$,
     'RLS: non-owner authenticated user sees zero rows in app.stock_movements'
   );
 
--- 54
+-- 83
 select
   is_empty (
     $$select item_id from app.item_balances$$,
@@ -1366,7 +2231,7 @@ select
 set
   local role authenticated;
 
--- 55
+-- 84
 select
   throws_ok (
     $$insert into app.stock_movements (
@@ -1387,7 +2252,7 @@ select
 
 reset role;
 
--- 56: service_role can post movements
+-- 85: service_role can post movements
 select
   set_config(
     'request.jwt.claims',
