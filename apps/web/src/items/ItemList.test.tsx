@@ -62,17 +62,22 @@ describe('ItemList', () => {
       factorToBase: 2,
       storedFactor: 2,
     };
-    let resolveReload: (value: UnitConversion[]) => void = () => undefined;
+    const listed = (rows: UnitConversion[]) => ({
+      baseUnit: 'kg' as const,
+      rows,
+    });
+    let resolveReload: (value: ReturnType<typeof listed>) => void = () =>
+      undefined;
     let calls = 0;
     vi.mocked(listConversions).mockImplementation(() => {
       calls += 1;
-      if (calls === 1) return Promise.resolve([initial]);
+      if (calls === 1) return Promise.resolve(listed([initial]));
       if (calls === 2) {
         return new Promise((resolve) => {
           resolveReload = resolve;
         });
       }
-      return Promise.resolve([saved]);
+      return Promise.resolve(listed([saved]));
     });
 
     render(<Host />);
@@ -88,7 +93,7 @@ describe('ItemList', () => {
     fireEvent.click(toggle());
     expect(screen.getByText('1 كيس = 1 كيلو')).toBeInTheDocument();
 
-    resolveReload([saved]);
+    resolveReload(listed([saved]));
     expect(await screen.findByText('1 كيس = 2 كيلو')).toBeInTheDocument();
     await waitFor(() => expect(toggle()).toBeEnabled());
 

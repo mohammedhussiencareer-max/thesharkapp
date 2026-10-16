@@ -149,6 +149,9 @@ isOneToOne: false
 "assert_ledger_write_allowed":
 { Args: Record<PropertyKey, never>; Returns: undefined
                            },
+"delete_unit_conversion":
+{ Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
+                           },
 "is_owner":
 { Args: Record<PropertyKey, never>; Returns: boolean
                            },
@@ -172,6 +175,9 @@ isOneToOne: false
                            },
 "post_sort":
 { Args: { "p_mixed_item": string,"p_occurred_at": string,"p_qty_taken": number,"p_shift_id"?: string,"p_sizes": Json }; Returns: string
+                           },
+"update_unit_conversion":
+{ Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
                            }
           }
           Enums: {

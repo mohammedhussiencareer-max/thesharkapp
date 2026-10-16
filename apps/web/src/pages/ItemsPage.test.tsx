@@ -16,7 +16,7 @@ import {
   updateItem,
 } from '@/items/api';
 import { StaleWriteError } from '@/items/errors';
-import type { CatalogItem, UnitConversion } from '@/items/types';
+import type { BaseUnit, CatalogItem, UnitConversion } from '@/items/types';
 import { ItemsPage } from '@/pages/ItemsPage';
 
 vi.mock('@/items/api', () => ({
@@ -102,6 +102,10 @@ const catalog: CatalogItem[] = [
   }),
 ];
 
+function listed(rows: UnitConversion[], baseUnit: BaseUnit) {
+  return { baseUnit, rows };
+}
+
 async function renderCatalog(items: CatalogItem[] = catalog) {
   vi.mocked(listItems).mockResolvedValue(items);
   render(
@@ -125,7 +129,7 @@ describe('ItemsPage', () => {
     vi.mocked(updateItem).mockReset();
     vi.mocked(updateItem).mockResolvedValue(undefined);
     vi.mocked(listConversions).mockReset();
-    vi.mocked(listConversions).mockResolvedValue([]);
+    vi.mocked(listConversions).mockResolvedValue({ baseUnit: 'kg', rows: [] });
     vi.mocked(addConversion).mockReset();
     vi.mocked(addConversion).mockResolvedValue(undefined);
   });
@@ -369,7 +373,7 @@ describe('ItemsPage', () => {
     await renderCatalog();
     const rows: UnitConversion[] = [];
     vi.mocked(listConversions).mockImplementation(() =>
-      Promise.resolve([...rows]),
+      Promise.resolve(listed([...rows], 'piece')),
     );
     vi.mocked(addConversion).mockImplementation((itemId, unit, factor) => {
       rows.push({
@@ -422,11 +426,12 @@ describe('ItemsPage', () => {
       factorToBase: 1,
       storedFactor: 1,
     };
-    let resolveReload: (value: UnitConversion[]) => void = () => undefined;
+    let resolveReload: (value: ReturnType<typeof listed>) => void = () =>
+      undefined;
     let calls = 0;
     vi.mocked(listConversions).mockImplementation(() => {
       calls += 1;
-      if (calls === 1) return Promise.resolve([initial]);
+      if (calls === 1) return Promise.resolve(listed([initial], 'liter'));
       return new Promise((resolve) => {
         resolveReload = resolve;
       });
@@ -445,7 +450,9 @@ describe('ItemsPage', () => {
     fireEvent.click(within(oil).getByRole('button', { name: 'حفظ المعامل' }));
     await waitFor(() => expect(filter).toBeDisabled());
 
-    resolveReload([{ ...initial, factorToBase: 2, storedFactor: 2 }]);
+    resolveReload(
+      listed([{ ...initial, factorToBase: 2, storedFactor: 2 }], 'liter'),
+    );
     expect(await within(oil).findByText('1 جركن = 2 لتر')).toBeInTheDocument();
     await waitFor(() => expect(filter).toBeEnabled());
   });
@@ -459,11 +466,12 @@ describe('ItemsPage', () => {
       factorToBase: 1,
       storedFactor: 1,
     };
-    let resolveReload: (value: UnitConversion[]) => void = () => undefined;
+    let resolveReload: (value: ReturnType<typeof listed>) => void = () =>
+      undefined;
     let calls = 0;
     vi.mocked(listConversions).mockImplementation(() => {
       calls += 1;
-      if (calls === 1) return Promise.resolve([initial]);
+      if (calls === 1) return Promise.resolve(listed([initial], 'piece'));
       return new Promise((resolve) => {
         resolveReload = resolve;
       });
@@ -489,7 +497,9 @@ describe('ItemsPage', () => {
     fireEvent.click(save());
     expect(updateItem).not.toHaveBeenCalled();
 
-    resolveReload([{ ...initial, factorToBase: 2, storedFactor: 2 }]);
+    resolveReload(
+      listed([{ ...initial, factorToBase: 2, storedFactor: 2 }], 'piece'),
+    );
     expect(
       await within(box).findByText('1 كرتونة = 2 قطعة'),
     ).toBeInTheDocument();
@@ -498,9 +508,12 @@ describe('ItemsPage', () => {
 
   it('locks conversion actions while an item save is in flight', async () => {
     await renderCatalog();
-    vi.mocked(listConversions).mockResolvedValue([
-      { itemId: 'box', unit: 'كرتونة', factorToBase: 1, storedFactor: 1 },
-    ]);
+    vi.mocked(listConversions).mockResolvedValue(
+      listed(
+        [{ itemId: 'box', unit: 'كرتونة', factorToBase: 1, storedFactor: 1 }],
+        'piece',
+      ),
+    );
     let resolveSave: () => void = () => undefined;
     vi.mocked(updateItem).mockImplementation(
       () =>
@@ -714,7 +727,7 @@ describe('ItemsPage', () => {
     let loads = 0;
     vi.mocked(listConversions).mockImplementation(() => {
       loads += 1;
-      return Promise.resolve([row(loads >= 4 ? 2 : 1)]);
+      return Promise.resolve(listed([row(loads >= 4 ? 2 : 1)], 'piece'));
     });
     vi.mocked(listItems).mockResolvedValue(catalog);
 
@@ -737,7 +750,8 @@ describe('ItemsPage', () => {
     await waitFor(() =>
       expect(vi.mocked(updateConversion)).toHaveBeenCalledTimes(1),
     );
-    expect(vi.mocked(updateConversion).mock.calls[0]?.[3]).toBe(1);
+    expect(vi.mocked(updateConversion).mock.calls[0]?.[3]).toBe('1');
+    expect(vi.mocked(updateConversion).mock.calls[0]?.[4]).toBe('piece');
 
     first.unmount();
     render(
@@ -778,7 +792,47 @@ describe('ItemsPage', () => {
       'box',
       'كرتونة',
       '3',
-      1,
+      '1',
+      'piece',
     ]);
+  });
+
+  it('reloads items when a conversion snapshot has a newer base unit', async () => {
+    const oil = item({
+      id: 'oil',
+      name: 'زيت',
+      kind: 'ingredient',
+      baseUnit: 'kg',
+      active: true,
+    });
+    const oilLiter = { ...oil, baseUnit: 'liter' as const };
+    let loads = 0;
+    vi.mocked(listItems).mockImplementation(() => {
+      loads += 1;
+      return Promise.resolve(loads === 1 ? [oil] : [oilLiter]);
+    });
+    vi.mocked(listConversions).mockResolvedValue(
+      listed(
+        [{ itemId: 'oil', unit: 'كيس', factorToBase: 2, storedFactor: '2' }],
+        'liter',
+      ),
+    );
+
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+
+    const card = await screen.findByRole('article', { name: 'زيت' });
+    fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
+    expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('kg');
+    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+
+    expect(await within(card).findByText('1 كيس = 2 لتر')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('liter');
+    });
+    expect(loads).toBeGreaterThanOrEqual(2);
   });
 });

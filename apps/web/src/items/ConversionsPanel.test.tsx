@@ -1,9 +1,14 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { addConversion, listConversions, updateConversion } from '@/items/api';
+import {
+  addConversion,
+  deleteConversion,
+  listConversions,
+  updateConversion,
+} from '@/items/api';
 import { ConversionsPanel } from '@/items/ConversionsPanel';
 import { StaleWriteError } from '@/items/errors';
-import type { CatalogItem } from '@/items/types';
+import type { BaseUnit, CatalogItem, UnitConversion } from '@/items/types';
 
 vi.mock('@/items/api', () => ({
   listConversions: vi.fn(),
@@ -11,6 +16,10 @@ vi.mock('@/items/api', () => ({
   updateConversion: vi.fn(),
   deleteConversion: vi.fn(),
 }));
+
+function snapshot(rows: UnitConversion[], baseUnit: BaseUnit = 'kg') {
+  return { baseUnit, rows };
+}
 
 const item: CatalogItem = {
   id: 'oil',
@@ -31,35 +40,39 @@ describe('ConversionsPanel', () => {
   beforeEach(() => {
     vi.mocked(listConversions).mockReset();
     vi.mocked(addConversion).mockReset();
+    vi.mocked(updateConversion).mockReset();
+    vi.mocked(deleteConversion).mockReset();
   });
 
   it('shows the exact stored factor instead of a rounded quantity', async () => {
-    vi.mocked(listConversions).mockResolvedValue([
-      {
-        itemId: 'oil',
-        unit: 'جرام',
-        factorToBase: 0.0075,
-        storedFactor: '0.007500000',
-      },
-      {
-        itemId: 'oil',
-        unit: 'مل',
-        factorToBase: 0.0001,
-        storedFactor: '0.0001',
-      },
-      {
-        itemId: 'oil',
-        unit: 'كيس',
-        factorToBase: 25,
-        storedFactor: '25.000000000',
-      },
-      {
-        itemId: 'oil',
-        unit: 'طن',
-        factorToBase: 12345678.12345679,
-        storedFactor: '12345678.123456789',
-      },
-    ]);
+    vi.mocked(listConversions).mockResolvedValue(
+      snapshot([
+        {
+          itemId: 'oil',
+          unit: 'جرام',
+          factorToBase: 0.0075,
+          storedFactor: '0.007500000',
+        },
+        {
+          itemId: 'oil',
+          unit: 'مل',
+          factorToBase: 0.0001,
+          storedFactor: '0.0001',
+        },
+        {
+          itemId: 'oil',
+          unit: 'كيس',
+          factorToBase: 25,
+          storedFactor: '25.000000000',
+        },
+        {
+          itemId: 'oil',
+          unit: 'طن',
+          factorToBase: 12345678.12345679,
+          storedFactor: '12345678.123456789',
+        },
+      ]),
+    );
 
     render(<ConversionsPanel item={item} />);
 
@@ -73,14 +86,16 @@ describe('ConversionsPanel', () => {
   });
 
   it('saves an unchanged high-precision factor as the same text', async () => {
-    vi.mocked(listConversions).mockResolvedValue([
-      {
-        itemId: 'oil',
-        unit: 'طن',
-        factorToBase: 0,
-        storedFactor: '12345678.123456789',
-      },
-    ]);
+    vi.mocked(listConversions).mockResolvedValue(
+      snapshot([
+        {
+          itemId: 'oil',
+          unit: 'طن',
+          factorToBase: 0,
+          storedFactor: '12345678.123456789',
+        },
+      ]),
+    );
     vi.mocked(updateConversion).mockResolvedValue(undefined);
 
     render(<ConversionsPanel item={item} />);
@@ -96,6 +111,7 @@ describe('ConversionsPanel', () => {
         'طن',
         '12345678.123456789',
         '12345678.123456789',
+        'kg',
       );
     });
   });
@@ -110,8 +126,8 @@ describe('ConversionsPanel', () => {
     // Same JS number, different exact decimal: a concurrent edit landed.
     const after = { ...before, storedFactor: '12345678.12345679' };
     vi.mocked(listConversions)
-      .mockResolvedValueOnce([before])
-      .mockResolvedValueOnce([after]);
+      .mockResolvedValueOnce(snapshot([before]))
+      .mockResolvedValueOnce(snapshot([after]));
     vi.mocked(updateConversion).mockRejectedValueOnce(new StaleWriteError());
 
     render(<ConversionsPanel item={item} />);
@@ -126,15 +142,19 @@ describe('ConversionsPanel', () => {
     expect(screen.getByLabelText('معامل طن')).toHaveValue('12345678.12345679');
   });
 
-  it('shows the stale message and reloads when adding against a changed base unit', async () => {
+  it('shows the liter label and reloads the item after a stale add', async () => {
+    const onItemStale = vi.fn();
     vi.mocked(listConversions)
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([
-        { itemId: 'oil', unit: 'كيس', factorToBase: 2, storedFactor: '2' },
-      ]);
+      .mockResolvedValueOnce(snapshot([]))
+      .mockResolvedValueOnce(
+        snapshot(
+          [{ itemId: 'oil', unit: 'كيس', factorToBase: 2, storedFactor: '2' }],
+          'liter',
+        ),
+      );
     vi.mocked(addConversion).mockRejectedValueOnce(new StaleWriteError());
 
-    render(<ConversionsPanel item={item} />);
+    render(<ConversionsPanel item={item} onItemStale={onItemStale} />);
     expect(
       await screen.findByText('مفيش تحويلات للصنف ده'),
     ).toBeInTheDocument();
@@ -151,15 +171,101 @@ describe('ConversionsPanel', () => {
       'البيانات اتغيّرت من مكان تاني — اتعملها تحديث، راجعها واحفظ تاني',
     );
     expect(addConversion).toHaveBeenCalledWith('oil', 'كيس', '25', 'kg');
-    expect(await screen.findByText('1 كيس = 2 كيلو')).toBeInTheDocument();
+    expect(await screen.findByText('1 كيس = 2 لتر')).toBeInTheDocument();
+    expect(screen.queryByText('1 كيس = 2 كيلو')).not.toBeInTheDocument();
     expect(screen.queryByText('1 كيس = 25 كيلو')).not.toBeInTheDocument();
+    expect(onItemStale).toHaveBeenCalled();
+  });
+
+  it('labels rows with the snapshot unit when the item base unit is stale', async () => {
+    const onItemStale = vi.fn();
+    vi.mocked(listConversions).mockResolvedValue(
+      snapshot(
+        [{ itemId: 'oil', unit: 'كيس', factorToBase: 2, storedFactor: '2' }],
+        'liter',
+      ),
+    );
+
+    render(<ConversionsPanel item={item} onItemStale={onItemStale} />);
+
+    expect(await screen.findByText('1 كيس = 2 لتر')).toBeInTheDocument();
+    expect(screen.queryByText(/كيلو/)).not.toBeInTheDocument();
+    expect(onItemStale).toHaveBeenCalled();
+  });
+
+  it('sends update and delete with the snapshot base unit', async () => {
+    vi.mocked(listConversions).mockResolvedValue(
+      snapshot(
+        [{ itemId: 'oil', unit: 'كيس', factorToBase: 2, storedFactor: '2' }],
+        'liter',
+      ),
+    );
+    vi.mocked(updateConversion).mockResolvedValue(undefined);
+    vi.mocked(deleteConversion).mockResolvedValue(undefined);
+
+    render(<ConversionsPanel item={item} />);
+    expect(await screen.findByText('1 كيس = 2 لتر')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('معامل كيس'), {
+      target: { value: '25' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+    await waitFor(() => {
+      expect(updateConversion).toHaveBeenCalledWith(
+        'oil',
+        'كيس',
+        '25',
+        '2',
+        'liter',
+      );
+    });
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: 'احذف التحويل' }),
+      ).toBeEnabled();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'احذف التحويل' }));
+    await waitFor(() => {
+      expect(deleteConversion).toHaveBeenCalledWith('oil', 'كيس', '2', 'liter');
+    });
+  });
+
+  it('shows the stale message and reloads when an update is refused', async () => {
+    const onItemStale = vi.fn();
+    vi.mocked(listConversions)
+      .mockResolvedValueOnce(
+        snapshot([
+          { itemId: 'oil', unit: 'كيس', factorToBase: 2, storedFactor: '2' },
+        ]),
+      )
+      .mockResolvedValueOnce(
+        snapshot(
+          [{ itemId: 'oil', unit: 'كيس', factorToBase: 2, storedFactor: '2' }],
+          'liter',
+        ),
+      );
+    vi.mocked(updateConversion).mockRejectedValueOnce(new StaleWriteError());
+
+    render(<ConversionsPanel item={item} onItemStale={onItemStale} />);
+    expect(await screen.findByText('1 كيس = 2 كيلو')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'البيانات اتغيّرت من مكان تاني — اتعملها تحديث، راجعها واحفظ تاني',
+    );
+    expect(await screen.findByText('1 كيس = 2 لتر')).toBeInTheDocument();
+    expect(updateConversion).toHaveBeenCalledWith('oil', 'كيس', '2', '2', 'kg');
+    expect(onItemStale).toHaveBeenCalled();
   });
 
   it('shows a reload error and retry when refreshing after a save fails', async () => {
     vi.mocked(listConversions)
-      .mockResolvedValueOnce([
-        { itemId: 'oil', unit: 'كرتونة', factorToBase: 12, storedFactor: 12 },
-      ])
+      .mockResolvedValueOnce(
+        snapshot([
+          { itemId: 'oil', unit: 'كرتونة', factorToBase: 12, storedFactor: 12 },
+        ]),
+      )
       .mockRejectedValueOnce(new Error('حصل خطأ. حاول تاني.'));
     vi.mocked(addConversion).mockResolvedValue(undefined);
 

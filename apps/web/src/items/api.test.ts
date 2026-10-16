@@ -53,6 +53,7 @@ function query(result: { data: unknown; error: unknown }) {
     captured.update = payload;
     return chain;
   };
+  chain.maybeSingle = self;
   chain.then = (
     resolve: (value: unknown) => unknown,
     reject?: (reason: unknown) => unknown,
@@ -254,78 +255,122 @@ describe('catalog api', () => {
     });
   });
 
-  it('throws StaleWriteError when a conversion update matches no factor', async () => {
-    const rows = query({ data: [], error: null });
-    mocks.schema.mockReturnValue({ from: () => rows.chain });
+  it('maps a stale conversion update to StaleWriteError', async () => {
+    mocks.schema.mockReturnValue({
+      rpc: () =>
+        Promise.resolve({
+          data: null,
+          error: { code: '40001', message: 'conversion changed' },
+        }),
+    });
 
     await expect(
-      updateConversion('oil', 'كيس', '3', '1.000000000'),
+      updateConversion('oil', 'كيس', '3', '1.000000000', 'kg'),
     ).rejects.toBeInstanceOf(StaleWriteError);
-    expect(rows.captured.update).toEqual({ factor_to_base: '3' });
-    expect(rows.captured.filters).toEqual([
-      { op: 'eq', column: 'item_id', value: 'oil' },
-      { op: 'eq', column: 'unit', value: 'كيس' },
-      { op: 'eq', column: 'factor_to_base', value: '1.000000000' },
-    ]);
   });
 
-  it('throws StaleWriteError when a conversion delete matches no factor', async () => {
-    const rows = query({ data: [], error: null });
-    mocks.schema.mockReturnValue({ from: () => rows.chain });
+  it('maps a stale conversion delete to StaleWriteError', async () => {
+    mocks.schema.mockReturnValue({
+      rpc: () =>
+        Promise.resolve({
+          data: null,
+          error: { code: '40001', message: 'base unit changed' },
+        }),
+    });
 
-    await expect(deleteConversion('oil', 'كيس', 1)).rejects.toBeInstanceOf(
-      StaleWriteError,
-    );
-    expect(rows.captured.filters).toEqual([
-      { op: 'eq', column: 'item_id', value: 'oil' },
-      { op: 'eq', column: 'unit', value: 'كيس' },
-      { op: 'eq', column: 'factor_to_base', value: 1 },
-    ]);
+    await expect(
+      deleteConversion('oil', 'كيس', '1', 'liter'),
+    ).rejects.toBeInstanceOf(StaleWriteError);
   });
 
-  it('uses the exact factor text in the update filter', async () => {
+  it('returns the snapshot base unit and sends that unit with the exact factor', async () => {
     const listed = query({
-      data: [
-        {
-          item_id: 'oil',
-          unit: 'كيس',
-          factor_to_base: 12345678.12345679,
-          factor_text: '12345678.123456789',
-        },
-      ],
+      data: {
+        base_unit: 'liter',
+        item_unit_conversions: [
+          {
+            item_id: 'oil',
+            unit: 'كيس',
+            factor_to_base: 12345678.12345679,
+            factor_text: '12345678.123456789',
+          },
+        ],
+      },
       error: null,
     });
     mocks.schema.mockReturnValue({ from: () => listed.chain });
 
-    const [row] = await listConversions('oil');
+    const snapshot = await listConversions('oil');
 
     expect(listed.captured.select).toBe(
-      'item_id, unit, factor_to_base, factor_text:factor_to_base::text',
+      'base_unit, item_unit_conversions(item_id, unit, factor_to_base, factor_text:factor_to_base::text)',
     );
-    expect(row?.storedFactor).toBe('12345678.123456789');
-    expect(row?.factorToBase).toBe(12345678.12345679);
-
-    const updated = query({ data: [{ unit: 'كيس' }], error: null });
-    mocks.schema.mockReturnValue({ from: () => updated.chain });
-    await updateConversion('oil', 'كيس', '2', row?.storedFactor ?? '');
-
-    expect(updated.captured.filters).toEqual([
-      { op: 'eq', column: 'item_id', value: 'oil' },
-      { op: 'eq', column: 'unit', value: 'كيس' },
-      { op: 'eq', column: 'factor_to_base', value: '12345678.123456789' },
+    expect(listed.captured.filters).toEqual([
+      { op: 'eq', column: 'id', value: 'oil' },
     ]);
+    const storedFactor = snapshot.rows[0]?.storedFactor;
+    expect(snapshot.baseUnit).toBe('liter');
+    expect(storedFactor).toBe('12345678.123456789');
+    expect(snapshot.rows[0]?.factorToBase).toBe(12345678.12345679);
+    if (typeof storedFactor !== 'string') {
+      throw new Error('expected factor text');
+    }
+
+    const rpcArgs: unknown[] = [];
+    mocks.schema.mockReturnValue({
+      rpc: (name: string, args: unknown) => {
+        rpcArgs.push({ name, args });
+        return Promise.resolve({ data: null, error: null });
+      },
+    });
+    await updateConversion('oil', 'كيس', '2', storedFactor, snapshot.baseUnit);
+    await deleteConversion('oil', 'كيس', storedFactor, snapshot.baseUnit);
+
+    expect(rpcArgs).toEqual([
+      {
+        name: 'update_unit_conversion',
+        args: {
+          p_item_id: 'oil',
+          p_unit: 'كيس',
+          p_expected_factor: '12345678.123456789',
+          p_factor: '2',
+          p_expected_base_unit: 'liter',
+        },
+      },
+      {
+        name: 'delete_unit_conversion',
+        args: {
+          p_item_id: 'oil',
+          p_unit: 'كيس',
+          p_expected_factor: '12345678.123456789',
+          p_expected_base_unit: 'liter',
+        },
+      },
+    ]);
+  });
+
+  it('throws StaleWriteError when the conversion snapshot item is missing', async () => {
+    const listed = query({ data: null, error: null });
+    mocks.schema.mockReturnValue({ from: () => listed.chain });
+
+    await expect(listConversions('oil')).rejects.toBeInstanceOf(
+      StaleWriteError,
+    );
   });
 
   it('rejects a factor cast that is not exact decimal text', async () => {
     const listed = query({
-      data: [
-        {
-          item_id: 'oil',
-          unit: 'كيس',
-          factor_to_base: 1,
-          factor_text: 1,
-        },
-      ],
+      data: {
+        base_unit: 'kg',
+        item_unit_conversions: [
+          {
+            item_id: 'oil',
+            unit: 'كيس',
+            factor_to_base: 1,
+            factor_text: 1,
+          },
+        ],
+      },
       error: null,
     });
     mocks.schema.mockReturnValue({ from: () => listed.chain });
@@ -379,14 +424,36 @@ describe('catalog api', () => {
       },
     ]);
 
-    await updateConversion('oil', 'كيس', '12345678.123456789', '1');
-    expect(rows.captured.update).toEqual({
-      factor_to_base: '12345678.123456789',
-    });
-    await updateConversion('oil', 'كيس', '999999999.999999999', '1');
-    expect(rows.captured.update).toEqual({
-      factor_to_base: '999999999.999999999',
-    });
+    await updateConversion('oil', 'كيس', '12345678.123456789', '1', 'kg');
+    await updateConversion('oil', 'كيس', '999999999.999999999', '1', 'kg');
+    expect(rpcArgs).toEqual([
+      {
+        p_item_id: 'oil',
+        p_unit: 'كيس',
+        p_factor: '12345678.123456789',
+        p_expected_base_unit: 'kg',
+      },
+      {
+        p_item_id: 'oil',
+        p_unit: 'كيس',
+        p_factor: '999999999.999999999',
+        p_expected_base_unit: 'liter',
+      },
+      {
+        p_item_id: 'oil',
+        p_unit: 'كيس',
+        p_expected_factor: '1',
+        p_factor: '12345678.123456789',
+        p_expected_base_unit: 'kg',
+      },
+      {
+        p_item_id: 'oil',
+        p_unit: 'كيس',
+        p_expected_factor: '1',
+        p_factor: '999999999.999999999',
+        p_expected_base_unit: 'kg',
+      },
+    ]);
   });
 
   it('calls add_unit_conversion with the exact factor and expected base unit', async () => {

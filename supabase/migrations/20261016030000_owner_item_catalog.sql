@@ -228,3 +228,138 @@ from
 
 grant
 execute on function app.add_unit_conversion (uuid, text, numeric, text) to authenticated;
+
+-- ============================================================================
+-- 5. Update and delete a conversion only if the base unit and factor still match.
+-- ============================================================================
+-- Lock order matches add_unit_conversion: the posting advisory lock is taken
+-- BEFORE reading base_unit, so a concurrent base_unit change (which takes the
+-- same lock before its row lock) cannot commit in between. The row change then
+-- runs under that lock. pg_advisory_xact_lock is granted to PUBLIC by default,
+-- so authenticated can execute it.
+create function app.update_unit_conversion (
+  p_item_id uuid,
+  p_unit text,
+  p_expected_factor numeric,
+  p_factor numeric,
+  p_expected_base_unit text
+) returns void language plpgsql security invoker
+set
+  search_path = '' as $$
+declare
+  v_base_unit text;
+  v_updated integer;
+begin
+  perform pg_catalog.pg_advisory_xact_lock(7342750000000000001::bigint);
+
+  select
+    si.base_unit
+  into v_base_unit
+  from
+    app.stock_items si
+  where
+    si.id = p_item_id;
+
+  if found
+  and v_base_unit is distinct from p_expected_base_unit then
+    raise exception 'base unit changed'
+      using errcode = '40001';
+  end if;
+
+  -- A hidden row looks missing. Only the owner, who can see every item, gets
+  -- the stale error; a non-owner falls through and the update matches nothing.
+  if not found
+  and app.is_owner () then
+    raise exception 'base unit changed'
+      using errcode = '40001';
+  end if;
+
+  update app.item_unit_conversions
+  set
+    factor_to_base = p_factor
+  where
+    item_id = p_item_id
+    and unit = p_unit
+    and factor_to_base = p_expected_factor;
+
+  get diagnostics v_updated = row_count;
+
+  if v_updated = 0 then
+    raise exception 'conversion changed'
+      using errcode = '40001';
+  end if;
+end;
+$$;
+
+comment on function app.update_unit_conversion (uuid, text, numeric, numeric, text) is 'Updates a conversion when base_unit and the stored factor still match. Takes the posting advisory lock before reading base_unit.';
+
+revoke
+execute on function app.update_unit_conversion (uuid, text, numeric, numeric, text)
+from
+  public,
+  anon;
+
+grant
+execute on function app.update_unit_conversion (uuid, text, numeric, numeric, text) to authenticated;
+
+create function app.delete_unit_conversion (
+  p_item_id uuid,
+  p_unit text,
+  p_expected_factor numeric,
+  p_expected_base_unit text
+) returns void language plpgsql security invoker
+set
+  search_path = '' as $$
+declare
+  v_base_unit text;
+  v_deleted integer;
+begin
+  perform pg_catalog.pg_advisory_xact_lock(7342750000000000001::bigint);
+
+  select
+    si.base_unit
+  into v_base_unit
+  from
+    app.stock_items si
+  where
+    si.id = p_item_id;
+
+  if found
+  and v_base_unit is distinct from p_expected_base_unit then
+    raise exception 'base unit changed'
+      using errcode = '40001';
+  end if;
+
+  -- A hidden row looks missing. Only the owner, who can see every item, gets
+  -- the stale error; a non-owner falls through and the delete matches nothing.
+  if not found
+  and app.is_owner () then
+    raise exception 'base unit changed'
+      using errcode = '40001';
+  end if;
+
+  delete from app.item_unit_conversions
+  where
+    item_id = p_item_id
+    and unit = p_unit
+    and factor_to_base = p_expected_factor;
+
+  get diagnostics v_deleted = row_count;
+
+  if v_deleted = 0 then
+    raise exception 'conversion changed'
+      using errcode = '40001';
+  end if;
+end;
+$$;
+
+comment on function app.delete_unit_conversion (uuid, text, numeric, text) is 'Deletes a conversion when base_unit and the stored factor still match. Takes the posting advisory lock before reading base_unit.';
+
+revoke
+execute on function app.delete_unit_conversion (uuid, text, numeric, text)
+from
+  public,
+  anon;
+
+grant
+execute on function app.delete_unit_conversion (uuid, text, numeric, text) to authenticated;

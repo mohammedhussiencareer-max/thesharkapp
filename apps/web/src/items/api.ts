@@ -22,7 +22,7 @@ function appDb() {
   return supabase.schema('app');
 }
 
-function isStaleBaseUnit(error: {
+function isStaleWrite(error: {
   code?: string;
   message?: string;
   details?: string | null;
@@ -33,7 +33,11 @@ function isStaleBaseUnit(error: {
       (part): part is string => typeof part === 'string' && part.length > 0,
     )
     .join('\n');
-  return error.code === '40001' || text.includes('base unit changed');
+  return (
+    error.code === '40001' ||
+    text.includes('base unit changed') ||
+    text.includes('conversion changed')
+  );
 }
 
 function throwIfError(
@@ -161,21 +165,42 @@ export async function updateItem(
   if (!data || data.length === 0) throw new StaleWriteError();
 }
 
-export async function listConversions(
-  itemId: string,
-): Promise<UnitConversion[]> {
+export type ConversionList = {
+  baseUnit: BaseUnit;
+  rows: UnitConversion[];
+};
+
+function conversionRows(value: unknown): UnitConversion[] {
+  if (!Array.isArray(value)) throw new Error(genericCatalogError);
+  return value.map((row: unknown) => {
+    if (!row || typeof row !== 'object') throw new Error(genericCatalogError);
+    const record = row as Record<string, unknown>;
+    if (typeof record.item_id !== 'string' || typeof record.unit !== 'string') {
+      throw new Error(genericCatalogError);
+    }
+    return {
+      itemId: record.item_id,
+      unit: record.unit,
+      factorToBase: toNumber(record.factor_to_base),
+      storedFactor: exactDecimal(record.factor_text),
+    };
+  });
+}
+
+export async function listConversions(itemId: string): Promise<ConversionList> {
   const { data, error } = await appDb()
-    .from('item_unit_conversions')
-    .select('item_id, unit, factor_to_base, factor_text:factor_to_base::text')
-    .eq('item_id', itemId)
-    .order('unit');
+    .from('stock_items')
+    .select(
+      'base_unit, item_unit_conversions(item_id, unit, factor_to_base, factor_text:factor_to_base::text)',
+    )
+    .eq('id', itemId)
+    .maybeSingle();
   throwIfError(error);
-  return (data ?? []).map((row) => ({
-    itemId: row.item_id,
-    unit: row.unit,
-    factorToBase: toNumber(row.factor_to_base),
-    storedFactor: exactDecimal(row.factor_text),
-  }));
+  if (!data) throw new StaleWriteError();
+  if (!isBaseUnit(data.base_unit)) throw new Error(genericCatalogError);
+  const rows = conversionRows(data.item_unit_conversions);
+  rows.sort((left, right) => left.unit.localeCompare(right.unit));
+  return { baseUnit: data.base_unit, rows };
 }
 
 export async function addConversion(
@@ -190,7 +215,7 @@ export async function addConversion(
     p_factor: numericColumn(factorToBase),
     p_expected_base_unit: expectedBaseUnit,
   });
-  if (error && isStaleBaseUnit(error)) throw new StaleWriteError();
+  if (error && isStaleWrite(error)) throw new StaleWriteError();
   throwIfError(error);
 }
 
@@ -198,31 +223,32 @@ export async function updateConversion(
   itemId: string,
   unit: string,
   factorToBase: string,
-  expectedFactor: number | string,
+  expectedFactor: string,
+  expectedBaseUnit: BaseUnit,
 ): Promise<void> {
-  const { data, error } = await appDb()
-    .from('item_unit_conversions')
-    .update({ factor_to_base: numericColumn(factorToBase) })
-    .eq('item_id', itemId)
-    .eq('unit', unit)
-    .eq('factor_to_base', expectedFactor as number)
-    .select('unit');
+  const { error } = await appDb().rpc('update_unit_conversion', {
+    p_item_id: itemId,
+    p_unit: unit,
+    p_expected_factor: numericColumn(expectedFactor),
+    p_factor: numericColumn(factorToBase),
+    p_expected_base_unit: expectedBaseUnit,
+  });
+  if (error && isStaleWrite(error)) throw new StaleWriteError();
   throwIfError(error);
-  if (!data || data.length === 0) throw new StaleWriteError();
 }
 
 export async function deleteConversion(
   itemId: string,
   unit: string,
-  expectedFactor: number | string,
+  expectedFactor: string,
+  expectedBaseUnit: BaseUnit,
 ): Promise<void> {
-  const { data, error } = await appDb()
-    .from('item_unit_conversions')
-    .delete()
-    .eq('item_id', itemId)
-    .eq('unit', unit)
-    .eq('factor_to_base', expectedFactor as number)
-    .select('unit');
+  const { error } = await appDb().rpc('delete_unit_conversion', {
+    p_item_id: itemId,
+    p_unit: unit,
+    p_expected_factor: numericColumn(expectedFactor),
+    p_expected_base_unit: expectedBaseUnit,
+  });
+  if (error && isStaleWrite(error)) throw new StaleWriteError();
   throwIfError(error);
-  if (!data || data.length === 0) throw new StaleWriteError();
 }

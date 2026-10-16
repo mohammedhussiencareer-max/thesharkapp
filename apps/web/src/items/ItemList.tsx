@@ -16,6 +16,7 @@ function ItemCard({
   onEdit,
   onToggleConversions,
   onConversionsBusy,
+  onItemStale,
 }: {
   item: CatalogItem;
   conversionsOpen: boolean;
@@ -24,6 +25,7 @@ function ItemCard({
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusy: (busy: boolean) => void;
+  onItemStale?: () => void | Promise<void>;
 }) {
   return (
     <article
@@ -86,6 +88,7 @@ function ItemCard({
           item={item}
           locked={editsDisabled}
           onBusyChange={onConversionsBusy}
+          onItemStale={onItemStale}
         />
       ) : null}
     </article>
@@ -109,6 +112,7 @@ export function ItemList({
   onEdit,
   onToggleConversions,
   onConversionsBusyChange,
+  onItemStale,
 }: {
   items: readonly CatalogItem[];
   showInactive: boolean;
@@ -117,6 +121,7 @@ export function ItemList({
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusyChange?: (busy: boolean) => void;
+  onItemStale?: () => void | Promise<void>;
 }) {
   const [conversionsBusy, setConversionsBusyState] = useState(false);
   // The page also locks controls that would unmount an open panel (the inactive filter).
@@ -135,6 +140,7 @@ export function ItemList({
       onEdit={onEdit}
       onToggleConversions={onToggleConversions}
       onConversionsBusy={setConversionsBusy}
+      onItemStale={onItemStale}
     />
   );
 
@@ -161,6 +167,7 @@ export function ItemList({
                   onEdit={onEdit}
                   onToggleConversions={onToggleConversions}
                   onConversionsBusy={setConversionsBusy}
+                  onItemStale={onItemStale}
                 />
               ) : (
                 <p>تحت {block.parent.name} (موقوف)</p>

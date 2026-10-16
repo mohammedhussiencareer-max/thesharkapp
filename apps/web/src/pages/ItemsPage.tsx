@@ -7,6 +7,7 @@ import {
   genericCatalogError,
   messageFrom,
   StaleWriteError,
+  staleWriteMessage,
 } from '@/items/errors';
 import { groupCatalog } from '@/items/group';
 import { ItemForm } from '@/items/ItemForm';
@@ -60,10 +61,26 @@ export function ItemsPage() {
   );
   const formModeRef = useRef<ItemEditor | null>(null);
   const expectedRef = useRef<ItemExpectation | null>(null);
+  const openConversionsRef = useRef<string | null>(null);
 
   function setEditor(next: ItemEditor | null) {
     formModeRef.current = next;
     setFormMode(next);
+  }
+
+  async function reloadCatalog(staleItemId?: string) {
+    const next = await listItems();
+    setItems(next);
+    setLoadError(null);
+    const editing = formModeRef.current;
+    if (staleItemId && editing?.type === 'edit' && editing.id === staleItemId) {
+      const fresh = next.find((row) => row.id === staleItemId);
+      if (fresh) {
+        expectedRef.current = expectationFromItem(fresh);
+        setFormEpoch((value) => value + 1);
+      }
+      setFormError(staleWriteMessage);
+    }
   }
 
   useEffect(() => {
@@ -134,14 +151,7 @@ export function ItemsPage() {
         sameEditor(formModeRef.current, started)
       ) {
         try {
-          const next = await listItems();
-          setItems(next);
-          const fresh = next.find((row) => row.id === started.id);
-          if (fresh) {
-            expectedRef.current = expectationFromItem(fresh);
-            setFormEpoch((value) => value + 1);
-          }
-          setFormError(error.message);
+          await reloadCatalog(started.id);
         } catch (reloadError) {
           setFormError(messageFrom(reloadError));
         }
@@ -246,12 +256,19 @@ export function ItemsPage() {
               openConversionsId={openConversionsId}
               editsDisabled={busy}
               onEdit={openEdit}
-              onToggleConversions={(itemId) =>
-                setOpenConversionsId((current) =>
-                  current === itemId ? null : itemId,
-                )
-              }
+              onToggleConversions={(itemId) => {
+                const next = openConversionsId === itemId ? null : itemId;
+                openConversionsRef.current = next;
+                setOpenConversionsId(next);
+              }}
               onConversionsBusyChange={setConversionsBusy}
+              onItemStale={() => {
+                const id = openConversionsRef.current;
+                if (!id) return;
+                return reloadCatalog(id).catch((error: unknown) => {
+                  setLoadError(messageFrom(error));
+                });
+              }}
             />
           )}
         </>
