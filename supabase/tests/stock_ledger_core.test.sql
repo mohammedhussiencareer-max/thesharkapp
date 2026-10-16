@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (90);
+  plan (92);
 
 -- Clean up any existing test rows in the transaction.
 delete from app.provisional_deficits;
@@ -2611,6 +2611,37 @@ select
   );
 
 reset role;
+
+-- 91: base_unit is frozen once an item has movements
+select
+  throws_ok (
+    $$update app.stock_items
+      set base_unit = 'piece'
+      where id = '10000000-0000-4000-8000-000000000001'$$,
+    '23514'::char(5),
+    'cannot change base_unit of an item that has movements',
+    'Guard: base_unit of an item with movements cannot change'
+  );
+
+-- 92: base_unit can still change before the first movement
+insert into
+  app.stock_items (id, name, kind, base_unit, count_frequency)
+values
+  (
+    '10000000-0000-4000-8000-000000000027',
+    'صنف بدون حركات',
+    'ingredient',
+    'kg',
+    'weekly'
+  );
+
+select
+  lives_ok (
+    $$update app.stock_items
+      set base_unit = 'liter'
+      where id = '10000000-0000-4000-8000-000000000027'$$,
+    'base_unit of an item without movements can change'
+  );
 
 select
   *

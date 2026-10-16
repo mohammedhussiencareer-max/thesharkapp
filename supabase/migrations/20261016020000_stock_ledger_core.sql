@@ -215,6 +215,47 @@ create trigger trg_stock_movements_no_truncate
 before truncate on app.stock_movements for each statement
 execute function app.prevent_stock_movements_mutation ();
 
+-- Movements are stored in the item's base unit without their own unit, so the
+-- base unit is frozen once the item has any movement. The trigger takes the
+-- same advisory lock as every posting: a concurrent first posting either
+-- commits before this check (and is seen) or waits until this update commits
+-- (and then reads the new unit). The UPDATE holds only a no-key row lock, which
+-- does not block the posting's foreign-key share lock, so the two cannot deadlock.
+create function app.trg_stock_items_freeze_base_unit () returns trigger language plpgsql security definer
+set
+  search_path = '' as $$
+begin
+  if new.base_unit is distinct from old.base_unit then
+    perform pg_catalog.pg_advisory_xact_lock(7342750000000000001::bigint);
+
+    if exists (
+      select
+        1
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = old.id
+    ) then
+      raise exception 'cannot change base_unit of an item that has movements'
+        using errcode = '23514';
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+revoke all on function app.trg_stock_items_freeze_base_unit ()
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create trigger trg_stock_items_freeze_base_unit
+before update of base_unit on app.stock_items for each row
+execute function app.trg_stock_items_freeze_base_unit ();
+
 -- ============================================================================
 -- 3. Derived Balances & Provisional Deficits
 -- ============================================================================
