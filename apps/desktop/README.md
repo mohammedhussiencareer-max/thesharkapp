@@ -34,7 +34,7 @@ Windows SmartScreen will warn that the publisher is unknown. Choose **More info 
 
 The installed app is a client of Supabase, the same way the browser app is. It does not keep its own database.
 
-`app.security.csp` in `src-tauri/tauri.conf.json` is the release policy. `connect-src` allows `'self'` and the local API `http://127.0.0.1:55421`. When the hosted project exists, add its `https://…supabase.co` origin to `connect-src` in **both** `app.security.csp` and `app.security.devCsp`, and provide `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` to the web build (`.env.production`, not committed). The installer freezes the URL and the CSP at build time.
+`app.security.csp` in `src-tauri/tauri.conf.json` is the release policy: `connect-src` allows `'self'` and the hosted project `https://pltkoohfodvvmymlsycz.supabase.co`. `app.security.devCsp` allows the local API `http://127.0.0.1:55421` for `desktop:dev`. The release build reads `apps/web/.env.production` (hosted URL + publishable key, both public). The installer freezes the URL and the CSP at build time.
 
 Release `style-src` is `'self'` only. Tailwind is compiled into a stylesheet file. The dev policy allows `'unsafe-inline'` styles and scripts because the Vite dev server injects Tailwind in a `<style>` tag and an inline React refresh preamble. Neither policy allows `'unsafe-eval'`.
 
