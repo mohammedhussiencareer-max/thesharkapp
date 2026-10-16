@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { ConversionsPanel } from '@/items/ConversionsPanel';
 import { formatEgp, formatLossPercent, formatQty } from '@/items/format';
 import { groupCatalog } from '@/items/group';
@@ -12,14 +12,18 @@ function ItemCard({
   item,
   conversionsOpen,
   editsDisabled,
+  conversionsLocked,
   onEdit,
   onToggleConversions,
+  onConversionsBusy,
 }: {
   item: CatalogItem;
   conversionsOpen: boolean;
   editsDisabled: boolean;
+  conversionsLocked: boolean;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
+  onConversionsBusy: (busy: boolean) => void;
 }) {
   return (
     <article
@@ -68,12 +72,18 @@ function ItemCard({
           className={secondaryButton}
           type="button"
           aria-expanded={conversionsOpen}
-          onClick={() => onToggleConversions(item.id)}
+          disabled={conversionsLocked}
+          onClick={() => {
+            if (conversionsLocked) return;
+            onToggleConversions(item.id);
+          }}
         >
           التحويلات
         </button>
       </div>
-      {conversionsOpen ? <ConversionsPanel item={item} /> : null}
+      {conversionsOpen ? (
+        <ConversionsPanel item={item} onBusyChange={onConversionsBusy} />
+      ) : null}
     </article>
   );
 }
@@ -102,6 +112,7 @@ export function ItemList({
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
 }) {
+  const [conversionsBusy, setConversionsBusy] = useState(false);
   const groups = groupCatalog(items, showInactive);
   const card = (item: CatalogItem) => (
     <ItemCard
@@ -109,8 +120,10 @@ export function ItemList({
       item={item}
       conversionsOpen={openConversionsId === item.id}
       editsDisabled={editsDisabled}
+      conversionsLocked={conversionsBusy}
       onEdit={onEdit}
       onToggleConversions={onToggleConversions}
+      onConversionsBusy={setConversionsBusy}
     />
   );
 
@@ -133,8 +146,10 @@ export function ItemList({
                   item={block.parent}
                   conversionsOpen={openConversionsId === block.parent.id}
                   editsDisabled={editsDisabled}
+                  conversionsLocked={conversionsBusy}
                   onEdit={onEdit}
                   onToggleConversions={onToggleConversions}
+                  onConversionsBusy={setConversionsBusy}
                 />
               ) : (
                 <p>تحت {block.parent.name} (موقوف)</p>

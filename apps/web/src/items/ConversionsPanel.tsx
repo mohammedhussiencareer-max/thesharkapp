@@ -91,7 +91,13 @@ function ConversionRow({
   );
 }
 
-export function ConversionsPanel({ item }: { item: CatalogItem }) {
+export function ConversionsPanel({
+  item,
+  onBusyChange,
+}: {
+  item: CatalogItem;
+  onBusyChange?: (busy: boolean) => void;
+}) {
   const requestRef = useRef(0);
   const [rows, setRows] = useState<UnitConversion[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -137,6 +143,7 @@ export function ConversionsPanel({ item }: { item: CatalogItem }) {
 
   async function run(work: () => Promise<void>) {
     setBusy(true);
+    onBusyChange?.(true);
     setActionError(null);
     try {
       await work();
@@ -145,6 +152,7 @@ export function ConversionsPanel({ item }: { item: CatalogItem }) {
       setActionError(messageFrom(error));
     } finally {
       setBusy(false);
+      onBusyChange?.(false);
     }
   }
 

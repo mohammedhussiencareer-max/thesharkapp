@@ -432,4 +432,48 @@ describe('ItemsPage', () => {
       expect(screen.queryByRole('form')).not.toBeInTheDocument();
     });
   });
+
+  it('keeps the editor closed until the saved name reloads', async () => {
+    await renderCatalog();
+    let resolveReload: (value: CatalogItem[]) => void = () => undefined;
+    vi.mocked(listItems).mockReturnValue(
+      new Promise((resolve) => {
+        resolveReload = resolve;
+      }),
+    );
+
+    const mixed = screen.getByRole('article', { name: 'بوري مخلوط' });
+    fireEvent.click(within(mixed).getByRole('button', { name: 'تعديل' }));
+    fireEvent.change(screen.getByLabelText('الاسم'), {
+      target: { value: 'بوري جديد' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('form')).not.toBeInTheDocument();
+    });
+    const edit = within(
+      screen.getByRole('article', { name: 'بوري مخلوط' }),
+    ).getByRole('button', { name: 'تعديل' });
+    expect(edit).toBeDisabled();
+    fireEvent.click(edit);
+    expect(screen.queryByRole('form')).not.toBeInTheDocument();
+
+    resolveReload(
+      catalog.map((row) =>
+        row.id === 'mixed' ? { ...row, name: 'بوري جديد' } : row,
+      ),
+    );
+
+    expect(
+      await screen.findByRole('heading', { name: 'بوري جديد' }),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      within(screen.getByRole('article', { name: 'بوري جديد' })).getByRole(
+        'button',
+        { name: 'تعديل' },
+      ),
+    );
+    expect(screen.getByLabelText('الاسم')).toHaveValue('بوري جديد');
+  });
 });

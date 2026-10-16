@@ -62,6 +62,7 @@ export function ItemsPage() {
         if (cancelled) return;
         setItems(next);
         setLoadError(null);
+        setSaving(false);
       } catch (error) {
         if (cancelled) return;
         setLoadError(messageFrom(error));
@@ -77,10 +78,6 @@ export function ItemsPage() {
   function retry() {
     setLoading(true);
     setLoadError(null);
-    setLoadId((value) => value + 1);
-  }
-
-  function refresh() {
     setLoadId((value) => value + 1);
   }
 
@@ -101,20 +98,30 @@ export function ItemsPage() {
     if (!started || saving) return;
     setSaving(true);
     setFormError(null);
+    let saved = false;
+    let unlock = true;
     try {
       if (started.type === 'edit') {
         await updateItem(started.id, draft);
       } else {
         await createItem(draft);
       }
+      saved = true;
       if (sameEditor(formModeRef.current, started)) setEditor(null);
-      refresh();
+      const next = await listItems();
+      setItems(next);
+      setLoadError(null);
     } catch (error) {
-      if (sameEditor(formModeRef.current, started)) {
-        setFormError(messageFrom(error));
+      if (!saved) {
+        if (sameEditor(formModeRef.current, started)) {
+          setFormError(messageFrom(error));
+        }
+      } else {
+        unlock = false;
+        setLoadError(messageFrom(error));
       }
     } finally {
-      setSaving(false);
+      if (unlock) setSaving(false);
     }
   }
 
