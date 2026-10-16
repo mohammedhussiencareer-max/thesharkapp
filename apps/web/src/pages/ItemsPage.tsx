@@ -119,7 +119,9 @@ export function ItemsPage() {
   function openEdit(item: CatalogItem) {
     if (busy) return;
     setFormError(null);
+    // The form and the stale-write expectation always start from the same row.
     expectedRef.current = expectationFromItem(item);
+    setFormEpoch((value) => value + 1);
     setEditor({ type: 'edit', id: item.id });
   }
 

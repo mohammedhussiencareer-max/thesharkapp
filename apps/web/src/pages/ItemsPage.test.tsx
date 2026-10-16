@@ -835,4 +835,58 @@ describe('ItemsPage', () => {
     });
     expect(loads).toBeGreaterThanOrEqual(2);
   });
+
+  it('re-initializes the editor from the same row as its expectation', async () => {
+    const oil = item({
+      id: 'oil',
+      name: 'زيت',
+      kind: 'ingredient',
+      baseUnit: 'kg',
+      active: true,
+    });
+    const box = item({
+      id: 'box',
+      name: 'علبة',
+      kind: 'packaging',
+      baseUnit: 'piece',
+      countFrequency: 'weekly',
+    });
+    const boxRenamed = { ...box, name: 'علبة كبيرة' };
+    const oilLiter = { ...oil, baseUnit: 'liter' as const };
+    let loads = 0;
+    vi.mocked(listItems).mockImplementation(() => {
+      loads += 1;
+      return Promise.resolve(loads === 1 ? [oil, box] : [oilLiter, boxRenamed]);
+    });
+    vi.mocked(listConversions).mockResolvedValue(listed([], 'liter'));
+
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+
+    const boxCard = await screen.findByRole('article', { name: 'علبة' });
+    fireEvent.click(within(boxCard).getByRole('button', { name: 'تعديل' }));
+    expect(screen.getByLabelText('الاسم')).toHaveValue('علبة');
+
+    // Another item's stale conversion snapshot reloads the whole catalog.
+    const oilCard = screen.getByRole('article', { name: 'زيت' });
+    fireEvent.click(within(oilCard).getByRole('button', { name: 'التحويلات' }));
+    const renamedCard = await screen.findByRole('article', {
+      name: 'علبة كبيرة',
+    });
+
+    fireEvent.click(within(renamedCard).getByRole('button', { name: 'تعديل' }));
+    expect(screen.getByLabelText('الاسم')).toHaveValue('علبة كبيرة');
+    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+
+    await waitFor(() => {
+      expect(updateItem).toHaveBeenCalledWith(
+        'box',
+        expect.objectContaining({ name: 'علبة كبيرة' }),
+        expect.objectContaining({ name: 'علبة كبيرة' }),
+      );
+    });
+  });
 });
