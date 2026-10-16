@@ -170,7 +170,7 @@ export function ConversionsPanel({
       return;
     }
     void run(async () => {
-      await addConversion(item.id, parsed.unit, parsed.factor);
+      await addConversion(item.id, parsed.unit, parsed.factor, item.baseUnit);
       setUnit('');
       setFactor('');
     });

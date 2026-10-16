@@ -164,3 +164,67 @@ from
 create trigger trg_stock_items_reject_converted_base_unit
 before update of base_unit on app.stock_items for each row
 execute function app.trg_stock_items_reject_converted_base_unit ();
+
+-- ============================================================================
+-- 4. Add a conversion only if the caller's base unit is still current.
+-- ============================================================================
+-- Lock order: take the posting advisory lock BEFORE reading base_unit. Every
+-- base_unit change takes this same lock in a BEFORE STATEMENT trigger, before
+-- its row lock, so this function waits for that change to commit and then
+-- reads the new unit. A plain select is enough; the lock already serializes
+-- the read with those updates. The insert's statement trigger takes the lock
+-- again, which this transaction already holds.
+-- pg_advisory_xact_lock is granted to PUBLIC by default in Postgres, so
+-- authenticated can execute it.
+create function app.add_unit_conversion (
+  p_item_id uuid,
+  p_unit text,
+  p_factor numeric,
+  p_expected_base_unit text
+) returns void language plpgsql security invoker
+set
+  search_path = '' as $$
+declare
+  v_base_unit text;
+begin
+  perform pg_catalog.pg_advisory_xact_lock(7342750000000000001::bigint);
+
+  select
+    si.base_unit
+  into v_base_unit
+  from
+    app.stock_items si
+  where
+    si.id = p_item_id;
+
+  if found
+  and v_base_unit is distinct from p_expected_base_unit then
+    raise exception 'base unit changed'
+      using errcode = '40001';
+  end if;
+
+  -- A hidden row looks missing. Only the owner, who can see every item, gets
+  -- the stale error; a non-owner falls through to the insert and RLS denies it.
+  if not found
+  and app.is_owner () then
+    raise exception 'base unit changed'
+      using errcode = '40001';
+  end if;
+
+  insert into
+    app.item_unit_conversions (item_id, unit, factor_to_base)
+  values
+    (p_item_id, p_unit, p_factor);
+end;
+$$;
+
+comment on function app.add_unit_conversion (uuid, text, numeric, text) is 'Inserts a conversion when base_unit still matches. Takes the posting advisory lock before reading base_unit so a concurrent base_unit change cannot land in between. pg_advisory_xact_lock stays executable by authenticated because Postgres grants it to PUBLIC.';
+
+revoke
+execute on function app.add_unit_conversion (uuid, text, numeric, text)
+from
+  public,
+  anon;
+
+grant
+execute on function app.add_unit_conversion (uuid, text, numeric, text) to authenticated;

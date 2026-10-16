@@ -410,7 +410,7 @@ describe('ItemsPage', () => {
     expect(
       await within(box).findByText('1 كرتونة = 12 قطعة'),
     ).toBeInTheDocument();
-    expect(addConversion).toHaveBeenCalledWith('box', 'كرتونة', '12');
+    expect(addConversion).toHaveBeenCalledWith('box', 'كرتونة', '12', 'piece');
   });
 
   it('locks the inactive filter while an inactive item conversion saves', async () => {

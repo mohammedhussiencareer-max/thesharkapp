@@ -353,16 +353,31 @@ describe('catalog api', () => {
     expect(items.captured.update).toMatchObject({ loss_pct: '0.99999' });
 
     const rows = query({ data: [{ unit: 'كيس' }], error: null });
-    mocks.schema.mockReturnValue({ from: () => rows.chain });
+    const rpcArgs: unknown[] = [];
+    mocks.schema.mockReturnValue({
+      from: () => rows.chain,
+      rpc: (_name: string, args: unknown) => {
+        rpcArgs.push(args);
+        return Promise.resolve({ data: null, error: null });
+      },
+    });
 
-    await addConversion('oil', 'كيس', '12345678.123456789');
-    expect(rows.captured.insert).toMatchObject({
-      factor_to_base: '12345678.123456789',
-    });
-    await addConversion('oil', 'كيس', '999999999.999999999');
-    expect(rows.captured.insert).toMatchObject({
-      factor_to_base: '999999999.999999999',
-    });
+    await addConversion('oil', 'كيس', '12345678.123456789', 'kg');
+    await addConversion('oil', 'كيس', '999999999.999999999', 'liter');
+    expect(rpcArgs).toEqual([
+      {
+        p_item_id: 'oil',
+        p_unit: 'كيس',
+        p_factor: '12345678.123456789',
+        p_expected_base_unit: 'kg',
+      },
+      {
+        p_item_id: 'oil',
+        p_unit: 'كيس',
+        p_factor: '999999999.999999999',
+        p_expected_base_unit: 'liter',
+      },
+    ]);
 
     await updateConversion('oil', 'كيس', '12345678.123456789', '1');
     expect(rows.captured.update).toEqual({
@@ -374,18 +389,58 @@ describe('catalog api', () => {
     });
   });
 
-  it('maps a duplicate conversion unit from the insert', async () => {
-    const rows = query({
-      data: null,
-      error: {
-        code: '23505',
-        message:
-          'duplicate key value violates unique constraint "item_unit_conversions_pkey"',
+  it('calls add_unit_conversion with the exact factor and expected base unit', async () => {
+    const args: unknown[] = [];
+    mocks.schema.mockReturnValue({
+      rpc: (name: string, payload: unknown) => {
+        args.push({ name, payload });
+        return Promise.resolve({ data: null, error: null });
       },
     });
-    mocks.schema.mockReturnValue({ from: () => rows.chain });
 
-    await expect(addConversion('oil', 'كيس', '2')).rejects.toThrow(
+    await addConversion('oil', 'كيس', '12345678.123456789', 'kg');
+
+    expect(args).toEqual([
+      {
+        name: 'add_unit_conversion',
+        payload: {
+          p_item_id: 'oil',
+          p_unit: 'كيس',
+          p_factor: '12345678.123456789',
+          p_expected_base_unit: 'kg',
+        },
+      },
+    ]);
+  });
+
+  it('maps a changed base unit to StaleWriteError', async () => {
+    mocks.schema.mockReturnValue({
+      rpc: () =>
+        Promise.resolve({
+          data: null,
+          error: { code: '40001', message: 'base unit changed' },
+        }),
+    });
+
+    await expect(
+      addConversion('oil', 'كيس', '25', 'kg'),
+    ).rejects.toBeInstanceOf(StaleWriteError);
+  });
+
+  it('maps a duplicate conversion unit from the insert', async () => {
+    mocks.schema.mockReturnValue({
+      rpc: () =>
+        Promise.resolve({
+          data: null,
+          error: {
+            code: '23505',
+            message:
+              'duplicate key value violates unique constraint "item_unit_conversions_pkey"',
+          },
+        }),
+    });
+
+    await expect(addConversion('oil', 'كيس', '2', 'kg')).rejects.toThrow(
       'الوحدة دي موجودة قبل كده',
     );
   });

@@ -126,6 +126,35 @@ describe('ConversionsPanel', () => {
     expect(screen.getByLabelText('معامل طن')).toHaveValue('12345678.12345679');
   });
 
+  it('shows the stale message and reloads when adding against a changed base unit', async () => {
+    vi.mocked(listConversions)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        { itemId: 'oil', unit: 'كيس', factorToBase: 2, storedFactor: '2' },
+      ]);
+    vi.mocked(addConversion).mockRejectedValueOnce(new StaleWriteError());
+
+    render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByText('مفيش تحويلات للصنف ده'),
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('اسم الوحدة'), {
+      target: { value: 'كيس' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '25' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'البيانات اتغيّرت من مكان تاني — اتعملها تحديث، راجعها واحفظ تاني',
+    );
+    expect(addConversion).toHaveBeenCalledWith('oil', 'كيس', '25', 'kg');
+    expect(await screen.findByText('1 كيس = 2 كيلو')).toBeInTheDocument();
+    expect(screen.queryByText('1 كيس = 25 كيلو')).not.toBeInTheDocument();
+  });
+
   it('shows a reload error and retry when refreshing after a save fails', async () => {
     vi.mocked(listConversions)
       .mockResolvedValueOnce([

@@ -137,7 +137,10 @@ isOneToOne: false
             [_ in never]: never
           }
           Functions: {
-            "apply_inflow_movement":
+            "add_unit_conversion":
+{ Args: { "p_expected_base_unit": string,"p_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
+                           },
+"apply_inflow_movement":
 { Args: { "p_batch_id": string,"p_in_qty": number,"p_in_total_cost"?: number,"p_in_unit_cost": number,"p_item_id": string,"p_movement_type": Database["app"]['Enums']["movement_type"],"p_note": string,"p_occurred_at": string,"p_shift_id": string,"p_source_id": string,"p_source_type": string }; Returns: undefined
                            },
 "apply_outflow_movement":

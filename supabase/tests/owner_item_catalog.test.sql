@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (71);
+  plan (83);
 
 -- Clean up any existing test rows in the transaction.
 delete from app.provisional_deficits;
@@ -365,6 +365,73 @@ select
     'authenticated can select, insert, update, and delete conversions'
   );
 
+-- 70
+select
+  is (
+    (
+      select
+        p.prosecdef
+      from
+        pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+      where
+        n.nspname = 'app'
+        and p.proname = 'add_unit_conversion'
+    ),
+    false,
+    'add_unit_conversion is security invoker'
+  );
+
+-- 71
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+      where
+        n.nspname = 'app'
+        and p.proname = 'add_unit_conversion'
+        and 'search_path=""' = any (p.proconfig)
+    ),
+    'add_unit_conversion has an empty search_path'
+  );
+
+-- 72
+select
+  ok (
+    has_function_privilege(
+      'authenticated',
+      'app.add_unit_conversion(uuid,text,numeric,text)'::regprocedure,
+      'EXECUTE'
+    ),
+    'authenticated can execute add_unit_conversion'
+  );
+
+-- 73
+select
+  ok (
+    not has_function_privilege(
+      'anon',
+      'app.add_unit_conversion(uuid,text,numeric,text)'::regprocedure,
+      'EXECUTE'
+    ),
+    'anon has no execute on add_unit_conversion'
+  );
+
+-- 74
+select
+  ok (
+    not has_function_privilege(
+      'public',
+      'app.add_unit_conversion(uuid,text,numeric,text)'::regprocedure,
+      'EXECUTE'
+    ),
+    'public has no execute on add_unit_conversion'
+  );
+
 -- ============================================================================
 -- Owner writes
 -- ============================================================================
@@ -523,6 +590,71 @@ select
     'owner delete removed the conversion row'
   );
 
+-- 75
+select
+  lives_ok (
+    $$select app.add_unit_conversion(
+      '31000000-0000-4000-8000-000000000003',
+      'bag',
+      25,
+      'kg'
+    )$$,
+    'owner can add a conversion through add_unit_conversion'
+  );
+
+-- 76
+select
+  results_eq (
+    $$select unit, factor_to_base::numeric
+      from app.item_unit_conversions
+      where item_id = '31000000-0000-4000-8000-000000000003'$$,
+    $$values ('bag'::text, 25::numeric)$$,
+    'add_unit_conversion stored bag = 25 against kg'
+  );
+
+-- 77
+select
+  throws_ok (
+    $$select app.add_unit_conversion(
+      '31000000-0000-4000-8000-000000000003',
+      'sack',
+      10,
+      'liter'
+    )$$,
+    '40001'::char(5),
+    'base unit changed',
+    'add_unit_conversion rejects a stale base unit'
+  );
+
+-- 78
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.item_unit_conversions
+      where
+        item_id = '31000000-0000-4000-8000-000000000003'
+    ),
+    1::bigint,
+    'stale base unit inserted nothing'
+  );
+
+-- 79
+select
+  throws_ok (
+    $$select app.add_unit_conversion(
+      '31000000-0000-4000-8000-000000000099',
+      'bag',
+      1,
+      'kg'
+    )$$,
+    '40001'::char(5),
+    'base unit changed',
+    'add_unit_conversion rejects a missing item'
+  );
+
 -- ============================================================================
 -- Signed-in non-owner: RLS hides rows; item DELETE is a missing grant.
 -- ============================================================================
@@ -584,6 +716,20 @@ select
     '42501'::char(5),
     'new row violates row-level security policy for table "item_unit_conversions"',
     'non-owner insert into item_unit_conversions is rejected by RLS'
+  );
+
+-- 80
+select
+  throws_ok (
+    $$select app.add_unit_conversion(
+      '31000000-0000-4000-8000-000000000003',
+      'علبة',
+      6,
+      'kg'
+    )$$,
+    '42501'::char(5),
+    'new row violates row-level security policy for table "item_unit_conversions"',
+    'non-owner add_unit_conversion is rejected by RLS'
   );
 
 -- 33
@@ -737,6 +883,20 @@ select
     '42501'::char(5),
     'permission denied for schema app',
     'anon cannot delete item_unit_conversions'
+  );
+
+-- 81
+select
+  throws_ok (
+    $$select app.add_unit_conversion(
+      '31000000-0000-4000-8000-000000000003',
+      'bag',
+      1,
+      'kg'
+    )$$,
+    '42501'::char(5),
+    'permission denied for schema app',
+    'anon cannot execute add_unit_conversion'
   );
 
 -- ============================================================================

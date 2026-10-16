@@ -9,6 +9,7 @@ import {
   isBaseUnit,
   isCountFrequency,
   isStockKind,
+  type BaseUnit,
   type CatalogItem,
   type ItemDraft,
   type UnitConversion,
@@ -19,6 +20,20 @@ export type { ItemExpectation };
 function appDb() {
   if (!supabase) throw new Error(genericCatalogError);
   return supabase.schema('app');
+}
+
+function isStaleBaseUnit(error: {
+  code?: string;
+  message?: string;
+  details?: string | null;
+  hint?: string | null;
+}): boolean {
+  const text = [error.message, error.details, error.hint]
+    .filter(
+      (part): part is string => typeof part === 'string' && part.length > 0,
+    )
+    .join('\n');
+  return error.code === '40001' || text.includes('base unit changed');
 }
 
 function throwIfError(
@@ -167,17 +182,16 @@ export async function addConversion(
   itemId: string,
   unit: string,
   factorToBase: string,
+  expectedBaseUnit: BaseUnit,
 ): Promise<void> {
-  const { data, error } = await appDb()
-    .from('item_unit_conversions')
-    .insert({
-      item_id: itemId,
-      unit: unit.trim(),
-      factor_to_base: numericColumn(factorToBase),
-    })
-    .select('unit');
+  const { error } = await appDb().rpc('add_unit_conversion', {
+    p_item_id: itemId,
+    p_unit: unit.trim(),
+    p_factor: numericColumn(factorToBase),
+    p_expected_base_unit: expectedBaseUnit,
+  });
+  if (error && isStaleBaseUnit(error)) throw new StaleWriteError();
   throwIfError(error);
-  if (!data || data.length === 0) throw new Error(genericCatalogError);
 }
 
 export async function updateConversion(
