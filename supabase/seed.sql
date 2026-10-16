@@ -1,0 +1,4 @@
+-- This file must stay free of credentials.
+-- Do not create users or an app.owner row here: `supabase db push --include-seed`
+-- runs this file on the linked project. The local owner is created by
+-- apps/web/e2e/global-setup.ts and must never be used on a hosted project.
