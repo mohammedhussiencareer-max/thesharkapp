@@ -41,6 +41,14 @@ function toNumber(value: unknown): number {
   return 0;
 }
 
+/** Exact decimal text from a PostgREST `::text` cast. Rejects JSON numbers. */
+function exactDecimal(value: unknown): string {
+  if (typeof value !== 'string') throw new Error(genericCatalogError);
+  const text = value.trim();
+  if (!/^-?\d+(\.\d+)?$/.test(text)) throw new Error(genericCatalogError);
+  return text;
+}
+
 function itemPayload(draft: ItemDraft) {
   return {
     name: draft.name.trim(),
@@ -59,7 +67,7 @@ export async function listItems(): Promise<CatalogItem[]> {
     db
       .from('stock_items')
       .select(
-        'id, name, kind, base_unit, count_frequency, loss_pct, parent_item_id, active',
+        'id, name, kind, base_unit, count_frequency, loss_pct, loss_pct_text:loss_pct::text, parent_item_id, active',
       )
       .order('name'),
     db
@@ -74,6 +82,7 @@ export async function listItems(): Promise<CatalogItem[]> {
   );
 
   return (itemsResult.data ?? []).map((row) => {
+    const storedLossPct = exactDecimal(row.loss_pct_text);
     if (
       !isStockKind(row.kind) ||
       !isBaseUnit(row.base_unit) ||
@@ -82,18 +91,14 @@ export async function listItems(): Promise<CatalogItem[]> {
       throw new Error(genericCatalogError);
     }
     const balance = balances.get(row.id);
-    const storedLossPct = row.loss_pct;
     return {
       id: row.id,
       name: row.name,
       kind: row.kind,
       baseUnit: row.base_unit,
       countFrequency: row.count_frequency,
-      lossPct: toNumber(storedLossPct),
-      storedLossPct:
-        typeof storedLossPct === 'string' || typeof storedLossPct === 'number'
-          ? storedLossPct
-          : toNumber(storedLossPct),
+      lossPct: toNumber(row.loss_pct),
+      storedLossPct,
       parentItemId: row.parent_item_id,
       active: row.active,
       onHandQty: balance ? toNumber(balance.on_hand_qty) : 0,
@@ -141,22 +146,16 @@ export async function listConversions(
 ): Promise<UnitConversion[]> {
   const { data, error } = await appDb()
     .from('item_unit_conversions')
-    .select('item_id, unit, factor_to_base')
+    .select('item_id, unit, factor_to_base, factor_text:factor_to_base::text')
     .eq('item_id', itemId)
     .order('unit');
   throwIfError(error);
-  return (data ?? []).map((row) => {
-    const storedFactor = row.factor_to_base;
-    return {
-      itemId: row.item_id,
-      unit: row.unit,
-      factorToBase: toNumber(storedFactor),
-      storedFactor:
-        typeof storedFactor === 'string' || typeof storedFactor === 'number'
-          ? storedFactor
-          : toNumber(storedFactor),
-    };
-  });
+  return (data ?? []).map((row) => ({
+    itemId: row.item_id,
+    unit: row.unit,
+    factorToBase: toNumber(row.factor_to_base),
+    storedFactor: exactDecimal(row.factor_text),
+  }));
 }
 
 export async function addConversion(

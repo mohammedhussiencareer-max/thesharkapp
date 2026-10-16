@@ -12,7 +12,7 @@ import {
   updateConversion,
 } from '@/items/api';
 import { messageFrom, StaleWriteError } from '@/items/errors';
-import { formatFactorInput, formatQty } from '@/items/format';
+import { formatStoredFactor } from '@/items/format';
 import { unitLabels } from '@/items/labels';
 import type { CatalogItem, UnitConversion } from '@/items/types';
 import { validateConversion } from '@/items/validation';
@@ -39,7 +39,7 @@ function ConversionRow({
   onDelete: () => Promise<void>;
 }) {
   const [factor, setFactor] = useState(() =>
-    formatFactorInput(conversion.factorToBase),
+    formatStoredFactor(conversion.storedFactor),
   );
   const [error, setError] = useState<string | null>(null);
 
@@ -57,7 +57,8 @@ function ConversionRow({
   return (
     <div className="flex flex-col gap-2 rounded border border-neutral-200 p-2">
       <p>
-        1 {conversion.unit} = {formatQty(conversion.factorToBase)} {baseLabel}
+        1 {conversion.unit} = {formatStoredFactor(conversion.storedFactor)}{' '}
+        {baseLabel}
       </p>
       <form
         className="flex flex-col gap-2 sm:flex-row sm:items-end"

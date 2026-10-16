@@ -440,7 +440,7 @@ describe('ItemsPage', () => {
     fireEvent.click(within(oil).getByRole('button', { name: 'حفظ المعامل' }));
     await waitFor(() => expect(filter).toBeDisabled());
 
-    resolveReload([{ ...initial, factorToBase: 2 }]);
+    resolveReload([{ ...initial, factorToBase: 2, storedFactor: 2 }]);
     expect(await within(oil).findByText('1 جركن = 2 لتر')).toBeInTheDocument();
     await waitFor(() => expect(filter).toBeEnabled());
   });
@@ -484,7 +484,7 @@ describe('ItemsPage', () => {
     fireEvent.click(save());
     expect(updateItem).not.toHaveBeenCalled();
 
-    resolveReload([{ ...initial, factorToBase: 2 }]);
+    resolveReload([{ ...initial, factorToBase: 2, storedFactor: 2 }]);
     expect(
       await within(box).findByText('1 كرتونة = 2 قطعة'),
     ).toBeInTheDocument();

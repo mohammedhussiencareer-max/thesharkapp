@@ -3,6 +3,7 @@ import {
   addConversion,
   createItem,
   deleteConversion,
+  listConversions,
   listItems,
   updateConversion,
   updateItem,
@@ -23,13 +24,17 @@ vi.mock('@/lib/supabase', () => ({
 
 function query(result: { data: unknown; error: unknown }) {
   const captured: {
+    select?: unknown;
     insert?: unknown;
     update?: unknown;
     filters: { op: 'eq' | 'is'; column: string; value: unknown }[];
   } = { filters: [] };
   const chain: Record<string, unknown> = {};
   const self = () => chain;
-  chain.select = self;
+  chain.select = (columns?: unknown) => {
+    captured.select = columns;
+    return chain;
+  };
   chain.order = self;
   chain.delete = self;
   chain.eq = (column: string, value: unknown) => {
@@ -79,7 +84,8 @@ describe('catalog api', () => {
           kind: 'seafood',
           base_unit: 'kg',
           count_frequency: 'weekly',
-          loss_pct: '0.125',
+          loss_pct: 0.125,
+          loss_pct_text: '0.12500',
           parent_item_id: null,
           active: true,
         },
@@ -90,6 +96,7 @@ describe('catalog api', () => {
           base_unit: 'piece',
           count_frequency: 'weekly',
           loss_pct: 0,
+          loss_pct_text: '0.00000',
           parent_item_id: null,
           active: false,
         },
@@ -121,7 +128,7 @@ describe('catalog api', () => {
         baseUnit: 'kg',
         countFrequency: 'weekly',
         lossPct: 0.125,
-        storedLossPct: '0.125',
+        storedLossPct: '0.12500',
         parentItemId: null,
         active: true,
         onHandQty: 1.5,
@@ -135,7 +142,7 @@ describe('catalog api', () => {
         baseUnit: 'piece',
         countFrequency: 'weekly',
         lossPct: 0,
-        storedLossPct: 0,
+        storedLossPct: '0.00000',
         parentItemId: null,
         active: false,
         onHandQty: 0,
@@ -143,6 +150,9 @@ describe('catalog api', () => {
         onHandValue: 0,
       },
     ]);
+    expect(items.captured.select).toBe(
+      'id, name, kind, base_unit, count_frequency, loss_pct, loss_pct_text:loss_pct::text, parent_item_id, active',
+    );
   });
 
   it('trims the name and does not send id or created_at', async () => {
@@ -271,6 +281,56 @@ describe('catalog api', () => {
       { op: 'eq', column: 'unit', value: 'كيس' },
       { op: 'eq', column: 'factor_to_base', value: 1 },
     ]);
+  });
+
+  it('uses the exact factor text in the update filter', async () => {
+    const listed = query({
+      data: [
+        {
+          item_id: 'oil',
+          unit: 'كيس',
+          factor_to_base: 12345678.12345679,
+          factor_text: '12345678.123456789',
+        },
+      ],
+      error: null,
+    });
+    mocks.schema.mockReturnValue({ from: () => listed.chain });
+
+    const [row] = await listConversions('oil');
+
+    expect(listed.captured.select).toBe(
+      'item_id, unit, factor_to_base, factor_text:factor_to_base::text',
+    );
+    expect(row?.storedFactor).toBe('12345678.123456789');
+    expect(row?.factorToBase).toBe(12345678.12345679);
+
+    const updated = query({ data: [{ unit: 'كيس' }], error: null });
+    mocks.schema.mockReturnValue({ from: () => updated.chain });
+    await updateConversion('oil', 'كيس', 2, row?.storedFactor ?? '');
+
+    expect(updated.captured.filters).toEqual([
+      { op: 'eq', column: 'item_id', value: 'oil' },
+      { op: 'eq', column: 'unit', value: 'كيس' },
+      { op: 'eq', column: 'factor_to_base', value: '12345678.123456789' },
+    ]);
+  });
+
+  it('rejects a factor cast that is not exact decimal text', async () => {
+    const listed = query({
+      data: [
+        {
+          item_id: 'oil',
+          unit: 'كيس',
+          factor_to_base: 1,
+          factor_text: 1,
+        },
+      ],
+      error: null,
+    });
+    mocks.schema.mockReturnValue({ from: () => listed.chain });
+
+    await expect(listConversions('oil')).rejects.toThrow('حصل خطأ. حاول تاني.');
   });
 
   it('maps a duplicate conversion unit from the insert', async () => {

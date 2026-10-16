@@ -32,6 +32,45 @@ describe('ConversionsPanel', () => {
     vi.mocked(addConversion).mockReset();
   });
 
+  it('shows the exact stored factor instead of a rounded quantity', async () => {
+    vi.mocked(listConversions).mockResolvedValue([
+      {
+        itemId: 'oil',
+        unit: 'جرام',
+        factorToBase: 0.0075,
+        storedFactor: '0.007500000',
+      },
+      {
+        itemId: 'oil',
+        unit: 'مل',
+        factorToBase: 0.0001,
+        storedFactor: '0.0001',
+      },
+      {
+        itemId: 'oil',
+        unit: 'كيس',
+        factorToBase: 25,
+        storedFactor: '25.000000000',
+      },
+      {
+        itemId: 'oil',
+        unit: 'طن',
+        factorToBase: 12345678.12345679,
+        storedFactor: '12345678.123456789',
+      },
+    ]);
+
+    render(<ConversionsPanel item={item} />);
+
+    expect(await screen.findByText('1 جرام = 0.0075 كيلو')).toBeInTheDocument();
+    expect(screen.getByText('1 مل = 0.0001 كيلو')).toBeInTheDocument();
+    expect(screen.getByText('1 كيس = 25 كيلو')).toBeInTheDocument();
+    expect(
+      screen.getByText('1 طن = 12345678.123456789 كيلو'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/0\.008/)).not.toBeInTheDocument();
+  });
+
   it('shows a reload error and retry when refreshing after a save fails', async () => {
     vi.mocked(listConversions)
       .mockResolvedValueOnce([

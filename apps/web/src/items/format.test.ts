@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatEgp, formatQty } from '@/items/format';
+import { formatEgp, formatQty, formatStoredFactor } from '@/items/format';
 
 describe('formatEgp', () => {
   it('lets Intl round values that a piaster Math.round mishandles', () => {
@@ -8,6 +8,15 @@ describe('formatEgp', () => {
     expect(formatEgp(1.015)).toBe('1.02 ج.م');
     expect(formatEgp(0)).toBe('0.00 ج.م');
     expect(formatEgp(-0)).toBe('0.00 ج.م');
+  });
+});
+
+describe('formatStoredFactor', () => {
+  it('trims trailing zeros and keeps every significant digit', () => {
+    expect(formatStoredFactor('0.007500000')).toBe('0.0075');
+    expect(formatStoredFactor('0.0001')).toBe('0.0001');
+    expect(formatStoredFactor('25.000000000')).toBe('25');
+    expect(formatStoredFactor('12345678.123456789')).toBe('12345678.123456789');
   });
 });
 

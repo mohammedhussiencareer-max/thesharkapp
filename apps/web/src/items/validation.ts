@@ -31,6 +31,12 @@ export type ItemField =
 export type ItemFormErrors = Partial<Record<ItemField, string>>;
 
 const lossRangeMessage = 'نسبة الفاقد من 0 لحد 99.999';
+const lossPrecisionMessage = 'نسبة الفاقد مينفعش تتخزن أدق من خمس خانات عشرية';
+const factorPositiveMessage = 'معامل التحويل لازم يكون رقم أكبر من صفر';
+const factorIntegerDigitsMessage =
+  'معامل التحويل مينفعش يبقى فيه أكتر من 9 أرقام قبل العلامة';
+const factorDecimalDigitsMessage =
+  'معامل التحويل مينفعش يبقى فيه أكتر من 9 أرقام بعد العلامة';
 
 export function emptyItemForm(): ItemFormValues {
   const defaults = defaultsForKind('fish_mixed');
@@ -63,12 +69,43 @@ export function itemToFormValues(item: CatalogItem): ItemFormValues {
   };
 }
 
-export function parseLossPercent(raw: string): number | null {
+function decimalText(raw: string): string | null {
   const trimmed = raw.trim().replace(',', '.');
-  if (!/^\d+(\.\d{1,3})?$/.test(trimmed)) return null;
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+/** Decimal places of `percent / 100` after trailing zeros are removed. */
+function fractionScale(percentText: string): number {
+  const parts = percentText.split('.');
+  const whole = parts[0] ?? '0';
+  const fraction = parts[1] ?? '';
+  let digits = `${whole}${fraction}`;
+  let scale = fraction.length + 2;
+  while (scale > 0 && digits.endsWith('0')) {
+    digits = digits.slice(0, -1);
+    scale -= 1;
+  }
+  return scale;
+}
+
+export function parseLossPercent(raw: string): number | null {
+  const trimmed = decimalText(raw);
+  if (trimmed === null || fractionScale(trimmed) > 5) return null;
   const percent = Number(trimmed);
   if (!Number.isFinite(percent) || percent < 0 || percent > 99.999) return null;
   return percent;
+}
+
+function lossPercentMessage(raw: string): string | null {
+  const trimmed = decimalText(raw);
+  if (trimmed === null) return lossRangeMessage;
+  const percent = Number(trimmed);
+  if (!Number.isFinite(percent) || percent < 0 || percent > 99.999) {
+    return lossRangeMessage;
+  }
+  if (fractionScale(trimmed) > 5) return lossPrecisionMessage;
+  return null;
 }
 
 export function lossPercentToFraction(percent: number): number {
@@ -94,10 +131,12 @@ export function validateItemForm(
     errors.countFrequency = 'دورية الجرد مش مظبوطة';
   }
 
-  const percent = parseLossPercent(values.lossPercent);
+  const lossMessage = lossPercentMessage(values.lossPercent);
+  const percent =
+    lossMessage === null ? parseLossPercent(values.lossPercent) : null;
   const lossPct = percent === null ? null : lossPercentToFraction(percent);
-  if (percent === null || lossPct === null || lossPct >= 1) {
-    errors.lossPercent = lossRangeMessage;
+  if (lossMessage !== null || lossPct === null || lossPct >= 1) {
+    errors.lossPercent = lossMessage ?? lossRangeMessage;
   }
 
   const fishMixedIds = new Set(
@@ -160,13 +199,23 @@ export function validateConversion(
     return { ok: false, error: 'مينفعش التحويل يبقى بنفس الوحدة الأساسية' };
   }
 
-  const factorText = factorRaw.trim().replace(',', '.');
-  if (!/^\d{1,9}(\.\d{1,9})?$/.test(factorText)) {
-    return { ok: false, error: 'معامل التحويل لازم يكون رقم أكبر من صفر' };
+  const factorText = decimalText(factorRaw);
+  if (factorText === null) {
+    return { ok: false, error: factorPositiveMessage };
+  }
+  const parts = factorText.split('.');
+  const whole = parts[0] ?? '0';
+  const fraction = parts[1] ?? '';
+  const integerDigits = whole.replace(/^0+/, '');
+  if (integerDigits.length > 9) {
+    return { ok: false, error: factorIntegerDigitsMessage };
+  }
+  if (fraction.replace(/0+$/, '').length > 9) {
+    return { ok: false, error: factorDecimalDigitsMessage };
   }
   const factor = Number(factorText);
   if (!Number.isFinite(factor) || factor <= 0) {
-    return { ok: false, error: 'معامل التحويل لازم يكون رقم أكبر من صفر' };
+    return { ok: false, error: factorPositiveMessage };
   }
   return { ok: true, unit, factor };
 }
