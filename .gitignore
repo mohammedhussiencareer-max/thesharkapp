@@ -7,8 +7,8 @@ coverage/
 .env
 .env.*
 !.env.example
-!.env.development
-!.env.production
+!/apps/web/.env.development
+!/apps/web/.env.production
 *.pem
 *.key
 *service-account*.json

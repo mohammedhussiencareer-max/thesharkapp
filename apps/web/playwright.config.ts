@@ -21,7 +21,8 @@ export default defineConfig({
     command:
       'pnpm exec tsc -b && pnpm exec vite build --mode development && pnpm preview',
     url: 'http://127.0.0.1:4173',
-    reuseExistingServer: !process.env.CI,
+    // Never reuse a running server: it could be a production preview that talks to the hosted project.
+    reuseExistingServer: false,
     timeout: 120_000,
   },
 });
