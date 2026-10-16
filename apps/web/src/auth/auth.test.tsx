@@ -6,6 +6,10 @@ import { AppRoutes } from '@/App';
 import { getAuthSnapshot, resetAuthStore } from '@/lib/auth-store';
 
 type Session = { user: { id: string; email: string } } | null;
+type RpcResult = {
+  data: boolean | null;
+  error: { message: string } | null;
+};
 
 const authState = vi.hoisted(() => ({
   session: null as Session,
@@ -16,9 +20,8 @@ const authState = vi.hoisted(() => ({
     data: { user: null; session: null };
     error: { message: string } | null;
   }> | null,
-  signOutGate: null as Promise<void> | null,
-  signedInSession: null as Session,
-  signInCalls: 0,
+  holdRpc: false,
+  rpcHolds: [] as Array<(result: RpcResult) => void>,
   listeners: [] as Array<(event: string, session: Session) => void>,
   signOut: vi.fn(),
 }));
@@ -43,7 +46,6 @@ vi.mock('@/lib/supabase', () => ({
         };
       },
       signInWithPassword: () => {
-        authState.signInCalls += 1;
         if (authState.signInGate) return authState.signInGate;
         if (authState.signInError) {
           return Promise.resolve({
@@ -51,36 +53,27 @@ vi.mock('@/lib/supabase', () => ({
             error: authState.signInError,
           });
         }
-        const session = authState.signedInSession ?? authState.session;
-        authState.session = session;
-        for (const listener of [...authState.listeners]) {
-          listener('SIGNED_IN', session);
-        }
         return Promise.resolve({
-          data: { user: session?.user ?? null, session },
+          data: { user: null, session: null },
           error: null,
         });
       },
       signOut: () => {
         authState.signOut();
-        const notify = () => {
-          authState.session = null;
-          for (const listener of [...authState.listeners]) {
-            listener('SIGNED_OUT', null);
-          }
-        };
-        if (authState.signOutGate) {
-          return authState.signOutGate.then(() => {
-            setTimeout(notify, 0);
-            return { error: null };
-          });
+        authState.session = null;
+        for (const listener of [...authState.listeners]) {
+          listener('SIGNED_OUT', null);
         }
-        notify();
         return Promise.resolve({ error: null });
       },
     },
     schema: () => ({
       rpc: () => {
+        if (authState.holdRpc) {
+          return new Promise<RpcResult>((resolve) => {
+            authState.rpcHolds.push(resolve);
+          });
+        }
         if (authState.rpcError) {
           return Promise.resolve({ data: null, error: authState.rpcError });
         }
@@ -110,12 +103,20 @@ function resetMock() {
   authState.rpcError = null;
   authState.signInError = null;
   authState.signInGate = null;
-  authState.signOutGate = null;
-  authState.signedInSession = null;
-  authState.signInCalls = 0;
+  authState.holdRpc = false;
+  authState.rpcHolds.splice(0, authState.rpcHolds.length);
   authState.listeners.splice(0, authState.listeners.length);
   authState.signOut.mockClear();
   resetAuthStore();
+}
+
+function notifySession(session: Session) {
+  authState.session = session;
+  act(() => {
+    for (const listener of authState.listeners) {
+      listener('SIGNED_IN', session);
+    }
+  });
 }
 
 describe('owner access', () => {
@@ -147,9 +148,10 @@ describe('owner access', () => {
     expect(
       screen.getByRole('button', { name: 'تسجيل الخروج' }),
     ).toBeInTheDocument();
+    expect(authState.signOut).not.toHaveBeenCalled();
   });
 
-  it('signs out a non-owner and shows the Arabic rejection', async () => {
+  it('shows a denied screen and signs out only when asked', async () => {
     authState.session = {
       user: { id: 'intruder', email: 'intruder@theshark.test' },
     };
@@ -158,10 +160,21 @@ describe('owner access', () => {
     renderApp('/');
 
     expect(
-      await screen.findByText('الحساب ده مش مسموح له يدخل'),
+      await screen.findByRole('heading', {
+        name: 'الحساب ده مش مسموح له يدخل',
+      }),
     ).toBeInTheDocument();
+    expect(getAuthSnapshot().status).toBe('denied');
+    expect(authState.session?.user.email).toBe('intruder@theshark.test');
+    expect(authState.signOut).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'تسجيل الخروج' }));
+
     expect(authState.signOut).toHaveBeenCalledOnce();
-    expect(screen.queryByText('intruder@theshark.test')).toBeNull();
+    expect(
+      await screen.findByRole('heading', { name: 'تسجيل الدخول' }),
+    ).toBeInTheDocument();
+    expect(getAuthSnapshot().status).toBe('signed-out');
   });
 
   it('keeps the session when the owner check cannot be completed', async () => {
@@ -177,6 +190,46 @@ describe('owner access', () => {
     ).toBeInTheDocument();
     expect(authState.signOut).not.toHaveBeenCalled();
     expect(screen.queryByText('network down')).toBeNull();
+
+    authState.rpcError = null;
+    authState.isOwner = true;
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+
+    expect(await screen.findByText('owner@theshark.test')).toBeInTheDocument();
+    expect(getAuthSnapshot().status).toBe('owner');
+    expect(authState.signOut).not.toHaveBeenCalled();
+  });
+
+  it('ignores a stale owner check from an older session', async () => {
+    authState.holdRpc = true;
+    authState.session = {
+      user: { id: 'intruder', email: 'intruder@theshark.test' },
+    };
+    authState.isOwner = false;
+    renderApp('/');
+
+    await vi.waitFor(() => {
+      expect(authState.rpcHolds).toHaveLength(1);
+    });
+
+    authState.holdRpc = false;
+    authState.isOwner = true;
+    notifySession({ user: { id: 'owner', email: 'owner@theshark.test' } });
+
+    expect(await screen.findByText('owner@theshark.test')).toBeInTheDocument();
+
+    const stale = authState.rpcHolds[0];
+    await act(async () => {
+      stale?.({ data: false, error: null });
+      await Promise.resolve();
+    });
+
+    expect(getAuthSnapshot().status).toBe('owner');
+    expect(screen.getByText('owner@theshark.test')).toBeInTheDocument();
+    expect(
+      screen.queryByRole('heading', { name: 'الحساب ده مش مسموح له يدخل' }),
+    ).toBeNull();
+    expect(authState.signOut).not.toHaveBeenCalled();
   });
 });
 
@@ -241,50 +294,5 @@ describe('login', () => {
     expect(
       await screen.findByText('البريد أو كلمة السر غلط'),
     ).toBeInTheDocument();
-  });
-
-  it('finishes a denied sign-out before an owner sign-in can be cleared', async () => {
-    let releaseSignOut: () => void = () => {};
-    authState.signOutGate = new Promise<void>((resolve) => {
-      releaseSignOut = resolve;
-    });
-    authState.session = {
-      user: { id: 'intruder', email: 'intruder@theshark.test' },
-    };
-    authState.isOwner = false;
-    renderApp('/login');
-
-    expect(await screen.findByText('جاري تسجيل الخروج…')).toBeInTheDocument();
-    expect(screen.getByLabelText('البريد')).toBeDisabled();
-    expect(screen.getByLabelText('كلمة السر')).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
-    expect(getAuthSnapshot().status).toBe('signing-out');
-    expect(authState.signOut).toHaveBeenCalledOnce();
-
-    authState.isOwner = true;
-    authState.signedInSession = {
-      user: { id: 'owner', email: 'owner@theshark.test' },
-    };
-    fireEvent.change(screen.getByLabelText('البريد'), {
-      target: { value: 'owner@theshark.test' },
-    });
-    fireEvent.change(screen.getByLabelText('كلمة السر'), {
-      target: { value: 'OwnerSignIn1234' },
-    });
-    fireEvent.submit(
-      screen.getByRole('button', { name: 'تسجيل الدخول' }).closest('form')!,
-    );
-
-    expect(authState.signInCalls).toBe(0);
-    const signOutCallsBeforeOwner = authState.signOut.mock.calls.length;
-
-    act(() => {
-      releaseSignOut();
-    });
-
-    expect(await screen.findByText('owner@theshark.test')).toBeInTheDocument();
-    expect(getAuthSnapshot().status).toBe('owner');
-    expect(authState.signInCalls).toBe(1);
-    expect(authState.signOut.mock.calls.length).toBe(signOutCallsBeforeOwner);
   });
 });
