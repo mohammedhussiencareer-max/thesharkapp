@@ -70,10 +70,14 @@ export function createSupabaseDb(
       throw new Error('Supabase RPC failed: network');
     }
     if (!response.ok) {
+      let text: string;
       try {
-        await response.text();
+        text = await response.text();
       } catch {
-        // The status is enough. Never surface the body.
+        text = '';
+      }
+      if (name === 'start_pos_sync_run' && isAnotherPosSyncRunning(text)) {
+        throw new Error('another POS sync is running');
       }
       throw new Error(`Supabase RPC failed: HTTP ${response.status}`);
     }
@@ -132,6 +136,20 @@ function rpcUrl(base: string, name: string): string {
     throw new Error(`Refusing non-local Supabase URL: ${base}`);
   }
   return url.toString();
+}
+
+function isAnotherPosSyncRunning(body: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body) as unknown;
+  } catch {
+    return false;
+  }
+  return (
+    isRecord(parsed) &&
+    parsed.code === '55P03' &&
+    parsed.message === 'another POS sync is running'
+  );
 }
 
 function parseRunId(value: unknown): number {

@@ -254,14 +254,50 @@ describe('parsers', () => {
     ).toHaveLength(1);
   });
 
-  it('skips a runQuery row that has only readTime', () => {
-    const invalid = /^Firestore read failed: invalid response$/;
+  it('accepts a runQuery page that is only a readTime', () => {
+    expect(
+      parseRunQueryResponse([{ readTime: '2026-10-16T00:00:00Z' }]),
+    ).toEqual([]);
     expect(
       parseRunQueryResponse([
-        { readTime: 'x' },
-        { document: { name: orderName } },
+        {
+          readTime: '2026-10-16T00:00:00.123456789Z',
+          skippedResults: 0,
+          done: true,
+          transaction: 'txn-test',
+          explainMetrics: {},
+        },
       ]),
-    ).toHaveLength(1);
+    ).toEqual([]);
+  });
+
+  it('accepts documents followed by a trailing readTime entry', () => {
+    expect(
+      parseRunQueryResponse([
+        {
+          document: { name: orderName },
+          readTime: '2026-10-16T00:00:00Z',
+          skippedResults: 0,
+        },
+        { readTime: '2026-10-16T00:00:00Z' },
+      ]),
+    ).toEqual([{ name: orderName }]);
+  });
+
+  it('rejects a runQuery page that is not a complete read', () => {
+    const invalid = /^Firestore read failed: invalid response$/;
+    expect(() => parseRunQueryResponse([])).toThrow(invalid);
+    expect(() => parseRunQueryResponse([{}])).toThrow(invalid);
+    expect(() => parseRunQueryResponse([{ readTime: 7 }])).toThrow(invalid);
+    expect(() => parseRunQueryResponse([{ readTime: 'x' }])).toThrow(invalid);
+    expect(() =>
+      parseRunQueryResponse([{ readTime: '2026-10-16T00:00:00Z', extra: 1 }]),
+    ).toThrow(invalid);
+    expect(() =>
+      parseRunQueryResponse([
+        { readTime: '2026-10-16T00:00:00Z', skippedResults: 1 },
+      ]),
+    ).toThrow(invalid);
     expect(() => parseRunQueryResponse([null])).toThrow(invalid);
     expect(() => parseRunQueryResponse([{ document: null }])).toThrow(invalid);
     expect(() =>

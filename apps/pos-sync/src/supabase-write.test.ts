@@ -78,4 +78,79 @@ describe('createSupabaseDb', () => {
       /^Supabase RPC failed: HTTP 500$/,
     );
   });
+
+  it('reports another POS sync is running when start is refused', async () => {
+    const db = createSupabaseDb(
+      'http://127.0.0.1:55421',
+      localServiceRoleKey,
+      async () => {
+        return new Response(
+          JSON.stringify({
+            code: '55P03',
+            details: 'pii-customer-name ya29.SECRET',
+            hint: null,
+            message: 'another POS sync is running',
+          }),
+          { status: 400 },
+        );
+      },
+    );
+    await expect(db.startRun('recent')).rejects.toThrow(
+      /^another POS sync is running$/,
+    );
+  });
+
+  it('keeps other database errors to the HTTP status', async () => {
+    const secret = 'pii-customer-name ya29.SECRET-DB';
+    const startCases: Array<{ status: number; body: string }> = [
+      { status: 500, body: secret },
+      {
+        status: 400,
+        body: JSON.stringify({ code: '55P03', message: secret }),
+      },
+      {
+        status: 400,
+        body: JSON.stringify({
+          code: 'P0001',
+          message: 'another POS sync is running',
+          details: secret,
+        }),
+      },
+      {
+        status: 400,
+        body: JSON.stringify({
+          code: '55P03',
+          message: 'Another POS sync is running',
+        }),
+      },
+    ];
+    for (const item of startCases) {
+      const db = createSupabaseDb(
+        'http://127.0.0.1:55421',
+        localServiceRoleKey,
+        async () => new Response(item.body, { status: item.status }),
+      );
+      await expect(db.startRun('recent')).rejects.toThrow(
+        new RegExp(`^Supabase RPC failed: HTTP ${item.status}$`),
+      );
+    }
+
+    const ingest = createSupabaseDb(
+      'http://127.0.0.1:55421',
+      localServiceRoleKey,
+      async () => {
+        return new Response(
+          JSON.stringify({
+            code: '55P03',
+            message: 'another POS sync is running',
+            details: secret,
+          }),
+          { status: 409 },
+        );
+      },
+    );
+    await expect(ingest.ingest(4, [], [], null)).rejects.toThrow(
+      /^Supabase RPC failed: HTTP 409$/,
+    );
+  });
 });

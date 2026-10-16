@@ -343,26 +343,91 @@ export function parseListResponse(payload: unknown): ListPage {
   return { documents, nextPageToken };
 }
 
+const RUN_QUERY_KEYS = new Set([
+  'document',
+  'readTime',
+  'transaction',
+  'skippedResults',
+  'done',
+  'explainMetrics',
+]);
+
 export function parseRunQueryResponse(
   payload: unknown,
 ): FirestoreRestDocument[] {
-  if (!Array.isArray(payload)) {
+  if (!Array.isArray(payload) || payload.length === 0) {
     throw new Error('Firestore read failed: invalid response');
   }
   const documents: FirestoreRestDocument[] = [];
   for (const entry of payload) {
-    if (!isRecord(entry)) {
-      throw new Error('Firestore read failed: invalid response');
-    }
-    if ('error' in entry) {
-      throw new Error('Firestore read failed: invalid response');
-    }
-    if (!('document' in entry)) {
-      continue;
-    }
-    documents.push(requireDocument(entry.document));
+    documents.push(...readRunQueryEntry(entry));
   }
   return documents;
+}
+
+function readRunQueryEntry(entry: unknown): FirestoreRestDocument[] {
+  if (!isRecord(entry)) {
+    throw new Error('Firestore read failed: invalid response');
+  }
+  for (const key of Object.keys(entry)) {
+    if (!RUN_QUERY_KEYS.has(key)) {
+      throw new Error('Firestore read failed: invalid response');
+    }
+  }
+  if ('readTime' in entry && !isRfc3339(entry.readTime)) {
+    throw new Error('Firestore read failed: invalid response');
+  }
+  if ('transaction' in entry && typeof entry.transaction !== 'string') {
+    throw new Error('Firestore read failed: invalid response');
+  }
+  if ('done' in entry && typeof entry.done !== 'boolean') {
+    throw new Error('Firestore read failed: invalid response');
+  }
+  if ('explainMetrics' in entry && !isRecord(entry.explainMetrics)) {
+    throw new Error('Firestore read failed: invalid response');
+  }
+  if ('skippedResults' in entry) {
+    const skipped = entry.skippedResults;
+    if (
+      typeof skipped !== 'number' ||
+      !Number.isInteger(skipped) ||
+      skipped < 0
+    ) {
+      throw new Error('Firestore read failed: invalid response');
+    }
+    if (skipped > 0) {
+      throw new Error('Firestore read failed: invalid response');
+    }
+  }
+  if ('document' in entry) {
+    return [requireDocument(entry.document)];
+  }
+  if (!isRfc3339(entry.readTime)) {
+    throw new Error('Firestore read failed: invalid response');
+  }
+  return [];
+}
+
+function isRfc3339(value: unknown): boolean {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const match =
+    /^(\d{4}-\d{2}-\d{2})[Tt](\d{2}:\d{2}:\d{2})(\.(\d+))?([Zz]|[+-]\d{2}:\d{2})$/.exec(
+      value,
+    );
+  if (match === null) {
+    return false;
+  }
+  const date = match[1];
+  const time = match[2];
+  const fraction = match[4] ?? '';
+  const offset = match[5];
+  if (date === undefined || time === undefined || offset === undefined) {
+    return false;
+  }
+  const millis = fraction.slice(0, 3).padEnd(3, '0');
+  return Number.isFinite(Date.parse(`${date}T${time}.${millis}${offset}`));
 }
 
 function requireDocument(value: unknown): FirestoreRestDocument {

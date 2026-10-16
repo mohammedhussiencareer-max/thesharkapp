@@ -173,6 +173,79 @@ describe('runPosSync', () => {
     expect(finished).toEqual({ status: 'failed', error: 'boom [redacted]' });
   });
 
+  it.each([
+    { label: '[{}]', payload: [{}] },
+    { label: '[{"readTime":7}]', payload: [{ readTime: 7 }] },
+    { label: '[]', payload: [] },
+    {
+      label: 'an unknown key',
+      payload: [{ readTime: '2026-10-16T00:00:00Z', extra: 1 }],
+    },
+    {
+      label: 'skippedResults 1',
+      payload: [{ readTime: '2026-10-16T00:00:00Z', skippedResults: 1 }],
+    },
+  ])(
+    'fails the run and does not send a scope for $label',
+    async ({ payload }) => {
+      const ingestCalls: unknown[] = [];
+      let finished: { status: string; error: string | null } | undefined;
+      const db: PosDb = {
+        async startRun() {
+          return 42;
+        },
+        async ingest() {
+          ingestCalls.push(true);
+          return zeroCounts();
+        },
+        async finishRun(_runId, status, _counts, error) {
+          finished = { status, error };
+        },
+      };
+      const firestore = createPosFirestore('test-token', async (_url, init) => {
+        if (init.method === 'POST') {
+          return new Response(JSON.stringify(payload), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            documents: [
+              {
+                name: 'projects/thesharkrestaurant/databases/(default)/documents/custody_shifts/shift-test-1',
+                updateTime: '2026-10-15T18:00:00Z',
+                fields: {
+                  id: { stringValue: 'shift-test-1' },
+                  opening_time: { timestampValue: '2026-10-15T09:00:00Z' },
+                  isActive: { booleanValue: true },
+                },
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        );
+      });
+      await expect(
+        runPosSync({
+          mode: 'recent',
+          supabaseUrl: 'http://127.0.0.1:55421',
+          serviceRoleKey: 'local-test-key',
+          reader: createPosReader(firestore),
+          db,
+        }),
+      ).rejects.toThrow(/^Firestore read failed: invalid response$/);
+      expect(ingestCalls).toEqual([]);
+      expect(finished).toEqual({
+        status: 'failed',
+        error: 'Firestore read failed: invalid response',
+      });
+    },
+  );
+
   it('fails the run and does not send a scope when a list document is null', async () => {
     const ingestCalls: unknown[] = [];
     let finished: { status: string; error: string | null } | undefined;

@@ -79,4 +79,21 @@ describe('main', () => {
     expect(errors[0]).toContain('Refusing non-local');
     expect(errors.join('\n')).not.toContain('ya29');
   });
+
+  it('prints when another POS sync is running', async () => {
+    const errors: string[] = [];
+    const code = await main({
+      argv: ['--mode', 'recent'],
+      env: { POS_SUPABASE_URL: 'http://127.0.0.1:55421' },
+      loadToken: async () => 'ya29.SECRET',
+      runSync: async () => {
+        throw new Error('another POS sync is running');
+      },
+      log: () => undefined,
+      error: (line) => errors.push(line),
+    });
+    expect(code).toBe(1);
+    expect(errors).toEqual(['pos sync failed: another POS sync is running']);
+    expect(errors.join('\n')).not.toContain('ya29');
+  });
 });
