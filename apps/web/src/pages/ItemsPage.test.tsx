@@ -1021,4 +1021,63 @@ describe('ItemsPage', () => {
     });
     expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('liter');
   });
+
+  it('stays locked after a landed save when a newer catalog read fails', async () => {
+    const oil = item({
+      id: 'oil',
+      name: 'زيت',
+      kind: 'ingredient',
+      baseUnit: 'kg',
+      active: true,
+    });
+    let resolveSaveRead: (value: CatalogItem[]) => void = () => undefined;
+    let loads = 0;
+    vi.mocked(listItems).mockImplementation(() => {
+      loads += 1;
+      if (loads === 1) return Promise.resolve([oil]);
+      if (loads === 2) {
+        return new Promise((resolve) => {
+          resolveSaveRead = resolve;
+        });
+      }
+      return Promise.reject(new Error('حصل خطأ. حاول تاني.'));
+    });
+    // The panel's snapshot read started before the save and lands after it.
+    let resolveSnapshot: (value: ReturnType<typeof listed>) => void = () =>
+      undefined;
+    vi.mocked(listConversions).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveSnapshot = resolve;
+      }),
+    );
+
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole('article', { name: 'زيت' });
+    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+    fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
+    fireEvent.change(screen.getByLabelText('الاسم'), {
+      target: { value: 'زيت جديد' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+    await waitFor(() => {
+      expect(loads).toBe(2);
+    });
+
+    resolveSnapshot(listed([], 'liter'));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'حصل خطأ. حاول تاني.',
+    );
+    resolveSaveRead([{ ...oil, name: 'زيت جديد' }]);
+    await waitFor(() => {
+      expect(loads).toBe(3);
+    });
+    expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'إعادة المحاولة' }),
+    ).toBeEnabled();
+  });
 });

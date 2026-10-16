@@ -52,7 +52,7 @@ export function ItemsPage() {
   const [formEpoch, setFormEpoch] = useState(0);
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  // A save landed but the reload after it failed: stay locked until a reload succeeds.
+  // A save landed and fresh rows are not applied yet: stay locked until a read applies them.
   const [needsReload, setNeedsReload] = useState(false);
   // One page-wide lock: while an item save or a conversion operation (and the
   // reload after it) is in flight, nothing that edits data or remounts a panel
@@ -166,11 +166,15 @@ export function ItemsPage() {
         await createItem(draft);
       }
       saved = true;
+      // Locked from the moment the save lands until fresh rows are applied,
+      // whichever read applies them.
+      setNeedsReload(true);
       if (sameEditor(formModeRef.current, started)) setEditor(null);
       const next = await readCatalog();
       if (next) {
         setItems(next);
         setLoadError(null);
+        setNeedsReload(false);
       }
     } catch (error) {
       if (
