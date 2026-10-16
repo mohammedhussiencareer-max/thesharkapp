@@ -5,7 +5,47 @@ export type Database = {
   
   "app": {
           Tables: {
-            "owner": {
+            "item_balances": {
+                  Row: {
+                    "avg_cost": number,"has_uncovered_deficit": boolean,"item_id": string,"last_occurred_at": string | null,"on_hand_qty": number,"on_hand_value": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "avg_cost"?: number,"has_uncovered_deficit"?: boolean,"item_id": string,"last_occurred_at"?: string | null,"on_hand_qty"?: number,"on_hand_value"?: number
+                  }
+                  Update: {
+                    "avg_cost"?: number,"has_uncovered_deficit"?: boolean,"item_id"?: string,"last_occurred_at"?: string | null,"on_hand_qty"?: number,"on_hand_value"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "item_balances_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: true
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"item_unit_conversions": {
+                  Row: {
+                    "factor_to_base": number,"item_id": string,"unit": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "factor_to_base": number,"item_id": string,"unit": string
+                  }
+                  Update: {
+                    "factor_to_base"?: number,"item_id"?: string,"unit"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "item_unit_conversions_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"owner": {
                   Row: {
                     "created_at": string,"id": boolean,"user_id": string
                   }
@@ -19,18 +59,120 @@ export type Database = {
                   Relationships: [
                     
                   ]
+                },"provisional_deficits": {
+                  Row: {
+                    "item_id": string,"movement_id": number,"provisional_unit_cost": number,"qty_uncovered": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "item_id": string,"movement_id": number,"provisional_unit_cost": number,"qty_uncovered": number
+                  }
+                  Update: {
+                    "item_id"?: string,"movement_id"?: number,"provisional_unit_cost"?: number,"qty_uncovered"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "provisional_deficits_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "provisional_deficits_movement_id_fkey"
+      columns: ["movement_id"]
+isOneToOne: true
+      referencedRelation: "stock_movements"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"stock_items": {
+                  Row: {
+                    "active": boolean,"base_unit": string,"count_frequency": string,"created_at": string,"id": string,"kind": string,"loss_pct": number,"name": string,"parent_item_id": string | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "active"?: boolean,"base_unit": string,"count_frequency": string,"created_at"?: string,"id"?: string,"kind": string,"loss_pct"?: number,"name": string,"parent_item_id"?: string | null
+                  }
+                  Update: {
+                    "active"?: boolean,"base_unit"?: string,"count_frequency"?: string,"created_at"?: string,"id"?: string,"kind"?: string,"loss_pct"?: number,"name"?: string,"parent_item_id"?: string | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "stock_items_parent_item_id_fkey"
+      columns: ["parent_item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"stock_movements": {
+                  Row: {
+                    "adjusts_movement_id": number | null,"batch_id": string,"created_at": string,"created_by": string | null,"id": number,"is_provisional": boolean,"item_id": string,"movement_type": Database["app"]['Enums']["movement_type"],"note": string | null,"occurred_at": string,"quantity": number,"shift_id": string | null,"source_id": string | null,"source_type": string | null,"total_cost": number,"unit_cost": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "adjusts_movement_id"?: number | null,"batch_id": string,"created_at"?: string,"created_by"?: string | null,"id"?: never,"is_provisional"?: boolean,"item_id": string,"movement_type": Database["app"]['Enums']["movement_type"],"note"?: string | null,"occurred_at": string,"quantity": number,"shift_id"?: string | null,"source_id"?: string | null,"source_type"?: string | null,"total_cost": number,"unit_cost": number
+                  }
+                  Update: {
+                    "adjusts_movement_id"?: number | null,"batch_id"?: string,"created_at"?: string,"created_by"?: string | null,"id"?: never,"is_provisional"?: boolean,"item_id"?: string,"movement_type"?: Database["app"]['Enums']["movement_type"],"note"?: string | null,"occurred_at"?: string,"quantity"?: number,"shift_id"?: string | null,"source_id"?: string | null,"source_type"?: string | null,"total_cost"?: number,"unit_cost"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "stock_movements_adjusts_movement_id_fkey"
+      columns: ["adjusts_movement_id"]
+isOneToOne: false
+      referencedRelation: "stock_movements"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "stock_movements_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
                 }
           }
           Views: {
             [_ in never]: never
           }
           Functions: {
-            "is_owner":
+            "apply_inflow_movement":
+{ Args: { "p_batch_id": string,"p_in_qty": number,"p_in_unit_cost": number,"p_item_id": string,"p_movement_type": Database["app"]['Enums']["movement_type"],"p_note": string,"p_occurred_at": string,"p_shift_id": string,"p_source_id": string,"p_source_type": string }; Returns: undefined
+                           },
+"apply_outflow_movement":
+{ Args: { "p_batch_id": string,"p_item_id": string,"p_movement_type": Database["app"]['Enums']["movement_type"],"p_note": string,"p_occurred_at": string,"p_out_qty": number,"p_shift_id": string,"p_source_id": string,"p_source_type": string }; Returns: undefined
+                           },
+"assert_ledger_write_allowed":
+{ Args: Record<PropertyKey, never>; Returns: undefined
+                           },
+"is_owner":
 { Args: Record<PropertyKey, never>; Returns: boolean
+                           },
+"lock_and_validate_item_balance":
+{ Args: { "p_item_id": string,"p_occurred_at": string }; Returns: {
+              "avg_cost": number,
+"has_uncovered_deficit": boolean,
+"item_id": string,
+"last_occurred_at": string | null,
+"on_hand_qty": number,
+"on_hand_value": number
+            }
+                          SetofOptions: {
+        from: "*"
+        to: "item_balances"
+        isOneToOne: true
+        isSetofReturn: false
+      } },
+"post_movements":
+{ Args: { "p_movements": Json }; Returns: string
+                           },
+"post_sort":
+{ Args: { "p_mixed_item": string,"p_occurred_at": string,"p_qty_taken": number,"p_shift_id"?: string,"p_sizes": Json }; Returns: string
                            }
           }
           Enums: {
-            [_ in never]: never
+            "movement_type": "opening"|"purchase"|"sort_out"|"sort_in"|"sort_loss"|"sale"|"sale_reversal"|"waste"|"count_adjustment"|"cost_adjustment"
           }
           CompositeTypes: {
             [_ in never]: never
@@ -162,7 +304,7 @@ export type CompositeTypes<
 export const Constants = {
   "app": {
           Enums: {
-            
+            "movement_type": ["opening", "purchase", "sort_out", "sort_in", "sort_loss", "sale", "sale_reversal", "waste", "count_adjustment", "cost_adjustment"]
           }
         },"public": {
           Enums: {
