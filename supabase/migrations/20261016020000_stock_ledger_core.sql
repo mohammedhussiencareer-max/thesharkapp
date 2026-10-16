@@ -216,18 +216,39 @@ before truncate on app.stock_movements for each statement
 execute function app.prevent_stock_movements_mutation ();
 
 -- Movements are stored in the item's base unit without their own unit, so the
--- base unit is frozen once the item has any movement. The trigger takes the
--- same advisory lock as every posting: a concurrent first posting either
--- commits before this check (and is seen) or waits until this update commits
--- (and then reads the new unit). The UPDATE holds only a no-key row lock, which
--- does not block the posting's foreign-key share lock, so the two cannot deadlock.
+-- base unit is frozen once the item has any movement. An UPDATE that sets
+-- base_unit first takes the same advisory lock as every posting in a BEFORE
+-- STATEMENT trigger, before any row is locked: a concurrent first posting either
+-- commits before the row check (and is seen) or waits until this update commits
+-- (and then reads the new unit). Taking it only in the row trigger would deadlock
+-- when the UPDATE also changes a unique column (name): its FOR UPDATE row lock
+-- would block the posting's foreign-key share lock while it waits on the posting.
+create function app.trg_stock_items_base_unit_lock () returns trigger language plpgsql security definer
+set
+  search_path = '' as $$
+begin
+  perform pg_catalog.pg_advisory_xact_lock(7342750000000000001::bigint);
+  return null;
+end;
+$$;
+
+revoke all on function app.trg_stock_items_base_unit_lock ()
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create trigger trg_stock_items_base_unit_lock
+before update of base_unit on app.stock_items for each statement
+execute function app.trg_stock_items_base_unit_lock ();
+
 create function app.trg_stock_items_freeze_base_unit () returns trigger language plpgsql security definer
 set
   search_path = '' as $$
 begin
   if new.base_unit is distinct from old.base_unit then
-    perform pg_catalog.pg_advisory_xact_lock(7342750000000000001::bigint);
-
+    -- The advisory lock is already held by trg_stock_items_base_unit_lock.
     if exists (
       select
         1
