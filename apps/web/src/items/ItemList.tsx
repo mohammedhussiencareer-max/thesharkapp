@@ -11,11 +11,13 @@ const secondaryButton =
 function ItemCard({
   item,
   conversionsOpen,
+  editsDisabled,
   onEdit,
   onToggleConversions,
 }: {
   item: CatalogItem;
   conversionsOpen: boolean;
+  editsDisabled: boolean;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
 }) {
@@ -57,6 +59,7 @@ function ItemCard({
         <button
           className={secondaryButton}
           type="button"
+          disabled={editsDisabled}
           onClick={() => onEdit(item)}
         >
           تعديل
@@ -88,12 +91,14 @@ export function ItemList({
   items,
   showInactive,
   openConversionsId,
+  editsDisabled,
   onEdit,
   onToggleConversions,
 }: {
   items: readonly CatalogItem[];
   showInactive: boolean;
   openConversionsId: string | null;
+  editsDisabled: boolean;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
 }) {
@@ -103,6 +108,7 @@ export function ItemList({
       key={item.id}
       item={item}
       conversionsOpen={openConversionsId === item.id}
+      editsDisabled={editsDisabled}
       onEdit={onEdit}
       onToggleConversions={onToggleConversions}
     />
@@ -126,6 +132,7 @@ export function ItemList({
                 <ItemCard
                   item={block.parent}
                   conversionsOpen={openConversionsId === block.parent.id}
+                  editsDisabled={editsDisabled}
                   onEdit={onEdit}
                   onToggleConversions={onToggleConversions}
                 />

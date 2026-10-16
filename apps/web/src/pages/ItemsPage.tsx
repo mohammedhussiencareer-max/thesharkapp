@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { createItem, listItems, updateItem } from '@/items/api';
+import { sameEditor, type ItemEditor } from '@/items/editor';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import { groupCatalog } from '@/items/group';
 import { ItemForm } from '@/items/ItemForm';
@@ -14,8 +15,6 @@ const primaryButton =
   'w-fit rounded bg-neutral-900 px-3 py-2 text-white disabled:opacity-60';
 const secondaryButton =
   'w-fit rounded border border-neutral-300 px-3 py-2 disabled:opacity-60';
-
-type FormMode = { type: 'create' } | { type: 'edit'; id: string };
 
 function visibleCount(
   items: readonly CatalogItem[],
@@ -42,12 +41,18 @@ export function ItemsPage() {
   const [loading, setLoading] = useState(true);
   const [loadId, setLoadId] = useState(0);
   const [showInactive, setShowInactive] = useState(false);
-  const [formMode, setFormMode] = useState<FormMode | null>(null);
+  const [formMode, setFormMode] = useState<ItemEditor | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [openConversionsId, setOpenConversionsId] = useState<string | null>(
     null,
   );
+  const formModeRef = useRef<ItemEditor | null>(null);
+
+  function setEditor(next: ItemEditor | null) {
+    formModeRef.current = next;
+    setFormMode(next);
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -80,24 +85,34 @@ export function ItemsPage() {
   }
 
   function openCreate() {
+    if (saving) return;
     setFormError(null);
-    setFormMode({ type: 'create' });
+    setEditor({ type: 'create' });
+  }
+
+  function openEdit(item: CatalogItem) {
+    if (saving) return;
+    setFormError(null);
+    setEditor({ type: 'edit', id: item.id });
   }
 
   async function handleSubmit(draft: ItemDraft) {
-    if (!formMode) return;
+    const started = formModeRef.current;
+    if (!started || saving) return;
     setSaving(true);
     setFormError(null);
     try {
-      if (formMode.type === 'edit') {
-        await updateItem(formMode.id, draft);
+      if (started.type === 'edit') {
+        await updateItem(started.id, draft);
       } else {
         await createItem(draft);
       }
-      setFormMode(null);
+      if (sameEditor(formModeRef.current, started)) setEditor(null);
       refresh();
     } catch (error) {
-      setFormError(messageFrom(error));
+      if (sameEditor(formModeRef.current, started)) {
+        setFormError(messageFrom(error));
+      }
     } finally {
       setSaving(false);
     }
@@ -141,6 +156,7 @@ export function ItemsPage() {
             <button
               className={primaryButton}
               type="button"
+              disabled={saving}
               onClick={openCreate}
             >
               ضيف صنف
@@ -167,7 +183,8 @@ export function ItemsPage() {
               onClearServerError={() => setFormError(null)}
               onSubmit={(draft) => void handleSubmit(draft)}
               onCancel={() => {
-                setFormMode(null);
+                if (saving) return;
+                setEditor(null);
                 setFormError(null);
               }}
             />
@@ -181,10 +198,8 @@ export function ItemsPage() {
               items={items}
               showInactive={showInactive}
               openConversionsId={openConversionsId}
-              onEdit={(item) => {
-                setFormError(null);
-                setFormMode({ type: 'edit', id: item.id });
-              }}
+              editsDisabled={saving}
+              onEdit={openEdit}
               onToggleConversions={(itemId) =>
                 setOpenConversionsId((current) =>
                   current === itemId ? null : itemId,

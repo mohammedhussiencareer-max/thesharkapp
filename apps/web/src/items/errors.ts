@@ -6,8 +6,8 @@ const checkReasons: ReadonlyArray<readonly [string, string]> = [
     'مينفعش تغيّر وحدة صنف عليه حركات',
   ],
   [
-    'cannot change base_unit to a unit that already has a conversion',
-    'مينفعش تخلي الوحدة الأساسية وحدة ليها تحويل',
+    'cannot change base_unit while the item has unit conversions',
+    'امسح التحويلات الأول قبل ما تغيّر الوحدة',
   ],
   [
     'cannot store a conversion for the item base unit',

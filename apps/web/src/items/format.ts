@@ -1,24 +1,25 @@
+const qtyFormat = new Intl.NumberFormat('en-US', {
+  maximumFractionDigits: 3,
+  useGrouping: false,
+});
+
+const egpFormat = new Intl.NumberFormat('en-US', {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+  useGrouping: false,
+});
+
 function finite(value: number): number {
-  return Number.isFinite(value) ? value : 0;
+  if (!Number.isFinite(value) || Object.is(value, -0)) return 0;
+  return value;
 }
 
 export function formatQty(value: number): string {
-  const rounded = Math.round(finite(value) * 1000) / 1000;
-  const normalized = Object.is(rounded, -0) ? 0 : rounded;
-  return normalized.toLocaleString('en-US', {
-    maximumFractionDigits: 3,
-    useGrouping: false,
-  });
+  return qtyFormat.format(finite(value));
 }
 
 export function formatEgp(value: number): string {
-  const rounded = Math.round(finite(value) * 100) / 100;
-  const normalized = Object.is(rounded, -0) ? 0 : rounded;
-  return `${normalized.toLocaleString('en-US', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-    useGrouping: false,
-  })} ج.م`;
+  return `${egpFormat.format(finite(value))} ج.م`;
 }
 
 export function formatLossPercent(fraction: number): string {

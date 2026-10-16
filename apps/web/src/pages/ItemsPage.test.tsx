@@ -253,7 +253,7 @@ describe('ItemsPage', () => {
       target: { value: 'seafood' },
     });
     expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('kg');
-    expect(screen.getByLabelText('الجرد')).toHaveValue('weekly');
+    expect(screen.getByLabelText('الجرد')).toHaveValue('daily');
     fireEvent.change(screen.getByLabelText('الاسم'), {
       target: { value: '  جمبري وسط  ' },
     });
@@ -274,7 +274,7 @@ describe('ItemsPage', () => {
         name: 'جمبري وسط',
         kind: 'seafood',
         baseUnit: 'kg',
-        countFrequency: 'weekly',
+        countFrequency: 'daily',
         lossPct: 0.125,
         parentItemId: null,
         active: true,
@@ -400,5 +400,36 @@ describe('ItemsPage', () => {
       await within(box).findByText('1 كرتونة = 12 قطعة'),
     ).toBeInTheDocument();
     expect(addConversion).toHaveBeenCalledWith('box', 'كرتونة', 12);
+  });
+
+  it('does not switch editors while a save is in flight', async () => {
+    let resolveSave: (value: void) => void = () => undefined;
+    vi.mocked(updateItem).mockReturnValue(
+      new Promise((resolve) => {
+        resolveSave = resolve;
+      }),
+    );
+    await renderCatalog();
+
+    const mixed = screen.getByRole('article', { name: 'بوري مخلوط' });
+    fireEvent.click(within(mixed).getByRole('button', { name: 'تعديل' }));
+    fireEvent.change(screen.getByLabelText('الاسم'), {
+      target: { value: 'بوري جديد' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+
+    expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
+    const size = screen.getByRole('article', { name: 'بوري كبير' });
+    const sizeEdit = within(size).getByRole('button', { name: 'تعديل' });
+    expect(sizeEdit).toBeDisabled();
+
+    fireEvent.click(sizeEdit);
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف صنف' }));
+    expect(screen.getByLabelText('الاسم')).toHaveValue('بوري جديد');
+
+    resolveSave();
+    await waitFor(() => {
+      expect(screen.queryByRole('form')).not.toBeInTheDocument();
+    });
   });
 });

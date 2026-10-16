@@ -37,7 +37,7 @@ export function defaultsForKind(kind: StockKind): {
   baseUnit: BaseUnit;
   countFrequency: CountFrequency;
 } {
-  if (kind === 'fish_mixed' || kind === 'fish_size') {
+  if (kind === 'fish_mixed' || kind === 'fish_size' || kind === 'seafood') {
     return { baseUnit: 'kg', countFrequency: 'daily' };
   }
   if (kind === 'packaging') {

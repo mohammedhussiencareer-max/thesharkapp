@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (64);
+  plan (69);
 
 -- Clean up any existing test rows in the transaction.
 delete from app.provisional_deficits;
@@ -235,6 +235,23 @@ select
 
 -- 10
 select
+  ok (
+    not exists (
+      select
+        1
+      from
+        pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+      where
+        n.nspname = 'app'
+        and p.proname = 'trg_item_unit_conversions_reject_base_unit'
+        and pg_catalog.pg_get_functiondef (p.oid) like '%pg_advisory_xact_lock%'
+    ),
+    'conversion base-unit check does not take the posting advisory lock'
+  );
+
+-- 11
+select
   has_trigger (
     'app',
     'stock_items',
@@ -242,7 +259,7 @@ select
     'stock_items converted base-unit trigger exists'
   );
 
--- 11
+-- 12
 select
   results_eq (
     $$select pg_catalog.btrim(privilege_type::text) collate "default"
@@ -256,7 +273,7 @@ select
     'authenticated table privileges on stock_items are INSERT and SELECT'
   );
 
--- 12
+-- 13
 select
   is (
     (
@@ -283,7 +300,7 @@ select
     'authenticated can update the seven editable stock_items columns'
   );
 
--- 13
+-- 14
 select
   is (
     (
@@ -302,7 +319,7 @@ select
     'authenticated cannot update stock_items.id or created_at'
   );
 
--- 14
+-- 15
 select
   results_eq (
     $$select pg_catalog.btrim(privilege_type::text) collate "default"
@@ -334,7 +351,7 @@ select
 set
   local role authenticated;
 
--- 15
+-- 16
 select
   lives_ok (
     $$insert into app.stock_items (id, name, kind, base_unit, count_frequency)
@@ -348,7 +365,7 @@ select
     'owner can insert a fish_mixed item'
   );
 
--- 16
+-- 17
 select
   lives_ok (
     $$update app.stock_items
@@ -360,7 +377,7 @@ select
     'owner can update editable stock_items columns'
   );
 
--- 17
+-- 18
 select
   results_eq (
     $$select name, kind, base_unit, count_frequency, loss_pct::numeric, parent_item_id, active
@@ -378,7 +395,7 @@ select
     'owner update stores the loss fraction and the other editable columns'
   );
 
--- 18
+-- 19
 select
   lives_ok (
     $$insert into app.stock_items (id, name, kind, base_unit, count_frequency, parent_item_id)
@@ -393,7 +410,7 @@ select
     'owner can insert a fish_size under a fish_mixed parent'
   );
 
--- 19
+-- 20
 select
   results_eq (
     $$select kind, base_unit, parent_item_id
@@ -407,7 +424,7 @@ select
     'owner fish_size row keeps its fish_mixed parent'
   );
 
--- 20
+-- 21
 select
   lives_ok (
     $$insert into app.stock_items (id, name, kind, base_unit, count_frequency)
@@ -418,7 +435,7 @@ select
     'owner can insert seafood and ingredient items'
   );
 
--- 21
+-- 22
 select
   lives_ok (
     $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
@@ -426,7 +443,7 @@ select
     'owner can insert a conversion'
   );
 
--- 22
+-- 23
 select
   lives_ok (
     $$update app.item_unit_conversions
@@ -436,7 +453,7 @@ select
     'owner can update a conversion factor'
   );
 
--- 23
+-- 24
 select
   results_eq (
     $$select factor_to_base::numeric
@@ -447,7 +464,7 @@ select
     'owner conversion update stored the new factor'
   );
 
--- 24
+-- 25
 select
   lives_ok (
     $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
@@ -455,7 +472,7 @@ select
     'owner can insert a second conversion'
   );
 
--- 25
+-- 26
 select
   lives_ok (
     $$delete from app.item_unit_conversions
@@ -464,7 +481,7 @@ select
     'owner can delete a conversion'
   );
 
--- 26
+-- 27
 select
   is_empty (
     $$select 1
@@ -494,21 +511,21 @@ select
 set
   local role authenticated;
 
--- 27
+-- 28
 select
   is_empty (
     $$select id from app.stock_items$$,
     'non-owner select of stock_items returns zero rows'
   );
 
--- 28
+-- 29
 select
   is_empty (
     $$select item_id from app.item_unit_conversions$$,
     'non-owner select of item_unit_conversions returns zero rows'
   );
 
--- 29
+-- 30
 select
   throws_ok (
     $$insert into app.stock_items (name, kind, base_unit, count_frequency)
@@ -518,7 +535,7 @@ select
     'non-owner insert into stock_items is rejected by RLS'
   );
 
--- 30
+-- 31
 select
   lives_ok (
     $$update app.stock_items
@@ -527,7 +544,7 @@ select
     'non-owner update of stock_items is not a permission error'
   );
 
--- 31
+-- 32
 select
   throws_ok (
     $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
@@ -537,7 +554,7 @@ select
     'non-owner insert into item_unit_conversions is rejected by RLS'
   );
 
--- 32
+-- 33
 select
   lives_ok (
     $$update app.item_unit_conversions
@@ -547,7 +564,7 @@ select
     'non-owner update of a conversion is not a permission error'
   );
 
--- 33
+-- 34
 select
   lives_ok (
     $$delete from app.item_unit_conversions
@@ -556,7 +573,7 @@ select
     'non-owner delete of a conversion is not a permission error'
   );
 
--- 34
+-- 35
 select
   throws_ok (
     $$delete from app.stock_items
@@ -568,7 +585,7 @@ select
 
 reset role;
 
--- 35
+-- 36
 select
   is (
     (
@@ -583,7 +600,7 @@ select
     'non-owner update of stock_items affected zero rows'
   );
 
--- 36
+-- 37
 select
   results_eq (
     $$select factor_to_base::numeric
@@ -594,7 +611,7 @@ select
     'non-owner update of a conversion affected zero rows'
   );
 
--- 37
+-- 38
 select
   is (
     (
@@ -616,7 +633,7 @@ select
 set
   local role anon;
 
--- 38
+-- 39
 select
   throws_ok (
     $$select id from app.stock_items$$,
@@ -625,7 +642,7 @@ select
     'anon cannot select stock_items'
   );
 
--- 39
+-- 40
 select
   throws_ok (
     $$insert into app.stock_items (name, kind, base_unit, count_frequency)
@@ -635,7 +652,7 @@ select
     'anon cannot insert stock_items'
   );
 
--- 40
+-- 41
 select
   throws_ok (
     $$update app.stock_items set name = 'صنف مجهول'$$,
@@ -644,7 +661,7 @@ select
     'anon cannot update stock_items'
   );
 
--- 41
+-- 42
 select
   throws_ok (
     $$delete from app.stock_items$$,
@@ -653,7 +670,7 @@ select
     'anon cannot delete stock_items'
   );
 
--- 42
+-- 43
 select
   throws_ok (
     $$select item_id from app.item_unit_conversions$$,
@@ -662,7 +679,7 @@ select
     'anon cannot select item_unit_conversions'
   );
 
--- 43
+-- 44
 select
   throws_ok (
     $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
@@ -672,7 +689,7 @@ select
     'anon cannot insert item_unit_conversions'
   );
 
--- 44
+-- 45
 select
   throws_ok (
     $$update app.item_unit_conversions set factor_to_base = 1$$,
@@ -681,7 +698,7 @@ select
     'anon cannot update item_unit_conversions'
   );
 
--- 45
+-- 46
 select
   throws_ok (
     $$delete from app.item_unit_conversions$$,
@@ -710,7 +727,7 @@ select
 set
   local role authenticated;
 
--- 46
+-- 47
 select
   throws_ok (
     $$delete from app.stock_items
@@ -720,7 +737,7 @@ select
     'owner cannot delete a stock item'
   );
 
--- 47
+-- 48
 select
   throws_ok (
     $$update app.stock_items
@@ -731,7 +748,7 @@ select
     'owner cannot update stock_items.id'
   );
 
--- 48
+-- 49
 select
   throws_ok (
     $$update app.stock_items
@@ -746,7 +763,7 @@ select
 -- Conversion unit and base_unit stay distinct. Existing integrity triggers
 -- still apply to the owner.
 -- ============================================================================
--- 49
+-- 50
 select
   throws_ok (
     $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
@@ -756,7 +773,7 @@ select
     'conversion to the item base unit is rejected'
   );
 
--- 50
+-- 51
 select
   throws_ok (
     $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
@@ -766,7 +783,7 @@ select
     'conversion unit that trims to the base unit is rejected'
   );
 
--- 51
+-- 52
 select
   throws_ok (
     $$update app.item_unit_conversions
@@ -778,18 +795,18 @@ select
     'updating a conversion onto the base unit is rejected'
   );
 
--- 52
+-- 53
 select
   throws_ok (
     $$update app.stock_items
       set base_unit = 'piece'
       where id = '31000000-0000-4000-8000-000000000004'$$,
     '23514'::char(5),
-    'cannot change base_unit to a unit that already has a conversion',
-    'base_unit change to a converted unit is rejected'
+    'cannot change base_unit while the item has unit conversions',
+    'base_unit change while a conversion exists is rejected'
   );
 
--- 53
+-- 54
 select
   is (
     (
@@ -804,7 +821,50 @@ select
     'rejected base_unit change left the ingredient on kg'
   );
 
--- 54
+-- 55
+select
+  lives_ok (
+    $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
+      values ('31000000-0000-4000-8000-000000000005', 'bag', 25)$$,
+    'owner can add a bag conversion before changing base_unit'
+  );
+
+-- 56
+select
+  throws_ok (
+    $$update app.stock_items
+      set base_unit = 'liter'
+      where id = '31000000-0000-4000-8000-000000000005'$$,
+    '23514'::char(5),
+    'cannot change base_unit while the item has unit conversions',
+    'kg item cannot change to liter while bag = 25 exists'
+  );
+
+-- 57
+select
+  is (
+    (
+      select
+        base_unit
+      from
+        app.stock_items
+      where
+        id = '31000000-0000-4000-8000-000000000005'
+    ),
+    'kg'::text,
+    'rejected base_unit change left the uncounted item on kg'
+  );
+
+-- 58
+select
+  lives_ok (
+    $$delete from app.item_unit_conversions
+      where item_id = '31000000-0000-4000-8000-000000000005'
+        and unit = 'bag'$$,
+    'owner can delete the bag conversion'
+  );
+
+-- 59
 select
   lives_ok (
     $$update app.stock_items
@@ -813,7 +873,7 @@ select
     'owner can change base_unit before any movement or conversion'
   );
 
--- 55
+-- 60
 select
   is (
     (
@@ -828,7 +888,7 @@ select
     'base_unit change without movements or conversions was stored'
   );
 
--- 56
+-- 61
 select
   throws_ok (
     $$insert into app.stock_items (name, kind, base_unit, count_frequency)
@@ -838,7 +898,7 @@ select
     'owner insert of fish_size without a parent is rejected'
   );
 
--- 57
+-- 62
 select
   throws_ok (
     $$insert into app.stock_items (name, kind, base_unit, count_frequency, parent_item_id)
@@ -854,7 +914,7 @@ select
     'owner insert of fish_size under a non-fish_mixed parent is rejected'
   );
 
--- 58
+-- 63
 select
   throws_ok (
     $$insert into app.stock_items (name, kind, base_unit, count_frequency, parent_item_id)
@@ -870,7 +930,7 @@ select
     'owner insert of a non-fish_size item with a parent is rejected'
   );
 
--- 59
+-- 64
 select
   throws_ok (
     $$update app.stock_items
@@ -881,7 +941,7 @@ select
     'owner cannot change kind of a fish_mixed item that has sizes'
   );
 
--- 60
+-- 65
 select
   throws_ok (
     $$insert into app.stock_items (name, kind, base_unit, count_frequency)
@@ -891,7 +951,7 @@ select
     'owner duplicate item name is a unique violation'
   );
 
--- 61
+-- 66
 select
   throws_ok (
     $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
@@ -916,7 +976,7 @@ select
 set
   local role service_role;
 
--- 62
+-- 67
 select
   lives_ok (
     $$select app.post_movements(
@@ -950,7 +1010,7 @@ select
 set
   local role authenticated;
 
--- 63
+-- 68
 select
   throws_ok (
     $$update app.stock_items
@@ -961,7 +1021,7 @@ select
     'owner cannot change base_unit after a movement'
   );
 
--- 64
+-- 69
 select
   is (
     (

@@ -40,14 +40,13 @@ describe('mapCatalogError', () => {
     ).toBe('مينفعش التحويل يبقى بنفس الوحدة الأساسية');
   });
 
-  it('maps a base unit that already has a conversion', () => {
+  it('maps a base unit change while conversions exist', () => {
     expect(
       mapCatalogError({
         code: '23514',
-        details:
-          'cannot change base_unit to a unit that already has a conversion',
+        details: 'cannot change base_unit while the item has unit conversions',
       }),
-    ).toBe('مينفعش تخلي الوحدة الأساسية وحدة ليها تحويل');
+    ).toBe('امسح التحويلات الأول قبل ما تغيّر الوحدة');
   });
 
   it('says a check violation is not allowed when the reason is unknown', () => {

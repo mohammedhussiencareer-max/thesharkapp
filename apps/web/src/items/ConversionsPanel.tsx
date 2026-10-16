@@ -183,7 +183,19 @@ export function ConversionsPanel({ item }: { item: CatalogItem }) {
 
   return (
     <div className="flex flex-col gap-3">
-      {rows.length === 0 ? <p>مفيش تحويلات للصنف ده</p> : null}
+      {loadError ? (
+        <div className="flex flex-col gap-2">
+          <p role="alert">{loadError}</p>
+          <button
+            className={secondaryButton}
+            type="button"
+            onClick={() => void load()}
+          >
+            إعادة المحاولة
+          </button>
+        </div>
+      ) : null}
+      {rows.length === 0 && !loadError ? <p>مفيش تحويلات للصنف ده</p> : null}
       {rows.map((conversion) => (
         <ConversionRow
           key={`${conversion.unit}@${conversion.factorToBase}`}
