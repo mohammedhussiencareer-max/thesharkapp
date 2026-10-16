@@ -52,10 +52,12 @@ export function ItemsPage() {
   const [formEpoch, setFormEpoch] = useState(0);
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // A save landed but the reload after it failed: stay locked until a reload succeeds.
+  const [needsReload, setNeedsReload] = useState(false);
   // One page-wide lock: while an item save or a conversion operation (and the
   // reload after it) is in flight, nothing that edits data or remounts a panel
   // can start, so no editor or panel ever opens on stale data.
-  const busy = saving || conversionsBusy;
+  const busy = saving || conversionsBusy || needsReload || loading;
   const [openConversionsId, setOpenConversionsId] = useState<string | null>(
     null,
   );
@@ -72,6 +74,7 @@ export function ItemsPage() {
     const next = await listItems();
     setItems(next);
     setLoadError(null);
+    setNeedsReload(false);
     const editing = formModeRef.current;
     if (staleItemId && editing?.type === 'edit' && editing.id === staleItemId) {
       const fresh = next.find((row) => row.id === staleItemId);
@@ -91,7 +94,7 @@ export function ItemsPage() {
         if (cancelled) return;
         setItems(next);
         setLoadError(null);
-        setSaving(false);
+        setNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
         setLoadError(messageFrom(error));
@@ -105,6 +108,7 @@ export function ItemsPage() {
   }, [loadId]);
 
   function retry() {
+    if (saving || conversionsBusy || loading) return;
     setLoading(true);
     setLoadError(null);
     setLoadId((value) => value + 1);
@@ -131,7 +135,6 @@ export function ItemsPage() {
     setSaving(true);
     setFormError(null);
     let saved = false;
-    let unlock = true;
     try {
       if (started.type === 'edit') {
         const expected = expectedRef.current;
@@ -162,11 +165,11 @@ export function ItemsPage() {
           setFormError(messageFrom(error));
         }
       } else {
-        unlock = false;
+        setNeedsReload(true);
         setLoadError(messageFrom(error));
       }
     } finally {
-      if (unlock) setSaving(false);
+      setSaving(false);
     }
   }
 
@@ -189,7 +192,12 @@ export function ItemsPage() {
       {items === null && !loading ? (
         <div className="flex flex-col gap-3">
           <p role="alert">{loadError ?? genericCatalogError}</p>
-          <button className={secondaryButton} type="button" onClick={retry}>
+          <button
+            className={secondaryButton}
+            type="button"
+            disabled={saving || conversionsBusy || loading}
+            onClick={retry}
+          >
             إعادة المحاولة
           </button>
         </div>
@@ -199,7 +207,12 @@ export function ItemsPage() {
           {loadError ? (
             <div className="flex flex-col gap-2">
               <p role="alert">{loadError}</p>
-              <button className={secondaryButton} type="button" onClick={retry}>
+              <button
+                className={secondaryButton}
+                type="button"
+                disabled={saving || conversionsBusy || loading}
+                onClick={retry}
+              >
                 إعادة المحاولة
               </button>
             </div>
@@ -236,7 +249,7 @@ export function ItemsPage() {
                 editingItem ? itemToFormValues(editingItem) : emptyItemForm()
               }
               submitting={saving}
-              locked={conversionsBusy}
+              locked={busy}
               serverError={formError}
               onClearServerError={() => setFormError(null)}
               onSubmit={(draft) => void handleSubmit(draft)}

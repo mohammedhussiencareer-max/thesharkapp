@@ -289,4 +289,28 @@ describe('ConversionsPanel', () => {
     ).toBeInTheDocument();
     expect(screen.getByText('1 كرتونة = 12 كيلو')).toBeInTheDocument();
   });
+
+  it('re-initializes the factor input when only the base unit changes', async () => {
+    const bag = {
+      itemId: 'oil',
+      unit: 'كيس',
+      factorToBase: 2,
+      storedFactor: '2',
+    };
+    // Deleted, base unit changed, re-added with the same factor elsewhere.
+    vi.mocked(listConversions)
+      .mockResolvedValueOnce(snapshot([bag], 'kg'))
+      .mockResolvedValueOnce(snapshot([bag], 'liter'));
+    vi.mocked(updateConversion).mockRejectedValueOnce(new StaleWriteError());
+
+    render(<ConversionsPanel item={item} />);
+    expect(await screen.findByText('1 كيس = 2 كيلو')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('معامل كيس'), {
+      target: { value: '25' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+
+    expect(await screen.findByText('1 كيس = 2 لتر')).toBeInTheDocument();
+    expect(screen.getByLabelText('معامل كيس')).toHaveValue('2');
+  });
 });

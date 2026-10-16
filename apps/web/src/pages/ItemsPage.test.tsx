@@ -889,4 +889,91 @@ describe('ItemsPage', () => {
       );
     });
   });
+
+  it('keeps the page locked until a reload after a landed save succeeds', async () => {
+    await renderCatalog();
+    vi.mocked(listItems).mockRejectedValueOnce(
+      new Error('حصل خطأ. حاول تاني.'),
+    );
+
+    const mixed = screen.getByRole('article', { name: 'بوري مخلوط' });
+    fireEvent.click(within(mixed).getByRole('button', { name: 'تعديل' }));
+    fireEvent.change(screen.getByLabelText('الاسم'), {
+      target: { value: 'بوري جديد' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'حصل خطأ. حاول تاني.',
+    );
+    expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
+
+    let resolveRetry: (value: CatalogItem[]) => void = () => undefined;
+    vi.mocked(listItems).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveRetry = resolve;
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
+
+    resolveRetry(
+      catalog.map((row) =>
+        row.id === 'mixed' ? { ...row, name: 'بوري جديد' } : row,
+      ),
+    );
+    expect(
+      await screen.findByRole('heading', { name: 'بوري جديد' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
+  });
+
+  it('does not let a retry finish unlock a save that is still running', async () => {
+    const oil = item({
+      id: 'oil',
+      name: 'زيت',
+      kind: 'ingredient',
+      baseUnit: 'kg',
+      active: true,
+    });
+    let loads = 0;
+    vi.mocked(listItems).mockImplementation(() => {
+      loads += 1;
+      if (loads === 2) return Promise.reject(new Error('حصل خطأ. حاول تاني.'));
+      return Promise.resolve([oil]);
+    });
+    // A newer base unit makes the panel reload the catalog, and that fails.
+    vi.mocked(listConversions).mockResolvedValue(listed([], 'liter'));
+    let releaseSave: () => void = () => undefined;
+    vi.mocked(updateItem).mockReturnValueOnce(
+      new Promise((resolve) => {
+        releaseSave = () => resolve(undefined);
+      }),
+    );
+
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole('article', { name: 'زيت' });
+    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+    const retry = await screen.findByRole('button', {
+      name: 'إعادة المحاولة',
+    });
+
+    fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
+    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+    await waitFor(() => {
+      expect(updateItem).toHaveBeenCalledTimes(1);
+    });
+    expect(retry).toBeDisabled();
+    fireEvent.click(retry);
+    expect(loads).toBe(2);
+
+    releaseSave();
+    await waitFor(() => {
+      expect(screen.queryByRole('form')).not.toBeInTheDocument();
+    });
+  });
 });
