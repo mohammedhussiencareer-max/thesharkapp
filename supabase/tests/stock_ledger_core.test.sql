@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (88);
+  plan (90);
 
 -- Clean up any existing test rows in the transaction.
 delete from app.provisional_deficits;
@@ -1839,7 +1839,7 @@ select
 
 -- 56: Sort with a size of the wrong parent
 select
-  throws_ok (
+  throws_like (
     $$select app.post_sort(
       '10000000-0000-4000-8000-000000000005',
       '2026-10-16T12:00:00Z',
@@ -1851,14 +1851,13 @@ select
         )
       )
     )$$,
-    '22023'::char(5),
-    null::text,
+    'size item % is not a valid fish_size child of mixed item %',
     'Guard: post_sort with a fish_size of the wrong parent raises'
   );
 
 -- 57: Sort with sizes summing above qty taken
 select
-  throws_ok (
+  throws_like (
     $$select app.post_sort(
       '10000000-0000-4000-8000-000000000005',
       '2026-10-16T12:00:00Z',
@@ -1874,8 +1873,7 @@ select
         )
       )
     )$$,
-    '22023'::char(5),
-    null::text,
+    'sum of sorted sizes (%) exceeds p_qty_taken (%)',
     'Guard: post_sort with sizes summing above p_qty_taken raises'
   );
 
@@ -2572,6 +2570,44 @@ select
       0.00::numeric(14,2)
     )$$,
     'Sort allocation: every share is >= 0, three sizes are posted, and sort_in value plus loss equals 0.02 with nothing left on the mixed item'
+  );
+
+-- 89: Infinite timestamp is rejected on the movements path
+select
+  throws_ok (
+    $$select app.post_movements(
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000001',
+          'movement_type', 'purchase',
+          'occurred_at', 'infinity',
+          'quantity', 1,
+          'unit_cost', 100
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'occurred_at must be a finite timestamp',
+    'Guard: post_movements rejects an infinite occurred_at'
+  );
+
+-- 90: Infinite timestamp is rejected on the sorting path
+select
+  throws_ok (
+    $$select app.post_sort(
+      '10000000-0000-4000-8000-000000000005',
+      'infinity',
+      1,
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', '10000000-0000-4000-8000-000000000006',
+          'quantity', 1
+        )
+      )
+    )$$,
+    '22023'::char(5),
+    'occurred_at must be a finite timestamp',
+    'Guard: post_sort rejects an infinite occurred_at'
   );
 
 reset role;

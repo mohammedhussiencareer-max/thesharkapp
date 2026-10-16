@@ -316,6 +316,12 @@ begin
       using errcode = '22023';
   end if;
 
+  -- An infinite timestamp would become last_occurred_at and block every later movement.
+  if not pg_catalog.isfinite(p_occurred_at) then
+    raise exception 'occurred_at must be a finite timestamp'
+      using errcode = '22023';
+  end if;
+
   insert into
     app.item_balances (
       item_id,
