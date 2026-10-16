@@ -61,6 +61,7 @@ where
 -- way) run one after the other. The row trigger then checks the item's base
 -- unit; while any conversion exists, trg_stock_items_reject_converted_base_unit
 -- rejects a base_unit change.
+-- Shared by the conversion writes and item deletes: takes the posting advisory lock.
 create function app.trg_item_unit_conversions_lock () returns trigger language plpgsql security definer
 set
   search_path = '' as $$
@@ -79,6 +80,14 @@ from
 
 create trigger trg_item_unit_conversions_lock
 before insert or update or delete on app.item_unit_conversions for each statement
+execute function app.trg_item_unit_conversions_lock ();
+
+-- Deleting an item cascades to its conversions, whose statement trigger takes
+-- the posting advisory lock only after the item row is locked. Take the lock
+-- first, before any item row lock, so a delete cannot deadlock with a posting
+-- that waits on the item row for its foreign-key check.
+create trigger trg_stock_items_delete_lock
+before delete on app.stock_items for each statement
 execute function app.trg_item_unit_conversions_lock ();
 
 create function app.trg_item_unit_conversions_reject_base_unit () returns trigger language plpgsql security definer

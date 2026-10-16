@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (70);
+  plan (71);
 
 -- Clean up any existing test rows in the transaction.
 delete from app.provisional_deficits;
@@ -264,6 +264,22 @@ select
     ),
     30,
     'trg_item_unit_conversions_lock is BEFORE INSERT OR UPDATE OR DELETE FOR EACH STATEMENT'
+  );
+
+-- 10c: item deletes take the posting advisory lock per statement, before row locks
+select
+  is (
+    (
+      select
+        t.tgtype::int
+      from
+        pg_catalog.pg_trigger t
+      where
+        t.tgrelid = 'app.stock_items'::regclass
+        and t.tgname = 'trg_stock_items_delete_lock'
+    ),
+    10,
+    'trg_stock_items_delete_lock is BEFORE DELETE FOR EACH STATEMENT'
   );
 
 -- 11
