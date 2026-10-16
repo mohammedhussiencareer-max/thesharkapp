@@ -62,8 +62,14 @@ jobs:
         with:
           node-version-file: .nvmrc
           cache: pnpm
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.121.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
+      - name: Start Supabase
+        run: supabase start --exclude studio,imgproxy,mailpit,edge-runtime,vector,logflare,realtime,storage-api
+      - run: pnpm db:reset
       - run: pnpm e2e
       - uses: actions/upload-artifact@v4
         if: failure()
@@ -71,3 +77,6 @@ jobs:
           name: playwright-report
           path: apps/web/playwright-report
           if-no-files-found: ignore
+      - name: Stop Supabase
+        if: always()
+        run: supabase stop

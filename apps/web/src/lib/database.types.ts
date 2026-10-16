@@ -5,13 +5,29 @@ export type Database = {
   
   "app": {
           Tables: {
-            [_ in never]: never
+            "owner": {
+                  Row: {
+                    "created_at": string,"id": boolean,"user_id": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_at"?: string,"id"?: boolean,"user_id": string
+                  }
+                  Update: {
+                    "created_at"?: string,"id"?: boolean,"user_id"?: string
+                  }
+                  Relationships: [
+                    
+                  ]
+                }
           }
           Views: {
             [_ in never]: never
           }
           Functions: {
-            [_ in never]: never
+            "is_owner":
+{ Args: Record<PropertyKey, never>; Returns: boolean
+                           }
           }
           Enums: {
             [_ in never]: never
