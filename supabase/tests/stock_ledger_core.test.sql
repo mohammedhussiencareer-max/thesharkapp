@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (85);
+  plan (88);
 
 -- Clean up any existing test rows in the transaction.
 delete from app.provisional_deficits;
@@ -297,6 +297,26 @@ values
     'daily',
     0,
     null
+  ),
+  -- Partial deficit cover rounding item
+  (
+    '10000000-0000-4000-8000-000000000022',
+    'جمبري جامبو',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  -- Sort remainder allocation mixed item
+  (
+    '10000000-0000-4000-8000-000000000023',
+    'قاروص مخلوط',
+    'fish_mixed',
+    'kg',
+    'daily',
+    0,
+    null
   );
 
 insert into
@@ -381,6 +401,33 @@ values
     'daily',
     0,
     '10000000-0000-4000-8000-000000000017'
+  ),
+  (
+    '10000000-0000-4000-8000-000000000024',
+    'قاروص كبير',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    '10000000-0000-4000-8000-000000000023'
+  ),
+  (
+    '10000000-0000-4000-8000-000000000025',
+    'قاروص وسط',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    '10000000-0000-4000-8000-000000000023'
+  ),
+  (
+    '10000000-0000-4000-8000-000000000026',
+    'قاروص صغير',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    '10000000-0000-4000-8000-000000000023'
   );
 
 insert into
@@ -1580,7 +1627,30 @@ select
         4,
         'shift_id',
         'shift-B'
-      ),
+      )
+    )
+  );
+
+-- Freeze each provisional sale id before the covering purchase. The assertion
+-- compares adjusts_movement_id to these ids, so it fails if an adjustment
+-- points at a different movement.
+create temp table provisional_sale_ids on
+commit
+drop as
+select
+  id,
+  shift_id,
+  occurred_at
+from
+  app.stock_movements
+where
+  item_id = '10000000-0000-4000-8000-000000000021'
+  and movement_type = 'sale'
+  and is_provisional;
+
+select
+  app.post_movements (
+    jsonb_build_array(
       jsonb_build_object(
         'item_id',
         '10000000-0000-4000-8000-000000000021',
@@ -1604,16 +1674,25 @@ select
     $$select
         ca.total_cost,
         ca.shift_id,
-        ca.adjusts_movement_id = s.id as points_to_expected_sale
+        ca.adjusts_movement_id
       from app.stock_movements ca
-      join app.stock_movements s on s.id = ca.adjusts_movement_id
       where ca.item_id = '10000000-0000-4000-8000-000000000021'
         and ca.movement_type = 'cost_adjustment'
       order by ca.id$$,
-    $$values
-      (-60.00::numeric(14,2), 'shift-A'::text, true),
-      (-40.00::numeric(14,2), 'shift-B'::text, true)$$,
-    'Two provisional deficits: covered oldest-first with cost_adjustments -60.00 (shift-A) and -40.00 (shift-B)'
+    $$select
+        v.total_cost,
+        v.shift_id,
+        s.id
+      from (
+        values
+          (-60.00::numeric(14,2), 'shift-A'::text, '2026-10-16T09:00:00Z'::timestamptz),
+          (-40.00::numeric(14,2), 'shift-B'::text, '2026-10-16T10:00:00Z'::timestamptz)
+      ) as v (total_cost, shift_id, occurred_at)
+      join provisional_sale_ids s
+        on s.shift_id = v.shift_id
+        and s.occurred_at = v.occurred_at
+      order by v.occurred_at$$,
+    'Two provisional deficits: covered oldest-first with cost_adjustments -60.00 (shift-A) and -40.00 (shift-B) pointing at the captured provisional sales'
   );
 
 -- 51
@@ -2277,6 +2356,222 @@ select
       )
     )$$,
     'Auth: service_role can execute app.post_movements'
+  );
+
+reset role;
+
+-- ============================================================================
+-- 86..88: Piaster conservation on partial deficit cover and sort allocation
+-- ============================================================================
+select
+  set_config(
+    'request.jwt.claims',
+    jsonb_build_object(
+      'sub',
+      'b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f',
+      'role',
+      'authenticated'
+    )::text,
+    true
+  );
+
+set
+  local role authenticated;
+
+-- Balance 0 with last avg 100.50, then sell 0.02 kg (provisional -2.01) and
+-- buy 0.01 kg at 101 twice. The second cover must absorb the leftover piaster.
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000022',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:00:00Z',
+        'quantity',
+        1,
+        'unit_cost',
+        100.50
+      ),
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000022',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-10-16T08:10:00Z',
+        'quantity',
+        1
+      ),
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000022',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-10-16T08:20:00Z',
+        'quantity',
+        0.02
+      ),
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000022',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:30:00Z',
+        'quantity',
+        0.01,
+        'unit_cost',
+        101
+      ),
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000022',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:40:00Z',
+        'quantity',
+        0.01,
+        'unit_cost',
+        101
+      )
+    )
+  );
+
+-- 86
+select
+  results_eq (
+    $$select
+        ib.on_hand_qty,
+        ib.on_hand_value,
+        (
+          select
+            (sm.total_cost + coalesce(sum(ca.total_cost), 0))::numeric(14,2)
+          from app.stock_movements sm
+          left join app.stock_movements ca
+            on ca.adjusts_movement_id = sm.id
+            and ca.movement_type = 'cost_adjustment'
+          where sm.item_id = ib.item_id
+            and sm.movement_type = 'sale'
+            and sm.is_provisional
+            and sm.quantity = -0.020000
+          group by sm.id, sm.total_cost
+        ),
+        (
+          select coalesce(sum(sm.total_cost), 0)::numeric(14,2)
+          from app.stock_movements sm
+          where sm.item_id = ib.item_id
+        ),
+        pd.qty_uncovered,
+        pd.value_uncovered
+      from app.item_balances ib
+      join app.provisional_deficits pd on pd.item_id = ib.item_id
+      where ib.item_id = '10000000-0000-4000-8000-000000000022'$$,
+    $$values (
+      0.000000::numeric(20,6),
+      0.00::numeric(14,2),
+      -2.02::numeric(14,2),
+      0.00::numeric(14,2),
+      0.000000::numeric(20,6),
+      0.00::numeric(14,2)
+    )$$,
+    'Partial deficit cover: 0.02 kg sold at avg 100.50 then two 0.01 kg buys at 101 leave qty 0, value 0.00, sale-plus-adjustments -2.02, and ledger sum equal to on_hand_value'
+  );
+
+-- Buy 0.04 kg at 0.50 (value 0.02), then sort all of it into three 0.01 sizes
+-- with 0.01 loss. Independent rounding used to give the last size a negative value.
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000023',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:00:00Z',
+        'quantity',
+        0.04,
+        'unit_cost',
+        0.50
+      )
+    )
+  );
+
+create temp table sort_rounding_batch (batch_id uuid) on
+commit
+drop;
+
+-- 87
+select
+  lives_ok (
+    $$insert into sort_rounding_batch
+      select app.post_sort(
+        '10000000-0000-4000-8000-000000000023',
+        '2026-10-16T09:00:00Z',
+        0.04,
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id', '10000000-0000-4000-8000-000000000024',
+            'quantity', 0.01
+          ),
+          jsonb_build_object(
+            'item_id', '10000000-0000-4000-8000-000000000025',
+            'quantity', 0.01
+          ),
+          jsonb_build_object(
+            'item_id', '10000000-0000-4000-8000-000000000026',
+            'quantity', 0.01
+          )
+        )
+      )$$,
+    'Sort allocation: sorting 0.04 kg worth 0.02 into 0.01 loss and three 0.01 sizes succeeds, including a zero-value size'
+  );
+
+-- 88
+select
+  results_eq (
+    $$select
+        (
+          select count(*)::int
+          from app.stock_movements sm
+          where sm.batch_id = (select batch_id from sort_rounding_batch)
+            and (
+              (sm.movement_type = 'sort_in' and sm.total_cost < 0)
+              or (sm.movement_type = 'sort_loss' and sm.total_cost > 0)
+            )
+        ),
+        (
+          select count(*)::int
+          from app.stock_movements sm
+          where sm.batch_id = (select batch_id from sort_rounding_batch)
+            and sm.movement_type = 'sort_in'
+        ),
+        (
+          select
+            (
+              coalesce(sum(sm.total_cost) filter (where sm.movement_type = 'sort_in'), 0)
+              - coalesce(sum(sm.total_cost) filter (where sm.movement_type = 'sort_loss'), 0)
+            )::numeric(14,2)
+          from app.stock_movements sm
+          where sm.batch_id = (select batch_id from sort_rounding_batch)
+        ),
+        ib.on_hand_qty,
+        ib.on_hand_value
+      from app.item_balances ib
+      where ib.item_id = '10000000-0000-4000-8000-000000000023'$$,
+    $$values (
+      0,
+      3,
+      0.02::numeric(14,2),
+      0.000000::numeric(20,6),
+      0.00::numeric(14,2)
+    )$$,
+    'Sort allocation: every share is >= 0, three sizes are posted, and sort_in value plus loss equals 0.02 with nothing left on the mixed item'
   );
 
 reset role;

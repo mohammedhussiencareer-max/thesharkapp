@@ -61,14 +61,14 @@ isOneToOne: false
                   ]
                 },"provisional_deficits": {
                   Row: {
-                    "item_id": string,"movement_id": number,"provisional_unit_cost": number,"qty_uncovered": number
+                    "item_id": string,"movement_id": number,"provisional_unit_cost": number,"qty_uncovered": number,"value_uncovered": number
                   }
                   ComputedFields: never
                   Insert: {
-                    "item_id": string,"movement_id": number,"provisional_unit_cost": number,"qty_uncovered": number
+                    "item_id": string,"movement_id": number,"provisional_unit_cost": number,"qty_uncovered": number,"value_uncovered": number
                   }
                   Update: {
-                    "item_id"?: string,"movement_id"?: number,"provisional_unit_cost"?: number,"qty_uncovered"?: number
+                    "item_id"?: string,"movement_id"?: number,"provisional_unit_cost"?: number,"qty_uncovered"?: number,"value_uncovered"?: number
                   }
                   Relationships: [
                     {

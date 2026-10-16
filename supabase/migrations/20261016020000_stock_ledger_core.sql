@@ -247,10 +247,15 @@ create table app.provisional_deficits (
   provisional_unit_cost numeric(20, 6) not null check (
     provisional_unit_cost <> 'NaN'::numeric
     and provisional_unit_cost >= 0
+  ),
+  value_uncovered numeric(14, 2) not null check (
+    value_uncovered <> 'NaN'::numeric
+    and value_uncovered <> 'Infinity'::numeric
+    and value_uncovered >= 0
   )
 );
 
-comment on table app.provisional_deficits is 'Tracks uncovered negative-stock outflow movements until subsequent inflows cover them.';
+comment on table app.provisional_deficits is 'Tracks uncovered negative-stock outflow movements until subsequent inflows cover them. value_uncovered is the provisional value still to be replaced.';
 
 create index provisional_deficits_uncovered_idx on app.provisional_deficits (item_id, movement_id)
 where
@@ -485,14 +490,16 @@ begin
         movement_id,
         item_id,
         qty_uncovered,
-        provisional_unit_cost
+        provisional_unit_cost,
+        value_uncovered
       )
     values
       (
         v_prov_movement_id,
         p_item_id,
         v_prov_qty,
-        v_unit_cost
+        v_unit_cost,
+        abs(v_prov_cost)
       );
 
     v_delta_value := v_delta_value + v_prov_cost;
@@ -563,6 +570,7 @@ declare
   v_remaining_inflow_value numeric(14, 2);
   v_covered_qty numeric(20, 6);
   v_covered_inflow_value numeric(14, 2);
+  v_covered_prov_value numeric(14, 2);
   v_adj_unit_cost numeric(20, 6);
   v_adj_total_cost numeric(14, 2);
   v_prior_pos_qty numeric(20, 6);
@@ -644,6 +652,7 @@ begin
     select
       pd.movement_id,
       pd.qty_uncovered,
+      pd.value_uncovered,
       pd.provisional_unit_cost,
       sm.shift_id as prov_shift_id
     from
@@ -669,10 +678,20 @@ begin
       );
     end if;
 
+    -- Conserve the original provisional value. A cover of the whole remainder
+    -- takes value_uncovered exactly; a partial cover takes its quantity share,
+    -- rounded to the piaster. provisional_unit_cost stays for unit_cost only.
+    if v_covered_qty = r_def.qty_uncovered then
+      v_covered_prov_value := r_def.value_uncovered;
+    else
+      v_covered_prov_value := pg_catalog.round(
+        r_def.value_uncovered * v_covered_qty / r_def.qty_uncovered,
+        2
+      );
+    end if;
+
     v_adj_unit_cost := v_inflow_unit_cost - r_def.provisional_unit_cost;
-    v_adj_total_cost := -(
-      v_covered_inflow_value - pg_catalog.round(v_covered_qty * r_def.provisional_unit_cost, 2)
-    );
+    v_adj_total_cost := -(v_covered_inflow_value - v_covered_prov_value);
 
     insert into
       app.stock_movements (
@@ -709,7 +728,8 @@ begin
 
     update app.provisional_deficits
     set
-      qty_uncovered = qty_uncovered - v_covered_qty
+      qty_uncovered = qty_uncovered - v_covered_qty,
+      value_uncovered = value_uncovered - v_covered_prov_value
     where
       movement_id = r_def.movement_id;
 
@@ -1056,7 +1076,8 @@ declare
   v_value_taken numeric(14, 2);
   v_loss_value numeric(14, 2);
   v_sort_out_value numeric(14, 2);
-  v_allocated_value numeric(14, 2) := 0;
+  v_remaining_value numeric(14, 2);
+  v_remaining_qty numeric(20, 6);
   v_size_value numeric(14, 2);
   v_size_unit_cost numeric(20, 6);
   v_num_sizes int;
@@ -1202,13 +1223,32 @@ begin
 
   v_loss_qty := v_qty_taken - v_sum_sizes;
 
+  -- Allocate against the remaining value and quantity (loss first, then sizes).
+  -- Each non-final share is round(remaining_value * share_qty / remaining_qty, 2),
+  -- clamped to [0, remaining_value]. The last size takes the remainder, so every
+  -- share is >= 0 and loss + sum(sizes) = value_taken exactly. A size may be 0.
+  v_remaining_value := v_value_taken;
+  v_remaining_qty := v_qty_taken;
+
   if v_loss_qty > 0 then
-    v_loss_value := pg_catalog.round(v_value_taken * v_loss_qty / v_qty_taken, 2);
+    v_loss_value := pg_catalog.round(
+      v_remaining_value * v_loss_qty / v_remaining_qty,
+      2
+    );
+
+    if v_loss_value < 0 then
+      v_loss_value := 0;
+    elsif v_loss_value > v_remaining_value then
+      v_loss_value := v_remaining_value;
+    end if;
+
+    v_remaining_value := v_remaining_value - v_loss_value;
+    v_remaining_qty := v_remaining_qty - v_loss_qty;
   else
     v_loss_value := 0;
   end if;
 
-  v_sort_out_value := v_value_taken - v_loss_value;
+  v_sort_out_value := v_remaining_value;
 
   -- 1. sort_out of sum(sizes) from mixed item removing v_sort_out_value.
   perform app.apply_outflow_movement (
@@ -1240,7 +1280,7 @@ begin
     );
   end if;
 
-  -- 3. sort_in for each size, splitting proportionally and giving rounding remainder to last size.
+  -- 3. sort_in for each size. The last size receives the remaining value (may be 0).
   for v_elem, v_ord in
     select
       e.value,
@@ -1251,12 +1291,23 @@ begin
     v_size_id := (v_elem ->> 'item_id')::uuid;
     v_size_qty := pg_catalog.round((v_elem ->> 'quantity')::numeric, 6);
 
-    if v_ord < v_num_sizes then
-      v_size_value := pg_catalog.round(v_value_taken * v_size_qty / v_qty_taken, 2);
-      v_allocated_value := v_allocated_value + v_size_value;
+    if v_ord = v_num_sizes then
+      v_size_value := v_remaining_value;
     else
-      v_size_value := v_value_taken - v_loss_value - v_allocated_value;
+      v_size_value := pg_catalog.round(
+        v_remaining_value * v_size_qty / v_remaining_qty,
+        2
+      );
+
+      if v_size_value < 0 then
+        v_size_value := 0;
+      elsif v_size_value > v_remaining_value then
+        v_size_value := v_remaining_value;
+      end if;
     end if;
+
+    v_remaining_value := v_remaining_value - v_size_value;
+    v_remaining_qty := v_remaining_qty - v_size_qty;
 
     v_size_unit_cost := pg_catalog.round(v_size_value / v_size_qty, 6);
 
