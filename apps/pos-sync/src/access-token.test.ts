@@ -25,6 +25,7 @@ describe('loadAccessToken', () => {
         expect(args).toEqual(['auth', 'print-access-token']);
         return { stdout: 'ya29.FROM-GCLOUD\n' };
       },
+      'linux',
     );
     expect(token).toBe('ya29.FROM-GCLOUD');
     expect(seen?.shell).toBe(false);
@@ -33,6 +34,60 @@ describe('loadAccessToken', () => {
     expect(seen?.encoding).toBe('utf8');
     expect(seen?.env.CLOUDSDK_ACTIVE_CONFIG_NAME).toBe('theshark');
     expect(seen?.env.PATH).toBe('C:\\tools');
+  });
+
+  it('runs gcloud through ComSpec on win32 without a shell', async () => {
+    let seen: TokenCommandOptions | undefined;
+    const token = await loadAccessToken(
+      { PATH: 'C:\\Windows', ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+      async (command, args, options) => {
+        seen = options;
+        expect(command).toBe('C:\\Windows\\System32\\cmd.exe');
+        expect(args).toEqual([
+          '/d',
+          '/s',
+          '/c',
+          'gcloud',
+          'auth',
+          'print-access-token',
+        ]);
+        return { stdout: ' ya29.FROM-GCLOUD \n' };
+      },
+      'win32',
+    );
+    expect(token).toBe('ya29.FROM-GCLOUD');
+    expect(seen?.shell).toBe(false);
+    expect(seen?.windowsHide).toBe(true);
+    expect(seen?.env.CLOUDSDK_ACTIVE_CONFIG_NAME).toBe('theshark');
+    expect(seen?.env.ComSpec).toBe('C:\\Windows\\System32\\cmd.exe');
+  });
+
+  it('uses cmd.exe on win32 when ComSpec is unset', async () => {
+    const token = await loadAccessToken(
+      { PATH: 'C:\\Windows' },
+      async (command, args, options) => {
+        expect(command).toBe('cmd.exe');
+        expect(args).toEqual([
+          '/d',
+          '/s',
+          '/c',
+          'gcloud',
+          'auth',
+          'print-access-token',
+        ]);
+        expect(options.shell).toBe(false);
+        expect(options.windowsHide).toBe(true);
+        return { stdout: 'ya29.FROM-GCLOUD' };
+      },
+      'win32',
+    );
+    expect(token).toBe('ya29.FROM-GCLOUD');
+  });
+
+  it('rejects a gcloud token that contains whitespace', async () => {
+    await expect(
+      loadAccessToken({}, async () => ({ stdout: 'ya29.abc def\n' }), 'linux'),
+    ).rejects.toThrow(/^Could not obtain a Google access token$/);
   });
 
   it('does not return command output when gcloud fails', async () => {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { PosSnapshot } from './read-pos.ts';
+import { createPosFirestore } from './firestore-read.ts';
+import { createPosReader, type PosSnapshot } from './read-pos.ts';
 import { runPosSync } from './sync.ts';
 import type { PosDb } from './supabase-write.ts';
 import type {
@@ -170,6 +171,43 @@ describe('runPosSync', () => {
     ).rejects.toThrow(/^boom \[redacted\]$/);
     expect(ingestCalls).toEqual([]);
     expect(finished).toEqual({ status: 'failed', error: 'boom [redacted]' });
+  });
+
+  it('fails the run and does not send a scope when a list document is null', async () => {
+    const ingestCalls: unknown[] = [];
+    let finished: { status: string; error: string | null } | undefined;
+    const db: PosDb = {
+      async startRun() {
+        return 41;
+      },
+      async ingest() {
+        ingestCalls.push(true);
+        return zeroCounts();
+      },
+      async finishRun(_runId, status, _counts, error) {
+        finished = { status, error };
+      },
+    };
+    const firestore = createPosFirestore('test-token', async () => {
+      return new Response(JSON.stringify({ documents: [null] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    await expect(
+      runPosSync({
+        mode: 'recent',
+        supabaseUrl: 'http://127.0.0.1:55421',
+        serviceRoleKey: 'local-test-key',
+        reader: createPosReader(firestore),
+        db,
+      }),
+    ).rejects.toThrow(/^Firestore read failed: invalid response$/);
+    expect(ingestCalls).toEqual([]);
+    expect(finished).toEqual({
+      status: 'failed',
+      error: 'Firestore read failed: invalid response',
+    });
   });
 
   it('does not finish a run that never started', async () => {

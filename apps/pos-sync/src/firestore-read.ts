@@ -1,4 +1,4 @@
-import { isSafeDocumentId, isRecord } from './decode.ts';
+import { isRecord, isSafeDocumentId, splitDocumentName } from './decode.ts';
 import type {
   FirestoreRestDocument,
   ListPage,
@@ -326,10 +326,7 @@ export function parseListResponse(payload: unknown): ListPage {
       throw new Error('Firestore read failed: invalid response');
     }
     for (const entry of payload.documents) {
-      const document = parseDocument(entry);
-      if (document !== undefined) {
-        documents.push(document);
-      }
+      documents.push(requireDocument(entry));
     }
   }
   if (
@@ -355,28 +352,41 @@ export function parseRunQueryResponse(
   const documents: FirestoreRestDocument[] = [];
   for (const entry of payload) {
     if (!isRecord(entry)) {
-      continue;
+      throw new Error('Firestore read failed: invalid response');
     }
     if ('error' in entry) {
       throw new Error('Firestore read failed: invalid response');
     }
-    const document = parseDocument(entry.document);
-    if (document !== undefined) {
-      documents.push(document);
+    if (!('document' in entry)) {
+      continue;
     }
+    documents.push(requireDocument(entry.document));
   }
   return documents;
 }
 
-function parseDocument(value: unknown): FirestoreRestDocument | undefined {
+function requireDocument(value: unknown): FirestoreRestDocument {
   if (!isRecord(value) || typeof value.name !== 'string') {
-    return undefined;
+    throw new Error('Firestore read failed: invalid response');
+  }
+  try {
+    splitDocumentName(value.name);
+  } catch (error) {
+    throw new Error('Firestore read failed: invalid response', {
+      cause: error,
+    });
   }
   const document: FirestoreRestDocument = { name: value.name };
-  if (typeof value.updateTime === 'string') {
+  if (value.updateTime !== undefined) {
+    if (typeof value.updateTime !== 'string') {
+      throw new Error('Firestore read failed: invalid response');
+    }
     document.updateTime = value.updateTime;
   }
-  if (isRecord(value.fields)) {
+  if (value.fields !== undefined) {
+    if (!isRecord(value.fields)) {
+      throw new Error('Firestore read failed: invalid response');
+    }
     document.fields = value.fields;
   }
   return document;
@@ -452,11 +462,7 @@ export function createPosFirestore(
           undefined,
           fetchImpl,
         );
-        const document = parseDocument(payload);
-        if (document === undefined) {
-          throw new Error('Firestore read failed: invalid response');
-        }
-        return document;
+        return requireDocument(payload);
       } catch (error) {
         if (
           error instanceof Error &&

@@ -41,27 +41,49 @@ function runGcloud(
   });
 }
 
+function gcloudLaunch(
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+): { command: string; args: string[] } {
+  if (platform === 'win32') {
+    return {
+      command: env.ComSpec ?? 'cmd.exe',
+      args: ['/d', '/s', '/c', 'gcloud', 'auth', 'print-access-token'],
+    };
+  }
+  return {
+    command: 'gcloud',
+    args: ['auth', 'print-access-token'],
+  };
+}
+
+function tokenFromOutput(stdout: string): string {
+  const token = stdout.trim();
+  if (token.length === 0 || /\s/.test(token)) {
+    throw new Error('empty token');
+  }
+  return token;
+}
+
 export async function loadAccessToken(
   env: NodeJS.ProcessEnv = process.env,
   run: TokenCommand = runGcloud,
+  platform: NodeJS.Platform = process.platform,
 ): Promise<string> {
   const fromEnv = env.POS_ACCESS_TOKEN;
   if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) {
     return fromEnv.trim();
   }
+  const launch = gcloudLaunch(platform, env);
   try {
-    const result = await run('gcloud', ['auth', 'print-access-token'], {
+    const result = await run(launch.command, launch.args, {
       env: { ...env, CLOUDSDK_ACTIVE_CONFIG_NAME: 'theshark' },
       encoding: 'utf8',
       windowsHide: true,
       shell: false,
       timeout: 30_000,
     });
-    const token = result.stdout.trim();
-    if (token.length === 0) {
-      throw new Error('empty token');
-    }
-    return token;
+    return tokenFromOutput(result.stdout);
   } catch {
     throw new Error('Could not obtain a Google access token');
   }

@@ -12,6 +12,10 @@
 -- completed read scope without treating earlier chunks as deleted in the POS.
 -- The runner sends p_scope only on that last chunk, after every page was read.
 -- scope_applied rejects a second scope for the same run.
+-- One run is running at a time. A run older than 30 minutes is failed as
+-- abandoned before the next start. A scope marks an order missing only when
+-- that order's last_synced_at is earlier than the run's started_at, so a
+-- later run's order is never marked missing by an older read.
 create table app.pos_shifts (
   id text primary key check (length(btrim(id)) > 0),
   opened_at timestamptz not null check (isfinite(opened_at)),
@@ -168,6 +172,13 @@ create table app.pos_sync_runs (
 comment on table app.pos_sync_runs is 'One local POS sync attempt. error is a short message and must not contain document contents.';
 
 comment on column app.pos_sync_runs.scope_applied is 'True after this run has applied missing-order marking for a completed read. A second scope is rejected.';
+
+-- Every running row stores the same status, so this index admits only one.
+create unique index pos_sync_runs_one_running_idx on app.pos_sync_runs (status)
+where
+  status = 'running';
+
+comment on index app.pos_sync_runs_one_running_idx is 'At most one POS sync run may have status running.';
 
 create table app.pos_sync_run_orders (
   run_id bigint not null references app.pos_sync_runs (id) on delete cascade,
@@ -472,18 +483,63 @@ declare
 begin
   perform app.assert_pos_write_allowed ();
 
-  insert into
-    app.pos_sync_runs (mode, status)
-  values
-    (p_mode, 'running')
-  returning
-    id into v_id;
+  -- Not the ledger posting lock. Holds starters in one line so the abandon
+  -- and the single running row cannot race. The partial unique index is the
+  -- backstop if a row is inserted outside this function.
+  perform pg_catalog.pg_advisory_xact_lock(8742130000000000002);
+
+  with
+    abandoned as (
+      update app.pos_sync_runs
+      set
+        status = 'failed',
+        finished_at = pg_catalog.now(),
+        error = 'abandoned'
+      where
+        status = 'running'
+        and started_at < pg_catalog.now() - interval '30 minutes'
+      returning
+        id
+    )
+  delete from app.pos_sync_run_orders
+  where
+    run_id in (
+      select
+        id
+      from
+        abandoned
+    );
+
+  if exists (
+    select
+      1
+    from
+      app.pos_sync_runs
+    where
+      status = 'running'
+  ) then
+    raise exception 'another POS sync is running'
+      using errcode = '55P03';
+  end if;
+
+  begin
+    insert into
+      app.pos_sync_runs (mode, status)
+    values
+      (p_mode, 'running')
+    returning
+      id into v_id;
+  exception
+    when unique_violation then
+      raise exception 'another POS sync is running'
+        using errcode = '55P03';
+  end;
 
   return v_id;
 end;
 $$;
 
-comment on function app.start_pos_sync_run (text) is 'Opens a POS sync run. mode is recent, window35, or full.';
+comment on function app.start_pos_sync_run (text) is 'Opens a POS sync run. Refuses while another run is running. A run older than 30 minutes is marked failed with error abandoned first. mode is recent, window35, or full.';
 
 revoke all on function app.start_pos_sync_run (text)
 from
@@ -559,6 +615,7 @@ declare
   v_status text;
   v_mode text;
   v_scope_applied boolean;
+  v_started_at timestamptz;
   v_scope_key text;
   v_key_count int;
   v_from timestamptz;
@@ -604,11 +661,13 @@ begin
   select
     r.status,
     r.mode,
-    r.scope_applied
+    r.scope_applied,
+    r.started_at
   into
     v_status,
     v_mode,
-    v_scope_applied
+    v_scope_applied,
+    v_started_at
   from
     app.pos_sync_runs r
   where
@@ -1078,6 +1137,7 @@ begin
         app.pos_orders o
       where
         o.missing_from_pos = false
+        and o.last_synced_at < v_started_at
         and not exists (
           select
             1
@@ -1142,7 +1202,7 @@ begin
 end;
 $$;
 
-comment on function app.ingest_pos_batch (bigint, jsonb, jsonb, jsonb) is 'Upserts POS shifts and orders for one chunk of a run. Replaces an order only when the incoming document is newer, or the same update time with a different content hash. Marks orders missing only when p_scope is set and the order id was not presented to this run. Does not post stock and does not take the ledger posting lock.';
+comment on function app.ingest_pos_batch (bigint, jsonb, jsonb, jsonb) is 'Upserts POS shifts and orders for one chunk of a run. Replaces an order only when the incoming document is newer, or the same update time with a different content hash. Marks orders missing only when p_scope is set, the order id was not presented to this run, and last_synced_at is earlier than the run started_at. Does not post stock and does not take the ledger posting lock.';
 
 revoke all on function app.ingest_pos_batch (bigint, jsonb, jsonb, jsonb)
 from

@@ -9,6 +9,7 @@ import {
   MAX_LIST_PAGES,
   RANGE_LIMIT,
   RECENT_ORDER_LIMIT,
+  RECENT_SHIFT_MAX_PAGES,
   collectTimestampRange,
   readPos,
   recentOrdersQuery,
@@ -67,15 +68,26 @@ describe('query builders', () => {
 });
 
 describe('readPos', () => {
-  it('reads four shifts and does not follow the next page', async () => {
+  it('follows shift pages until four shifts are collected', async () => {
     const lists: unknown[] = [];
     const queries: unknown[] = [];
     const firestore: PosFirestore = {
       async list(_collection, query) {
         lists.push(query);
+        if (lists.length === 1) {
+          return {
+            documents: [shiftDoc('shift-test-d')],
+            nextPageToken: 'page-2',
+          };
+        }
         return {
-          documents: [shiftDoc('shift-test-b'), shiftDoc('shift-test-a')],
-          nextPageToken: 'do-not-follow',
+          documents: [
+            shiftDoc('shift-test-a'),
+            shiftDoc('shift-test-c'),
+            shiftDoc('shift-test-b'),
+            shiftDoc('shift-test-extra'),
+          ],
+          nextPageToken: 'page-3',
         };
       },
       async getShift() {
@@ -91,13 +103,86 @@ describe('readPos', () => {
       firestore,
       new Date('2026-10-16T00:00:00Z'),
     );
-    expect(lists).toEqual([{ pageSize: 4, orderBy: 'opening_time desc' }]);
+    expect(lists).toEqual([
+      { pageSize: 4, orderBy: 'opening_time desc' },
+      { pageSize: 4, orderBy: 'opening_time desc', pageToken: 'page-2' },
+    ]);
     expect(queries).toHaveLength(1);
     expect(snapshot.scope).toEqual({
-      shift_ids: ['shift-test-a', 'shift-test-b'],
+      shift_ids: [
+        'shift-test-a',
+        'shift-test-b',
+        'shift-test-c',
+        'shift-test-d',
+      ],
     });
     expect(snapshot.orders.map((order) => order.id)).toEqual(['order-test-1']);
     expect(snapshot.missingShiftIds).toEqual([]);
+  });
+
+  it('stops paging shifts when there is no next page', async () => {
+    const lists: unknown[] = [];
+    const firestore: PosFirestore = {
+      async list(_collection, query) {
+        lists.push(query);
+        if (lists.length === 1) {
+          return {
+            documents: [shiftDoc('shift-test-1')],
+            nextPageToken: 'page-2',
+          };
+        }
+        return { documents: [] };
+      },
+      async getShift() {
+        throw new Error('get should not be called');
+      },
+      async queryOrders() {
+        return [];
+      },
+    };
+    const snapshot = await readPos('recent', firestore, new Date());
+    expect(lists).toHaveLength(2);
+    expect(snapshot.scope).toEqual({ shift_ids: ['shift-test-1'] });
+  });
+
+  it('fails closed when shift pages exceed the cap', async () => {
+    let calls = 0;
+    const firestore: PosFirestore = {
+      async list() {
+        calls += 1;
+        return { documents: [], nextPageToken: `tok-${calls}` };
+      },
+      async getShift() {
+        throw new Error('get should not be called');
+      },
+      async queryOrders() {
+        throw new Error('query should not be called');
+      },
+    };
+    await expect(readPos('recent', firestore, new Date())).rejects.toThrow(
+      /page limit/,
+    );
+    expect(calls).toBe(RECENT_SHIFT_MAX_PAGES);
+  });
+
+  it('fails closed when a shift page token repeats', async () => {
+    let calls = 0;
+    const firestore: PosFirestore = {
+      async list() {
+        calls += 1;
+        return { documents: [shiftDoc('shift-test-1')], nextPageToken: 'same' };
+      },
+      async getShift() {
+        throw new Error('get should not be called');
+      },
+      async queryOrders() {
+        throw new Error('query should not be called');
+      },
+    };
+    await expect(readPos('recent', firestore, new Date())).rejects.toThrow(
+      /repeated Firestore page token/,
+    );
+    expect(calls).toBe(2);
   });
 
   it('skips the order query when there are no shifts', async () => {

@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (134);
+  plan (141);
 
 -- Synthetic users only. No POS documents and no customer data.
 delete from app.owner;
@@ -292,6 +292,14 @@ select
     'pos_orders',
     'pos_orders_ordered_at_idx',
     'pos_orders is indexed by ordered_at'
+  );
+
+select
+  has_index (
+    'app',
+    'pos_sync_runs',
+    'pos_sync_runs_one_running_idx',
+    'only one pos sync run may be running'
   );
 
 select
@@ -1772,6 +1780,24 @@ select
 -- ============================================================================
 -- Missing orders, per scope. Seen ids accumulate across chunks of one run.
 -- ============================================================================
+do $finish_run_a$
+begin
+  perform app.finish_pos_sync_run (
+    (
+      select
+        n
+      from
+        pg_temp.pos_test_ids
+      where
+        k = 'run-a'
+    ),
+    'ok',
+    '{}'::jsonb,
+    null
+  );
+end
+$finish_run_a$;
+
 insert into
   pos_test_ids (k, n)
 values
@@ -1823,10 +1849,37 @@ select
     null
   );
 
+do $finish_run_shift$
+begin
+  perform app.finish_pos_sync_run (
+    (
+      select
+        n
+      from
+        pg_temp.pos_test_ids
+      where
+        k = 'run-shift'
+    ),
+    'ok',
+    '{}'::jsonb,
+    null
+  );
+end
+$finish_run_shift$;
+
 insert into
   pos_test_ids (k, n)
 values
   ('run-shift-2', app.start_pos_sync_run ('recent'));
+
+reset role;
+
+update app.pos_orders
+set
+  last_synced_at = pg_catalog.now () - interval '1 minute';
+
+set
+  local role authenticated;
 
 insert into
   pos_test_json (k, v)
@@ -1906,6 +1959,24 @@ select
     'marking an order missing keeps the row and its lines'
   );
 
+do $finish_run_shift_2$
+begin
+  perform app.finish_pos_sync_run (
+    (
+      select
+        n
+      from
+        pg_temp.pos_test_ids
+      where
+        k = 'run-shift-2'
+    ),
+    'ok',
+    '{}'::jsonb,
+    null
+  );
+end
+$finish_run_shift_2$;
+
 insert into
   pos_test_ids (k, n)
 values
@@ -1957,6 +2028,24 @@ select
     null
   );
 
+do $finish_run_window$
+begin
+  perform app.finish_pos_sync_run (
+    (
+      select
+        n
+      from
+        pg_temp.pos_test_ids
+      where
+        k = 'run-window'
+    ),
+    'ok',
+    '{}'::jsonb,
+    null
+  );
+end
+$finish_run_window$;
+
 insert into
   pos_test_ids (k, n)
 values
@@ -1964,6 +2053,15 @@ values
     'run-window-2',
     app.start_pos_sync_run ('window35')
   );
+
+reset role;
+
+update app.pos_orders
+set
+  last_synced_at = pg_catalog.now () - interval '1 minute';
+
+set
+  local role authenticated;
 
 insert into
   pos_test_json (k, v)
@@ -2035,6 +2133,24 @@ select
     'a window scope does not mark an order before from'
   );
 
+do $finish_run_window_2$
+begin
+  perform app.finish_pos_sync_run (
+    (
+      select
+        n
+      from
+        pg_temp.pos_test_ids
+      where
+        k = 'run-window-2'
+    ),
+    'ok',
+    '{}'::jsonb,
+    null
+  );
+end
+$finish_run_window_2$;
+
 insert into
   pos_test_ids (k, n)
 values
@@ -2085,6 +2201,24 @@ select
     ),
     null
   );
+
+do $finish_run_chunk$
+begin
+  perform app.finish_pos_sync_run (
+    (
+      select
+        n
+      from
+        pg_temp.pos_test_ids
+      where
+        k = 'run-chunk'
+    ),
+    'ok',
+    '{}'::jsonb,
+    null
+  );
+end
+$finish_run_chunk$;
 
 insert into
   pos_test_ids (k, n)
@@ -2146,6 +2280,15 @@ select
     ),
     null
   );
+
+reset role;
+
+update app.pos_orders
+set
+  last_synced_at = pg_catalog.now () - interval '1 minute';
+
+set
+  local role authenticated;
 
 insert into
   pos_test_json (k, v)
@@ -2223,6 +2366,24 @@ select
     1,
     'missing count is the number of rows newly marked'
   );
+
+do $finish_run_chunk_2$
+begin
+  perform app.finish_pos_sync_run (
+    (
+      select
+        n
+      from
+        pg_temp.pos_test_ids
+      where
+        k = 'run-chunk-2'
+    ),
+    'ok',
+    '{}'::jsonb,
+    null
+  );
+end
+$finish_run_chunk_2$;
 
 insert into
   pos_test_ids (k, n)
@@ -2332,10 +2493,37 @@ select
     'a run rejects a second scope'
   );
 
+do $finish_run_reappear$
+begin
+  perform app.finish_pos_sync_run (
+    (
+      select
+        n
+      from
+        pg_temp.pos_test_ids
+      where
+        k = 'run-reappear'
+    ),
+    'ok',
+    '{}'::jsonb,
+    null
+  );
+end
+$finish_run_reappear$;
+
 insert into
   pos_test_ids (k, n)
 values
   ('run-full', app.start_pos_sync_run ('full'));
+
+reset role;
+
+update app.pos_orders
+set
+  last_synced_at = pg_catalog.now () - interval '1 minute';
+
+set
+  local role authenticated;
 
 insert into
   pos_test_json (k, v)
@@ -2554,6 +2742,24 @@ select
     'service_role cannot delete pos_orders'
   );
 
+do $finish_run_full$
+begin
+  perform app.finish_pos_sync_run (
+    (
+      select
+        n
+      from
+        pg_temp.pos_test_ids
+      where
+        k = 'run-full'
+    ),
+    'ok',
+    '{}'::jsonb,
+    null
+  );
+end
+$finish_run_full$;
+
 insert into
   pos_test_ids (k, n)
 values
@@ -2766,6 +2972,225 @@ select
     $$select line_id from app.pos_order_lines where order_id = 'order-test-cascade'$$,
     'deleting an order cascades to its lines'
   );
+
+-- ============================================================================
+-- One running sync, and a later write is not marked missing by an older run.
+-- ============================================================================
+with
+  inserted as (
+    insert into
+      app.pos_sync_runs (mode, status, started_at)
+    values
+      (
+        'recent',
+        'running',
+        pg_catalog.now () - interval '31 minutes'
+      )
+    returning
+      id
+  )
+insert into
+  pos_test_ids (k, n)
+select
+  'run-stale',
+  inserted.id
+from
+  inserted;
+
+select
+  set_config(
+    'request.jwt.claims',
+    jsonb_build_object(
+      'sub',
+      'b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f',
+      'role',
+      'authenticated'
+    )::text,
+    true
+  );
+
+set
+  local role authenticated;
+
+insert into
+  pos_test_ids (k, n)
+values
+  ('run-fresh', app.start_pos_sync_run ('recent'));
+
+select
+  is (
+    (
+      select
+        status
+      from
+        app.pos_sync_runs
+      where
+        id = (
+          select
+            n
+          from
+            pos_test_ids
+          where
+            k = 'run-stale'
+        )
+    ),
+    'failed',
+    'a run older than 30 minutes is marked failed'
+  );
+
+select
+  is (
+    (
+      select
+        error
+      from
+        app.pos_sync_runs
+      where
+        id = (
+          select
+            n
+          from
+            pos_test_ids
+          where
+            k = 'run-stale'
+        )
+    ),
+    'abandoned',
+    'an abandoned run records error abandoned'
+  );
+
+select
+  is (
+    (
+      select
+        status
+      from
+        app.pos_sync_runs
+      where
+        id = (
+          select
+            n
+          from
+            pos_test_ids
+          where
+            k = 'run-fresh'
+        )
+    ),
+    'running',
+    'a new run replaces an abandoned run'
+  );
+
+select
+  throws_ok (
+    $$select app.start_pos_sync_run('window35')$$,
+    '55P03'::char(5),
+    'another POS sync is running',
+    'a second sync cannot start while one is running'
+  );
+
+reset role;
+
+insert into
+  app.pos_orders (
+    id,
+    shift_id,
+    status,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    last_synced_at
+  )
+values
+  (
+    'order-test-after-start',
+    'shift-test-guard',
+    'complete',
+    pg_catalog.now (),
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    pg_catalog.now (),
+    repeat('ab', 32),
+    pg_catalog.now () + interval '1 second'
+  ),
+  (
+    'order-test-before-start',
+    'shift-test-guard',
+    'complete',
+    pg_catalog.now (),
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    pg_catalog.now (),
+    repeat('cd', 32),
+    pg_catalog.now () - interval '1 minute'
+  );
+
+set
+  local role authenticated;
+
+insert into
+  pos_test_json (k, v)
+select
+  'guard-scope',
+  app.ingest_pos_batch (
+    (
+      select
+        n
+      from
+        pos_test_ids
+      where
+        k = 'run-fresh'
+    ),
+    '[]'::jsonb,
+    '[]'::jsonb,
+    jsonb_build_object(
+      'shift_ids',
+      jsonb_build_array('shift-test-guard')
+    )
+  );
+
+select
+  is (
+    (
+      select
+        missing_from_pos
+      from
+        app.pos_orders
+      where
+        id = 'order-test-after-start'
+    ),
+    false,
+    'an order synced after the run started is not marked missing'
+  );
+
+select
+  is (
+    (
+      select
+        missing_from_pos
+      from
+        app.pos_orders
+      where
+        id = 'order-test-before-start'
+    ),
+    true,
+    'an order synced before the run started is marked missing'
+  );
+
+reset role;
 
 select
   *

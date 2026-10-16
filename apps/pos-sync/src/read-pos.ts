@@ -1,6 +1,10 @@
 import { compareId } from './hash.ts';
 import { mapOrderDocument, mapShiftDocument } from './mapper.ts';
-import type { FirestoreRestDocument, PosFirestore } from './pos-firestore.ts';
+import type {
+  FirestoreRestDocument,
+  ListQuery,
+  PosFirestore,
+} from './pos-firestore.ts';
 import { window35From } from './scope.ts';
 import type {
   PosOrderIngest,
@@ -10,6 +14,8 @@ import type {
 } from './types.ts';
 
 export const RECENT_SHIFT_PAGE = 4;
+export const RECENT_SHIFT_LIMIT = 4;
+export const RECENT_SHIFT_MAX_PAGES = 20;
 export const RECENT_ORDER_LIMIT = 2000;
 export const RANGE_LIMIT = 300;
 export const LIST_PAGE_SIZE = 300;
@@ -118,12 +124,41 @@ export async function readPos(
 }
 
 async function readRecent(firestore: PosFirestore): Promise<PosSnapshot> {
-  const page = await firestore.list('custody_shifts', {
-    pageSize: RECENT_SHIFT_PAGE,
-    orderBy: 'opening_time desc',
-  });
+  const collected: FirestoreRestDocument[] = [];
+  const seenTokens = new Set<string>();
+  let pageToken: string | undefined;
+  let complete = false;
+  for (let page = 0; page < RECENT_SHIFT_MAX_PAGES; page += 1) {
+    if (pageToken !== undefined) {
+      if (seenTokens.has(pageToken)) {
+        throw new Error('repeated Firestore page token');
+      }
+      seenTokens.add(pageToken);
+    }
+    const query: ListQuery = {
+      pageSize: RECENT_SHIFT_PAGE,
+      orderBy: 'opening_time desc',
+    };
+    if (pageToken !== undefined) {
+      query.pageToken = pageToken;
+    }
+    const result = await firestore.list('custody_shifts', query);
+    const room = RECENT_SHIFT_LIMIT - collected.length;
+    collected.push(...result.documents.slice(0, room));
+    if (
+      collected.length >= RECENT_SHIFT_LIMIT ||
+      result.nextPageToken === undefined
+    ) {
+      complete = true;
+      break;
+    }
+    pageToken = result.nextPageToken;
+  }
+  if (!complete) {
+    throw new Error('Firestore page limit exceeded');
+  }
   const shifts = uniqueById(
-    page.documents.map((document) => mapShiftDocument(document)),
+    collected.map((document) => mapShiftDocument(document)),
     'shift',
   );
   const shiftIds = shifts.map((shift) => shift.id);

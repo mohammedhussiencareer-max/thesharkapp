@@ -145,7 +145,6 @@ describe('firestoreFetch', () => {
           {
             name: 'projects/thesharkrestaurant/databases/(default)/documents/custody_shifts/shift-test-1',
           },
-          { readTime: 'skip-me' },
         ],
         nextPageToken: '',
       });
@@ -206,33 +205,67 @@ describe('firestoreFetch', () => {
   });
 });
 
+const orderName =
+  'projects/thesharkrestaurant/databases/(default)/documents/orders/order-test-1';
+
 describe('parsers', () => {
-  it('skips entries without a document and rejects error payloads', () => {
-    expect(
+  it('rejects a malformed list document instead of skipping it', () => {
+    const invalid = /^Firestore read failed: invalid response$/;
+    expect(() => parseListResponse({ documents: [null] })).toThrow(invalid);
+    expect(() => parseListResponse({ documents: [{ readTime: 'x' }] })).toThrow(
+      invalid,
+    );
+    expect(() => parseListResponse({ documents: [{ name: 1 }] })).toThrow(
+      invalid,
+    );
+    expect(() =>
       parseListResponse({
         documents: [
-          { readTime: 'x' },
           {
-            name: 'projects/thesharkrestaurant/databases/(default)/documents/orders/order-test-1',
+            name: 'projects/other/databases/(default)/documents/orders/order-test-1',
           },
         ],
-      }).documents,
-    ).toHaveLength(1);
+      }),
+    ).toThrow(invalid);
+    expect(() =>
+      parseListResponse({
+        documents: [
+          {
+            name: 'projects/thesharkrestaurant/databases/(default)/documents/customers/customer-test-1',
+          },
+        ],
+      }),
+    ).toThrow(invalid);
+    expect(() =>
+      parseListResponse({
+        documents: [{ name: orderName, updateTime: 1 }],
+      }),
+    ).toThrow(invalid);
+    expect(() =>
+      parseListResponse({
+        documents: [{ name: orderName, fields: 'nope' }],
+      }),
+    ).toThrow(invalid);
     expect(() =>
       parseListResponse({ error: { message: 'pii-customer-name' } }),
-    ).toThrow(/^Firestore read failed: invalid response$/);
+    ).toThrow(invalid);
+    expect(
+      parseListResponse({ documents: [{ name: orderName }] }).documents,
+    ).toHaveLength(1);
+  });
+
+  it('skips a runQuery row that has only readTime', () => {
+    const invalid = /^Firestore read failed: invalid response$/;
     expect(
       parseRunQueryResponse([
         { readTime: 'x' },
-        {
-          document: {
-            name: 'projects/thesharkrestaurant/databases/(default)/documents/orders/order-test-1',
-          },
-        },
+        { document: { name: orderName } },
       ]),
     ).toHaveLength(1);
+    expect(() => parseRunQueryResponse([null])).toThrow(invalid);
+    expect(() => parseRunQueryResponse([{ document: null }])).toThrow(invalid);
     expect(() =>
       parseRunQueryResponse([{ error: { message: 'pii-customer-name' } }]),
-    ).toThrow(/^Firestore read failed: invalid response$/);
+    ).toThrow(invalid);
   });
 });
