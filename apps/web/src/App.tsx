@@ -4,6 +4,7 @@ import { RequireOwner } from '@/auth/RequireOwner';
 import { useAuth } from '@/lib/auth-context';
 import { supabase } from '@/lib/supabase';
 import { HomePage } from '@/pages/HomePage';
+import { ItemsPage } from '@/pages/ItemsPage';
 import { LoginPage } from '@/pages/LoginPage';
 import { MissingEnvScreen } from '@/pages/MissingEnvScreen';
 import { NotFoundPage } from '@/pages/NotFoundPage';
@@ -22,6 +23,14 @@ export function AppRoutes() {
         element={
           <RequireOwner>
             <HomeRoute />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/items"
+        element={
+          <RequireOwner>
+            <ItemsPage />
           </RequireOwner>
         }
       />
