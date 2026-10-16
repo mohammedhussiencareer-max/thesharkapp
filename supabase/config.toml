@@ -69,7 +69,7 @@ schema_paths = []
 enabled = true
 # Specifies an ordered list of seed files to load during db reset.
 # Supports glob patterns relative to supabase directory: "./seeds/*.sql"
-# Local synthetic owner only. Do not point a hosted project at this file.
+# Must stay free of credentials. Local owner setup is the e2e global setup.
 sql_paths = ["./seed.sql"]
 
 [db.network_restrictions]

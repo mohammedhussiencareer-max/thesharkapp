@@ -1,9 +1,9 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AuthProvider } from '@/auth/AuthProvider';
 import { AppRoutes } from '@/App';
-import { resetAuthStore } from '@/lib/auth-store';
+import { getAuthSnapshot, resetAuthStore } from '@/lib/auth-store';
 
 type Session = { user: { id: string; email: string } } | null;
 
@@ -16,6 +16,9 @@ const authState = vi.hoisted(() => ({
     data: { user: null; session: null };
     error: { message: string } | null;
   }> | null,
+  signOutGate: null as Promise<void> | null,
+  signedInSession: null as Session,
+  signInCalls: 0,
   listeners: [] as Array<(event: string, session: Session) => void>,
   signOut: vi.fn(),
 }));
@@ -40,6 +43,7 @@ vi.mock('@/lib/supabase', () => ({
         };
       },
       signInWithPassword: () => {
+        authState.signInCalls += 1;
         if (authState.signInGate) return authState.signInGate;
         if (authState.signInError) {
           return Promise.resolve({
@@ -47,17 +51,31 @@ vi.mock('@/lib/supabase', () => ({
             error: authState.signInError,
           });
         }
+        const session = authState.signedInSession ?? authState.session;
+        authState.session = session;
+        for (const listener of [...authState.listeners]) {
+          listener('SIGNED_IN', session);
+        }
         return Promise.resolve({
-          data: { user: null, session: null },
+          data: { user: session?.user ?? null, session },
           error: null,
         });
       },
       signOut: () => {
         authState.signOut();
-        authState.session = null;
-        for (const listener of [...authState.listeners]) {
-          listener('SIGNED_OUT', null);
+        const notify = () => {
+          authState.session = null;
+          for (const listener of [...authState.listeners]) {
+            listener('SIGNED_OUT', null);
+          }
+        };
+        if (authState.signOutGate) {
+          return authState.signOutGate.then(() => {
+            setTimeout(notify, 0);
+            return { error: null };
+          });
         }
+        notify();
         return Promise.resolve({ error: null });
       },
     },
@@ -86,16 +104,23 @@ function renderApp(path: string) {
   );
 }
 
+function resetMock() {
+  authState.session = null;
+  authState.isOwner = false;
+  authState.rpcError = null;
+  authState.signInError = null;
+  authState.signInGate = null;
+  authState.signOutGate = null;
+  authState.signedInSession = null;
+  authState.signInCalls = 0;
+  authState.listeners.splice(0, authState.listeners.length);
+  authState.signOut.mockClear();
+  resetAuthStore();
+}
+
 describe('owner access', () => {
   beforeEach(() => {
-    authState.session = null;
-    authState.isOwner = false;
-    authState.rpcError = null;
-    authState.signInError = null;
-    authState.signInGate = null;
-    authState.listeners.splice(0, authState.listeners.length);
-    authState.signOut.mockClear();
-    resetAuthStore();
+    resetMock();
   });
 
   it('redirects to login when signed out', async () => {
@@ -157,14 +182,7 @@ describe('owner access', () => {
 
 describe('login', () => {
   beforeEach(() => {
-    authState.session = null;
-    authState.isOwner = false;
-    authState.rpcError = null;
-    authState.signInError = null;
-    authState.signInGate = null;
-    authState.listeners.splice(0, authState.listeners.length);
-    authState.signOut.mockClear();
-    resetAuthStore();
+    resetMock();
   });
 
   function fillForm() {
@@ -223,5 +241,50 @@ describe('login', () => {
     expect(
       await screen.findByText('البريد أو كلمة السر غلط'),
     ).toBeInTheDocument();
+  });
+
+  it('finishes a denied sign-out before an owner sign-in can be cleared', async () => {
+    let releaseSignOut: () => void = () => {};
+    authState.signOutGate = new Promise<void>((resolve) => {
+      releaseSignOut = resolve;
+    });
+    authState.session = {
+      user: { id: 'intruder', email: 'intruder@theshark.test' },
+    };
+    authState.isOwner = false;
+    renderApp('/login');
+
+    expect(await screen.findByText('جاري تسجيل الخروج…')).toBeInTheDocument();
+    expect(screen.getByLabelText('البريد')).toBeDisabled();
+    expect(screen.getByLabelText('كلمة السر')).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
+    expect(getAuthSnapshot().status).toBe('signing-out');
+    expect(authState.signOut).toHaveBeenCalledOnce();
+
+    authState.isOwner = true;
+    authState.signedInSession = {
+      user: { id: 'owner', email: 'owner@theshark.test' },
+    };
+    fireEvent.change(screen.getByLabelText('البريد'), {
+      target: { value: 'owner@theshark.test' },
+    });
+    fireEvent.change(screen.getByLabelText('كلمة السر'), {
+      target: { value: 'OwnerSignIn1234' },
+    });
+    fireEvent.submit(
+      screen.getByRole('button', { name: 'تسجيل الدخول' }).closest('form')!,
+    );
+
+    expect(authState.signInCalls).toBe(0);
+    const signOutCallsBeforeOwner = authState.signOut.mock.calls.length;
+
+    act(() => {
+      releaseSignOut();
+    });
+
+    expect(await screen.findByText('owner@theshark.test')).toBeInTheDocument();
+    expect(getAuthSnapshot().status).toBe('owner');
+    expect(authState.signInCalls).toBe(1);
+    expect(authState.signOut.mock.calls.length).toBe(signOutCallsBeforeOwner);
   });
 });

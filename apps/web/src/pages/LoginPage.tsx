@@ -12,6 +12,8 @@ export function LoginPage() {
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [invalid, setInvalid] = useState(false);
+  const signingOut = status === 'signing-out';
+  const formLocked = submitting || signingOut;
 
   function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -41,6 +43,7 @@ export function LoginPage() {
             name="email"
             autoComplete="username"
             required
+            disabled={formLocked}
             value={email}
             onChange={(event) => setEmail(event.target.value)}
           />
@@ -54,18 +57,20 @@ export function LoginPage() {
             autoComplete="current-password"
             required
             minLength={12}
+            disabled={formLocked}
             value={password}
             onChange={(event) => setPassword(event.target.value)}
           />
         </label>
         {invalid ? <p role="alert">البريد أو كلمة السر غلط</p> : null}
+        {signingOut ? <p role="status">جاري تسجيل الخروج…</p> : null}
         {status === 'denied' ? (
           <p role="alert">الحساب ده مش مسموح له يدخل</p>
         ) : null}
         <button
           className="rounded bg-neutral-900 px-3 py-2 text-white disabled:opacity-60"
           type="submit"
-          disabled={submitting}
+          disabled={formLocked}
         >
           {submitting ? 'جاري الدخول…' : 'تسجيل الدخول'}
         </button>
