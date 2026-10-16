@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { createItem, listItems, updateItem } from '@/items/api';
+import { expectationFromItem, type ItemExpectation } from '@/items/expectation';
 import { sameEditor, type ItemEditor } from '@/items/editor';
-import { genericCatalogError, messageFrom } from '@/items/errors';
+import {
+  genericCatalogError,
+  messageFrom,
+  StaleWriteError,
+} from '@/items/errors';
 import { groupCatalog } from '@/items/group';
 import { ItemForm } from '@/items/ItemForm';
 import { ItemList } from '@/items/ItemList';
@@ -43,6 +48,7 @@ export function ItemsPage() {
   const [showInactive, setShowInactive] = useState(false);
   const [conversionsBusy, setConversionsBusy] = useState(false);
   const [formMode, setFormMode] = useState<ItemEditor | null>(null);
+  const [formEpoch, setFormEpoch] = useState(0);
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   // One page-wide lock: while an item save or a conversion operation (and the
@@ -53,6 +59,7 @@ export function ItemsPage() {
     null,
   );
   const formModeRef = useRef<ItemEditor | null>(null);
+  const expectedRef = useRef<ItemExpectation | null>(null);
 
   function setEditor(next: ItemEditor | null) {
     formModeRef.current = next;
@@ -95,6 +102,7 @@ export function ItemsPage() {
   function openEdit(item: CatalogItem) {
     if (busy) return;
     setFormError(null);
+    expectedRef.current = expectationFromItem(item);
     setEditor({ type: 'edit', id: item.id });
   }
 
@@ -107,7 +115,9 @@ export function ItemsPage() {
     let unlock = true;
     try {
       if (started.type === 'edit') {
-        await updateItem(started.id, draft);
+        const expected = expectedRef.current;
+        if (!expected) throw new StaleWriteError();
+        await updateItem(started.id, draft, expected);
       } else {
         await createItem(draft);
       }
@@ -117,7 +127,25 @@ export function ItemsPage() {
       setItems(next);
       setLoadError(null);
     } catch (error) {
-      if (!saved) {
+      if (
+        !saved &&
+        error instanceof StaleWriteError &&
+        started.type === 'edit' &&
+        sameEditor(formModeRef.current, started)
+      ) {
+        try {
+          const next = await listItems();
+          setItems(next);
+          const fresh = next.find((row) => row.id === started.id);
+          if (fresh) {
+            expectedRef.current = expectationFromItem(fresh);
+            setFormEpoch((value) => value + 1);
+          }
+          setFormError(error.message);
+        } catch (reloadError) {
+          setFormError(messageFrom(reloadError));
+        }
+      } else if (!saved) {
         if (sameEditor(formModeRef.current, started)) {
           setFormError(messageFrom(error));
         }
@@ -185,7 +213,11 @@ export function ItemsPage() {
           </div>
           {showForm ? (
             <ItemForm
-              key={formMode?.type === 'edit' ? formMode.id : 'create'}
+              key={
+                formMode?.type === 'edit'
+                  ? `${formMode.id}:${formEpoch}`
+                  : 'create'
+              }
               items={items}
               editingId={editingItem?.id}
               initial={

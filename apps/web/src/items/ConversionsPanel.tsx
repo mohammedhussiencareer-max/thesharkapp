@@ -11,7 +11,7 @@ import {
   listConversions,
   updateConversion,
 } from '@/items/api';
-import { messageFrom } from '@/items/errors';
+import { messageFrom, StaleWriteError } from '@/items/errors';
 import { formatFactorInput, formatQty } from '@/items/format';
 import { unitLabels } from '@/items/labels';
 import type { CatalogItem, UnitConversion } from '@/items/types';
@@ -154,6 +154,7 @@ export function ConversionsPanel({
       await load();
     } catch (error) {
       setActionError(messageFrom(error));
+      if (error instanceof StaleWriteError) await load();
     } finally {
       setBusy(false);
       onBusyChange?.(false);
@@ -216,9 +217,24 @@ export function ConversionsPanel({
           baseUnit={item.baseUnit}
           disabled={busy || locked}
           onSave={(nextFactor) =>
-            run(() => updateConversion(item.id, conversion.unit, nextFactor))
+            run(() =>
+              updateConversion(
+                item.id,
+                conversion.unit,
+                nextFactor,
+                conversion.storedFactor,
+              ),
+            )
           }
-          onDelete={() => run(() => deleteConversion(item.id, conversion.unit))}
+          onDelete={() =>
+            run(() =>
+              deleteConversion(
+                item.id,
+                conversion.unit,
+                conversion.storedFactor,
+              ),
+            )
+          }
         />
       ))}
       <form className="flex flex-col gap-2" onSubmit={onAdd}>

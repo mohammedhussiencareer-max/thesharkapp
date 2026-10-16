@@ -15,6 +15,7 @@ import {
   updateConversion,
   updateItem,
 } from '@/items/api';
+import { StaleWriteError } from '@/items/errors';
 import type { CatalogItem, UnitConversion } from '@/items/types';
 import { ItemsPage } from '@/pages/ItemsPage';
 
@@ -31,10 +32,11 @@ vi.mock('@/items/api', () => ({
 function item(
   overrides: Partial<CatalogItem> & Pick<CatalogItem, 'id' | 'name' | 'kind'>,
 ): CatalogItem {
-  return {
+  const row: CatalogItem = {
     baseUnit: 'kg',
     countFrequency: 'daily',
     lossPct: 0,
+    storedLossPct: 0,
     parentItemId: null,
     active: true,
     onHandQty: 0,
@@ -42,6 +44,8 @@ function item(
     onHandValue: 0,
     ...overrides,
   };
+  if (overrides.storedLossPct === undefined) row.storedLossPct = row.lossPct;
+  return row;
 }
 
 const catalog: CatalogItem[] = [
@@ -356,6 +360,7 @@ describe('ItemsPage', () => {
       expect(updateItem).toHaveBeenCalledWith(
         'mixed',
         expect.objectContaining({ name: 'بوري جديد', kind: 'fish_mixed' }),
+        expect.objectContaining({ name: 'بوري مخلوط', kind: 'fish_mixed' }),
       );
     });
   });
@@ -367,7 +372,7 @@ describe('ItemsPage', () => {
       Promise.resolve([...rows]),
     );
     vi.mocked(addConversion).mockImplementation((itemId, unit, factor) => {
-      rows.push({ itemId, unit, factorToBase: factor });
+      rows.push({ itemId, unit, factorToBase: factor, storedFactor: factor });
       return Promise.resolve();
     });
 
@@ -410,6 +415,7 @@ describe('ItemsPage', () => {
       itemId: 'oil',
       unit: 'جركن',
       factorToBase: 1,
+      storedFactor: 1,
     };
     let resolveReload: (value: UnitConversion[]) => void = () => undefined;
     let calls = 0;
@@ -446,6 +452,7 @@ describe('ItemsPage', () => {
       itemId: 'box',
       unit: 'كرتونة',
       factorToBase: 1,
+      storedFactor: 1,
     };
     let resolveReload: (value: UnitConversion[]) => void = () => undefined;
     let calls = 0;
@@ -487,7 +494,7 @@ describe('ItemsPage', () => {
   it('locks conversion actions while an item save is in flight', async () => {
     await renderCatalog();
     vi.mocked(listConversions).mockResolvedValue([
-      { itemId: 'box', unit: 'كرتونة', factorToBase: 1 },
+      { itemId: 'box', unit: 'كرتونة', factorToBase: 1, storedFactor: 1 },
     ]);
     let resolveSave: () => void = () => undefined;
     vi.mocked(updateItem).mockImplementation(
@@ -598,5 +605,175 @@ describe('ItemsPage', () => {
       ),
     );
     expect(screen.getByLabelText('الاسم')).toHaveValue('بوري جديد');
+  });
+
+  it('refuses a stale item rename and shows the name that landed', async () => {
+    let releaseFirst: () => void = () => undefined;
+    let updates = 0;
+    vi.mocked(updateItem).mockImplementation(() => {
+      updates += 1;
+      if (updates === 1) {
+        return new Promise<void>((resolve) => {
+          releaseFirst = () => resolve();
+        });
+      }
+      throw new StaleWriteError();
+    });
+    const landed = catalog.map((row) =>
+      row.id === 'mixed' ? { ...row, name: 'بوري جديد' } : row,
+    );
+    let loads = 0;
+    vi.mocked(listItems).mockImplementation(() => {
+      loads += 1;
+      return Promise.resolve(loads >= 4 ? landed : catalog);
+    });
+
+    const first = render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    expect(
+      await screen.findByRole('heading', { name: 'بوري مخلوط' }),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      within(screen.getByRole('article', { name: 'بوري مخلوط' })).getByRole(
+        'button',
+        { name: 'تعديل' },
+      ),
+    );
+    fireEvent.change(screen.getByLabelText('الاسم'), {
+      target: { value: 'بوري جديد' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => expect(updates).toBe(1));
+
+    first.unmount();
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    expect(
+      await screen.findByRole('heading', { name: 'بوري مخلوط' }),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      within(screen.getByRole('article', { name: 'بوري مخلوط' })).getByRole(
+        'button',
+        { name: 'تعديل' },
+      ),
+    );
+    expect(screen.getByLabelText('الاسم')).toHaveValue('بوري مخلوط');
+
+    releaseFirst();
+    await waitFor(() => expect(loads).toBe(3));
+    expect(screen.getByLabelText('الاسم')).toHaveValue('بوري مخلوط');
+
+    fireEvent.change(screen.getByLabelText('الاسم'), {
+      target: { value: 'اسم تاني' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'البيانات اتغيّرت من مكان تاني — اتعملها تحديث، راجعها واحفظ تاني',
+    );
+    expect(
+      screen.getByRole('form', { name: 'تعديل الصنف' }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText('الاسم')).toHaveValue('بوري جديد');
+    expect(updates).toBe(2);
+    expect(vi.mocked(updateItem).mock.calls[1]?.[1]).toMatchObject({
+      name: 'اسم تاني',
+    });
+    expect(vi.mocked(updateItem).mock.calls[1]?.[2]).toMatchObject({
+      name: 'بوري مخلوط',
+    });
+  });
+
+  it('refuses a stale factor save after leaving and reopening the page', async () => {
+    let releaseFirst: () => void = () => undefined;
+    vi.mocked(updateConversion).mockImplementation((_id, _unit, factor) => {
+      if (factor === 2) {
+        return new Promise<void>((resolve) => {
+          releaseFirst = () => resolve();
+        });
+      }
+      throw new StaleWriteError();
+    });
+    const row = (factor: number): UnitConversion => ({
+      itemId: 'box',
+      unit: 'كرتونة',
+      factorToBase: factor,
+      storedFactor: factor,
+    });
+    let loads = 0;
+    vi.mocked(listConversions).mockImplementation(() => {
+      loads += 1;
+      return Promise.resolve([row(loads >= 4 ? 2 : 1)]);
+    });
+    vi.mocked(listItems).mockResolvedValue(catalog);
+
+    const first = render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const opened = await screen.findByRole('article', { name: 'علبة' });
+    fireEvent.click(within(opened).getByRole('button', { name: 'التحويلات' }));
+    expect(
+      await within(opened).findByText('1 كرتونة = 1 قطعة'),
+    ).toBeInTheDocument();
+    fireEvent.change(within(opened).getByLabelText('معامل كرتونة'), {
+      target: { value: '2' },
+    });
+    fireEvent.click(
+      within(opened).getByRole('button', { name: 'حفظ المعامل' }),
+    );
+    await waitFor(() =>
+      expect(vi.mocked(updateConversion)).toHaveBeenCalledTimes(1),
+    );
+    expect(vi.mocked(updateConversion).mock.calls[0]?.[3]).toBe(1);
+
+    first.unmount();
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const reopened = await screen.findByRole('article', { name: 'علبة' });
+    fireEvent.click(
+      within(reopened).getByRole('button', { name: 'التحويلات' }),
+    );
+    expect(
+      await within(reopened).findByText('1 كرتونة = 1 قطعة'),
+    ).toBeInTheDocument();
+
+    releaseFirst();
+    await waitFor(() => expect(loads).toBe(3));
+    expect(within(reopened).getByText('1 كرتونة = 1 قطعة')).toBeInTheDocument();
+
+    fireEvent.change(within(reopened).getByLabelText('معامل كرتونة'), {
+      target: { value: '3' },
+    });
+    fireEvent.click(
+      within(reopened).getByRole('button', { name: 'حفظ المعامل' }),
+    );
+
+    expect(await within(reopened).findByRole('alert')).toHaveTextContent(
+      'البيانات اتغيّرت من مكان تاني — اتعملها تحديث، راجعها واحفظ تاني',
+    );
+    expect(
+      await within(reopened).findByText('1 كرتونة = 2 قطعة'),
+    ).toBeInTheDocument();
+    expect(
+      within(reopened).queryByText('1 كرتونة = 3 قطعة'),
+    ).not.toBeInTheDocument();
+    expect(vi.mocked(updateConversion)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(updateConversion).mock.calls[1]).toEqual([
+      'box',
+      'كرتونة',
+      3,
+      1,
+    ]);
   });
 });

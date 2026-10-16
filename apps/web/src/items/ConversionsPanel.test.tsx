@@ -18,6 +18,7 @@ const item: CatalogItem = {
   baseUnit: 'kg',
   countFrequency: 'weekly',
   lossPct: 0,
+  storedLossPct: 0,
   parentItemId: null,
   active: true,
   onHandQty: 0,
@@ -34,7 +35,7 @@ describe('ConversionsPanel', () => {
   it('shows a reload error and retry when refreshing after a save fails', async () => {
     vi.mocked(listConversions)
       .mockResolvedValueOnce([
-        { itemId: 'oil', unit: 'كرتونة', factorToBase: 12 },
+        { itemId: 'oil', unit: 'كرتونة', factorToBase: 12, storedFactor: 12 },
       ])
       .mockRejectedValueOnce(new Error('حصل خطأ. حاول تاني.'));
     vi.mocked(addConversion).mockResolvedValue(undefined);

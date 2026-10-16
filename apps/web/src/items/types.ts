@@ -23,6 +23,8 @@ export type CatalogItem = {
   baseUnit: BaseUnit;
   countFrequency: CountFrequency;
   lossPct: number;
+  /** Exact `loss_pct` value read from PostgREST, used as the update filter. */
+  storedLossPct: number | string;
   parentItemId: string | null;
   active: boolean;
   onHandQty: number;
@@ -44,6 +46,8 @@ export type UnitConversion = {
   itemId: string;
   unit: string;
   factorToBase: number;
+  /** Exact `factor_to_base` value read from PostgREST, used as the write filter. */
+  storedFactor: number | string;
 };
 
 export function isStockKind(value: string): value is StockKind {

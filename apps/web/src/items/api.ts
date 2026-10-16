@@ -1,4 +1,9 @@
-import { genericCatalogError, mapCatalogError } from '@/items/errors';
+import {
+  genericCatalogError,
+  mapCatalogError,
+  StaleWriteError,
+} from '@/items/errors';
+import type { ItemExpectation } from '@/items/expectation';
 import { supabase } from '@/lib/supabase';
 import {
   isBaseUnit,
@@ -8,6 +13,8 @@ import {
   type ItemDraft,
   type UnitConversion,
 } from '@/items/types';
+
+export type { ItemExpectation };
 
 function appDb() {
   if (!supabase) throw new Error(genericCatalogError);
@@ -75,13 +82,18 @@ export async function listItems(): Promise<CatalogItem[]> {
       throw new Error(genericCatalogError);
     }
     const balance = balances.get(row.id);
+    const storedLossPct = row.loss_pct;
     return {
       id: row.id,
       name: row.name,
       kind: row.kind,
       baseUnit: row.base_unit,
       countFrequency: row.count_frequency,
-      lossPct: toNumber(row.loss_pct),
+      lossPct: toNumber(storedLossPct),
+      storedLossPct:
+        typeof storedLossPct === 'string' || typeof storedLossPct === 'number'
+          ? storedLossPct
+          : toNumber(storedLossPct),
       parentItemId: row.parent_item_id,
       active: row.active,
       onHandQty: balance ? toNumber(balance.on_hand_qty) : 0,
@@ -100,14 +112,28 @@ export async function createItem(draft: ItemDraft): Promise<void> {
   if (!data || data.length === 0) throw new Error(genericCatalogError);
 }
 
-export async function updateItem(id: string, draft: ItemDraft): Promise<void> {
-  const { data, error } = await appDb()
+export async function updateItem(
+  id: string,
+  draft: ItemDraft,
+  expected: ItemExpectation,
+): Promise<void> {
+  const matched = appDb()
     .from('stock_items')
     .update(itemPayload(draft))
     .eq('id', id)
-    .select('id');
+    .eq('name', expected.name)
+    .eq('kind', expected.kind)
+    .eq('base_unit', expected.baseUnit)
+    .eq('count_frequency', expected.countFrequency)
+    .eq('loss_pct', expected.lossPct as number)
+    .eq('active', expected.active);
+  const filtered =
+    expected.parentItemId === null
+      ? matched.is('parent_item_id', null)
+      : matched.eq('parent_item_id', expected.parentItemId);
+  const { data, error } = await filtered.select('id');
   throwIfError(error);
-  if (!data || data.length === 0) throw new Error(genericCatalogError);
+  if (!data || data.length === 0) throw new StaleWriteError();
 }
 
 export async function listConversions(
@@ -119,11 +145,18 @@ export async function listConversions(
     .eq('item_id', itemId)
     .order('unit');
   throwIfError(error);
-  return (data ?? []).map((row) => ({
-    itemId: row.item_id,
-    unit: row.unit,
-    factorToBase: toNumber(row.factor_to_base),
-  }));
+  return (data ?? []).map((row) => {
+    const storedFactor = row.factor_to_base;
+    return {
+      itemId: row.item_id,
+      unit: row.unit,
+      factorToBase: toNumber(storedFactor),
+      storedFactor:
+        typeof storedFactor === 'string' || typeof storedFactor === 'number'
+          ? storedFactor
+          : toNumber(storedFactor),
+    };
+  });
 }
 
 export async function addConversion(
@@ -147,27 +180,31 @@ export async function updateConversion(
   itemId: string,
   unit: string,
   factorToBase: number,
+  expectedFactor: number | string,
 ): Promise<void> {
   const { data, error } = await appDb()
     .from('item_unit_conversions')
     .update({ factor_to_base: factorToBase })
     .eq('item_id', itemId)
     .eq('unit', unit)
+    .eq('factor_to_base', expectedFactor as number)
     .select('unit');
   throwIfError(error);
-  if (!data || data.length === 0) throw new Error(genericCatalogError);
+  if (!data || data.length === 0) throw new StaleWriteError();
 }
 
 export async function deleteConversion(
   itemId: string,
   unit: string,
+  expectedFactor: number | string,
 ): Promise<void> {
   const { data, error } = await appDb()
     .from('item_unit_conversions')
     .delete()
     .eq('item_id', itemId)
     .eq('unit', unit)
+    .eq('factor_to_base', expectedFactor as number)
     .select('unit');
   throwIfError(error);
-  if (!data || data.length === 0) throw new Error(genericCatalogError);
+  if (!data || data.length === 0) throw new StaleWriteError();
 }

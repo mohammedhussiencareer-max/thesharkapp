@@ -19,6 +19,7 @@ const item: CatalogItem = {
   baseUnit: 'kg',
   countFrequency: 'weekly',
   lossPct: 0,
+  storedLossPct: 0,
   parentItemId: null,
   active: true,
   onHandQty: 0,
@@ -54,8 +55,13 @@ describe('ItemList', () => {
       itemId: item.id,
       unit: 'كيس',
       factorToBase: 1,
+      storedFactor: 1,
     };
-    const saved: UnitConversion = { ...initial, factorToBase: 2 };
+    const saved: UnitConversion = {
+      ...initial,
+      factorToBase: 2,
+      storedFactor: 2,
+    };
     let resolveReload: (value: UnitConversion[]) => void = () => undefined;
     let calls = 0;
     vi.mocked(listConversions).mockImplementation(() => {

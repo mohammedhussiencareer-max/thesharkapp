@@ -1,5 +1,15 @@
 export const genericCatalogError = 'حصل خطأ. حاول تاني.';
 
+export const staleWriteMessage =
+  'البيانات اتغيّرت من مكان تاني — اتعملها تحديث، راجعها واحفظ تاني';
+
+export class StaleWriteError extends Error {
+  constructor() {
+    super(staleWriteMessage);
+    this.name = 'StaleWriteError';
+  }
+}
+
 const checkReasons: ReadonlyArray<readonly [string, string]> = [
   [
     'cannot change base_unit of an item that has movements',
