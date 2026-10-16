@@ -45,6 +45,10 @@ export function ItemsPage() {
   const [formMode, setFormMode] = useState<ItemEditor | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // One page-wide lock: while an item save or a conversion operation (and the
+  // reload after it) is in flight, nothing that edits data or remounts a panel
+  // can start, so no editor or panel ever opens on stale data.
+  const busy = saving || conversionsBusy;
   const [openConversionsId, setOpenConversionsId] = useState<string | null>(
     null,
   );
@@ -83,20 +87,20 @@ export function ItemsPage() {
   }
 
   function openCreate() {
-    if (saving) return;
+    if (busy) return;
     setFormError(null);
     setEditor({ type: 'create' });
   }
 
   function openEdit(item: CatalogItem) {
-    if (saving) return;
+    if (busy) return;
     setFormError(null);
     setEditor({ type: 'edit', id: item.id });
   }
 
   async function handleSubmit(draft: ItemDraft) {
     const started = formModeRef.current;
-    if (!started || saving) return;
+    if (!started || busy) return;
     setSaving(true);
     setFormError(null);
     let saved = false;
@@ -164,7 +168,7 @@ export function ItemsPage() {
             <button
               className={primaryButton}
               type="button"
-              disabled={saving}
+              disabled={busy}
               onClick={openCreate}
             >
               ضيف صنف
@@ -173,7 +177,7 @@ export function ItemsPage() {
               <input
                 type="checkbox"
                 checked={showInactive}
-                disabled={conversionsBusy}
+                disabled={busy}
                 onChange={(event) => setShowInactive(event.target.checked)}
               />
               عرض الموقوف
@@ -188,11 +192,12 @@ export function ItemsPage() {
                 editingItem ? itemToFormValues(editingItem) : emptyItemForm()
               }
               submitting={saving}
+              locked={conversionsBusy}
               serverError={formError}
               onClearServerError={() => setFormError(null)}
               onSubmit={(draft) => void handleSubmit(draft)}
               onCancel={() => {
-                if (saving) return;
+                if (busy) return;
                 setEditor(null);
                 setFormError(null);
               }}
@@ -207,7 +212,7 @@ export function ItemsPage() {
               items={items}
               showInactive={showInactive}
               openConversionsId={openConversionsId}
-              editsDisabled={saving}
+              editsDisabled={busy}
               onEdit={openEdit}
               onToggleConversions={(itemId) =>
                 setOpenConversionsId((current) =>

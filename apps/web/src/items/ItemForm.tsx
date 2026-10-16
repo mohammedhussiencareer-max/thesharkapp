@@ -30,6 +30,7 @@ export function ItemForm({
   editingId,
   initial,
   submitting,
+  locked = false,
   serverError,
   onClearServerError,
   onSubmit,
@@ -39,6 +40,8 @@ export function ItemForm({
   editingId?: string;
   initial?: ItemFormValues;
   submitting: boolean;
+  /** Another operation on the page is in flight; the form waits for it. */
+  locked?: boolean;
   serverError: string | null;
   onClearServerError: () => void;
   onSubmit: (draft: ItemDraft) => void;
@@ -99,7 +102,7 @@ export function ItemForm({
             className={fieldClass}
             name="item-name"
             autoComplete="off"
-            disabled={submitting}
+            disabled={submitting || locked}
             value={values.name}
             onChange={(event) => change({ name: event.target.value })}
           />
@@ -111,7 +114,7 @@ export function ItemForm({
           النوع
           <select
             className={fieldClass}
-            disabled={submitting}
+            disabled={submitting || locked}
             value={values.kind}
             onChange={onKind}
           >
@@ -130,7 +133,7 @@ export function ItemForm({
             السمك المخلوط
             <select
               className={fieldClass}
-              disabled={submitting}
+              disabled={submitting || locked}
               value={values.parentItemId}
               onChange={(event) => change({ parentItemId: event.target.value })}
             >
@@ -153,7 +156,7 @@ export function ItemForm({
           الوحدة الأساسية
           <select
             className={fieldClass}
-            disabled={submitting}
+            disabled={submitting || locked}
             value={values.baseUnit}
             onChange={(event) => {
               const baseUnit = event.target.value;
@@ -175,7 +178,7 @@ export function ItemForm({
           الجرد
           <select
             className={fieldClass}
-            disabled={submitting}
+            disabled={submitting || locked}
             value={values.countFrequency}
             onChange={(event) => {
               const countFrequency = event.target.value;
@@ -201,7 +204,7 @@ export function ItemForm({
             className={fieldClass}
             dir="ltr"
             inputMode="decimal"
-            disabled={submitting}
+            disabled={submitting || locked}
             value={values.lossPercent}
             onChange={(event) => change({ lossPercent: event.target.value })}
           />
@@ -214,20 +217,24 @@ export function ItemForm({
       <label className="flex items-center gap-2">
         <input
           type="checkbox"
-          disabled={submitting}
+          disabled={submitting || locked}
           checked={values.active}
           onChange={(event) => change({ active: event.target.checked })}
         />
         شغال
       </label>
       <div className="flex flex-wrap gap-2">
-        <button className={primaryButton} type="submit" disabled={submitting}>
+        <button
+          className={primaryButton}
+          type="submit"
+          disabled={submitting || locked}
+        >
           {submitting ? 'جاري الحفظ…' : 'حفظ'}
         </button>
         <button
           className={secondaryButton}
           type="button"
-          disabled={submitting}
+          disabled={submitting || locked}
           onClick={onCancel}
         >
           إلغاء

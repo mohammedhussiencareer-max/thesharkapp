@@ -93,9 +93,12 @@ function ConversionRow({
 
 export function ConversionsPanel({
   item,
+  locked = false,
   onBusyChange,
 }: {
   item: CatalogItem;
+  /** Set by the page while an item save is in flight. */
+  locked?: boolean;
   onBusyChange?: (busy: boolean) => void;
 }) {
   const requestRef = useRef(0);
@@ -142,6 +145,7 @@ export function ConversionsPanel({
   }, [item.id]);
 
   async function run(work: () => Promise<void>) {
+    if (busy || locked) return;
     setBusy(true);
     onBusyChange?.(true);
     setActionError(null);
@@ -210,7 +214,7 @@ export function ConversionsPanel({
           conversion={conversion}
           baseLabel={baseLabel}
           baseUnit={item.baseUnit}
-          disabled={busy}
+          disabled={busy || locked}
           onSave={(nextFactor) =>
             run(() => updateConversion(item.id, conversion.unit, nextFactor))
           }
@@ -223,7 +227,7 @@ export function ConversionsPanel({
           <input
             className={fieldClass}
             autoComplete="off"
-            disabled={busy}
+            disabled={busy || locked}
             value={unit}
             onChange={(event) => setUnit(event.target.value)}
           />
@@ -234,7 +238,7 @@ export function ConversionsPanel({
             className={fieldClass}
             dir="ltr"
             inputMode="decimal"
-            disabled={busy}
+            disabled={busy || locked}
             value={factor}
             onChange={(event) => setFactor(event.target.value)}
           />
@@ -243,7 +247,11 @@ export function ConversionsPanel({
           1 من الوحدة دي = كام {baseLabel}
         </p>
         {actionError ? <p role="alert">{actionError}</p> : null}
-        <button className={primaryButton} type="submit" disabled={busy}>
+        <button
+          className={primaryButton}
+          type="submit"
+          disabled={busy || locked}
+        >
           ضيف التحويل
         </button>
       </form>

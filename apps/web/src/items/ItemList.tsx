@@ -82,7 +82,11 @@ function ItemCard({
         </button>
       </div>
       {conversionsOpen ? (
-        <ConversionsPanel item={item} onBusyChange={onConversionsBusy} />
+        <ConversionsPanel
+          item={item}
+          locked={editsDisabled}
+          onBusyChange={onConversionsBusy}
+        />
       ) : null}
     </article>
   );
@@ -127,7 +131,7 @@ export function ItemList({
       item={item}
       conversionsOpen={openConversionsId === item.id}
       editsDisabled={editsDisabled}
-      conversionsLocked={conversionsBusy}
+      conversionsLocked={conversionsBusy || editsDisabled}
       onEdit={onEdit}
       onToggleConversions={onToggleConversions}
       onConversionsBusy={setConversionsBusy}
@@ -153,7 +157,7 @@ export function ItemList({
                   item={block.parent}
                   conversionsOpen={openConversionsId === block.parent.id}
                   editsDisabled={editsDisabled}
-                  conversionsLocked={conversionsBusy}
+                  conversionsLocked={conversionsBusy || editsDisabled}
                   onEdit={onEdit}
                   onToggleConversions={onToggleConversions}
                   onConversionsBusy={setConversionsBusy}

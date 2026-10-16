@@ -439,6 +439,92 @@ describe('ItemsPage', () => {
     await waitFor(() => expect(filter).toBeEnabled());
   });
 
+  it('locks an open item editor while a conversion save reloads', async () => {
+    vi.mocked(updateConversion).mockReset();
+    await renderCatalog();
+    const initial: UnitConversion = {
+      itemId: 'box',
+      unit: 'كرتونة',
+      factorToBase: 1,
+    };
+    let resolveReload: (value: UnitConversion[]) => void = () => undefined;
+    let calls = 0;
+    vi.mocked(listConversions).mockImplementation(() => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve([initial]);
+      return new Promise((resolve) => {
+        resolveReload = resolve;
+      });
+    });
+    vi.mocked(updateConversion).mockResolvedValue(undefined);
+
+    const box = screen.getByRole('article', { name: 'علبة' });
+    fireEvent.click(within(box).getByRole('button', { name: 'تعديل' }));
+    fireEvent.click(within(box).getByRole('button', { name: 'التحويلات' }));
+    expect(
+      await within(box).findByText('1 كرتونة = 1 قطعة'),
+    ).toBeInTheDocument();
+
+    fireEvent.change(within(box).getByLabelText('معامل كرتونة'), {
+      target: { value: '2' },
+    });
+    fireEvent.click(within(box).getByRole('button', { name: 'حفظ المعامل' }));
+
+    const save = () => screen.getByRole('button', { name: /^حفظ$/ });
+    await waitFor(() => expect(save()).toBeDisabled());
+    expect(within(box).getByRole('button', { name: 'تعديل' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
+    fireEvent.click(save());
+    expect(updateItem).not.toHaveBeenCalled();
+
+    resolveReload([{ ...initial, factorToBase: 2 }]);
+    expect(
+      await within(box).findByText('1 كرتونة = 2 قطعة'),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(save()).toBeEnabled());
+  });
+
+  it('locks conversion actions while an item save is in flight', async () => {
+    await renderCatalog();
+    vi.mocked(listConversions).mockResolvedValue([
+      { itemId: 'box', unit: 'كرتونة', factorToBase: 1 },
+    ]);
+    let resolveSave: () => void = () => undefined;
+    vi.mocked(updateItem).mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveSave = resolve;
+        }),
+    );
+
+    const box = screen.getByRole('article', { name: 'علبة' });
+    fireEvent.click(within(box).getByRole('button', { name: 'التحويلات' }));
+    expect(
+      await within(box).findByText('1 كرتونة = 1 قطعة'),
+    ).toBeInTheDocument();
+    fireEvent.click(within(box).getByRole('button', { name: 'تعديل' }));
+    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+
+    await waitFor(() =>
+      expect(
+        within(box).getByRole('button', { name: 'حفظ المعامل' }),
+      ).toBeDisabled(),
+    );
+    expect(
+      within(box).getByRole('button', { name: 'ضيف التحويل' }),
+    ).toBeDisabled();
+    expect(
+      within(box).getByRole('button', { name: 'التحويلات' }),
+    ).toBeDisabled();
+
+    resolveSave();
+    await waitFor(() =>
+      expect(
+        within(box).getByRole('button', { name: 'حفظ المعامل' }),
+      ).toBeEnabled(),
+    );
+  });
+
   it('does not switch editors while a save is in flight', async () => {
     let resolveSave: (value: void) => void = () => undefined;
     vi.mocked(updateItem).mockReturnValue(
