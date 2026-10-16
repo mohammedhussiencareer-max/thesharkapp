@@ -1,3 +1,5 @@
+import { Link } from 'react-router-dom';
+
 export function HomePage({
   email,
   onSignOut,
@@ -10,6 +12,12 @@ export function HomePage({
       <h1 className="text-2xl font-semibold">The Shark</h1>
       <p>المخزون والمكسب اليومي</p>
       <p>{email}</p>
+      <Link
+        className="inline-flex w-fit rounded bg-neutral-900 px-3 py-2 text-white"
+        to="/items"
+      >
+        الأصناف
+      </Link>
       <button type="button" onClick={onSignOut}>
         تسجيل الخروج
       </button>
