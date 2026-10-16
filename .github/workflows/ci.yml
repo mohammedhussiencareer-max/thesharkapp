@@ -80,3 +80,53 @@ jobs:
       - name: Stop Supabase
         if: always()
         run: supabase stop
+
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      desktop: ${{ steps.filter.outputs.desktop }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            desktop:
+              - 'apps/desktop/**'
+              - 'apps/web/**'
+              - 'pnpm-lock.yaml'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - '.nvmrc'
+              - '.github/workflows/ci.yml'
+
+  desktop:
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm desktop:check
+      - name: tauri build
+        run: pnpm desktop:build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-nsis-installer
+          path: apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
+          retention-days: 7
+          if-no-files-found: error
