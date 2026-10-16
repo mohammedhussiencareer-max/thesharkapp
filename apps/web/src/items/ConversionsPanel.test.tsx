@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { addConversion, listConversions, updateConversion } from '@/items/api';
 import { ConversionsPanel } from '@/items/ConversionsPanel';
+import { StaleWriteError } from '@/items/errors';
 import type { CatalogItem } from '@/items/types';
 
 vi.mock('@/items/api', () => ({
@@ -97,6 +98,32 @@ describe('ConversionsPanel', () => {
         '12345678.123456789',
       );
     });
+  });
+
+  it('re-initializes the factor input when only the exact stored text changes', async () => {
+    const before = {
+      itemId: 'oil',
+      unit: 'طن',
+      factorToBase: 12345678.123456789,
+      storedFactor: '12345678.123456789',
+    };
+    // Same JS number, different exact decimal: a concurrent edit landed.
+    const after = { ...before, storedFactor: '12345678.12345679' };
+    vi.mocked(listConversions)
+      .mockResolvedValueOnce([before])
+      .mockResolvedValueOnce([after]);
+    vi.mocked(updateConversion).mockRejectedValueOnce(new StaleWriteError());
+
+    render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByText('1 طن = 12345678.123456789 كيلو'),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+
+    expect(
+      await screen.findByText('1 طن = 12345678.12345679 كيلو'),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText('معامل طن')).toHaveValue('12345678.12345679');
   });
 
   it('shows a reload error and retry when refreshing after a save fails', async () => {

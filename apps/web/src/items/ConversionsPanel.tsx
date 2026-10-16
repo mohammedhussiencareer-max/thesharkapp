@@ -212,7 +212,7 @@ export function ConversionsPanel({
       {rows.length === 0 && !loadError ? <p>مفيش تحويلات للصنف ده</p> : null}
       {rows.map((conversion) => (
         <ConversionRow
-          key={`${conversion.unit}@${conversion.factorToBase}`}
+          key={`${conversion.unit}@${String(conversion.storedFactor)}`}
           conversion={conversion}
           baseLabel={baseLabel}
           baseUnit={item.baseUnit}
