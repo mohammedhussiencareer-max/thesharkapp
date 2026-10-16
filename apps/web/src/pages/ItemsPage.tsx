@@ -41,6 +41,7 @@ export function ItemsPage() {
   const [loading, setLoading] = useState(true);
   const [loadId, setLoadId] = useState(0);
   const [showInactive, setShowInactive] = useState(false);
+  const [conversionsBusy, setConversionsBusy] = useState(false);
   const [formMode, setFormMode] = useState<ItemEditor | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -172,6 +173,7 @@ export function ItemsPage() {
               <input
                 type="checkbox"
                 checked={showInactive}
+                disabled={conversionsBusy}
                 onChange={(event) => setShowInactive(event.target.checked)}
               />
               عرض الموقوف
@@ -212,6 +214,7 @@ export function ItemsPage() {
                   current === itemId ? null : itemId,
                 )
               }
+              onConversionsBusyChange={setConversionsBusy}
             />
           )}
         </>

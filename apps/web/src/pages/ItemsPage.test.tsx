@@ -12,6 +12,7 @@ import {
   createItem,
   listConversions,
   listItems,
+  updateConversion,
   updateItem,
 } from '@/items/api';
 import type { CatalogItem, UnitConversion } from '@/items/types';
@@ -400,6 +401,42 @@ describe('ItemsPage', () => {
       await within(box).findByText('1 كرتونة = 12 قطعة'),
     ).toBeInTheDocument();
     expect(addConversion).toHaveBeenCalledWith('box', 'كرتونة', 12);
+  });
+
+  it('locks the inactive filter while an inactive item conversion saves', async () => {
+    vi.mocked(updateConversion).mockReset();
+    await renderCatalog();
+    const initial: UnitConversion = {
+      itemId: 'oil',
+      unit: 'جركن',
+      factorToBase: 1,
+    };
+    let resolveReload: (value: UnitConversion[]) => void = () => undefined;
+    let calls = 0;
+    vi.mocked(listConversions).mockImplementation(() => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve([initial]);
+      return new Promise((resolve) => {
+        resolveReload = resolve;
+      });
+    });
+    vi.mocked(updateConversion).mockResolvedValue(undefined);
+
+    const filter = screen.getByRole('checkbox', { name: 'عرض الموقوف' });
+    fireEvent.click(filter);
+    const oil = await screen.findByRole('article', { name: 'زيت' });
+    fireEvent.click(within(oil).getByRole('button', { name: 'التحويلات' }));
+    expect(await within(oil).findByText('1 جركن = 1 لتر')).toBeInTheDocument();
+
+    fireEvent.change(within(oil).getByLabelText('معامل جركن'), {
+      target: { value: '2' },
+    });
+    fireEvent.click(within(oil).getByRole('button', { name: 'حفظ المعامل' }));
+    await waitFor(() => expect(filter).toBeDisabled());
+
+    resolveReload([{ ...initial, factorToBase: 2 }]);
+    expect(await within(oil).findByText('1 جركن = 2 لتر')).toBeInTheDocument();
+    await waitFor(() => expect(filter).toBeEnabled());
   });
 
   it('does not switch editors while a save is in flight', async () => {

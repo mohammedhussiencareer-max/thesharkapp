@@ -104,6 +104,7 @@ export function ItemList({
   editsDisabled,
   onEdit,
   onToggleConversions,
+  onConversionsBusyChange,
 }: {
   items: readonly CatalogItem[];
   showInactive: boolean;
@@ -111,8 +112,14 @@ export function ItemList({
   editsDisabled: boolean;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
+  onConversionsBusyChange?: (busy: boolean) => void;
 }) {
-  const [conversionsBusy, setConversionsBusy] = useState(false);
+  const [conversionsBusy, setConversionsBusyState] = useState(false);
+  // The page also locks controls that would unmount an open panel (the inactive filter).
+  const setConversionsBusy = (busy: boolean) => {
+    setConversionsBusyState(busy);
+    onConversionsBusyChange?.(busy);
+  };
   const groups = groupCatalog(items, showInactive);
   const card = (item: CatalogItem) => (
     <ItemCard
