@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (110);
+  plan (111);
 
 -- Clean up any existing test rows in the transaction.
 delete from app.provisional_deficits;
@@ -1587,6 +1587,17 @@ select
     ),
     'liter'::text,
     'frozen base_unit stayed liter'
+  );
+
+-- 111: the base-unit row trigger takes no item row lock (the posting advisory
+-- lock already serializes it); a row lock there deadlocks with multi-row item
+-- updates such as toggling active.
+select
+  ok (
+    pg_catalog.pg_get_functiondef (
+      'app.trg_item_unit_conversions_reject_base_unit()'::regprocedure
+    ) !~* 'for\s+(share|update|no\s+key\s+update|key\s+share)',
+    'conversion base-unit trigger takes no item row lock'
   );
 
 select

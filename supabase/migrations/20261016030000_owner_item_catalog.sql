@@ -102,8 +102,7 @@ begin
   from
     app.stock_items si
   where
-    si.id = new.item_id
-  for share;
+    si.id = new.item_id;
 
   if found
   and pg_catalog.btrim(new.unit) = v_base_unit then
@@ -115,6 +114,10 @@ begin
 end;
 $$;
 
+-- No row lock on the item: base_unit changes and item deletes take the same
+-- posting advisory lock that trg_item_unit_conversions_lock already holds, so
+-- the read is stable, and a row lock here could deadlock with multi-row item
+-- updates (for example toggling active) that take no advisory lock.
 comment on function app.trg_item_unit_conversions_reject_base_unit () is 'Rejects a conversion whose unit trims to the item base_unit. The posting advisory lock is already held by trg_item_unit_conversions_lock.';
 
 revoke all on function app.trg_item_unit_conversions_reject_base_unit ()
