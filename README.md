@@ -18,6 +18,9 @@ pnpm test
 pnpm format
 pnpm format:check
 pnpm build
+pnpm desktop:dev
+pnpm desktop:build
+pnpm desktop:check
 pnpm exec playwright install --with-deps chromium
 pnpm e2e
 pnpm db:start

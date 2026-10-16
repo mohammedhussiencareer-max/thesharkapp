@@ -1,0 +1,17 @@
+[package]
+name = "the-shark"
+version = "0.1.0"
+description = "The Shark inventory and daily profit"
+authors = ["The Shark"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "=2.7.3", features = [] }
+
+[dependencies]
+tauri = { version = "=2.12.4", features = [] }
+
+# `tauri build` passes `--features tauri/custom-protocol`. It is not a default
+# feature, so `cargo test` / clippy do not need apps/web/dist to exist.
+[features]
+custom-protocol = ["tauri/custom-protocol"]
