@@ -16,6 +16,7 @@
     "desktop:build": "pnpm --filter desktop installer",
     "desktop:check": "pnpm --filter desktop check",
     "e2e": "pnpm --filter web e2e",
+    "pos:sync": "pnpm --filter pos-sync sync",
     "db:start": "supabase start",
     "db:stop": "supabase stop",
     "db:reset": "supabase --yes db reset",

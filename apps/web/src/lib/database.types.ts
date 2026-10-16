@@ -59,6 +59,88 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"pos_order_lines": {
+                  Row: {
+                    "item_id": string,"item_name": string | null,"line_id": string,"line_total": number,"options": NonNullable<Json>,"order_id": string,"price_per_kg": number | null,"quantity": number,"size_name": string | null,"unit_price": number | null,"weighted_qty": number | null,"weighted_unit": string | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "item_id": string,"item_name"?: string | null,"line_id": string,"line_total": number,"options"?: NonNullable<Json>,"order_id": string,"price_per_kg"?: number | null,"quantity": number,"size_name"?: string | null,"unit_price"?: number | null,"weighted_qty"?: number | null,"weighted_unit"?: string | null
+                  }
+                  Update: {
+                    "item_id"?: string,"item_name"?: string | null,"line_id"?: string,"line_total"?: number,"options"?: NonNullable<Json>,"order_id"?: string,"price_per_kg"?: number | null,"quantity"?: number,"size_name"?: string | null,"unit_price"?: number | null,"weighted_qty"?: number | null,"weighted_unit"?: string | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "pos_order_lines_order_id_fkey"
+      columns: ["order_id"]
+isOneToOne: false
+      referencedRelation: "pos_orders"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"pos_orders": {
+                  Row: {
+                    "content_hash": string,"delivery_fee": number,"discount": number,"financial_revision": number | null,"first_synced_at": string,"id": string,"last_financial_operation_key": string | null,"last_synced_at": string,"missing_from_pos": boolean,"order_number": number | null,"order_type": string | null,"ordered_at": string,"payment_type": string | null,"pos_update_time": string,"service_tax": number,"shift_id": string,"status": string,"subtotal": number,"tax": number,"total": number,"version": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "content_hash": string,"delivery_fee": number,"discount": number,"financial_revision"?: number | null,"first_synced_at"?: string,"id": string,"last_financial_operation_key"?: string | null,"last_synced_at"?: string,"missing_from_pos"?: boolean,"order_number"?: number | null,"order_type"?: string | null,"ordered_at": string,"payment_type"?: string | null,"pos_update_time": string,"service_tax": number,"shift_id": string,"status": string,"subtotal": number,"tax": number,"total": number,"version"?: number
+                  }
+                  Update: {
+                    "content_hash"?: string,"delivery_fee"?: number,"discount"?: number,"financial_revision"?: number | null,"first_synced_at"?: string,"id"?: string,"last_financial_operation_key"?: string | null,"last_synced_at"?: string,"missing_from_pos"?: boolean,"order_number"?: number | null,"order_type"?: string | null,"ordered_at"?: string,"payment_type"?: string | null,"pos_update_time"?: string,"service_tax"?: number,"shift_id"?: string,"status"?: string,"subtotal"?: number,"tax"?: number,"total"?: number,"version"?: number
+                  }
+                  Relationships: [
+                    
+                  ]
+                },"pos_shifts": {
+                  Row: {
+                    "closed_at": string | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "closed_at"?: string | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at"?: string
+                  }
+                  Update: {
+                    "closed_at"?: string | null,"id"?: string,"is_active"?: boolean,"opened_at"?: string,"pos_update_time"?: string,"synced_at"?: string
+                  }
+                  Relationships: [
+                    
+                  ]
+                },"pos_sync_run_orders": {
+                  Row: {
+                    "order_id": string,"run_id": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "order_id": string,"run_id": number
+                  }
+                  Update: {
+                    "order_id"?: string,"run_id"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "pos_sync_run_orders_run_id_fkey"
+      columns: ["run_id"]
+isOneToOne: false
+      referencedRelation: "pos_sync_runs"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"pos_sync_runs": {
+                  Row: {
+                    "counts": Json | null,"error": string | null,"finished_at": string | null,"id": number,"mode": string,"scope_applied": boolean,"started_at": string,"status": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "counts"?: Json | null,"error"?: string | null,"finished_at"?: string | null,"id"?: never,"mode": string,"scope_applied"?: boolean,"started_at"?: string,"status"?: string
+                  }
+                  Update: {
+                    "counts"?: Json | null,"error"?: string | null,"finished_at"?: string | null,"id"?: never,"mode"?: string,"scope_applied"?: boolean,"started_at"?: string,"status"?: string
+                  }
+                  Relationships: [
+                    
+                  ]
                 },"provisional_deficits": {
                   Row: {
                     "item_id": string,"movement_id": number,"provisional_unit_cost": number,"qty_uncovered": number,"value_uncovered": number
@@ -149,8 +231,17 @@ isOneToOne: false
 "assert_ledger_write_allowed":
 { Args: Record<PropertyKey, never>; Returns: undefined
                            },
+"assert_pos_write_allowed":
+{ Args: Record<PropertyKey, never>; Returns: undefined
+                           },
 "delete_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
+                           },
+"finish_pos_sync_run":
+{ Args: { "p_counts": Json,"p_error": string,"p_run_id": number,"p_status": string }; Returns: undefined
+                           },
+"ingest_pos_batch":
+{ Args: { "p_orders": Json,"p_run_id": number,"p_scope": Json,"p_shifts": Json }; Returns: Json
                            },
 "is_owner":
 { Args: Record<PropertyKey, never>; Returns: boolean
@@ -170,11 +261,23 @@ isOneToOne: false
         isOneToOne: true
         isSetofReturn: false
       } },
+"pos_money":
+{ Args: { "p_value": number }; Returns: number
+                           },
+"pos_qty":
+{ Args: { "p_value": number }; Returns: number
+                           },
 "post_movements":
 { Args: { "p_movements": Json }; Returns: string
                            },
 "post_sort":
 { Args: { "p_mixed_item": string,"p_occurred_at": string,"p_qty_taken": number,"p_shift_id"?: string,"p_sizes": Json }; Returns: string
+                           },
+"replace_pos_order_lines":
+{ Args: { "p_lines": Json,"p_order_id": string }; Returns: undefined
+                           },
+"start_pos_sync_run":
+{ Args: { "p_mode": string }; Returns: number
                            },
 "update_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
