@@ -57,13 +57,34 @@ export function ItemsPage() {
   // One page-wide lock: while an item save or a conversion operation (and the
   // reload after it) is in flight, nothing that edits data or remounts a panel
   // can start, so no editor or panel ever opens on stale data.
-  const busy = saving || conversionsBusy || needsReload || loading;
+  const [catalogLoads, setCatalogLoads] = useState(0);
+  const busy = saving || conversionsBusy || needsReload || catalogLoads > 0;
   const [openConversionsId, setOpenConversionsId] = useState<string | null>(
     null,
   );
   const formModeRef = useRef<ItemEditor | null>(null);
   const expectedRef = useRef<ItemExpectation | null>(null);
   const openConversionsRef = useRef<string | null>(null);
+  const catalogSeqRef = useRef(0);
+  const catalogLoadsRef = useRef(0);
+
+  // Every catalog read goes through here: it holds the page lock while in
+  // flight, and only the newest read may apply its rows or its error.
+  async function readCatalog(): Promise<CatalogItem[] | null> {
+    const seq = ++catalogSeqRef.current;
+    catalogLoadsRef.current += 1;
+    setCatalogLoads(catalogLoadsRef.current);
+    try {
+      const next = await listItems();
+      return seq === catalogSeqRef.current ? next : null;
+    } catch (error) {
+      if (seq !== catalogSeqRef.current) return null;
+      throw error;
+    } finally {
+      catalogLoadsRef.current -= 1;
+      setCatalogLoads(catalogLoadsRef.current);
+    }
+  }
 
   function setEditor(next: ItemEditor | null) {
     formModeRef.current = next;
@@ -71,7 +92,8 @@ export function ItemsPage() {
   }
 
   async function reloadCatalog(staleItemId?: string) {
-    const next = await listItems();
+    const next = await readCatalog();
+    if (!next) return;
     setItems(next);
     setLoadError(null);
     setNeedsReload(false);
@@ -90,8 +112,8 @@ export function ItemsPage() {
     let cancelled = false;
     void (async () => {
       try {
-        const next = await listItems();
-        if (cancelled) return;
+        const next = await readCatalog();
+        if (cancelled || !next) return;
         setItems(next);
         setLoadError(null);
         setNeedsReload(false);
@@ -108,7 +130,7 @@ export function ItemsPage() {
   }, [loadId]);
 
   function retry() {
-    if (saving || conversionsBusy || loading) return;
+    if (saving || conversionsBusy || catalogLoadsRef.current > 0) return;
     setLoading(true);
     setLoadError(null);
     setLoadId((value) => value + 1);
@@ -131,7 +153,7 @@ export function ItemsPage() {
 
   async function handleSubmit(draft: ItemDraft) {
     const started = formModeRef.current;
-    if (!started || busy) return;
+    if (!started || busy || catalogLoadsRef.current > 0) return;
     setSaving(true);
     setFormError(null);
     let saved = false;
@@ -145,9 +167,11 @@ export function ItemsPage() {
       }
       saved = true;
       if (sameEditor(formModeRef.current, started)) setEditor(null);
-      const next = await listItems();
-      setItems(next);
-      setLoadError(null);
+      const next = await readCatalog();
+      if (next) {
+        setItems(next);
+        setLoadError(null);
+      }
     } catch (error) {
       if (
         !saved &&
@@ -195,7 +219,7 @@ export function ItemsPage() {
           <button
             className={secondaryButton}
             type="button"
-            disabled={saving || conversionsBusy || loading}
+            disabled={saving || conversionsBusy || catalogLoads > 0}
             onClick={retry}
           >
             إعادة المحاولة
@@ -210,7 +234,7 @@ export function ItemsPage() {
               <button
                 className={secondaryButton}
                 type="button"
-                disabled={saving || conversionsBusy || loading}
+                disabled={saving || conversionsBusy || catalogLoads > 0}
                 onClick={retry}
               >
                 إعادة المحاولة

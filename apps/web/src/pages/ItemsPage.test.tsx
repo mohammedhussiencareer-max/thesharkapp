@@ -976,4 +976,49 @@ describe('ItemsPage', () => {
       expect(screen.queryByRole('form')).not.toBeInTheDocument();
     });
   });
+
+  it('locks the page while a stale-snapshot catalog reload is in flight', async () => {
+    const oil = item({
+      id: 'oil',
+      name: 'زيت',
+      kind: 'ingredient',
+      baseUnit: 'kg',
+      active: true,
+    });
+    let resolveStaleReload: (value: CatalogItem[]) => void = () => undefined;
+    let loads = 0;
+    vi.mocked(listItems).mockImplementation(() => {
+      loads += 1;
+      if (loads === 2) {
+        return new Promise((resolve) => {
+          resolveStaleReload = resolve;
+        });
+      }
+      return Promise.resolve([oil]);
+    });
+    vi.mocked(listConversions).mockResolvedValue(listed([], 'liter'));
+
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole('article', { name: 'زيت' });
+    fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
+    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+
+    await waitFor(() => {
+      expect(loads).toBe(2);
+    });
+    expect(screen.getByRole('button', { name: /^حفظ$/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+    expect(updateItem).not.toHaveBeenCalled();
+
+    resolveStaleReload([{ ...oil, baseUnit: 'liter' }]);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
+    });
+    expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('liter');
+  });
 });
