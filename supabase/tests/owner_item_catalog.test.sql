@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (69);
+  plan (70);
 
 -- Clean up any existing test rows in the transaction.
 delete from app.provisional_deficits;
@@ -248,6 +248,22 @@ select
         and pg_catalog.pg_get_functiondef (p.oid) like '%pg_advisory_xact_lock%'
     ),
     'conversion base-unit check does not take the posting advisory lock'
+  );
+
+-- 10b: conversion writes take the posting advisory lock per statement, before row locks
+select
+  is (
+    (
+      select
+        t.tgtype::int
+      from
+        pg_catalog.pg_trigger t
+      where
+        t.tgrelid = 'app.item_unit_conversions'::regclass
+        and t.tgname = 'trg_item_unit_conversions_lock'
+    ),
+    30,
+    'trg_item_unit_conversions_lock is BEFORE INSERT OR UPDATE OR DELETE FOR EACH STATEMENT'
   );
 
 -- 11
