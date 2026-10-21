@@ -21,8 +21,9 @@ function query(result: { data: unknown; error: unknown }) {
     select?: unknown;
     filters: { op: string; column: string; value: unknown }[];
     orders: { column: string; ascending: boolean | undefined }[];
+    ranges: { from: number; to: number }[];
     limit?: number;
-  } = { filters: [], orders: [] };
+  } = { filters: [], orders: [], ranges: [] };
   const chain: Record<string, unknown> = {};
   chain.select = (columns?: unknown) => {
     captured.select = columns;
@@ -32,7 +33,7 @@ function query(result: { data: unknown; error: unknown }) {
     captured.orders.push({ column, ascending: options?.ascending });
     return chain;
   };
-  for (const op of ['eq', 'gte', 'lt'] as const) {
+  for (const op of ['eq', 'gte', 'lt', 'in'] as const) {
     chain[op] = (column: string, value: unknown) => {
       captured.filters.push({ op, column, value });
       return chain;
@@ -40,6 +41,10 @@ function query(result: { data: unknown; error: unknown }) {
   }
   chain.limit = (value: number) => {
     captured.limit = value;
+    return chain;
+  };
+  chain.range = (from: number, to: number) => {
+    captured.ranges.push({ from, to });
     return chain;
   };
   chain.then = (
@@ -139,6 +144,11 @@ describe('purchases api', () => {
     expect(items.captured.filters).toEqual([
       { op: 'eq', column: 'active', value: true },
     ]);
+    expect(items.captured.orders).toEqual([
+      { column: 'name', ascending: true },
+      { column: 'id', ascending: true },
+    ]);
+    expect(items.captured.ranges).toEqual([{ from: 0, to: 999 }]);
   });
 
   it('lists purchases newest first with exact money text', async () => {
@@ -152,31 +162,39 @@ describe('purchases api', () => {
           note: null,
           total_paid_text: '50.00',
           created_at: '2026-07-15T09:01:00.000Z',
-          purchase_lines: [
-            {
-              line_no: 2,
-              item_id: 'mixed',
-              quantity_text: '1.000000',
-              unit: 'kg',
-              base_quantity_text: '1.000000',
-              amount_paid_text: '10.00',
-              stock_items: [{ name: 'بوري', base_unit: 'kg' }],
-            },
-            {
-              line_no: 1,
-              item_id: 'oil',
-              quantity_text: '2.000000',
-              unit: 'لتر',
-              base_quantity_text: '1.840000',
-              amount_paid_text: '40.00',
-              stock_items: { name: 'زيت', base_unit: 'kg' },
-            },
-          ],
         },
       ],
       error: null,
     });
-    mocks.schema.mockReturnValue({ from: () => purchases.chain });
+    const lines = query({
+      data: [
+        {
+          purchase_id: 'p1',
+          line_no: 2,
+          item_id: 'mixed',
+          quantity_text: '1.000000',
+          unit: 'kg',
+          base_quantity_text: '1.000000',
+          amount_paid_text: '10.00',
+          stock_items: [{ name: 'بوري', base_unit: 'kg' }],
+        },
+        {
+          purchase_id: 'p1',
+          line_no: 1,
+          item_id: 'oil',
+          quantity_text: '2.000000',
+          unit: 'لتر',
+          base_quantity_text: '1.840000',
+          amount_paid_text: '40.00',
+          stock_items: { name: 'زيت', base_unit: 'kg' },
+        },
+      ],
+      error: null,
+    });
+    mocks.schema.mockReturnValue({
+      from: (table: string) =>
+        table === 'purchase_lines' ? lines.chain : purchases.chain,
+    });
 
     const rows = await listPurchases({
       from: '2026-07-14T21:00:00.000Z',
@@ -193,14 +211,23 @@ describe('purchases api', () => {
     expect(purchases.captured.orders).toEqual([
       { column: 'purchased_at', ascending: false },
       { column: 'created_at', ascending: false },
+      { column: 'id', ascending: false },
     ]);
     expect(purchases.captured.filters).toEqual([
       { op: 'gte', column: 'purchased_at', value: '2026-07-14T21:00:00.000Z' },
       { op: 'lt', column: 'purchased_at', value: '2026-07-15T21:00:00.000Z' },
     ]);
-    expect(purchases.captured.limit).toBe(1000);
+    expect(purchases.captured.ranges).toEqual([{ from: 0, to: 999 }]);
+    expect(lines.captured.orders).toEqual([
+      { column: 'purchase_id', ascending: true },
+      { column: 'line_no', ascending: true },
+    ]);
+    expect(lines.captured.filters).toEqual([
+      { op: 'in', column: 'purchase_id', value: ['p1'] },
+    ]);
+    expect(lines.captured.ranges).toEqual([{ from: 0, to: 999 }]);
     expect(String(purchases.captured.select)).toContain('total_paid::text');
-    expect(String(purchases.captured.select)).toContain('quantity::text');
+    expect(String(lines.captured.select)).toContain('quantity::text');
   });
 
   it('sends purchase and opening numbers as exact strings', async () => {

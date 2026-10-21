@@ -1,20 +1,12 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { createClient } from '@supabase/supabase-js';
-import { expect, test } from '@playwright/test';
 import type { Database } from '../src/lib/database.types';
 import { ownerEmail, ownerPassword } from './.test-owner';
-import { assertLocalSupabaseUrl } from './local-guard';
-
-const localEnv = readFileSync(
-  join(import.meta.dirname, '..', '.env.development'),
-  'utf8',
-);
-const envValue = (key: string) =>
-  new RegExp(`^${key}=(.+)$`, 'm').exec(localEnv)?.[1]?.trim() ?? '';
+import { expect, test } from './fixtures';
+import { developmentPublicEnv } from './local-guard';
 
 test('owner records opening stock and a purchase in a converted unit', async ({
   page,
+  supabaseUrl,
 }) => {
   test.setTimeout(90_000);
   const stamp = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -109,11 +101,10 @@ test('owner records opening stock and a purchase in a converted unit', async ({
     page.getByRole('article', { name: oil, exact: true }),
   ).toHaveCount(0);
 
-  const url = envValue('VITE_SUPABASE_URL') || 'http://127.0.0.1:55421';
-  assertLocalSupabaseUrl(url);
+  const env = developmentPublicEnv();
   const supabase = createClient<Database>(
-    url,
-    envValue('VITE_SUPABASE_ANON_KEY'),
+    supabaseUrl,
+    env.VITE_SUPABASE_ANON_KEY ?? '',
     {
       auth: {
         persistSession: false,

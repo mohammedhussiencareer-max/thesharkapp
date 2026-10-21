@@ -79,40 +79,71 @@ export function nowCairoDateTimeLocal(now = new Date()): string {
   return `${wall.year}-${pad(wall.month)}-${pad(wall.day)}T${pad(wall.hour)}:${pad(wall.minute)}`;
 }
 
+export const missingCairoTimeMessage = 'الوقت ده مش موجود في توقيت القاهرة';
+
+export type CairoDateTimeParse =
+  { ok: true; iso: string } | { ok: false; reason: 'invalid' | 'missing' };
+
 /**
- * Interpret a `datetime-local` value as Africa/Cairo and return a UTC ISO string.
- * Returns null when the value is not a real Cairo wall time (including a DST gap).
- * An overlapping hour uses the first matching offset.
+ * Interpret a `datetime-local` value as Africa/Cairo.
+ * A skipped clock time (Egypt starts DST at 00:00, so that hour does not
+ * exist) is `missing`. A repeated clock time (the autumn fall-back) uses the
+ * earlier instant: the first time that wall clock occurs, while daylight
+ * saving is still in effect.
  */
-export function cairoDateTimeLocalToIso(value: string): string | null {
+export function parseCairoDateTimeLocal(value: string): CairoDateTimeParse {
   const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value);
-  if (!match) return null;
+  if (!match) return { ok: false, reason: 'invalid' };
   const year = Number(match[1]);
   const month = Number(match[2]);
   const day = Number(match[3]);
   const hour = Number(match[4]);
   const minute = Number(match[5]);
-  if (!isRealDate(year, month, day) || hour > 23 || minute > 59) return null;
-
-  const utc = Date.UTC(year, month - 1, day, hour, minute, 0);
-  const offset1 = zoneOffset(new Date(utc));
-  if (offset1 === null) return null;
-  let guess = utc - offset1;
-  const offset2 = zoneOffset(new Date(guess));
-  if (offset2 === null) return null;
-  if (offset2 !== offset1) guess = utc - offset2;
-  const check = wallParts(new Date(guess));
-  if (
-    !check ||
-    check.year !== year ||
-    check.month !== month ||
-    check.day !== day ||
-    check.hour !== hour ||
-    check.minute !== minute
-  ) {
-    return null;
+  if (!isRealDate(year, month, day) || hour > 23 || minute > 59) {
+    return { ok: false, reason: 'invalid' };
   }
-  return new Date(guess).toISOString();
+
+  const matches = matchingInstants(year, month, day, hour, minute);
+  const earliest = matches[0];
+  if (earliest === undefined) return { ok: false, reason: 'missing' };
+  return { ok: true, iso: new Date(earliest).toISOString() };
+}
+
+export function cairoDateTimeLocalToIso(value: string): string | null {
+  const parsed = parseCairoDateTimeLocal(value);
+  return parsed.ok ? parsed.iso : null;
+}
+
+/** Sample offsets around the labeled instant so both sides of a transition are seen. */
+function matchingInstants(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+): number[] {
+  const label = Date.UTC(year, month - 1, day, hour, minute, 0);
+  const windowMs = 14 * 60 * 60 * 1000;
+  const stepMs = 30 * 60 * 1000;
+  const found = new Set<number>();
+  for (let delta = -windowMs; delta <= windowMs; delta += stepMs) {
+    const offset = zoneOffset(new Date(label + delta));
+    if (offset === null) continue;
+    const instant = label - offset;
+    const wall = wallParts(new Date(instant));
+    if (
+      wall &&
+      wall.year === year &&
+      wall.month === month &&
+      wall.day === day &&
+      wall.hour === hour &&
+      wall.minute === minute &&
+      wall.second === 0
+    ) {
+      found.add(instant);
+    }
+  }
+  return [...found].sort((left, right) => left - right);
 }
 
 export function formatCairoDateTime(iso: string): string {
@@ -135,29 +166,69 @@ function parseDate(
   return { year, month, day };
 }
 
-function formatDate(year: number, month: number, day: number): string {
-  return `${year}-${pad(month)}-${pad(day)}`;
+/**
+ * First instant that exists on a Cairo calendar day.
+ * On the DST start day, 00:00 is skipped and the day begins at 01:00.
+ */
+function firstInstantOfDay(
+  year: number,
+  month: number,
+  day: number,
+): number | null {
+  const target = year * 10000 + month * 100 + day;
+  const anchor = Date.UTC(year, month - 1, day);
+  const windowMs = 18 * 60 * 60 * 1000;
+  let lo = anchor - windowMs;
+  let hi = anchor + windowMs;
+  const keyOf = (ms: number) => {
+    const wall = wallParts(new Date(ms));
+    if (!wall) return null;
+    return wall.year * 10000 + wall.month * 100 + wall.day;
+  };
+  const loKey = keyOf(lo);
+  const hiKey = keyOf(hi);
+  if (loKey === null || hiKey === null || loKey >= target || hiKey < target) {
+    return null;
+  }
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const key = keyOf(mid);
+    if (key === null || key < target) lo = mid + 1;
+    else hi = mid;
+  }
+  const wall = wallParts(new Date(lo));
+  if (!wall || wall.year !== year || wall.month !== month || wall.day !== day) {
+    return null;
+  }
+  return lo;
 }
 
 /** Inclusive start of a Cairo calendar date, as a UTC ISO string. */
 export function cairoDateStartIso(date: string): string | null {
   const parsed = parseDate(date);
   if (!parsed) return null;
-  return cairoDateTimeLocalToIso(
-    `${formatDate(parsed.year, parsed.month, parsed.day)}T00:00`,
-  );
+  const instant = firstInstantOfDay(parsed.year, parsed.month, parsed.day);
+  return instant === null ? null : new Date(instant).toISOString();
 }
 
-/** Exclusive end: start of the next Cairo calendar date. */
+/**
+ * Exclusive end of a Cairo calendar date: the first instant of the next day.
+ * Compared with `purchased_at <` this value, the selected day runs through the
+ * instant just before the next day's start, including a repeated fall-back hour.
+ * The next day is not assumed to start at 00:00.
+ */
 export function cairoNextDateStartIso(date: string): string | null {
   const parsed = parseDate(date);
   if (!parsed) return null;
   const next = new Date(
     Date.UTC(parsed.year, parsed.month - 1, parsed.day + 1),
   );
-  return cairoDateTimeLocalToIso(
-    `${formatDate(next.getUTCFullYear(), next.getUTCMonth() + 1, next.getUTCDate())}T00:00`,
+  const instant = firstInstantOfDay(
+    next.getUTCFullYear(),
+    next.getUTCMonth() + 1,
+    next.getUTCDate(),
   );
+  return instant === null ? null : new Date(instant).toISOString();
 }
 
 export function dateRangeError(from: string, to: string): string | null {

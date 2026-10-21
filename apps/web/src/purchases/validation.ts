@@ -18,7 +18,10 @@ import type {
   StockChoice,
   UnitOption,
 } from '@/purchases/types';
-import { cairoDateTimeLocalToIso } from '@/purchases/time';
+import {
+  missingCairoTimeMessage,
+  parseCairoDateTimeLocal,
+} from '@/purchases/time';
 
 const quantityScaleMessage = 'الكمية مينفعش تبقى أدق من 6 خانات';
 const quantityRangeMessage = 'الكمية أكبر من اللازم';
@@ -145,8 +148,14 @@ export function validateOpening(
   const fields: OpeningFieldErrors = {};
   const lines: OpeningDraft['lines'] = [];
   let formError: string | null = null;
-  const occurredAt = cairoDateTimeLocalToIso(occurredAtLocal);
-  if (!occurredAt) formError = 'اكتب وقت رصيد صحيح بتوقيت القاهرة';
+  const occurred = parseCairoDateTimeLocal(occurredAtLocal);
+  const occurredAt = occurred.ok ? occurred.iso : null;
+  if (!occurred.ok) {
+    formError =
+      occurred.reason === 'missing'
+        ? missingCairoTimeMessage
+        : 'اكتب وقت رصيد صحيح بتوقيت القاهرة';
+  }
 
   for (const item of items) {
     const row = values[item.id] ?? {
@@ -245,8 +254,14 @@ export function validatePurchase(
   items: readonly StockChoice[],
 ): { ok: true; draft: PurchaseDraft } | { ok: false; errors: PurchaseErrors } {
   const errors: PurchaseErrors = { lines: {} };
-  const purchasedAt = cairoDateTimeLocalToIso(values.purchasedAt);
-  if (!purchasedAt) errors.purchasedAt = 'اكتب وقت شراء صحيح بتوقيت القاهرة';
+  const purchased = parseCairoDateTimeLocal(values.purchasedAt);
+  const purchasedAt = purchased.ok ? purchased.iso : null;
+  if (!purchased.ok) {
+    errors.purchasedAt =
+      purchased.reason === 'missing'
+        ? missingCairoTimeMessage
+        : 'اكتب وقت شراء صحيح بتوقيت القاهرة';
+  }
 
   const supplier = optionalText(
     values.supplier,

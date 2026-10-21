@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { StockChoice } from '@/purchases/types';
+import { missingCairoTimeMessage } from '@/purchases/time';
 import {
   previewPurchaseLine,
   validateOpening,
@@ -70,6 +71,25 @@ describe('purchase validation', () => {
       baseQuantity: '1.84',
       unitCost: '27.173913',
     });
+  });
+
+  it('rejects a clock time skipped by the Cairo DST gap', () => {
+    const result = validatePurchase(
+      { ...purchaseValues(), purchasedAt: '2027-04-30T00:30' },
+      [oil],
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.purchasedAt).toBe(missingCairoTimeMessage);
+
+    const opening = validateOpening(
+      { oil: { quantity: '1', unit: 'kg', unitCost: '10' } },
+      [oil],
+      '2027-04-30T00:00',
+    );
+    expect(opening.ok).toBe(false);
+    if (opening.ok) return;
+    expect(opening.formError).toBe(missingCairoTimeMessage);
   });
 
   it('rejects a negative amount, a missing line, and an unknown unit', () => {
