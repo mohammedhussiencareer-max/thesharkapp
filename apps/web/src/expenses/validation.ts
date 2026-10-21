@@ -1,6 +1,6 @@
 import {
-  digitCount,
   driverPay,
+  hasLongDigitRun,
   parseHours,
   parseMoney,
   type ParseFailure,
@@ -35,7 +35,7 @@ export const expenseMessages = {
   driverLarge: 'أجر الساعات أكبر من المسموح',
   note: 'الملاحظة أطول من 500 حرف',
   label: 'اسم الطيار أطول من 40 حرف',
-  phone: 'متسجلش رقم تليفون أو رقم قومي',
+  phone: 'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
   paidOn: 'تاريخ الدفع مش مظبوط',
   categoryName: 'اكتب اسم التصنيف',
   categoryNameLong: 'اسم التصنيف أطول من 80 حرف',
@@ -61,7 +61,8 @@ export type ExpenseFormErrors = Partial<
 >;
 
 export type ExpenseValidation =
-  { ok: true; draft: ExpenseDraft } | { ok: false; errors: ExpenseFormErrors };
+  | { ok: true; draft: Omit<ExpenseDraft, 'requestId'> }
+  | { ok: false; errors: ExpenseFormErrors };
 
 export function emptyExpenseForm(): ExpenseFormValues {
   return {
@@ -180,7 +181,7 @@ export function validateExpenseForm(
     }
     const label = values.driverLabel.trim();
     if (charLength(label) > 40) errors.driverLabel = expenseMessages.label;
-    else if (digitCount(label) >= 8) errors.driverLabel = expenseMessages.phone;
+    else if (hasLongDigitRun(label)) errors.driverLabel = expenseMessages.phone;
     else if (label !== '') driverLabel = label;
   } else if (kind) {
     const parsed = parseMoney(values.amount);
@@ -190,6 +191,7 @@ export function validateExpenseForm(
 
   const note = values.note.trim();
   if (charLength(note) > 500) errors.note = expenseMessages.note;
+  else if (hasLongDigitRun(note)) errors.note = expenseMessages.phone;
 
   let paidOn: string | null = null;
   if (values.paidOn.trim() !== '') {
@@ -225,6 +227,7 @@ export function validateCategoryName(value: string): string | null {
   const text = value.trim();
   if (text.length === 0) return expenseMessages.categoryName;
   if (charLength(text) > 80) return expenseMessages.categoryNameLong;
+  if (hasLongDigitRun(text)) return expenseMessages.phone;
   return null;
 }
 
@@ -232,5 +235,6 @@ export function validateVoidReason(value: string): string | null {
   const text = value.trim();
   if (text.length === 0) return expenseMessages.voidReason;
   if (charLength(text) > 500) return expenseMessages.voidReasonLong;
+  if (hasLongDigitRun(text)) return expenseMessages.phone;
   return null;
 }

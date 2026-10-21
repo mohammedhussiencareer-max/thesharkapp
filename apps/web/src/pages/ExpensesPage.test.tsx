@@ -22,6 +22,7 @@ import type {
   ExpenseLine,
   ExpenseMonth,
 } from '@/expenses/types';
+import { retrySafeMessage } from '@/expenses/errors';
 import { ExpensesPage } from '@/pages/ExpensesPage';
 
 vi.mock('@/expenses/api', () => ({
@@ -181,12 +182,83 @@ describe('ExpensesPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'تأكيد الإلغاء' }));
 
     await waitFor(() =>
-      expect(voidExpenseEntry).toHaveBeenCalledWith('entry-1', 'تكرار'),
+      expect(voidExpenseEntry).toHaveBeenCalledWith(
+        'entry-1',
+        'تكرار',
+        expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+        ),
+      ),
     );
     expect(await screen.findByText('ملغي')).toBeInTheDocument();
     expect(
       screen.queryByRole('button', { name: 'إلغاء المصروف' }),
     ).not.toBeInTheDocument();
+  });
+
+  it('keeps the expense request id across a failed save and mints a new one after success', async () => {
+    renderPage();
+    async function fillRent() {
+      fireEvent.change(await screen.findByLabelText('التصنيف'), {
+        target: { value: 'rent' },
+      });
+      fireEvent.change(screen.getByLabelText('المبلغ'), {
+        target: { value: '1000' },
+      });
+    }
+    await fillRent();
+    vi.mocked(addExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      retrySafeMessage,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(2));
+    const first = vi.mocked(addExpenseEntry).mock.calls[0]?.[0]?.requestId;
+    const second = vi.mocked(addExpenseEntry).mock.calls[1]?.[0]?.requestId;
+    expect(first).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
+    expect(second).toBe(first);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('التصنيف')).toHaveValue('');
+      expect(screen.getByRole('button', { name: 'حفظ المصروف' })).toBeEnabled();
+    });
+    await fillRent();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(addExpenseEntry).mock.calls[2]?.[0]?.requestId).not.toBe(
+      first,
+    );
+  });
+
+  it('reuses the void request id when the void reply is lost', async () => {
+    vi.mocked(voidExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    renderPage();
+    async function confirmVoid() {
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'إلغاء المصروف' }),
+      );
+      fireEvent.change(screen.getByLabelText('سبب الإلغاء'), {
+        target: { value: 'تكرار' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'تأكيد الإلغاء' }));
+    }
+    await confirmVoid();
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      retrySafeMessage,
+    );
+    await confirmVoid();
+    await waitFor(() => expect(voidExpenseEntry).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(voidExpenseEntry).mock.calls[1]?.[2]).toBe(
+      vi.mocked(voidExpenseEntry).mock.calls[0]?.[2],
+    );
   });
 
   it('marks the month complete and clears it again', async () => {

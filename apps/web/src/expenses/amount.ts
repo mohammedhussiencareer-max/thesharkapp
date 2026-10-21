@@ -80,8 +80,23 @@ export function driverPay(hours: string, hourlyRate: string): ParsedDecimal {
   return { ok: true, value: formatPiasters(rounded) };
 }
 
-/** Western, Arabic-Indic, and Extended Arabic-Indic digits anywhere in the text. */
-export function digitCount(value: string): number {
-  const matches = value.match(/[0-9\u0660-\u0669\u06f0-\u06f9]/g);
-  return matches?.length ?? 0;
+const phoneDigit = /[0-9\u0660-\u0669\u06f0-\u06f9]/;
+const phoneSeparator = /[\s.\u066b\u2013\u2014\u2212-]/;
+
+/**
+ * A run of 8 or more digits. Spaces, dashes, and dots between digits do not
+ * break the run. Counts Western, Arabic-Indic, and Extended Arabic-Indic digits.
+ */
+export function hasLongDigitRun(value: string): boolean {
+  let run = 0;
+  for (const char of value) {
+    if (phoneDigit.test(char)) {
+      run += 1;
+      if (run >= 8) return true;
+      continue;
+    }
+    if (phoneSeparator.test(char)) continue;
+    run = 0;
+  }
+  return false;
 }

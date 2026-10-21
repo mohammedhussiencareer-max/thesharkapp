@@ -65,6 +65,7 @@ export type ExpenseMonth = {
 };
 
 export type ExpenseDraft = {
+  requestId: string;
   categoryId: string;
   amount: string | null;
   periodMonth: string | null;

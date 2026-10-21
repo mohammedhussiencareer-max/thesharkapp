@@ -4,6 +4,7 @@ import {
   loadExpenseMonth,
   voidExpenseEntry,
 } from '@/expenses/api';
+import { retrySafeMessage } from '@/expenses/errors';
 import type { ExpenseDraft } from '@/expenses/types';
 import { genericCatalogError } from '@/items/errors';
 
@@ -133,7 +134,7 @@ describe('expense api', () => {
 
   it('reads exact decimal text for the month, newest first', async () => {
     const categories = query({ data: [categoryRow], error: null });
-    const lines = query({ data: [actualRow, estimateRow], error: null });
+    const lines = query({ data: [estimateRow, actualRow], error: null });
     const days = query({ data: [dayRow], error: null });
     const status = query({
       data: {
@@ -151,7 +152,6 @@ describe('expense api', () => {
     expect(mocks.schema).toHaveBeenCalledWith('app');
     expect(categories.captured.select).toBe('id, name, kind, active');
     expect(categories.captured.orders).toEqual([
-      { column: 'name', ascending: true },
       { column: 'id', ascending: true },
     ]);
     expect(lines.captured.select).toContain('amount::text');
@@ -159,10 +159,7 @@ describe('expense api', () => {
     expect(lines.captured.or).toBe(
       'period_month.eq.2030-04-01,and(expense_date.gte.2030-04-01,expense_date.lte.2030-04-30)',
     );
-    expect(lines.captured.orders).toEqual([
-      { column: 'created_at', ascending: false },
-      { column: 'id', ascending: false },
-    ]);
+    expect(lines.captured.orders).toEqual([{ column: 'id', ascending: true }]);
     expect(days.captured.select).toContain('fixed_share::text');
     expect(days.captured.orders).toEqual([{ column: 'date', ascending: true }]);
     expect(categories.captured.ranges).toEqual([{ from: 0, to: 999 }]);
@@ -227,6 +224,7 @@ describe('expense api', () => {
       status: query({ data: null, error: null }),
     });
     const fixed: ExpenseDraft = {
+      requestId: 'a17e0000-0000-4000-8000-0000000000aa',
       categoryId: 'cat-rent',
       amount: '1000.00',
       periodMonth: '2030-04-01',
@@ -239,6 +237,7 @@ describe('expense api', () => {
       driverLabel: null,
     };
     const driver: ExpenseDraft = {
+      requestId: 'a17e0000-0000-4000-8000-0000000000ab',
       categoryId: 'cat-driver',
       amount: '165.00',
       periodMonth: null,
@@ -253,7 +252,11 @@ describe('expense api', () => {
 
     await addExpenseEntry(fixed);
     await addExpenseEntry(driver);
-    await voidExpenseEntry('est', 'تكرار');
+    await voidExpenseEntry(
+      'est',
+      'تكرار',
+      'a17e0000-0000-4000-8000-0000000000ac',
+    );
 
     const fixedArgs = rpcCalls[0]?.args;
     const driverArgs = rpcCalls[1]?.args;
@@ -263,6 +266,7 @@ describe('expense api', () => {
       'void_expense_entry',
     ]);
     expect(fixedArgs).toEqual({
+      p_request_id: 'a17e0000-0000-4000-8000-0000000000aa',
       p_category_id: 'cat-rent',
       p_is_estimate: false,
       p_amount: '1000.00',
@@ -272,6 +276,7 @@ describe('expense api', () => {
     });
     expect(JSON.stringify(fixedArgs)).toContain('"p_amount":"1000.00"');
     expect(driverArgs).toEqual({
+      p_request_id: 'a17e0000-0000-4000-8000-0000000000ab',
       p_category_id: 'cat-driver',
       p_is_estimate: false,
       p_expense_date: '2030-04-15',
@@ -282,7 +287,11 @@ describe('expense api', () => {
     expect(driverArgs).not.toHaveProperty('p_amount');
     expect(JSON.stringify(driverArgs)).toContain('"p_hours":"5.50"');
     expect(JSON.stringify(driverArgs)).toContain('"p_hourly_rate":"30.00"');
-    expect(rpcCalls[2]?.args).toEqual({ p_id: 'est', p_reason: 'تكرار' });
+    expect(rpcCalls[2]?.args).toEqual({
+      p_id: 'est',
+      p_reason: 'تكرار',
+      p_request_id: 'a17e0000-0000-4000-8000-0000000000ac',
+    });
   });
 
   it('turns a database rejection into Arabic', async () => {
@@ -296,6 +305,7 @@ describe('expense api', () => {
 
     await expect(
       addExpenseEntry({
+        requestId: 'a17e0000-0000-4000-8000-0000000000ad',
         categoryId: 'cat-rent',
         amount: '10.00',
         periodMonth: '2030-04-01',
@@ -308,5 +318,80 @@ describe('expense api', () => {
         driverLabel: null,
       }),
     ).rejects.toThrow('التصنيف ده متوقف');
+  });
+
+  it('tells the owner to retry when the save reply is lost', async () => {
+    mocks.schema.mockReturnValue({
+      rpc() {
+        throw new Error('Failed to fetch');
+      },
+    });
+    await expect(
+      addExpenseEntry({
+        requestId: 'a17e0000-0000-4000-8000-0000000000ae',
+        categoryId: 'cat-rent',
+        amount: '10.00',
+        periodMonth: '2030-04-01',
+        expenseDate: null,
+        paidOn: null,
+        isEstimate: false,
+        note: null,
+        hours: null,
+        hourlyRate: null,
+        driverLabel: null,
+      }),
+    ).rejects.toThrow(retrySafeMessage);
+  });
+
+  it('returns every category id once when a name changes between pages', async () => {
+    const ids = Array.from(
+      { length: 1001 },
+      (_, index) => `c${String(index).padStart(4, '0')}`,
+    );
+    const server = ids.map((id) => ({
+      id,
+      name: id,
+      kind: 'daily',
+      active: true,
+    }));
+    const orders: string[] = [];
+    const chain: Record<string, unknown> = {};
+    chain.select = () => chain;
+    chain.order = (column: string) => {
+      orders.push(column);
+      return chain;
+    };
+    chain.range = (from: number, to: number) => {
+      const column = orders.at(-1) === 'name' ? 'name' : 'id';
+      const sorted = [...server].sort((left, right) =>
+        left[column].localeCompare(right[column]),
+      );
+      const slice = sorted.slice(from, to + 1);
+      const first = server[0];
+      if (from === 0 && first) first.name = 'zzzz-renamed';
+      return Promise.resolve({ data: slice, error: null });
+    };
+
+    install({
+      categories: {
+        chain,
+        captured: { orders: [], ranges: [] },
+      },
+      lines: query({ data: [], error: null }),
+      days: query({ data: [], error: null }),
+      status: query({ data: null, error: null }),
+    });
+
+    const month = await loadExpenseMonth('2030-04-01');
+
+    expect(orders).toContain('id');
+    expect(orders).not.toContain('name');
+    expect(month.categories).toHaveLength(ids.length);
+    expect(month.categories.map((row) => row.id).sort()).toEqual(
+      [...ids].sort(),
+    );
+    expect(month.categories.filter((row) => row.id === 'c0000')).toEqual([
+      expect.objectContaining({ name: 'zzzz-renamed' }),
+    ]);
   });
 });

@@ -1,4 +1,5 @@
-import { expect, test, type Page } from '@playwright/test';
+import type { Page } from '@playwright/test';
+import { expect, test } from './fixtures';
 import { ownerEmail, ownerPassword } from './.test-owner';
 
 async function voidOpenExpenses(page: Page): Promise<void> {

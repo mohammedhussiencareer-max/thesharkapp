@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mapExpenseError } from '@/expenses/errors';
+import { mapExpenseError, retrySafeMessage } from '@/expenses/errors';
 import { genericCatalogError } from '@/items/errors';
 
 describe('mapExpenseError', () => {
@@ -26,6 +26,25 @@ describe('mapExpenseError', () => {
           'duplicate key value violates unique constraint "expense_entries_voids_id_key"',
       }),
     ).toBe('المصروف ده اتلغى قبل كده');
+    expect(
+      mapExpenseError({
+        code: '23505',
+        message:
+          'duplicate key value violates unique constraint "expense_entries_request_id_key"',
+      }),
+    ).toBe(retrySafeMessage);
+    expect(
+      mapExpenseError({
+        message: 'request_id already used for a different expense',
+      }),
+    ).toBe(
+      'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع مصاريف الشهر قبل ما تسجّل تاني',
+    );
+    expect(
+      mapExpenseError({
+        message: 'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+      }),
+    ).toBe('مينفعش تكتب أرقام تليفونات أو أرقام قومية');
   });
 
   it('hides an unknown failure', () => {

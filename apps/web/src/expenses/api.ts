@@ -1,4 +1,4 @@
-import { mapExpenseError } from '@/expenses/errors';
+import { mapExpenseError, retrySafeMessage } from '@/expenses/errors';
 import { markSuperseded } from '@/expenses/status';
 import {
   isExpenseKind,
@@ -12,7 +12,7 @@ import { genericCatalogError } from '@/items/errors';
 import { monthEndIso } from '@/lib/cairo';
 import type { Database } from '@/lib/database.types';
 import { exactDecimal, exactDecimalOrNull } from '@/lib/decimal';
-import { readAllPages } from '@/lib/paged';
+import { fetchAllPages, PageCapError } from '@/lib/paged';
 import { supabase } from '@/lib/supabase';
 
 const categoryColumns = 'id, name, kind, active';
@@ -32,6 +32,55 @@ function appDb() {
 
 function throwIfError(error: { message?: string } | null): void {
   if (error) throw new Error(mapExpenseError(error));
+}
+
+async function readPages<T extends object>(
+  load: (
+    from: number,
+    to: number,
+  ) => PromiseLike<{
+    data: T[] | null;
+    error: { message?: string } | null;
+  }>,
+  keyOf: (row: T) => string,
+): Promise<T[]> {
+  try {
+    return await fetchAllPages(async (from, to) => {
+      const result = await load(from, to);
+      throwIfError(result.error);
+      return { data: result.data, error: null };
+    }, keyOf);
+  } catch (error) {
+    if (error instanceof PageCapError) {
+      throw new Error(genericCatalogError, { cause: error });
+    }
+    throw error;
+  }
+}
+
+function pageKey(row: object, field: string): string {
+  const value = (row as Record<string, unknown>)[field];
+  if (typeof value !== 'string' || value === '') {
+    throw new Error(genericCatalogError);
+  }
+  return value;
+}
+
+async function writeEntry(
+  call: () => PromiseLike<{ error: { message?: string } | null }>,
+): Promise<void> {
+  let result: { error: { message?: string } | null };
+  try {
+    result = await call();
+  } catch (error) {
+    throw new Error(retrySafeMessage, { cause: error });
+  }
+  if (!result.error) return;
+  const mapped = mapExpenseError(result.error);
+  if (mapped === genericCatalogError) {
+    throw new Error(retrySafeMessage, { cause: result.error });
+  }
+  throw new Error(mapped);
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -141,32 +190,40 @@ export async function loadExpenseMonth(
   const month = monthStartOrThrow(monthStart);
   const monthEnd = monthEndIso(month);
   const db = appDb();
-  const [categories, lines, days, statusResult] = await Promise.all([
-    readAllPages(
-      db
-        .from('expense_categories')
-        .select(categoryColumns)
-        .order('name', { ascending: true })
-        .order('id', { ascending: true }),
-      genericCatalogError,
+  // Page by an immutable unique key, then sort for display. A rename must not
+  // repeat one category and drop another. period_month and expense_date do not
+  // change after insert, so those filters stay on the query. date is the whole
+  // key of a day row.
+  const [categoryRows, lineRows, dayRows, statusResult] = await Promise.all([
+    readPages(
+      (from, to) =>
+        db
+          .from('expense_categories')
+          .select(categoryColumns)
+          .order('id', { ascending: true })
+          .range(from, to),
+      (row) => pageKey(row, 'id'),
     ),
-    readAllPages(
-      db
-        .from('expense_lines')
-        .select(lineColumns)
-        .or(
-          `period_month.eq.${month},and(expense_date.gte.${month},expense_date.lte.${monthEnd})`,
-        )
-        .order('created_at', { ascending: false })
-        .order('id', { ascending: false }),
-      genericCatalogError,
+    readPages(
+      (from, to) =>
+        db
+          .from('expense_lines')
+          .select(lineColumns)
+          .or(
+            `period_month.eq.${month},and(expense_date.gte.${month},expense_date.lte.${monthEnd})`,
+          )
+          .order('id', { ascending: true })
+          .range(from, to),
+      (row) => pageKey(row, 'id'),
     ),
-    readAllPages(
-      db
-        .rpc('expense_daily', { p_from: month, p_to: monthEnd })
-        .select(dayColumns)
-        .order('date', { ascending: true }),
-      genericCatalogError,
+    readPages(
+      (from, to) =>
+        db
+          .rpc('expense_daily', { p_from: month, p_to: monthEnd })
+          .select(dayColumns)
+          .order('date', { ascending: true })
+          .range(from, to),
+      (row) => pageKey(row, 'date'),
     ),
     db
       .from('month_expense_status')
@@ -177,11 +234,28 @@ export async function loadExpenseMonth(
   throwIfError(statusResult.error);
   const status = statusResult.data;
 
+  const categories = categoryRows.map((row) => mapCategory(row));
+  categories.sort(
+    (left, right) =>
+      left.name.localeCompare(right.name, 'ar') ||
+      (left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+  );
+  const lines = lineRows.map((row) => mapLine(row));
+  lines.sort((left, right) => {
+    const created = right.createdAt.localeCompare(left.createdAt);
+    if (created !== 0) return created;
+    return left.id < right.id ? 1 : left.id > right.id ? -1 : 0;
+  });
+  const days = dayRows.map((row) => mapDay(row));
+  days.sort((left, right) =>
+    left.date < right.date ? -1 : left.date > right.date ? 1 : 0,
+  );
+
   return {
     monthStart: month,
-    categories: categories.map((row) => mapCategory(row)),
-    entries: markSuperseded(lines.map((row) => mapLine(row))),
-    days: days.map((row) => mapDay(row)),
+    categories,
+    entries: markSuperseded(lines),
+    days,
     complete: status ? requiredBoolean(status.complete) : false,
     confirmedAt: status ? optionalString(status.confirmed_at) : null,
   };
@@ -191,6 +265,7 @@ export async function addExpenseEntry(draft: ExpenseDraft): Promise<void> {
   const args: EntryArgs = {
     p_category_id: draft.categoryId,
     p_is_estimate: draft.isEstimate,
+    p_request_id: draft.requestId,
   };
   if (draft.amount !== null && draft.hours === null) {
     args.p_amount = numericParam(draft.amount);
@@ -204,19 +279,21 @@ export async function addExpenseEntry(draft: ExpenseDraft): Promise<void> {
     args.p_hourly_rate = numericParam(draft.hourlyRate);
   }
   if (draft.driverLabel !== null) args.p_driver_label = draft.driverLabel;
-  const { error } = await appDb().rpc('add_expense_entry', args);
-  throwIfError(error);
+  await writeEntry(() => appDb().rpc('add_expense_entry', args));
 }
 
 export async function voidExpenseEntry(
   id: string,
   reason: string,
+  requestId: string,
 ): Promise<void> {
-  const { error } = await appDb().rpc('void_expense_entry', {
-    p_id: id,
-    p_reason: reason,
-  });
-  throwIfError(error);
+  await writeEntry(() =>
+    appDb().rpc('void_expense_entry', {
+      p_id: id,
+      p_reason: reason,
+      p_request_id: requestId,
+    }),
+  );
 }
 
 export async function setMonthExpenseComplete(

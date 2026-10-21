@@ -9,10 +9,27 @@
 -- row points at it (voids_id) with a reason and does not carry an amount.
 -- There is no UPDATE and no DELETE. driver_hours.amount is not taken from the
 -- client: trg_expense_entries_validate sets it to round(hours * hourly_rate, 2)
--- (half away from zero, the numeric round). A driver_label is a short label
--- the owner types. Eight or more digits (Western, Arabic-Indic, or
--- Extended Arabic-Indic) are rejected so a phone number or national id is not
--- stored. Notes are free text up to 500 characters and are not scanned.
+-- (half away from zero, the numeric round).
+--
+-- request_id is unique on every row, entries and voids. The web mints one id
+-- per draft and sends that same id again if the reply is lost. After the owner
+-- check and after the raw payload is validated and normalized, the function
+-- looks up request_id before any category or target lookup. The same normalized
+-- payload returns the saved id and inserts nothing. A different payload raises
+-- 'request_id already used for a different expense' (22023). The unique
+-- constraint is only the race guard: the loser retries, and the retry hits the
+-- lookup. A void retry with the same request_id, the same target, and the same
+-- reason returns the existing void. A different target or reason is the same
+-- refusal. A void uses its own request_id; it does not reuse the entry's.
+-- Driver pay ignores the client amount, so a replay compares hours, rate, and
+-- the computed amount, not the discarded client amount.
+--
+-- The owner types the category name, the note, the void reason, and the driver
+-- label. One helper, app.text_has_long_digit_run, rejects a run of 8 or more
+-- digits in all of them. Western, Arabic-Indic (٠-٩), and Extended
+-- Arabic-Indic (۰-۹) digits count. Spaces, dashes, and dots between digits do
+-- not break the run, so '010 0000 0000' and '٠١٠٠٠٠٠٠٠٠٠' are refused. The
+-- message is 'مينفعش تكتب أرقام تليفونات أو أرقام قومية'.
 --
 -- What counts, when the day is read (not at insert):
 --   * a voided row does not count, and a void marker never counts;
@@ -54,6 +71,74 @@
 -- Writes go through security definer functions with search_path = '' that allow
 -- only the owner or service_role. Authenticated users may SELECT; RLS hides
 -- rows from everyone else. anon has no grants.
+-- ============================================================================
+-- Phone-like runs. Used by category names, notes, void reasons, and labels.
+-- ============================================================================
+create function app.text_has_long_digit_run (p_text text) returns boolean language plpgsql immutable
+set
+  search_path = '' as $$
+declare
+  v_text text;
+  v_next text;
+  v_step integer := 0;
+begin
+  -- Any whitespace becomes a space so the run check can ignore it.
+  v_text := pg_catalog.regexp_replace(coalesce(p_text, ''), '[[:space:]]', ' ', 'g');
+
+  if v_text = '' then
+    return false;
+  end if;
+
+  -- Collapse separators that sit between digits. Non-overlapping matches need
+  -- another pass ('1 2 3' becomes '12 3', then '123').
+  loop
+    v_step := v_step + 1;
+    exit when v_step > 500;
+
+    v_next := pg_catalog.regexp_replace(
+      v_text,
+      '([0-9٠-٩۰-۹])[- .–—−٫]+([0-9٠-٩۰-۹])',
+      '\1\2',
+      'g'
+    );
+    exit when v_next = v_text;
+
+    v_text := v_next;
+  end loop;
+
+  return v_text ~ '[0-9٠-٩۰-۹]{8}';
+end;
+$$;
+
+comment on function app.text_has_long_digit_run (text) is 'True when free text contains a run of 8 or more digits. Spaces, dashes, and dots between digits are ignored. Counts Western, Arabic-Indic, and Extended Arabic-Indic digits.';
+
+revoke all on function app.text_has_long_digit_run (text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.assert_no_phone_text (p_text text) returns void language plpgsql
+set
+  search_path = '' as $$
+begin
+  if app.text_has_long_digit_run (p_text) then
+    raise exception 'مينفعش تكتب أرقام تليفونات أو أرقام قومية'
+      using errcode = '22023';
+  end if;
+end;
+$$;
+
+comment on function app.assert_no_phone_text (text) is 'Rejects a phone-like or national-id-like run in owner-typed text.';
+
+revoke all on function app.assert_no_phone_text (text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 -- ============================================================================
 -- 1. Categories
 -- ============================================================================
@@ -133,6 +218,27 @@ create trigger trg_expense_categories_no_truncate
 before truncate on app.expense_categories for each statement
 execute function app.trg_expense_categories_no_delete ();
 
+create function app.trg_expense_categories_phone () returns trigger language plpgsql security definer
+set
+  search_path = '' as $$
+begin
+  perform app.assert_no_phone_text (new.name);
+
+  return new;
+end;
+$$;
+
+revoke all on function app.trg_expense_categories_phone ()
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create trigger trg_expense_categories_phone
+before insert or update on app.expense_categories for each row
+execute function app.trg_expense_categories_phone ();
+
 insert into
   app.expense_categories (name, kind)
 values
@@ -150,6 +256,7 @@ values
 -- ============================================================================
 create table app.expense_entries (
   id uuid primary key default gen_random_uuid(),
+  request_id uuid not null unique,
   category_id uuid null references app.expense_categories (id) on delete restrict,
   amount numeric(14, 2) null,
   period_month date null,
@@ -238,6 +345,8 @@ comment on column app.expense_entries.paid_on is 'Payment date. Separate from th
 
 comment on column app.expense_entries.is_estimate is 'True until an actual invoice for the same category and period supersedes it. The row is kept.';
 
+comment on column app.expense_entries.request_id is 'One id per draft, including a void draft. A replay of the same normalized payload returns this row.';
+
 comment on column app.expense_entries.voids_id is 'Set only on a void marker. Unique, so an entry is voided at most once.';
 
 create index expense_entries_category_id_idx on app.expense_entries (category_id);
@@ -284,7 +393,6 @@ set
 declare
   v_kind text;
   v_active boolean;
-  v_digits text;
 begin
   if new.voids_id is not null then
     if new.void_reason is null
@@ -299,6 +407,7 @@ begin
     end if;
 
     new.void_reason := btrim(new.void_reason);
+    perform app.assert_no_phone_text (new.void_reason);
     new.category_id := null;
     new.amount := null;
     new.period_month := null;
@@ -349,6 +458,9 @@ begin
 
     return new;
   end if;
+
+  perform app.assert_no_phone_text (new.note);
+  perform app.assert_no_phone_text (new.driver_label);
 
   if new.category_id is null then
     raise exception 'expense category is required'
@@ -505,20 +617,6 @@ begin
     or new.hourly_rate = 'NaN'::numeric then
       raise exception 'hourly rate must be greater than zero'
         using errcode = '22023';
-    end if;
-
-    if new.driver_label is not null then
-      v_digits := pg_catalog.regexp_replace(
-        new.driver_label,
-        '[^0-9٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹]',
-        '',
-        'g'
-      );
-
-      if char_length(v_digits) >= 8 then
-        raise exception 'driver label must not contain a phone number'
-          using errcode = '22023';
-      end if;
     end if;
 
     -- Client amount is ignored. Half away from zero, same as numeric round.
@@ -703,6 +801,8 @@ begin
       using errcode = '22023';
   end if;
 
+  perform app.assert_no_phone_text (v_name);
+
   if p_kind is null
   or p_kind not in (
     'fixed_monthly',
@@ -755,6 +855,8 @@ begin
     raise exception 'expense category name is too long'
       using errcode = '22023';
   end if;
+
+  perform app.assert_no_phone_text (v_name);
 
   update app.expense_categories
   set
@@ -827,7 +929,10 @@ create function app.add_expense_entry (
   p_note text default null,
   p_hours numeric default null,
   p_hourly_rate numeric default null,
-  p_driver_label text default null
+  p_driver_label text default null,
+  -- Last, because PostgreSQL requires every argument after a default to have
+  -- one too. Null is rejected below; the web always sends the draft id.
+  p_request_id uuid default null
 ) returns uuid language plpgsql security definer
 set
   search_path = '' as $$
@@ -836,24 +941,19 @@ declare
   v_amount numeric;
   v_note text;
   v_label text;
+  v_existing app.expense_entries;
   v_id uuid;
 begin
   perform app.assert_expense_write_allowed ();
 
-  select
-    category.kind
-  into
-    v_kind
-  from
-    app.expense_categories category
-  where
-    category.id = p_category_id;
+  if p_request_id is null then
+    raise exception 'request_id is required'
+      using errcode = '22023';
+  end if;
 
   -- Scale is rejected here because numeric(14,2) would round it on the way in.
-  -- Driver pay ignores p_amount; the validate trigger computes it.
-  if v_kind = 'driver_hours' then
-    v_amount := null;
-  elsif p_amount is not null then
+  -- This does not read the category. Driver pay still ignores p_amount.
+  if p_amount is not null then
     if p_amount = 'NaN'::numeric
     or p_amount <> pg_catalog.round(p_amount, 2) then
       raise exception 'amount must have at most 2 decimal places'
@@ -896,16 +996,6 @@ begin
     end if;
   end if;
 
-  if v_kind = 'driver_hours'
-  and p_hours is not null
-  and p_hourly_rate is not null
-  and p_hours > 0
-  and p_hourly_rate > 0
-  and pg_catalog.round(p_hours * p_hourly_rate, 2) > 999999999999.99 then
-    raise exception 'driver amount is too large'
-      using errcode = '22023';
-  end if;
-
   v_note := nullif(btrim(coalesce(p_note, '')), '');
 
   if v_note is not null
@@ -922,8 +1012,76 @@ begin
       using errcode = '22023';
   end if;
 
+  perform app.assert_no_phone_text (v_note);
+  perform app.assert_no_phone_text (v_label);
+
+  -- Replay before any category lookup. A later rename or deactivation must
+  -- still return the row that this request already posted.
+  select
+    *
+  into
+    v_existing
+  from
+    app.expense_entries entry
+  where
+    entry.request_id = p_request_id;
+
+  if found then
+    if v_existing.voids_id is null
+    and v_existing.category_id is not distinct from p_category_id
+    and v_existing.period_month is not distinct from p_period_month
+    and v_existing.expense_date is not distinct from p_expense_date
+    and v_existing.paid_on is not distinct from p_paid_on
+    and v_existing.is_estimate is not distinct from p_is_estimate
+    and v_existing.note is not distinct from v_note
+    and v_existing.hours is not distinct from p_hours
+    and v_existing.hourly_rate is not distinct from p_hourly_rate
+    and v_existing.driver_label is not distinct from v_label
+    and (
+      (
+        v_existing.hours is not null
+        and v_existing.amount = pg_catalog.round(
+          v_existing.hours * v_existing.hourly_rate,
+          2
+        )
+      )
+      or (
+        v_existing.hours is null
+        and v_existing.amount is not distinct from v_amount
+      )
+    ) then
+      return v_existing.id;
+    end if;
+
+    raise exception 'request_id already used for a different expense'
+      using errcode = '22023';
+  end if;
+
+  select
+    category.kind
+  into
+    v_kind
+  from
+    app.expense_categories category
+  where
+    category.id = p_category_id;
+
+  if v_kind = 'driver_hours' then
+    v_amount := null;
+
+    if p_hours is not null
+    and p_hourly_rate is not null
+    and p_hours > 0
+    and p_hourly_rate > 0
+    and pg_catalog.round(p_hours * p_hourly_rate, 2) > 999999999999.99 then
+      raise exception 'driver amount is too large'
+        using errcode = '22023';
+    end if;
+  end if;
+
   insert into
     app.expense_entries (
+      request_id,
       category_id,
       amount,
       period_month,
@@ -938,6 +1096,7 @@ begin
     )
   values
     (
+      p_request_id,
       p_category_id,
       v_amount,
       p_period_month,
@@ -967,8 +1126,9 @@ comment on function app.add_expense_entry (
   text,
   numeric,
   numeric,
-  text
-) is 'Posts one expense. Driver amount is computed by the validate trigger and the client amount is discarded.';
+  text,
+  uuid
+) is 'Posts one expense. The same request_id and normalized payload returns the saved id. Driver amount is computed by the validate trigger and the client amount is discarded.';
 
 revoke all on function app.add_expense_entry (
   uuid,
@@ -980,7 +1140,8 @@ revoke all on function app.add_expense_entry (
   text,
   numeric,
   numeric,
-  text
+  text,
+  uuid
 )
 from
   public,
@@ -997,27 +1158,72 @@ execute on function app.add_expense_entry (
   text,
   numeric,
   numeric,
-  text
+  text,
+  uuid
 ) to authenticated,
 service_role;
 
-create function app.void_expense_entry (p_id uuid, p_reason text) returns uuid language plpgsql security definer
+create function app.void_expense_entry (p_id uuid, p_reason text, p_request_id uuid) returns uuid language plpgsql security definer
 set
   search_path = '' as $$
 declare
+  v_reason text;
+  v_existing app.expense_entries;
   v_id uuid;
 begin
   perform app.assert_expense_write_allowed ();
+
+  if p_request_id is null then
+    raise exception 'request_id is required'
+      using errcode = '22023';
+  end if;
 
   if p_id is null then
     raise exception 'unknown expense entry'
       using errcode = '22023';
   end if;
 
+  v_reason := nullif(btrim(coalesce(p_reason, '')), '');
+
+  if v_reason is null then
+    raise exception 'void reason is required'
+      using errcode = '22023';
+  end if;
+
+  if char_length(v_reason) > 500 then
+    raise exception 'void reason is too long'
+      using errcode = '22023';
+  end if;
+
+  perform app.assert_no_phone_text (v_reason);
+
+  -- Same request, same target, and same reason returns the void already
+  -- stored. A different target or reason is refused. The target is not read
+  -- until this request id is new, so a retry does not fail as "already voided".
+  select
+    *
+  into
+    v_existing
+  from
+    app.expense_entries entry
+  where
+    entry.request_id = p_request_id;
+
+  if found then
+    if v_existing.voids_id is not distinct from p_id
+    and v_existing.void_reason is not distinct from v_reason
+    and v_existing.category_id is null then
+      return v_existing.id;
+    end if;
+
+    raise exception 'request_id already used for a different expense'
+      using errcode = '22023';
+  end if;
+
   insert into
-    app.expense_entries (voids_id, void_reason, created_by)
+    app.expense_entries (request_id, voids_id, void_reason, created_by)
   values
-    (p_id, p_reason, auth.uid ())
+    (p_request_id, p_id, v_reason, auth.uid ())
   returning
     id into v_id;
 
@@ -1025,15 +1231,15 @@ begin
 end;
 $$;
 
-comment on function app.void_expense_entry (uuid, text) is 'Appends a void marker. The original entry stays. The validate trigger checks the reason and that the target is an open expense.';
+comment on function app.void_expense_entry (uuid, text, uuid) is 'Appends a void marker. The same request_id, target, and reason returns the existing void and does not insert another row.';
 
-revoke all on function app.void_expense_entry (uuid, text)
+revoke all on function app.void_expense_entry (uuid, text, uuid)
 from
   public,
   anon;
 
 grant
-execute on function app.void_expense_entry (uuid, text) to authenticated,
+execute on function app.void_expense_entry (uuid, text, uuid) to authenticated,
 service_role;
 
 create function app.set_month_expense_complete (p_month date, p_complete boolean) returns void language plpgsql security definer

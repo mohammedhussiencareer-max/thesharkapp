@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { driverPay, parseHours, parseMoney } from '@/expenses/amount';
+import {
+  driverPay,
+  hasLongDigitRun,
+  parseHours,
+  parseMoney,
+} from '@/expenses/amount';
 
 describe('expense amounts', () => {
   it('accepts Arabic-Indic digits and one decimal comma', () => {
@@ -15,6 +20,18 @@ describe('expense amounts', () => {
     expect(parseMoney('1.005')).toEqual({ ok: false, reason: 'scale' });
     expect(parseMoney('1000000000000')).toEqual({ ok: false, reason: 'large' });
     expect(parseHours('10000')).toEqual({ ok: false, reason: 'large' });
+  });
+
+  it('treats separated digits as one phone-like run', () => {
+    expect(hasLongDigitRun('01000000000')).toBe(true);
+    expect(hasLongDigitRun('010 0000 0000')).toBe(true);
+    expect(hasLongDigitRun('010-0000-0000')).toBe(true);
+    expect(hasLongDigitRun('010.0000.0000')).toBe(true);
+    expect(hasLongDigitRun('٠١٠٠٠٠٠٠٠٠٠')).toBe(true);
+    expect(hasLongDigitRun('٠١٠ ٠٠٠٠ ٠٠٠٠')).toBe(true);
+    expect(hasLongDigitRun('۰۱۰۰۰۰۰۰۰۰۰')).toBe(true);
+    expect(hasLongDigitRun('فاتورة 1234567')).toBe(false);
+    expect(hasLongDigitRun('رقم 1234x5678')).toBe(false);
   });
 
   it('rounds driver pay half away from zero to the piaster', () => {

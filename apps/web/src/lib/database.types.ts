@@ -21,14 +21,14 @@ export type Database = {
                   ]
                 },"expense_entries": {
                   Row: {
-                    "amount": number | null,"category_id": string | null,"created_at": string,"created_by": string | null,"driver_label": string | null,"expense_date": string | null,"hourly_rate": number | null,"hours": number | null,"id": string,"is_estimate": boolean | null,"note": string | null,"paid_on": string | null,"period_month": string | null,"void_reason": string | null,"voids_id": string | null
+                    "amount": number | null,"category_id": string | null,"created_at": string,"created_by": string | null,"driver_label": string | null,"expense_date": string | null,"hourly_rate": number | null,"hours": number | null,"id": string,"is_estimate": boolean | null,"note": string | null,"paid_on": string | null,"period_month": string | null,"request_id": string,"void_reason": string | null,"voids_id": string | null
                   }
                   ComputedFields: never
                   Insert: {
-                    "amount"?: number | null,"category_id"?: string | null,"created_at"?: string,"created_by"?: string | null,"driver_label"?: string | null,"expense_date"?: string | null,"hourly_rate"?: number | null,"hours"?: number | null,"id"?: string,"is_estimate"?: boolean | null,"note"?: string | null,"paid_on"?: string | null,"period_month"?: string | null,"void_reason"?: string | null,"voids_id"?: string | null
+                    "amount"?: number | null,"category_id"?: string | null,"created_at"?: string,"created_by"?: string | null,"driver_label"?: string | null,"expense_date"?: string | null,"hourly_rate"?: number | null,"hours"?: number | null,"id"?: string,"is_estimate"?: boolean | null,"note"?: string | null,"paid_on"?: string | null,"period_month"?: string | null,"request_id": string,"void_reason"?: string | null,"voids_id"?: string | null
                   }
                   Update: {
-                    "amount"?: number | null,"category_id"?: string | null,"created_at"?: string,"created_by"?: string | null,"driver_label"?: string | null,"expense_date"?: string | null,"hourly_rate"?: number | null,"hours"?: number | null,"id"?: string,"is_estimate"?: boolean | null,"note"?: string | null,"paid_on"?: string | null,"period_month"?: string | null,"void_reason"?: string | null,"voids_id"?: string | null
+                    "amount"?: number | null,"category_id"?: string | null,"created_at"?: string,"created_by"?: string | null,"driver_label"?: string | null,"expense_date"?: string | null,"hourly_rate"?: number | null,"hours"?: number | null,"id"?: string,"is_estimate"?: boolean | null,"note"?: string | null,"paid_on"?: string | null,"period_month"?: string | null,"request_id"?: string,"void_reason"?: string | null,"voids_id"?: string | null
                   }
                   Relationships: [
                     {
@@ -423,7 +423,7 @@ isOneToOne: false
 { Args: { "p_kind": string,"p_name": string }; Returns: string
                            },
 "add_expense_entry":
-{ Args: { "p_amount"?: number,"p_category_id": string,"p_driver_label"?: string,"p_expense_date"?: string,"p_hourly_rate"?: number,"p_hours"?: number,"p_is_estimate"?: boolean,"p_note"?: string,"p_paid_on"?: string,"p_period_month"?: string }; Returns: string
+{ Args: { "p_amount"?: number,"p_category_id": string,"p_driver_label"?: string,"p_expense_date"?: string,"p_hourly_rate"?: number,"p_hours"?: number,"p_is_estimate"?: boolean,"p_note"?: string,"p_paid_on"?: string,"p_period_month"?: string,"p_request_id"?: string }; Returns: string
                            },
 "add_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
@@ -439,6 +439,9 @@ isOneToOne: false
                            },
 "assert_ledger_write_allowed":
 { Args: Record<PropertyKey, never>; Returns: undefined
+                           },
+"assert_no_phone_text":
+{ Args: { "p_text": string }; Returns: undefined
                            },
 "assert_pos_write_allowed":
 { Args: Record<PropertyKey, never>; Returns: undefined
@@ -521,11 +524,14 @@ isOneToOne: false
 "start_pos_sync_run":
 { Args: { "p_mode": string }; Returns: number
                            },
+"text_has_long_digit_run":
+{ Args: { "p_text": string }; Returns: boolean
+                           },
 "update_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
                            },
 "void_expense_entry":
-{ Args: { "p_id": string,"p_reason": string }; Returns: string
+{ Args: { "p_id": string,"p_reason": string,"p_request_id": string }; Returns: string
                            }
           }
           Enums: {

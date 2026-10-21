@@ -1,5 +1,12 @@
 import { genericCatalogError } from '@/items/errors';
 
+/** A lost reply can be saved again; the same request id will not post twice. */
+export const retrySafeMessage =
+  'حصل خطأ. اضغط حفظ تاني — لو الطلب اتسجل مش هيتسجل مرتين.';
+
+const differentRequestMessage =
+  'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع مصاريف الشهر قبل ما تسجّل تاني';
+
 const reasons: Array<[string, string]> = [
   [
     'driver amount must be greater than zero',
@@ -8,8 +15,14 @@ const reasons: Array<[string, string]> = [
   ['driver amount is too large', 'أجر الساعات أكبر من المسموح'],
   [
     'driver label must not contain a phone number',
-    'متسجلش رقم تليفون أو رقم قومي',
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
   ],
+  [
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+  ],
+  ['request_id already used for a different expense', differentRequestMessage],
+  ['request_id is required', retrySafeMessage],
   [
     'driver fields must be empty unless the category is driver hours',
     'بيانات الطيار للمصروف ده بس',
@@ -79,8 +92,9 @@ export function mapExpenseError(error: unknown): string {
   const { code, text } = errorText(error);
 
   if (code === '23505') {
-    if (text.includes('expense_entries') || text.includes('voids_id')) {
-      return 'المصروف ده اتلغى قبل كده';
+    if (text.includes('voids_id')) return 'المصروف ده اتلغى قبل كده';
+    if (text.includes('request_id') || text.includes('expense_entries')) {
+      return retrySafeMessage;
     }
     return 'الاسم ده موجود قبل كده';
   }

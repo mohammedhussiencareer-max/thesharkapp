@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import type { ExpenseCategory } from '@/expenses/types';
 import {
   emptyExpenseForm,
+  validateCategoryName,
   validateExpenseForm,
+  validateVoidReason,
   type ExpenseFormValues,
 } from '@/expenses/validation';
 
@@ -119,7 +121,9 @@ describe('validateExpenseForm', () => {
     });
     expect(phone.ok).toBe(false);
     if (!phone.ok) {
-      expect(phone.errors.driverLabel).toBe('متسجلش رقم تليفون أو رقم قومي');
+      expect(phone.errors.driverLabel).toBe(
+        'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+      );
     }
     expect(pay).toMatchObject({
       ok: true,
@@ -132,6 +136,61 @@ describe('validateExpenseForm', () => {
         driverLabel: 'طيار اختبار',
       },
     });
+  });
+
+  it('rejects a phone-like run in every free-text field', () => {
+    const message = 'مينفعش تكتب أرقام تليفونات أو أرقام قومية';
+    const spaced = validate({
+      categoryId: 'rent',
+      amount: '10',
+      note: '010 0000 0000',
+    });
+    const arabic = validate({
+      categoryId: 'rent',
+      amount: '10',
+      note: '٠١٠٠٠٠٠٠٠٠٠',
+    });
+    const eastern = validate({
+      categoryId: 'driver',
+      date: '2030-04-15',
+      hours: '1',
+      hourlyRate: '30',
+      driverLabel: '۰۱۰۰۰۰۰۰۰۰۰',
+    });
+    const dashed = validate({
+      categoryId: 'rent',
+      amount: '10',
+      note: '010-0000-0000',
+    });
+    const dotted = validate({
+      categoryId: 'rent',
+      amount: '10',
+      note: '010.0000.0000',
+    });
+    const short = validate({
+      categoryId: 'rent',
+      amount: '10',
+      note: 'فاتورة 1234567',
+    });
+    const broken = validate({
+      categoryId: 'rent',
+      amount: '10',
+      note: 'رقم 1234x5678',
+    });
+    expect(spaced.ok).toBe(false);
+    expect(arabic.ok).toBe(false);
+    expect(eastern.ok).toBe(false);
+    expect(dashed.ok).toBe(false);
+    expect(dotted.ok).toBe(false);
+    if (!spaced.ok) expect(spaced.errors.note).toBe(message);
+    if (!arabic.ok) expect(arabic.errors.note).toBe(message);
+    if (!eastern.ok) expect(eastern.errors.driverLabel).toBe(message);
+    expect(short.ok).toBe(true);
+    expect(broken.ok).toBe(true);
+    expect(validateCategoryName('تليفون ٠١٠٠٠٠٠٠٠٠٠')).toBe(message);
+    expect(validateVoidReason('٠١٠ ٠٠٠٠ ٠٠٠٠')).toBe(message);
+    expect(validateCategoryName('كهربا')).toBeNull();
+    expect(validateVoidReason('تكرار')).toBeNull();
   });
 
   it('rejects a note longer than 500 characters', () => {

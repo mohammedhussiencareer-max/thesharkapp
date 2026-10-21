@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (171);
+  plan (196);
 
 -- Users and the single owner. Same fixture ids as the other pgTAP files.
 delete from app.owner;
@@ -144,7 +144,8 @@ select
       'text',
       'numeric',
       'numeric',
-      'text'
+      'text',
+      'uuid'
     ],
     'app.add_expense_entry exists'
   );
@@ -153,7 +154,7 @@ select
   has_function (
     'app',
     'void_expense_entry',
-    array['uuid', 'text'],
+    array['uuid', 'text', 'uuid'],
     'app.void_expense_entry exists'
   );
 
@@ -411,7 +412,7 @@ select
   is (
     has_function_privilege(
       'authenticated',
-      'app.add_expense_entry(uuid,numeric,date,date,date,boolean,text,numeric,numeric,text)',
+      'app.add_expense_entry(uuid,numeric,date,date,date,boolean,text,numeric,numeric,text,uuid)',
       'execute'
     ),
     true,
@@ -422,7 +423,7 @@ select
   is (
     has_function_privilege(
       'anon',
-      'app.add_expense_entry(uuid,numeric,date,date,date,boolean,text,numeric,numeric,text)',
+      'app.add_expense_entry(uuid,numeric,date,date,date,boolean,text,numeric,numeric,text,uuid)',
       'execute'
     ),
     false,
@@ -475,6 +476,25 @@ select
     'category kind is frozen'
   );
 
+select
+  has_function (
+    'app',
+    'text_has_long_digit_run',
+    array['text'],
+    'app.text_has_long_digit_run exists'
+  );
+
+select
+  is (
+    has_function_privilege(
+      'authenticated',
+      'app.text_has_long_digit_run(text)',
+      'execute'
+    ),
+    false,
+    'authenticated cannot execute the phone-digit helper'
+  );
+
 -- ============================================================================
 -- Owner
 -- ============================================================================
@@ -517,7 +537,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000001'
     )$$,
     '22023'::char(5),
     'amount must be greater than zero',
@@ -536,7 +557,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000002'
     )$$,
     '22023'::char(5),
     'amount must be greater than zero',
@@ -555,7 +577,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000003'
     )$$,
     '22023'::char(5),
     'amount must have at most 2 decimal places',
@@ -574,7 +597,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000004'
     )$$,
     '22023'::char(5),
     'period month is required',
@@ -593,7 +617,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000005'
     )$$,
     '22023'::char(5),
     'period month is required',
@@ -612,7 +637,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000006'
     )$$,
     '22023'::char(5),
     'period month must be the first day of the month',
@@ -631,7 +657,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000007'
     )$$,
     '22023'::char(5),
     'expense date must be empty for a monthly expense',
@@ -650,7 +677,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000008'
     )$$,
     '22023'::char(5),
     'date is out of range',
@@ -669,7 +697,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000009'
     )$$,
     '22023'::char(5),
     'expense date is required',
@@ -688,7 +717,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000010'
     )$$,
     '22023'::char(5),
     'period month must be empty for a daily expense',
@@ -707,7 +737,8 @@ select
       null,
       null,
       30,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000011'
     )$$,
     '22023'::char(5),
     'hours are required for driver pay',
@@ -726,7 +757,8 @@ select
       null,
       5,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000012'
     )$$,
     '22023'::char(5),
     'hourly rate is required for driver pay',
@@ -745,7 +777,8 @@ select
       null,
       0,
       30,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000013'
     )$$,
     '22023'::char(5),
     'hours must be greater than zero',
@@ -764,7 +797,8 @@ select
       null,
       1.005,
       30,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000014'
     )$$,
     '22023'::char(5),
     'hours must have at most 2 decimal places',
@@ -783,10 +817,11 @@ select
       null,
       1,
       30,
-      '01001234567'
+      '01001234567',
+      'a17e0000-0000-4000-8000-000000000015'
     )$$,
     '22023'::char(5),
-    'driver label must not contain a phone number',
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
     'a driver label with eight or more digits is rejected'
   );
 
@@ -802,7 +837,8 @@ select
       repeat('م', 501),
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000016'
     )$$,
     '22023'::char(5),
     'note is too long',
@@ -821,7 +857,8 @@ select
       null,
       1,
       30,
-      repeat('ا', 41)
+      repeat('ا', 41),
+      'a17e0000-0000-4000-8000-000000000017'
     )$$,
     '22023'::char(5),
     'driver label is too long',
@@ -840,7 +877,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000018'
     )$$,
     '22023'::char(5),
     'unknown expense category',
@@ -859,7 +897,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000019'
     )$$,
     '22023'::char(5),
     'is_estimate is required',
@@ -870,7 +909,8 @@ select
   throws_ok (
     $$select app.void_expense_entry(
       '00000000-0000-4000-8000-000000000099',
-      'سبب'
+      'سبب',
+      'a17e0000-0000-4000-8000-000000000041'
     )$$,
     '22023'::char(5),
     'unknown expense entry',
@@ -881,7 +921,8 @@ select
   throws_ok (
     $$select app.void_expense_entry(
       (select id from app.expense_categories limit 1),
-      '   '
+      '   ',
+      'a17e0000-0000-4000-8000-000000000042'
     )$$,
     '22023'::char(5),
     'void reason is required',
@@ -949,7 +990,8 @@ select
       'rent-jan',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000020'
     )$$,
     'owner posts January rent'
   );
@@ -966,7 +1008,8 @@ select
       'rent-feb',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000021'
     )$$,
     'owner posts February rent'
   );
@@ -983,7 +1026,8 @@ select
       'rent-apr',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000022'
     )$$,
     'owner posts April rent'
   );
@@ -1242,7 +1286,8 @@ select
       'interest-apr',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000023'
     )$$,
     'owner posts April interest'
   );
@@ -1259,7 +1304,8 @@ select
       'depr-apr',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000024'
     )$$,
     'owner posts April depreciation'
   );
@@ -1348,7 +1394,8 @@ select
       'driver-165',
       5.50,
       30.00,
-      '  طيار اختبار  '
+      '  طيار اختبار  ',
+      'a17e0000-0000-4000-8000-000000000025'
     )$$,
     'owner posts driver hours and a wrong client amount'
   );
@@ -1414,7 +1461,8 @@ select
       'driver-round',
       1.15,
       0.10,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000026'
     )$$,
     'owner posts a driver amount that rounds half away from zero'
   );
@@ -1445,7 +1493,8 @@ select
       'daily-750',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000027'
     )$$,
     'owner posts a daily gas expense'
   );
@@ -1486,7 +1535,8 @@ select
       'gas-est',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000028'
     )$$,
     'owner posts a gas estimate'
   );
@@ -1515,7 +1565,8 @@ select
       'gas-act',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000029'
     )$$,
     'owner posts the gas invoice'
   );
@@ -1559,7 +1610,8 @@ select
   lives_ok (
     $$select app.void_expense_entry(
       (select id from app.expense_entries where note = 'gas-act'),
-      'فاتورة غلط'
+      'فاتورة غلط',
+      'a17e0000-0000-4000-8000-000000000043'
     )$$,
     'owner voids the gas invoice'
   );
@@ -1594,7 +1646,8 @@ select
   throws_ok (
     $$select app.void_expense_entry(
       (select id from app.expense_entries where note = 'gas-act'),
-      'تاني'
+      'تاني',
+      'a17e0000-0000-4000-8000-000000000044'
     )$$,
     '22023'::char(5),
     'expense entry is already voided',
@@ -1619,7 +1672,8 @@ select
               note = 'gas-act'
           )
       ),
-      'لا'
+      'لا',
+      'a17e0000-0000-4000-8000-000000000045'
     )$$,
     '22023'::char(5),
     'cannot void a void',
@@ -1630,7 +1684,8 @@ select
   lives_ok (
     $$select app.void_expense_entry(
       (select id from app.expense_entries where note = 'gas-est'),
-      'التقدير خلص'
+      'التقدير خلص',
+      'a17e0000-0000-4000-8000-000000000046'
     )$$,
     'owner voids the gas estimate'
   );
@@ -1663,7 +1718,8 @@ select
   lives_ok (
     $$select app.void_expense_entry(
       (select id from app.expense_entries where note = 'rent-feb'),
-      'إيجار اتسجل غلط'
+      'إيجار اتسجل غلط',
+      'a17e0000-0000-4000-8000-000000000047'
     )$$,
     'owner voids February rent'
   );
@@ -1705,7 +1761,8 @@ select
       'rent-aug-a',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000030'
     )$$,
     'owner posts the first August rent'
   );
@@ -1722,7 +1779,8 @@ select
       'rent-aug-b',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000031'
     )$$,
     'owner posts the second August rent'
   );
@@ -1764,7 +1822,8 @@ select
       'may-rent-est',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000032'
     )$$,
     'owner posts a May rent estimate'
   );
@@ -1781,7 +1840,8 @@ select
       'may-interest',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000033'
     )$$,
     'owner posts May interest'
   );
@@ -1810,7 +1870,8 @@ select
       'may-rent-act',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000034'
     )$$,
     'owner posts the May rent invoice'
   );
@@ -1839,7 +1900,8 @@ select
       'jun-drv-est',
       2,
       10,
-      'طيار تقدير'
+      'طيار تقدير',
+      'a17e0000-0000-4000-8000-000000000035'
     )$$,
     'owner posts a June driver estimate'
   );
@@ -1856,7 +1918,8 @@ select
       'jun-drv-act',
       3,
       10,
-      'طيار فاتورة'
+      'طيار فاتورة',
+      'a17e0000-0000-4000-8000-000000000036'
     )$$,
     'owner posts a June driver invoice'
   );
@@ -1877,7 +1940,8 @@ select
   lives_ok (
     $$select app.void_expense_entry(
       (select id from app.expense_entries where note = 'jun-drv-act'),
-      'الساعات غلط'
+      'الساعات غلط',
+      'a17e0000-0000-4000-8000-000000000048'
     )$$,
     'owner voids the June driver invoice'
   );
@@ -1906,7 +1970,8 @@ select
       '   ',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000037'
     )$$,
     'owner posts transport with a blank note'
   );
@@ -1921,7 +1986,7 @@ select
   );
 
 select
-  lives_ok (
+  throws_ok (
     $$select app.add_expense_entry(
       (select id from app.expense_categories where name = 'نقل'),
       2,
@@ -1932,9 +1997,12 @@ select
       'فاتورة 12345678',
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000038'
     )$$,
-    'a note may contain an invoice number'
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with eight digits is rejected'
   );
 
 select
@@ -1988,7 +2056,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000039'
     )$$,
     '22023'::char(5),
     'expense category is inactive',
@@ -2132,6 +2201,434 @@ select
   );
 
 -- ============================================================================
+-- Lost replies and phone-like free text
+-- ============================================================================
+select
+  lives_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'إيجار'),
+      1000.00,
+      '2026-09-01',
+      null,
+      null,
+      false,
+      'replay-rent',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009001'
+    )$$,
+    'owner posts a rent that can be retried'
+  );
+
+select
+  is (
+    (
+      select
+        app.add_expense_entry (
+          (
+            select
+              id
+            from
+              app.expense_categories
+            where
+              name = 'إيجار'
+          ),
+          1000.00,
+          '2026-09-01',
+          null,
+          null,
+          false,
+          'replay-rent',
+          null,
+          null,
+          null,
+          'a17e0000-0000-4000-8000-000000009001'
+        )
+    ),
+    (
+      select
+        id
+      from
+        app.expense_entries
+      where
+        note = 'replay-rent'
+    ),
+    'the same request returns the saved expense'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.expense_entries
+      where
+        note = 'replay-rent'
+    ),
+    1::bigint,
+    'a replay does not insert a second expense'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'إيجار'),
+      1001.00,
+      '2026-09-01',
+      null,
+      null,
+      false,
+      'replay-rent',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009001'
+    )$$,
+    '22023'::char(5),
+    'request_id already used for a different expense',
+    'a request id cannot post a different expense'
+  );
+
+select
+  is (
+    (
+      select
+        app.add_expense_entry (
+          (
+            select
+              id
+            from
+              app.expense_categories
+            where
+              name = 'أجر طيارين'
+          ),
+          9.99,
+          null,
+          '2026-04-15',
+          '2026-04-20',
+          false,
+          'driver-165',
+          5.50,
+          30.00,
+          '  طيار اختبار  ',
+          'a17e0000-0000-4000-8000-000000000025'
+        )
+    ),
+    (
+      select
+        id
+      from
+        app.expense_entries
+      where
+        note = 'driver-165'
+    ),
+    'a driver replay ignores the discarded client amount'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.expense_entries
+      where
+        note = 'driver-165'
+    ),
+    1::bigint,
+    'a driver replay does not insert a second row'
+  );
+
+select
+  lives_ok (
+    $$select app.void_expense_entry(
+      (select id from app.expense_entries where note = 'replay-rent'),
+      'تكرار',
+      'a17e0000-0000-4000-8000-000000009002'
+    )$$,
+    'owner voids the replayed rent'
+  );
+
+select
+  is (
+    (
+      select
+        app.void_expense_entry (
+          (
+            select
+              id
+            from
+              app.expense_entries
+            where
+              note = 'replay-rent'
+          ),
+          'تكرار',
+          'a17e0000-0000-4000-8000-000000009002'
+        )
+    ),
+    (
+      select
+        id
+      from
+        app.expense_entries
+      where
+        voids_id = (
+          select
+            id
+          from
+            app.expense_entries
+          where
+            note = 'replay-rent'
+        )
+    ),
+    'the same void request returns the existing void'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.expense_entries
+      where
+        voids_id = (
+          select
+            id
+          from
+            app.expense_entries
+          where
+            note = 'replay-rent'
+        )
+    ),
+    1::bigint,
+    'a void replay does not insert a second void'
+  );
+
+select
+  throws_ok (
+    $$select app.void_expense_entry(
+      (select id from app.expense_entries where note = 'replay-rent'),
+      'سبب تاني',
+      'a17e0000-0000-4000-8000-000000009002'
+    )$$,
+    '22023'::char(5),
+    'request_id already used for a different expense',
+    'a void request id cannot change the reason'
+  );
+
+select
+  lives_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'إيجار'),
+      10.00,
+      '2026-09-01',
+      null,
+      null,
+      false,
+      'replay-other',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009003'
+    )$$,
+    'owner posts a second September rent'
+  );
+
+select
+  throws_ok (
+    $$select app.void_expense_entry(
+      (select id from app.expense_entries where note = 'replay-other'),
+      'تكرار',
+      'a17e0000-0000-4000-8000-000000009002'
+    )$$,
+    '22023'::char(5),
+    'request_id already used for a different expense',
+    'a void request id cannot void a different entry'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '010 0000 0000',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009011'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with spaced digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '٠١٠٠٠٠٠٠٠٠٠',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009012'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with Arabic-Indic digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '۰۱۰۰۰۰۰۰۰۰۰',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009013'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with Extended Arabic-Indic digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '010-0000-0000',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009014'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with dashed digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.void_expense_entry(
+      (select id from app.expense_entries where note = 'replay-other'),
+      '010.0000.0000',
+      'a17e0000-0000-4000-8000-000000009015'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a void reason with dotted digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.void_expense_entry(
+      (select id from app.expense_entries where note = 'replay-other'),
+      '٠١٠ ٠٠٠٠ ٠٠٠٠',
+      'a17e0000-0000-4000-8000-000000009016'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a void reason with spaced Arabic-Indic digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_category('تليفون ٠١٠٠٠٠٠٠٠٠٠', 'daily')$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a category name with Arabic-Indic digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.rename_expense_category(
+      (select id from app.expense_categories where name = 'نقل'),
+      'نقل ۰۱۰۰۰۰۰۰۰۰۰'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a renamed category with Extended Arabic-Indic digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'أجر طيارين'),
+      null,
+      null,
+      '2026-11-02',
+      null,
+      false,
+      null,
+      1,
+      30,
+      '۰۱۰۰۰۰۰۰۰۰۰',
+      'a17e0000-0000-4000-8000-000000009017'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a driver label with Extended Arabic-Indic digits is rejected'
+  );
+
+select
+  lives_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-03',
+      null,
+      false,
+      'فاتورة 1234567',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009018'
+    )$$,
+    'a note with seven digits is stored'
+  );
+
+select
+  lives_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-04',
+      null,
+      false,
+      'رقم 1234x5678',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009019'
+    )$$,
+    'letters keep digit runs separate'
+  );
+
+-- ============================================================================
 -- Non-owner, anon, service_role
 -- ============================================================================
 select
@@ -2186,7 +2683,8 @@ select
       null,
       null,
       null,
-      null
+      null,
+      'a17e0000-0000-4000-8000-000000000040'
     )$$,
     '42501'::char(5),
     'insufficient_privilege',

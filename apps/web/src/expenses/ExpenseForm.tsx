@@ -33,6 +33,7 @@ export function ExpenseForm({
 }) {
   const amountErrorId = useId();
   const headingId = useId();
+  const [requestId] = useState(() => crypto.randomUUID());
   const [values, setValues] = useState<ExpenseFormValues>(emptyExpenseForm);
   const [errors, setErrors] = useState<ExpenseFormErrors>({});
   const category =
@@ -59,7 +60,7 @@ export function ExpenseForm({
       setErrors(result.errors);
       return;
     }
-    onSubmit(result.draft);
+    onSubmit({ ...result.draft, requestId });
   }
 
   return (

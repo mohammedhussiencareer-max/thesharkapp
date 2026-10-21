@@ -33,6 +33,7 @@ export function ExpensesPage() {
   const [readLoads, setReadLoads] = useState(0);
   const [loadId, setLoadId] = useState(0);
   const [formEpoch, setFormEpoch] = useState(0);
+  const voidRequestIds = useRef(new Map<string, string>());
   const seqRef = useRef(0);
   const readsRef = useRef(0);
   const savingRef = useRef(false);
@@ -203,9 +204,15 @@ export function ExpensesPage() {
           <ExpenseList
             entries={data.entries}
             disabled={busy}
-            onVoid={(id, reason) =>
-              void runWrite(() => voidExpenseEntry(id, reason), setListError)
-            }
+            onVoid={(id, reason) => {
+              const existing = voidRequestIds.current.get(id);
+              const requestId = existing ?? crypto.randomUUID();
+              if (!existing) voidRequestIds.current.set(id, requestId);
+              void runWrite(async () => {
+                await voidExpenseEntry(id, reason, requestId);
+                voidRequestIds.current.delete(id);
+              }, setListError);
+            }}
           />
           <AllocationTable days={data.days} />
           <CategoryManager
