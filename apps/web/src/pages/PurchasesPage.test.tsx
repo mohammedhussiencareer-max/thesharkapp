@@ -7,7 +7,12 @@ import {
 } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { backDatedMessage } from '@/purchases/errors';
+import {
+  backDatedMessage,
+  ConversionChangedError,
+  conversionChangedMessage,
+  retrySafeMessage,
+} from '@/purchases/errors';
 import {
   listPurchases,
   listStockChoices,
@@ -208,5 +213,84 @@ describe('PurchasesPage', () => {
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'مراجعة' })).toBeEnabled();
     expect(screen.getByLabelText('من')).toBeEnabled();
+  });
+
+  function fillAndReview() {
+    fireEvent.change(screen.getByLabelText('الصنف'), {
+      target: { value: 'oil' },
+    });
+    fireEvent.change(screen.getByLabelText('الكمية'), {
+      target: { value: '2' },
+    });
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'لتر' },
+    });
+    fireEvent.change(screen.getByLabelText('المبلغ'), {
+      target: { value: '50' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'مراجعة' }));
+  }
+
+  it('keeps the request id across a failed save and mints a new one after success', async () => {
+    await renderPage();
+    vi.mocked(recordPurchase).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    fillAndReview();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      retrySafeMessage,
+    );
+    expect(
+      screen.getByText('المشتريات نهائية لحد ما نضيف التعديل'),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordPurchase).toHaveBeenCalledTimes(2);
+    });
+    const first = vi.mocked(recordPurchase).mock.calls[0]?.[0]?.requestId;
+    const second = vi.mocked(recordPurchase).mock.calls[1]?.[0]?.requestId;
+    expect(first).toBeTruthy();
+    expect(second).toBe(first);
+
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'اتسجلت المشتريات',
+    );
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'مراجعة' })).toBeEnabled();
+    });
+    fillAndReview();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordPurchase).toHaveBeenCalledTimes(3);
+    });
+    expect(vi.mocked(recordPurchase).mock.calls[2]?.[0]?.requestId).not.toBe(
+      first,
+    );
+  });
+
+  it('asks for another review when the conversion changed and keeps the draft', async () => {
+    await renderPage();
+    const loads = vi.mocked(listStockChoices).mock.calls.length;
+    vi.mocked(recordPurchase).mockRejectedValueOnce(
+      new ConversionChangedError(),
+    );
+    fillAndReview();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      conversionChangedMessage,
+    );
+    expect(
+      screen.getByText('المشتريات نهائية لحد ما نضيف التعديل'),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(vi.mocked(listStockChoices).mock.calls.length).toBeGreaterThan(
+        loads,
+      );
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    expect(screen.queryByLabelText('الكمية')).not.toBeInTheDocument();
   });
 });

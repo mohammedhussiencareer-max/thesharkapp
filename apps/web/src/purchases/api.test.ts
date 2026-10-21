@@ -5,7 +5,11 @@ import {
   recordOpeningStock,
   recordPurchase,
 } from '@/purchases/api';
-import { backDatedMessage } from '@/purchases/errors';
+import {
+  backDatedMessage,
+  ConversionChangedError,
+  retrySafeMessage,
+} from '@/purchases/errors';
 import type { OpeningDraft, PurchaseDraft } from '@/purchases/types';
 
 const mocks = vi.hoisted(() => ({
@@ -55,6 +59,7 @@ function query(result: { data: unknown; error: unknown }) {
 }
 
 const purchaseDraft: PurchaseDraft = {
+  requestId: 'b1000000-0000-4000-8000-000000000001',
   purchasedAt: '2026-07-15T09:00:00.000Z',
   supplier: 'مورد',
   invoiceNo: null,
@@ -69,15 +74,31 @@ const purchaseDraft: PurchaseDraft = {
       baseUnit: 'kg',
       baseQuantity: '1.84',
       unitCost: '27.173913',
+      expectedFactor: '0.92',
     },
   ],
 };
 
 const openingDraft: OpeningDraft = {
+  requestId: 'a1000000-0000-4000-8000-000000000001',
   occurredAt: '2026-01-15T10:00:00.000Z',
   lines: [
-    { itemId: 'oil', quantity: '4', unit: 'kg', unitCost: '12.5' },
-    { itemId: 'mixed', quantity: '10', unit: 'kg', unitCost: '100' },
+    {
+      itemId: 'oil',
+      quantity: '4',
+      unit: 'kg',
+      unitCost: '12.5',
+      expectedBaseUnit: 'kg',
+      expectedFactor: '1',
+    },
+    {
+      itemId: 'mixed',
+      quantity: '10',
+      unit: 'kg',
+      unitCost: '100',
+      expectedBaseUnit: 'kg',
+      expectedFactor: '1',
+    },
   ],
 };
 
@@ -344,6 +365,7 @@ describe('purchases api', () => {
       name: 'record_purchase',
       args: {
         p_purchase: {
+          request_id: 'b1000000-0000-4000-8000-000000000001',
           purchased_at: '2026-07-15T09:00:00.000Z',
           supplier: 'مورد',
           invoice_no: null,
@@ -354,6 +376,8 @@ describe('purchases api', () => {
               quantity: '2',
               unit: 'لتر',
               amount_paid: '50.00',
+              expected_base_unit: 'kg',
+              expected_factor: '0.92',
             },
           ],
         },
@@ -361,18 +385,57 @@ describe('purchases api', () => {
     });
     expect(JSON.stringify(calls[0]?.args)).toContain('"quantity":"2"');
     expect(JSON.stringify(calls[0]?.args)).toContain('"amount_paid":"50.00"');
+    expect(JSON.stringify(calls[0]?.args)).toContain(
+      '"expected_factor":"0.92"',
+    );
     expect(JSON.stringify(calls[0]?.args)).not.toContain('unit_cost');
     expect(calls[1]).toEqual({
       name: 'record_opening_stock',
       args: {
+        p_request_id: 'a1000000-0000-4000-8000-000000000001',
         p_occurred_at: '2026-01-15T10:00:00.000Z',
         p_lines: [
-          { item_id: 'oil', quantity: '4', unit: 'kg', unit_cost: '12.5' },
-          { item_id: 'mixed', quantity: '10', unit: 'kg', unit_cost: '100' },
+          {
+            item_id: 'oil',
+            quantity: '4',
+            unit: 'kg',
+            unit_cost: '12.5',
+            expected_base_unit: 'kg',
+            expected_factor: '1',
+          },
+          {
+            item_id: 'mixed',
+            quantity: '10',
+            unit: 'kg',
+            unit_cost: '100',
+            expected_base_unit: 'kg',
+            expected_factor: '1',
+          },
         ],
       },
     });
     expect(JSON.stringify(calls[1]?.args)).toContain('"unit_cost":"12.5"');
+    expect(JSON.stringify(calls[1]?.args)).toContain('"expected_factor":"1"');
+  });
+
+  it('turns a lost reply into a safe retry and a changed conversion into a review error', async () => {
+    mocks.schema.mockReturnValue({
+      rpc: () => Promise.reject(new TypeError('Failed to fetch')),
+    });
+    await expect(recordPurchase(purchaseDraft)).rejects.toThrow(
+      retrySafeMessage,
+    );
+
+    mocks.schema.mockReturnValue({
+      rpc: () =>
+        Promise.resolve({
+          data: null,
+          error: { code: '40001', message: 'conversion changed' },
+        }),
+    });
+    await expect(recordOpeningStock(openingDraft)).rejects.toBeInstanceOf(
+      ConversionChangedError,
+    );
   });
 
   it('maps a back-dated ledger error to the Arabic item message', async () => {

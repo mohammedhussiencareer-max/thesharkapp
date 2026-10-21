@@ -131,6 +131,8 @@ export function OpeningGrid({
   onClearServerError: () => void;
   onSubmit: (draft: OpeningDraft) => void;
 }) {
+  // One id for this draft. A failed save retries it; a new form gets a new one.
+  const [requestId] = useState(() => crypto.randomUUID());
   const [occurredAt, setOccurredAt] = useState(() => nowCairoDateTimeLocal());
   const [values, setValues] = useState<OpeningValues>({});
   const [formError, setFormError] = useState<string | null>(null);
@@ -167,7 +169,7 @@ export function OpeningGrid({
       setFields(result.fields);
       return;
     }
-    onSubmit(result.draft);
+    onSubmit({ ...result.draft, requestId });
   }
 
   function renderItem(catalogItem: CatalogItem) {

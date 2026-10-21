@@ -23,9 +23,14 @@ export type OpeningLineDraft = {
   quantity: string;
   unit: string;
   unitCost: string;
+  /** Base unit shown when the owner reviewed the line. */
+  expectedBaseUnit: string;
+  /** Exact factor shown when the owner reviewed the line. `"1"` for the base unit. */
+  expectedFactor: string;
 };
 
 export type OpeningDraft = {
+  requestId: string;
   occurredAt: string;
   lines: OpeningLineDraft[];
 };
@@ -39,9 +44,12 @@ export type PurchaseLineDraft = {
   baseUnit: BaseUnit;
   baseQuantity: string;
   unitCost: string;
+  /** Exact factor shown on the review step. `"1"` when the unit is the base unit. */
+  expectedFactor: string;
 };
 
 export type PurchaseDraft = {
+  requestId: string;
   purchasedAt: string;
   supplier: string | null;
   invoiceNo: string | null;

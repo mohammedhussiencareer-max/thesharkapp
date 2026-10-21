@@ -28,6 +28,9 @@
 -- ============================================================================
 create table app.purchases (
   id uuid primary key default gen_random_uuid(),
+  -- Client id for one draft. A lost reply retries the same id; a new draft
+  -- gets a new one. Unique so a second insert cannot double-post.
+  request_id uuid not null unique,
   purchased_at timestamptz not null,
   supplier text null,
   invoice_no text null,
@@ -68,6 +71,8 @@ comment on table app.purchases is 'Append-only purchase headers. Writes go throu
 
 comment on column app.purchases.batch_id is 'stock_movements.batch_id for the purchase lines posted with this header.';
 
+comment on column app.purchases.request_id is 'Idempotency key generated once per purchase draft. The same key and the same payload return the existing purchase; a different payload is refused.';
+
 create index purchases_purchased_at_idx on app.purchases (purchased_at desc, created_at desc);
 
 create table app.purchase_lines (
@@ -105,6 +110,48 @@ comment on column app.purchase_lines.movement_id is 'The purchase inflow posted 
 
 create index purchase_lines_item_id_idx on app.purchase_lines (item_id);
 
+-- Opening stock has no purchase header. This append-only pair stores the
+-- request id and the posted lines so a lost reply can return the same batch
+-- without another post_movements call. Quantity 0 lines are not stored; they
+-- are not part of the payload identity.
+create table app.opening_stocks (
+  id uuid primary key,
+  request_id uuid not null unique,
+  occurred_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  created_by uuid null default auth.uid (),
+  constraint opening_stocks_occurred_at_finite_chk check (pg_catalog.isfinite (occurred_at))
+);
+
+comment on table app.opening_stocks is 'Append-only opening batches. id is the ledger batch id returned by app.record_opening_stock. Writes go through that function.';
+
+comment on column app.opening_stocks.request_id is 'Idempotency key generated once per opening draft. The same key and the same posted lines return this batch; a different payload is refused.';
+
+create table app.opening_stock_lines (
+  opening_id uuid not null references app.opening_stocks (id) on delete restrict,
+  line_no integer not null,
+  item_id uuid not null references app.stock_items (id) on delete restrict,
+  quantity numeric(20, 6) not null,
+  unit text not null,
+  unit_cost numeric(20, 6) not null,
+  primary key (opening_id, line_no),
+  constraint opening_stock_lines_line_no_chk check (line_no > 0),
+  constraint opening_stock_lines_quantity_chk check (
+    quantity <> 'NaN'::numeric
+    and quantity > 0
+  ),
+  constraint opening_stock_lines_unit_chk check (
+    char_length(btrim(unit)) > 0
+    and unit = btrim(unit)
+  ),
+  constraint opening_stock_lines_unit_cost_chk check (
+    unit_cost <> 'NaN'::numeric
+    and unit_cost >= 0
+  )
+);
+
+comment on table app.opening_stock_lines is 'Append-only lines of an opening batch, in the order they were posted. quantity and unit are what the owner entered.';
+
 create function app.prevent_purchase_mutation () returns trigger language plpgsql
 set
   search_path = '' as $$
@@ -135,6 +182,22 @@ execute function app.prevent_purchase_mutation ();
 
 create trigger trg_purchase_lines_no_truncate
 before truncate on app.purchase_lines for each statement
+execute function app.prevent_purchase_mutation ();
+
+create trigger trg_opening_stocks_no_update_delete
+before update or delete on app.opening_stocks for each row
+execute function app.prevent_purchase_mutation ();
+
+create trigger trg_opening_stocks_no_truncate
+before truncate on app.opening_stocks for each statement
+execute function app.prevent_purchase_mutation ();
+
+create trigger trg_opening_stock_lines_no_update_delete
+before update or delete on app.opening_stock_lines for each row
+execute function app.prevent_purchase_mutation ();
+
+create trigger trg_opening_stock_lines_no_truncate
+before truncate on app.opening_stock_lines for each statement
 execute function app.prevent_purchase_mutation ();
 
 -- ============================================================================
@@ -185,6 +248,20 @@ declare
   v_amounts numeric[] := '{}'::numeric[];
   v_unit_costs numeric[] := '{}'::numeric[];
   v_movement_ids bigint[] := '{}'::bigint[];
+  v_factors numeric[] := '{}'::numeric[];
+  v_base_units text[] := '{}'::text[];
+  v_expected_bases text[] := '{}'::text[];
+  v_expected_factors numeric[] := '{}'::numeric[];
+  v_expected_base text;
+  v_expected_factor_text text;
+  v_expected_factor numeric;
+  v_request_text text;
+  v_request_id uuid;
+  v_existing_id uuid;
+  v_existing_at timestamptz;
+  v_existing_supplier text;
+  v_existing_invoice text;
+  v_existing_note text;
 begin
   perform app.assert_ledger_write_allowed ();
 
@@ -340,6 +417,19 @@ begin
         using errcode = '22023';
     end if;
 
+    -- Base unit cannot change once this item has a movement, so a retry of a
+    -- posted purchase still matches. A first post whose reviewed base unit
+    -- differs is refused before the unit name is resolved.
+    v_expected_base := nullif(
+      pg_catalog.btrim(v_elem ->> 'expected_base_unit'),
+      ''
+    );
+    if v_expected_base is not null
+    and v_expected_base is distinct from v_base_unit then
+      raise exception 'conversion changed'
+        using errcode = '40001';
+    end if;
+
     if v_unit = v_base_unit then
       v_factor := 1;
     else
@@ -395,7 +485,111 @@ begin
     v_base_qtys := v_base_qtys || v_base_qty;
     v_amounts := v_amounts || v_amount;
     v_unit_costs := v_unit_costs || v_unit_cost;
+    v_factors := v_factors || v_factor;
+    v_base_units := v_base_units || v_base_unit;
+    v_expected_factor_text := nullif(
+      pg_catalog.btrim(v_elem ->> 'expected_factor'),
+      ''
+    );
+    if v_expected_factor_text is null then
+      v_expected_factor := null;
+    elsif v_expected_factor_text !~ '^\d+(\.\d+)?$' then
+      raise exception 'expected_factor is required'
+        using errcode = '22023';
+    else
+      v_expected_factor := v_expected_factor_text::numeric;
+    end if;
+    -- array_append keeps a null element. || would drop the whole array.
+    v_expected_bases := pg_catalog.array_append(v_expected_bases, v_expected_base);
+    v_expected_factors := pg_catalog.array_append(
+      v_expected_factors,
+      v_expected_factor
+    );
     v_n := v_n + 1;
+  end loop;
+
+  -- Same draft retries with the same request_id. Compare the payload the
+  -- owner sent (header plus lines in order) and return the existing purchase
+  -- before any inflow. The advisory lock taken above serializes this with
+  -- every other ledger write, so two callers cannot both miss the row.
+  -- purchases.request_id is unique as the final guard: if a second insert
+  -- still raced, it would fail and this transaction would roll the inflows
+  -- back with it.
+  v_request_text := nullif(pg_catalog.btrim(p_purchase ->> 'request_id'), '');
+  if v_request_text is not null then
+    if v_request_text !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+      raise exception 'request_id is required'
+        using errcode = '22023';
+    end if;
+    v_request_id := v_request_text::uuid;
+    select
+      p.id,
+      p.purchased_at,
+      p.supplier,
+      p.invoice_no,
+      p.note
+    into
+      v_existing_id,
+      v_existing_at,
+      v_existing_supplier,
+      v_existing_invoice,
+      v_existing_note
+    from
+      app.purchases p
+    where
+      p.request_id = v_request_id;
+    if found then
+      if v_existing_at is distinct from v_purchased_at
+      or v_existing_supplier is distinct from v_supplier
+      or v_existing_invoice is distinct from v_invoice_no
+      or v_existing_note is distinct from v_note
+      or (
+        select
+          count(*)
+        from
+          app.purchase_lines pl
+        where
+          pl.purchase_id = v_existing_id
+      ) is distinct from v_n
+      or exists (
+        select
+          1
+        from
+          app.purchase_lines pl
+          join rows from (pg_catalog.unnest(v_item_ids), pg_catalog.unnest(v_qtys), pg_catalog.unnest(v_units), pg_catalog.unnest(v_amounts)) with ordinality as u (item_id, quantity, unit, amount_paid, line_no) on u.line_no = pl.line_no
+        where
+          pl.purchase_id = v_existing_id
+          and (
+            pl.item_id is distinct from u.item_id
+            or pl.quantity is distinct from u.quantity
+            or pl.unit is distinct from u.unit
+            or pl.amount_paid is distinct from u.amount_paid
+          )
+      ) then
+        raise exception 'request_id already used for a different purchase'
+          using errcode = '22023';
+      end if;
+      return v_existing_id;
+    end if;
+  end if;
+
+  if v_request_id is null then
+    raise exception 'request_id is required'
+      using errcode = '22023';
+  end if;
+
+  -- Still holding the posting lock, so the factor read above is the factor
+  -- this post will use. A conversion or base_unit change waits on the same lock.
+  for v_i in 1..v_n loop
+    if v_expected_bases[v_i] is null or v_expected_factors[v_i] is null then
+      raise exception 'expected_base_unit is required'
+        using errcode = '22023';
+    end if;
+    if v_expected_bases[v_i] is distinct from v_base_units[v_i]
+    or v_expected_factors[v_i] is distinct from v_factors[v_i] then
+      raise exception 'conversion changed'
+        using errcode = '40001';
+    end if;
   end loop;
 
   v_purchase_id := pg_catalog.gen_random_uuid();
@@ -468,6 +662,7 @@ begin
   insert into
     app.purchases (
       id,
+      request_id,
       purchased_at,
       supplier,
       invoice_no,
@@ -479,6 +674,7 @@ begin
   values
     (
       v_purchase_id,
+      v_request_id,
       v_purchased_at,
       v_supplier,
       v_invoice_no,
@@ -536,7 +732,11 @@ service_role;
 -- a movement between the check and app.post_movements. post_movements takes
 -- the same lock again (already held) and locks item_balances only then.
 -- Quantity 0 lines are omitted. One post_movements call is one batch.
-create function app.record_opening_stock (p_occurred_at timestamptz, p_lines jsonb) returns uuid language plpgsql security definer
+create function app.record_opening_stock (
+  p_occurred_at timestamptz,
+  p_lines jsonb,
+  p_request_id uuid
+) returns uuid language plpgsql security definer
 set
   search_path = '' as $$
 declare
@@ -544,6 +744,15 @@ declare
   v_movements jsonb := '[]'::jsonb;
   v_elem jsonb;
   v_seen uuid[] := '{}'::uuid[];
+  v_item_ids uuid[] := '{}'::uuid[];
+  v_names text[] := '{}'::text[];
+  v_qtys numeric[] := '{}'::numeric[];
+  v_units text[] := '{}'::text[];
+  v_costs numeric[] := '{}'::numeric[];
+  v_factors numeric[] := '{}'::numeric[];
+  v_base_units text[] := '{}'::text[];
+  v_expected_bases text[] := '{}'::text[];
+  v_expected_factors numeric[] := '{}'::numeric[];
   v_item_text text;
   v_item_id uuid;
   v_name text;
@@ -557,6 +766,11 @@ declare
   v_base_qty numeric;
   v_line_total numeric;
   v_count integer := 0;
+  v_expected_base text;
+  v_expected_factor_text text;
+  v_expected_factor numeric;
+  v_existing_id uuid;
+  v_existing_at timestamptz;
 begin
   perform app.assert_ledger_write_allowed ();
 
@@ -673,18 +887,16 @@ begin
         using errcode = '22023';
     end if;
 
-    -- Still holding the posting advisory lock, so no concurrent post can
-    -- insert a movement for this item until we commit or roll back.
-    if exists (
-      select
-        1
-      from
-        app.stock_movements sm
-      where
-        sm.item_id = v_item_id
-    ) then
-      raise exception 'item already has movements: %', v_name
-        using errcode = '22023';
+    -- Base unit cannot change once this item has a movement, so a retry still
+    -- matches. A first post whose reviewed base unit differs is refused here.
+    v_expected_base := nullif(
+      pg_catalog.btrim(v_elem ->> 'expected_base_unit'),
+      ''
+    );
+    if v_expected_base is not null
+    and v_expected_base is distinct from v_base_unit then
+      raise exception 'conversion changed'
+        using errcode = '40001';
     end if;
 
     if v_unit = v_base_unit then
@@ -725,24 +937,31 @@ begin
         using errcode = '22023';
     end if;
 
+    v_expected_factor_text := nullif(
+      pg_catalog.btrim(v_elem ->> 'expected_factor'),
+      ''
+    );
+    if v_expected_factor_text is null then
+      v_expected_factor := null;
+    elsif v_expected_factor_text !~ '^\d+(\.\d+)?$' then
+      raise exception 'expected_factor is required'
+        using errcode = '22023';
+    else
+      v_expected_factor := v_expected_factor_text::numeric;
+    end if;
+
     v_seen := v_seen || v_item_id;
-    v_movements := v_movements || pg_catalog.jsonb_build_array(
-      pg_catalog.jsonb_build_object(
-        'item_id',
-        v_item_id,
-        'movement_type',
-        'opening',
-        'occurred_at',
-        p_occurred_at,
-        'quantity',
-        v_qty,
-        'unit',
-        v_unit,
-        'unit_cost',
-        v_unit_cost,
-        'source_type',
-        'opening'
-      )
+    v_item_ids := v_item_ids || v_item_id;
+    v_names := v_names || v_name;
+    v_qtys := v_qtys || v_qty;
+    v_units := v_units || v_unit;
+    v_costs := v_costs || v_unit_cost;
+    v_factors := v_factors || v_factor;
+    v_base_units := v_base_units || v_base_unit;
+    v_expected_bases := pg_catalog.array_append(v_expected_bases, v_expected_base);
+    v_expected_factors := pg_catalog.array_append(
+      v_expected_factors,
+      v_expected_factor
     );
     v_count := v_count + 1;
   end loop;
@@ -752,20 +971,138 @@ begin
       using errcode = '22023';
   end if;
 
+  if p_request_id is null then
+    raise exception 'request_id is required'
+      using errcode = '22023';
+  end if;
+
+  -- Same draft retries with the same request id and returns the batch that
+  -- already posted. The advisory lock serializes this lookup with every other
+  -- ledger write. opening_stocks.request_id is unique as the final guard: a
+  -- second insert fails and rolls this transaction back, so it cannot
+  -- double-post. Quantity 0 lines were skipped above and are not compared.
+  select
+    o.id,
+    o.occurred_at
+  into
+    v_existing_id,
+    v_existing_at
+  from
+    app.opening_stocks o
+  where
+    o.request_id = p_request_id;
+
+  if found then
+    if v_existing_at is distinct from p_occurred_at
+    or (
+      select
+        count(*)
+      from
+        app.opening_stock_lines ol
+      where
+        ol.opening_id = v_existing_id
+    ) is distinct from v_count
+    or exists (
+      select
+        1
+      from
+        app.opening_stock_lines ol
+        join rows from (pg_catalog.unnest(v_item_ids), pg_catalog.unnest(v_qtys), pg_catalog.unnest(v_units), pg_catalog.unnest(v_costs)) with ordinality as u (item_id, quantity, unit, unit_cost, line_no) on u.line_no = ol.line_no
+      where
+        ol.opening_id = v_existing_id
+        and (
+          ol.item_id is distinct from u.item_id
+          or ol.quantity is distinct from u.quantity
+          or ol.unit is distinct from u.unit
+          or ol.unit_cost is distinct from u.unit_cost
+        )
+    ) then
+      raise exception 'request_id already used for a different opening'
+        using errcode = '22023';
+    end if;
+    return v_existing_id;
+  end if;
+
+  for v_i in 1..v_count loop
+    -- Still holding the posting advisory lock, so no concurrent post can
+    -- insert a movement for this item until we commit or roll back.
+    if exists (
+      select
+        1
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = v_item_ids[v_i]
+    ) then
+      raise exception 'item already has movements: %', v_names[v_i]
+        using errcode = '22023';
+    end if;
+
+    if v_expected_bases[v_i] is null or v_expected_factors[v_i] is null then
+      raise exception 'expected_base_unit is required'
+        using errcode = '22023';
+    end if;
+
+    if v_expected_bases[v_i] is distinct from v_base_units[v_i]
+    or v_expected_factors[v_i] is distinct from v_factors[v_i] then
+      raise exception 'conversion changed'
+        using errcode = '40001';
+    end if;
+
+    v_movements := v_movements || pg_catalog.jsonb_build_array(
+      pg_catalog.jsonb_build_object(
+        'item_id',
+        v_item_ids[v_i],
+        'movement_type',
+        'opening',
+        'occurred_at',
+        p_occurred_at,
+        'quantity',
+        v_qtys[v_i],
+        'unit',
+        v_units[v_i],
+        'unit_cost',
+        v_costs[v_i],
+        'source_type',
+        'opening'
+      )
+    );
+  end loop;
+
   v_batch_id := app.post_movements (v_movements);
+
+  insert into
+    app.opening_stocks (id, request_id, occurred_at, created_by)
+  values
+    (v_batch_id, p_request_id, p_occurred_at, auth.uid ());
+
+  for v_i in 1..v_count loop
+    insert into
+      app.opening_stock_lines (opening_id, line_no, item_id, quantity, unit, unit_cost)
+    values
+      (
+        v_batch_id,
+        v_i,
+        v_item_ids[v_i],
+        v_qtys[v_i],
+        v_units[v_i],
+        v_costs[v_i]
+      );
+  end loop;
+
   return v_batch_id;
 end;
 $$;
 
-comment on function app.record_opening_stock (timestamptz, jsonb) is 'Posts one opening batch through app.post_movements. Takes advisory lock 7342750000000000001 before checking that each item has no movements and before post_movements locks balances. Quantity 0 lines are skipped. The returned uuid is the ledger batch id.';
+comment on function app.record_opening_stock (timestamptz, jsonb, uuid) is 'Posts one opening batch through app.post_movements and records it in app.opening_stocks under p_request_id. Takes advisory lock 7342750000000000001 before checking that each item has no movements and before post_movements locks balances. The same request id and the same posted lines return the existing batch. Quantity 0 lines are skipped. The returned uuid is the ledger batch id.';
 
-revoke all on function app.record_opening_stock (timestamptz, jsonb)
+revoke all on function app.record_opening_stock (timestamptz, jsonb, uuid)
 from
   public,
   anon;
 
 grant
-execute on function app.record_opening_stock (timestamptz, jsonb) to authenticated,
+execute on function app.record_opening_stock (timestamptz, jsonb, uuid) to authenticated,
 service_role;
 
 -- ============================================================================
@@ -775,11 +1112,23 @@ alter table app.purchases enable row level security;
 
 alter table app.purchase_lines enable row level security;
 
+alter table app.opening_stocks enable row level security;
+
+alter table app.opening_stock_lines enable row level security;
+
 create policy purchases_select_owner on app.purchases for
 select
   to authenticated using (app.is_owner ());
 
 create policy purchase_lines_select_owner on app.purchase_lines for
+select
+  to authenticated using (app.is_owner ());
+
+create policy opening_stocks_select_owner on app.opening_stocks for
+select
+  to authenticated using (app.is_owner ());
+
+create policy opening_stock_lines_select_owner on app.opening_stock_lines for
 select
   to authenticated using (app.is_owner ());
 
@@ -797,8 +1146,24 @@ from
   authenticated,
   service_role;
 
+revoke all on table app.opening_stocks
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+revoke all on table app.opening_stock_lines
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 grant
 select
   on table app.purchases,
-  app.purchase_lines to authenticated,
+  app.purchase_lines,
+  app.opening_stocks,
+  app.opening_stock_lines to authenticated,
   service_role;

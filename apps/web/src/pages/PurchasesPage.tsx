@@ -6,7 +6,10 @@ import {
   listStockChoices,
   recordPurchase,
 } from '@/purchases/api';
-import { genericPurchaseError } from '@/purchases/errors';
+import {
+  ConversionChangedError,
+  genericPurchaseError,
+} from '@/purchases/errors';
 import { PurchaseForm } from '@/purchases/PurchaseForm';
 import { PurchaseList } from '@/purchases/PurchaseList';
 import type { Purchase, PurchaseDraft, StockChoice } from '@/purchases/types';
@@ -106,6 +109,23 @@ export function PurchasesPage() {
     };
   }, [loadId]);
 
+  async function reloadChoices() {
+    const seq = ++seqRef.current;
+    loadsRef.current += 1;
+    setLoads(loadsRef.current);
+    try {
+      const choices = await listStockChoices();
+      if (seq !== seqRef.current) return;
+      setSnapshot((current) => (current ? { ...current, choices } : current));
+    } catch (error) {
+      if (seq !== seqRef.current) return;
+      setLoadError(messageFrom(error));
+    } finally {
+      loadsRef.current -= 1;
+      setLoads(loadsRef.current);
+    }
+  }
+
   function retry() {
     if (saving || loadsRef.current > 0) return;
     setLoading(true);
@@ -147,8 +167,10 @@ export function PurchasesPage() {
         setNeedsReload(false);
       }
     } catch (error) {
-      if (!saved) setServerError(messageFrom(error));
-      else {
+      if (!saved) {
+        setServerError(messageFrom(error));
+        if (error instanceof ConversionChangedError) await reloadChoices();
+      } else {
         setNeedsReload(true);
         setLoadError(messageFrom(error));
       }

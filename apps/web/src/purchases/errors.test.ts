@@ -20,6 +20,25 @@ describe('mapPurchaseError', () => {
     );
   });
 
+  it('points to the saved list when a request id was reused with edits', () => {
+    expect(
+      mapPurchaseError({
+        code: '22023',
+        message: 'request_id already used for a different purchase',
+      }),
+    ).toBe(
+      'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع قايمة المشتريات قبل ما تسجّل تاني',
+    );
+    expect(
+      mapPurchaseError({
+        code: '22023',
+        message: 'request_id already used for a different opening',
+      }),
+    ).toBe(
+      'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع الأرصدة قبل ما تسجّل تاني',
+    );
+  });
+
   it('maps permission, validation, and unknown failures', () => {
     expect(
       mapPurchaseError({ code: '42501', message: 'permission denied' }),

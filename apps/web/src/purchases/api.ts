@@ -2,7 +2,12 @@ import { isBaseUnit, isStockKind } from '@/items/types';
 import type { Json } from '@/lib/database.types';
 import { fetchAllPages, PageCapError } from '@/lib/paged';
 import { supabase } from '@/lib/supabase';
-import { genericPurchaseError, mapPurchaseError } from '@/purchases/errors';
+import {
+  ConversionChangedError,
+  genericPurchaseError,
+  mapPurchaseError,
+  retrySafeMessage,
+} from '@/purchases/errors';
 import type {
   OpeningDraft,
   Purchase,
@@ -40,6 +45,40 @@ async function readPages<T>(
     }
     throw error;
   }
+}
+
+function isConversionChanged(error: {
+  code?: string;
+  message?: string;
+  details?: string | null;
+  hint?: string | null;
+}): boolean {
+  const text = [error.message, error.details, error.hint]
+    .filter(
+      (part): part is string => typeof part === 'string' && part.length > 0,
+    )
+    .join('\n');
+  return error.code === '40001' || text.includes('conversion changed');
+}
+
+async function writeRpc(
+  call: () => PromiseLike<{
+    error: Parameters<typeof throwIfError>[0];
+  }>,
+): Promise<void> {
+  let result: { error: Parameters<typeof throwIfError>[0] };
+  try {
+    result = await call();
+  } catch (error) {
+    throw new Error(retrySafeMessage, { cause: error });
+  }
+  if (!result.error) return;
+  if (isConversionChanged(result.error)) throw new ConversionChangedError();
+  const mapped = mapPurchaseError(result.error);
+  if (mapped === genericPurchaseError) {
+    throw new Error(retrySafeMessage, { cause: result.error });
+  }
+  throw new Error(mapped);
 }
 
 function throwIfError(
@@ -248,6 +287,7 @@ export async function listPurchases(
 
 function purchasePayload(draft: PurchaseDraft): Json {
   return {
+    request_id: draft.requestId,
     purchased_at: draft.purchasedAt,
     supplier: draft.supplier,
     invoice_no: draft.invoiceNo,
@@ -257,15 +297,18 @@ function purchasePayload(draft: PurchaseDraft): Json {
       quantity: line.quantity,
       unit: line.unit,
       amount_paid: line.amountPaid,
+      expected_base_unit: line.baseUnit,
+      expected_factor: line.expectedFactor,
     })),
   };
 }
 
 export async function recordPurchase(draft: PurchaseDraft): Promise<void> {
-  const { error } = await appDb().rpc('record_purchase', {
-    p_purchase: purchasePayload(draft),
-  });
-  throwIfError(error);
+  await writeRpc(() =>
+    appDb().rpc('record_purchase', {
+      p_purchase: purchasePayload(draft),
+    }),
+  );
 }
 
 export async function recordOpeningStock(draft: OpeningDraft): Promise<void> {
@@ -274,10 +317,14 @@ export async function recordOpeningStock(draft: OpeningDraft): Promise<void> {
     quantity: line.quantity,
     unit: line.unit,
     unit_cost: line.unitCost,
+    expected_base_unit: line.expectedBaseUnit,
+    expected_factor: line.expectedFactor,
   }));
-  const { error } = await appDb().rpc('record_opening_stock', {
-    p_occurred_at: draft.occurredAt,
-    p_lines: lines,
-  });
-  throwIfError(error);
+  await writeRpc(() =>
+    appDb().rpc('record_opening_stock', {
+      p_request_id: draft.requestId,
+      p_occurred_at: draft.occurredAt,
+      p_lines: lines,
+    }),
+  );
 }

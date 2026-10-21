@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { OpeningGrid } from '@/purchases/OpeningGrid';
-import type { StockChoice } from '@/purchases/types';
+import type { OpeningDraft, StockChoice } from '@/purchases/types';
 
 const oil: StockChoice = {
   id: 'oil',
@@ -38,7 +38,7 @@ const size: StockChoice = {
 
 describe('OpeningGrid', () => {
   it('groups items and posts the filled rows at the chosen Cairo time', () => {
-    const onSubmit = vi.fn();
+    const onSubmit = vi.fn<(draft: OpeningDraft) => void>();
     render(
       <OpeningGrid
         items={[size, oil, mixed]}
@@ -75,9 +75,22 @@ describe('OpeningGrid', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
 
-    expect(onSubmit).toHaveBeenCalledWith({
+    const submitted = onSubmit.mock.calls[0]?.[0];
+    expect(submitted?.requestId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
+    expect(submitted).toMatchObject({
       occurredAt: '2026-07-15T09:00:00.000Z',
-      lines: [{ itemId: 'mixed', quantity: '10', unit: 'kg', unitCost: '100' }],
+      lines: [
+        {
+          itemId: 'mixed',
+          quantity: '10',
+          unit: 'kg',
+          unitCost: '100',
+          expectedBaseUnit: 'kg',
+          expectedFactor: '1',
+        },
+      ],
     });
   });
 

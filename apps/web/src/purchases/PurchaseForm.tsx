@@ -4,6 +4,8 @@ import { kindLabels, unitLabels } from '@/items/labels';
 import type { StockKind } from '@/items/types';
 import { formatMoneyText } from '@/purchases/decimal';
 import type { PurchaseDraft, StockChoice } from '@/purchases/types';
+
+type ReviewedPurchase = Omit<PurchaseDraft, 'requestId'>;
 import { nowCairoDateTimeLocal } from '@/purchases/time';
 import {
   previewPurchaseLine,
@@ -49,6 +51,8 @@ export function PurchaseForm({
   onSubmit: (draft: PurchaseDraft) => void;
 }) {
   const keyRef = useRef(1);
+  // One id for this draft. A failed save retries it; a new form gets a new one.
+  const [requestId] = useState(() => crypto.randomUUID());
   const [values, setValues] = useState<PurchaseValues>(() => ({
     purchasedAt: nowCairoDateTimeLocal(),
     supplier: '',
@@ -57,7 +61,7 @@ export function PurchaseForm({
     lines: [emptyLine('1')],
   }));
   const [errors, setErrors] = useState<PurchaseErrors>({ lines: {} });
-  const [draft, setDraft] = useState<PurchaseDraft | null>(null);
+  const [draft, setDraft] = useState<ReviewedPurchase | null>(null);
   const disabled = locked || submitting;
 
   function edit(patch: Partial<PurchaseValues>) {
@@ -109,7 +113,7 @@ export function PurchaseForm({
       setDraft(result.draft);
       return;
     }
-    onSubmit(draft);
+    onSubmit({ ...draft, requestId });
   }
 
   return (

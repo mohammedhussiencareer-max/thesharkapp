@@ -2,7 +2,10 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
 import { listStockChoices, recordOpeningStock } from '@/purchases/api';
-import { genericPurchaseError } from '@/purchases/errors';
+import {
+  ConversionChangedError,
+  genericPurchaseError,
+} from '@/purchases/errors';
 import { OpeningGrid } from '@/purchases/OpeningGrid';
 import type { OpeningDraft, StockChoice } from '@/purchases/types';
 
@@ -90,8 +93,17 @@ export function OpeningPage() {
         setNeedsReload(false);
       }
     } catch (error) {
-      if (!saved) setServerError(messageFrom(error));
-      else {
+      if (!saved) {
+        setServerError(messageFrom(error));
+        if (error instanceof ConversionChangedError) {
+          try {
+            const next = await readChoices();
+            if (next) setItems(next);
+          } catch (reloadError) {
+            setLoadError(messageFrom(reloadError));
+          }
+        }
+      } else {
         setNeedsReload(true);
         setLoadError(messageFrom(error));
       }

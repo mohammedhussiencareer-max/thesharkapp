@@ -143,7 +143,7 @@ export function validateOpening(
   items: readonly StockChoice[],
   occurredAtLocal: string,
 ):
-  | { ok: true; draft: OpeningDraft }
+  | { ok: true; draft: Omit<OpeningDraft, 'requestId'> }
   | { ok: false; formError: string | null; fields: OpeningFieldErrors } {
   const fields: OpeningFieldErrors = {};
   const lines: OpeningDraft['lines'] = [];
@@ -226,6 +226,8 @@ export function validateOpening(
       quantity: formatDec(quantity),
       unit: row.unit || item.baseUnit,
       unitCost: formatDec(cost),
+      expectedBaseUnit: item.baseUnit,
+      expectedFactor: factor,
     });
   }
 
@@ -252,7 +254,9 @@ function optionalText(
 export function validatePurchase(
   values: PurchaseValues,
   items: readonly StockChoice[],
-): { ok: true; draft: PurchaseDraft } | { ok: false; errors: PurchaseErrors } {
+):
+  | { ok: true; draft: Omit<PurchaseDraft, 'requestId'> }
+  | { ok: false; errors: PurchaseErrors } {
   const errors: PurchaseErrors = { lines: {} };
   const purchased = parseCairoDateTimeLocal(values.purchasedAt);
   const purchasedAt = purchased.ok ? purchased.iso : null;
@@ -315,6 +319,7 @@ export function validatePurchase(
             baseUnit: item.baseUnit,
             baseQuantity: base.text,
             unitCost: '0',
+            expectedFactor: factor,
           };
         } else {
           const cost = divRound(amountParsed, base.value, 6);
@@ -330,6 +335,7 @@ export function validatePurchase(
               baseUnit: item.baseUnit,
               baseQuantity: base.text,
               unitCost: formatDec(cost),
+              expectedFactor: factor,
             };
           }
         }

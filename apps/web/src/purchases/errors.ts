@@ -2,6 +2,21 @@ export const genericPurchaseError = 'حصل خطأ. حاول تاني.';
 
 export const permissionMessage = 'مفيش صلاحية للعملية دي';
 
+/** A lost reply can be saved again; the same request id will not post twice. */
+export const retrySafeMessage =
+  'حصل خطأ. اضغط حفظ تاني — لو الطلب اتسجل مش هيتسجل مرتين.';
+
+/** The unit or factor changed after the owner reviewed the line. */
+export const conversionChangedMessage =
+  'الوحدة أو معامل التحويل اتغيّر. راجع السطور واحفظ تاني.';
+
+export class ConversionChangedError extends Error {
+  constructor() {
+    super(conversionChangedMessage);
+    this.name = 'ConversionChangedError';
+  }
+}
+
 const backDatedMarker = 'back-dated movement not supported yet';
 
 export function backDatedMessage(itemName: string): string {
@@ -30,6 +45,14 @@ const namedReasons: ReadonlyArray<readonly [string, (name: string) => string]> =
   ];
 
 const exactReasons: ReadonlyArray<readonly [string, string]> = [
+  [
+    'request_id already used for a different purchase',
+    'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع قايمة المشتريات قبل ما تسجّل تاني',
+  ],
+  [
+    'request_id already used for a different opening',
+    'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع الأرصدة قبل ما تسجّل تاني',
+  ],
   ['purchased_at is required', 'اكتب وقت الشراء'],
   ['purchased_at must be a finite timestamp', 'وقت الشراء مش مظبوط'],
   ['occurred_at is required', 'اكتب وقت الرصيد'],

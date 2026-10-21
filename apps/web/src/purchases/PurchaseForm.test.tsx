@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { backDatedMessage } from '@/purchases/errors';
 import { PurchaseForm } from '@/purchases/PurchaseForm';
-import type { StockChoice } from '@/purchases/types';
+import type { PurchaseDraft, StockChoice } from '@/purchases/types';
 
 const oil: StockChoice = {
   id: 'oil',
@@ -17,7 +17,7 @@ const oil: StockChoice = {
 
 describe('PurchaseForm', () => {
   it('shows the derived unit cost, confirms, then submits exact strings', () => {
-    const onSubmit = vi.fn();
+    const onSubmit = vi.fn<(draft: PurchaseDraft) => void>();
     render(
       <PurchaseForm
         items={[oil]}
@@ -63,7 +63,11 @@ describe('PurchaseForm', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'مراجعة' }));
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
-    expect(onSubmit).toHaveBeenCalledWith({
+    const submitted = onSubmit.mock.calls[0]?.[0];
+    expect(submitted?.requestId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
+    expect(submitted).toMatchObject({
       purchasedAt: '2026-07-15T09:00:00.000Z',
       supplier: 'مورد',
       invoiceNo: null,
@@ -78,6 +82,7 @@ describe('PurchaseForm', () => {
           baseUnit: 'kg',
           baseQuantity: '1.84',
           unitCost: '27.173913',
+          expectedFactor: '0.92',
         },
       ],
     });

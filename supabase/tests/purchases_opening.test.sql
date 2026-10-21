@@ -122,8 +122,8 @@ select
   has_function (
     'app',
     'record_opening_stock',
-    array['timestamptz', 'jsonb'],
-    'app.record_opening_stock(timestamptz, jsonb) exists'
+    array['timestamptz', 'jsonb', 'uuid'],
+    'app.record_opening_stock(timestamptz, jsonb, uuid) exists'
   );
 
 select
@@ -254,7 +254,7 @@ select
         (
           select
             pg_catalog.pg_get_functiondef (
-              'app.record_opening_stock(timestamptz,jsonb)'::regprocedure
+              'app.record_opening_stock(timestamptz,jsonb,uuid)'::regprocedure
             ) as def
         ) s
     ),
@@ -290,22 +290,22 @@ select
   ok (
     has_function_privilege(
       'authenticated',
-      'app.record_opening_stock(timestamptz,jsonb)'::regprocedure,
+      'app.record_opening_stock(timestamptz,jsonb,uuid)'::regprocedure,
       'EXECUTE'
     )
     and has_function_privilege(
       'service_role',
-      'app.record_opening_stock(timestamptz,jsonb)'::regprocedure,
+      'app.record_opening_stock(timestamptz,jsonb,uuid)'::regprocedure,
       'EXECUTE'
     )
     and not has_function_privilege(
       'anon',
-      'app.record_opening_stock(timestamptz,jsonb)'::regprocedure,
+      'app.record_opening_stock(timestamptz,jsonb,uuid)'::regprocedure,
       'EXECUTE'
     )
     and not has_function_privilege(
       'public',
-      'app.record_opening_stock(timestamptz,jsonb)'::regprocedure,
+      'app.record_opening_stock(timestamptz,jsonb,uuid)'::regprocedure,
       'EXECUTE'
     ),
     'record_opening_stock execute is granted to authenticated and service_role only'
@@ -490,6 +490,34 @@ values
     'packaging',
     'piece',
     'weekly'
+  ),
+  (
+    '20000000-0000-4000-8000-00000000000a',
+    'صنف إعادة فتح',
+    'ingredient',
+    'kg',
+    'weekly'
+  ),
+  (
+    '20000000-0000-4000-8000-00000000000b',
+    'صنف كيس',
+    'ingredient',
+    'kg',
+    'weekly'
+  ),
+  (
+    '20000000-0000-4000-8000-00000000000c',
+    'صنف وحدة شراء',
+    'packaging',
+    'piece',
+    'weekly'
+  ),
+  (
+    '20000000-0000-4000-8000-00000000000d',
+    'صنف وحدة فتح',
+    'packaging',
+    'piece',
+    'weekly'
   );
 
 insert into
@@ -504,7 +532,8 @@ values
     '20000000-0000-4000-8000-000000000006',
     'كرتونة',
     12
-  );
+  ),
+  ('20000000-0000-4000-8000-00000000000b', 'كيس', 4);
 
 select
   set_config(
@@ -536,7 +565,11 @@ select
         'unit',
         'kg',
         'unit_cost',
-        '100'
+        '100',
+        'expected_base_unit',
+        'kg',
+        'expected_factor',
+        '1'
       ),
       jsonb_build_object(
         'item_id',
@@ -546,7 +579,11 @@ select
         'unit',
         'كرتونة',
         'unit_cost',
-        '30'
+        '30',
+        'expected_base_unit',
+        'kg',
+        'expected_factor',
+        '12'
       ),
       jsonb_build_object(
         'item_id',
@@ -558,7 +595,8 @@ select
         'unit_cost',
         '5'
       )
-    )
+    ),
+    'a1000000-0000-4000-8000-000000000001'
   );
 
 select
@@ -632,7 +670,8 @@ select
           'item_id', '20000000-0000-4000-8000-000000000008',
           'quantity', 2, 'unit', 'kg', 'unit_cost', 1
         )
-      )
+      ),
+      'a1000000-0000-4000-8000-000000000002'
     )$$,
     '22023',
     'duplicate opening item: خام اختبار',
@@ -648,7 +687,8 @@ select
           'item_id', '20000000-0000-4000-8000-000000000007',
           'quantity', 1, 'unit', 'kg', 'unit_cost', 1
         )
-      )
+      ),
+      'a1000000-0000-4000-8000-000000000003'
     )$$,
     '22023',
     'item already has movements: بوري اختبار',
@@ -664,7 +704,8 @@ select
           'item_id', '20000000-0000-4000-8000-000000000008',
           'quantity', 1, 'unit', 'kg', 'unit_cost', -1
         )
-      )
+      ),
+      'a1000000-0000-4000-8000-000000000004'
     )$$,
     '22023',
     'opening unit_cost must be >= 0',
@@ -680,7 +721,8 @@ select
           'item_id', '20000000-0000-4000-8000-000000000008',
           'quantity', -1, 'unit', 'kg', 'unit_cost', 1
         )
-      )
+      ),
+      'a1000000-0000-4000-8000-000000000005'
     )$$,
     '22023',
     'quantity must be a finite number >= 0',
@@ -696,7 +738,8 @@ select
           'item_id', '20000000-0000-4000-8000-000000000008',
           'quantity', 0, 'unit', 'kg'
         )
-      )
+      ),
+      'a1000000-0000-4000-8000-000000000006'
     )$$,
     '22023',
     'at least one opening line is required',
@@ -733,6 +776,8 @@ select
     jsonb_build_object(
       'purchased_at',
       '2026-10-21T10:00:00Z',
+      'request_id',
+      'b1000000-0000-4000-8000-000000000001',
       'supplier',
       '  مورد اختبار  ',
       'invoice_no',
@@ -749,7 +794,11 @@ select
           'unit',
           'kg',
           'amount_paid',
-          '1000.00'
+          '1000.00',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '1'
         ),
         jsonb_build_object(
           'item_id',
@@ -759,7 +808,11 @@ select
           'unit',
           'kg',
           'amount_paid',
-          '2000'
+          '2000',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '1'
         )
       )
     )
@@ -844,6 +897,8 @@ select
     jsonb_build_object(
       'purchased_at',
       '2026-10-21T11:00:00Z',
+      'request_id',
+      'b1000000-0000-4000-8000-000000000002',
       'supplier',
       '   ',
       'invoice_no',
@@ -860,7 +915,11 @@ select
           'unit',
           'لتر',
           'amount_paid',
-          '50.00'
+          '50.00',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '0.92'
         )
       )
     )
@@ -918,6 +977,8 @@ select
     jsonb_build_object(
       'purchased_at',
       '2026-10-21T12:00:00Z',
+      'request_id',
+      'b1000000-0000-4000-8000-000000000003',
       'lines',
       jsonb_build_array(
         jsonb_build_object(
@@ -928,7 +989,11 @@ select
           'unit',
           'piece',
           'amount_paid',
-          '10.00'
+          '10.00',
+          'expected_base_unit',
+          'piece',
+          'expected_factor',
+          '1'
         )
       )
     )
@@ -957,6 +1022,8 @@ select
     jsonb_build_object(
       'purchased_at',
       '2026-10-21T13:00:00Z',
+      'request_id',
+      'b1000000-0000-4000-8000-000000000004',
       'lines',
       jsonb_build_array(
         jsonb_build_object(
@@ -967,7 +1034,11 @@ select
           'unit',
           'piece',
           'amount_paid',
-          '0'
+          '0',
+          'expected_base_unit',
+          'piece',
+          'expected_factor',
+          '1'
         )
       )
     )
@@ -1044,14 +1115,17 @@ select
         perform app.record_purchase(
           jsonb_build_object(
             'purchased_at', '2026-10-21T09:00:00Z',
+            'request_id', 'b1000000-0000-4000-8000-000000000005',
             'lines', jsonb_build_array(
               jsonb_build_object(
                 'item_id', '20000000-0000-4000-8000-000000000005',
-                'quantity', '1', 'unit', 'kg', 'amount_paid', '10'
+                'quantity', '1', 'unit', 'kg', 'amount_paid', '10',
+                'expected_base_unit', 'kg', 'expected_factor', '1'
               ),
               jsonb_build_object(
                 'item_id', '20000000-0000-4000-8000-000000000002',
-                'quantity', '1', 'unit', 'kg', 'amount_paid', '10'
+                'quantity', '1', 'unit', 'kg', 'amount_paid', '10',
+                'expected_base_unit', 'kg', 'expected_factor', '1'
               )
             )
           )
@@ -1111,6 +1185,8 @@ select
     jsonb_build_object(
       'purchased_at',
       '2026-10-21T15:00:00Z',
+      'request_id',
+      'b1000000-0000-4000-8000-000000000006',
       'lines',
       jsonb_build_array(
         jsonb_build_object(
@@ -1121,7 +1197,11 @@ select
           'unit',
           'kg',
           'amount_paid',
-          '80'
+          '80',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '1'
         )
       )
     )
@@ -1152,9 +1232,14 @@ select
         'unit',
         'kg',
         'unit_cost',
-        '12.5'
+        '12.5',
+        'expected_base_unit',
+        'kg',
+        'expected_factor',
+        '1'
       )
-    )
+    ),
+    'a1000000-0000-4000-8000-000000000007'
   );
 
 select
@@ -1397,7 +1482,7 @@ select
 
 select
   throws_ok (
-    $$select app.record_opening_stock(null, '[]'::jsonb)$$,
+    $$select app.record_opening_stock(null, '[]'::jsonb, 'a1000000-0000-4000-8000-000000000008')$$,
     '22023',
     'occurred_at is required',
     'opening requires a time'
@@ -1405,7 +1490,7 @@ select
 
 select
   throws_ok (
-    $$select app.record_opening_stock('infinity', '[]'::jsonb)$$,
+    $$select app.record_opening_stock('infinity', '[]'::jsonb, 'a1000000-0000-4000-8000-000000000009')$$,
     '22023',
     'occurred_at must be a finite timestamp',
     'opening rejects an infinite time'
@@ -1464,6 +1549,438 @@ select
     'owner can read purchase lines'
   );
 
+-- ============================================================================
+-- Idempotency and the reviewed conversion
+-- ============================================================================
+select
+  app.record_purchase (
+    jsonb_build_object(
+      'purchased_at',
+      '2026-10-21T19:00:00Z',
+      'request_id',
+      'b1000000-0000-4000-8000-000000000007',
+      'supplier',
+      'مورد إعادة',
+      'lines',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          '20000000-0000-4000-8000-000000000005',
+          'quantity',
+          '3',
+          'unit',
+          'kg',
+          'amount_paid',
+          '15.00',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '1'
+        )
+      )
+    )
+  );
+
+select
+  is (
+    app.record_purchase (
+      jsonb_build_object(
+        'purchased_at',
+        '2026-10-21T19:00:00Z',
+        'request_id',
+        'b1000000-0000-4000-8000-000000000007',
+        'supplier',
+        'مورد إعادة',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            '20000000-0000-4000-8000-000000000005',
+            'quantity',
+            '3',
+            'unit',
+            'kg',
+            'amount_paid',
+            '15.00',
+            'expected_base_unit',
+            'kg',
+            'expected_factor',
+            '1'
+          )
+        )
+      )
+    ),
+    (
+      select
+        id
+      from
+        app.purchases
+      where
+        request_id = 'b1000000-0000-4000-8000-000000000007'
+    ),
+    'same purchase request id and payload returns the existing id'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.purchases
+      where
+        request_id = 'b1000000-0000-4000-8000-000000000007'
+    ),
+    1::bigint,
+    'same purchase request id adds no second header'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.purchase_lines pl
+        join app.purchases p on p.id = pl.purchase_id
+      where
+        p.request_id = 'b1000000-0000-4000-8000-000000000007'
+    ),
+    1::bigint,
+    'same purchase request id adds no second line'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements
+      where
+        item_id = '20000000-0000-4000-8000-000000000005'
+    ),
+    1::bigint,
+    'same purchase request id adds no movement'
+  );
+
+select
+  throws_ok (
+    $$select app.record_purchase(jsonb_build_object(
+      'purchased_at', '2026-10-21T19:00:00Z',
+      'request_id', 'b1000000-0000-4000-8000-000000000007',
+      'supplier', 'مورد تاني',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', '20000000-0000-4000-8000-000000000005',
+        'quantity', '3', 'unit', 'kg', 'amount_paid', '15.00',
+        'expected_base_unit', 'kg', 'expected_factor', '1'
+      ))
+    ))$$,
+    '22023',
+    'request_id already used for a different purchase',
+    'same purchase request id with a different payload is refused'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements
+      where
+        item_id = '20000000-0000-4000-8000-000000000005'
+    ),
+    1::bigint,
+    'refused purchase replay adds no movement'
+  );
+
+select
+  app.record_opening_stock (
+    '2026-10-21T19:30:00Z',
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '20000000-0000-4000-8000-00000000000a',
+        'quantity',
+        '6',
+        'unit',
+        'kg',
+        'unit_cost',
+        '2',
+        'expected_base_unit',
+        'kg',
+        'expected_factor',
+        '1'
+      )
+    ),
+    'a1000000-0000-4000-8000-000000000010'
+  );
+
+select
+  is (
+    app.record_opening_stock (
+      '2026-10-21T19:30:00Z',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          '20000000-0000-4000-8000-00000000000a',
+          'quantity',
+          '6',
+          'unit',
+          'kg',
+          'unit_cost',
+          '2',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '1'
+        )
+      ),
+      'a1000000-0000-4000-8000-000000000010'
+    ),
+    (
+      select
+        id
+      from
+        app.opening_stocks
+      where
+        request_id = 'a1000000-0000-4000-8000-000000000010'
+    ),
+    'same opening request id and payload returns the existing batch'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.opening_stocks
+      where
+        request_id = 'a1000000-0000-4000-8000-000000000010'
+    ),
+    1::bigint,
+    'same opening request id adds no second header'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.opening_stock_lines ol
+        join app.opening_stocks o on o.id = ol.opening_id
+      where
+        o.request_id = 'a1000000-0000-4000-8000-000000000010'
+    ),
+    1::bigint,
+    'same opening request id adds no second line'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements
+      where
+        item_id = '20000000-0000-4000-8000-00000000000a'
+    ),
+    1::bigint,
+    'same opening request id adds no movement'
+  );
+
+select
+  throws_ok (
+    $$select app.record_opening_stock(
+      '2026-10-21T19:30:00Z',
+      jsonb_build_array(jsonb_build_object(
+        'item_id', '20000000-0000-4000-8000-00000000000a',
+        'quantity', '7', 'unit', 'kg', 'unit_cost', '2',
+        'expected_base_unit', 'kg', 'expected_factor', '1'
+      )),
+      'a1000000-0000-4000-8000-000000000010'
+    )$$,
+    '22023',
+    'request_id already used for a different opening',
+    'same opening request id with a different payload is refused'
+  );
+
+select
+  app.update_unit_conversion (
+    '20000000-0000-4000-8000-000000000006',
+    'كرتونة',
+    12,
+    24,
+    'kg'
+  );
+
+select
+  throws_ok (
+    $$select app.record_purchase(jsonb_build_object(
+      'purchased_at', '2026-10-21T20:00:00Z',
+      'request_id', 'b1000000-0000-4000-8000-000000000008',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', '20000000-0000-4000-8000-000000000006',
+        'quantity', '2', 'unit', 'كرتونة', 'amount_paid', '40',
+        'expected_base_unit', 'kg', 'expected_factor', '12'
+      ))
+    ))$$,
+    '40001',
+    'conversion changed',
+    'stale purchase factor is refused after the conversion changes'
+  );
+
+select
+  app.record_purchase (
+    jsonb_build_object(
+      'purchased_at',
+      '2026-10-21T20:10:00Z',
+      'request_id',
+      'b1000000-0000-4000-8000-000000000009',
+      'lines',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          '20000000-0000-4000-8000-000000000006',
+          'quantity',
+          '2',
+          'unit',
+          'كرتونة',
+          'amount_paid',
+          '48.00',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '24'
+        )
+      )
+    )
+  );
+
+select
+  is (
+    (
+      select
+        pl.base_quantity
+      from
+        app.purchase_lines pl
+        join app.purchases p on p.id = pl.purchase_id
+      where
+        p.request_id = 'b1000000-0000-4000-8000-000000000009'
+    ),
+    48::numeric,
+    'a purchase with the current expected factor posts that base quantity'
+  );
+
+select
+  app.update_unit_conversion (
+    '20000000-0000-4000-8000-00000000000b',
+    'كيس',
+    4,
+    8,
+    'kg'
+  );
+
+select
+  throws_ok (
+    $$select app.record_opening_stock(
+      '2026-10-21T20:20:00Z',
+      jsonb_build_array(jsonb_build_object(
+        'item_id', '20000000-0000-4000-8000-00000000000b',
+        'quantity', '1', 'unit', 'كيس', 'unit_cost', '8',
+        'expected_base_unit', 'kg', 'expected_factor', '4'
+      )),
+      'a1000000-0000-4000-8000-000000000011'
+    )$$,
+    '40001',
+    'conversion changed',
+    'stale opening factor is refused after the conversion changes'
+  );
+
+select
+  app.record_opening_stock (
+    '2026-10-21T20:30:00Z',
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '20000000-0000-4000-8000-00000000000b',
+        'quantity',
+        '1',
+        'unit',
+        'كيس',
+        'unit_cost',
+        '8',
+        'expected_base_unit',
+        'kg',
+        'expected_factor',
+        '8'
+      )
+    ),
+    'a1000000-0000-4000-8000-000000000012'
+  );
+
+select
+  is (
+    (
+      select
+        on_hand_qty
+      from
+        app.item_balances
+      where
+        item_id = '20000000-0000-4000-8000-00000000000b'
+    ),
+    8::numeric,
+    'an opening with the current expected factor posts that base quantity'
+  );
+
+update app.stock_items
+set
+  base_unit = 'kg'
+where
+  id = '20000000-0000-4000-8000-00000000000c';
+
+select
+  throws_ok (
+    $$select app.record_purchase(jsonb_build_object(
+      'purchased_at', '2026-10-21T20:40:00Z',
+      'request_id', 'b1000000-0000-4000-8000-00000000000a',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', '20000000-0000-4000-8000-00000000000c',
+        'quantity', '1', 'unit', 'piece', 'amount_paid', '5',
+        'expected_base_unit', 'piece', 'expected_factor', '1'
+      ))
+    ))$$,
+    '40001',
+    'conversion changed',
+    'stale purchase base unit is refused'
+  );
+
+update app.stock_items
+set
+  base_unit = 'kg'
+where
+  id = '20000000-0000-4000-8000-00000000000d';
+
+select
+  throws_ok (
+    $$select app.record_opening_stock(
+      '2026-10-21T20:50:00Z',
+      jsonb_build_array(jsonb_build_object(
+        'item_id', '20000000-0000-4000-8000-00000000000d',
+        'quantity', '1', 'unit', 'piece', 'unit_cost', '5',
+        'expected_base_unit', 'piece', 'expected_factor', '1'
+      )),
+      'a1000000-0000-4000-8000-000000000013'
+    )$$,
+    '40001',
+    'conversion changed',
+    'stale opening base unit is refused'
+  );
+
 select
   throws_ok (
     $$insert into app.purchases (purchased_at, total_paid, batch_id)
@@ -1471,6 +1988,15 @@ select
     '42501',
     null::text,
     'owner cannot insert a purchase directly'
+  );
+
+select
+  throws_ok (
+    $$insert into app.opening_stocks (id, request_id, occurred_at)
+      values (gen_random_uuid(), gen_random_uuid(), now())$$,
+    '42501',
+    null::text,
+    'owner cannot insert an opening batch directly'
   );
 
 select
@@ -1517,7 +2043,7 @@ select
 
 select
   throws_ok (
-    $$select app.record_opening_stock(now(), '[]'::jsonb)$$,
+    $$select app.record_opening_stock(now(), '[]'::jsonb, 'a1000000-0000-4000-8000-00000000000a')$$,
     '42501',
     'insufficient_privilege',
     'non-owner cannot record opening stock'
@@ -1533,6 +2059,18 @@ select
   is_empty (
     $$select purchase_id from app.purchase_lines$$,
     'non-owner cannot read purchase lines'
+  );
+
+select
+  is_empty (
+    $$select id from app.opening_stocks$$,
+    'non-owner cannot read opening batches'
+  );
+
+select
+  is_empty (
+    $$select opening_id from app.opening_stock_lines$$,
+    'non-owner cannot read opening lines'
   );
 
 select
@@ -1559,7 +2097,7 @@ select
 
 select
   throws_ok (
-    $$select app.record_opening_stock(now(), '[]'::jsonb)$$,
+    $$select app.record_opening_stock(now(), '[]'::jsonb, 'a1000000-0000-4000-8000-00000000000b')$$,
     '42501',
     null::text,
     'anon cannot execute record_opening_stock'
@@ -1642,8 +2180,10 @@ select
       '2026-10-21T17:00:00Z',
       jsonb_build_array(jsonb_build_object(
         'item_id', '20000000-0000-4000-8000-000000000009',
-        'quantity', '1', 'unit', 'piece', 'unit_cost', '5'
-      ))
+        'quantity', '1', 'unit', 'piece', 'unit_cost', '5',
+        'expected_base_unit', 'piece', 'expected_factor', '1'
+      )),
+      'a1000000-0000-4000-8000-00000000000c'
     )$$,
     'service_role can record opening stock'
   );

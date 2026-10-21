@@ -70,6 +70,7 @@ describe('purchase validation', () => {
       amountPaid: '50.00',
       baseQuantity: '1.84',
       unitCost: '27.173913',
+      expectedFactor: '0.92',
     });
   });
 
@@ -124,7 +125,14 @@ describe('purchase validation', () => {
     if (!skipped.ok) return;
     expect(skipped.draft.occurredAt).toBe('2026-01-15T10:00:00.000Z');
     expect(skipped.draft.lines).toEqual([
-      { itemId: 'mixed', quantity: '4', unit: 'kg', unitCost: '12.5' },
+      {
+        itemId: 'mixed',
+        quantity: '4',
+        unit: 'kg',
+        unitCost: '12.5',
+        expectedBaseUnit: 'kg',
+        expectedFactor: '1',
+      },
     ]);
   });
 

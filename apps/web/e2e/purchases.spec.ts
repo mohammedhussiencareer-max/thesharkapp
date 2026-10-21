@@ -126,6 +126,7 @@ test('owner records opening stock and a purchase in a converted unit', async ({
     .single();
   expect(item.error).toBeNull();
   const refused = await db.rpc('record_opening_stock', {
+    p_request_id: crypto.randomUUID(),
     p_occurred_at: new Date().toISOString(),
     p_lines: [
       {
@@ -133,6 +134,8 @@ test('owner records opening stock and a purchase in a converted unit', async ({
         quantity: '1',
         unit: item.data?.base_unit ?? 'kg',
         unit_cost: '10',
+        expected_base_unit: item.data?.base_unit ?? 'kg',
+        expected_factor: '1',
       },
     ],
   });
