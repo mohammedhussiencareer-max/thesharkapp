@@ -37,11 +37,13 @@ test('owner records expenses and sees the daily allocation', async ({
   await expect(table).toBeVisible(visible);
   await voidOpenExpenses(page);
 
-  await page.getByLabel('التصنيف').selectOption({ label: 'إيجار' });
-  await page.getByLabel('المبلغ').fill('1000');
-  const estimate = page.getByRole('checkbox', { name: 'تقدير' });
+  const form = page.getByRole('form', { name: 'مصروف جديد' });
+
+  await form.getByLabel('التصنيف').selectOption({ label: 'إيجار' });
+  await form.getByLabel('المبلغ').fill('1000');
+  const estimate = form.getByRole('checkbox', { name: 'تقدير' });
   if (await estimate.isChecked()) await estimate.uncheck();
-  await page.getByRole('button', { name: 'حفظ المصروف' }).click();
+  await form.getByRole('button', { name: 'حفظ المصروف' }).click();
   await expect(table.getByRole('cell', { name: '33.34 ج.م' })).toHaveCount(
     20,
     visible,
@@ -51,33 +53,33 @@ test('owner records expenses and sees the daily allocation', async ({
     '1000.00',
   );
 
-  await page.getByLabel('التصنيف').selectOption({ label: 'أجر طيارين' });
-  await page.getByLabel('التاريخ').fill('2030-04-15');
-  await page.getByLabel('الساعات').fill('5.5');
-  await page.getByLabel('سعر الساعة').fill('30');
-  await page.getByLabel('اسم الطيار').fill('طيار اختبار');
-  await expect(page.getByLabel('المبلغ')).toContainText('165.00');
-  await page.getByRole('button', { name: 'حفظ المصروف' }).click();
+  await form.getByLabel('التصنيف').selectOption({ label: 'أجر طيارين' });
+  await form.getByLabel('التاريخ').fill('2030-04-15');
+  await form.getByLabel('الساعات').fill('5.5');
+  await form.getByLabel('سعر الساعة').fill('30');
+  await form.getByLabel('اسم الطيار').fill('طيار اختبار');
+  await expect(form.getByLabel('المبلغ')).toContainText('165.00');
+  await form.getByRole('button', { name: 'حفظ المصروف' }).click();
   await expect(table.getByRole('row', { name: /15\/04\/2030/ })).toContainText(
     '165.00',
     visible,
   );
 
-  await page.getByLabel('التصنيف').selectOption({ label: 'غاز' });
-  await page.getByLabel('التاريخ').fill('2030-04-03');
-  await page.getByLabel('المبلغ').fill('40');
-  await page.getByRole('checkbox', { name: 'تقدير' }).check();
-  await page.getByRole('button', { name: 'حفظ المصروف' }).click();
+  await form.getByLabel('التصنيف').selectOption({ label: 'غاز' });
+  await form.getByLabel('التاريخ').fill('2030-04-03');
+  await form.getByLabel('المبلغ').fill('40');
+  await form.getByRole('checkbox', { name: 'تقدير' }).check();
+  await form.getByRole('button', { name: 'حفظ المصروف' }).click();
   const estimateRow = page.getByRole('article', { name: /40\.00/ });
   await expect(estimateRow.getByText('تقدير', { exact: true })).toBeVisible(
     visible,
   );
 
-  await page.getByLabel('التصنيف').selectOption({ label: 'غاز' });
-  await page.getByLabel('التاريخ').fill('2030-04-03');
-  await page.getByLabel('المبلغ').fill('55');
-  await page.getByRole('checkbox', { name: 'تقدير' }).uncheck();
-  await page.getByRole('button', { name: 'حفظ المصروف' }).click();
+  await form.getByLabel('التصنيف').selectOption({ label: 'غاز' });
+  await form.getByLabel('التاريخ').fill('2030-04-03');
+  await form.getByLabel('المبلغ').fill('55');
+  await form.getByRole('checkbox', { name: 'تقدير' }).uncheck();
+  await form.getByRole('button', { name: 'حفظ المصروف' }).click();
   await expect(page.getByText('التقدير اتلغى بالفاتورة')).toBeVisible(visible);
   const third = table.getByRole('row', { name: /03\/04\/2030/ });
   await expect(third).toContainText('55.00');

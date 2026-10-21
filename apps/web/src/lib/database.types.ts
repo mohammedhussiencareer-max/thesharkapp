@@ -5,7 +5,59 @@ export type Database = {
   
   "app": {
           Tables: {
-            "item_balances": {
+            "expense_categories": {
+                  Row: {
+                    "active": boolean,"created_at": string,"id": string,"kind": string,"name": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "active"?: boolean,"created_at"?: string,"id"?: string,"kind": string,"name": string
+                  }
+                  Update: {
+                    "active"?: boolean,"created_at"?: string,"id"?: string,"kind"?: string,"name"?: string
+                  }
+                  Relationships: [
+                    
+                  ]
+                },"expense_entries": {
+                  Row: {
+                    "amount": number | null,"category_id": string | null,"created_at": string,"created_by": string | null,"driver_label": string | null,"expense_date": string | null,"hourly_rate": number | null,"hours": number | null,"id": string,"is_estimate": boolean | null,"note": string | null,"paid_on": string | null,"period_month": string | null,"void_reason": string | null,"voids_id": string | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "amount"?: number | null,"category_id"?: string | null,"created_at"?: string,"created_by"?: string | null,"driver_label"?: string | null,"expense_date"?: string | null,"hourly_rate"?: number | null,"hours"?: number | null,"id"?: string,"is_estimate"?: boolean | null,"note"?: string | null,"paid_on"?: string | null,"period_month"?: string | null,"void_reason"?: string | null,"voids_id"?: string | null
+                  }
+                  Update: {
+                    "amount"?: number | null,"category_id"?: string | null,"created_at"?: string,"created_by"?: string | null,"driver_label"?: string | null,"expense_date"?: string | null,"hourly_rate"?: number | null,"hours"?: number | null,"id"?: string,"is_estimate"?: boolean | null,"note"?: string | null,"paid_on"?: string | null,"period_month"?: string | null,"void_reason"?: string | null,"voids_id"?: string | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "expense_entries_category_id_fkey"
+      columns: ["category_id"]
+isOneToOne: false
+      referencedRelation: "expense_categories"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "expense_entries_voids_id_fkey"
+      columns: ["voids_id"]
+isOneToOne: true
+      referencedRelation: "expense_entries"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "expense_entries_voids_id_fkey"
+      columns: ["voids_id"]
+isOneToOne: true
+      referencedRelation: "expense_lines"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "expense_entries_voids_id_fkey"
+      columns: ["voids_id"]
+isOneToOne: true
+      referencedRelation: "expense_lines"
+      referencedColumns: ["void_id"]
+    }
+                  ]
+                },"item_balances": {
                   Row: {
                     "avg_cost": number,"has_uncovered_deficit": boolean,"item_id": string,"last_occurred_at": string | null,"on_hand_qty": number,"on_hand_value": number
                   }
@@ -44,6 +96,20 @@ isOneToOne: false
       referencedRelation: "stock_items"
       referencedColumns: ["id"]
     }
+                  ]
+                },"month_expense_status": {
+                  Row: {
+                    "complete": boolean,"confirmed_at": string | null,"confirmed_by": string | null,"month": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "complete": boolean,"confirmed_at"?: string | null,"confirmed_by"?: string | null,"month": string
+                  }
+                  Update: {
+                    "complete"?: boolean,"confirmed_at"?: string | null,"confirmed_by"?: string | null,"month"?: string
+                  }
+                  Relationships: [
+                    
                   ]
                 },"opening_stock_lines": {
                   Row: {
@@ -328,7 +394,21 @@ isOneToOne: false
                 }
           }
           Views: {
-            "pos_shift_summaries": {
+            "expense_lines": {
+                  Row: {
+                    "amount": number | null,"category_id": string | null,"category_kind": string | null,"category_name": string | null,"created_at": string | null,"driver_label": string | null,"expense_date": string | null,"hourly_rate": number | null,"hours": number | null,"id": string | null,"is_estimate": boolean | null,"note": string | null,"paid_on": string | null,"period_month": string | null,"void_id": string | null,"void_reason": string | null,"voided_at": string | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    {
+      foreignKeyName: "expense_entries_category_id_fkey"
+      columns: ["category_id"]
+isOneToOne: false
+      referencedRelation: "expense_categories"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"pos_shift_summaries": {
                   Row: {
                     "closed_at": string | null,"drawer_difference": number | null,"drawer_total": number | null,"gross_sales": number | null,"is_active": boolean | null,"net_sales": number | null,"opened_at": string | null,"orders_canceled": number | null,"orders_complete": number | null,"orders_missing": number | null,"orders_open": number | null,"refunds": number | null,"shift_id": string | null,"unknown_tx": number | null
                   }
@@ -339,7 +419,13 @@ isOneToOne: false
                 }
           }
           Functions: {
-            "add_unit_conversion":
+            "add_expense_category":
+{ Args: { "p_kind": string,"p_name": string }; Returns: string
+                           },
+"add_expense_entry":
+{ Args: { "p_amount"?: number,"p_category_id": string,"p_driver_label"?: string,"p_expense_date"?: string,"p_hourly_rate"?: number,"p_hours"?: number,"p_is_estimate"?: boolean,"p_note"?: string,"p_paid_on"?: string,"p_period_month"?: string }; Returns: string
+                           },
+"add_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
                            },
 "apply_inflow_movement":
@@ -347,6 +433,9 @@ isOneToOne: false
                            },
 "apply_outflow_movement":
 { Args: { "p_batch_id": string,"p_item_id": string,"p_movement_type": Database["app"]['Enums']["movement_type"],"p_note": string,"p_occurred_at": string,"p_out_qty": number,"p_override_total_cost"?: number,"p_shift_id": string,"p_source_id": string,"p_source_type": string }; Returns: undefined
+                           },
+"assert_expense_write_allowed":
+{ Args: Record<PropertyKey, never>; Returns: undefined
                            },
 "assert_ledger_write_allowed":
 { Args: Record<PropertyKey, never>; Returns: undefined
@@ -356,6 +445,24 @@ isOneToOne: false
                            },
 "delete_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
+                           },
+"expense_daily":
+{ Args: { "p_from": string,"p_to": string }; Returns: {
+              "daily_total": number,"date": string,"depreciation": number,"driver_total": number,"fixed_share": number,"interest": number,"total": number
+            }[]
+                           },
+"expense_day_share":
+{ Args: { "p_amount": number,"p_day_count": number,"p_day_index": number }; Returns: number
+                           },
+"expense_effective":
+{ Args: Record<PropertyKey, never>; Returns: {
+              "amount": number,"category_id": string,"expense_date": string,"id": string,"is_estimate": boolean,"kind": string,"period_month": string
+            }[]
+                           },
+"expense_month_check":
+{ Args: { "p_month": string }; Returns: {
+              "balanced": boolean,"days_total": number,"entries_total": number
+            }[]
                            },
 "finish_pos_sync_run":
 { Args: { "p_counts": Json,"p_error": string,"p_run_id": number,"p_status": string }; Returns: undefined
@@ -399,14 +506,26 @@ isOneToOne: false
 "record_purchase":
 { Args: { "p_purchase": Json }; Returns: string
                            },
+"rename_expense_category":
+{ Args: { "p_id": string,"p_name": string }; Returns: undefined
+                           },
 "replace_pos_order_lines":
 { Args: { "p_lines": Json,"p_order_id": string }; Returns: undefined
+                           },
+"set_expense_category_active":
+{ Args: { "p_active": boolean,"p_id": string }; Returns: undefined
+                           },
+"set_month_expense_complete":
+{ Args: { "p_complete": boolean,"p_month": string }; Returns: undefined
                            },
 "start_pos_sync_run":
 { Args: { "p_mode": string }; Returns: number
                            },
 "update_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
+                           },
+"void_expense_entry":
+{ Args: { "p_id": string,"p_reason": string }; Returns: string
                            }
           }
           Enums: {

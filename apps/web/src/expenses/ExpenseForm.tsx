@@ -32,6 +32,7 @@ export function ExpenseForm({
   onSubmit: (draft: ExpenseDraft) => void;
 }) {
   const amountErrorId = useId();
+  const headingId = useId();
   const [values, setValues] = useState<ExpenseFormValues>(emptyExpenseForm);
   const [errors, setErrors] = useState<ExpenseFormErrors>({});
   const category =
@@ -62,8 +63,15 @@ export function ExpenseForm({
   }
 
   return (
-    <form className="flex flex-col gap-3" noValidate onSubmit={onSubmitForm}>
-      <h2 className="text-lg font-semibold">مصروف جديد</h2>
+    <form
+      aria-labelledby={headingId}
+      className="flex flex-col gap-3"
+      noValidate
+      onSubmit={onSubmitForm}
+    >
+      <h2 id={headingId} className="text-lg font-semibold">
+        مصروف جديد
+      </h2>
       {serverError ? <p role="alert">{serverError}</p> : null}
       <label className="flex flex-col gap-1">
         التصنيف

@@ -9,7 +9,7 @@ See [CLAUDE.md](CLAUDE.md) and [AI-WORKFLOW.md](AI-WORKFLOW.md). Design approved
 ## Hosted Supabase
 
 - Project `theshark`, ref `pltkoohfodvvmymlsycz`, region `eu-central-1`, free plan. URL and publishable key are in `apps/web/.env.production` (public values).
-- Migrations reach the hosted project through the Supabase MCP `apply_migration`, named after the file's suffix, only after the PR is merged. Applied: `baseline`, `owner_access`, `stock_ledger_core`, `owner_item_catalog`, `pos_sales` (2026-10-16) and `pos_refunds_drawer` (2026-10-21; hosted fingerprint matches local, views included). `purchases_opening` is applied after PR #18 merges. Advisors: `authenticated` may execute `is_owner`, `post_movements`, `post_sort` and the POS sync RPCs (intended: each checks the owner or service_role itself); `pos_sync_run_orders` has RLS with no policy (internal, no grants); leaked-password protection needs a paid plan.
+- Migrations reach the hosted project through the Supabase MCP `apply_migration`, named after the file's suffix, only after the PR is merged. Applied: `baseline`, `owner_access`, `stock_ledger_core`, `owner_item_catalog`, `pos_sales` (2026-10-16) `pos_refunds_drawer` and `purchases_opening` (2026-10-21; hosted fingerprints match local, views included). `expenses` is applied after the task 17 PR merges. Advisors: `authenticated` may execute `is_owner`, `post_movements`, `post_sort`, `record_purchase`, `record_opening_stock`, the expense write RPCs and the POS sync RPCs (intended: each checks the owner or service_role itself); `pos_sync_run_orders` has RLS with no policy (internal, no grants); leaked-password protection needs a paid plan.
 - Dashboard settings done by the owner: signups disabled, schema `app` exposed in the Data API. Recommended but optional: turn off "Automatically expose new tables".
 - Owner account linked in `app.owner`. Verified from outside: signup returns `signup_disabled`; anon gets `permission denied for schema app`.
 
@@ -27,9 +27,9 @@ See [CLAUDE.md](CLAUDE.md) and [AI-WORKFLOW.md](AI-WORKFLOW.md). Design approved
 
 ## Open PRs
 
-- PR #18 (task 16, purchases and opening stock) is in review.
+- Task 17 (issue #19, expenses and daily allocation) is in review.
 
-Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner item catalog screen) → bae0ebe; PR #14 (task 13, POS sales sync) → c052d70; PR #17 (task 15, shift sales with refunds and drawer reconciliation) → e7d6068. Implementer: Grok 4.7 via Cursor; the Argon trial is over (paused, low weekly quota).
+Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner item catalog screen) → bae0ebe; PR #14 (task 13, POS sales sync) → c052d70; PR #17 (task 15, shift sales with refunds and drawer reconciliation) → e7d6068; PR #18 (task 16, purchases and opening stock with idempotent saves) → 3e40613. Implementer: Grok 4.7 via Cursor; the Argon trial is over (paused, low weekly quota).
 
 ## Repository
 
