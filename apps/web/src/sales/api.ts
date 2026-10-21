@@ -1,6 +1,7 @@
 import { genericCatalogError } from '@/items/errors';
 import { exactDecimal, exactDecimalOrNull } from '@/lib/decimal';
 import { addMoney } from '@/lib/money';
+import { readAllPages } from '@/lib/paged';
 import { supabase } from '@/lib/supabase';
 import type {
   SalesHome,
@@ -30,6 +31,13 @@ function appDb() {
 
 function throwIfError(error: { message?: string } | null): void {
   if (error) throw new Error(genericCatalogError);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error(genericCatalogError);
+  }
+  return value as Record<string, unknown>;
 }
 
 function requiredString(value: unknown): string {
@@ -81,53 +89,33 @@ function optionValues(value: unknown): string[] {
 }
 
 // View columns are nullable in the generated types; every field is checked here.
-function mapSummary(row: {
-  shift_id: unknown;
-  opened_at: unknown;
-  closed_at: unknown;
-  is_active: unknown;
-  orders_complete: unknown;
-  gross_sales_text: unknown;
-  refunds_text: unknown;
-  net_sales_text: unknown;
-  orders_canceled: unknown;
-  orders_open: unknown;
-  orders_missing: unknown;
-  drawer_total_text: unknown;
-  drawer_difference_text: unknown;
-  unknown_tx: unknown;
-}): ShiftSummary {
+function mapSummary(row: unknown): ShiftSummary {
+  const record = asRecord(row);
   return {
-    shiftId: requiredString(row.shift_id),
-    openedAt: requiredString(row.opened_at),
-    closedAt: optionalString(row.closed_at),
-    isActive: requiredBoolean(row.is_active),
-    ordersComplete: requiredCount(row.orders_complete),
-    grossSales: exactDecimal(row.gross_sales_text, genericCatalogError),
-    refunds: exactDecimal(row.refunds_text, genericCatalogError),
-    netSales: exactDecimal(row.net_sales_text, genericCatalogError),
-    ordersCanceled: requiredCount(row.orders_canceled),
-    ordersOpen: requiredCount(row.orders_open),
-    ordersMissing: requiredCount(row.orders_missing),
-    drawerTotal: exactDecimalOrNull(row.drawer_total_text, genericCatalogError),
-    drawerDifference: exactDecimalOrNull(
-      row.drawer_difference_text,
+    shiftId: requiredString(record.shift_id),
+    openedAt: requiredString(record.opened_at),
+    closedAt: optionalString(record.closed_at),
+    isActive: requiredBoolean(record.is_active),
+    ordersComplete: requiredCount(record.orders_complete),
+    grossSales: exactDecimal(record.gross_sales_text, genericCatalogError),
+    refunds: exactDecimal(record.refunds_text, genericCatalogError),
+    netSales: exactDecimal(record.net_sales_text, genericCatalogError),
+    ordersCanceled: requiredCount(record.orders_canceled),
+    ordersOpen: requiredCount(record.orders_open),
+    ordersMissing: requiredCount(record.orders_missing),
+    drawerTotal: exactDecimalOrNull(
+      record.drawer_total_text,
       genericCatalogError,
     ),
-    unknownTx: requiredCount(row.unknown_tx),
+    drawerDifference: exactDecimalOrNull(
+      record.drawer_difference_text,
+      genericCatalogError,
+    ),
+    unknownTx: requiredCount(record.unknown_tx),
   };
 }
 
-function mapLine(row: {
-  line_id: string;
-  item_name: string | null;
-  size_name: string | null;
-  quantity_text: unknown;
-  weighted_qty_text: unknown;
-  weighted_unit: string | null;
-  line_total_text: unknown;
-  options: unknown;
-}): SalesOrderLine {
+function mapLine(row: Record<string, unknown>): SalesOrderLine {
   return {
     lineId: requiredString(row.line_id),
     itemName: optionalString(row.item_name),
@@ -143,12 +131,16 @@ function mapLine(row: {
 export async function loadSalesHome(now = Date.now()): Promise<SalesHome> {
   const since = new Date(now - salesWindowMs).toISOString();
   const db = appDb();
-  const [shiftsResult, syncResult] = await Promise.all([
-    db
-      .from('pos_shift_summaries')
-      .select(summaryColumns)
-      .gte('opened_at', since)
-      .order('opened_at', { ascending: false }),
+  const [shifts, syncResult] = await Promise.all([
+    readAllPages(
+      db
+        .from('pos_shift_summaries')
+        .select(summaryColumns)
+        .gte('opened_at', since)
+        .order('opened_at', { ascending: false })
+        .order('shift_id', { ascending: true }),
+      genericCatalogError,
+    ),
     db
       .from('pos_sync_runs')
       .select('finished_at')
@@ -158,11 +150,10 @@ export async function loadSalesHome(now = Date.now()): Promise<SalesHome> {
       .limit(1)
       .maybeSingle(),
   ]);
-  throwIfError(shiftsResult.error);
   throwIfError(syncResult.error);
   const finished = syncResult.data?.finished_at ?? null;
   return {
-    shifts: (shiftsResult.data ?? []).map((row) => mapSummary(row)),
+    shifts: shifts.map((row) => mapSummary(row)),
     lastSyncAt: finished === null ? null : requiredString(finished),
   };
 }
@@ -171,41 +162,49 @@ export async function loadShiftDetail(
   shiftId: string,
 ): Promise<ShiftDetail | null> {
   const db = appDb();
-  const [summaryResult, ordersResult, refundsResult] = await Promise.all([
+  const [summaryResult, orderRows, refundRows] = await Promise.all([
     db
       .from('pos_shift_summaries')
       .select(summaryColumns)
       .eq('shift_id', shiftId)
       .maybeSingle(),
-    db
-      .from('pos_orders')
-      .select(orderColumns)
-      .eq('shift_id', shiftId)
-      .order('ordered_at', { ascending: true }),
-    db
-      .from('pos_shift_transactions')
-      .select(transactionColumns)
-      .eq('shift_id', shiftId)
-      .eq('tx_type', 3),
+    readAllPages(
+      db
+        .from('pos_orders')
+        .select(orderColumns)
+        .eq('shift_id', shiftId)
+        .order('ordered_at', { ascending: true })
+        .order('id', { ascending: true }),
+      genericCatalogError,
+    ),
+    readAllPages(
+      db
+        .from('pos_shift_transactions')
+        .select(transactionColumns)
+        .eq('shift_id', shiftId)
+        .eq('tx_type', 3)
+        .order('tx_id', { ascending: true }),
+      genericCatalogError,
+    ),
   ]);
   throwIfError(summaryResult.error);
-  throwIfError(ordersResult.error);
-  throwIfError(refundsResult.error);
   if (!summaryResult.data) return null;
 
-  const orderRows = ordersResult.data ?? [];
-  const orderIds = orderRows.map((row) => requiredString(row.id));
-  const linesResult =
-    orderIds.length === 0
-      ? { data: [], error: null }
-      : await db
-          .from('pos_order_lines')
-          .select(lineColumns)
-          .in('order_id', orderIds);
-  throwIfError(linesResult.error);
+  // Lines are filtered by the shift through the order join, not by an IN list
+  // of order ids: a busy shift has hundreds of orders and that URL gets too long.
+  const lineRows = await readAllPages(
+    db
+      .from('pos_order_lines')
+      .select(`${lineColumns}, pos_orders!inner(shift_id)`)
+      .eq('pos_orders.shift_id', shiftId)
+      .order('order_id', { ascending: true })
+      .order('line_id', { ascending: true }),
+    genericCatalogError,
+  );
 
   const linesByOrder = new Map<string, SalesOrderLine[]>();
-  for (const row of linesResult.data ?? []) {
+  for (const value of lineRows) {
+    const row = asRecord(value);
     const orderId = requiredString(row.order_id);
     const lines = linesByOrder.get(orderId) ?? [];
     lines.push(mapLine(row));
@@ -216,7 +215,8 @@ export async function loadShiftDetail(
   }
 
   const refunded = new Map<string, string>();
-  for (const row of refundsResult.data ?? []) {
+  for (const value of refundRows) {
+    const row = asRecord(value);
     const orderId = optionalString(row.order_id);
     if (orderId === null) continue;
     const amount = exactDecimal(row.amount_text, genericCatalogError);
@@ -224,7 +224,8 @@ export async function loadShiftDetail(
   }
 
   const orders: SalesOrder[] = orderRows
-    .map((row) => {
+    .map((value) => {
+      const row = asRecord(value);
       const id = requiredString(row.id);
       return {
         id,

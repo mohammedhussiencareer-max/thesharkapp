@@ -27,7 +27,7 @@ See [CLAUDE.md](CLAUDE.md) and [AI-WORKFLOW.md](AI-WORKFLOW.md). Design approved
 
 ## Open PRs
 
-- Task 15 (shift sales, POS refunds, drawer reconciliation) is in progress on `task/15-shift-sales`. No PR yet.
+- PR #17 (task 15, shift sales, POS refunds, drawer reconciliation) is in review.
 
 Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner item catalog screen) → bae0ebe; PR #14 (task 13, POS sales sync) → c052d70. Implementer: Grok 4.7 via Cursor; the Argon trial is over (paused, low weekly quota).
 
