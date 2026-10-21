@@ -20,7 +20,8 @@ export function CategoryManager({
   categories: readonly ExpenseCategory[];
   disabled: boolean;
   serverError: string | null;
-  onAdd: (name: string, kind: ExpenseKind) => void;
+  /** Resolves true once the category is saved; the form clears only then. */
+  onAdd: (name: string, kind: ExpenseKind) => Promise<boolean>;
   onRename: (id: string, name: string) => void;
   onSetActive: (id: string, active: boolean) => void;
 }) {
@@ -42,9 +43,11 @@ export function CategoryManager({
     }
     setNameError(null);
     setKindError(null);
-    setName('');
-    setKind('');
-    onAdd(name.trim(), kind);
+    void onAdd(name.trim(), kind).then((saved) => {
+      if (!saved) return;
+      setName('');
+      setKind('');
+    });
   }
 
   return (

@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (235);
+  plan (240);
 
 -- Users and the single owner. Same fixture ids as the other pgTAP files.
 delete from app.owner;
@@ -493,6 +493,44 @@ select
     ),
     false,
     'authenticated cannot execute the phone-digit helper'
+  );
+
+select
+  is (
+    (
+      select
+        datlocprovider::text
+      from
+        pg_catalog.pg_database
+      where
+        datname = pg_catalog.current_database ()
+    ),
+    'i',
+    'the database locale provider is ICU, so [[:alpha:]] matches the client letter rule'
+  );
+
+select
+  ok (
+    app.text_has_long_digit_run (U&'0100\064B0000000'),
+    'a fathatan mark between digits does not split a phone number'
+  );
+
+select
+  ok (
+    app.text_has_long_digit_run (U&'0100\06510000000'),
+    'a shadda mark between digits does not split a phone number'
+  );
+
+select
+  ok (
+    app.text_has_long_digit_run (U&'0100\03010000000'),
+    'a combining acute accent between digits does not split a phone number'
+  );
+
+select
+  ok (
+    not app.text_has_long_digit_run (U&'0100 \0628\064E 0000'),
+    'a letter with a mark still splits the run'
   );
 
 -- ============================================================================

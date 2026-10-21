@@ -240,10 +240,7 @@ export function ExpensesPage() {
             disabled={busy}
             serverError={categoryError}
             onAdd={(name, kind: ExpenseKind) =>
-              void runWrite(
-                () => addExpenseCategory(name, kind),
-                setCategoryError,
-              )
+              runWrite(() => addExpenseCategory(name, kind), setCategoryError)
             }
             onRename={(id, name) =>
               void runWrite(

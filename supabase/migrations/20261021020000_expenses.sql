@@ -83,6 +83,27 @@
 -- ============================================================================
 -- Phone-like runs. Used by category names, notes, void reasons, and labels.
 -- ============================================================================
+-- [[:alpha:]] follows the database locale provider. Under ICU, PostgreSQL
+-- uses u_isalpha, which is the Unicode Letter category (L*): the same set as
+-- the client's /\p{L}/u, with combining marks (harakat such as U+064B) not
+-- counted as letters. libc or builtin can treat marks as alphabetic and would
+-- let a mark split a phone number, so refuse to install anywhere but ICU.
+do $icu$
+begin
+  if (
+    select
+      d.datlocprovider
+    from
+      pg_catalog.pg_database d
+    where
+      d.datname = pg_catalog.current_database()
+  ) is distinct from 'i' then
+    raise exception 'expenses free-text check needs an ICU database locale'
+      using errcode = '0A000';
+  end if;
+end;
+$icu$;
+
 create function app.text_has_long_digit_run (p_text text) returns boolean language plpgsql immutable
 set
   search_path = '' as $$
