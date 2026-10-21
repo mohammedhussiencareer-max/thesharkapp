@@ -184,6 +184,19 @@ function mapDay(value: unknown): AllocationDay {
   };
 }
 
+/**
+ * Microseconds since the epoch for a PostgREST timestamptz. Postgres drops
+ * trailing zero fractions ("10:00:00+00:00" vs "10:00:00.001+00:00"), so text
+ * order is not time order; Date.parse alone would lose the microseconds.
+ */
+export function instantKey(value: string): number {
+  const match = /^(.*T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(.*)$/.exec(value);
+  const millis = Date.parse(match ? `${match[1]}${match[3]}` : value);
+  if (Number.isNaN(millis)) throw new Error(genericCatalogError);
+  const micros = Number((match?.[2] ?? '').padEnd(6, '0').slice(0, 6));
+  return millis * 1000 + micros;
+}
+
 export async function loadExpenseMonth(
   monthStart: string,
 ): Promise<ExpenseMonth> {
@@ -242,7 +255,7 @@ export async function loadExpenseMonth(
   );
   const lines = lineRows.map((row) => mapLine(row));
   lines.sort((left, right) => {
-    const created = right.createdAt.localeCompare(left.createdAt);
+    const created = instantKey(right.createdAt) - instantKey(left.createdAt);
     if (created !== 0) return created;
     return left.id < right.id ? 1 : left.id > right.id ? -1 : 0;
   });

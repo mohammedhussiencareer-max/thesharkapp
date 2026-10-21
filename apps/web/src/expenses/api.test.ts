@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   addExpenseEntry,
+  instantKey,
   loadExpenseMonth,
   voidExpenseEntry,
 } from '@/expenses/api';
@@ -191,6 +192,27 @@ describe('expense api', () => {
       ['est', '40.00', true],
     ]);
     expect(month.complete).toBe(false);
+  });
+
+  it('orders newest first by instant even when a fraction is dropped', async () => {
+    expect(instantKey('2030-04-03T10:00:00.000001+00:00')).toBeGreaterThan(
+      instantKey('2030-04-03T10:00:00+00:00'),
+    );
+    const older = { ...estimateRow, created_at: '2030-04-03T10:00:00+00:00' };
+    const newer = {
+      ...actualRow,
+      created_at: '2030-04-03T10:00:00.001+00:00',
+    };
+    install({
+      categories: query({ data: [categoryRow], error: null }),
+      lines: query({ data: [older, newer], error: null }),
+      days: query({ data: [dayRow], error: null }),
+      status: query({ data: null, error: null }),
+    });
+
+    const month = await loadExpenseMonth('2030-04-01');
+
+    expect(month.entries.map((entry) => entry.id)).toEqual(['act', 'est']);
   });
 
   it('rejects a JSON number where money text is required', async () => {
