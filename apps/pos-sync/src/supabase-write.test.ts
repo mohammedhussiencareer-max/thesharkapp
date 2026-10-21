@@ -11,6 +11,7 @@ const counts: IngestCounts = {
   missing: 0,
   shifts_upserted: 1,
   shifts_skipped: 0,
+  transactions: 0,
 };
 
 describe('createSupabaseDb', () => {

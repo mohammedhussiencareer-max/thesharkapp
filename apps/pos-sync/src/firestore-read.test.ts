@@ -6,6 +6,7 @@ import {
   firestoreGetUrl,
   firestoreListUrl,
   firestoreRunQueryUrl,
+  firestoreTransactionsUrl,
   parseListResponse,
   parseRunQueryResponse,
 } from './firestore-read.ts';
@@ -50,6 +51,21 @@ describe('assertFirestoreReadAllowed', () => {
       'https://user:pass@firestore.googleapis.com/v1/projects/thesharkrestaurant/databases/(default)/documents/orders?pageSize=1',
     ],
     ['GET', `${ROOT}/orders/../customers?pageSize=1`],
+    ['GET', `${ROOT}/custody_shifts/shift-test-1/orders?pageSize=1`],
+    [
+      'GET',
+      `${ROOT}/custody_shifts/shift-test-1/transactions/tx-test-1/notes?pageSize=1`,
+    ],
+    ['GET', `${ROOT}/custody_shifts/shift-test-1/transactions/tx-test-1`],
+    ['POST', `${ROOT}/custody_shifts/shift-test-1/transactions?pageSize=1`],
+    ['PATCH', `${ROOT}/custody_shifts/shift-test-1/transactions?pageSize=1`],
+    ['DELETE', `${ROOT}/custody_shifts/shift-test-1/transactions/tx-test-1`],
+    ['PUT', `${ROOT}/custody_shifts/shift-test-1/transactions?pageSize=1`],
+    [
+      'GET',
+      `${ROOT}/custody_shifts/shift-test-1/transactions?pageSize=1&orderBy=timestamp`,
+    ],
+    ['GET', `${ROOT}/custody_shifts/not safe/transactions?pageSize=1`],
   ] as const;
 
   it('refuses writes and other URLs before any request', async () => {
@@ -110,6 +126,17 @@ describe('assertFirestoreReadAllowed', () => {
         },
       }),
     ).toThrow(/Firestore read refused/);
+  });
+
+  it('allows a paged list of one shift transaction subcollection', () => {
+    const url = firestoreTransactionsUrl('shift-test-1', {
+      pageSize: 300,
+      pageToken: 'page-2',
+    });
+    expect(url).toBe(
+      `${ROOT}/custody_shifts/shift-test-1/transactions?pageSize=300&pageToken=page-2`,
+    );
+    expect(() => assertFirestoreReadAllowed('GET', url)).not.toThrow();
   });
 });
 
@@ -252,6 +279,29 @@ describe('parsers', () => {
     expect(
       parseListResponse({ documents: [{ name: orderName }] }).documents,
     ).toHaveLength(1);
+    const txName =
+      'projects/thesharkrestaurant/databases/(default)/documents/custody_shifts/shift-test-1/transactions/tx-test-1';
+    expect(
+      parseListResponse({ documents: [{ name: txName }] }).documents,
+    ).toEqual([{ name: txName }]);
+    expect(() =>
+      parseListResponse({
+        documents: [
+          {
+            name: 'projects/thesharkrestaurant/databases/(default)/documents/custody_shifts/shift-test-1/orders/order-test-1',
+          },
+        ],
+      }),
+    ).toThrow(invalid);
+    expect(() =>
+      parseListResponse({
+        documents: [
+          {
+            name: 'projects/thesharkrestaurant/databases/(default)/documents/custody_shifts/shift-test-1/transactions/tx-test-1/extra',
+          },
+        ],
+      }),
+    ).toThrow(invalid);
   });
 
   it('accepts only the documented list response keys', () => {

@@ -6,6 +6,8 @@ import { supabase } from '@/lib/supabase';
 import { HomePage } from '@/pages/HomePage';
 import { ItemsPage } from '@/pages/ItemsPage';
 import { LoginPage } from '@/pages/LoginPage';
+import { SalesPage } from '@/pages/SalesPage';
+import { SalesShiftPage } from '@/pages/SalesShiftPage';
 import { MissingEnvScreen } from '@/pages/MissingEnvScreen';
 import { NotFoundPage } from '@/pages/NotFoundPage';
 
@@ -31,6 +33,22 @@ export function AppRoutes() {
         element={
           <RequireOwner>
             <ItemsPage />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/sales"
+        element={
+          <RequireOwner>
+            <SalesPage />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/sales/:shiftId"
+        element={
+          <RequireOwner>
+            <SalesShiftPage />
           </RequireOwner>
         }
       />

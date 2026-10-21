@@ -15,10 +15,19 @@ export type ListPage = {
   nextPageToken?: string;
 };
 
+export type TransactionListQuery = {
+  pageSize: number;
+  pageToken?: string;
+};
+
 export type PosFirestore = {
   list(
     collection: 'orders' | 'custody_shifts',
     query: ListQuery,
+  ): Promise<ListPage>;
+  listShiftTransactions(
+    shiftId: string,
+    query: TransactionListQuery,
   ): Promise<ListPage>;
   getShift(id: string): Promise<FirestoreRestDocument | null>;
   queryOrders(body: unknown): Promise<FirestoreRestDocument[]>;

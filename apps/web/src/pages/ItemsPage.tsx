@@ -14,13 +14,7 @@ import { ItemForm } from '@/items/ItemForm';
 import { ItemList } from '@/items/ItemList';
 import type { CatalogItem, ItemDraft } from '@/items/types';
 import { emptyItemForm, itemToFormValues } from '@/items/validation';
-
-const shell =
-  'mx-auto flex min-h-dvh w-full max-w-3xl flex-col gap-4 px-4 py-6 text-start';
-const primaryButton =
-  'w-fit rounded bg-neutral-900 px-3 py-2 text-white disabled:opacity-60';
-const secondaryButton =
-  'w-fit rounded border border-neutral-300 px-3 py-2 disabled:opacity-60';
+import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
 
 function visibleCount(
   items: readonly CatalogItem[],
@@ -208,7 +202,7 @@ export function ItemsPage() {
     formMode?.type === 'create' || (formMode?.type === 'edit' && editingItem);
 
   return (
-    <main className={shell}>
+    <main className={pageShell}>
       <p>
         <Link className="underline" to="/">
           الرئيسية
