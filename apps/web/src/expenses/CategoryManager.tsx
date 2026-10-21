@@ -29,6 +29,7 @@ export function CategoryManager({
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [nameError, setNameError] = useState<string | null>(null);
   const [kindError, setKindError] = useState<string | null>(null);
+  const [renameErrors, setRenameErrors] = useState<Record<string, string>>({});
 
   function addCategory(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -85,6 +86,8 @@ export function CategoryManager({
       <ul className="flex flex-col gap-3">
         {categories.map((category) => {
           const draft = drafts[category.id] ?? category.name;
+          const renameError = renameErrors[category.id];
+          const renameErrorId = `category-name-${category.id}-error`;
           return (
             <li key={category.id}>
               <article
@@ -99,6 +102,8 @@ export function CategoryManager({
                     className={fieldClass}
                     value={draft}
                     disabled={disabled}
+                    aria-invalid={renameError ? true : undefined}
+                    aria-describedby={renameError ? renameErrorId : undefined}
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
@@ -107,13 +112,30 @@ export function CategoryManager({
                     }
                   />
                 </label>
+                {renameError ? (
+                  <p id={renameErrorId} role="alert">
+                    {renameError}
+                  </p>
+                ) : null}
                 <button
                   className={secondaryButton}
                   type="button"
                   disabled={disabled}
                   onClick={() => {
                     const error = validateCategoryName(draft);
-                    if (error) return;
+                    if (error) {
+                      setRenameErrors((current) => ({
+                        ...current,
+                        [category.id]: error,
+                      }));
+                      return;
+                    }
+                    setRenameErrors((current) => {
+                      if (!(category.id in current)) return current;
+                      const next = { ...current };
+                      delete next[category.id];
+                      return next;
+                    });
                     const next = draft.trim();
                     if (next === category.name) return;
                     onRename(category.id, next);

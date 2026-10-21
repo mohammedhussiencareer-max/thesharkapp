@@ -29,9 +29,11 @@
 -- Unicode decimal digits (general category Nd) in all of them. The bracket
 -- class lists every Nd range from Node Unicode 16.0
 -- (process.versions.unicode), generated with /\p{Nd}/u over U+0000–U+10FFFF.
--- The client uses the same property. Text is NFKC-normalized first. Spaces,
--- dashes, dots, and zero-width format characters between digits do not break
--- the run. The message is 'مينفعش تكتب أرقام تليفونات أو أرقام قومية'.
+-- The client uses the same property. Text is NFKC-normalized first. A letter
+-- resets the count. Every other character is ignored, so brackets, slashes,
+-- punctuation, symbols, and format characters do not break the run. A date
+-- like 2030-04-03 is eight digits and is refused; that is an accepted
+-- trade-off. The message is 'مينفعش تكتب أرقام تليفونات أو أرقام قومية'.
 --
 -- What counts, when the day is read (not at insert):
 --   * a voided row does not count, and a void marker never counts;
@@ -86,8 +88,8 @@ set
   search_path = '' as $$
 declare
   v_text text;
-  v_next text;
-  v_step integer := 0;
+  v_char text;
+  v_run integer := 0;
   -- Nd bracket class, Node Unicode 16.0, 71 inclusive ranges.
   -- 0030-0039 0660-0669 06F0-06F9 07C0-07C9 0966-096F 09E6-09EF 0A66-0A6F
   -- 0AE6-0AEF 0B66-0B6F 0BE6-0BEF 0C66-0C6F 0CE6-0CEF 0D66-0D6F 0DE6-0DEF
@@ -101,62 +103,6 @@ declare
   -- 16A60-16A69 16AC0-16AC9 16B50-16B59 16D70-16D79 1CCF0-1CCF9 1D7CE-1D7FF
   -- 1E140-1E149 1E2F0-1E2F9 1E4F0-1E4F9 1E5F1-1E5FA 1E950-1E959 1FBF0-1FBF9
   c_digit constant text := $nd$[0-9٠-٩۰-۹߀-߉०-९০-৯੦-੯૦-૯୦-୯௦-௯౦-౯೦-೯൦-൯෦-෯๐-๙໐-໙༠-༩၀-၉႐-႙០-៩᠐-᠙᥆-᥏᧐-᧙᪀-᪉᪐-᪙᭐-᭙᮰-᮹᱀-᱉᱐-᱙꘠-꘩꣐-꣙꤀-꤉꧐-꧙꧰-꧹꩐-꩙꯰-꯹０-９𐒠-𐒩𐴰-𐴹𐵀-𐵉𑁦-𑁯𑃰-𑃹𑄶-𑄿𑇐-𑇙𑋰-𑋹𑑐-𑑙𑓐-𑓙𑙐-𑙙𑛀-𑛉𑛐-𑛣𑜰-𑜹𑣠-𑣩𑥐-𑥙𑯰-𑯹𑱐-𑱙𑵐-𑵙𑶠-𑶩𑽐-𑽙𖄰-𖄹𖩠-𖩩𖫀-𖫉𖭐-𖭙𖵰-𖵹𜳰-𜳹𝟎-𝟿𞅀-𞅉𞋰-𞋹𞓰-𞓹𞗱-𞗺𞥐-𞥙🯰-🯹]$nd$;
-  -- Separators between digits. chr(45) is first so the hyphen is literal.
-  -- Whitespace: U+0009–U+000D, U+0020, U+00A0, U+1680, U+2000–U+200A,
-  -- U+2028, U+2029, U+202F, U+205F, U+3000.
-  -- Dashes: U+002D, U+2010–U+2015, U+2212, U+FE58, U+FE63, U+FF0D.
-  -- Dots: U+002E, U+066B, U+FF0E, U+3002, U+00B7.
-  -- Format: U+200B–U+200F, U+2060, U+FEFF, U+061C.
-  c_sep constant text := '['
-    || chr(45)
-    || chr(9)
-    || chr(10)
-    || chr(11)
-    || chr(12)
-    || chr(13)
-    || chr(32)
-    || chr(160)
-    || chr(5760)
-    || chr(8192)
-    || chr(8193)
-    || chr(8194)
-    || chr(8195)
-    || chr(8196)
-    || chr(8197)
-    || chr(8198)
-    || chr(8199)
-    || chr(8200)
-    || chr(8201)
-    || chr(8202)
-    || chr(8232)
-    || chr(8233)
-    || chr(8239)
-    || chr(8287)
-    || chr(12288)
-    || chr(8208)
-    || chr(8209)
-    || chr(8210)
-    || chr(8211)
-    || chr(8212)
-    || chr(8213)
-    || chr(8722)
-    || chr(65112)
-    || chr(65123)
-    || chr(65293)
-    || chr(46)
-    || chr(1643)
-    || chr(65294)
-    || chr(12290)
-    || chr(183)
-    || chr(8203)
-    || chr(8204)
-    || chr(8205)
-    || chr(8206)
-    || chr(8207)
-    || chr(8288)
-    || chr(65279)
-    || chr(1564)
-    || ']';
 begin
   v_text := pg_catalog.normalize(
     coalesce(p_text, ''),
@@ -167,28 +113,29 @@ begin
     return false;
   end if;
 
-  -- Collapse separators that sit between digits. Non-overlapping matches need
-  -- another pass ('1 2 3' becomes '12 3', then '123').
-  loop
-    v_step := v_step + 1;
-    exit when v_step > 500;
+  -- A digit counts. A letter resets the run. Everything else is ignored, so
+  -- brackets, slashes, punctuation, symbols, and format characters do not
+  -- break it. Test the digit before [[:alpha:]]. A date like 2030-04-03 is
+  -- eight digits and is refused; that is an accepted trade-off.
+  for v_index in 1..pg_catalog.char_length(v_text) loop
+    v_char := pg_catalog.substring(v_text, v_index, 1);
 
-    v_next := pg_catalog.regexp_replace(
-      v_text,
-      '(' || c_digit || ')' || c_sep || '+(' || c_digit || ')',
-      '\1\2',
-      'g'
-    );
-    exit when v_next = v_text;
+    if v_char ~ c_digit then
+      v_run := v_run + 1;
 
-    v_text := v_next;
+      if v_run >= 8 then
+        return true;
+      end if;
+    elsif v_char ~ '[[:alpha:]]' then
+      v_run := 0;
+    end if;
   end loop;
 
-  return v_text ~ (c_digit || '{8}');
+  return false;
 end;
 $$;
 
-comment on function app.text_has_long_digit_run (text) is 'True when free text contains a run of 8 or more Unicode decimal digits (Nd, Unicode 16.0). NFKC is applied first. Spaces, dashes, dots, and zero-width format characters between digits are ignored.';
+comment on function app.text_has_long_digit_run (text) is 'True when free text contains a run of 8 or more Unicode decimal digits (Nd, Unicode 16.0). NFKC is applied first. A letter resets the count. Every other character is ignored. A date like 2030-04-03 is refused; that is an accepted trade-off.';
 
 revoke all on function app.text_has_long_digit_run (text)
 from

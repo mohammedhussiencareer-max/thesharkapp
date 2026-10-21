@@ -81,29 +81,13 @@ export function driverPay(hours: string, hourlyRate: string): ParsedDecimal {
 }
 
 const decimalDigit = /\p{Nd}/u;
+const letter = /\p{L}/u;
 
 /**
- * Ignored between decimal digits. Same set as `app.text_has_long_digit_run`.
- * U+002D is listed here and placed last in the class so it stays literal.
+ * Shared cases for `hasLongDigitRun` and the server helper. A full date such
+ * as 2030-04-03 is eight digits and is refused. That is an accepted trade-off
+ * for the phone and national-id rule.
  */
-export const digitRunIgnoredCodePoints = [
-  0x002d, 0x0009, 0x000a, 0x000b, 0x000c, 0x000d, 0x0020, 0x00a0, 0x1680,
-  0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008,
-  0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0x2010, 0x2011,
-  0x2012, 0x2013, 0x2014, 0x2015, 0x2212, 0xfe58, 0xfe63, 0xff0d, 0x002e,
-  0x066b, 0xff0e, 0x3002, 0x00b7, 0x200b, 0x200c, 0x200d, 0x200e, 0x200f,
-  0x2060, 0xfeff, 0x061c,
-] as const;
-
-const digitSeparator = new RegExp(
-  `[${digitRunIgnoredCodePoints
-    .filter((codePoint) => codePoint !== 0x002d)
-    .map((codePoint) => `\\u{${codePoint.toString(16)}}`)
-    .join('')}-]`,
-  'u',
-);
-
-/** Shared digit-run cases: fullwidth, Devanagari, Bengali, mathematical bold, mixed scripts, NBSP, zero-width, and NFKC superscripts. */
 export const longDigitRunSamples = [
   '01000000000',
   '010 0000 0000',
@@ -121,20 +105,27 @@ export const longDigitRunSamples = [
   '0100\u00A00000000',
   '0100\u200B0000000',
   '\u00B9\u00B2\u00B3\u2074\u2075\u2076\u2077\u2078',
+  '(03) 000-0000',
+  '+20 (100) 000/0000',
+  '010_0000_0000',
+  '010\u2022000\u20220000',
+  '010\u{1F600}0000\u{1F600}0000',
+  '2030-04-03',
 ] as const;
 
-/** Seven digits, and eight digits split by a letter, stay allowed. */
+/** Seven digits, or eight digits split by a letter, stay allowed. */
 export const shortDigitRunSamples = [
   'فاتورة 1234567',
   'رقم 1234x5678',
   '1234x\u200B5678',
   '\uFF10\uFF11\uFF12\uFF13\uFF14\uFF15\uFF16',
+  '0100 ب 0000',
+  '5.5 ساعة × 30 جنيه',
 ] as const;
 
 /**
- * A run of 8 or more Unicode decimal digits. NFKC is applied first. The
- * separators in {@link digitRunIgnoredCodePoints}, plus hyphen-minus, do not
- * break the run.
+ * A run of 8 or more Unicode decimal digits. NFKC is applied first. A letter
+ * resets the count. Every other character is ignored.
  */
 export function hasLongDigitRun(value: string): boolean {
   const text = value.normalize('NFKC');
@@ -145,8 +136,7 @@ export function hasLongDigitRun(value: string): boolean {
       if (run >= 8) return true;
       continue;
     }
-    if (digitSeparator.test(char)) continue;
-    run = 0;
+    if (letter.test(char)) run = 0;
   }
   return false;
 }

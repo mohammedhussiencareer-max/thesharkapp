@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  digitRunIgnoredCodePoints,
   driverPay,
   hasLongDigitRun,
   longDigitRunSamples,
@@ -25,17 +24,12 @@ describe('expense amounts', () => {
     expect(parseHours('10000')).toEqual({ ok: false, reason: 'large' });
   });
 
-  it('treats every decimal digit as one run, including the shared separators', () => {
+  it('counts decimal digits until a letter breaks the run', () => {
     for (const sample of longDigitRunSamples) {
       expect(hasLongDigitRun(sample)).toBe(true);
     }
     for (const sample of shortDigitRunSamples) {
       expect(hasLongDigitRun(sample)).toBe(false);
-    }
-    for (const codePoint of digitRunIgnoredCodePoints) {
-      expect(
-        hasLongDigitRun(`1234${String.fromCodePoint(codePoint)}5678`),
-      ).toBe(true);
     }
   });
 

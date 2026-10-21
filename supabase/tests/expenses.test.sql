@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (221);
+  plan (235);
 
 -- Users and the single owner. Same fixture ids as the other pgTAP files.
 delete from app.owner;
@@ -2910,6 +2910,247 @@ select
       'a17e0000-0000-4000-8000-000000009033'
     )$$,
     'a letter still splits a digit run when a zero-width space is nearby'
+  );
+
+-- Only a letter breaks a digit run. Brackets and slashes do not.
+-- 2030-04-03 is eight digits and is refused; that is an accepted trade-off.
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '(03) 000-0000',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009037'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with bracketed digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '+20 (100) 000/0000',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009038'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with a slash between digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '010_0000_0000',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009039'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with underscores between digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '010' || chr(8226) || '000' || chr(8226) || '0000',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009040'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with bullets between digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '010' || chr(128512) || '0000' || chr(128512) || '0000',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009041'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with emoji between digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '2030-04-03',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009042'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a date in a note is refused as eight digits'
+  );
+
+select
+  throws_ok (
+    $$select app.void_expense_entry(
+      (select id from app.expense_entries where note = 'replay-other'),
+      '(03) 000-0000',
+      'a17e0000-0000-4000-8000-000000009043'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a void reason with bracketed digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.void_expense_entry(
+      (select id from app.expense_entries where note = 'replay-other'),
+      '+20 (100) 000/0000',
+      'a17e0000-0000-4000-8000-000000009044'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a void reason with a slash between digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_category('(03) 000-0000', 'daily')$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a category name with bracketed digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.rename_expense_category(
+      (select id from app.expense_categories where name = 'نقل'),
+      '+20 (100) 000/0000'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a renamed category with a slash between digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'أجر طيارين'),
+      null,
+      null,
+      '2026-11-02',
+      null,
+      false,
+      null,
+      1,
+      30,
+      '(03) 000-0000',
+      'a17e0000-0000-4000-8000-000000009045'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a driver label with bracketed digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'أجر طيارين'),
+      null,
+      null,
+      '2026-11-02',
+      null,
+      false,
+      null,
+      1,
+      30,
+      '+20 (100) 000/0000',
+      'a17e0000-0000-4000-8000-000000009046'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a driver label with a slash between digits is rejected'
+  );
+
+select
+  lives_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-07',
+      null,
+      false,
+      '0100 ب 0000',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009047'
+    )$$,
+    'an Arabic letter breaks a digit run'
+  );
+
+select
+  lives_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-08',
+      null,
+      false,
+      '5.5 ساعة × 30 جنيه',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009048'
+    )$$,
+    'a note with hours and a rate is stored'
   );
 
 -- Two accepted daily actuals sum past numeric(14,2). A monthly entry at the
