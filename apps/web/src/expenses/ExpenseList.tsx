@@ -16,10 +16,13 @@ function whenLabel(line: ExpenseLine): string {
 export function ExpenseList({
   entries,
   disabled,
+  pendingReasons = new Map<string, string>(),
   onVoid,
 }: {
   entries: readonly ExpenseLine[];
   disabled: boolean;
+  /** Reasons of voids sent without a confirmed reply, keyed by entry id. */
+  pendingReasons?: ReadonlyMap<string, string>;
   onVoid: (id: string, reason: string) => void;
 }) {
   const [voidingId, setVoidingId] = useState<string | null>(null);
@@ -29,7 +32,9 @@ export function ExpenseList({
   function openVoid(id: string) {
     if (disabled) return;
     setVoidingId(id);
-    setReason('');
+    // A void whose reply was lost is retried with the same reason, so the
+    // server replays it instead of refusing a different payload.
+    setReason(pendingReasons.get(id) ?? '');
     setReasonError(null);
   }
 
@@ -57,6 +62,7 @@ export function ExpenseList({
       {entries.map((line) => {
         const label = `${line.categoryName} ${formatEgpText(line.amount)} ${whenLabel(line)}`;
         const open = voidingId === line.id;
+        const pending = pendingReasons.has(line.id);
         return (
           <li key={line.id}>
             <article
@@ -95,12 +101,18 @@ export function ExpenseList({
                       className={fieldClass}
                       value={reason}
                       disabled={disabled}
+                      readOnly={pending}
                       onChange={(event) => {
                         setReason(event.target.value);
                         setReasonError(null);
                       }}
                     />
                   </label>
+                  {pending ? (
+                    <p>
+                      الإلغاء اللي فات ممكن يكون اتسجل — هيتبعت تاني بنفس السبب
+                    </p>
+                  ) : null}
                   {reasonError ? <p role="alert">{reasonError}</p> : null}
                   <button
                     className={secondaryButton}

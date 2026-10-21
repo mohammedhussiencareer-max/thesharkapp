@@ -262,6 +262,37 @@ describe('ExpensesPage', () => {
     );
   });
 
+  it('retries a lost void with the first reason even if another is typed', async () => {
+    vi.mocked(voidExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    renderPage();
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'إلغاء المصروف' }),
+    );
+    fireEvent.change(screen.getByLabelText('سبب الإلغاء'), {
+      target: { value: 'تكرار' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد الإلغاء' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      retrySafeMessage,
+    );
+
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'إلغاء المصروف' }),
+    );
+    const reason = screen.getByLabelText('سبب الإلغاء');
+    expect(reason).toHaveValue('تكرار');
+    expect(reason).toHaveAttribute('readonly');
+    fireEvent.change(reason, { target: { value: 'اتسجل مرتين' } });
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد الإلغاء' }));
+
+    await waitFor(() => expect(voidExpenseEntry).toHaveBeenCalledTimes(2));
+    const [first, second] = vi.mocked(voidExpenseEntry).mock.calls;
+    expect(second).toEqual(first);
+    expect(second?.[1]).toBe('تكرار');
+  });
+
   it('marks the month complete and clears it again', async () => {
     let complete = false;
     vi.mocked(loadExpenseMonth).mockImplementation((monthStart) =>

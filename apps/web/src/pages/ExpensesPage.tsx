@@ -33,7 +33,10 @@ export function ExpensesPage() {
   const [readLoads, setReadLoads] = useState(0);
   const [loadId, setLoadId] = useState(0);
   const [formEpoch, setFormEpoch] = useState(0);
-  const voidRequestIds = useRef(new Map<string, string>());
+  const [pendingVoids, setPendingVoids] = useState<
+    ReadonlyMap<string, { requestId: string; reason: string }>
+  >(new Map());
+  const pendingVoidsRef = useRef(pendingVoids);
   const seqRef = useRef(0);
   const readsRef = useRef(0);
   const savingRef = useRef(false);
@@ -206,13 +209,28 @@ export function ExpensesPage() {
           <ExpenseList
             entries={data.entries}
             disabled={busy}
-            onVoid={(id, reason) => {
-              const existing = voidRequestIds.current.get(id);
-              const requestId = existing ?? crypto.randomUUID();
-              if (!existing) voidRequestIds.current.set(id, requestId);
+            pendingReasons={
+              new Map(
+                [...pendingVoids].map(([id, pending]) => [id, pending.reason]),
+              )
+            }
+            onVoid={(id, typedReason) => {
+              // Keep the request id and the reason together until a reply
+              // confirms the void, so a retry sends the same payload.
+              const pending = pendingVoidsRef.current.get(id) ?? {
+                requestId: crypto.randomUUID(),
+                reason: typedReason,
+              };
+              const withPending = new Map(pendingVoidsRef.current);
+              withPending.set(id, pending);
+              pendingVoidsRef.current = withPending;
+              setPendingVoids(withPending);
               void runWrite(async () => {
-                await voidExpenseEntry(id, reason, requestId);
-                voidRequestIds.current.delete(id);
+                await voidExpenseEntry(id, pending.reason, pending.requestId);
+                const done = new Map(pendingVoidsRef.current);
+                done.delete(id);
+                pendingVoidsRef.current = done;
+                setPendingVoids(done);
               }, setListError);
             }}
           />
