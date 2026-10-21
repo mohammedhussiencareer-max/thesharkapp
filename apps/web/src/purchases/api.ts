@@ -26,13 +26,14 @@ async function readPages<T>(
     data: T[] | null;
     error: Parameters<typeof throwIfError>[0];
   }>,
+  keyOf: (row: T) => string,
 ): Promise<T[]> {
   try {
     return await fetchAllPages(async (from, to) => {
       const result = await load(from, to);
       throwIfError(result.error);
       return { data: result.data, error: null };
-    });
+    }, keyOf);
   } catch (error) {
     if (error instanceof PageCapError) {
       throw new Error(genericPurchaseError, { cause: error });
@@ -91,20 +92,28 @@ function conversionsOf(value: unknown): UnitOption[] {
 
 export async function listStockChoices(): Promise<StockChoice[]> {
   // One paged read so a balance (the sign that the item already has a movement)
-  // is read with the same catalog row as its conversions. name, id is unique.
-  const data = await readPages((from, to) =>
-    appDb()
-      .from('stock_items')
-      .select(
-        'id, name, kind, base_unit, parent_item_id, active, item_balances(item_id), item_unit_conversions(unit, factor_text:factor_to_base::text)',
-      )
-      .eq('active', true)
-      .order('name', { ascending: true })
-      .order('id', { ascending: true })
-      .range(from, to),
+  // is read with the same catalog row as its conversions. Paged by id, which
+  // never changes (a rename must not move a row between pages); sorted by name
+  // afterwards.
+  const data = await readPages(
+    (from, to) =>
+      appDb()
+        .from('stock_items')
+        .select(
+          'id, name, kind, base_unit, parent_item_id, active, item_balances(item_id), item_unit_conversions(unit, factor_text:factor_to_base::text)',
+        )
+        .eq('active', true)
+        .order('id', { ascending: true })
+        .range(from, to),
+    (row) => row.id,
+  );
+  data.sort(
+    (left, right) =>
+      left.name.localeCompare(right.name, 'ar') ||
+      (left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
   );
 
-  return (data ?? []).map((row) => {
+  return data.map((row) => {
     if (!isStockKind(row.kind) || !isBaseUnit(row.base_unit)) {
       throw new Error(genericPurchaseError);
     }
@@ -168,16 +177,18 @@ async function linesByPurchase(
   const grouped = new Map<string, PurchaseLine[]>();
   for (let index = 0; index < purchaseIds.length; index += lineChunk) {
     const ids = purchaseIds.slice(index, index + lineChunk);
-    const page = await readPages((from, to) =>
-      appDb()
-        .from('purchase_lines')
-        .select(
-          'purchase_id, line_no, item_id, quantity_text:quantity::text, unit, base_quantity_text:base_quantity::text, amount_paid_text:amount_paid::text, stock_items(name, base_unit)',
-        )
-        .in('purchase_id', ids)
-        .order('purchase_id', { ascending: true })
-        .order('line_no', { ascending: true })
-        .range(from, to),
+    const page = await readPages(
+      (from, to) =>
+        appDb()
+          .from('purchase_lines')
+          .select(
+            'purchase_id, line_no, item_id, quantity_text:quantity::text, unit, base_quantity_text:base_quantity::text, amount_paid_text:amount_paid::text, stock_items(name, base_unit)',
+          )
+          .in('purchase_id', ids)
+          .order('purchase_id', { ascending: true })
+          .order('line_no', { ascending: true })
+          .range(from, to),
+      (row) => `${String(row.purchase_id)}:${String(row.line_no)}`,
     );
     for (const row of page) {
       const parsed = purchaseLine(row);
@@ -195,20 +206,30 @@ async function linesByPurchase(
 export async function listPurchases(
   filter: PurchaseFilter = {},
 ): Promise<Purchase[]> {
-  const data = await readPages((from, to) => {
-    // purchased_at, created_at, id is a unique total order for stable pages.
-    let query = appDb()
-      .from('purchases')
-      .select(
-        'id, purchased_at, supplier, invoice_no, note, total_paid_text:total_paid::text, created_at',
-      )
-      .order('purchased_at', { ascending: false })
-      .order('created_at', { ascending: false })
-      .order('id', { ascending: false });
-    if (filter.from) query = query.gte('purchased_at', filter.from);
-    if (filter.toExclusive)
-      query = query.lt('purchased_at', filter.toExclusive);
-    return query.range(from, to);
+  const data = await readPages(
+    (from, to) => {
+      // Purchases are append-only: page by insert time + id (never change),
+      // then show newest purchase first.
+      let query = appDb()
+        .from('purchases')
+        .select(
+          'id, purchased_at, supplier, invoice_no, note, total_paid_text:total_paid::text, created_at',
+        )
+        .order('created_at', { ascending: true })
+        .order('id', { ascending: true });
+      if (filter.from) query = query.gte('purchased_at', filter.from);
+      if (filter.toExclusive)
+        query = query.lt('purchased_at', filter.toExclusive);
+      return query.range(from, to);
+    },
+    (row) => row.id,
+  );
+  data.sort((left, right) => {
+    const at =
+      Date.parse(right.purchased_at) - Date.parse(left.purchased_at) ||
+      Date.parse(right.created_at) - Date.parse(left.created_at);
+    if (at !== 0) return at;
+    return left.id < right.id ? 1 : left.id > right.id ? -1 : 0;
   });
   const lines = await linesByPurchase(data.map((row) => row.id));
 

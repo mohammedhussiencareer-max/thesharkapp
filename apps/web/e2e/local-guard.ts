@@ -69,9 +69,18 @@ type GuardedPage = {
       continue(): Promise<unknown>;
     }) => Promise<unknown> | void,
   ): Promise<unknown>;
+  // page.route does not see WebSockets; Playwright routes them separately.
+  routeWebSocket(
+    url: string,
+    handler: (ws: {
+      url(): string;
+      close(options?: { code?: number; reason?: string }): Promise<unknown>;
+      connectToServer(): unknown;
+    }) => Promise<unknown> | void,
+  ): Promise<unknown>;
 };
 
-/** Abort every non-loopback request for the life of the page. */
+/** Abort every non-loopback request and WebSocket for the life of the page. */
 export async function installLoopbackGuard(page: GuardedPage): Promise<void> {
   await page.route('**/*', async (route) => {
     if (isBlockedRemoteUrl(route.request().url())) {
@@ -79,5 +88,16 @@ export async function installLoopbackGuard(page: GuardedPage): Promise<void> {
       return;
     }
     await route.continue();
+  });
+  await page.routeWebSocket('**/*', async (ws) => {
+    if (isBlockedRemoteUrl(ws.url())) {
+      // Never connected to the remote server; the page sees a closed socket.
+      await ws.close({
+        code: 1008,
+        reason: 'blocked by the e2e loopback guard',
+      });
+      return;
+    }
+    ws.connectToServer();
   });
 }

@@ -116,17 +116,8 @@ describe('purchases api', () => {
       from: () => items.chain,
     });
 
+    // Paged by id, then sorted by Arabic name: بوري before زيت.
     await expect(listStockChoices()).resolves.toEqual([
-      {
-        id: 'oil',
-        name: 'زيت',
-        kind: 'ingredient',
-        baseUnit: 'kg',
-        parentItemId: null,
-        active: true,
-        hasMovements: false,
-        conversions: [{ unit: 'لتر', factorToBase: '0.920000' }],
-      },
       {
         id: 'mixed',
         name: 'بوري',
@@ -137,6 +128,16 @@ describe('purchases api', () => {
         hasMovements: true,
         conversions: [],
       },
+      {
+        id: 'oil',
+        name: 'زيت',
+        kind: 'ingredient',
+        baseUnit: 'kg',
+        parentItemId: null,
+        active: true,
+        hasMovements: false,
+        conversions: [{ unit: 'لتر', factorToBase: '0.920000' }],
+      },
     ]);
     expect(items.captured.select).toBe(
       'id, name, kind, base_unit, parent_item_id, active, item_balances(item_id), item_unit_conversions(unit, factor_text:factor_to_base::text)',
@@ -144,10 +145,7 @@ describe('purchases api', () => {
     expect(items.captured.filters).toEqual([
       { op: 'eq', column: 'active', value: true },
     ]);
-    expect(items.captured.orders).toEqual([
-      { column: 'name', ascending: true },
-      { column: 'id', ascending: true },
-    ]);
+    expect(items.captured.orders).toEqual([{ column: 'id', ascending: true }]);
     expect(items.captured.ranges).toEqual([{ from: 0, to: 999 }]);
   });
 
@@ -209,9 +207,8 @@ describe('purchases api', () => {
       amountPaid: '40.00',
     });
     expect(purchases.captured.orders).toEqual([
-      { column: 'purchased_at', ascending: false },
-      { column: 'created_at', ascending: false },
-      { column: 'id', ascending: false },
+      { column: 'created_at', ascending: true },
+      { column: 'id', ascending: true },
     ]);
     expect(purchases.captured.filters).toEqual([
       { op: 'gte', column: 'purchased_at', value: '2026-07-14T21:00:00.000Z' },
@@ -228,6 +225,47 @@ describe('purchases api', () => {
     expect(lines.captured.ranges).toEqual([{ from: 0, to: 999 }]);
     expect(String(purchases.captured.select)).toContain('total_paid::text');
     expect(String(lines.captured.select)).toContain('quantity::text');
+  });
+
+  it('shows the newest purchase first whatever order the pages came in', async () => {
+    const row = (id: string, purchasedAt: string, createdAt: string) => ({
+      id,
+      purchased_at: purchasedAt,
+      supplier: null,
+      invoice_no: null,
+      note: null,
+      total_paid_text: '1.00',
+      created_at: createdAt,
+    });
+    // Pages arrive in insert order; a late-entered purchase happened earlier.
+    const purchases = query({
+      data: [
+        row(
+          'p-early-entry',
+          '2026-07-15T09:00:00.000Z',
+          '2026-07-15T09:01:00.000Z',
+        ),
+        row(
+          'p-late-entry',
+          '2026-07-14T08:00:00.000Z',
+          '2026-07-16T10:00:00.000Z',
+        ),
+        row('p-newest', '2026-07-16T12:00:00.000Z', '2026-07-16T12:01:00.000Z'),
+      ],
+      error: null,
+    });
+    const lines = query({ data: [], error: null });
+    mocks.schema.mockReturnValue({
+      from: (table: string) =>
+        table === 'purchase_lines' ? lines.chain : purchases.chain,
+    });
+
+    const listed = await listPurchases();
+    expect(listed.map((purchase) => purchase.id)).toEqual([
+      'p-newest',
+      'p-early-entry',
+      'p-late-entry',
+    ]);
   });
 
   it('sends purchase and opening numbers as exact strings', async () => {

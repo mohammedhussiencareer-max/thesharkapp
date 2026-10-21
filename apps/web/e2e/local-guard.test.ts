@@ -104,15 +104,31 @@ describe('loopback route guard', () => {
         return Promise.resolve();
       },
     });
+    const socketFor = (url: string) => ({
+      url: () => url,
+      close: () => {
+        decisions.push(`close ${url}`);
+        return Promise.resolve();
+      },
+      connectToServer: () => {
+        decisions.push(`connect ${url}`);
+      },
+    });
     await installLoopbackGuard({
       route: async (_pattern, handler) => {
         await handler(routeFor('https://abc.supabase.co/auth/v1/token'));
         await handler(routeFor('http://127.0.0.1:55421/rest/v1/stock_items'));
       },
+      routeWebSocket: async (_pattern, handler) => {
+        await handler(socketFor('wss://abc.supabase.co/realtime/v1/websocket'));
+        await handler(socketFor('ws://127.0.0.1:5173/'));
+      },
     });
     expect(decisions).toEqual([
       'abort https://abc.supabase.co/auth/v1/token',
       'continue http://127.0.0.1:55421/rest/v1/stock_items',
+      'close wss://abc.supabase.co/realtime/v1/websocket',
+      'connect ws://127.0.0.1:5173/',
     ]);
   });
 });

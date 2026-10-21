@@ -13,8 +13,11 @@ export class PageCapError extends Error {
 
 /**
  * Read every row by `.range(from, to)`.
- * The caller applies a stable total order (a unique key or key tuple) before
- * `range`, so later pages do not skip or repeat rows.
+ * The caller orders by a unique key whose value never changes (an id or an
+ * insert time plus id), on tables whose rows are never deleted. A row inserted
+ * by another session while paging can then only push later rows forward, so a
+ * row can repeat across pages but never be skipped; repeats are dropped by
+ * `keyOf`. Sort for display after reading, not by a column that can change.
  * A short page ends the read. Fifty full pages throw instead of returning them.
  */
 export async function fetchAllPages<T>(
@@ -22,8 +25,10 @@ export async function fetchAllPages<T>(
     from: number,
     to: number,
   ) => PromiseLike<{ data: T[] | null; error: unknown }>,
+  keyOf: (row: T) => string,
 ): Promise<T[]> {
   const rows: T[] = [];
+  const seen = new Set<string>();
   for (let page = 0; page < maxPages; page += 1) {
     const from = page * pageSize;
     const to = from + pageSize - 1;
@@ -31,7 +36,12 @@ export async function fetchAllPages<T>(
     if (error instanceof Error) throw error;
     if (error) throw new Error('page read failed');
     const batch = data ?? [];
-    rows.push(...batch);
+    for (const row of batch) {
+      const key = keyOf(row);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push(row);
+    }
     if (batch.length < pageSize) return rows;
   }
   throw new PageCapError();
