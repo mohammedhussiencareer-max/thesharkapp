@@ -79,6 +79,10 @@ const exactReasons: ReadonlyArray<readonly [string, string]> = [
   ],
   ['amount_paid must be in piasters', 'المبلغ لأقرب قرش'],
   ['opening unit_cost must be >= 0', 'التكلفة لازم تكون رقم من صفر أو أكتر'],
+  [
+    'unit_cost must have at most 6 decimal places',
+    'تكلفة الوحدة مينفعش تبقى أدق من 6 خانات',
+  ],
   ['unit_cost is required', 'اكتب تكلفة الوحدة'],
   ['unit is required', 'اختار الوحدة'],
   ['at least one opening line is required', 'اكتب كمية لصنف واحد على الأقل'],

@@ -67,6 +67,12 @@ describe('mapPurchaseError', () => {
         message: 'amount_paid must be in piasters',
       }),
     ).toBe('المبلغ لأقرب قرش');
+    expect(
+      mapPurchaseError({
+        code: '22023',
+        message: 'unit_cost must have at most 6 decimal places',
+      }),
+    ).toBe('تكلفة الوحدة مينفعش تبقى أدق من 6 خانات');
     expect(mapPurchaseError({ code: '22023', message: 'something new' })).toBe(
       'البيانات مش مظبوطة',
     );

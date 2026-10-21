@@ -401,92 +401,13 @@ begin
         using errcode = '22023';
     end if;
 
-    select
-      si.name,
-      si.base_unit
-    into
-      v_name,
-      v_base_unit
-    from
-      app.stock_items si
-    where
-      si.id = v_item_id;
-
-    if not found then
-      raise exception 'unknown stock_item id: %', v_item_id
-        using errcode = '22023';
-    end if;
-
-    -- Base unit cannot change once this item has a movement, so a retry of a
-    -- posted purchase still matches. A first post whose reviewed base unit
-    -- differs is refused before the unit name is resolved.
+    -- Expected fields are syntax-checked here and compared with the catalog
+    -- only after a replay miss. A missing value stays null so a saved draft
+    -- can return before that check. array_append keeps a null element.
     v_expected_base := nullif(
       pg_catalog.btrim(v_elem ->> 'expected_base_unit'),
       ''
     );
-    if v_expected_base is not null
-    and v_expected_base is distinct from v_base_unit then
-      raise exception 'conversion changed'
-        using errcode = '40001';
-    end if;
-
-    if v_unit = v_base_unit then
-      v_factor := 1;
-    else
-      select
-        iuc.factor_to_base
-      into v_factor
-      from
-        app.item_unit_conversions iuc
-      where
-        iuc.item_id = v_item_id
-        and iuc.unit = v_unit;
-
-      if not found then
-        raise exception 'unknown unit "%" for item %', v_unit, v_name
-          using errcode = '22023';
-      end if;
-    end if;
-
-    v_base_qty := pg_catalog.round(v_qty * v_factor, 6);
-
-    if v_base_qty <= 0 or v_base_qty >= 100000000000000 then
-      raise exception 'purchase base quantity must be > 0'
-        using errcode = '22023';
-    end if;
-
-    if v_amount = 0 then
-      v_unit_cost := 0;
-    else
-      v_unit_cost := pg_catalog.round(v_amount / v_base_qty, 6);
-    end if;
-
-    if v_amount > 0 and v_unit_cost <= 0 then
-      raise exception 'converted purchase unit_cost must be > 0'
-        using errcode = '22023';
-    end if;
-
-    if v_unit_cost >= 100000000000000 then
-      raise exception 'purchase unit_cost is out of range'
-        using errcode = '22023';
-    end if;
-
-    v_total := v_total + v_amount;
-
-    if v_total >= 1000000000000 then
-      raise exception 'purchase total_paid is out of range'
-        using errcode = '22023';
-    end if;
-
-    v_item_ids := v_item_ids || v_item_id;
-    v_names := v_names || v_name;
-    v_qtys := v_qtys || v_qty;
-    v_units := v_units || v_unit;
-    v_base_qtys := v_base_qtys || v_base_qty;
-    v_amounts := v_amounts || v_amount;
-    v_unit_costs := v_unit_costs || v_unit_cost;
-    v_factors := v_factors || v_factor;
-    v_base_units := v_base_units || v_base_unit;
     v_expected_factor_text := nullif(
       pg_catalog.btrim(v_elem ->> 'expected_factor'),
       ''
@@ -499,7 +420,11 @@ begin
     else
       v_expected_factor := v_expected_factor_text::numeric;
     end if;
-    -- array_append keeps a null element. || would drop the whole array.
+
+    v_item_ids := v_item_ids || v_item_id;
+    v_qtys := v_qtys || v_qty;
+    v_units := v_units || v_unit;
+    v_amounts := v_amounts || v_amount;
     v_expected_bases := pg_catalog.array_append(v_expected_bases, v_expected_base);
     v_expected_factors := pg_catalog.array_append(
       v_expected_factors,
@@ -508,13 +433,13 @@ begin
     v_n := v_n + 1;
   end loop;
 
-  -- Same draft retries with the same request_id. Compare the payload the
-  -- owner sent (header plus lines in order) and return the existing purchase
-  -- before any inflow. The advisory lock taken above serializes this with
-  -- every other ledger write, so two callers cannot both miss the row.
-  -- purchases.request_id is unique as the final guard: if a second insert
-  -- still raced, it would fail and this transaction would roll the inflows
-  -- back with it.
+  -- Replay uses the normalized payload only: trimmed text, timestamptz, uuid,
+  -- and numerics already rejected when they would not fit the columns
+  -- (quantity scale 6, amount_paid in piasters). No stock_items or conversion
+  -- read has happened, so a deleted unit still returns the saved purchase.
+  -- The advisory lock serializes this lookup with every other ledger write.
+  -- purchases.request_id is unique as the final guard: a second insert that
+  -- still raced fails and rolls its inflows back with this transaction.
   v_request_text := nullif(pg_catalog.btrim(p_purchase ->> 'request_id'), '');
   if v_request_text is not null then
     if v_request_text !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
@@ -578,13 +503,98 @@ begin
       using errcode = '22023';
   end if;
 
-  -- Still holding the posting lock, so the factor read above is the factor
-  -- this post will use. A conversion or base_unit change waits on the same lock.
+  -- First post for this request. Catalog reads stay under the posting lock.
+  for v_i in 1..v_n loop
+    v_item_id := v_item_ids[v_i];
+    v_qty := v_qtys[v_i];
+    v_unit := v_units[v_i];
+    v_amount := v_amounts[v_i];
+
+    select
+      si.name,
+      si.base_unit
+    into
+      v_name,
+      v_base_unit
+    from
+      app.stock_items si
+    where
+      si.id = v_item_id;
+
+    if not found then
+      raise exception 'unknown stock_item id: %', v_item_id
+        using errcode = '22023';
+    end if;
+
+    -- A reviewed base unit that no longer matches is refused before the unit
+    -- name is resolved, so a stale unit name is not reported as unknown.
+    if v_expected_bases[v_i] is not null
+    and v_expected_bases[v_i] is distinct from v_base_unit then
+      raise exception 'conversion changed'
+        using errcode = '40001';
+    end if;
+
+    if v_unit = v_base_unit then
+      v_factor := 1;
+    else
+      select
+        iuc.factor_to_base
+      into v_factor
+      from
+        app.item_unit_conversions iuc
+      where
+        iuc.item_id = v_item_id
+        and iuc.unit = v_unit;
+
+      if not found then
+        raise exception 'unknown unit "%" for item %', v_unit, v_name
+          using errcode = '22023';
+      end if;
+    end if;
+
+    v_base_qty := pg_catalog.round(v_qty * v_factor, 6);
+
+    if v_base_qty <= 0 or v_base_qty >= 100000000000000 then
+      raise exception 'purchase base quantity must be > 0'
+        using errcode = '22023';
+    end if;
+
+    if v_amount = 0 then
+      v_unit_cost := 0;
+    else
+      v_unit_cost := pg_catalog.round(v_amount / v_base_qty, 6);
+    end if;
+
+    if v_amount > 0 and v_unit_cost <= 0 then
+      raise exception 'converted purchase unit_cost must be > 0'
+        using errcode = '22023';
+    end if;
+
+    if v_unit_cost >= 100000000000000 then
+      raise exception 'purchase unit_cost is out of range'
+        using errcode = '22023';
+    end if;
+
+    v_total := v_total + v_amount;
+
+    if v_total >= 1000000000000 then
+      raise exception 'purchase total_paid is out of range'
+        using errcode = '22023';
+    end if;
+
+    v_names := v_names || v_name;
+    v_base_qtys := v_base_qtys || v_base_qty;
+    v_unit_costs := v_unit_costs || v_unit_cost;
+    v_factors := v_factors || v_factor;
+    v_base_units := v_base_units || v_base_unit;
+  end loop;
+
   for v_i in 1..v_n loop
     if v_expected_bases[v_i] is null or v_expected_factors[v_i] is null then
       raise exception 'expected_base_unit is required'
         using errcode = '22023';
     end if;
+
     if v_expected_bases[v_i] is distinct from v_base_units[v_i]
     or v_expected_factors[v_i] is distinct from v_factors[v_i] then
       raise exception 'conversion changed'
@@ -855,6 +865,13 @@ begin
         using errcode = '22023';
     end if;
 
+    -- numeric(20,6) would round a longer cost, and the retry would then look
+    -- like a different payload. Refuse it before the line is stored.
+    if v_unit_cost <> pg_catalog.round(v_unit_cost, 6) then
+      raise exception 'unit_cost must have at most 6 decimal places'
+        using errcode = '22023';
+    end if;
+
     if v_qty = 0 then
       continue;
     end if;
@@ -866,77 +883,10 @@ begin
         using errcode = '22023';
     end if;
 
-    select
-      si.name,
-      si.base_unit
-    into
-      v_name,
-      v_base_unit
-    from
-      app.stock_items si
-    where
-      si.id = v_item_id;
-
-    if not found then
-      raise exception 'unknown stock_item id: %', v_item_id
-        using errcode = '22023';
-    end if;
-
-    if v_item_id = any (v_seen) then
-      raise exception 'duplicate opening item: %', v_name
-        using errcode = '22023';
-    end if;
-
-    -- Base unit cannot change once this item has a movement, so a retry still
-    -- matches. A first post whose reviewed base unit differs is refused here.
     v_expected_base := nullif(
       pg_catalog.btrim(v_elem ->> 'expected_base_unit'),
       ''
     );
-    if v_expected_base is not null
-    and v_expected_base is distinct from v_base_unit then
-      raise exception 'conversion changed'
-        using errcode = '40001';
-    end if;
-
-    if v_unit = v_base_unit then
-      v_factor := 1;
-    else
-      select
-        iuc.factor_to_base
-      into v_factor
-      from
-        app.item_unit_conversions iuc
-      where
-        iuc.item_id = v_item_id
-        and iuc.unit = v_unit;
-
-      if not found then
-        raise exception 'unknown unit "%" for item %', v_unit, v_name
-          using errcode = '22023';
-      end if;
-    end if;
-
-    v_base_qty := pg_catalog.round(v_qty * v_factor, 6);
-
-    if v_base_qty <= 0 or v_base_qty >= 100000000000000 then
-      raise exception 'opening base quantity must be > 0'
-        using errcode = '22023';
-    end if;
-
-    begin
-      v_line_total := pg_catalog.round(v_qty * v_unit_cost, 2);
-    exception
-      when numeric_value_out_of_range then
-        raise exception 'opening total_cost is out of range'
-          using errcode = '22023';
-    end;
-
-    if v_line_total >= 1000000000000 then
-      raise exception 'opening total_cost is out of range'
-        using errcode = '22023';
-    end if;
-
     v_expected_factor_text := nullif(
       pg_catalog.btrim(v_elem ->> 'expected_factor'),
       ''
@@ -950,14 +900,10 @@ begin
       v_expected_factor := v_expected_factor_text::numeric;
     end if;
 
-    v_seen := v_seen || v_item_id;
     v_item_ids := v_item_ids || v_item_id;
-    v_names := v_names || v_name;
     v_qtys := v_qtys || v_qty;
     v_units := v_units || v_unit;
     v_costs := v_costs || v_unit_cost;
-    v_factors := v_factors || v_factor;
-    v_base_units := v_base_units || v_base_unit;
     v_expected_bases := pg_catalog.array_append(v_expected_bases, v_expected_base);
     v_expected_factors := pg_catalog.array_append(
       v_expected_factors,
@@ -976,9 +922,11 @@ begin
       using errcode = '22023';
   end if;
 
-  -- Same draft retries with the same request id and returns the batch that
-  -- already posted. The advisory lock serializes this lookup with every other
-  -- ledger write. opening_stocks.request_id is unique as the final guard: a
+  -- Replay uses the normalized payload only: timestamptz, trimmed unit, uuid,
+  -- and numerics that already fit the columns (quantity and unit_cost scale 6).
+  -- No stock_items, conversion, or stock_movements read has happened, so a
+  -- deleted unit still returns the saved batch. The advisory lock serializes
+  -- this lookup. opening_stocks.request_id is unique as the final guard: a
   -- second insert fails and rolls this transaction back, so it cannot
   -- double-post. Quantity 0 lines were skipped above and are not compared.
   select
@@ -1022,6 +970,86 @@ begin
     end if;
     return v_existing_id;
   end if;
+
+  for v_i in 1..v_count loop
+    v_item_id := v_item_ids[v_i];
+    v_qty := v_qtys[v_i];
+    v_unit := v_units[v_i];
+    v_unit_cost := v_costs[v_i];
+
+    select
+      si.name,
+      si.base_unit
+    into
+      v_name,
+      v_base_unit
+    from
+      app.stock_items si
+    where
+      si.id = v_item_id;
+
+    if not found then
+      raise exception 'unknown stock_item id: %', v_item_id
+        using errcode = '22023';
+    end if;
+
+    if v_item_id = any (v_seen) then
+      raise exception 'duplicate opening item: %', v_name
+        using errcode = '22023';
+    end if;
+
+    v_seen := v_seen || v_item_id;
+    v_names := v_names || v_name;
+
+    -- A reviewed base unit that no longer matches is refused before the unit
+    -- name is resolved, so a stale unit name is not reported as unknown.
+    if v_expected_bases[v_i] is not null
+    and v_expected_bases[v_i] is distinct from v_base_unit then
+      raise exception 'conversion changed'
+        using errcode = '40001';
+    end if;
+
+    if v_unit = v_base_unit then
+      v_factor := 1;
+    else
+      select
+        iuc.factor_to_base
+      into v_factor
+      from
+        app.item_unit_conversions iuc
+      where
+        iuc.item_id = v_item_id
+        and iuc.unit = v_unit;
+
+      if not found then
+        raise exception 'unknown unit "%" for item %', v_unit, v_name
+          using errcode = '22023';
+      end if;
+    end if;
+
+    v_base_qty := pg_catalog.round(v_qty * v_factor, 6);
+
+    if v_base_qty <= 0 or v_base_qty >= 100000000000000 then
+      raise exception 'opening base quantity must be > 0'
+        using errcode = '22023';
+    end if;
+
+    begin
+      v_line_total := pg_catalog.round(v_qty * v_unit_cost, 2);
+    exception
+      when numeric_value_out_of_range then
+        raise exception 'opening total_cost is out of range'
+          using errcode = '22023';
+    end;
+
+    if v_line_total >= 1000000000000 then
+      raise exception 'opening total_cost is out of range'
+        using errcode = '22023';
+    end if;
+
+    v_factors := v_factors || v_factor;
+    v_base_units := v_base_units || v_base_unit;
+  end loop;
 
   for v_i in 1..v_count loop
     -- Still holding the posting advisory lock, so no concurrent post can

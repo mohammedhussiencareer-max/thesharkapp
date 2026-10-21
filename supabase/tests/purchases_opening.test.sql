@@ -518,6 +518,20 @@ values
     'packaging',
     'piece',
     'weekly'
+  ),
+  (
+    '20000000-0000-4000-8000-00000000000e',
+    'صنف إعادة شراء',
+    'ingredient',
+    'kg',
+    'weekly'
+  ),
+  (
+    '20000000-0000-4000-8000-00000000000f',
+    'صنف إعادة فتح تكلفة',
+    'ingredient',
+    'kg',
+    'weekly'
   );
 
 insert into
@@ -533,7 +547,9 @@ values
     'كرتونة',
     12
   ),
-  ('20000000-0000-4000-8000-00000000000b', 'كيس', 4);
+  ('20000000-0000-4000-8000-00000000000b', 'كيس', 4),
+  ('20000000-0000-4000-8000-00000000000e', 'علبة', 3),
+  ('20000000-0000-4000-8000-00000000000f', 'علبة', 2);
 
 select
   set_config(
@@ -1083,6 +1099,7 @@ select
   throws_ok (
     $$select app.record_purchase(jsonb_build_object(
       'purchased_at', '2026-10-21T14:00:00Z',
+      'request_id', 'b1000000-0000-4000-8000-00000000000e',
       'lines', jsonb_build_array(
         jsonb_build_object(
           'item_id', '20000000-0000-4000-8000-000000000001',
@@ -1470,6 +1487,7 @@ select
   throws_ok (
     $$select app.record_purchase(jsonb_build_object(
       'purchased_at', '2026-10-21T18:00:00Z',
+      'request_id', 'b1000000-0000-4000-8000-00000000000d',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', '20000000-0000-4000-8000-0000000000ff',
         'quantity', 1, 'unit', 'kg', 'amount_paid', 1
@@ -1979,6 +1997,314 @@ select
     '40001',
     'conversion changed',
     'stale opening base unit is refused'
+  );
+
+select
+  app.record_purchase (
+    jsonb_build_object(
+      'purchased_at',
+      '2026-10-21T21:00:00Z',
+      'request_id',
+      'b1000000-0000-4000-8000-00000000000b',
+      'lines',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          '20000000-0000-4000-8000-00000000000e',
+          'quantity',
+          '2',
+          'unit',
+          'علبة',
+          'amount_paid',
+          '30.00',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '3'
+        )
+      )
+    )
+  );
+
+select
+  app.delete_unit_conversion (
+    '20000000-0000-4000-8000-00000000000e',
+    'علبة',
+    3,
+    'kg'
+  );
+
+select
+  is (
+    app.record_purchase (
+      jsonb_build_object(
+        'purchased_at',
+        '2026-10-21T21:00:00Z',
+        'request_id',
+        'b1000000-0000-4000-8000-00000000000b',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            '20000000-0000-4000-8000-00000000000e',
+            'quantity',
+            '2',
+            'unit',
+            'علبة',
+            'amount_paid',
+            '30.00',
+            'expected_base_unit',
+            'kg',
+            'expected_factor',
+            '3'
+          )
+        )
+      )
+    ),
+    (
+      select
+        id
+      from
+        app.purchases
+      where
+        request_id = 'b1000000-0000-4000-8000-00000000000b'
+    ),
+    'a purchase retry returns the saved id after its conversion is deleted'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements
+      where
+        item_id = '20000000-0000-4000-8000-00000000000e'
+    ),
+    1::bigint,
+    'a purchase retry after a deleted conversion adds no movement'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.purchase_lines pl
+        join app.purchases p on p.id = pl.purchase_id
+      where
+        p.request_id = 'b1000000-0000-4000-8000-00000000000b'
+    ),
+    1::bigint,
+    'a purchase retry after a deleted conversion adds no line'
+  );
+
+select
+  throws_ok (
+    $$select app.record_purchase(jsonb_build_object(
+      'purchased_at', '2026-10-21T21:00:00Z',
+      'request_id', 'b1000000-0000-4000-8000-00000000000b',
+      'supplier', 'مورد تاني',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', '20000000-0000-4000-8000-00000000000e',
+        'quantity', '2', 'unit', 'علبة', 'amount_paid', '30.00',
+        'expected_base_unit', 'kg', 'expected_factor', '3'
+      ))
+    ))$$,
+    '22023',
+    'request_id already used for a different purchase',
+    'a different purchase payload is still refused after the conversion is deleted'
+  );
+
+select
+  throws_ok (
+    $$select app.record_purchase(jsonb_build_object(
+      'purchased_at', '2026-10-21T21:10:00Z',
+      'request_id', 'b1000000-0000-4000-8000-00000000000c',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', '20000000-0000-4000-8000-00000000000e',
+        'quantity', '2', 'unit', 'علبة', 'amount_paid', '30.00',
+        'expected_base_unit', 'kg', 'expected_factor', '3'
+      ))
+    ))$$,
+    '22023',
+    'unknown unit "علبة" for item صنف إعادة شراء',
+    'a new purchase request still fails when the unit was deleted'
+  );
+
+select
+  throws_ok (
+    $$select app.record_opening_stock(
+      '2026-10-21T21:20:00Z',
+      jsonb_build_array(jsonb_build_object(
+        'item_id', '20000000-0000-4000-8000-00000000000f',
+        'quantity', '1', 'unit', 'علبة', 'unit_cost', '1.2345678',
+        'expected_base_unit', 'kg', 'expected_factor', '2'
+      )),
+      'a1000000-0000-4000-8000-000000000014'
+    )$$,
+    '22023',
+    'unit_cost must have at most 6 decimal places',
+    'an opening cost with 7 decimal places is refused'
+  );
+
+select
+  app.record_opening_stock (
+    '2026-10-21T21:30:00Z',
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '20000000-0000-4000-8000-00000000000f',
+        'quantity',
+        '1',
+        'unit',
+        'علبة',
+        'unit_cost',
+        '1.234567',
+        'expected_base_unit',
+        'kg',
+        'expected_factor',
+        '2'
+      )
+    ),
+    'a1000000-0000-4000-8000-000000000015'
+  );
+
+select
+  is (
+    app.record_opening_stock (
+      '2026-10-21T21:30:00Z',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          '20000000-0000-4000-8000-00000000000f',
+          'quantity',
+          '1',
+          'unit',
+          'علبة',
+          'unit_cost',
+          '1.234567',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '2'
+        )
+      ),
+      'a1000000-0000-4000-8000-000000000015'
+    ),
+    (
+      select
+        id
+      from
+        app.opening_stocks
+      where
+        request_id = 'a1000000-0000-4000-8000-000000000015'
+    ),
+    'a 6-decimal opening cost retries as the same batch'
+  );
+
+select
+  app.delete_unit_conversion (
+    '20000000-0000-4000-8000-00000000000f',
+    'علبة',
+    2,
+    'kg'
+  );
+
+select
+  is (
+    app.record_opening_stock (
+      '2026-10-21T21:30:00Z',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          '20000000-0000-4000-8000-00000000000f',
+          'quantity',
+          '1',
+          'unit',
+          'علبة',
+          'unit_cost',
+          '1.234567',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '2'
+        )
+      ),
+      'a1000000-0000-4000-8000-000000000015'
+    ),
+    (
+      select
+        id
+      from
+        app.opening_stocks
+      where
+        request_id = 'a1000000-0000-4000-8000-000000000015'
+    ),
+    'an opening retry returns the saved batch after its conversion is deleted'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements
+      where
+        item_id = '20000000-0000-4000-8000-00000000000f'
+    ),
+    1::bigint,
+    'an opening retry after a deleted conversion adds no movement'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.opening_stock_lines ol
+        join app.opening_stocks o on o.id = ol.opening_id
+      where
+        o.request_id = 'a1000000-0000-4000-8000-000000000015'
+    ),
+    1::bigint,
+    'an opening retry after a deleted conversion adds no line'
+  );
+
+select
+  throws_ok (
+    $$select app.record_opening_stock(
+      '2026-10-21T21:30:00Z',
+      jsonb_build_array(jsonb_build_object(
+        'item_id', '20000000-0000-4000-8000-00000000000f',
+        'quantity', '2', 'unit', 'علبة', 'unit_cost', '1.234567',
+        'expected_base_unit', 'kg', 'expected_factor', '2'
+      )),
+      'a1000000-0000-4000-8000-000000000015'
+    )$$,
+    '22023',
+    'request_id already used for a different opening',
+    'a different opening payload is still refused after the conversion is deleted'
+  );
+
+select
+  throws_ok (
+    $$select app.record_opening_stock(
+      '2026-10-21T21:40:00Z',
+      jsonb_build_array(jsonb_build_object(
+        'item_id', '20000000-0000-4000-8000-00000000000f',
+        'quantity', '1', 'unit', 'علبة', 'unit_cost', '1.234567',
+        'expected_base_unit', 'kg', 'expected_factor', '2'
+      )),
+      'a1000000-0000-4000-8000-000000000016'
+    )$$,
+    '22023',
+    'unknown unit "علبة" for item صنف إعادة فتح تكلفة',
+    'a new opening request still fails when the unit was deleted'
   );
 
 select
