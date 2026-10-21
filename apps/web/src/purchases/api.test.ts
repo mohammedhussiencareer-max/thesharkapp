@@ -109,6 +109,16 @@ describe('purchases api', () => {
           item_balances: [{ item_id: 'mixed' }],
           item_unit_conversions: [],
         },
+        {
+          id: 'old',
+          name: 'أرز',
+          kind: 'ingredient',
+          base_unit: 'kg',
+          parent_item_id: null,
+          active: false,
+          item_balances: null,
+          item_unit_conversions: [],
+        },
       ],
       error: null,
     });
@@ -142,11 +152,61 @@ describe('purchases api', () => {
     expect(items.captured.select).toBe(
       'id, name, kind, base_unit, parent_item_id, active, item_balances(item_id), item_unit_conversions(unit, factor_text:factor_to_base::text)',
     );
-    expect(items.captured.filters).toEqual([
-      { op: 'eq', column: 'active', value: true },
-    ]);
+    // Inactive rows are dropped after paging, never filtered on the server.
+    expect(items.captured.filters).toEqual([]);
     expect(items.captured.orders).toEqual([{ column: 'id', ascending: true }]);
     expect(items.captured.ranges).toEqual([{ from: 0, to: 999 }]);
+  });
+
+  it('keeps every active item when one is deactivated between pages', async () => {
+    const ids = Array.from(
+      { length: 1002 },
+      (_, index) => `i${String(index).padStart(4, '0')}`,
+    );
+    const server = ids.map((id) => ({
+      id,
+      name: id,
+      kind: 'ingredient',
+      base_unit: 'kg',
+      parent_item_id: null,
+      active: true,
+      item_balances: null,
+      item_unit_conversions: [],
+    }));
+    let calls = 0;
+    mocks.schema.mockReturnValue({
+      from: () => {
+        const chain: Record<string, unknown> = {};
+        let range = { from: 0, to: 0 };
+        let activeOnly = false;
+        chain.select = () => chain;
+        chain.order = () => chain;
+        chain.eq = (column: string) => {
+          if (column === 'active') activeOnly = true;
+          return chain;
+        };
+        chain.range = (from: number, to: number) => {
+          range = { from, to };
+          return chain;
+        };
+        chain.then = (resolve: (value: unknown) => unknown) => {
+          calls += 1;
+          const visible = server.filter((row) => !activeOnly || row.active);
+          const page = visible
+            .slice(range.from, range.to + 1)
+            .map((row) => ({ ...row }));
+          // Another session deactivates the first item after page one.
+          if (calls === 1) server[0]!.active = false;
+          return Promise.resolve({ data: page, error: null }).then(resolve);
+        };
+        return chain;
+      },
+    });
+
+    const choices = await listStockChoices();
+    const seen = new Set(choices.map((choice) => choice.id));
+    for (const id of ids.slice(1)) expect(seen.has(id)).toBe(true);
+    expect(choices).toHaveLength(1002);
   });
 
   it('lists purchases newest first with exact money text', async () => {

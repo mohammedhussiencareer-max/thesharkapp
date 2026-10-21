@@ -94,19 +94,21 @@ export async function listStockChoices(): Promise<StockChoice[]> {
   // One paged read so a balance (the sign that the item already has a movement)
   // is read with the same catalog row as its conversions. Paged by id, which
   // never changes (a rename must not move a row between pages); sorted by name
-  // afterwards.
-  const data = await readPages(
+  // afterwards. The active filter runs after paging: filtering on the server
+  // would let a deactivation between two pages shift every later row and skip
+  // one that is still active.
+  const all = await readPages(
     (from, to) =>
       appDb()
         .from('stock_items')
         .select(
           'id, name, kind, base_unit, parent_item_id, active, item_balances(item_id), item_unit_conversions(unit, factor_text:factor_to_base::text)',
         )
-        .eq('active', true)
         .order('id', { ascending: true })
         .range(from, to),
     (row) => row.id,
   );
+  const data = all.filter((row) => row.active === true);
   data.sort(
     (left, right) =>
       left.name.localeCompare(right.name, 'ar') ||
