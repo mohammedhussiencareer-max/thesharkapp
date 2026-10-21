@@ -93,16 +93,42 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
-                },"pos_shifts": {
+                },"pos_shift_transactions": {
                   Row: {
-                    "closed_at": string | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at": string
+                    "amount": number,"occurred_at": string,"order_id": string | null,"shift_id": string,"tx_id": string,"tx_type": number
                   }
                   ComputedFields: never
                   Insert: {
-                    "closed_at"?: string | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at"?: string
+                    "amount": number,"occurred_at": string,"order_id"?: string | null,"shift_id": string,"tx_id": string,"tx_type": number
                   }
                   Update: {
-                    "closed_at"?: string | null,"id"?: string,"is_active"?: boolean,"opened_at"?: string,"pos_update_time"?: string,"synced_at"?: string
+                    "amount"?: number,"occurred_at"?: string,"order_id"?: string | null,"shift_id"?: string,"tx_id"?: string,"tx_type"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "pos_shift_transactions_shift_id_fkey"
+      columns: ["shift_id"]
+isOneToOne: false
+      referencedRelation: "pos_shift_summaries"
+      referencedColumns: ["shift_id"]
+    },{
+      foreignKeyName: "pos_shift_transactions_shift_id_fkey"
+      columns: ["shift_id"]
+isOneToOne: false
+      referencedRelation: "pos_shifts"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"pos_shifts": {
+                  Row: {
+                    "closed_at": string | null,"drawer_cash_net": number | null,"drawer_credit": number | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "closed_at"?: string | null,"drawer_cash_net"?: number | null,"drawer_credit"?: number | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at"?: string
+                  }
+                  Update: {
+                    "closed_at"?: string | null,"drawer_cash_net"?: number | null,"drawer_credit"?: number | null,"id"?: string,"is_active"?: boolean,"opened_at"?: string,"pos_update_time"?: string,"synced_at"?: string
                   }
                   Relationships: [
                     
@@ -216,7 +242,15 @@ isOneToOne: false
                 }
           }
           Views: {
-            [_ in never]: never
+            "pos_shift_summaries": {
+                  Row: {
+                    "closed_at": string | null,"drawer_difference": number | null,"drawer_total": number | null,"gross_sales": number | null,"is_active": boolean | null,"net_sales": number | null,"opened_at": string | null,"orders_canceled": number | null,"orders_complete": number | null,"orders_missing": number | null,"orders_open": number | null,"refunds": number | null,"shift_id": string | null,"unknown_tx": number | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    
+                  ]
+                }
           }
           Functions: {
             "add_unit_conversion":

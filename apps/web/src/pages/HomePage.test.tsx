@@ -17,6 +17,10 @@ describe('HomePage', () => {
     ).toBeInTheDocument();
     expect(screen.getByText('المخزون والمكسب اليومي')).toBeInTheDocument();
     expect(screen.getByText('owner@theshark.test')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'المبيعات' })).toHaveAttribute(
+      'href',
+      '/sales',
+    );
     expect(screen.getByRole('link', { name: 'الأصناف' })).toHaveAttribute(
       'href',
       '/items',

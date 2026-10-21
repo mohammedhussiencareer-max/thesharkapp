@@ -122,3 +122,32 @@ export function splitDocumentName(name: string): {
   }
   return { collection, id };
 }
+
+/** `custody_shifts/{shiftId}/transactions/{txId}` under the POS project. */
+export function splitTransactionName(name: string): {
+  shiftId: string;
+  txId: string;
+} {
+  if (!name.startsWith(DOCUMENT_PREFIX)) {
+    throw new Error('Firestore document name is invalid');
+  }
+  const parts = name.slice(DOCUMENT_PREFIX.length).split('/');
+  if (parts.length !== 4) {
+    throw new Error('Firestore document name is invalid');
+  }
+  const collection = parts[0];
+  const shiftId = parts[1];
+  const sub = parts[2];
+  const txId = parts[3];
+  if (
+    collection !== 'custody_shifts' ||
+    sub !== 'transactions' ||
+    shiftId === undefined ||
+    txId === undefined ||
+    !isSafeDocumentId(shiftId) ||
+    !isSafeDocumentId(txId)
+  ) {
+    throw new Error('Firestore document name is invalid');
+  }
+  return { shiftId, txId };
+}

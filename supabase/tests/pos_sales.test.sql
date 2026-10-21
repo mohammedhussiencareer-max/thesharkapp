@@ -118,6 +118,8 @@ create function pg_temp.pos_shift (
       p_active,
       'pos_update_time',
       p_updated,
+      'transactions',
+      '[]'::jsonb,
       'pay_outs',
       'drawer-should-drop'
     );

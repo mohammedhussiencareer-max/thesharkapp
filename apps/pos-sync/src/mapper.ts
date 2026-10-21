@@ -1,4 +1,9 @@
-import { decodeFirestoreValue, isRecord, splitDocumentName } from './decode.ts';
+import {
+  decodeFirestoreValue,
+  isRecord,
+  splitDocumentName,
+  splitTransactionName,
+} from './decode.ts';
 import {
   decimalFromNumber,
   fixedLineTotal,
@@ -14,6 +19,7 @@ import type {
   PosLineOptionIngest,
   PosOrderIngest,
   PosShiftIngest,
+  PosShiftTransactionIngest,
   StoredLine,
   StoredOrder,
 } from './types.ts';
@@ -128,6 +134,22 @@ function optionalInt(value: unknown, label: string): number | null {
     throw new Error(`unexpected ${label}`);
   }
   return parsed;
+}
+
+function requiredInt(value: unknown, label: string): number {
+  const parsed = requiredNumber(value, label);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`unexpected ${label}`);
+  }
+  return parsed;
+}
+
+function optionalMoney(value: unknown, label: string): string | null {
+  const parsed = optionalNumber(value, label);
+  if (parsed === null) {
+    return null;
+  }
+  return moneyFromNumber(parsed);
 }
 
 function requiredBool(value: unknown, label: string): boolean {
@@ -421,7 +443,71 @@ export function mapShiftDocument(document: {
     closed_at: optionalTime(field(fields, 'closingTime'), 'closingTime'),
     is_active: requiredBool(field(fields, 'isActive'), 'isActive'),
     pos_update_time: requireUpdateTime(document.updateTime),
+    drawer_cash_net: optionalMoney(
+      field(fields, 'cash_payments_net'),
+      'cash_payments_net',
+    ),
+    drawer_credit: optionalMoney(
+      field(fields, 'credit_payments'),
+      'credit_payments',
+    ),
+    transactions: [],
   };
+}
+
+const TRANSACTION_KEYS = [
+  'tx_id',
+  'order_id',
+  'tx_type',
+  'amount',
+  'occurred_at',
+] as const;
+
+/** Accounting fields only. `description` and `operationKey` are never read. */
+export function mapShiftTransaction(
+  shiftId: string,
+  document: { name?: string; fields?: unknown },
+): PosShiftTransactionIngest {
+  if (typeof document.name !== 'string') {
+    throw new Error('Firestore document name is invalid');
+  }
+  const parsed = splitTransactionName(document.name);
+  if (parsed.shiftId !== shiftId) {
+    throw new Error('Firestore read failed: invalid response');
+  }
+  const fields = documentFields(document.fields);
+  const row: PosShiftTransactionIngest = {
+    tx_id: parsed.txId,
+    order_id: optionalString(field(fields, 'orderId'), 'orderId'),
+    tx_type: requiredInt(field(fields, 'type'), 'type'),
+    amount: moneyFromNumber(requiredNumber(field(fields, 'amount'), 'amount')),
+    occurred_at: requiredTime(field(fields, 'timestamp'), 'timestamp'),
+  };
+  const keys = Object.keys(row);
+  if (
+    keys.length !== TRANSACTION_KEYS.length ||
+    TRANSACTION_KEYS.some((key) => !keys.includes(key))
+  ) {
+    throw new Error('unexpected transaction shape');
+  }
+  return row;
+}
+
+export function mapShiftTransactions(
+  shiftId: string,
+  documents: Array<{ name?: string; fields?: unknown }>,
+): PosShiftTransactionIngest[] {
+  const rows = documents.map((document) =>
+    mapShiftTransaction(shiftId, document),
+  );
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (seen.has(row.tx_id)) {
+      throw new Error('duplicate tx id');
+    }
+    seen.add(row.tx_id);
+  }
+  return rows.sort((left, right) => compareId(left.tx_id, right.tx_id));
 }
 
 export function mapOrderDocument(document: {

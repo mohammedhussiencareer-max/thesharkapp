@@ -1,6 +1,6 @@
 # Handoff
 
-Updated: 2026-10-16.
+Updated: 2026-10-21.
 
 ## Rules
 
@@ -9,7 +9,7 @@ See [CLAUDE.md](CLAUDE.md) and [AI-WORKFLOW.md](AI-WORKFLOW.md). Design approved
 ## Hosted Supabase
 
 - Project `theshark`, ref `pltkoohfodvvmymlsycz`, region `eu-central-1`, free plan. URL and publishable key are in `apps/web/.env.production` (public values).
-- Migrations reach the hosted project through the Supabase MCP `apply_migration`, named after the file's suffix, only after the PR is merged. Applied: `baseline`, `owner_access`, `stock_ledger_core`, `owner_item_catalog` (2026-10-16; hosted schema fingerprint matches local for functions, columns, constraints, triggers, policies, grants and indexes). `pos_sales` is applied after PR #14 merges. Advisors: `authenticated` may execute `is_owner`, `post_movements`, `post_sort` (intended: the posting functions check the owner themselves); leaked-password protection needs a paid plan.
+- Migrations reach the hosted project through the Supabase MCP `apply_migration`, named after the file's suffix, only after the PR is merged. Applied: `baseline`, `owner_access`, `stock_ledger_core`, `owner_item_catalog`, and `pos_sales` (2026-10-16). `pos_refunds_drawer` (`20261021000000`) is applied to hosted only after the task 15 PR merges. Advisors: `authenticated` may execute `is_owner`, `post_movements`, `post_sort` (intended: the posting functions check the owner themselves); leaked-password protection needs a paid plan.
 - Dashboard settings done by the owner: signups disabled, schema `app` exposed in the Data API. Recommended but optional: turn off "Automatically expose new tables".
 - Owner account linked in `app.owner`. Verified from outside: signup returns `signup_disabled`; anon gets `permission denied for schema app`.
 
@@ -27,9 +27,9 @@ See [CLAUDE.md](CLAUDE.md) and [AI-WORKFLOW.md](AI-WORKFLOW.md). Design approved
 
 ## Open PRs
 
-- PR #14 (task 13, POS sales sync): in final review.
+- Task 15 (shift sales, POS refunds, drawer reconciliation) is in progress on `task/15-shift-sales`. No PR yet.
 
-Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner item catalog screen) → bae0ebe. Implementer: Grok 4.7 via Cursor; the Argon trial is over (paused, low weekly quota).
+Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner item catalog screen) → bae0ebe; PR #14 (task 13, POS sales sync) → c052d70. Implementer: Grok 4.7 via Cursor; the Argon trial is over (paused, low weekly quota).
 
 ## Repository
 
@@ -37,7 +37,7 @@ Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner it
 
 ## Next
 
-- Shift sales screen and reconciliation (3 shifts differ from the drawer by 169–660 EGP; investigate there).
+- Finish task 15: shift sales screen, refunds from shift transactions, and drawer totals stored for reconciliation only. Net sales are completed order totals minus those refunds. A refunded order stays complete; its cost follows the cancel decision later (default «اتعمل»).
 - Purchases + opening stock, sorting, and count screens on the ledger; recipes (import + add/edit screen) and POS→recipe mapping; deduction engine.
 
 ## Needs the owner

@@ -14,6 +14,12 @@ export function HomePage({
       <p>{email}</p>
       <Link
         className="inline-flex w-fit rounded bg-neutral-900 px-3 py-2 text-white"
+        to="/sales"
+      >
+        المبيعات
+      </Link>
+      <Link
+        className="inline-flex w-fit rounded bg-neutral-900 px-3 py-2 text-white"
         to="/items"
       >
         الأصناف

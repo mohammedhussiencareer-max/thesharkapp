@@ -14,6 +14,7 @@ const result: SyncResult = {
     missing: 0,
     shifts_upserted: 1,
     shifts_skipped: 0,
+    transactions: 0,
   },
 };
 

@@ -1,9 +1,14 @@
 import { compareId } from './hash.ts';
-import { mapOrderDocument, mapShiftDocument } from './mapper.ts';
+import {
+  mapOrderDocument,
+  mapShiftDocument,
+  mapShiftTransactions,
+} from './mapper.ts';
 import type {
   FirestoreRestDocument,
   ListQuery,
   PosFirestore,
+  TransactionListQuery,
 } from './pos-firestore.ts';
 import { window35From } from './scope.ts';
 import type {
@@ -17,6 +22,8 @@ export const RECENT_SHIFT_PAGE = 4;
 export const RECENT_SHIFT_LIMIT = 4;
 export const RECENT_SHIFT_MAX_PAGES = 20;
 export const RECENT_ORDER_LIMIT = 2000;
+/** Firestore rejects an IN filter with more than 30 values. */
+export const FIRESTORE_IN_LIMIT = 30;
 export const RANGE_LIMIT = 300;
 export const LIST_PAGE_SIZE = 300;
 export const MAX_LIST_PAGES = 10000;
@@ -114,13 +121,16 @@ export async function readPos(
   firestore: PosFirestore,
   now: Date,
 ): Promise<PosSnapshot> {
-  if (mode === 'recent') {
-    return readRecent(firestore);
-  }
-  if (mode === 'window35') {
-    return readWindow(firestore, now);
-  }
-  return readFull(firestore);
+  const snapshot =
+    mode === 'recent'
+      ? await readRecent(firestore)
+      : mode === 'window35'
+        ? await readWindow(firestore, now)
+        : await readFull(firestore);
+  return {
+    ...snapshot,
+    shifts: await attachTransactions(firestore, snapshot.shifts),
+  };
 }
 
 async function readRecent(firestore: PosFirestore): Promise<PosSnapshot> {
@@ -188,10 +198,14 @@ async function readWindow(
   if (probe.length > 0) {
     throw new Error('orders exist after the scan window');
   }
-  const orders = mapOrders(documents);
-  const shiftIds = [...new Set(orders.map((order) => order.shift_id))].sort(
-    compareId,
-  );
+  // Map the window once. A shift that opened earlier still owns orders from
+  // before `from`; those orders are in the drawer. Read them too, or the
+  // sales summary shows a false drawer difference. Each document is mapped
+  // once. Scope stays {from}, so orders before `from` are never marked missing.
+  const windowOrders = mapOrders(documents);
+  const shiftIds = [
+    ...new Set(windowOrders.map((order) => order.shift_id)),
+  ].sort(compareId);
   const shifts: PosShiftIngest[] = [];
   const missingShiftIds: string[] = [];
   for (const shiftId of shiftIds) {
@@ -202,12 +216,45 @@ async function readWindow(
     }
     shifts.push(mapShiftDocument(document));
   }
+  const uniqueShifts = uniqueById(shifts, 'shift');
+  const fromMs = Date.parse(from);
+  const earlyShiftIds = uniqueShifts
+    .filter((shift) => openedBefore(shift.opened_at, fromMs))
+    .map((shift) => shift.id);
+  const backfill = await readOrdersForShifts(firestore, earlyShiftIds);
+  const seenNames = new Set(documents.map((document) => document.name));
+  const fresh = backfill.filter((document) => !seenNames.has(document.name));
   return {
-    shifts: uniqueById(shifts, 'shift'),
-    orders,
+    shifts: uniqueShifts,
+    orders: uniqueById([...windowOrders, ...mapOrders(fresh)], 'order'),
     scope: { from },
     missingShiftIds,
   };
+}
+
+function openedBefore(openedAt: string, fromMs: number): boolean {
+  const openedMs = Date.parse(openedAt);
+  if (!Number.isFinite(openedMs) || !Number.isFinite(fromMs)) {
+    throw new Error('invalid timestamp');
+  }
+  return openedMs < fromMs;
+}
+
+async function readOrdersForShifts(
+  firestore: PosFirestore,
+  shiftIds: string[],
+): Promise<FirestoreRestDocument[]> {
+  const documents: FirestoreRestDocument[] = [];
+  const sorted = [...shiftIds].sort(compareId);
+  for (let index = 0; index < sorted.length; index += FIRESTORE_IN_LIMIT) {
+    const chunk = sorted.slice(index, index + FIRESTORE_IN_LIMIT);
+    const page = await firestore.queryOrders(recentOrdersQuery(chunk));
+    if (page.length >= RECENT_ORDER_LIMIT) {
+      throw new Error('recent orders page was truncated');
+    }
+    documents.push(...page);
+  }
+  return documents;
 }
 
 async function readFull(firestore: PosFirestore): Promise<PosSnapshot> {
@@ -222,6 +269,49 @@ async function readFull(firestore: PosFirestore): Promise<PosSnapshot> {
     scope: { all: true },
     missingShiftIds: [],
   };
+}
+
+async function attachTransactions(
+  firestore: PosFirestore,
+  shifts: PosShiftIngest[],
+): Promise<PosShiftIngest[]> {
+  const next: PosShiftIngest[] = [];
+  for (const shift of shifts) {
+    const documents = await listShiftTransactions(firestore, shift.id);
+    next.push({
+      ...shift,
+      transactions: mapShiftTransactions(shift.id, documents),
+    });
+  }
+  return next;
+}
+
+async function listShiftTransactions(
+  firestore: PosFirestore,
+  shiftId: string,
+): Promise<FirestoreRestDocument[]> {
+  const documents: FirestoreRestDocument[] = [];
+  const seenTokens = new Set<string>();
+  let pageToken: string | undefined;
+  for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
+    if (pageToken !== undefined) {
+      if (seenTokens.has(pageToken)) {
+        throw new Error('repeated Firestore page token');
+      }
+      seenTokens.add(pageToken);
+    }
+    const query: TransactionListQuery = { pageSize: LIST_PAGE_SIZE };
+    if (pageToken !== undefined) {
+      query.pageToken = pageToken;
+    }
+    const result = await firestore.listShiftTransactions(shiftId, query);
+    documents.push(...result.documents);
+    if (result.nextPageToken === undefined) {
+      return documents;
+    }
+    pageToken = result.nextPageToken;
+  }
+  throw new Error('Firestore page limit exceeded');
 }
 
 async function listAll(

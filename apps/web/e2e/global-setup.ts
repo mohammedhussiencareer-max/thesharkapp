@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from '../src/lib/database.types';
 import { assertLocalSupabaseUrl } from './local-guard';
+import { seedSales } from './seed-sales';
 import { localServiceRoleKey, ownerEmail, ownerPassword } from './.test-owner';
 
 const localApiUrl = process.env.E2E_SUPABASE_URL ?? 'http://127.0.0.1:55421';
@@ -45,6 +46,7 @@ export default async function globalSetup(): Promise<void> {
     .from('owner')
     .upsert({ id: true, user_id: userId }, { onConflict: 'id' });
   if (saved.error) throw saved.error;
+  await seedSales(client, localApiUrl);
 }
 
 async function findOwnerId(

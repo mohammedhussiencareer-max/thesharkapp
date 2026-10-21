@@ -19,6 +19,7 @@ export type SyncCounts = {
   missing: number;
   shifts_upserted: number;
   shifts_skipped: number;
+  transactions: number;
 };
 
 export type SyncResult = {
@@ -39,6 +40,7 @@ function emptyCounts(): SyncCounts {
     missing: 0,
     shifts_upserted: 0,
     shifts_skipped: 0,
+    transactions: 0,
   };
 }
 
@@ -67,9 +69,13 @@ export async function runPosSync(input: {
     const orders = [...read.orders].sort((left, right) =>
       compareId(left.id, right.id),
     );
+    const transactionCount = shifts.reduce(
+      (sum, shift) => sum + shift.transactions.length,
+      0,
+    );
     counts.read = orders.length;
     input.logger?.(
-      `pos sync read mode=${input.mode} shifts=${shifts.length} orders=${orders.length} shift_ids=${shifts.map((shift) => shift.id).join(',')} missing_shifts=${read.missingShiftIds.join(',')}`,
+      `pos sync read mode=${input.mode} shifts=${shifts.length} orders=${orders.length} transactions=${transactionCount} shift_ids=${shifts.map((shift) => shift.id).join(',')} missing_shifts=${read.missingShiftIds.join(',')}`,
     );
     const calls = planIngestCalls({ shifts, orders, scope: read.scope });
     for (const call of calls) {
@@ -86,6 +92,7 @@ export async function runPosSync(input: {
       counts.missing += chunk.missing;
       counts.shifts_upserted += chunk.shifts_upserted;
       counts.shifts_skipped += chunk.shifts_skipped;
+      counts.transactions += chunk.transactions;
     }
     await db.finishRun(runId, 'ok', { ...counts }, null);
     return {

@@ -4,6 +4,7 @@ import {
   StaleWriteError,
 } from '@/items/errors';
 import type { ItemExpectation } from '@/items/expectation';
+import { exactDecimal } from '@/lib/decimal';
 import { supabase } from '@/lib/supabase';
 import {
   isBaseUnit,
@@ -60,14 +61,6 @@ function toNumber(value: unknown): number {
   return 0;
 }
 
-/** Exact decimal text from a PostgREST `::text` cast. Rejects JSON numbers. */
-function exactDecimal(value: unknown): string {
-  if (typeof value !== 'string') throw new Error(genericCatalogError);
-  const text = value.trim();
-  if (!/^-?\d+(\.\d+)?$/.test(text)) throw new Error(genericCatalogError);
-  return text;
-}
-
 /** PostgREST accepts a JSON decimal string for a numeric column. */
 function numericColumn(value: string): number {
   return value as unknown as number;
@@ -115,7 +108,7 @@ export async function listItems(): Promise<CatalogItem[]> {
   throwIfError(error);
 
   return (data ?? []).map((row) => {
-    const storedLossPct = exactDecimal(row.loss_pct_text);
+    const storedLossPct = exactDecimal(row.loss_pct_text, genericCatalogError);
     if (
       !isStockKind(row.kind) ||
       !isBaseUnit(row.base_unit) ||
@@ -191,7 +184,7 @@ function conversionRows(value: unknown): UnitConversion[] {
       itemId: record.item_id,
       unit: record.unit,
       factorToBase: toNumber(record.factor_to_base),
-      storedFactor: exactDecimal(record.factor_text),
+      storedFactor: exactDecimal(record.factor_text, genericCatalogError),
     };
   });
 }

@@ -1,9 +1,15 @@
-import { isRecord, isSafeDocumentId, splitDocumentName } from './decode.ts';
+import {
+  isRecord,
+  isSafeDocumentId,
+  splitDocumentName,
+  splitTransactionName,
+} from './decode.ts';
 import type {
   FirestoreRestDocument,
   ListPage,
   ListQuery,
   PosFirestore,
+  TransactionListQuery,
 } from './pos-firestore.ts';
 
 const ORIGIN = 'https://firestore.googleapis.com';
@@ -55,6 +61,25 @@ export function firestoreGetUrl(
 
 export function firestoreRunQueryUrl(): string {
   return `${ORIGIN}${RUN_QUERY_PATH}`;
+}
+
+export function firestoreTransactionsUrl(
+  shiftId: string,
+  query: TransactionListQuery,
+): string {
+  if (!isSafeDocumentId(shiftId)) {
+    throw new Error('Firestore read refused');
+  }
+  const url = new URL(
+    `${ORIGIN}${DOCUMENT_PATH}/custody_shifts/${encodeURIComponent(shiftId)}/transactions`,
+  );
+  url.searchParams.set('pageSize', String(query.pageSize));
+  if (query.pageToken !== undefined) {
+    url.searchParams.set('pageToken', query.pageToken);
+  }
+  const text = url.toString();
+  assertFirestoreReadAllowed('GET', text);
+  return text;
 }
 
 export function assertFirestoreReadAllowed(
@@ -111,6 +136,21 @@ export function assertFirestoreReadAllowed(
     }
     return;
   }
+  // List only: custody_shifts/{shiftId}/transactions. A single transaction
+  // document, any other subcollection, and anything deeper are refused.
+  if (segments.length === 3) {
+    const shiftId = segments[1];
+    if (
+      segments[0] !== 'custody_shifts' ||
+      segments[2] !== 'transactions' ||
+      shiftId === undefined ||
+      !isSafeDocumentId(shiftId)
+    ) {
+      throw new Error('Firestore read refused');
+    }
+    assertTransactionListParams(parsed.searchParams);
+    return;
+  }
   throw new Error('Firestore read refused');
 }
 
@@ -120,12 +160,17 @@ function assertCollection(collection: string | undefined): void {
   }
 }
 
-function assertListParams(params: URLSearchParams): void {
+function assertTransactionListParams(params: URLSearchParams): void {
   for (const key of params.keys()) {
-    if (key !== 'pageSize' && key !== 'pageToken' && key !== 'orderBy') {
+    if (key !== 'pageSize' && key !== 'pageToken') {
       throw new Error('Firestore read refused');
     }
   }
+  assertPageSize(params);
+  assertPageToken(params);
+}
+
+function assertPageSize(params: URLSearchParams): void {
   const pageSizes = params.getAll('pageSize');
   const pageSize = pageSizes[0];
   if (
@@ -136,6 +181,27 @@ function assertListParams(params: URLSearchParams): void {
   ) {
     throw new Error('Firestore read refused');
   }
+}
+
+function assertPageToken(params: URLSearchParams): void {
+  const tokens = params.getAll('pageToken');
+  const token = tokens[0];
+  if (
+    tokens.length > 1 ||
+    (tokens.length === 1 && (token === undefined || token.length === 0))
+  ) {
+    throw new Error('Firestore read refused');
+  }
+}
+
+function assertListParams(params: URLSearchParams): void {
+  for (const key of params.keys()) {
+    if (key !== 'pageSize' && key !== 'pageToken' && key !== 'orderBy') {
+      throw new Error('Firestore read refused');
+    }
+  }
+  assertPageSize(params);
+  assertPageToken(params);
   const orderBy = params.getAll('orderBy');
   if (orderBy.length > 1) {
     throw new Error('Firestore read refused');
@@ -146,14 +212,6 @@ function assertListParams(params: URLSearchParams): void {
     direction !== 'opening_time' &&
     direction !== 'opening_time asc' &&
     direction !== 'opening_time desc'
-  ) {
-    throw new Error('Firestore read refused');
-  }
-  const tokens = params.getAll('pageToken');
-  const token = tokens[0];
-  if (
-    tokens.length > 1 ||
-    (tokens.length === 1 && (token === undefined || token.length === 0))
   ) {
     throw new Error('Firestore read refused');
   }
@@ -438,12 +496,28 @@ function isRfc3339(value: unknown): boolean {
   return Number.isFinite(Date.parse(`${date}T${time}.${millis}${offset}`));
 }
 
+function assertKnownDocumentName(name: string): void {
+  const rest = name.startsWith(
+    'projects/thesharkrestaurant/databases/(default)/documents/',
+  )
+    ? name.slice(
+        'projects/thesharkrestaurant/databases/(default)/documents/'.length,
+      )
+    : '';
+  const depth = rest === '' ? 0 : rest.split('/').length;
+  if (depth === 4) {
+    splitTransactionName(name);
+    return;
+  }
+  splitDocumentName(name);
+}
+
 function requireDocument(value: unknown): FirestoreRestDocument {
   if (!isRecord(value) || typeof value.name !== 'string') {
     throw new Error('Firestore read failed: invalid response');
   }
   try {
-    splitDocumentName(value.name);
+    assertKnownDocumentName(value.name);
   } catch (error) {
     throw new Error('Firestore read failed: invalid response', {
       cause: error,
@@ -520,6 +594,16 @@ export function createPosFirestore(
       const payload = await firestoreFetch(
         'GET',
         firestoreListUrl(collection, query),
+        token,
+        undefined,
+        fetchImpl,
+      );
+      return parseListResponse(payload);
+    },
+    async listShiftTransactions(shiftId, query) {
+      const payload = await firestoreFetch(
+        'GET',
+        firestoreTransactionsUrl(shiftId, query),
         token,
         undefined,
         fetchImpl,

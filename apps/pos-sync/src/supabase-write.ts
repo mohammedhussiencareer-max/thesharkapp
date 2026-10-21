@@ -171,6 +171,7 @@ function parseCounts(value: unknown): IngestCounts {
     missing: countField(value.missing),
     shifts_upserted: countField(value.shifts_upserted),
     shifts_skipped: countField(value.shifts_skipped),
+    transactions: countField(value.transactions),
   };
 }
 

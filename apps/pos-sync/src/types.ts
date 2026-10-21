@@ -3,12 +3,23 @@ export type SyncMode = 'recent' | 'window35' | 'full';
 export type SyncScope =
   { shift_ids: string[] } | { from: string } | { all: true };
 
+export type PosShiftTransactionIngest = {
+  tx_id: string;
+  order_id: string | null;
+  tx_type: number;
+  amount: string;
+  occurred_at: string;
+};
+
 export type PosShiftIngest = {
   id: string;
   opened_at: string;
   closed_at: string | null;
   is_active: boolean;
   pos_update_time: string;
+  drawer_cash_net: string | null;
+  drawer_credit: string | null;
+  transactions: PosShiftTransactionIngest[];
 };
 
 export type PosLineOptionIngest = {
@@ -93,4 +104,5 @@ export type IngestCounts = {
   missing: number;
   shifts_upserted: number;
   shifts_skipped: number;
+  transactions: number;
 };

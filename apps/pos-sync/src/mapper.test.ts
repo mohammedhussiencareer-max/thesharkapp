@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { contentHash } from './hash.ts';
+import { canonicalJson, contentHash } from './hash.ts';
 import {
   mapOrderDocument,
   mapShiftDocument,
+  mapShiftTransaction,
   storedProjection,
 } from './mapper.ts';
 
@@ -255,8 +256,36 @@ describe('mapShiftDocument', () => {
       closed_at: null,
       is_active: true,
       pos_update_time: '2026-10-15T18:00:00.000000Z',
+      drawer_cash_net: null,
+      drawer_credit: null,
+      transactions: [],
     });
     expect(JSON.stringify(shift)).not.toContain('drawer-should-drop');
+  });
+
+  it('keeps drawer totals as exact money and ignores every other drawer field', () => {
+    const shift = mapShiftDocument({
+      name: `${NAME_PREFIX}/custody_shifts/shift-test-1`,
+      updateTime: '2026-10-15T18:00:00Z',
+      fields: {
+        opening_time: ts('2026-10-15T09:00:00Z'),
+        isActive: bool(false),
+        cash_payments_net: dbl(100.5),
+        credit_payments: int(20),
+        difference: dbl(-12.34),
+        expected_drawer_money: int(1),
+        opening_amount: int(2),
+        closing_amount: int(3),
+        cash_drop: int(4),
+        total_pay_ins: int(5),
+        total_pay_outs: int(6),
+        drawer_open_count: int(7),
+      },
+    });
+    expect(shift.drawer_cash_net).toBe('100.50');
+    expect(shift.drawer_credit).toBe('20.00');
+    expect(JSON.stringify(shift)).not.toContain('difference');
+    expect(JSON.stringify(shift)).not.toContain('-12.34');
   });
 
   it('rejects a shift id that does not match the document', () => {
@@ -271,5 +300,126 @@ describe('mapShiftDocument', () => {
         },
       }),
     ).toThrow(/does not match/);
+  });
+});
+
+const TX_SENTINEL = 'pii-tx-description 01000000000';
+
+function txDocument(
+  shiftId: string,
+  txId: string,
+  fields: Record<string, unknown>,
+) {
+  return {
+    name: `${NAME_PREFIX}/custody_shifts/${shiftId}/transactions/${txId}`,
+    fields,
+  };
+}
+
+describe('mapShiftTransaction', () => {
+  it('keeps types 0, 2 and 3 and ignores a PII-looking description', () => {
+    const order = mapOrderDocument({
+      name: `${NAME_PREFIX}/orders/order-test-1`,
+      updateTime: '2026-10-15T12:00:00Z',
+      fields: {
+        status: str('complete'),
+        shiftId: str('shift-test-1'),
+        timestamp: ts('2026-10-15T12:00:00Z'),
+        subtotalAmount: int(10),
+        discountAmount: int(0),
+        taxTotalAmount: int(0),
+        serviceTaxAmount: int(0),
+        totalAmount: int(10),
+      },
+    });
+    const hashBefore = order.content_hash;
+    const rows = [0, 2, 3].map((type) =>
+      mapShiftTransaction(
+        'shift-test-1',
+        txDocument('shift-test-1', `tx-${type}`, {
+          type: int(type),
+          amount: type === 0 ? int(15) : dbl(12.5),
+          timestamp: ts('2026-10-15T15:04:05Z'),
+          description: str(TX_SENTINEL),
+          operationKey: str('op-should-drop'),
+          id: str('field-id-should-drop'),
+          ...(type === 2 ? {} : { orderId: str('order-test-1') }),
+        }),
+      ),
+    );
+    expect(rows[0]).toEqual({
+      tx_id: 'tx-0',
+      order_id: 'order-test-1',
+      tx_type: 0,
+      amount: '15.00',
+      occurred_at: '2026-10-15T15:04:05.000000Z',
+    });
+    expect(rows[1]?.order_id).toBeNull();
+    expect(rows[1]?.amount).toBe('12.50');
+    expect(rows[2]?.tx_type).toBe(3);
+    const encoded = JSON.stringify(rows);
+    expect(encoded).not.toContain(TX_SENTINEL);
+    expect(encoded).not.toContain('01000000000');
+    expect(encoded).not.toContain('op-should-drop');
+    expect(keysDeep(rows)).not.toContain('description');
+    expect(order.content_hash).toBe(hashBefore);
+    expect(canonicalJson(storedProjection(order))).not.toContain(TX_SENTINEL);
+    expect(canonicalJson({ transactions: rows })).not.toContain(TX_SENTINEL);
+  });
+
+  it('rejects a bad type, amount, or timestamp', () => {
+    expect(() =>
+      mapShiftTransaction(
+        'shift-test-1',
+        txDocument('shift-test-1', 'tx-bad', {
+          type: dbl(1.5),
+          amount: int(1),
+          timestamp: ts('2026-10-15T15:00:00Z'),
+        }),
+      ),
+    ).toThrow(/unexpected type/);
+    expect(() =>
+      mapShiftTransaction(
+        'shift-test-1',
+        txDocument('shift-test-1', 'tx-bad', {
+          type: str('refund'),
+          amount: int(1),
+          timestamp: ts('2026-10-15T15:00:00Z'),
+        }),
+      ),
+    ).toThrow(/unexpected type/);
+    expect(() =>
+      mapShiftTransaction(
+        'shift-test-1',
+        txDocument('shift-test-1', 'tx-bad', {
+          type: int(3),
+          amount: str('12.50'),
+          timestamp: ts('2026-10-15T15:00:00Z'),
+        }),
+      ),
+    ).toThrow(/unexpected amount/);
+    expect(() =>
+      mapShiftTransaction(
+        'shift-test-1',
+        txDocument('shift-test-1', 'tx-bad', {
+          type: int(3),
+          amount: int(1),
+          timestamp: str('not-a-time'),
+        }),
+      ),
+    ).toThrow(/timestamp/);
+  });
+
+  it('rejects a transaction whose parent shift does not match', () => {
+    expect(() =>
+      mapShiftTransaction(
+        'shift-test-1',
+        txDocument('shift-test-other', 'tx-a', {
+          type: int(3),
+          amount: int(1),
+          timestamp: ts('2026-10-15T15:00:00Z'),
+        }),
+      ),
+    ).toThrow(/invalid response/);
   });
 });
