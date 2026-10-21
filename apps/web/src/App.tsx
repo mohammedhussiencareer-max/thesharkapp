@@ -3,6 +3,7 @@ import { AuthProvider } from '@/auth/AuthProvider';
 import { RequireOwner } from '@/auth/RequireOwner';
 import { useAuth } from '@/lib/auth-context';
 import { supabase } from '@/lib/supabase';
+import { ExpensesPage } from '@/pages/ExpensesPage';
 import { HomePage } from '@/pages/HomePage';
 import { ItemsPage } from '@/pages/ItemsPage';
 import { LoginPage } from '@/pages/LoginPage';
@@ -27,6 +28,14 @@ export function AppRoutes() {
         element={
           <RequireOwner>
             <HomeRoute />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/expenses"
+        element={
+          <RequireOwner>
+            <ExpensesPage />
           </RequireOwner>
         }
       />

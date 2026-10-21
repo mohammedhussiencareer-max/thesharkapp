@@ -36,6 +36,12 @@ export function HomePage({
       >
         المشتريات
       </Link>
+      <Link
+        className="inline-flex w-fit rounded bg-neutral-900 px-3 py-2 text-white"
+        to="/expenses"
+      >
+        المصاريف
+      </Link>
       <button type="button" onClick={onSignOut}>
         تسجيل الخروج
       </button>

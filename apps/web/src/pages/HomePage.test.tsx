@@ -32,6 +32,10 @@ describe('HomePage', () => {
       'href',
       '/purchases',
     );
+    expect(screen.getByRole('link', { name: 'المصاريف' })).toHaveAttribute(
+      'href',
+      '/expenses',
+    );
 
     fireEvent.click(screen.getByRole('button', { name: 'تسجيل الخروج' }));
     expect(onSignOut).toHaveBeenCalledOnce();
