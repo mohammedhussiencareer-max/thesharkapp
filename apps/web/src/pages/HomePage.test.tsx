@@ -25,6 +25,13 @@ describe('HomePage', () => {
       'href',
       '/items',
     );
+    expect(
+      screen.getByRole('link', { name: 'الرصيد الافتتاحي' }),
+    ).toHaveAttribute('href', '/opening');
+    expect(screen.getByRole('link', { name: 'المشتريات' })).toHaveAttribute(
+      'href',
+      '/purchases',
+    );
 
     fireEvent.click(screen.getByRole('button', { name: 'تسجيل الخروج' }));
     expect(onSignOut).toHaveBeenCalledOnce();
