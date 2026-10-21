@@ -1,100 +1,72 @@
 import { describe, expect, it } from 'vitest';
-import {
-  postgrestMaxPages,
-  postgrestPageSize,
-  readAllPages,
-} from '@/lib/paged';
+import { fetchAllPages, maxPages, PageCapError, pageSize } from '@/lib/paged';
 
-const pageError = 'حصل خطأ. حاول تاني.';
-
-function scripted(
-  pages: { data: unknown; error: { message?: string } | null }[],
-) {
-  const ranges: { from: number; to: number }[] = [];
-  let index = 0;
-  const query = {
-    range(from: number, to: number) {
-      ranges.push({ from, to });
-      const result = pages[index] ?? { data: [], error: null };
-      index += 1;
-      return Promise.resolve(result);
-    },
+function pagesOf(rows: readonly number[]) {
+  const calls: Array<[number, number]> = [];
+  const load = (from: number, to: number) => {
+    calls.push([from, to]);
+    return Promise.resolve({
+      data: rows.slice(from, to + 1),
+      error: null,
+    });
   };
-  return { query, ranges };
+  return { calls, load };
 }
 
-function numberedPage(start: number, length: number): number[] {
-  return Array.from({ length }, (_, offset) => start + offset);
-}
+describe('fetchAllPages', () => {
+  it('returns 1002 rows in order when the second page is short', async () => {
+    const rows = Array.from({ length: pageSize + 2 }, (_, index) => index);
+    const { calls, load } = pagesOf(rows);
 
-describe('readAllPages', () => {
-  it('returns 1002 rows in order from a full page and a short page', async () => {
-    const { query, ranges } = scripted([
-      { data: numberedPage(0, postgrestPageSize), error: null },
-      { data: numberedPage(postgrestPageSize, 2), error: null },
-    ]);
-
-    const rows = await readAllPages<number>(query, pageError);
-
-    expect(rows).toHaveLength(1002);
-    expect(rows[0]).toBe(0);
-    expect(rows[999]).toBe(999);
-    expect(rows[1000]).toBe(1000);
-    expect(rows[1001]).toBe(1001);
-    expect(ranges).toEqual([
-      { from: 0, to: 999 },
-      { from: 1000, to: 1999 },
+    await expect(fetchAllPages(load, String)).resolves.toEqual(rows);
+    expect(calls).toEqual([
+      [0, pageSize - 1],
+      [pageSize, pageSize * 2 - 1],
     ]);
   });
 
-  it('returns the full page when the next page is empty', async () => {
-    const { query, ranges } = scripted([
-      { data: numberedPage(0, postgrestPageSize), error: null },
-      { data: [], error: null },
-    ]);
+  it('stops after a full page followed by an empty page', async () => {
+    const rows = Array.from({ length: pageSize }, (_, index) => index);
+    const { calls, load } = pagesOf(rows);
 
-    const rows = await readAllPages<number>(query, pageError);
-
-    expect(rows).toHaveLength(1000);
-    expect(rows[0]).toBe(0);
-    expect(rows[999]).toBe(999);
-    expect(ranges).toEqual([
-      { from: 0, to: 999 },
-      { from: 1000, to: 1999 },
+    await expect(fetchAllPages(load, String)).resolves.toEqual(rows);
+    expect(calls).toEqual([
+      [0, pageSize - 1],
+      [pageSize, pageSize * 2 - 1],
     ]);
   });
 
-  it('fails closed when every page is full up to the cap', async () => {
-    const full = numberedPage(0, postgrestPageSize);
-    const ranges: { from: number; to: number }[] = [];
-    const query = {
-      range(from: number, to: number) {
-        ranges.push({ from, to });
-        return Promise.resolve({ data: full, error: null });
-      },
+  it('drops a row repeated when another session inserts between pages', async () => {
+    // Ordered by an immutable key on an append-only table: an insert that
+    // sorts before the read position shifts the rest forward by one.
+    const table = Array.from({ length: pageSize + 2 }, (_, index) => index + 1);
+    const load = (from: number, to: number) => {
+      if (from === pageSize) table.unshift(0);
+      return Promise.resolve({ data: table.slice(from, to + 1), error: null });
     };
 
-    await expect(readAllPages(query, pageError)).rejects.toThrow(pageError);
-    expect(ranges).toHaveLength(postgrestMaxPages);
-    expect(ranges[0]).toEqual({ from: 0, to: postgrestPageSize - 1 });
-    expect(ranges[1]).toEqual({
-      from: postgrestPageSize,
-      to: postgrestPageSize * 2 - 1,
-    });
-    expect(ranges[postgrestMaxPages - 1]).toEqual({
-      from: (postgrestMaxPages - 1) * postgrestPageSize,
-      to: postgrestMaxPages * postgrestPageSize - 1,
-    });
+    const read = await fetchAllPages(load, String);
+    expect(read).toHaveLength(pageSize + 2);
+    expect(new Set(read).size).toBe(read.length);
+    expect(read).toEqual(
+      Array.from({ length: pageSize + 2 }, (_, index) => index + 1),
+    );
   });
 
-  it('uses the caller error when a page fails', async () => {
-    const { query } = scripted([
-      {
-        data: null,
-        error: { message: 'permission denied for schema app' },
-      },
-    ]);
+  it('fails closed when every page is full through the cap', async () => {
+    const calls: number[] = [];
+    const load = (from: number) => {
+      calls.push(from);
+      return Promise.resolve({
+        data: Array.from({ length: pageSize }, (_, index) => from + index),
+        error: null,
+      });
+    };
 
-    await expect(readAllPages(query, pageError)).rejects.toThrow(pageError);
+    await expect(fetchAllPages(load, String)).rejects.toBeInstanceOf(
+      PageCapError,
+    );
+    expect(calls).toHaveLength(maxPages);
+    expect(calls[maxPages - 1]).toBe((maxPages - 1) * pageSize);
   });
 });

@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './fixtures';
 
 test('signed-out home redirects to login and stays RTL', async ({ page }) => {
   await page.goto('/');

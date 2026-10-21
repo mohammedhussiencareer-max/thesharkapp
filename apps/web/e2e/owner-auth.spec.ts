@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './fixtures';
 import { ownerEmail, ownerPassword } from './.test-owner';
 
 test('owner signs in, sees their email, and signs out', async ({ page }) => {

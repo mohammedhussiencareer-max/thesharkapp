@@ -1,6 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from '../src/lib/database.types';
-import { assertLocalSupabaseUrl } from './local-guard';
+import { assertLocalSupabaseUrl, developmentSupabaseUrl } from './local-guard';
 import { seedSales } from './seed-sales';
 import { localServiceRoleKey, ownerEmail, ownerPassword } from './.test-owner';
 
@@ -18,6 +18,7 @@ function isExistingUser(error: {
 }
 
 export default async function globalSetup(): Promise<void> {
+  assertLocalSupabaseUrl(developmentSupabaseUrl());
   assertLocalSupabaseUrl(localApiUrl);
 
   const client = createClient<Database>(localApiUrl, localServiceRoleKey, {

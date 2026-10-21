@@ -24,6 +24,18 @@ export function HomePage({
       >
         الأصناف
       </Link>
+      <Link
+        className="inline-flex w-fit rounded bg-neutral-900 px-3 py-2 text-white"
+        to="/opening"
+      >
+        الرصيد الافتتاحي
+      </Link>
+      <Link
+        className="inline-flex w-fit rounded bg-neutral-900 px-3 py-2 text-white"
+        to="/purchases"
+      >
+        المشتريات
+      </Link>
       <button type="button" onClick={onSignOut}>
         تسجيل الخروج
       </button>

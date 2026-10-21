@@ -45,6 +45,46 @@ isOneToOne: false
       referencedColumns: ["id"]
     }
                   ]
+                },"opening_stock_lines": {
+                  Row: {
+                    "item_id": string,"line_no": number,"opening_id": string,"quantity": number,"unit": string,"unit_cost": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "item_id": string,"line_no": number,"opening_id": string,"quantity": number,"unit": string,"unit_cost": number
+                  }
+                  Update: {
+                    "item_id"?: string,"line_no"?: number,"opening_id"?: string,"quantity"?: number,"unit"?: string,"unit_cost"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "opening_stock_lines_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "opening_stock_lines_opening_id_fkey"
+      columns: ["opening_id"]
+isOneToOne: false
+      referencedRelation: "opening_stocks"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"opening_stocks": {
+                  Row: {
+                    "created_at": string,"created_by": string | null,"id": string,"occurred_at": string,"request_id": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_at"?: string,"created_by"?: string | null,"id": string,"occurred_at": string,"request_id": string
+                  }
+                  Update: {
+                    "created_at"?: string,"created_by"?: string | null,"id"?: string,"occurred_at"?: string,"request_id"?: string
+                  }
+                  Relationships: [
+                    
+                  ]
                 },"owner": {
                   Row: {
                     "created_at": string,"id": boolean,"user_id": string
@@ -193,6 +233,52 @@ isOneToOne: true
       referencedColumns: ["id"]
     }
                   ]
+                },"purchase_lines": {
+                  Row: {
+                    "amount_paid": number,"base_quantity": number,"item_id": string,"line_no": number,"movement_id": number,"purchase_id": string,"quantity": number,"unit": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "amount_paid": number,"base_quantity": number,"item_id": string,"line_no": number,"movement_id": number,"purchase_id": string,"quantity": number,"unit": string
+                  }
+                  Update: {
+                    "amount_paid"?: number,"base_quantity"?: number,"item_id"?: string,"line_no"?: number,"movement_id"?: number,"purchase_id"?: string,"quantity"?: number,"unit"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "purchase_lines_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "purchase_lines_movement_id_fkey"
+      columns: ["movement_id"]
+isOneToOne: true
+      referencedRelation: "stock_movements"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "purchase_lines_purchase_id_fkey"
+      columns: ["purchase_id"]
+isOneToOne: false
+      referencedRelation: "purchases"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"purchases": {
+                  Row: {
+                    "batch_id": string,"created_at": string,"created_by": string | null,"id": string,"invoice_no": string | null,"note": string | null,"purchased_at": string,"request_id": string,"supplier": string | null,"total_paid": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "batch_id": string,"created_at"?: string,"created_by"?: string | null,"id"?: string,"invoice_no"?: string | null,"note"?: string | null,"purchased_at": string,"request_id": string,"supplier"?: string | null,"total_paid": number
+                  }
+                  Update: {
+                    "batch_id"?: string,"created_at"?: string,"created_by"?: string | null,"id"?: string,"invoice_no"?: string | null,"note"?: string | null,"purchased_at"?: string,"request_id"?: string,"supplier"?: string | null,"total_paid"?: number
+                  }
+                  Relationships: [
+                    
+                  ]
                 },"stock_items": {
                   Row: {
                     "active": boolean,"base_unit": string,"count_frequency": string,"created_at": string,"id": string,"kind": string,"loss_pct": number,"name": string,"parent_item_id": string | null
@@ -306,6 +392,12 @@ isOneToOne: false
                            },
 "post_sort":
 { Args: { "p_mixed_item": string,"p_occurred_at": string,"p_qty_taken": number,"p_shift_id"?: string,"p_sizes": Json }; Returns: string
+                           },
+"record_opening_stock":
+{ Args: { "p_lines": Json,"p_occurred_at": string,"p_request_id": string }; Returns: string
+                           },
+"record_purchase":
+{ Args: { "p_purchase": Json }; Returns: string
                            },
 "replace_pos_order_lines":
 { Args: { "p_lines": Json,"p_order_id": string }; Returns: undefined
