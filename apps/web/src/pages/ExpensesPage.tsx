@@ -119,6 +119,8 @@ export function ExpensesPage() {
           setNeedsReload(false);
         }
       } catch (error) {
+        // The write is already stored. Stay locked until a later read applies,
+        // and leave the error up so the owner can retry this load.
         setLoadError(messageFrom(error));
       }
     } catch (error) {

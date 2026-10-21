@@ -23,6 +23,7 @@ import type {
   ExpenseMonth,
 } from '@/expenses/types';
 import { retrySafeMessage } from '@/expenses/errors';
+import { genericCatalogError } from '@/items/errors';
 import { ExpensesPage } from '@/pages/ExpensesPage';
 
 vi.mock('@/expenses/api', () => ({
@@ -356,6 +357,41 @@ describe('ExpensesPage', () => {
       await Promise.resolve();
     });
     await waitFor(() => expect(screen.getByLabelText('الشهر')).toBeEnabled());
+  });
+
+  it('shows the load error and unlocks when the owner retries a failed reload', async () => {
+    renderPage();
+    fireEvent.change(await screen.findByLabelText('التصنيف'), {
+      target: { value: 'rent' },
+    });
+    fireEvent.change(screen.getByLabelText('المبلغ'), {
+      target: { value: '1000' },
+    });
+    const requested = vi.mocked(loadExpenseMonth).mock.calls[0]?.[0] ?? '';
+    vi.mocked(loadExpenseMonth).mockRejectedValueOnce(
+      new Error(genericCatalogError),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      genericCatalogError,
+    );
+    expect(
+      screen.getByRole('button', { name: 'إعادة المحاولة' }),
+    ).toBeEnabled();
+    expect(screen.getByLabelText('الشهر')).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'إلغاء المصروف' }),
+    ).toBeDisabled();
+
+    vi.mocked(loadExpenseMonth).mockImplementation((monthStart) =>
+      Promise.resolve(monthData(monthStart)),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => expect(screen.getByLabelText('الشهر')).toBeEnabled());
+    expect(screen.getByRole('button', { name: 'إلغاء المصروف' })).toBeEnabled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(loadExpenseMonth).toHaveBeenLastCalledWith(requested);
   });
 
   it('adds a category through the manager', async () => {

@@ -215,6 +215,30 @@ describe('expense api', () => {
     expect(month.entries.map((entry) => entry.id)).toEqual(['act', 'est']);
   });
 
+  it('reads a day total wider than numeric(14,2)', async () => {
+    install({
+      categories: query({ data: [categoryRow], error: null }),
+      lines: query({ data: [], error: null }),
+      days: query({
+        data: [
+          {
+            ...dayRow,
+            fixed_share_text: '0.00',
+            daily_total_text: '1000000000000.00',
+            total_text: '1000000000000.00',
+          },
+        ],
+        error: null,
+      }),
+      status: query({ data: null, error: null }),
+    });
+
+    const month = await loadExpenseMonth('2030-04-01');
+
+    expect(month.days[0]?.dailyTotal).toBe('1000000000000.00');
+    expect(month.days[0]?.total).toBe('1000000000000.00');
+  });
+
   it('rejects a JSON number where money text is required', async () => {
     install({
       categories: query({ data: [categoryRow], error: null }),

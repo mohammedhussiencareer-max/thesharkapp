@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  digitRunIgnoredCodePoints,
   driverPay,
   hasLongDigitRun,
+  longDigitRunSamples,
   parseHours,
   parseMoney,
+  shortDigitRunSamples,
 } from '@/expenses/amount';
 
 describe('expense amounts', () => {
@@ -22,16 +25,18 @@ describe('expense amounts', () => {
     expect(parseHours('10000')).toEqual({ ok: false, reason: 'large' });
   });
 
-  it('treats separated digits as one phone-like run', () => {
-    expect(hasLongDigitRun('01000000000')).toBe(true);
-    expect(hasLongDigitRun('010 0000 0000')).toBe(true);
-    expect(hasLongDigitRun('010-0000-0000')).toBe(true);
-    expect(hasLongDigitRun('010.0000.0000')).toBe(true);
-    expect(hasLongDigitRun('٠١٠٠٠٠٠٠٠٠٠')).toBe(true);
-    expect(hasLongDigitRun('٠١٠ ٠٠٠٠ ٠٠٠٠')).toBe(true);
-    expect(hasLongDigitRun('۰۱۰۰۰۰۰۰۰۰۰')).toBe(true);
-    expect(hasLongDigitRun('فاتورة 1234567')).toBe(false);
-    expect(hasLongDigitRun('رقم 1234x5678')).toBe(false);
+  it('treats every decimal digit as one run, including the shared separators', () => {
+    for (const sample of longDigitRunSamples) {
+      expect(hasLongDigitRun(sample)).toBe(true);
+    }
+    for (const sample of shortDigitRunSamples) {
+      expect(hasLongDigitRun(sample)).toBe(false);
+    }
+    for (const codePoint of digitRunIgnoredCodePoints) {
+      expect(
+        hasLongDigitRun(`1234${String.fromCodePoint(codePoint)}5678`),
+      ).toBe(true);
+    }
   });
 
   it('rounds driver pay half away from zero to the piaster', () => {

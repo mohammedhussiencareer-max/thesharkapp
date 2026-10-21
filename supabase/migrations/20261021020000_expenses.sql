@@ -26,10 +26,12 @@
 --
 -- The owner types the category name, the note, the void reason, and the driver
 -- label. One helper, app.text_has_long_digit_run, rejects a run of 8 or more
--- digits in all of them. Western, Arabic-Indic (٠-٩), and Extended
--- Arabic-Indic (۰-۹) digits count. Spaces, dashes, and dots between digits do
--- not break the run, so '010 0000 0000' and '٠١٠٠٠٠٠٠٠٠٠' are refused. The
--- message is 'مينفعش تكتب أرقام تليفونات أو أرقام قومية'.
+-- Unicode decimal digits (general category Nd) in all of them. The bracket
+-- class lists every Nd range from Node Unicode 16.0
+-- (process.versions.unicode), generated with /\p{Nd}/u over U+0000–U+10FFFF.
+-- The client uses the same property. Text is NFKC-normalized first. Spaces,
+-- dashes, dots, and zero-width format characters between digits do not break
+-- the run. The message is 'مينفعش تكتب أرقام تليفونات أو أرقام قومية'.
 --
 -- What counts, when the day is read (not at insert):
 --   * a voided row does not count, and a void marker never counts;
@@ -62,6 +64,11 @@
 -- days. app.expense_month_check reports whether the sum of the month's day
 -- totals equals the sum of the effective entries in that month.
 --
+-- Sums and outputs of expense_day_share, expense_daily, and expense_month_check
+-- are unconstrained numeric, rounded to 2 decimal places. One posted entry is
+-- still numeric(14,2). Adding entries that each fit that cap cannot overflow
+-- the day or the month total.
+--
 -- No advisory lock. A write does not update a running balance. Supersession is
 -- decided when a day is read. A second void of the same entry fails the unique
 -- voids_id constraint. Month status stores an explicit boolean, so two writers
@@ -81,9 +88,80 @@ declare
   v_text text;
   v_next text;
   v_step integer := 0;
+  -- Nd bracket class, Node Unicode 16.0, 71 inclusive ranges.
+  -- 0030-0039 0660-0669 06F0-06F9 07C0-07C9 0966-096F 09E6-09EF 0A66-0A6F
+  -- 0AE6-0AEF 0B66-0B6F 0BE6-0BEF 0C66-0C6F 0CE6-0CEF 0D66-0D6F 0DE6-0DEF
+  -- 0E50-0E59 0ED0-0ED9 0F20-0F29 1040-1049 1090-1099 17E0-17E9 1810-1819
+  -- 1946-194F 19D0-19D9 1A80-1A89 1A90-1A99 1B50-1B59 1BB0-1BB9 1C40-1C49
+  -- 1C50-1C59 A620-A629 A8D0-A8D9 A900-A909 A9D0-A9D9 A9F0-A9F9 AA50-AA59
+  -- ABF0-ABF9 FF10-FF19 104A0-104A9 10D30-10D39 10D40-10D49 11066-1106F
+  -- 110F0-110F9 11136-1113F 111D0-111D9 112F0-112F9 11450-11459 114D0-114D9
+  -- 11650-11659 116C0-116C9 116D0-116E3 11730-11739 118E0-118E9 11950-11959
+  -- 11BF0-11BF9 11C50-11C59 11D50-11D59 11DA0-11DA9 11F50-11F59 16130-16139
+  -- 16A60-16A69 16AC0-16AC9 16B50-16B59 16D70-16D79 1CCF0-1CCF9 1D7CE-1D7FF
+  -- 1E140-1E149 1E2F0-1E2F9 1E4F0-1E4F9 1E5F1-1E5FA 1E950-1E959 1FBF0-1FBF9
+  c_digit constant text := $nd$[0-9٠-٩۰-۹߀-߉०-९০-৯੦-੯૦-૯୦-୯௦-௯౦-౯೦-೯൦-൯෦-෯๐-๙໐-໙༠-༩၀-၉႐-႙០-៩᠐-᠙᥆-᥏᧐-᧙᪀-᪉᪐-᪙᭐-᭙᮰-᮹᱀-᱉᱐-᱙꘠-꘩꣐-꣙꤀-꤉꧐-꧙꧰-꧹꩐-꩙꯰-꯹０-９𐒠-𐒩𐴰-𐴹𐵀-𐵉𑁦-𑁯𑃰-𑃹𑄶-𑄿𑇐-𑇙𑋰-𑋹𑑐-𑑙𑓐-𑓙𑙐-𑙙𑛀-𑛉𑛐-𑛣𑜰-𑜹𑣠-𑣩𑥐-𑥙𑯰-𑯹𑱐-𑱙𑵐-𑵙𑶠-𑶩𑽐-𑽙𖄰-𖄹𖩠-𖩩𖫀-𖫉𖭐-𖭙𖵰-𖵹𜳰-𜳹𝟎-𝟿𞅀-𞅉𞋰-𞋹𞓰-𞓹𞗱-𞗺𞥐-𞥙🯰-🯹]$nd$;
+  -- Separators between digits. chr(45) is first so the hyphen is literal.
+  -- Whitespace: U+0009–U+000D, U+0020, U+00A0, U+1680, U+2000–U+200A,
+  -- U+2028, U+2029, U+202F, U+205F, U+3000.
+  -- Dashes: U+002D, U+2010–U+2015, U+2212, U+FE58, U+FE63, U+FF0D.
+  -- Dots: U+002E, U+066B, U+FF0E, U+3002, U+00B7.
+  -- Format: U+200B–U+200F, U+2060, U+FEFF, U+061C.
+  c_sep constant text := '['
+    || chr(45)
+    || chr(9)
+    || chr(10)
+    || chr(11)
+    || chr(12)
+    || chr(13)
+    || chr(32)
+    || chr(160)
+    || chr(5760)
+    || chr(8192)
+    || chr(8193)
+    || chr(8194)
+    || chr(8195)
+    || chr(8196)
+    || chr(8197)
+    || chr(8198)
+    || chr(8199)
+    || chr(8200)
+    || chr(8201)
+    || chr(8202)
+    || chr(8232)
+    || chr(8233)
+    || chr(8239)
+    || chr(8287)
+    || chr(12288)
+    || chr(8208)
+    || chr(8209)
+    || chr(8210)
+    || chr(8211)
+    || chr(8212)
+    || chr(8213)
+    || chr(8722)
+    || chr(65112)
+    || chr(65123)
+    || chr(65293)
+    || chr(46)
+    || chr(1643)
+    || chr(65294)
+    || chr(12290)
+    || chr(183)
+    || chr(8203)
+    || chr(8204)
+    || chr(8205)
+    || chr(8206)
+    || chr(8207)
+    || chr(8288)
+    || chr(65279)
+    || chr(1564)
+    || ']';
 begin
-  -- Any whitespace becomes a space so the run check can ignore it.
-  v_text := pg_catalog.regexp_replace(coalesce(p_text, ''), '[[:space:]]', ' ', 'g');
+  v_text := pg_catalog.normalize(
+    coalesce(p_text, ''),
+    'NFKC'
+  );
 
   if v_text = '' then
     return false;
@@ -97,7 +175,7 @@ begin
 
     v_next := pg_catalog.regexp_replace(
       v_text,
-      '([0-9٠-٩۰-۹])[- .–—−٫]+([0-9٠-٩۰-۹])',
+      '(' || c_digit || ')' || c_sep || '+(' || c_digit || ')',
       '\1\2',
       'g'
     );
@@ -106,11 +184,11 @@ begin
     v_text := v_next;
   end loop;
 
-  return v_text ~ '[0-9٠-٩۰-۹]{8}';
+  return v_text ~ (c_digit || '{8}');
 end;
 $$;
 
-comment on function app.text_has_long_digit_run (text) is 'True when free text contains a run of 8 or more digits. Spaces, dashes, and dots between digits are ignored. Counts Western, Arabic-Indic, and Extended Arabic-Indic digits.';
+comment on function app.text_has_long_digit_run (text) is 'True when free text contains a run of 8 or more Unicode decimal digits (Nd, Unicode 16.0). NFKC is applied first. Spaces, dashes, dots, and zero-width format characters between digits are ignored.';
 
 revoke all on function app.text_has_long_digit_run (text)
 from
@@ -1316,19 +1394,20 @@ create function app.expense_day_share (
   p_amount numeric,
   p_day_count integer,
   p_day_index integer
-) returns numeric(14, 2) language sql immutable security invoker
+) returns numeric language sql immutable security invoker
 set
   search_path = '' as $$
   select
-    (
+    round(
       (
         (p_amount * 100)::bigint / p_day_count
         + case
           when p_day_index <= ((p_amount * 100)::bigint % p_day_count) then 1
           else 0
         end
-      )::numeric / 100
-    )::numeric(14, 2);
+      )::numeric / 100,
+      2
+    );
 $$;
 
 comment on function app.expense_day_share (numeric, integer, integer) is 'Largest-remainder piaster share for one entry. Day 1 through the remainder get one extra piaster. 1000.00 / 30 is 33.34 on days 1-10 and 33.33 after that.';
@@ -1413,12 +1492,12 @@ service_role;
 
 create function app.expense_daily (p_from date, p_to date) returns table (
   "date" date,
-  fixed_share numeric(14, 2),
-  daily_total numeric(14, 2),
-  driver_total numeric(14, 2),
-  interest numeric(14, 2),
-  depreciation numeric(14, 2),
-  total numeric(14, 2)
+  fixed_share numeric,
+  daily_total numeric,
+  driver_total numeric,
+  interest numeric,
+  depreciation numeric,
+  total numeric
 ) language plpgsql stable security invoker
 set
   search_path = '' as $$
@@ -1503,27 +1582,36 @@ begin
     monthly_days as (
       select
         shares.day,
-        coalesce(
-          sum(shares.share) filter (
-            where
-              shares.kind = 'fixed_monthly'
+        round(
+          coalesce(
+            sum(shares.share) filter (
+              where
+                shares.kind = 'fixed_monthly'
+            ),
+            0
           ),
-          0
-        )::numeric(14, 2) as fixed_share,
-        coalesce(
-          sum(shares.share) filter (
-            where
-              shares.kind = 'interest'
+          2
+        ) as fixed_share,
+        round(
+          coalesce(
+            sum(shares.share) filter (
+              where
+                shares.kind = 'interest'
+            ),
+            0
           ),
-          0
-        )::numeric(14, 2) as interest,
-        coalesce(
-          sum(shares.share) filter (
-            where
-              shares.kind = 'depreciation'
+          2
+        ) as interest,
+        round(
+          coalesce(
+            sum(shares.share) filter (
+              where
+                shares.kind = 'depreciation'
+            ),
+            0
           ),
-          0
-        )::numeric(14, 2) as depreciation
+          2
+        ) as depreciation
       from
         shares
       group by
@@ -1532,20 +1620,26 @@ begin
     daily_days as (
       select
         effective.expense_date as day,
-        coalesce(
-          sum(effective.amount) filter (
-            where
-              effective.kind = 'daily'
+        round(
+          coalesce(
+            sum(effective.amount) filter (
+              where
+                effective.kind = 'daily'
+            ),
+            0
           ),
-          0
-        )::numeric(14, 2) as daily_total,
-        coalesce(
-          sum(effective.amount) filter (
-            where
-              effective.kind = 'driver_hours'
+          2
+        ) as daily_total,
+        round(
+          coalesce(
+            sum(effective.amount) filter (
+              where
+                effective.kind = 'driver_hours'
+            ),
+            0
           ),
-          0
-        )::numeric(14, 2) as driver_total
+          2
+        ) as driver_total
       from
         effective
       where
@@ -1556,14 +1650,15 @@ begin
     )
   select
     days.day as "date",
-    coalesce(monthly_days.fixed_share, 0)::numeric(14, 2) as fixed_share,
-    coalesce(daily_days.daily_total, 0)::numeric(14, 2) as daily_total,
-    coalesce(daily_days.driver_total, 0)::numeric(14, 2) as driver_total,
-    coalesce(monthly_days.interest, 0)::numeric(14, 2) as interest,
-    coalesce(monthly_days.depreciation, 0)::numeric(14, 2) as depreciation,
-    (
-      coalesce(monthly_days.fixed_share, 0) + coalesce(daily_days.daily_total, 0) + coalesce(daily_days.driver_total, 0) + coalesce(monthly_days.interest, 0) + coalesce(monthly_days.depreciation, 0)
-    )::numeric(14, 2) as total
+    round(coalesce(monthly_days.fixed_share, 0), 2) as fixed_share,
+    round(coalesce(daily_days.daily_total, 0), 2) as daily_total,
+    round(coalesce(daily_days.driver_total, 0), 2) as driver_total,
+    round(coalesce(monthly_days.interest, 0), 2) as interest,
+    round(coalesce(monthly_days.depreciation, 0), 2) as depreciation,
+    round(
+      coalesce(monthly_days.fixed_share, 0) + coalesce(daily_days.daily_total, 0) + coalesce(daily_days.driver_total, 0) + coalesce(monthly_days.interest, 0) + coalesce(monthly_days.depreciation, 0),
+      2
+    ) as total
   from
     days
     left join monthly_days on monthly_days.day = days.day
@@ -1585,16 +1680,16 @@ execute on function app.expense_daily (date, date) to authenticated,
 service_role;
 
 create function app.expense_month_check (p_month date) returns table (
-  days_total numeric(14, 2),
-  entries_total numeric(14, 2),
+  days_total numeric,
+  entries_total numeric,
   balanced boolean
 ) language plpgsql stable security invoker
 set
   search_path = '' as $$
 declare
   v_end date;
-  v_days numeric(14, 2);
-  v_entries numeric(14, 2);
+  v_days numeric;
+  v_entries numeric;
 begin
   if p_month is null
   or p_month <> pg_catalog.date_trunc('month', p_month::timestamp)::date then
@@ -1611,14 +1706,14 @@ begin
   v_end := (p_month + interval '1 month' - interval '1 day')::date;
 
   select
-    coalesce(sum(day_row.total), 0)::numeric(14, 2)
+    round(coalesce(sum(day_row.total), 0), 2)
   into
     v_days
   from
     app.expense_daily (p_month, v_end) day_row;
 
   select
-    coalesce(sum(entry.amount), 0)::numeric(14, 2)
+    round(coalesce(sum(entry.amount), 0), 2)
   into
     v_entries
   from

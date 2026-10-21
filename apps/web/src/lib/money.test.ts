@@ -18,6 +18,12 @@ describe('money text', () => {
     expect(formatEgpText('-1.50')).toBe('-1.50 ج.م');
   });
 
+  it('accepts a total wider than numeric(14,2)', () => {
+    expect(toPiasters('1000000000000.00')).toBe(100000000000000n);
+    expect(formatEgpText('1000000000000.00')).toBe('1000000000000.00 ج.م');
+    expect(addMoney('999999999999.99', '0.01')).toBe('1000000000000.00');
+  });
+
   it('treats one piaster as the match limit', () => {
     expect(moneyAbsAtMost('0.01', 1n)).toBe(true);
     expect(moneyAbsAtMost('-0.01', 1n)).toBe(true);

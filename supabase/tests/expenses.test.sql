@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (196);
+  plan (221);
 
 -- Users and the single owner. Same fixture ids as the other pgTAP files.
 delete from app.owner;
@@ -2626,6 +2626,411 @@ select
       'a17e0000-0000-4000-8000-000000009019'
     )$$,
     'letters keep digit runs separate'
+  );
+
+-- Fullwidth (U+FF10) and zero-width (U+200B) on every free-text field.
+-- Other Nd scripts and the separator set are checked on notes.
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '0100000' || chr(65296) || '000',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009020'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with a fullwidth digit is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '0100' || chr(8203) || '0000000',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009021'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with a zero-width space between digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      repeat(chr(2406), 8),
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009022'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with Devanagari digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      repeat(chr(2534), 8),
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009023'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with Bengali digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      repeat(chr(120782), 8),
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009024'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with mathematical bold digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '0123' || chr(2406) || chr(2407) || chr(2534) || chr(2535),
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009025'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a note with mixed decimal digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '0' || chr(9) || '1' || chr(160) || '2' || chr(8203) || '3' || chr(8239) || '4' || chr(8201) || '5' || chr(8288) || '6' || chr(65279) || '7' || chr(1564) || '8',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009026'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'whitespace and format characters do not split a digit run'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-01',
+      null,
+      false,
+      '0' || chr(8208) || '1' || chr(65112) || '2' || chr(65123) || '3' || chr(1643) || '4' || chr(65294) || '5' || chr(12290) || '6' || chr(183) || '7',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009027'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'unicode dashes and dots do not split a digit run'
+  );
+
+select
+  throws_ok (
+    $$select app.void_expense_entry(
+      (select id from app.expense_entries where note = 'replay-other'),
+      repeat(chr(65296), 8),
+      'a17e0000-0000-4000-8000-000000009028'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a void reason with fullwidth digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.void_expense_entry(
+      (select id from app.expense_entries where note = 'replay-other'),
+      '0100' || chr(8203) || '0000',
+      'a17e0000-0000-4000-8000-000000009029'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a void reason with a zero-width space is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_category(
+      '0100000' || chr(65296) || '000',
+      'daily'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a category name with a fullwidth digit is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.rename_expense_category(
+      (select id from app.expense_categories where name = 'نقل'),
+      '0100' || chr(8203) || '0000000'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a renamed category with a zero-width space is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'أجر طيارين'),
+      null,
+      null,
+      '2026-11-02',
+      null,
+      false,
+      null,
+      1,
+      30,
+      repeat(chr(65296), 8),
+      'a17e0000-0000-4000-8000-000000009030'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a driver label with fullwidth digits is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'أجر طيارين'),
+      null,
+      null,
+      '2026-11-02',
+      null,
+      false,
+      null,
+      1,
+      30,
+      '0100' || chr(8203) || '0000',
+      'a17e0000-0000-4000-8000-000000009031'
+    )$$,
+    '22023'::char(5),
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'a driver label with a zero-width space is rejected'
+  );
+
+select
+  lives_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-05',
+      null,
+      false,
+      repeat(chr(65296), 7),
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009032'
+    )$$,
+    'seven fullwidth digits are stored'
+  );
+
+select
+  lives_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'نقل'),
+      1,
+      null,
+      '2026-11-06',
+      null,
+      false,
+      '1234x' || chr(8203) || '5678',
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009033'
+    )$$,
+    'a letter still splits a digit run when a zero-width space is nearby'
+  );
+
+-- Two accepted daily actuals sum past numeric(14,2). A monthly entry at the
+-- cap, spread over 31 days, still balances. 99999999999999 piasters / 31 is
+-- 32258064516.13 on days 1-27 and 32258064516.12 after that.
+select
+  lives_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'غاز'),
+      999999999999.99,
+      null,
+      '2026-12-15',
+      null,
+      false,
+      null,
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009034'
+    )$$,
+    'a daily actual at the amount cap is stored'
+  );
+
+select
+  lives_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'غاز'),
+      0.01,
+      null,
+      '2026-12-15',
+      null,
+      false,
+      null,
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009035'
+    )$$,
+    'a second daily actual on that day is stored'
+  );
+
+select
+  is (
+    (
+      select
+        daily_total
+      from
+        app.expense_daily ('2026-12-15', '2026-12-15')
+    ),
+    1000000000000.00::numeric,
+    'two capped daily actuals sum past numeric(14,2)'
+  );
+
+select
+  results_eq (
+    $$select days_total, entries_total, balanced
+      from app.expense_month_check('2026-12-01')$$,
+    $$select 1000000000000.00::numeric, 1000000000000.00::numeric, true$$,
+    'December month check returns the exact sum'
+  );
+
+select
+  lives_ok (
+    $$select app.add_expense_entry(
+      (select id from app.expense_categories where name = 'إيجار'),
+      999999999999.99,
+      '2027-01-01',
+      null,
+      null,
+      false,
+      null,
+      null,
+      null,
+      null,
+      'a17e0000-0000-4000-8000-000000009036'
+    )$$,
+    'a monthly entry at the amount cap is stored'
+  );
+
+select
+  is (
+    (
+      select
+        fixed_share
+      from
+        app.expense_daily ('2027-01-01', '2027-01-01')
+    ),
+    32258064516.13::numeric,
+    'day 1 of a near-cap month gets the extra piaster'
+  );
+
+select
+  is (
+    (
+      select
+        fixed_share
+      from
+        app.expense_daily ('2027-01-31', '2027-01-31')
+    ),
+    32258064516.12::numeric,
+    'day 31 of a near-cap month gets the base share'
+  );
+
+select
+  is (
+    (
+      select
+        sum(fixed_share)
+      from
+        app.expense_daily ('2027-01-01', '2027-01-31')
+    ),
+    999999999999.99::numeric,
+    'a near-cap monthly entry sums exactly over 31 days'
+  );
+
+select
+  results_eq (
+    $$select days_total, entries_total, balanced
+      from app.expense_month_check('2027-01-01')$$,
+    $$select 999999999999.99::numeric, 999999999999.99::numeric, true$$,
+    'a near-cap month check balances'
   );
 
 -- ============================================================================
