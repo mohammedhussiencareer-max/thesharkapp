@@ -32,6 +32,10 @@ describe('HomePage', () => {
       'href',
       '/purchases',
     );
+    expect(screen.getByRole('link', { name: 'الفرز' })).toHaveAttribute(
+      'href',
+      '/sorting',
+    );
     expect(screen.getByRole('link', { name: 'المصاريف' })).toHaveAttribute(
       'href',
       '/expenses',

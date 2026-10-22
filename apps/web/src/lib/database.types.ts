@@ -345,6 +345,58 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"sort_batch_lines": {
+                  Row: {
+                    "batch_id": string,"line_no": number,"quantity": number,"size_item_id": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "batch_id": string,"line_no": number,"quantity": number,"size_item_id": string
+                  }
+                  Update: {
+                    "batch_id"?: string,"line_no"?: number,"quantity"?: number,"size_item_id"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "sort_batch_lines_batch_id_fkey"
+      columns: ["batch_id"]
+isOneToOne: false
+      referencedRelation: "sort_batches"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "sort_batch_lines_batch_id_fkey"
+      columns: ["batch_id"]
+isOneToOne: false
+      referencedRelation: "sort_history"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "sort_batch_lines_size_item_id_fkey"
+      columns: ["size_item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"sort_batches": {
+                  Row: {
+                    "created_at": string,"created_by": string | null,"id": string,"mixed_item_id": string,"note": string | null,"occurred_at": string,"qty_taken": number,"request_id": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_at"?: string,"created_by"?: string | null,"id": string,"mixed_item_id": string,"note"?: string | null,"occurred_at": string,"qty_taken": number,"request_id": string
+                  }
+                  Update: {
+                    "created_at"?: string,"created_by"?: string | null,"id"?: string,"mixed_item_id"?: string,"note"?: string | null,"occurred_at"?: string,"qty_taken"?: number,"request_id"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "sort_batches_mixed_item_id_fkey"
+      columns: ["mixed_item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"stock_items": {
                   Row: {
                     "active": boolean,"base_unit": string,"count_frequency": string,"created_at": string,"id": string,"kind": string,"loss_pct": number,"name": string,"parent_item_id": string | null
@@ -415,6 +467,20 @@ isOneToOne: false
                   ComputedFields: never
                   Relationships: [
                     
+                  ]
+                },"sort_history": {
+                  Row: {
+                    "cost_per_kg": number | null,"created_at": string | null,"id": string | null,"loss_qty": number | null,"loss_value": number | null,"mixed_item_id": string | null,"mixed_item_name": string | null,"note": string | null,"occurred_at": string | null,"qty_taken": number | null,"sizes_qty": number | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    {
+      foreignKeyName: "sort_batches_mixed_item_id_fkey"
+      columns: ["mixed_item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
                   ]
                 }
           }
@@ -508,6 +574,9 @@ isOneToOne: false
                            },
 "record_purchase":
 { Args: { "p_purchase": Json }; Returns: string
+                           },
+"record_sort":
+{ Args: { "p_sort": Json }; Returns: string
                            },
 "rename_expense_category":
 { Args: { "p_id": string,"p_name": string }; Returns: undefined

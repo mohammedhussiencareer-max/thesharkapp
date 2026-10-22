@@ -10,6 +10,7 @@ import { LoginPage } from '@/pages/LoginPage';
 import { OpeningPage } from '@/pages/OpeningPage';
 import { PurchasesPage } from '@/pages/PurchasesPage';
 import { SalesPage } from '@/pages/SalesPage';
+import { SortingPage } from '@/pages/SortingPage';
 import { SalesShiftPage } from '@/pages/SalesShiftPage';
 import { MissingEnvScreen } from '@/pages/MissingEnvScreen';
 import { NotFoundPage } from '@/pages/NotFoundPage';
@@ -76,6 +77,14 @@ export function AppRoutes() {
         element={
           <RequireOwner>
             <PurchasesPage />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/sorting"
+        element={
+          <RequireOwner>
+            <SortingPage />
           </RequireOwner>
         }
       />
