@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { isDefiniteRefusal, isUnknownOutcome } from '@/lib/write-outcome';
 import {
   backDatedSortMessage,
-  isUnknownOutcome,
+  isDefiniteRefusal as exportedDefiniteRefusal,
+  isUnknownOutcome as exportedUnknownOutcome,
   mapSortError,
   mixedRequiredMessage,
   notEnoughStockMessage,
@@ -82,54 +84,9 @@ describe('mapSortError', () => {
   });
 });
 
-describe('isUnknownOutcome', () => {
-  it('treats a coded refusal as a known rollback', () => {
-    expect(
-      isUnknownOutcome({ code: '22023', message: 'not enough stock to sort' }),
-    ).toBe(false);
-    expect(
-      isUnknownOutcome({
-        code: 'P0001',
-        message: 'back-dated movement not supported yet',
-      }),
-    ).toBe(false);
-    expect(
-      isUnknownOutcome({ code: '42501', message: 'permission denied' }),
-    ).toBe(false);
-    expect(
-      isUnknownOutcome({ code: '40001', message: 'could not serialize' }),
-    ).toBe(false);
-    expect(
-      isUnknownOutcome(
-        new Error('back-dated', {
-          cause: {
-            code: 'P0001',
-            message: 'back-dated movement not supported yet',
-          },
-        }),
-      ),
-    ).toBe(false);
-  });
-
-  it('keeps a unique violation unknown because the id may already be stored', () => {
-    expect(
-      isUnknownOutcome({ code: '23505', message: 'duplicate key value' }),
-    ).toBe(true);
-    expect(
-      isUnknownOutcome(
-        new Error('duplicate', {
-          cause: { code: '23505', message: 'duplicate key' },
-        }),
-      ),
-    ).toBe(true);
-  });
-
-  it('treats a missing code as unknown', () => {
-    expect(isUnknownOutcome(new TypeError('Failed to fetch'))).toBe(true);
-    expect(isUnknownOutcome(new Error('timeout'))).toBe(true);
-    expect(isUnknownOutcome({ message: 'timeout' })).toBe(true);
-    expect(isUnknownOutcome({ code: '  ', message: 'empty' })).toBe(true);
-    expect(isUnknownOutcome('network down')).toBe(true);
-    expect(isUnknownOutcome(null)).toBe(true);
+describe('write outcome re-export', () => {
+  it('shares the allow-list classifier', () => {
+    expect(exportedUnknownOutcome).toBe(isUnknownOutcome);
+    expect(exportedDefiniteRefusal).toBe(isDefiniteRefusal);
   });
 });

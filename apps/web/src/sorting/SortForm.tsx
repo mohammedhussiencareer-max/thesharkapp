@@ -37,7 +37,7 @@ export function SortForm({
   onClearServerError: () => void;
   onSubmit: (draft: SortDraft) => void;
 }) {
-  // Reused after a coded refusal, because that attempt was not stored.
+  // Reused after a definite refusal, because that attempt was not stored.
   // An unknown outcome resends `pending` with this same id. A confirmed
   // save remounts the form and mints a new id.
   const [requestId] = useState(() => crypto.randomUUID());

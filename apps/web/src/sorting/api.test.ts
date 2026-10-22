@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
 import {
+  genericSortError,
   isUnknownOutcome,
   notEnoughStockMessage,
   retrySafeMessage,
@@ -105,6 +106,24 @@ describe('sorting api', () => {
       error: { code: '22023', message: 'not enough stock to sort' },
     });
     await expect(recordSort(draft)).rejects.toThrow(notEnoughStockMessage);
+    await expect(recordSort(draft)).rejects.toSatisfy(
+      (error: unknown) => !isUnknownOutcome(error),
+    );
+
+    rpc.mockResolvedValue({
+      data: null,
+      error: { code: 'PGRST003', message: 'upstream timed out' },
+    });
+    await expect(recordSort(draft)).rejects.toThrow(retrySafeMessage);
+    await expect(recordSort(draft)).rejects.toSatisfy((error: unknown) =>
+      isUnknownOutcome(error),
+    );
+
+    rpc.mockResolvedValue({
+      data: null,
+      error: { code: '0A000', message: 'feature not supported' },
+    });
+    await expect(recordSort(draft)).rejects.toThrow(genericSortError);
     await expect(recordSort(draft)).rejects.toSatisfy(
       (error: unknown) => !isUnknownOutcome(error),
     );

@@ -10,34 +10,8 @@ export const retrySafeMessage =
 export const pendingResendMessage =
   'الحفظ اللي فات ممكن يكون اتسجل — هيتبعت تاني من غير تغيير';
 
-/**
- * A refused save is not stored, so the form reuses its request id for the
- * corrected draft. 23505 is not a refusal: the id may already be stored.
- */
-function serverCode(error: unknown): string {
-  let current: unknown = error;
-  const seen = new Set<object>();
-  for (let depth = 0; depth < 5; depth += 1) {
-    if (typeof current !== 'object' || current === null) return '';
-    if (seen.has(current)) return '';
-    seen.add(current);
-    const code = (current as { code?: unknown }).code;
-    if (typeof code === 'string' && code.trim() !== '') return code.trim();
-    current = (current as { cause?: unknown }).cause;
-  }
-  return '';
-}
-
-/**
- * True when the save might have committed: no Postgres/PostgREST code
- * (network, timeout, empty code), or unique violation 23505.
- * Any other code means this attempt rolled back.
- */
-export function isUnknownOutcome(error: unknown): boolean {
-  const code = serverCode(error);
-  if (code === '') return true;
-  return code === '23505';
-}
+/** In-transaction refusals only. The allow-list lives in write-outcome.ts. */
+export { isDefiniteRefusal, isUnknownOutcome } from '@/lib/write-outcome';
 
 export const requestIdConflictMessage =
   'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع الفرز قبل ما تسجّل تاني';

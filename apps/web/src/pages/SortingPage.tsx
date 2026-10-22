@@ -5,6 +5,7 @@ import { pageShell, secondaryButton } from '@/lib/page-style';
 import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
 import {
   genericSortError,
+  isDefiniteRefusal,
   isUnknownOutcome,
   mapSortError,
   retrySafeMessage,
@@ -172,6 +173,7 @@ export function SortingPage() {
     try {
       await recordSort(draft);
       saved = true;
+      // The form resubmits the pinned object, so this success is that payload.
       setPending(null);
       // Stays set until the reload applies data, or a visible retryable error
       // replaces it. A range that cannot be read clears the lock instead.
@@ -192,7 +194,14 @@ export function SortingPage() {
     } catch (error) {
       if (!saved) {
         setServerError(reportedSortError(error));
-        setPending(isUnknownOutcome(error) ? draft : null);
+        // A pin stays until this exact payload succeeds or the same replay
+        // is definitely refused. A later unknown result does not clear it
+        // or replace it with a different draft.
+        setPending((current) => {
+          if (current && current !== draft) return current;
+          if (current) return isDefiniteRefusal(error) ? null : current;
+          return isUnknownOutcome(error) ? draft : null;
+        });
       } else {
         setNeedsReload(true);
         setLoadError(messageFrom(error));

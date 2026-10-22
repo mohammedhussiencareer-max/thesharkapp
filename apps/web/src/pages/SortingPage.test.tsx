@@ -391,6 +391,120 @@ describe('SortingPage', () => {
     );
   });
 
+  it('keeps the pin when a later attempt is unknown', async () => {
+    await renderPage();
+    fillSort();
+    vi.mocked(recordSort).mockRejectedValueOnce(
+      new TypeError('Failed to fetch'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+    expect(screen.getByLabelText('كمية المخلوط')).toHaveAttribute('readonly');
+
+    vi.mocked(recordSort).mockRejectedValueOnce({
+      code: 'PGRST003',
+      message: 'upstream timed out',
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(retrySafeMessage);
+    });
+    expect(screen.getByText(pendingResendMessage)).toBeInTheDocument();
+    expect(screen.getByLabelText('كمية المخلوط')).toHaveAttribute('readonly');
+    expect(screen.getByLabelText('وقت الفرز')).toHaveAttribute('readonly');
+    expect(screen.getByLabelText('السمك المخلوط')).toBeDisabled();
+    expect(vi.mocked(recordSort).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(recordSort).mock.calls[0]?.[0],
+    );
+
+    fireEvent.change(screen.getByLabelText('كمية المخلوط'), {
+      target: { value: '99' },
+    });
+    expect(screen.getByLabelText('كمية المخلوط')).toHaveValue('10');
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordSort).toHaveBeenCalledTimes(3);
+    });
+    expect(vi.mocked(recordSort).mock.calls[2]?.[0]).toEqual(
+      vi.mocked(recordSort).mock.calls[0]?.[0],
+    );
+  });
+
+  it('releases the pin when the replay is definitely refused', async () => {
+    await renderPage();
+    fillSort();
+    vi.mocked(recordSort).mockRejectedValueOnce(
+      new TypeError('Failed to fetch'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    vi.mocked(recordSort).mockRejectedValueOnce({
+      code: '22023',
+      message: 'not enough stock to sort',
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        notEnoughStockMessage,
+      );
+    });
+    expect(vi.mocked(recordSort).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(recordSort).mock.calls[0]?.[0],
+    );
+    expect(screen.queryByText(pendingResendMessage)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('وقت الفرز')).not.toHaveAttribute('readonly');
+    expect(screen.getByLabelText('كمية المخلوط')).not.toHaveAttribute(
+      'readonly',
+    );
+    expect(screen.getByLabelText('كمية المخلوط')).toHaveValue('10');
+    expect(screen.getByLabelText('السمك المخلوط')).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText('كمية كبير'), {
+      target: { value: '5' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordSort).toHaveBeenCalledTimes(3);
+    });
+    const first = vi.mocked(recordSort).mock.calls[0]?.[0];
+    const edited = vi.mocked(recordSort).mock.calls[2]?.[0];
+    expect(edited?.requestId).toBe(first?.requestId);
+    expect(edited?.lines).toEqual([
+      { itemId: 'large', quantity: '5' },
+      { itemId: 'small', quantity: '3.5' },
+    ]);
+  });
+
+  it('clears the pin after the pinned payload succeeds and mints a new request id', async () => {
+    await renderPage();
+    fillSort();
+    vi.mocked(recordSort).mockRejectedValueOnce(
+      new TypeError('Failed to fetch'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('اتسجل الفرز');
+    expect(screen.queryByText(pendingResendMessage)).not.toBeInTheDocument();
+    const pinnedId = vi.mocked(recordSort).mock.calls[0]?.[0]?.requestId;
+    expect(vi.mocked(recordSort).mock.calls[1]?.[0]?.requestId).toBe(pinnedId);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    expect(screen.getByLabelText('كمية المخلوط')).toHaveValue('');
+
+    fillSort();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordSort).toHaveBeenCalledTimes(3);
+    });
+    expect(vi.mocked(recordSort).mock.calls[2]?.[0]?.requestId).not.toBe(
+      pinnedId,
+    );
+  });
+
   it('stays unlocked when the range is reversed after a save', async () => {
     await renderPage();
     fillSort();

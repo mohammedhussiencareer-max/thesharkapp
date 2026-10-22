@@ -58,8 +58,9 @@ async function writeRpc(
   }
   if (!result.error) return;
   const mapped = mapSortError(result.error);
-  // A coded refusal already tells us the attempt rolled back. Only an unknown
-  // outcome, including 23505, is reported as retry-safe.
+  // A definite refusal already rolled back, so its mapped text stands.
+  // An unknown outcome (anything off the allow-list, including 23505 and
+  // PostgREST codes) is retry-safe when there is no specific Arabic mapping.
   const message =
     mapped === genericSortError && isUnknownOutcome(result.error)
       ? retrySafeMessage
