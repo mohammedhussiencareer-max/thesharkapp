@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -28,6 +29,8 @@ import {
   retrySafeMessage,
 } from '@/expenses/errors';
 import { genericCatalogError } from '@/items/errors';
+import { formatMonth } from '@/lib/cairo';
+import { formatEgpText } from '@/lib/money';
 import { ExpensesPage } from '@/pages/ExpensesPage';
 
 vi.mock('@/expenses/api', () => ({
@@ -312,12 +315,12 @@ describe('ExpensesPage', () => {
     expect(screen.getByText(pendingResendMessage)).toBeInTheDocument();
     const amount = screen.getByLabelText('المبلغ');
     expect(amount).toHaveAttribute('readonly');
-    expect(amount).toHaveValue('1000');
+    expect(amount).toHaveValue('1000.00');
     expect(screen.getByLabelText('التصنيف')).toBeDisabled();
     expect(screen.getByLabelText('ملاحظة')).toHaveAttribute('readonly');
 
     fireEvent.change(amount, { target: { value: '9999' } });
-    expect(amount).toHaveValue('1000');
+    expect(amount).toHaveValue('1000.00');
     fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
     await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(2));
     expect(vi.mocked(addExpenseEntry).mock.calls[1]?.[0]).toEqual(
@@ -338,11 +341,11 @@ describe('ExpensesPage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('مفيش صلاحية');
     expect(screen.getByText(pendingResendMessage)).toBeInTheDocument();
     expect(screen.getByLabelText('المبلغ')).toHaveAttribute('readonly');
-    expect(screen.getByLabelText('المبلغ')).toHaveValue('1000');
+    expect(screen.getByLabelText('المبلغ')).toHaveValue('1000.00');
     fireEvent.change(screen.getByLabelText('المبلغ'), {
       target: { value: '9999' },
     });
-    expect(screen.getByLabelText('المبلغ')).toHaveValue('1000');
+    expect(screen.getByLabelText('المبلغ')).toHaveValue('1000.00');
 
     fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
     await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(3));
@@ -404,6 +407,308 @@ describe('ExpensesPage', () => {
     expect(vi.mocked(addExpenseEntry).mock.calls[2]?.[0]).toMatchObject({
       amount: '1500.00',
     });
+  });
+
+  const reloadedCategories: ExpenseCategory[] = [
+    { id: 'rent', name: 'إيجار جديد', kind: 'daily', active: false },
+    { id: 'gas', name: 'غاز جديد', kind: 'fixed_monthly', active: true },
+    { id: 'driver', name: 'طيار جديد', kind: 'daily', active: true },
+  ];
+
+  function monthBesides(current: string): string {
+    return current === '2030-05' ? '2030-06' : '2030-05';
+  }
+
+  async function readPageMonth(): Promise<string> {
+    const picker = await screen.findByLabelText<HTMLInputElement>('الشهر');
+    return picker.value;
+  }
+
+  function stageReloadedMonth(
+    monthValue: string,
+    patch: Partial<ExpenseMonth> = {},
+  ) {
+    vi.mocked(loadExpenseMonth).mockImplementation((monthStart) =>
+      Promise.resolve(
+        monthData(monthStart, {
+          categories: reloadedCategories,
+          entries: [
+            entry({
+              id: 'other-entry',
+              note: 'مصروف الشهر التاني',
+              categoryId: 'gas',
+              categoryName: 'غاز',
+              categoryKind: 'daily',
+              amount: '8.00',
+              periodMonth: null,
+              expenseDate: `${monthValue}-02`,
+            }),
+          ],
+          days: [
+            {
+              ...day(),
+              date: `${monthValue}-01`,
+              fixedShare: '0.00',
+              dailyTotal: '9.00',
+              total: '9.00',
+            },
+          ],
+          ...patch,
+        }),
+      ),
+    );
+  }
+
+  async function moveToMonth(monthValue: string) {
+    const picker = screen.getByLabelText('الشهر');
+    expect(picker).toBeEnabled();
+    fireEvent.change(picker, { target: { value: monthValue } });
+    expect(await screen.findByText('مصروف الشهر التاني')).toBeInTheDocument();
+    expect(picker).toHaveValue(monthValue);
+    expect(
+      screen.getAllByRole('cell', { name: '9.00 ج.م' }).length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.queryByRole('cell', { name: '33.34 ج.م' }),
+    ).not.toBeInTheDocument();
+  }
+
+  it('shows the pinned month after the page month changes and resends it', async () => {
+    vi.mocked(addExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    renderPage();
+    const pageMonth = await readPageMonth();
+    const other = monthBesides(pageMonth);
+    fireEvent.change(await screen.findByLabelText('التصنيف'), {
+      target: { value: 'rent' },
+    });
+    fireEvent.change(screen.getByLabelText('المبلغ'), {
+      target: { value: '1000' },
+    });
+    fireEvent.change(screen.getByLabelText('ملاحظة'), {
+      target: { value: 'ملاحظة مثبتة' },
+    });
+    fireEvent.change(screen.getByLabelText('تاريخ الدفع'), {
+      target: { value: '2030-04-20' },
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'تقدير' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    stageReloadedMonth(other);
+    await moveToMonth(other);
+
+    const form = screen.getByRole('form', { name: 'مصروف جديد' });
+    expect(within(form).getByLabelText('شهر المصروف')).toHaveValue(pageMonth);
+    expect(within(form).getByLabelText('شهر المصروف')).toBeDisabled();
+    expect(
+      within(form).getByRole('option', { name: 'إيجار' }),
+    ).toBeInTheDocument();
+    expect(
+      within(form).queryByRole('option', { name: 'إيجار جديد' }),
+    ).not.toBeInTheDocument();
+    expect(within(form).getByText('النوع: ثابت شهري')).toBeInTheDocument();
+    expect(within(form).queryByLabelText('التاريخ')).not.toBeInTheDocument();
+    expect(within(form).getByLabelText('المبلغ')).toHaveValue('1000.00');
+    expect(within(form).getByLabelText('ملاحظة')).toHaveValue('ملاحظة مثبتة');
+    expect(within(form).getByLabelText('تاريخ الدفع')).toHaveValue(
+      '2030-04-20',
+    );
+    expect(within(form).getByRole('checkbox', { name: 'تقدير' })).toBeChecked();
+    expect(within(form).getByText(pendingResendMessage)).toBeInTheDocument();
+    expect(screen.queryByText('إيجار الاختبار')).not.toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'حفظ المصروف' })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(2));
+    const [first, second] = vi.mocked(addExpenseEntry).mock.calls;
+    expect(first?.[0]?.periodMonth).toBe(`${pageMonth}-01`);
+    expect(second?.[0]).toEqual(first?.[0]);
+  });
+
+  it('shows the pinned daily date after the page month changes and resends it', async () => {
+    vi.mocked(addExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    renderPage();
+    const pageMonth = await readPageMonth();
+    const other = monthBesides(pageMonth);
+    fireEvent.change(await screen.findByLabelText('التصنيف'), {
+      target: { value: 'gas' },
+    });
+    fireEvent.change(screen.getByLabelText('التاريخ'), {
+      target: { value: `${pageMonth}-15` },
+    });
+    fireEvent.change(screen.getByLabelText('المبلغ'), {
+      target: { value: '40' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    stageReloadedMonth(other);
+    await moveToMonth(other);
+
+    const form = screen.getByRole('form', { name: 'مصروف جديد' });
+    const date = within(form).getByLabelText('التاريخ');
+    expect(date).toHaveValue(`${pageMonth}-15`);
+    expect(date).not.toHaveAttribute('min');
+    expect(date).not.toHaveAttribute('max');
+    expect(within(form).getByLabelText('المبلغ')).toHaveValue('40.00');
+    expect(
+      within(form).getByRole('option', { name: 'غاز' }),
+    ).toBeInTheDocument();
+    expect(
+      within(form).queryByRole('option', { name: 'غاز جديد' }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(form).queryByLabelText('شهر المصروف'),
+    ).not.toBeInTheDocument();
+    expect(within(form).getByText('النوع: يومي')).toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'حفظ المصروف' })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(2));
+    const [first, second] = vi.mocked(addExpenseEntry).mock.calls;
+    expect(first?.[0]?.expenseDate).toBe(`${pageMonth}-15`);
+    expect(second?.[0]).toEqual(first?.[0]);
+  });
+
+  it('shows the pinned driver fields after the page month changes and resends them', async () => {
+    vi.mocked(addExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    renderPage();
+    const pageMonth = await readPageMonth();
+    const other = monthBesides(pageMonth);
+    fireEvent.change(await screen.findByLabelText('التصنيف'), {
+      target: { value: 'driver' },
+    });
+    fireEvent.change(screen.getByLabelText('التاريخ'), {
+      target: { value: `${pageMonth}-15` },
+    });
+    fireEvent.change(screen.getByLabelText('الساعات'), {
+      target: { value: '5.5' },
+    });
+    fireEvent.change(screen.getByLabelText('سعر الساعة'), {
+      target: { value: '30' },
+    });
+    fireEvent.change(screen.getByLabelText('اسم الطيار'), {
+      target: { value: 'طيار اختبار' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    stageReloadedMonth(other);
+    await moveToMonth(other);
+
+    const form = screen.getByRole('form', { name: 'مصروف جديد' });
+    expect(within(form).getByLabelText('الساعات')).toHaveValue('5.50');
+    expect(within(form).getByLabelText('سعر الساعة')).toHaveValue('30.00');
+    expect(within(form).getByLabelText('اسم الطيار')).toHaveValue(
+      'طيار اختبار',
+    );
+    expect(within(form).getByLabelText('التاريخ')).toHaveValue(
+      `${pageMonth}-15`,
+    );
+    expect(within(form).getByLabelText('المبلغ')).toHaveTextContent(
+      '165.00 ج.م',
+    );
+    expect(
+      within(form).getByRole('option', { name: 'أجر طيارين' }),
+    ).toBeInTheDocument();
+    expect(
+      within(form).queryByRole('option', { name: 'طيار جديد' }),
+    ).not.toBeInTheDocument();
+    expect(within(form).getByText('النوع: أجر طيارين')).toBeInTheDocument();
+    expect(
+      within(form).queryByRole('textbox', { name: 'المبلغ' }),
+    ).not.toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'حفظ المصروف' })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(2));
+    const [first, second] = vi.mocked(addExpenseEntry).mock.calls;
+    expect(first?.[0]).toMatchObject({
+      hours: '5.50',
+      hourlyRate: '30.00',
+      driverLabel: 'طيار اختبار',
+      amount: '165.00',
+      expenseDate: `${pageMonth}-15`,
+    });
+    expect(second?.[0]).toEqual(first?.[0]);
+  });
+
+  it('keeps the pinned void target and reason after the page month changes', async () => {
+    vi.mocked(voidExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    renderPage();
+    const pageMonth = await readPageMonth();
+    const other = monthBesides(pageMonth);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'إلغاء المصروف' }),
+    );
+    fireEvent.change(screen.getByLabelText('سبب الإلغاء'), {
+      target: { value: 'تكرار' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد الإلغاء' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      retrySafeMessage,
+    );
+
+    stageReloadedMonth(other, {
+      entries: [
+        entry({
+          id: 'entry-1',
+          note: 'اتغير',
+          categoryName: 'اسم تاني',
+          amount: '5.00',
+          periodMonth: `${other}-01`,
+        }),
+        entry({
+          id: 'entry-2',
+          note: 'مصروف الشهر التاني',
+          categoryId: 'gas',
+          categoryName: 'غاز',
+          categoryKind: 'daily',
+          amount: '8.00',
+          periodMonth: null,
+          expenseDate: `${other}-02`,
+        }),
+      ],
+    });
+    await moveToMonth(other);
+
+    const card = screen.getByRole('article', {
+      name: `إيجار ${formatEgpText('1000.00')} ${formatMonth('2030-04-01')}`,
+    });
+    expect(within(card).getByText('إيجار الاختبار')).toBeInTheDocument();
+    expect(screen.queryByText('اتغير')).not.toBeInTheDocument();
+    expect(screen.queryByText('اسم تاني')).not.toBeInTheDocument();
+    expect(screen.queryByText('5.00 ج.م')).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(card).getByRole('button', { name: 'إلغاء المصروف' }),
+    );
+    const reason = within(card).getByLabelText('سبب الإلغاء');
+    expect(reason).toHaveValue('تكرار');
+    expect(reason).toHaveAttribute('readonly');
+    expect(within(card).getByText(pendingVoidMessage)).toBeInTheDocument();
+    fireEvent.click(
+      within(card).getByRole('button', { name: 'تأكيد الإلغاء' }),
+    );
+
+    await waitFor(() => expect(voidExpenseEntry).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(voidExpenseEntry).mock.calls[1]).toEqual(
+      vi.mocked(voidExpenseEntry).mock.calls[0],
+    );
   });
 
   it('reuses the void request id when the void reply is lost', async () => {

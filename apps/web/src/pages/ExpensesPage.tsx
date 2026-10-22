@@ -19,13 +19,39 @@ import {
   mapExpenseError,
   retrySafeMessage,
 } from '@/expenses/errors';
-import type { ExpenseDraft, ExpenseKind, ExpenseMonth } from '@/expenses/types';
+import type {
+  ExpenseDraft,
+  ExpenseKind,
+  ExpenseLine,
+  ExpenseMonth,
+} from '@/expenses/types';
 import { fieldClass } from '@/expenses/labels';
 import { messageFrom } from '@/items/errors';
 import { cairoMonthInput, formatCairo, formatMonth } from '@/lib/cairo';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 
-type VoidAttempt = { requestId: string; reason: string };
+type VoidAttempt = {
+  requestId: string;
+  reason: string;
+  /** The row as it was when the void was sent. The list follows the month picker. */
+  entry: ExpenseLine | null;
+};
+
+/**
+ * Pinned void targets stay on screen with the snapshotted row, including when
+ * the month picker has loaded a different list. Rows for the selected month
+ * follow that list.
+ */
+function entriesWithPinnedVoids(
+  entries: readonly ExpenseLine[],
+  pins: ReadonlyMap<string, VoidAttempt>,
+): ExpenseLine[] {
+  const pinned = [...pins.values()].flatMap((pin) =>
+    pin.entry ? [pin.entry] : [],
+  );
+  const pinnedIds = new Set(pinned.map((line) => line.id));
+  return [...pinned, ...entries.filter((line) => !pinnedIds.has(line.id))];
+}
 
 type WriteResult = {
   saved: boolean;
@@ -221,7 +247,13 @@ export function ExpensesPage() {
       pinned?.requestId ??
       voidRequestIdsRef.current.get(id) ??
       crypto.randomUUID();
-    const attempt = pinned ?? { requestId, reason: typedReason };
+    const visible =
+      pinned?.entry ?? data?.entries.find((line) => line.id === id) ?? null;
+    const attempt = pinned ?? {
+      requestId,
+      reason: typedReason,
+      entry: visible ? { ...visible } : null,
+    };
     const result = await runWrite(
       () => voidExpenseEntry(id, attempt.reason, attempt.requestId),
       setListError,
@@ -256,6 +288,8 @@ export function ExpensesPage() {
           disabled={writeLocked}
           onChange={(event) => changeMonth(event.target.value)}
         />
+        {/* This picker still moves the list and the allocation while a save
+            or void is pinned. The form and the void card keep the payload. */}
       </label>
       {!ready && !loadError ? <p>جاري تحميل المصاريف…</p> : null}
       {loadError ? (
@@ -306,7 +340,7 @@ export function ExpensesPage() {
           <h2 className="text-lg font-semibold">مصاريف الشهر</h2>
           {listError ? <p role="alert">{listError}</p> : null}
           <ExpenseList
-            entries={data.entries}
+            entries={entriesWithPinnedVoids(data.entries, pendingVoids)}
             disabled={busy}
             pendingReasons={
               new Map(
