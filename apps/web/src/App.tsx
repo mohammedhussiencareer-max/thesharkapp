@@ -4,6 +4,7 @@ import { RequireOwner } from '@/auth/RequireOwner';
 import { useAuth } from '@/lib/auth-context';
 import { supabase } from '@/lib/supabase';
 import { ExpensesPage } from '@/pages/ExpensesPage';
+import { CountsPage } from '@/pages/CountsPage';
 import { HomePage } from '@/pages/HomePage';
 import { ItemsPage } from '@/pages/ItemsPage';
 import { LoginPage } from '@/pages/LoginPage';
@@ -85,6 +86,14 @@ export function AppRoutes() {
         element={
           <RequireOwner>
             <SortingPage />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/counts"
+        element={
+          <RequireOwner>
+            <CountsPage />
           </RequireOwner>
         }
       />
