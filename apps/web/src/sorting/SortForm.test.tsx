@@ -25,6 +25,7 @@ function renderForm(items: readonly MixedFish[] = [mixed], locked = false) {
       locked={locked}
       submitting={false}
       serverError={null}
+      pending={null}
       onClearServerError={() => undefined}
       onSubmit={onSubmit}
     />,

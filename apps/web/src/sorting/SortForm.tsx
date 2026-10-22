@@ -1,4 +1,4 @@
-import { useRef, useState, type FormEvent } from 'react';
+import { useState, type FormEvent } from 'react';
 import { nowCairoDateTimeLocal } from '@/purchases/time';
 import { pendingResendMessage } from '@/sorting/errors';
 import { formatCostPerKg, formatKg, formatLossMoney } from '@/sorting/format';
@@ -24,6 +24,7 @@ export function SortForm({
   locked,
   submitting,
   serverError,
+  pending,
   onClearServerError,
   onSubmit,
 }: {
@@ -31,16 +32,17 @@ export function SortForm({
   locked: boolean;
   submitting: boolean;
   serverError: string | null;
+  /** Set only after an unknown outcome. Null when the save was not sent or was refused. */
+  pending: SortDraft | null;
   onClearServerError: () => void;
   onSubmit: (draft: SortDraft) => void;
 }) {
-  // One id for this draft. A failed save retries it; a new form gets a new one.
+  // Reused after a coded refusal, because that attempt was not stored.
+  // An unknown outcome resends `pending` with this same id. A confirmed
+  // save remounts the form and mints a new id.
   const [requestId] = useState(() => crypto.randomUUID());
   const [values, setValues] = useState<SortValues>(emptyValues);
   const [showErrors, setShowErrors] = useState(false);
-  // The payload already sent. Kept until this form is replaced after a confirmed save.
-  const pendingRef = useRef<SortDraft | null>(null);
-  const [pending, setPending] = useState<SortDraft | null>(null);
   const disabled = locked || submitting;
   const selected = items.find((item) => item.id === values.mixedItemId) ?? null;
   const assessment = pending ? null : assessSort(values, items);
@@ -62,14 +64,14 @@ export function SortForm({
     null;
 
   function edit(patch: Partial<SortValues>) {
-    if (pendingRef.current) return;
+    if (pending) return;
     onClearServerError();
     setShowErrors(false);
     setValues((current) => ({ ...current, ...patch }));
   }
 
   function editQuantity(sizeId: string, quantity: string) {
-    if (pendingRef.current) return;
+    if (pending) return;
     onClearServerError();
     setShowErrors(false);
     setValues((current) => ({
@@ -81,9 +83,8 @@ export function SortForm({
   function onSubmitForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (disabled) return;
-    const existing = pendingRef.current;
-    if (existing) {
-      onSubmit(existing);
+    if (pending) {
+      onSubmit(pending);
       return;
     }
     const result = assessSort(values, items);
@@ -91,19 +92,7 @@ export function SortForm({
       setShowErrors(true);
       return;
     }
-    const draft: SortDraft = { ...result.draft, requestId };
-    pendingRef.current = draft;
-    setPending(draft);
-    setValues((current) => ({
-      ...current,
-      mixedItemId: draft.mixedItemId,
-      qtyTaken: draft.qtyTaken,
-      note: draft.note ?? '',
-      quantities: Object.fromEntries(
-        draft.lines.map((line) => [line.itemId, line.quantity]),
-      ),
-    }));
-    onSubmit(draft);
+    onSubmit({ ...result.draft, requestId });
   }
 
   return (

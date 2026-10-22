@@ -3,7 +3,12 @@ import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
-import { genericSortError } from '@/sorting/errors';
+import {
+  genericSortError,
+  isUnknownOutcome,
+  mapSortError,
+  retrySafeMessage,
+} from '@/sorting/errors';
 import { SortForm } from '@/sorting/SortForm';
 import { SortList } from '@/sorting/SortList';
 import type { MixedFish, SortDraft, SortRecord } from '@/sorting/types';
@@ -43,6 +48,7 @@ export function SortingPage() {
   const [needsReload, setNeedsReload] = useState(false);
   const [loads, setLoads] = useState(0);
   const [serverError, setServerError] = useState<string | null>(null);
+  const [pending, setPending] = useState<SortDraft | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [formEpoch, setFormEpoch] = useState(0);
   const [from, setFrom] = useState('');
@@ -141,6 +147,14 @@ export function SortingPage() {
     setLoadId((value) => value + 1);
   }
 
+  function reportedSortError(error: unknown): string {
+    if (error instanceof Error && error.message.trim() !== '') {
+      return error.message;
+    }
+    if (isUnknownOutcome(error)) return retrySafeMessage;
+    return mapSortError(error);
+  }
+
   async function handleSubmit(draft: SortDraft) {
     if (busy || loadsRef.current > 0) return;
     const problem = historyFilterError(
@@ -158,6 +172,7 @@ export function SortingPage() {
     try {
       await recordSort(draft);
       saved = true;
+      setPending(null);
       // Stays set until the reload applies data, or a visible retryable error
       // replaces it. A range that cannot be read clears the lock instead.
       setNeedsReload(true);
@@ -176,7 +191,8 @@ export function SortingPage() {
       }
     } catch (error) {
       if (!saved) {
-        setServerError(messageFrom(error));
+        setServerError(reportedSortError(error));
+        setPending(isUnknownOutcome(error) ? draft : null);
       } else {
         setNeedsReload(true);
         setLoadError(messageFrom(error));
@@ -276,6 +292,7 @@ export function SortingPage() {
               locked={busy}
               submitting={saving}
               serverError={serverError}
+              pending={pending}
               onClearServerError={() => setServerError(null)}
               onSubmit={(next) => void handleSubmit(next)}
             />

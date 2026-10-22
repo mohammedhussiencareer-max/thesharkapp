@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
-import { notEnoughStockMessage, retrySafeMessage } from '@/sorting/errors';
+import {
+  isUnknownOutcome,
+  notEnoughStockMessage,
+  retrySafeMessage,
+} from '@/sorting/errors';
 import type { SortDraft } from '@/sorting/types';
 
 const mocks = vi.hoisted(() => ({
@@ -92,12 +96,18 @@ describe('sorting api', () => {
     });
     mocks.schema.mockReturnValue({ rpc });
     await expect(recordSort(draft)).rejects.toThrow(retrySafeMessage);
+    await expect(recordSort(draft)).rejects.toSatisfy((error: unknown) =>
+      isUnknownOutcome(error),
+    );
 
     rpc.mockResolvedValue({
       data: null,
       error: { code: '22023', message: 'not enough stock to sort' },
     });
     await expect(recordSort(draft)).rejects.toThrow(notEnoughStockMessage);
+    await expect(recordSort(draft)).rejects.toSatisfy(
+      (error: unknown) => !isUnknownOutcome(error),
+    );
   });
 
   it('pages the catalog by id and keeps only active kilogram fish', async () => {

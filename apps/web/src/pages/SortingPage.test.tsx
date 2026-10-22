@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SortingPage } from '@/pages/SortingPage';
 import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
 import {
+  backDatedSortMessage,
   notEnoughStockMessage,
   pendingResendMessage,
   retrySafeMessage,
@@ -282,6 +283,112 @@ describe('SortingPage', () => {
     expect(recordSort).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
     expect(screen.getByLabelText('من')).toBeEnabled();
+    expect(screen.getByLabelText('كمية المخلوط')).not.toHaveAttribute(
+      'readonly',
+    );
+    expect(screen.queryByText(pendingResendMessage)).not.toBeInTheDocument();
+  });
+
+  it('saves after a reversed range is corrected', async () => {
+    await renderPage();
+    fillSort();
+    const beforeTo = vi.mocked(listSorts).mock.calls.length;
+    fireEvent.change(screen.getByLabelText('إلى'), {
+      target: { value: '2026-10-21' },
+    });
+    await waitFor(() => {
+      expect(vi.mocked(listSorts).mock.calls.length).toBe(beforeTo + 1);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    fireEvent.change(screen.getByLabelText('من'), {
+      target: { value: '2026-10-22' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(recordSort).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('وقت الفرز')).not.toHaveAttribute('readonly');
+    expect(screen.getByLabelText('كمية المخلوط')).not.toHaveAttribute(
+      'readonly',
+    );
+    expect(screen.getByLabelText('السمك المخلوط')).toBeEnabled();
+
+    const beforeFix = vi.mocked(listSorts).mock.calls.length;
+    fireEvent.change(screen.getByLabelText('من'), {
+      target: { value: '2026-10-21' },
+    });
+    await waitFor(() => {
+      expect(vi.mocked(listSorts).mock.calls.length).toBe(beforeFix + 1);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordSort).toHaveBeenCalledTimes(1);
+    });
+    expect(vi.mocked(recordSort).mock.calls[0]?.[0]).toMatchObject({
+      qtyTaken: '10',
+      lines: [
+        { itemId: 'large', quantity: '6' },
+        { itemId: 'small', quantity: '3.5' },
+      ],
+    });
+  });
+
+  it('lets the owner correct the time after a back-dated refusal', async () => {
+    await renderPage();
+    fillSort();
+    fireEvent.change(screen.getByLabelText('وقت الفرز'), {
+      target: { value: '2026-10-22T10:00' },
+    });
+    vi.mocked(recordSort).mockRejectedValueOnce({
+      code: 'P0001',
+      message: 'back-dated movement not supported yet',
+      details: 'بوري مخلوط',
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      backDatedSortMessage('بوري مخلوط'),
+    );
+    expect(screen.getByLabelText('وقت الفرز')).not.toHaveAttribute('readonly');
+    expect(screen.queryByText(pendingResendMessage)).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('وقت الفرز'), {
+      target: { value: '2026-10-22T12:00' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordSort).toHaveBeenCalledTimes(2);
+    });
+    const first = vi.mocked(recordSort).mock.calls[0]?.[0];
+    const second = vi.mocked(recordSort).mock.calls[1]?.[0];
+    expect(first?.occurredAt).toBe('2026-10-22T07:00:00.000Z');
+    expect(second?.occurredAt).toBe('2026-10-22T09:00:00.000Z');
+    expect(second?.requestId).toBe(first?.requestId);
+  });
+
+  it('resends the same payload after a network failure', async () => {
+    await renderPage();
+    fillSort();
+    vi.mocked(recordSort).mockRejectedValueOnce(
+      new TypeError('Failed to fetch'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Failed to fetch',
+    );
+    expect(screen.getByText(pendingResendMessage)).toBeInTheDocument();
+    expect(screen.getByLabelText('كمية المخلوط')).toHaveAttribute('readonly');
+    expect(screen.getByLabelText('وقت الفرز')).toHaveAttribute('readonly');
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordSort).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(recordSort).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(recordSort).mock.calls[0]?.[0],
+    );
   });
 
   it('stays unlocked when the range is reversed after a save', async () => {

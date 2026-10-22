@@ -3,6 +3,7 @@ import { fetchAllPages, PageCapError } from '@/lib/paged';
 import { supabase } from '@/lib/supabase';
 import {
   genericSortError,
+  isUnknownOutcome,
   mapSortError,
   retrySafeMessage,
 } from '@/sorting/errors';
@@ -57,10 +58,13 @@ async function writeRpc(
   }
   if (!result.error) return;
   const mapped = mapSortError(result.error);
-  if (mapped === genericSortError) {
-    throw new Error(retrySafeMessage, { cause: result.error });
-  }
-  throw new Error(mapped);
+  // A coded refusal already tells us the attempt rolled back. Only an unknown
+  // outcome, including 23505, is reported as retry-safe.
+  const message =
+    mapped === genericSortError && isUnknownOutcome(result.error)
+      ? retrySafeMessage
+      : mapped;
+  throw new Error(message, { cause: result.error });
 }
 
 function throwIfError(
