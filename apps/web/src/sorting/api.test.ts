@@ -130,6 +130,7 @@ describe('sorting api', () => {
           active: true,
           item_balances: {
             on_hand_qty_text: '100.000000',
+            on_hand_value_text: '5123.46',
             avg_cost_text: '51.234567',
             has_uncovered_deficit: false,
           },
@@ -165,6 +166,7 @@ describe('sorting api', () => {
         id: 'mixed',
         name: 'بوري',
         onHandQty: '100.000000',
+        onHandValue: '5123.46',
         avgCost: '51.234567',
         hasUncoveredDeficit: false,
         sizes: [
@@ -177,6 +179,7 @@ describe('sorting api', () => {
     expect(items.captured.filters).toEqual([]);
     expect(items.captured.ranges).toEqual([{ from: 0, to: 999 }]);
     expect(String(items.captured.select)).toContain('on_hand_qty::text');
+    expect(String(items.captured.select)).toContain('on_hand_value::text');
     expect(String(items.captured.select)).toContain('avg_cost::text');
   });
 

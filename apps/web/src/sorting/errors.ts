@@ -6,6 +6,10 @@ export const permissionMessage = 'مفيش صلاحية للعملية دي';
 export const retrySafeMessage =
   'حصل خطأ. اضغط حفظ تاني — لو الطلب اتسجل مش هيتسجل مرتين.';
 
+/** Shown while a lost save is still waiting, so the next حفظ sends it unchanged. */
+export const pendingResendMessage =
+  'الحفظ اللي فات ممكن يكون اتسجل — هيتبعت تاني من غير تغيير';
+
 export const requestIdConflictMessage =
   'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع الفرز قبل ما تسجّل تاني';
 

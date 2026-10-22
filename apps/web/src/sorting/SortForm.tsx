@@ -1,5 +1,6 @@
-import { useState, type FormEvent } from 'react';
+import { useRef, useState, type FormEvent } from 'react';
 import { nowCairoDateTimeLocal } from '@/purchases/time';
+import { pendingResendMessage } from '@/sorting/errors';
 import { formatCostPerKg, formatKg, formatLossMoney } from '@/sorting/format';
 import { assessSort } from '@/sorting/validation';
 import type { MixedFish, SortDraft, SortValues } from '@/sorting/types';
@@ -37,11 +38,14 @@ export function SortForm({
   const [requestId] = useState(() => crypto.randomUUID());
   const [values, setValues] = useState<SortValues>(emptyValues);
   const [showErrors, setShowErrors] = useState(false);
+  // The payload already sent. Kept until this form is replaced after a confirmed save.
+  const pendingRef = useRef<SortDraft | null>(null);
+  const [pending, setPending] = useState<SortDraft | null>(null);
   const disabled = locked || submitting;
   const selected = items.find((item) => item.id === values.mixedItemId) ?? null;
-  const assessment = assessSort(values, items);
-  const preview = assessment.preview;
-  const submitted = showErrors ? assessment.errors : null;
+  const assessment = pending ? null : assessSort(values, items);
+  const preview = assessment?.preview ?? null;
+  const submitted = showErrors && assessment ? assessment.errors : null;
   const quantityError = submitted
     ? Object.values(submitted.quantities).find((message) => message.length > 0)
     : undefined;
@@ -53,17 +57,19 @@ export function SortForm({
     submitted?.mixedItemId ??
     submitted?.note ??
     quantityError ??
-    assessment.blockers.qtyTaken ??
-    assessment.blockers.form ??
+    assessment?.blockers.qtyTaken ??
+    assessment?.blockers.form ??
     null;
 
   function edit(patch: Partial<SortValues>) {
+    if (pendingRef.current) return;
     onClearServerError();
     setShowErrors(false);
     setValues((current) => ({ ...current, ...patch }));
   }
 
   function editQuantity(sizeId: string, quantity: string) {
+    if (pendingRef.current) return;
     onClearServerError();
     setShowErrors(false);
     setValues((current) => ({
@@ -75,12 +81,29 @@ export function SortForm({
   function onSubmitForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (disabled) return;
+    const existing = pendingRef.current;
+    if (existing) {
+      onSubmit(existing);
+      return;
+    }
     const result = assessSort(values, items);
     if (!result.draft) {
       setShowErrors(true);
       return;
     }
-    onSubmit({ ...result.draft, requestId });
+    const draft: SortDraft = { ...result.draft, requestId };
+    pendingRef.current = draft;
+    setPending(draft);
+    setValues((current) => ({
+      ...current,
+      mixedItemId: draft.mixedItemId,
+      qtyTaken: draft.qtyTaken,
+      note: draft.note ?? '',
+      quantities: Object.fromEntries(
+        draft.lines.map((line) => [line.itemId, line.quantity]),
+      ),
+    }));
+    onSubmit(draft);
   }
 
   return (
@@ -93,6 +116,7 @@ export function SortForm({
             className={fieldClass}
             type="datetime-local"
             disabled={disabled}
+            readOnly={pending !== null}
             value={values.occurredAt}
             onChange={(event) => edit({ occurredAt: event.target.value })}
           />
@@ -101,7 +125,7 @@ export function SortForm({
           السمك المخلوط
           <select
             className={fieldClass}
-            disabled={disabled}
+            disabled={disabled || pending !== null}
             value={values.mixedItemId}
             onChange={(event) => edit({ mixedItemId: event.target.value })}
           >
@@ -125,6 +149,7 @@ export function SortForm({
           className={fieldClass}
           inputMode="decimal"
           disabled={disabled}
+          readOnly={pending !== null}
           value={values.qtyTaken}
           onChange={(event) => edit({ qtyTaken: event.target.value })}
         />
@@ -142,6 +167,7 @@ export function SortForm({
               <input
                 className={fieldClass}
                 inputMode="decimal"
+                readOnly={pending !== null}
                 value={values.quantities[size.id] ?? ''}
                 onChange={(event) => editQuantity(size.id, event.target.value)}
               />
@@ -154,6 +180,7 @@ export function SortForm({
         <input
           className={fieldClass}
           disabled={disabled}
+          readOnly={pending !== null}
           value={values.note}
           onChange={(event) => edit({ note: event.target.value })}
         />
@@ -183,6 +210,7 @@ export function SortForm({
           </ul>
         </section>
       ) : null}
+      {pending ? <p>{pendingResendMessage}</p> : null}
       <button className={primaryButton} type="submit" disabled={disabled}>
         حفظ
       </button>

@@ -140,17 +140,38 @@ export function assessSort(
 
   let avg: Dec | null = null;
   let onHand: Dec | null = null;
+  let onHandValue: Dec | null = null;
   if (item) {
     avg = storedDecimal(item.avgCost);
     onHand = storedDecimal(item.onHandQty);
-    if (!avg || isNegative(avg) || !onHand) errors.form = badCostMessage;
+    onHandValue = storedDecimal(item.onHandValue);
+    if (
+      !avg ||
+      isNegative(avg) ||
+      !onHand ||
+      !onHandValue ||
+      isNegative(onHandValue) ||
+      onHandValue.scale > 2 ||
+      integerDigits(onHandValue) > 12
+    ) {
+      errors.form = badCostMessage;
+    }
   }
 
   const preview =
-    taken.ok && !sizeFailed && avg && !isNegative(avg)
+    taken.ok &&
+    !sizeFailed &&
+    avg &&
+    !isNegative(avg) &&
+    onHand &&
+    onHandValue &&
+    !isNegative(onHandValue) &&
+    onHandValue.scale <= 2
       ? previewSort({
           qtyTaken: taken.value,
           avgCost: avg,
+          onHandQty: onHand,
+          onHandValue,
           lines: parsedSizes,
         })
       : null;

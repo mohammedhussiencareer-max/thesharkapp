@@ -9,7 +9,11 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SortingPage } from '@/pages/SortingPage';
 import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
-import { retrySafeMessage } from '@/sorting/errors';
+import {
+  notEnoughStockMessage,
+  pendingResendMessage,
+  retrySafeMessage,
+} from '@/sorting/errors';
 import type { MixedFish, SortRecord } from '@/sorting/types';
 
 vi.mock('@/sorting/api', () => ({
@@ -22,6 +26,7 @@ const mixed: MixedFish = {
   id: 'mixed',
   name: 'بوري مخلوط',
   onHandQty: '100',
+  onHandValue: '5000.00',
   avgCost: '50',
   hasUncoveredDeficit: false,
   sizes: [
@@ -204,5 +209,142 @@ describe('SortingPage', () => {
     expect(
       screen.queryByRole('article', { name: 'دنيس مخلوط' }),
     ).not.toBeInTheDocument();
+  });
+
+  it('resends the saved payload after a lost reply and a zero balance', async () => {
+    await renderPage();
+    fireEvent.change(screen.getByLabelText('السمك المخلوط'), {
+      target: { value: 'mixed' },
+    });
+    fireEvent.change(screen.getByLabelText('كمية المخلوط'), {
+      target: { value: '100' },
+    });
+    fireEvent.change(screen.getByLabelText('كمية كبير'), {
+      target: { value: '100' },
+    });
+    vi.mocked(recordSort).mockRejectedValueOnce(new Error(retrySafeMessage));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      retrySafeMessage,
+    );
+    expect(screen.getByText(pendingResendMessage)).toBeInTheDocument();
+
+    vi.mocked(listMixedFish).mockResolvedValue([
+      { ...mixed, onHandQty: '0', onHandValue: '0.00', avgCost: '0' },
+    ]);
+    fireEvent.change(screen.getByLabelText('من'), {
+      target: { value: '2026-10-01' },
+    });
+    expect(await screen.findByText(/الرصيد 0 كيلو/)).toBeInTheDocument();
+    expect(screen.getByLabelText('كمية المخلوط')).toHaveAttribute('readonly');
+    expect(screen.getByLabelText('كمية كبير')).toHaveAttribute('readonly');
+    expect(screen.queryByText(notEnoughStockMessage)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordSort).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(recordSort).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(recordSort).mock.calls[0]?.[0],
+    );
+  });
+
+  it('blocks a save when the history range is reversed', async () => {
+    await renderPage();
+    fillSort();
+    const beforeRange = vi.mocked(listSorts).mock.calls.length;
+    fireEvent.change(screen.getByLabelText('إلى'), {
+      target: { value: '2026-10-21' },
+    });
+    await waitFor(() => {
+      expect(vi.mocked(listSorts).mock.calls.length).toBe(beforeRange + 1);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    const reads = vi.mocked(listSorts).mock.calls.length;
+    fireEvent.change(screen.getByLabelText('من'), {
+      target: { value: '2026-10-22' },
+    });
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'تاريخ البداية لازم يكون قبل تاريخ النهاية',
+    );
+    expect(screen.getByLabelText('من')).toHaveAttribute('aria-invalid', 'true');
+    expect(screen.getByLabelText('إلى')).toHaveAttribute(
+      'aria-invalid',
+      'true',
+    );
+    expect(screen.getByLabelText('من')).toBeEnabled();
+    expect(screen.getByLabelText('إلى')).toBeEnabled();
+    expect(vi.mocked(listSorts)).toHaveBeenCalledTimes(reads);
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(recordSort).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    expect(screen.getByLabelText('من')).toBeEnabled();
+  });
+
+  it('stays unlocked when the range is reversed after a save', async () => {
+    await renderPage();
+    fillSort();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('اتسجل الفرز');
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+
+    const beforeRange = vi.mocked(listSorts).mock.calls.length;
+    fireEvent.change(screen.getByLabelText('إلى'), {
+      target: { value: '2026-10-21' },
+    });
+    await waitFor(() => {
+      expect(vi.mocked(listSorts).mock.calls.length).toBe(beforeRange + 1);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    const reads = vi.mocked(listSorts).mock.calls.length;
+    fireEvent.change(screen.getByLabelText('من'), {
+      target: { value: '2026-10-22' },
+    });
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'تاريخ البداية لازم يكون قبل تاريخ النهاية',
+    );
+    expect(screen.getByLabelText('من')).toHaveAttribute('aria-invalid', 'true');
+    expect(screen.getByLabelText('إلى')).toHaveAttribute(
+      'aria-invalid',
+      'true',
+    );
+    expect(screen.getByLabelText('من')).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    expect(vi.mocked(listSorts)).toHaveBeenCalledTimes(reads);
+    expect(
+      screen.queryByRole('button', { name: 'إعادة المحاولة' }),
+    ).not.toBeInTheDocument();
+
+    fillSort();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(recordSort).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText('من')).toBeEnabled();
+  });
+
+  it('offers a retry when the reload after a save fails', async () => {
+    await renderPage();
+    fillSort();
+    vi.mocked(listSorts).mockRejectedValueOnce(new Error('تعذر التحميل'));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('تعذر التحميل');
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+    expect(screen.getByLabelText('من')).toBeDisabled();
+
+    vi.mocked(listSorts).mockResolvedValueOnce([sortRow('saved')]);
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(
+      await screen.findByRole('article', { name: 'بوري مخلوط' }),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    expect(screen.getByLabelText('من')).toBeEnabled();
   });
 });

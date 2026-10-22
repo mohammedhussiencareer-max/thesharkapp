@@ -8,6 +8,8 @@ export type MixedFish = {
   id: string;
   name: string;
   onHandQty: string;
+  /** Ledger book value, numeric(14,2) text. The preview splits this, not qty × average. */
+  onHandValue: string;
   avgCost: string;
   hasUncoveredDeficit: boolean;
   sizes: SizeChoice[];

@@ -95,15 +95,22 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function balanceOf(value: unknown): {
   onHandQty: string;
+  onHandValue: string;
   avgCost: string;
   hasUncoveredDeficit: boolean;
 } {
   const row = record(value);
   if (!row) {
-    return { onHandQty: '0', avgCost: '0', hasUncoveredDeficit: false };
+    return {
+      onHandQty: '0',
+      onHandValue: '0.00',
+      avgCost: '0',
+      hasUncoveredDeficit: false,
+    };
   }
   return {
     onHandQty: exactDecimal(row.on_hand_qty_text),
+    onHandValue: exactDecimal(row.on_hand_value_text),
     avgCost: exactDecimal(row.avg_cost_text),
     hasUncoveredDeficit: row.has_uncovered_deficit === true,
   };
@@ -128,7 +135,7 @@ export async function listMixedFish(): Promise<MixedFish[]> {
       appDb()
         .from('stock_items')
         .select(
-          'id, name, kind, base_unit, parent_item_id, active, item_balances(on_hand_qty_text:on_hand_qty::text, avg_cost_text:avg_cost::text, has_uncovered_deficit)',
+          'id, name, kind, base_unit, parent_item_id, active, item_balances(on_hand_qty_text:on_hand_qty::text, on_hand_value_text:on_hand_value::text, avg_cost_text:avg_cost::text, has_uncovered_deficit)',
         )
         .order('id', { ascending: true })
         .range(from, to),
@@ -160,6 +167,7 @@ export async function listMixedFish(): Promise<MixedFish[]> {
       id: row.id,
       name: row.name,
       onHandQty: balance.onHandQty,
+      onHandValue: balance.onHandValue,
       avgCost: balance.avgCost,
       hasUncoveredDeficit: balance.hasUncoveredDeficit,
       sizes: sizesByParent.get(row.id) ?? [],

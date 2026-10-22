@@ -15,6 +15,7 @@ const mixed: MixedFish = {
   id: 'mixed',
   name: 'بوري مخلوط',
   onHandQty: '100',
+  onHandValue: '5123.46',
   avgCost: '51.234567',
   hasUncoveredDeficit: false,
   sizes: [

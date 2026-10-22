@@ -8,6 +8,7 @@ const mixed: MixedFish = {
   id: 'mixed',
   name: 'بوري مخلوط',
   onHandQty: '1000',
+  onHandValue: '51234.57',
   avgCost: '51.234567',
   hasUncoveredDeficit: false,
   sizes: [
@@ -55,7 +56,7 @@ describe('SortForm', () => {
     expect(preview).toHaveTextContent('الفاقد 2 كيلو');
     expect(preview).toHaveTextContent('102.47');
     expect(preview).toHaveTextContent('51.234567');
-    expect(preview).toHaveTextContent('3074.07');
+    expect(preview).toHaveTextContent('3074.08');
     expect(preview).toHaveTextContent('1946.91');
 
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));

@@ -17,6 +17,23 @@ const fieldClass = 'w-full rounded border border-neutral-300 px-3 py-2';
 
 type Snapshot = { items: MixedFish[]; sorts: SortRecord[] };
 
+type ReadResult =
+  | { status: 'ready'; snapshot: Snapshot }
+  | { status: 'stale' }
+  | { status: 'blocked'; message: string };
+
+function historyFilterError(from: string, to: string): string | null {
+  const range = dateRangeError(from, to);
+  if (range) return range;
+  if (
+    (from && !cairoDateStartIso(from)) ||
+    (to && !cairoNextDateStartIso(to))
+  ) {
+    return 'التاريخ مش مظبوط';
+  }
+  return null;
+}
+
 export function SortingPage() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -37,11 +54,14 @@ export function SortingPage() {
   const editingLocked = saving || needsReload;
   const busy = editingLocked || loads > 0;
 
-  async function readSnapshot(): Promise<Snapshot | null> {
-    const range = dateRangeError(filterRef.current.from, filterRef.current.to);
-    if (range) {
-      setFilterError(range);
-      return null;
+  async function readSnapshot(): Promise<ReadResult> {
+    const problem = historyFilterError(
+      filterRef.current.from,
+      filterRef.current.to,
+    );
+    if (problem) {
+      setFilterError(problem);
+      return { status: 'blocked', message: problem };
     }
     const fromIso = filterRef.current.from
       ? cairoDateStartIso(filterRef.current.from)
@@ -49,13 +69,6 @@ export function SortingPage() {
     const toExclusive = filterRef.current.to
       ? cairoNextDateStartIso(filterRef.current.to)
       : null;
-    if (
-      (filterRef.current.from && !fromIso) ||
-      (filterRef.current.to && !toExclusive)
-    ) {
-      setFilterError('التاريخ مش مظبوط');
-      return null;
-    }
     setFilterError(null);
     const seq = ++seqRef.current;
     loadsRef.current += 1;
@@ -68,9 +81,11 @@ export function SortingPage() {
           toExclusive: toExclusive ?? undefined,
         }),
       ]);
-      return seq === seqRef.current ? { items, sorts } : null;
+      return seq === seqRef.current
+        ? { status: 'ready', snapshot: { items, sorts } }
+        : { status: 'stale' };
     } catch (error) {
-      if (seq !== seqRef.current) return null;
+      if (seq !== seqRef.current) return { status: 'stale' };
       throw error;
     } finally {
       loadsRef.current -= 1;
@@ -83,8 +98,13 @@ export function SortingPage() {
     void (async () => {
       try {
         const next = await readSnapshot();
-        if (cancelled || !next) return;
-        setSnapshot(next);
+        if (cancelled || next.status === 'stale') return;
+        if (next.status === 'blocked') {
+          setLoadError(next.message);
+          setNeedsReload(false);
+          return;
+        }
+        setSnapshot(next.snapshot);
         setLoadError(null);
         setNeedsReload(false);
       } catch (error) {
@@ -111,17 +131,26 @@ export function SortingPage() {
     filterRef.current = next;
     setFrom(next.from);
     setTo(next.to);
-    const range = dateRangeError(next.from, next.to);
-    setFilterError(range);
-    if (range) {
+    const problem = historyFilterError(next.from, next.to);
+    setFilterError(problem);
+    if (problem) {
       seqRef.current += 1;
       return;
     }
+    setLoadError(null);
     setLoadId((value) => value + 1);
   }
 
   async function handleSubmit(draft: SortDraft) {
     if (busy || loadsRef.current > 0) return;
+    const problem = historyFilterError(
+      filterRef.current.from,
+      filterRef.current.to,
+    );
+    if (problem) {
+      setFilterError(problem);
+      return;
+    }
     setSaving(true);
     setServerError(null);
     setSuccess(null);
@@ -129,13 +158,20 @@ export function SortingPage() {
     try {
       await recordSort(draft);
       saved = true;
+      // Stays set until the reload applies data, or a visible retryable error
+      // replaces it. A range that cannot be read clears the lock instead.
       setNeedsReload(true);
       setFormEpoch((value) => value + 1);
       setSuccess('اتسجل الفرز');
       const next = await readSnapshot();
-      if (next) {
-        setSnapshot(next);
+      if (next.status === 'ready') {
+        setSnapshot(next.snapshot);
         setLoadError(null);
+        setNeedsReload(false);
+      } else if (next.status === 'blocked') {
+        setLoadError(next.message);
+        setNeedsReload(false);
+      } else {
         setNeedsReload(false);
       }
     } catch (error) {
@@ -168,6 +204,8 @@ export function SortingPage() {
             className={fieldClass}
             type="date"
             disabled={editingLocked}
+            aria-invalid={filterError ? true : undefined}
+            aria-describedby={filterError ? 'sort-range-error' : undefined}
             value={from}
             onChange={(event) =>
               changeFilter({
@@ -183,6 +221,8 @@ export function SortingPage() {
             className={fieldClass}
             type="date"
             disabled={editingLocked}
+            aria-invalid={filterError ? true : undefined}
+            aria-describedby={filterError ? 'sort-range-error' : undefined}
             value={to}
             onChange={(event) =>
               changeFilter({
@@ -193,7 +233,11 @@ export function SortingPage() {
           />
         </label>
       </div>
-      {filterError ? <p role="alert">{filterError}</p> : null}
+      {filterError ? (
+        <p id="sort-range-error" role="alert">
+          {filterError}
+        </p>
+      ) : null}
       {loading && snapshot === null ? <p>جاري تحميل الفرز…</p> : null}
       {snapshot === null && !loading ? (
         <div className="flex flex-col gap-3">
@@ -210,7 +254,7 @@ export function SortingPage() {
       ) : null}
       {snapshot !== null && loadError ? (
         <div className="flex flex-col gap-2">
-          <p role="alert">{loadError}</p>
+          {loadError !== filterError ? <p role="alert">{loadError}</p> : null}
           <button
             className={secondaryButton}
             type="button"
