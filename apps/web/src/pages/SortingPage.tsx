@@ -5,7 +5,7 @@ import { pageShell, secondaryButton } from '@/lib/page-style';
 import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
 import {
   genericSortError,
-  isDefiniteRefusal,
+  isPayloadRefusal,
   isUnknownOutcome,
   mapSortError,
   retrySafeMessage,
@@ -195,11 +195,12 @@ export function SortingPage() {
       if (!saved) {
         setServerError(reportedSortError(error));
         // A pin stays until this exact payload succeeds or the same replay
-        // is definitely refused. A later unknown result does not clear it
-        // or replace it with a different draft.
+        // is refused by a rule the payload itself breaks. A permission or
+        // contention error can fire before the server's request_id replay,
+        // so it leaves the original unknown and keeps the pin.
         setPending((current) => {
           if (current && current !== draft) return current;
-          if (current) return isDefiniteRefusal(error) ? null : current;
+          if (current) return isPayloadRefusal(error) ? null : current;
           return isUnknownOutcome(error) ? draft : null;
         });
       } else {

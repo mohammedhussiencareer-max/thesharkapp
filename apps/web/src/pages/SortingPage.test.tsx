@@ -430,6 +430,35 @@ describe('SortingPage', () => {
     );
   });
 
+  it('keeps the pin when the replay is refused for permission', async () => {
+    await renderPage();
+    fillSort();
+    vi.mocked(recordSort).mockRejectedValueOnce(
+      new TypeError('Failed to fetch'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    vi.mocked(recordSort).mockRejectedValueOnce({
+      code: '42501',
+      message: 'insufficient_privilege',
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordSort).toHaveBeenCalledTimes(2);
+    });
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+    expect(screen.getByLabelText('كمية المخلوط')).toHaveAttribute('readonly');
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordSort).toHaveBeenCalledTimes(3);
+    });
+    expect(vi.mocked(recordSort).mock.calls[2]?.[0]).toEqual(
+      vi.mocked(recordSort).mock.calls[0]?.[0],
+    );
+  });
+
   it('releases the pin when the replay is definitely refused', async () => {
     await renderPage();
     fillSort();

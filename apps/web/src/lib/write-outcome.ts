@@ -65,3 +65,21 @@ export function isDefiniteRefusal(error: unknown): boolean {
 export function isUnknownOutcome(error: unknown): boolean {
   return !isDefiniteRefusal(error);
 }
+
+const PAYLOAD_SQLSTATES: ReadonlySet<string> = new Set(['P0001', '0A000']);
+
+/**
+ * Whether a refusal of a replayed payload proves the original never
+ * committed. Only errors that the same payload would always raise count:
+ * data exceptions, integrity checks (except 23505), and raised business rules.
+ * If the original had committed, the server's request_id replay would have
+ * returned it before these checks could fail again. 42501, 40001, 40P01 and
+ * 55000 depend on the caller or on concurrency and can fire before the replay
+ * lookup, so they leave the outcome of the original unknown.
+ */
+export function isPayloadRefusal(error: unknown): boolean {
+  const code = serverCode(error);
+  if (code === '23505') return false;
+  if (DATA_EXCEPTION.test(code) || INTEGRITY_CONSTRAINT.test(code)) return true;
+  return PAYLOAD_SQLSTATES.has(code);
+}

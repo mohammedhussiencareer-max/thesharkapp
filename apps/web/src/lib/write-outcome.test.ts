@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { isDefiniteRefusal, isUnknownOutcome } from '@/lib/write-outcome';
+import {
+  isDefiniteRefusal,
+  isUnknownOutcome,
+  isPayloadRefusal,
+} from '@/lib/write-outcome';
 
 const definiteSqlStates = [
   '22023',
@@ -32,6 +36,17 @@ function expectOutcome(error: unknown, definite: boolean, label: string) {
 }
 
 describe('write outcome', () => {
+  it('releases a replay only on a refusal the payload itself causes', () => {
+    for (const code of ['22023', '22P02', '23514', 'P0001', '0A000']) {
+      expect(isPayloadRefusal({ code })).toBe(true);
+    }
+    for (const code of ['42501', '40001', '40P01', '55000', '23505', '57014']) {
+      expect(isPayloadRefusal({ code })).toBe(false);
+    }
+    expect(isPayloadRefusal({ code: 'PGRST003' })).toBe(false);
+    expect(isPayloadRefusal(new Error('Failed to fetch'))).toBe(false);
+  });
+
   it('treats allow-listed in-transaction SQLSTATEs as definite refusals', () => {
     for (const code of definiteSqlStates) {
       expectOutcome(

@@ -11,7 +11,11 @@ export const pendingResendMessage =
   'الحفظ اللي فات ممكن يكون اتسجل — هيتبعت تاني من غير تغيير';
 
 /** In-transaction refusals only. The allow-list lives in write-outcome.ts. */
-export { isDefiniteRefusal, isUnknownOutcome } from '@/lib/write-outcome';
+export {
+  isDefiniteRefusal,
+  isPayloadRefusal,
+  isUnknownOutcome,
+} from '@/lib/write-outcome';
 
 export const requestIdConflictMessage =
   'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع الفرز قبل ما تسجّل تاني';
