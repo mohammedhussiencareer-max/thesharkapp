@@ -12,8 +12,8 @@ import {
   quantityScaleMessage,
   requestIdConflictMessage,
   retrySafeMessage,
-  syncCoverageMessage,
   unknownItemMessage,
+  waitingForSyncMessage,
 } from '@/counts/errors';
 
 describe('mapCountError', () => {
@@ -27,15 +27,9 @@ describe('mapCountError', () => {
     expect(
       mapCountError({ code: '22023', message: 'a shift is still open' }),
     ).toBe(openShiftMessage);
-    expect(syncCoverageMessage).toBe(
-      'لازم مزامنة جديدة تبدأ بعد وقت الجرد وبعد ما قفلة الوردية تتسجل',
+    expect(waitingForSyncMessage).toBe(
+      'الجرد اتحفظ ومستني مزامنة جديدة تبدأ بعد دلوقتي. بعد المزامنة دوس «سجّل الجرد» تاني.',
     );
-    expect(
-      mapCountError({
-        code: '22023',
-        message: 'sync has not covered this count time',
-      }),
-    ).toBe('لازم مزامنة جديدة تبدأ بعد وقت الجرد وبعد ما قفلة الوردية تتسجل');
     expect(
       mapCountError({
         code: '22023',

@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { waitingForSyncMessage } from '../src/counts/errors';
 import type { Database } from '../src/lib/database.types';
 import { nowCairoDateTimeLocal } from '../src/purchases/time';
 import { localServiceRoleKey, ownerEmail, ownerPassword } from './.test-owner';
@@ -6,17 +7,14 @@ import { expect, test } from './fixtures';
 import { assertLocalSupabaseUrl } from './local-guard';
 
 /**
- * Coverage is the newest ok sync run by id. That run must have finished, and
- * its started_at must be after close_recorded_at of the latest shift that
- * opened at or before the count. Both times are the database clock. The seeded
- * shift is inserted before this spec, so its close is already recorded. This
- * spec then starts and finishes an ok run, which makes started_at later than
- * that stamp. Coverage does not depend on the gap between the count time and
- * the run start. The count time is two minutes ago, after the seeded close and
- * after the opening. The seeded shift closed about 20 hours ago. No open shift
- * is seeded. A parallel spec can hold the single running sync; this retries
- * that collision. Coverage uses the same service-role start/finish path as the
- * sales seed.
+ * The owner counts, then submits. The first save stores the count and waits.
+ * This spec then starts and finishes an ok run, and presses سجّل الجرد again.
+ * That run's started_at is the database clock of the start, so it is after
+ * the submit and after the seeded shift's close stamp. The count time is two
+ * minutes ago, after the seeded close and after the opening. The seeded shift
+ * closed about 20 hours ago. No open shift is seeded. A parallel spec can
+ * hold the single running sync; this retries that collision. Coverage uses
+ * the same service-role start/finish path as the sales seed.
  */
 async function coverCountTime(apiUrl: string): Promise<void> {
   assertLocalSupabaseUrl(apiUrl);
@@ -108,9 +106,12 @@ test('owner counts a daily item short and sees the shortage', async ({
   await page.getByLabel(`الكمية المعدودة ${name}`).fill('7');
   await page.getByLabel('ملاحظة').fill(stamp);
 
+  await page.getByRole('button', { name: 'حفظ', exact: true }).click();
+  await expect(page.getByText(waitingForSyncMessage)).toBeVisible(visible);
+
   await coverCountTime(supabaseUrl);
 
-  await page.getByRole('button', { name: 'حفظ', exact: true }).click();
+  await page.getByRole('button', { name: 'سجّل الجرد' }).click();
   await expect(page.getByRole('status')).toHaveText('اتسجل الجرد', visible);
   const saved = page.getByRole('article', { name: stamp, exact: true });
   await expect(saved).toBeVisible(visible);

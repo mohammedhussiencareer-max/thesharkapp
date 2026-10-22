@@ -30,6 +30,8 @@ export function CountForm({
   submitting,
   serverError,
   pending,
+  waiting,
+  requestKey,
   onClearServerError,
   onSubmit,
 }: {
@@ -39,17 +41,30 @@ export function CountForm({
   serverError: string | null;
   /** Set only after an unknown outcome. Null when the save was not sent or was refused. */
   pending: CountDraft | null;
+  /** The server stored this payload and is waiting for a later sync. */
+  waiting: CountDraft | null;
+  /**
+   * Bumped when a stored request is refused. The field values stay; the next
+   * save uses a new request id. The stored row remains in the pending list.
+   */
+  requestKey: number;
   onClearServerError: () => void;
   onSubmit: (draft: CountDraft) => void;
 }) {
-  // Reused after a definite refusal, because that attempt was not stored.
-  // An unknown outcome resends `pending` with this same id. A confirmed
-  // save remounts the form and mints a new id.
-  const [requestId] = useState(() => crypto.randomUUID());
+  // Reused after a refusal that stored nothing. An unknown outcome resends
+  // `pending` with this same id. A stored request that is later refused
+  // bumps `requestKey` and mints a new id. A confirmed save remounts the form.
+  const [requestId, setRequestId] = useState(() => crypto.randomUUID());
+  const [appliedKey, setAppliedKey] = useState(requestKey);
+  if (appliedKey !== requestKey) {
+    setAppliedKey(requestKey);
+    setRequestId(crypto.randomUUID());
+  }
   const [values, setValues] = useState<CountValues>(emptyValues);
   const [showErrors, setShowErrors] = useState(false);
   const disabled = locked || submitting;
-  const assessment = pending ? null : assessCount(values, items);
+  const pinned = pending ?? waiting;
+  const assessment = pinned ? null : assessCount(values, items);
   const preview = assessment?.preview ?? null;
   const submitted = showErrors && assessment ? assessment.errors : null;
   const quantityError = submitted
@@ -67,14 +82,14 @@ export function CountForm({
   );
 
   function edit(patch: Partial<CountValues>) {
-    if (pending) return;
+    if (pinned) return;
     onClearServerError();
     setShowErrors(false);
     setValues((current) => ({ ...current, ...patch }));
   }
 
   function editQuantity(itemId: string, quantity: string) {
-    if (pending) return;
+    if (pinned) return;
     onClearServerError();
     setShowErrors(false);
     setValues((current) => ({
@@ -88,6 +103,10 @@ export function CountForm({
     if (disabled) return;
     if (pending) {
       onSubmit(pending);
+      return;
+    }
+    if (waiting) {
+      onSubmit(waiting);
       return;
     }
     const result = assessCount(values, items);
@@ -110,9 +129,9 @@ export function CountForm({
             className={fieldClass}
             type="datetime-local"
             disabled={disabled}
-            readOnly={pending !== null}
+            readOnly={pinned !== null}
             value={
-              pending ? pinnedCountTime(pending.countedAt) : values.countedAt
+              pinned ? pinnedCountTime(pinned.countedAt) : values.countedAt
             }
             onChange={(event) => edit({ countedAt: event.target.value })}
           />
@@ -122,15 +141,15 @@ export function CountForm({
           <input
             className={fieldClass}
             disabled={disabled}
-            readOnly={pending !== null}
-            value={pending ? (pending.note ?? '') : values.note}
+            readOnly={pinned !== null}
+            value={pinned ? (pinned.note ?? '') : values.note}
             onChange={(event) => edit({ note: event.target.value })}
           />
         </label>
       </div>
       <div className="flex flex-col gap-3">
-        {pending
-          ? pending.lines.map((line) => {
+        {pinned
+          ? pinned.lines.map((line) => {
               const name = line.itemName ?? line.itemId;
               return (
                 <div
@@ -167,7 +186,7 @@ export function CountForm({
                       className={fieldClass}
                       inputMode="decimal"
                       disabled={disabled}
-                      readOnly={pending !== null}
+                      readOnly={pinned !== null}
                       aria-invalid={fieldError ? true : undefined}
                       value={values.quantities[item.id] ?? ''}
                       onChange={(event) =>
@@ -195,7 +214,7 @@ export function CountForm({
         </section>
       ) : null}
       <button className={primaryButton} type="submit" disabled={disabled}>
-        حفظ
+        {waiting && !pending ? 'سجّل الجرد' : 'حفظ'}
       </button>
     </form>
   );

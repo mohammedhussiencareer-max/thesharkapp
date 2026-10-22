@@ -7,7 +7,13 @@ import {
 } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { listCounts, listDailyItems, recordCount } from '@/counts/api';
+import {
+  listCounts,
+  listDailyItems,
+  listPendingCounts,
+  recordCount,
+  recordStoredCount,
+} from '@/counts/api';
 import {
   backDatedCountMessage,
   insideShiftMessage,
@@ -16,16 +22,22 @@ import {
   permissionMessage,
   retrySafeMessage,
   surplusWarning,
-  syncCoverageMessage,
+  waitingForSyncMessage,
 } from '@/counts/errors';
-import type { CountItem, CountRecord } from '@/counts/types';
+import type { CountItem, CountRecord, CountWriteResult } from '@/counts/types';
 import { CountsPage } from '@/pages/CountsPage';
+import { formatCairoDateTime } from '@/purchases/time';
 
 vi.mock('@/counts/api', () => ({
   listDailyItems: vi.fn(),
   listCounts: vi.fn(),
+  listPendingCounts: vi.fn(),
   recordCount: vi.fn(),
+  recordStoredCount: vi.fn(),
 }));
+
+const posted: CountWriteResult = { status: 'posted', countId: 'saved-count' };
+const waiting: CountWriteResult = { status: 'waiting_for_sync' };
 
 const tilapia: CountItem = {
   id: 'tilapia',
@@ -79,18 +91,22 @@ describe('CountsPage', () => {
   beforeEach(() => {
     vi.mocked(listDailyItems).mockReset();
     vi.mocked(listCounts).mockReset();
+    vi.mocked(listPendingCounts).mockReset();
     vi.mocked(recordCount).mockReset();
+    vi.mocked(recordStoredCount).mockReset();
     vi.mocked(listDailyItems).mockResolvedValue([tilapia, shrimp]);
     vi.mocked(listCounts).mockResolvedValue([]);
-    vi.mocked(recordCount).mockResolvedValue(undefined);
+    vi.mocked(listPendingCounts).mockResolvedValue([]);
+    vi.mocked(recordCount).mockResolvedValue(posted);
+    vi.mocked(recordStoredCount).mockResolvedValue(posted);
   });
 
   it('locks the page through the save and the reload', async () => {
     await renderPage();
-    let releaseSave: () => void = () => undefined;
+    let releaseSave: (result: CountWriteResult) => void = () => undefined;
     vi.mocked(recordCount).mockReturnValueOnce(
       new Promise((resolve) => {
-        releaseSave = () => resolve();
+        releaseSave = resolve;
       }),
     );
     fillShortage();
@@ -108,7 +124,7 @@ describe('CountsPage', () => {
         releaseReload = resolve;
       }),
     );
-    releaseSave();
+    releaseSave(posted);
     expect(await screen.findByRole('status')).toHaveTextContent('اتسجل الجرد');
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
@@ -240,7 +256,7 @@ describe('CountsPage', () => {
     ]);
   });
 
-  it('shows why a count inside a shift or before sync coverage is blocked', async () => {
+  it('shows why a count inside a shift or during an open shift is blocked', async () => {
     await renderPage();
     fillShortage();
     vi.mocked(recordCount).mockRejectedValueOnce({
@@ -259,15 +275,6 @@ describe('CountsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
     await waitFor(() => {
       expect(screen.getByRole('alert')).toHaveTextContent(openShiftMessage);
-    });
-
-    vi.mocked(recordCount).mockRejectedValueOnce({
-      code: '22023',
-      message: 'sync has not covered this count time',
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
-    await waitFor(() => {
-      expect(screen.getByRole('alert')).toHaveTextContent(syncCoverageMessage);
     });
   });
 
@@ -399,11 +406,11 @@ describe('CountsPage', () => {
 
     vi.mocked(recordCount).mockRejectedValueOnce({
       code: '22023',
-      message: 'sync has not covered this count time',
+      message: 'count time is inside a shift',
     });
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
     await waitFor(() => {
-      expect(screen.getByRole('alert')).toHaveTextContent(syncCoverageMessage);
+      expect(screen.getByRole('alert')).toHaveTextContent(insideShiftMessage);
     });
     expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(
       vi.mocked(recordCount).mock.calls[0]?.[0],
@@ -548,5 +555,252 @@ describe('CountsPage', () => {
     expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('7');
     expect(screen.getByLabelText('وقت الجرد')).toHaveAttribute('readonly');
     expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+  });
+
+  it('keeps the same payload read-only while the count waits for sync', async () => {
+    await renderPage();
+    vi.mocked(listPendingCounts).mockImplementation(() => {
+      const sent = vi.mocked(recordCount).mock.calls[0]?.[0];
+      if (!sent) return Promise.resolve([]);
+      return Promise.resolve([
+        {
+          requestId: sent.requestId,
+          preparedAt: sent.countedAt,
+          countedAt: sent.countedAt,
+          itemCount: sent.lines.length,
+          payload: {
+            request_id: sent.requestId,
+            frequency: 'daily',
+            counted_at: sent.countedAt,
+            note: sent.note,
+            lines: sent.lines.map((line) => ({
+              item_id: line.itemId,
+              counted_qty: line.countedQty,
+            })),
+          },
+        },
+      ]);
+    });
+    vi.mocked(recordCount).mockResolvedValue(waiting);
+    fillShortage();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByText(waitingForSyncMessage)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'سجّل الجرد' })).toBeEnabled();
+    });
+    expect(screen.queryByText('اتسجل الجرد')).not.toBeInTheDocument();
+    expect(screen.queryByText(pendingResendMessage)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('7');
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveAttribute(
+      'readonly',
+    );
+    expect(screen.getByLabelText('وقت الجرد')).toHaveAttribute('readonly');
+    expect(
+      screen.queryByRole('heading', { name: 'جرد مستني المزامنة' }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    await waitFor(() => {
+      expect(recordCount).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(recordCount).mock.calls[0]?.[0],
+    );
+    expect(screen.getByText(waitingForSyncMessage)).toBeInTheDocument();
+    expect(screen.queryByText('اتسجل الجرد')).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'سجّل الجرد' })).toHaveLength(
+      1,
+    );
+  });
+
+  it('posts the pinned payload and releases it', async () => {
+    await renderPage();
+    vi.mocked(recordCount).mockResolvedValueOnce(waiting);
+    fillShortage();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'سجّل الجرد' })).toBeEnabled();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent('اتسجل الجرد');
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    expect(screen.queryByText(waitingForSyncMessage)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('');
+    expect(screen.getByLabelText('وقت الجرد')).not.toHaveAttribute('readonly');
+    expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(recordCount).mock.calls[0]?.[0],
+    );
+  });
+
+  it('turns an unknown waiting resend back into the save pin', async () => {
+    await renderPage();
+    vi.mocked(recordCount).mockResolvedValueOnce(waiting);
+    fillShortage();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'سجّل الجرد' })).toBeEnabled();
+    });
+
+    vi.mocked(recordCount).mockRejectedValueOnce(
+      new TypeError('Failed to fetch'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+    expect(screen.queryByText(waitingForSyncMessage)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveAttribute(
+      'readonly',
+    );
+    expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(recordCount).mock.calls[0]?.[0],
+    );
+  });
+
+  it('keeps the waiting pin when a resend is refused for permission', async () => {
+    await renderPage();
+    vi.mocked(recordCount).mockResolvedValueOnce(waiting);
+    fillShortage();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'سجّل الجرد' })).toBeEnabled();
+    });
+
+    vi.mocked(recordCount).mockRejectedValueOnce({
+      code: '42501',
+      message: 'insufficient_privilege',
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(permissionMessage);
+    });
+    expect(screen.getByText(waitingForSyncMessage)).toBeInTheDocument();
+    expect(screen.queryByText(pendingResendMessage)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'سجّل الجرد' })).toBeEnabled();
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveAttribute(
+      'readonly',
+    );
+    expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(recordCount).mock.calls[0]?.[0],
+    );
+  });
+
+  it('mints a new request id when a stored count is refused', async () => {
+    await renderPage();
+    vi.mocked(listPendingCounts).mockImplementation(() => {
+      const sent = vi.mocked(recordCount).mock.calls[0]?.[0];
+      if (!sent) return Promise.resolve([]);
+      return Promise.resolve([
+        {
+          requestId: sent.requestId,
+          preparedAt: sent.countedAt,
+          countedAt: sent.countedAt,
+          itemCount: sent.lines.length,
+          payload: {
+            request_id: sent.requestId,
+            frequency: 'daily',
+            counted_at: sent.countedAt,
+            note: sent.note,
+            lines: sent.lines.map((line) => ({
+              item_id: line.itemId,
+              counted_qty: line.countedQty,
+            })),
+          },
+        },
+      ]);
+    });
+    vi.mocked(recordCount).mockResolvedValueOnce(waiting);
+    fillShortage();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'سجّل الجرد' })).toBeEnabled();
+    });
+    expect(
+      screen.queryByRole('heading', { name: 'جرد مستني المزامنة' }),
+    ).not.toBeInTheDocument();
+
+    vi.mocked(recordCount).mockRejectedValueOnce({
+      code: '22023',
+      message: 'count time is inside a shift',
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      insideShiftMessage,
+    );
+    expect(screen.queryByText(waitingForSyncMessage)).not.toBeInTheDocument();
+    expect(screen.queryByText(pendingResendMessage)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('وقت الجرد')).not.toHaveAttribute('readonly');
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('7');
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    expect(
+      screen.getByRole('heading', { name: 'جرد مستني المزامنة' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'سجّل الجرد' })).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText('الكمية المعدودة بلطي'), {
+      target: { value: '8' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordCount).toHaveBeenCalledTimes(3);
+    });
+    const storedId = vi.mocked(recordCount).mock.calls[0]?.[0]?.requestId;
+    const refused = vi.mocked(recordCount).mock.calls[1]?.[0];
+    const edited = vi.mocked(recordCount).mock.calls[2]?.[0];
+    expect(refused).toEqual(vi.mocked(recordCount).mock.calls[0]?.[0]);
+    expect(edited?.requestId).toBeTruthy();
+    expect(edited?.requestId).not.toBe(storedId);
+    expect(edited?.lines).toEqual([
+      { itemId: 'tilapia', itemName: 'بلطي', countedQty: '8' },
+    ]);
+    expect(
+      screen.getByRole('heading', { name: 'جرد مستني المزامنة' }),
+    ).toBeInTheDocument();
+  });
+
+  it('shows a stored count after reload and resends that payload', async () => {
+    const stored = {
+      request_id: 'd1900000-0000-4000-8000-000000000060',
+      frequency: 'daily',
+      counted_at: '2026-10-22T10:00:00.000Z',
+      note: null,
+      lines: [{ item_id: 'tilapia', counted_qty: '7' }],
+    };
+    const when = formatCairoDateTime(stored.counted_at);
+    vi.mocked(listPendingCounts).mockResolvedValueOnce([
+      {
+        requestId: stored.request_id,
+        preparedAt: '2026-10-22T10:05:00.000Z',
+        countedAt: stored.counted_at,
+        itemCount: 1,
+        payload: stored,
+      },
+    ]);
+    await renderPage();
+
+    expect(
+      screen.getByRole('heading', { name: 'جرد مستني المزامنة' }),
+    ).toBeInTheDocument();
+    const card = screen.getByRole('article', { name: `جرد مستني ${when}` });
+    expect(card).toHaveTextContent(when);
+    expect(card).toHaveTextContent('الأصناف 1');
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('اتسجل الجرد');
+    await waitFor(() => {
+      expect(recordStoredCount).toHaveBeenCalledTimes(1);
+    });
+    expect(vi.mocked(recordStoredCount).mock.calls[0]?.[0]).toEqual(stored);
+    expect(recordCount).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(
+        screen.queryByRole('article', { name: `جرد مستني ${when}` }),
+      ).not.toBeInTheDocument();
+    });
   });
 });

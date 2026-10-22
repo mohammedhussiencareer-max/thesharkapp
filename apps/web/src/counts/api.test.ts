@@ -1,10 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { listCounts, listDailyItems, recordCount } from '@/counts/api';
 import {
+  listCounts,
+  listDailyItems,
+  listPendingCounts,
+  recordCount,
+  recordStoredCount,
+} from '@/counts/api';
+import {
+  genericCountError,
+  insideShiftMessage,
   isPayloadRefusal,
   isUnknownOutcome,
   retrySafeMessage,
-  syncCoverageMessage,
 } from '@/counts/errors';
 import type { CountDraft } from '@/counts/types';
 
@@ -65,12 +72,16 @@ describe('counts api', () => {
   });
 
   it('sends exact quantity strings, daily frequency, and the request id', async () => {
-    const rpc = vi
-      .fn()
-      .mockResolvedValue({ data: draft.requestId, error: null });
+    const rpc = vi.fn().mockResolvedValue({
+      data: { status: 'posted', count_id: 'saved-count' },
+      error: null,
+    });
     mocks.schema.mockReturnValue({ rpc });
 
-    await recordCount(draft);
+    await expect(recordCount(draft)).resolves.toEqual({
+      status: 'posted',
+      countId: 'saved-count',
+    });
 
     expect(mocks.schema).toHaveBeenCalledWith('app');
     expect(rpc).toHaveBeenCalledWith('record_count', {
@@ -85,18 +96,66 @@ describe('counts api', () => {
         ],
       },
     });
+
+    rpc.mockResolvedValueOnce({
+      data: JSON.stringify({ status: 'posted', count_id: 'saved-count' }),
+      error: null,
+    });
+    await expect(recordCount(draft)).resolves.toEqual({
+      status: 'posted',
+      countId: 'saved-count',
+    });
   });
 
-  it('maps a sync refusal as a payload refusal and keeps a lost reply retry-safe', async () => {
+  it('returns waiting_for_sync as a successful result', async () => {
+    const stored = {
+      request_id: draft.requestId,
+      frequency: 'daily',
+      counted_at: draft.countedAt,
+      note: draft.note,
+      lines: [{ item_id: 'tilapia', counted_qty: '7' }],
+    };
+    const rpc = vi.fn().mockResolvedValue({
+      data: { status: 'waiting_for_sync' },
+      error: null,
+    });
+    mocks.schema.mockReturnValue({ rpc });
+
+    await expect(recordCount(draft)).resolves.toEqual({
+      status: 'waiting_for_sync',
+    });
+
+    rpc.mockResolvedValueOnce({
+      data: [{ status: 'waiting_for_sync' }],
+      error: null,
+    });
+    await expect(recordStoredCount(stored)).resolves.toEqual({
+      status: 'waiting_for_sync',
+    });
+    expect(rpc).toHaveBeenLastCalledWith('record_count', { p_count: stored });
+  });
+
+  it('keeps an unreadable success retry-safe', async () => {
+    const rpc = vi
+      .fn()
+      .mockResolvedValue({ data: draft.requestId, error: null });
+    mocks.schema.mockReturnValue({ rpc });
+    await expect(recordCount(draft)).rejects.toThrow(retrySafeMessage);
+    await expect(recordCount(draft)).rejects.toSatisfy((error: unknown) =>
+      isUnknownOutcome(error),
+    );
+  });
+
+  it('maps an inside-shift refusal as a payload refusal and keeps a lost reply retry-safe', async () => {
     const rpc = vi.fn().mockResolvedValue({
       data: null,
       error: {
         code: '22023',
-        message: 'sync has not covered this count time',
+        message: 'count time is inside a shift',
       },
     });
     mocks.schema.mockReturnValue({ rpc });
-    await expect(recordCount(draft)).rejects.toThrow(syncCoverageMessage);
+    await expect(recordCount(draft)).rejects.toThrow(insideShiftMessage);
     await expect(recordCount(draft)).rejects.toSatisfy((error: unknown) =>
       isPayloadRefusal(error),
     );
@@ -219,5 +278,68 @@ describe('counts api', () => {
       hasSurplus: true,
       note: 'صباح',
     });
+  });
+
+  it('reads pending counts in prepare order and keeps the stored payload', async () => {
+    const payload = {
+      request_id: 'd1900000-0000-4000-8000-000000000060',
+      frequency: 'daily',
+      counted_at: '2026-10-22T10:00:00.000Z',
+      note: null,
+      lines: [{ item_id: 'tilapia', counted_qty: '7' }],
+    };
+    const built = query({
+      data: [
+        {
+          request_id: 'd1900000-0000-4000-8000-000000000060',
+          prepared_at: '2026-10-22T10:05:00.000Z',
+          counted_at: '2026-10-22T10:00:00.000Z',
+          item_count: 1,
+          payload,
+        },
+      ],
+      error: null,
+    });
+    const tables: string[] = [];
+    mocks.schema.mockReturnValue({
+      from: (table: string) => {
+        tables.push(table);
+        return built.chain;
+      },
+    });
+
+    const pending = await listPendingCounts();
+
+    expect(tables).toEqual(['stock_count_pending']);
+    expect(built.captured.orders).toEqual([
+      { column: 'prepared_at', ascending: true },
+      { column: 'request_id', ascending: true },
+    ]);
+    expect(built.captured.ranges).toEqual([{ from: 0, to: 999 }]);
+    expect(String(built.captured.select)).toContain('payload');
+    expect(pending).toEqual([
+      {
+        requestId: 'd1900000-0000-4000-8000-000000000060',
+        preparedAt: '2026-10-22T10:05:00.000Z',
+        countedAt: '2026-10-22T10:00:00.000Z',
+        itemCount: 1,
+        payload,
+      },
+    ]);
+
+    const broken = query({
+      data: [
+        {
+          request_id: 'd1900000-0000-4000-8000-000000000060',
+          prepared_at: '2026-10-22T10:05:00.000Z',
+          counted_at: '2026-10-22T10:00:00.000Z',
+          item_count: 1,
+          payload: null,
+        },
+      ],
+      error: null,
+    });
+    mocks.schema.mockReturnValue({ from: () => broken.chain });
+    await expect(listPendingCounts()).rejects.toThrow(genericCountError);
   });
 });

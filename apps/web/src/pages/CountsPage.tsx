@@ -2,19 +2,38 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { CountForm } from '@/counts/CountForm';
 import { CountList } from '@/counts/CountList';
-import { listCounts, listDailyItems, recordCount } from '@/counts/api';
+import { PendingCounts } from '@/counts/PendingCounts';
+import {
+  listCounts,
+  listDailyItems,
+  listPendingCounts,
+  recordCount,
+  recordStoredCount,
+} from '@/counts/api';
 import {
   genericCountError,
   isPayloadRefusal,
   isUnknownOutcome,
   mapCountError,
   retrySafeMessage,
+  waitingForSyncMessage,
 } from '@/counts/errors';
-import type { CountDraft, CountItem, CountRecord } from '@/counts/types';
+import type {
+  CountDraft,
+  CountItem,
+  CountRecord,
+  CountWriteResult,
+  PendingCount,
+} from '@/counts/types';
 import { messageFrom } from '@/items/errors';
+import type { Json } from '@/lib/database.types';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 
-type Snapshot = { items: CountItem[]; counts: CountRecord[] };
+type Snapshot = {
+  items: CountItem[];
+  counts: CountRecord[];
+  pendingCounts: PendingCount[];
+};
 
 type ReadResult = { status: 'ready'; snapshot: Snapshot } | { status: 'stale' };
 
@@ -28,8 +47,11 @@ export function CountsPage() {
   const [loads, setLoads] = useState(0);
   const [serverError, setServerError] = useState<string | null>(null);
   const [pending, setPending] = useState<CountDraft | null>(null);
+  const [waiting, setWaiting] = useState<CountDraft | null>(null);
+  const [waitNotice, setWaitNotice] = useState(false);
   const [success, setSuccess] = useState<string | null>(null);
   const [formEpoch, setFormEpoch] = useState(0);
+  const [requestKey, setRequestKey] = useState(0);
   const seqRef = useRef(0);
   const loadsRef = useRef(0);
   const editingLocked = saving || needsReload;
@@ -40,12 +62,13 @@ export function CountsPage() {
     loadsRef.current += 1;
     setLoads(loadsRef.current);
     try {
-      const [items, counts] = await Promise.all([
+      const [items, counts, pendingCounts] = await Promise.all([
         listDailyItems(),
         listCounts(),
+        listPendingCounts(),
       ]);
       return seq === seqRef.current
-        ? { status: 'ready', snapshot: { items, counts } }
+        ? { status: 'ready', snapshot: { items, counts, pendingCounts } }
         : { status: 'stale' };
     } catch (error) {
       if (seq !== seqRef.current) return { status: 'stale' };
@@ -98,6 +121,80 @@ export function CountsPage() {
     return mapCountError(error);
   }
 
+  async function refreshAfterWait(): Promise<void> {
+    try {
+      const next = await readSnapshot();
+      if (next.status === 'ready') {
+        setSnapshot(next.snapshot);
+        setLoadError(null);
+      }
+    } catch (error) {
+      setLoadError(messageFrom(error));
+    }
+  }
+
+  function applyPosted(): void {
+    setPending(null);
+    setWaiting(null);
+    setWaitNotice(false);
+    // Stays set until the reload applies data, or a visible retryable error
+    // replaces it. A stale read clears the lock instead of leaving it stuck.
+    setNeedsReload(true);
+    setFormEpoch((value) => value + 1);
+    setSuccess('اتسجل الجرد');
+  }
+
+  function holdUnknown(draft: CountDraft, error: unknown): void {
+    setServerError(reportedCountError(error));
+    // A pin stays until this exact payload succeeds or the same replay
+    // is refused by a rule the payload itself breaks. A permission or
+    // contention error can fire before the server's request_id replay,
+    // so it leaves the existing pin in place and does not start a new one.
+    if (isPayloadRefusal(error)) {
+      // The waiting draft is already stored. A corrected save needs a new
+      // request id; the old row stays in the pending list.
+      const stored = waiting === draft;
+      setWaitNotice(false);
+      setPending((current) => (current && current !== draft ? current : null));
+      setWaiting((current) => (current && current !== draft ? current : null));
+      if (stored) setRequestKey((value) => value + 1);
+      return;
+    }
+    if (isUnknownOutcome(error)) {
+      // A lost reply may have posted. The next حفظ resends this payload,
+      // including when the lost call was the waiting resend.
+      setWaitNotice(false);
+      setPending((current) => (current && current !== draft ? current : draft));
+      setWaiting((current) => (current && current !== draft ? current : null));
+    }
+  }
+
+  async function finishWrite(
+    result: CountWriteResult,
+    draft: CountDraft | null,
+  ): Promise<boolean> {
+    if (result.status === 'waiting_for_sync') {
+      if (draft) {
+        setWaiting(draft);
+        setPending(null);
+      }
+      setWaitNotice(true);
+      setSuccess(null);
+      await refreshAfterWait();
+      return false;
+    }
+    applyPosted();
+    const next = await readSnapshot();
+    if (next.status === 'ready') {
+      setSnapshot(next.snapshot);
+      setLoadError(null);
+      setNeedsReload(false);
+    } else {
+      setNeedsReload(false);
+    }
+    return true;
+  }
+
   async function handleSubmit(draft: CountDraft) {
     if (busy || loadsRef.current > 0) return;
     setSaving(true);
@@ -105,35 +202,54 @@ export function CountsPage() {
     setSuccess(null);
     let saved = false;
     try {
-      await recordCount(draft);
-      saved = true;
-      // The form resubmits the pinned object, so this success is that payload.
-      setPending(null);
-      // Stays set until the reload applies data, or a visible retryable error
-      // replaces it. A stale read clears the lock instead of leaving it stuck.
-      setNeedsReload(true);
-      setFormEpoch((value) => value + 1);
-      setSuccess('اتسجل الجرد');
-      const next = await readSnapshot();
-      if (next.status === 'ready') {
-        setSnapshot(next.snapshot);
-        setLoadError(null);
-        setNeedsReload(false);
+      const result = await recordCount(draft);
+      if (result.status === 'posted') saved = true;
+      await finishWrite(result, draft);
+    } catch (error) {
+      if (!saved) {
+        holdUnknown(draft, error);
       } else {
-        setNeedsReload(false);
+        setNeedsReload(true);
+        setLoadError(messageFrom(error));
       }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleStored(payload: Json) {
+    if (busy || loadsRef.current > 0) return;
+    setSaving(true);
+    setServerError(null);
+    setSuccess(null);
+    let saved = false;
+    try {
+      const result = await recordStoredCount(payload);
+      if (result.status === 'posted') saved = true;
+      await finishWrite(result, null);
     } catch (error) {
       if (!saved) {
         setServerError(reportedCountError(error));
-        // A pin stays until this exact payload succeeds or the same replay
-        // is refused by a rule the payload itself breaks. A permission or
-        // contention error can fire before the server's request_id replay,
-        // so it leaves the original unknown and keeps the pin.
-        setPending((current) => {
-          if (current && current !== draft) return current;
-          if (current) return isPayloadRefusal(error) ? null : current;
-          return isUnknownOutcome(error) ? draft : null;
-        });
+        const requestId =
+          payload &&
+          typeof payload === 'object' &&
+          !Array.isArray(payload) &&
+          typeof (payload as { request_id?: unknown }).request_id === 'string'
+            ? (payload as { request_id: string }).request_id
+            : null;
+        if (
+          requestId &&
+          (pending?.requestId === requestId ||
+            waiting?.requestId === requestId) &&
+          isPayloadRefusal(error)
+        ) {
+          if (waiting?.requestId === requestId) {
+            setRequestKey((value) => value + 1);
+          }
+          setPending(null);
+          setWaiting(null);
+          setWaitNotice(false);
+        }
       } else {
         setNeedsReload(true);
         setLoadError(messageFrom(error));
@@ -153,6 +269,9 @@ export function CountsPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الجرد اليومي</h1>
+      {waiting || waitNotice ? (
+        <p role="status">{waitingForSyncMessage}</p>
+      ) : null}
       {success ? <p role="status">{success}</p> : null}
       <button
         className={secondaryButton}
@@ -191,7 +310,7 @@ export function CountsPage() {
       ) : null}
       {snapshot !== null ? (
         <>
-          {items.length === 0 && pending === null ? (
+          {items.length === 0 && pending === null && waiting === null ? (
             <p>مفيش أصناف جرد يومي نشطة</p>
           ) : (
             <CountForm
@@ -201,10 +320,19 @@ export function CountsPage() {
               submitting={saving}
               serverError={serverError}
               pending={pending}
+              waiting={waiting}
+              requestKey={requestKey}
               onClearServerError={() => setServerError(null)}
               onSubmit={(next) => void handleSubmit(next)}
             />
           )}
+          <PendingCounts
+            counts={snapshot.pendingCounts.filter(
+              (row) => row.requestId !== waiting?.requestId,
+            )}
+            disabled={busy}
+            onResend={(payload) => void handleStored(payload)}
+          />
           <CountList counts={snapshot.counts} />
         </>
       ) : null}

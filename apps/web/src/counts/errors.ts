@@ -15,7 +15,7 @@ export {
   isDefiniteRefusal,
   isPayloadRefusal,
   isUnknownOutcome,
-} from '@/lib/write-outcome';
+} from '../lib/write-outcome';
 
 export const requestIdConflictMessage =
   'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع الجرد قبل ما تسجّل تاني';
@@ -26,8 +26,9 @@ export const insideShiftMessage =
 export const openShiftMessage =
   'فيه وردية لسه مفتوحة. اقفلها الأول وبعدين اعمل الجرد';
 
-export const syncCoverageMessage =
-  'لازم مزامنة جديدة تبدأ بعد وقت الجرد وبعد ما قفلة الوردية تتسجل';
+/** The server stored the count and is waiting for a sync that starts after this submit. */
+export const waitingForSyncMessage =
+  'الجرد اتحفظ ومستني مزامنة جديدة تبدأ بعد دلوقتي. بعد المزامنة دوس «سجّل الجرد» تاني.';
 
 export const frequencyMessage = 'الصنف مش من أصناف الجرد ده';
 
@@ -78,7 +79,6 @@ const exactReasons: ReadonlyArray<readonly [string, string]> = [
   ['counted_qty is out of range', quantityRangeMessage],
   ['count time is inside a shift', insideShiftMessage],
   ['a shift is still open', openShiftMessage],
-  ['sync has not covered this count time', syncCoverageMessage],
   ['item count frequency does not match', frequencyMessage],
   ['item is inactive', inactiveItemMessage],
   ['unknown stock item', unknownItemMessage],

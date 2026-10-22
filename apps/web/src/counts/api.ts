@@ -7,7 +7,13 @@ import {
   mapCountError,
   retrySafeMessage,
 } from '@/counts/errors';
-import type { CountDraft, CountItem, CountRecord } from '@/counts/types';
+import type {
+  CountDraft,
+  CountItem,
+  CountRecord,
+  CountWriteResult,
+  PendingCount,
+} from '@/counts/types';
 
 function appDb() {
   if (!supabase) throw new Error(genericCountError);
@@ -40,16 +46,20 @@ async function readPages<T>(
 
 async function writeRpc(
   call: () => PromiseLike<{
+    data: unknown;
     error: Parameters<typeof throwIfError>[0];
   }>,
-): Promise<void> {
-  let result: { error: Parameters<typeof throwIfError>[0] };
+): Promise<unknown> {
+  let result: {
+    data: unknown;
+    error: Parameters<typeof throwIfError>[0];
+  };
   try {
     result = await call();
   } catch (error) {
     throw new Error(retrySafeMessage, { cause: error });
   }
-  if (!result.error) return;
+  if (!result.error) return result.data;
   const mapped = mapCountError(result.error);
   const message =
     mapped === genericCountError && isUnknownOutcome(result.error)
@@ -219,8 +229,88 @@ function countPayload(draft: CountDraft): Json {
   };
 }
 
-export async function recordCount(draft: CountDraft): Promise<void> {
-  await writeRpc(() =>
+function parseCountWrite(data: unknown): CountWriteResult {
+  let value = data;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value) as unknown;
+    } catch (error) {
+      throw new Error(retrySafeMessage, { cause: error });
+    }
+  }
+  if (Array.isArray(value)) value = value[0];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(retrySafeMessage);
+  }
+  const row = value as Record<string, unknown>;
+  if (typeof row.status !== 'string') {
+    throw new Error(retrySafeMessage);
+  }
+  if (row.status === 'waiting_for_sync') return { status: 'waiting_for_sync' };
+  if (
+    row.status === 'posted' &&
+    typeof row.count_id === 'string' &&
+    row.count_id.length > 0
+  ) {
+    return { status: 'posted', countId: row.count_id };
+  }
+  throw new Error(retrySafeMessage);
+}
+
+export async function recordCount(
+  draft: CountDraft,
+): Promise<CountWriteResult> {
+  const data = await writeRpc(() =>
     appDb().rpc('record_count', { p_count: countPayload(draft) }),
   );
+  return parseCountWrite(data);
+}
+
+/** Resend the normalized payload the server already stored. */
+export async function recordStoredCount(
+  payload: Json,
+): Promise<CountWriteResult> {
+  const data = await writeRpc(() =>
+    appDb().rpc('record_count', { p_count: payload }),
+  );
+  return parseCountWrite(data);
+}
+
+export async function listPendingCounts(): Promise<PendingCount[]> {
+  const data = await readPages(
+    (from, to) =>
+      appDb()
+        .from('stock_count_pending')
+        .select('request_id, prepared_at, counted_at, item_count, payload')
+        .order('prepared_at', { ascending: true })
+        .order('request_id', { ascending: true })
+        .range(from, to),
+    (row) => {
+      if (typeof row.request_id !== 'string' || row.request_id.length === 0) {
+        throw new Error(genericCountError);
+      }
+      return row.request_id;
+    },
+  );
+  return data.map((row) => {
+    if (
+      typeof row.request_id !== 'string' ||
+      typeof row.prepared_at !== 'string' ||
+      typeof row.counted_at !== 'string' ||
+      typeof row.item_count !== 'number' ||
+      !Number.isInteger(row.item_count) ||
+      row.payload === null ||
+      typeof row.payload !== 'object' ||
+      Array.isArray(row.payload)
+    ) {
+      throw new Error(genericCountError);
+    }
+    return {
+      requestId: row.request_id,
+      preparedAt: row.prepared_at,
+      countedAt: row.counted_at,
+      itemCount: row.item_count,
+      payload: row.payload,
+    };
+  });
 }

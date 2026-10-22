@@ -435,6 +435,20 @@ isOneToOne: false
       referencedColumns: ["id"]
     }
                   ]
+                },"stock_count_requests": {
+                  Row: {
+                    "created_by": string | null,"payload": NonNullable<Json>,"prepared_at": string,"request_id": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_by"?: string | null,"payload": NonNullable<Json>,"prepared_at": string,"request_id": string
+                  }
+                  Update: {
+                    "created_by"?: string | null,"payload"?: NonNullable<Json>,"prepared_at"?: string,"request_id"?: string
+                  }
+                  Relationships: [
+                    
+                  ]
                 },"stock_counts": {
                   Row: {
                     "counted_at": string,"created_at": string,"created_by": string | null,"frequency": string,"id": string,"note": string | null,"request_id": string
@@ -542,6 +556,20 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"stock_count_pending": {
+                  Row: {
+                    "counted_at": string | null,"created_by": string | null,"frequency": string | null,"item_count": number | null,"note": string | null,"payload": Json | null,"prepared_at": string | null,"request_id": string | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                           "counted_at"?: never,"created_by"?: string | null,"frequency"?: never,"item_count"?: never,"note"?: never,"payload"?: Json | null,"prepared_at"?: string | null,"request_id"?: string | null
+                         }
+                        Update: {
+                           "counted_at"?: never,"created_by"?: string | null,"frequency"?: never,"item_count"?: never,"note"?: never,"payload"?: Json | null,"prepared_at"?: string | null,"request_id"?: string | null
+                         }
+                        Relationships: [
+                    
+                  ]
                 }
           }
           Functions: {
@@ -630,7 +658,7 @@ isOneToOne: false
 { Args: { "p_mixed_item": string,"p_occurred_at": string,"p_qty_taken": number,"p_shift_id"?: string,"p_sizes": Json }; Returns: string
                            },
 "record_count":
-{ Args: { "p_count": Json }; Returns: string
+{ Args: { "p_count": Json }; Returns: Json
                            },
 "record_opening_stock":
 { Args: { "p_lines": Json,"p_occurred_at": string,"p_request_id": string }; Returns: string

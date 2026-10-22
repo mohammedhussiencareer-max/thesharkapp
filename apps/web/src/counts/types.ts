@@ -1,3 +1,5 @@
+import type { Json } from '@/lib/database.types';
+
 export type CountItem = {
   id: string;
   name: string;
@@ -25,6 +27,18 @@ export type CountValues = {
   countedAt: string;
   note: string;
   quantities: Record<string, string>;
+};
+
+export type CountWriteResult =
+  { status: 'posted'; countId: string } | { status: 'waiting_for_sync' };
+
+export type PendingCount = {
+  requestId: string;
+  preparedAt: string;
+  countedAt: string;
+  itemCount: number;
+  /** Normalized body stored by the server. Resend it unchanged. */
+  payload: Json;
 };
 
 export type CountRecord = {
