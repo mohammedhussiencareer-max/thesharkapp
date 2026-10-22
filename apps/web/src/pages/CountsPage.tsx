@@ -37,6 +37,14 @@ type Snapshot = {
 
 type ReadResult = { status: 'ready'; snapshot: Snapshot } | { status: 'stale' };
 
+function requestIdOf(payload: Json): string | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return null;
+  }
+  const requestId = (payload as { request_id?: unknown }).request_id;
+  return typeof requestId === 'string' ? requestId : null;
+}
+
 export function CountsPage() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -46,6 +54,7 @@ export function CountsPage() {
   const [needsReload, setNeedsReload] = useState(false);
   const [loads, setLoads] = useState(0);
   const [serverError, setServerError] = useState<string | null>(null);
+  const [cardError, setCardError] = useState<string | null>(null);
   const [pending, setPending] = useState<CountDraft | null>(null);
   const [waiting, setWaiting] = useState<CountDraft | null>(null);
   const [waitNotice, setWaitNotice] = useState(false);
@@ -133,14 +142,20 @@ export function CountsPage() {
     }
   }
 
-  function applyPosted(): void {
-    setPending(null);
-    setWaiting(null);
-    setWaitNotice(false);
+  function applyPosted(requestId: string | null, fromForm: boolean): void {
+    const matches = (draft: CountDraft | null) =>
+      requestId !== null && draft?.requestId === requestId;
+    // Success releases only this request. A different pending card can still
+    // post while another draft stays pinned after an unknown outcome.
+    if (fromForm || matches(pending) || matches(waiting)) {
+      setPending((current) => (matches(current) ? null : current));
+      setWaiting((current) => (matches(current) ? null : current));
+      setWaitNotice(false);
+      setFormEpoch((value) => value + 1);
+    }
     // Stays set until the reload applies data, or a visible retryable error
     // replaces it. A stale read clears the lock instead of leaving it stuck.
     setNeedsReload(true);
-    setFormEpoch((value) => value + 1);
     setSuccess('اتسجل الجرد');
   }
 
@@ -151,13 +166,21 @@ export function CountsPage() {
     // contention error can fire before the server's request_id replay,
     // so it leaves the existing pin in place and does not start a new one.
     if (isPayloadRefusal(error)) {
-      // The waiting draft is already stored. A corrected save needs a new
-      // request id; the old row stays in the pending list.
-      const stored = waiting === draft;
+      // A lost prepare reply can already be stored. Reusing that id for an
+      // edited count is refused, so any payload refusal of a pinned or
+      // stored request starts a new id. A first submit that is refused
+      // stored nothing and keeps its id. The old row stays in the list.
+      const replay =
+        pending?.requestId === draft.requestId ||
+        waiting?.requestId === draft.requestId;
       setWaitNotice(false);
-      setPending((current) => (current && current !== draft ? current : null));
-      setWaiting((current) => (current && current !== draft ? current : null));
-      if (stored) setRequestKey((value) => value + 1);
+      setPending((current) =>
+        current?.requestId === draft.requestId ? null : current,
+      );
+      setWaiting((current) =>
+        current?.requestId === draft.requestId ? null : current,
+      );
+      if (replay) setRequestKey((value) => value + 1);
       return;
     }
     if (isUnknownOutcome(error)) {
@@ -172,6 +195,7 @@ export function CountsPage() {
   async function finishWrite(
     result: CountWriteResult,
     draft: CountDraft | null,
+    requestId: string | null,
   ): Promise<boolean> {
     if (result.status === 'waiting_for_sync') {
       if (draft) {
@@ -183,7 +207,7 @@ export function CountsPage() {
       await refreshAfterWait();
       return false;
     }
-    applyPosted();
+    applyPosted(requestId, draft !== null);
     const next = await readSnapshot();
     if (next.status === 'ready') {
       setSnapshot(next.snapshot);
@@ -199,12 +223,13 @@ export function CountsPage() {
     if (busy || loadsRef.current > 0) return;
     setSaving(true);
     setServerError(null);
+    setCardError(null);
     setSuccess(null);
     let saved = false;
     try {
       const result = await recordCount(draft);
       if (result.status === 'posted') saved = true;
-      await finishWrite(result, draft);
+      await finishWrite(result, draft, draft.requestId);
     } catch (error) {
       if (!saved) {
         holdUnknown(draft, error);
@@ -219,35 +244,34 @@ export function CountsPage() {
 
   async function handleStored(payload: Json) {
     if (busy || loadsRef.current > 0) return;
+    const requestId = requestIdOf(payload);
     setSaving(true);
     setServerError(null);
+    setCardError(null);
     setSuccess(null);
     let saved = false;
     try {
       const result = await recordStoredCount(payload);
       if (result.status === 'posted') saved = true;
-      await finishWrite(result, null);
+      await finishWrite(result, null, requestId);
     } catch (error) {
       if (!saved) {
-        setServerError(reportedCountError(error));
-        const requestId =
-          payload &&
-          typeof payload === 'object' &&
-          !Array.isArray(payload) &&
-          typeof (payload as { request_id?: unknown }).request_id === 'string'
-            ? (payload as { request_id: string }).request_id
-            : null;
+        // The form is hidden when nothing is active, so a card refusal
+        // has to render beside the pending list.
+        setCardError(reportedCountError(error));
         if (
           requestId &&
           (pending?.requestId === requestId ||
             waiting?.requestId === requestId) &&
           isPayloadRefusal(error)
         ) {
-          if (waiting?.requestId === requestId) {
-            setRequestKey((value) => value + 1);
-          }
-          setPending(null);
-          setWaiting(null);
+          setRequestKey((value) => value + 1);
+          setPending((current) =>
+            current?.requestId === requestId ? null : current,
+          );
+          setWaiting((current) =>
+            current?.requestId === requestId ? null : current,
+          );
           setWaitNotice(false);
         }
       } else {
@@ -326,6 +350,7 @@ export function CountsPage() {
               onSubmit={(next) => void handleSubmit(next)}
             />
           )}
+          {cardError ? <p role="alert">{cardError}</p> : null}
           <PendingCounts
             counts={snapshot.pendingCounts.filter(
               (row) => row.requestId !== waiting?.requestId,

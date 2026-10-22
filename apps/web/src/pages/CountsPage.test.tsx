@@ -16,6 +16,7 @@ import {
 } from '@/counts/api';
 import {
   backDatedCountMessage,
+  inactiveItemMessage,
   insideShiftMessage,
   openShiftMessage,
   pendingResendMessage,
@@ -395,7 +396,7 @@ describe('CountsPage', () => {
     );
   });
 
-  it('releases the pin when the replay is definitely refused', async () => {
+  it('starts a new request id when a pinned prepare is refused after a lost reply', async () => {
     await renderPage();
     fillShortage();
     vi.mocked(recordCount).mockRejectedValueOnce(
@@ -428,7 +429,9 @@ describe('CountsPage', () => {
     });
     const first = vi.mocked(recordCount).mock.calls[0]?.[0];
     const edited = vi.mocked(recordCount).mock.calls[2]?.[0];
-    expect(edited?.requestId).toBe(first?.requestId);
+    // The lost reply may have stored the old id. An edited resend needs a new one.
+    expect(edited?.requestId).toBeTruthy();
+    expect(edited?.requestId).not.toBe(first?.requestId);
     expect(edited?.lines).toEqual([
       { itemId: 'tilapia', itemName: 'بلطي', countedQty: '8' },
     ]);
@@ -801,6 +804,104 @@ describe('CountsPage', () => {
       expect(
         screen.queryByRole('article', { name: `جرد مستني ${when}` }),
       ).not.toBeInTheDocument();
+    });
+  });
+
+  it('keeps a pinned draft when a different pending card posts', async () => {
+    const other = {
+      request_id: 'd1900000-0000-4000-8000-000000000061',
+      frequency: 'daily',
+      counted_at: '2026-10-22T08:00:00.000Z',
+      note: null,
+      lines: [{ item_id: 'shrimp', counted_qty: '3' }],
+    };
+    vi.mocked(listPendingCounts).mockResolvedValue([
+      {
+        requestId: other.request_id,
+        preparedAt: '2026-10-22T08:05:00.000Z',
+        countedAt: other.counted_at,
+        itemCount: 1,
+        payload: other,
+      },
+    ]);
+    await renderPage();
+    expect(
+      screen.getByRole('heading', { name: 'جرد مستني المزامنة' }),
+    ).toBeInTheDocument();
+
+    fillShortage();
+    vi.mocked(recordCount).mockRejectedValueOnce(
+      new TypeError('Failed to fetch'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+    const pinned = vi.mocked(recordCount).mock.calls[0]?.[0];
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'سجّل الجرد' })).toBeEnabled();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('اتسجل الجرد');
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    expect(vi.mocked(recordStoredCount).mock.calls[0]?.[0]).toEqual(other);
+    expect(screen.getByText(pendingResendMessage)).toBeInTheDocument();
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('7');
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveAttribute(
+      'readonly',
+    );
+    expect(screen.getByLabelText('وقت الجرد')).toHaveAttribute('readonly');
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordCount).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(pinned);
+  });
+
+  it('shows a pending-card refusal when the count form is hidden', async () => {
+    const stored = {
+      request_id: 'd1900000-0000-4000-8000-000000000060',
+      frequency: 'daily',
+      counted_at: '2026-10-22T10:00:00.000Z',
+      note: null,
+      lines: [{ item_id: 'tilapia', counted_qty: '7' }],
+    };
+    vi.mocked(listDailyItems).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([
+      {
+        requestId: stored.request_id,
+        preparedAt: '2026-10-22T10:05:00.000Z',
+        countedAt: stored.counted_at,
+        itemCount: 1,
+        payload: stored,
+      },
+    ]);
+    render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    expect(
+      await screen.findByRole('heading', { name: 'جرد مستني المزامنة' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('مفيش أصناف جرد يومي نشطة')).toBeInTheDocument();
+    expect(screen.queryByLabelText('وقت الجرد')).not.toBeInTheDocument();
+
+    vi.mocked(recordStoredCount).mockRejectedValueOnce({
+      code: '22023',
+      message: 'item is inactive',
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      inactiveItemMessage,
+    );
+    expect(
+      screen.getByRole('heading', { name: 'جرد مستني المزامنة' }),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'سجّل الجرد' })).toBeEnabled();
     });
   });
 });

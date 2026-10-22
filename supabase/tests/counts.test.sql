@@ -3711,6 +3711,307 @@ select
     'a new count stays waiting when no ok sync run exists'
   );
 
+-- A 14-digit, 6-decimal quantity is stored as exact text. JavaScript would
+-- turn the JSON number 12345678901234.123456 into 12345678901234.123, and
+-- the resend would be refused. Both replay paths compare that same text.
+select
+  set_config(
+    'request.jwt.claims',
+    jsonb_build_object(
+      'sub',
+      'b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f',
+      'role',
+      'authenticated'
+    )::text,
+    true
+  );
+
+set
+  local role authenticated;
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000080',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T12:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000009',
+            'counted_qty',
+            '12345678901234.123456'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a 14-digit, 6-decimal quantity prepares'
+  );
+
+select
+  is (
+    (
+      select
+        request.payload -> 'lines' -> 0
+      from
+        app.stock_count_requests request
+      where
+        request.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    jsonb_build_object(
+      'item_id',
+      'c1900000-0000-4000-8000-000000000009',
+      'counted_qty',
+      '12345678901234.123456'
+    ),
+    'the stored quantity is the exact decimal text, not a JSON number'
+  );
+
+select
+  is (
+    (
+      select
+        pending.payload -> 'lines' -> 0 ->> 'counted_qty'
+      from
+        app.stock_count_pending pending
+      where
+        pending.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    '12345678901234.123456',
+    'the pending view returns the exact quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      (
+        select
+          request.payload
+        from
+          app.stock_count_requests request
+        where
+          request.request_id = 'd1900000-0000-4000-8000-000000000080'
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'the prepare replay accepts the stored quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000080',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T12:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000009',
+            'counted_qty',
+            '012345678901234.123456'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'the prepare replay matches a leading zero to the same quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000080',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T12:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000009',
+            'counted_qty',
+            '12345678901234.123456'::numeric
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'the prepare replay matches the same quantity sent as a JSON number'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000080',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T12:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000009',
+        'counted_qty', '12345678901234.123455'
+      ))
+    ))$$,
+    '22023',
+    'request_id already used for a different count',
+    'the prepare replay refuses a different 14-digit quantity'
+  );
+
+select
+  is (
+    (
+      pg_temp.cover_prepared_count (
+        (
+          select
+            request.payload
+          from
+            app.stock_count_requests request
+          where
+            request.request_id = 'd1900000-0000-4000-8000-000000000080'
+        )
+      )
+    ) ->> 'status',
+    'posted',
+    'the stored 14-digit quantity posts after a covering sync'
+  );
+
+select
+  is (
+    (
+      select
+        line.counted_qty::text
+      from
+        app.stock_count_lines line
+        join app.stock_counts counted on counted.id = line.count_id
+      where
+        counted.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    (
+      select
+        request.payload -> 'lines' -> 0 ->> 'counted_qty'
+      from
+        app.stock_count_requests request
+      where
+        request.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    'the posted line and the stored payload use the same quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      (
+        select
+          request.payload
+        from
+          app.stock_count_requests request
+        where
+          request.request_id = 'd1900000-0000-4000-8000-000000000080'
+      )
+    ),
+    (
+      select
+        jsonb_build_object('status', 'posted', 'count_id', counted.id)
+      from
+        app.stock_counts counted
+      where
+        counted.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    'the posted replay accepts the stored quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000080',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T12:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000009',
+            'counted_qty',
+            '012345678901234.123456'
+          )
+        )
+      )
+    ),
+    (
+      select
+        jsonb_build_object('status', 'posted', 'count_id', counted.id)
+      from
+        app.stock_counts counted
+      where
+        counted.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    'the posted replay matches a leading zero to the same quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000080',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T12:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000009',
+            'counted_qty',
+            '12345678901234.123456'::numeric
+          )
+        )
+      )
+    ),
+    (
+      select
+        jsonb_build_object('status', 'posted', 'count_id', counted.id)
+      from
+        app.stock_counts counted
+      where
+        counted.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    'the posted replay matches the same quantity sent as a JSON number'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000080',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T12:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000009',
+        'counted_qty', '12345678901234.123455'
+      ))
+    ))$$,
+    '22023',
+    'request_id already used for a different count',
+    'the posted replay refuses a different 14-digit quantity'
+  );
+
 select
   *
 from

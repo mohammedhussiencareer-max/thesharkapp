@@ -266,7 +266,7 @@ export async function recordCount(
   return parseCountWrite(data);
 }
 
-/** Resend the normalized payload the server already stored. */
+/** Resend the stored payload unchanged, including exact counted_qty strings. */
 export async function recordStoredCount(
   payload: Json,
 ): Promise<CountWriteResult> {

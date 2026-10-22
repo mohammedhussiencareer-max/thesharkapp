@@ -66,7 +66,11 @@
 -- lock 7342750000000000001 before the request_id replay and before
 -- lock_and_validate_item_balance locks item_balances. Replay compares the
 -- normalized payload only and returns before any catalog, shift, sync, or
--- balance read. stock_counts.request_id is unique as the last guard.
+-- balance read. counted_qty in that payload is numeric(20, 6) text, never a
+-- JSON number: a 14-digit, 6-decimal number does not round-trip through
+-- JavaScript. The prepare replay compares that normalized payload. The
+-- posted replay compares the same quantity text. stock_counts.request_id
+-- is unique as the last guard.
 -- ============================================================================
 -- 1. Append-only count documents
 -- ============================================================================
@@ -199,7 +203,7 @@ create table app.stock_count_requests (
 
 comment on table app.stock_count_requests is 'Append-only prepare step for a stock count. The first record_count call stores the normalized payload and the database clock, then commits by returning waiting_for_sync. A later call with the same payload posts only after a sync run starts after prepared_at. Writes go through app.record_count.';
 
-comment on column app.stock_count_requests.payload is 'Normalized count: request_id, frequency, counted_at, note, and lines in submit order. Built inside record_count. A caller prepared_at is not stored.';
+comment on column app.stock_count_requests.payload is 'Normalized count: request_id, frequency, counted_at, note, and lines in submit order. counted_qty is numeric(20, 6) text, never a JSON number, so a resend keeps every digit. Built inside record_count. A caller prepared_at is not stored.';
 
 comment on column app.stock_count_requests.prepared_at is 'Database clock of the first submit, set with clock_timestamp() inside record_count. The owner submits only after the physical count, so this instant is after the count. A sync run that starts after it reads Firestore after the count. A caller value is never trusted.';
 
@@ -300,6 +304,7 @@ declare
   v_seen uuid[] := '{}'::uuid[];
   v_item_ids uuid[] := '{}'::uuid[];
   v_counted numeric(20, 6) [] := '{}'::numeric(20, 6) [];
+  v_counted_text text[] := '{}'::text[];
   v_n integer := 0;
   v_existing_id uuid;
   v_existing_frequency text;
@@ -469,6 +474,8 @@ begin
     v_seen := v_seen || v_item_id;
     v_item_ids := v_item_ids || v_item_id;
     v_counted := v_counted || v_qty;
+    -- Exact decimal text. A JSON number would lose digits in JavaScript.
+    v_counted_text := v_counted_text || v_qty::text;
     v_n := v_n + 1;
   end loop;
 
@@ -478,17 +485,18 @@ begin
         'item_id',
         u.item_id,
         'counted_qty',
-        u.counted_qty
+        u.counted_text
       )
       order by
         u.line_no
     )
   into v_lines
   from
-    rows from (pg_catalog.unnest(v_item_ids), pg_catalog.unnest(v_counted)) with ordinality as u (item_id, counted_qty, line_no);
+    rows from (pg_catalog.unnest(v_item_ids), pg_catalog.unnest(v_counted_text)) with ordinality as u (item_id, counted_text, line_no);
 
-  -- Built once from the normalized fields. Key order and quantity scale stay
-  -- stable, and a caller clock is not part of it.
+  -- Built once from the normalized fields. counted_qty is numeric(20, 6)
+  -- text, so the prepare replay and the posted replay compare one form.
+  -- Key order stays stable, and a caller clock is not part of it.
   v_payload := pg_catalog.jsonb_build_object(
     'request_id',
     v_request_id,
@@ -536,12 +544,12 @@ begin
       select
         1
       from
-        rows from (pg_catalog.unnest(v_item_ids), pg_catalog.unnest(v_counted)) with ordinality as u (item_id, counted_qty, line_no)
+        rows from (pg_catalog.unnest(v_item_ids), pg_catalog.unnest(v_counted_text)) with ordinality as u (item_id, counted_text, line_no)
         join app.stock_count_lines line on line.count_id = v_existing_id
         and line.line_no = u.line_no
       where
         line.item_id is distinct from u.item_id
-        or line.counted_qty is distinct from u.counted_qty
+        or line.counted_qty::text is distinct from u.counted_text
     ) then
       raise exception 'request_id already used for a different count'
         using errcode = '22023';
@@ -890,7 +898,7 @@ begin
 end;
 $$;
 
-comment on function app.record_count (jsonb) is 'Prepares, then posts, one stock count. Takes advisory lock 7342750000000000001 first, validates the payload, and replays request_id against stock_counts before any catalog, shift, sync, or balance read. The same normalized payload returns {"status":"posted","count_id":...} and does not post again. A different payload raises 22023 request_id already used for a different count. The first submit stores stock_count_requests with prepared_at = clock_timestamp() and returns {"status":"waiting_for_sync"} without raising, after the shift and item guards. The owner submits only after the physical count, so prepared_at is after the count. A later call with the same payload waits until the newest ok pos_sync_runs row, by id, has finished_at not null, started_at > prepared_at, and started_at > the latest close_recorded_at among shifts with opened_at <= counted_at. Those times are all the database clock. started_at is not compared with counted_at. Sale and shift times are POS-clock and are compared with counted_at only to place movements before or after the count. When that run exists, every guard runs again on the fresh mirror, then non-zero deltas post as one count_adjustment batch (actual minus locked on-hand). After the post, last_occurred_at moves to counted_at plus one microsecond so a later movement at or before the count is back-dated. A sale still missing is refused by that watermark until a later recompute.';
+comment on function app.record_count (jsonb) is 'Prepares, then posts, one stock count. Takes advisory lock 7342750000000000001 first, validates the payload, and replays request_id against stock_counts before any catalog, shift, sync, or balance read. The same normalized payload returns {"status":"posted","count_id":...} and does not post again. counted_qty is stored as numeric(20, 6) text, not a JSON number, and both the prepare replay and the posted replay compare that same text. A different payload raises 22023 request_id already used for a different count. The first submit stores stock_count_requests with prepared_at = clock_timestamp() and returns {"status":"waiting_for_sync"} without raising, after the shift and item guards. The owner submits only after the physical count, so prepared_at is after the count. A later call with the same payload waits until the newest ok pos_sync_runs row, by id, has finished_at not null, started_at > prepared_at, and started_at > the latest close_recorded_at among shifts with opened_at <= counted_at. Those times are all the database clock. started_at is not compared with counted_at. Sale and shift times are POS-clock and are compared with counted_at only to place movements before or after the count. When that run exists, every guard runs again on the fresh mirror, then non-zero deltas post as one count_adjustment batch (actual minus locked on-hand). After the post, last_occurred_at moves to counted_at plus one microsecond so a later movement at or before the count is back-dated. A sale still missing is refused by that watermark until a later recompute.';
 
 revoke all on function app.record_count (jsonb)
 from
@@ -977,7 +985,7 @@ where
       counted.request_id = request.request_id
   );
 
-comment on view app.stock_count_pending is 'One row per prepared count that has no stock_counts row yet. security_invoker so owner RLS on stock_count_requests and stock_counts applies. payload is the normalized body to send again.';
+comment on view app.stock_count_pending is 'One row per prepared count that has no stock_counts row yet. security_invoker so owner RLS on stock_count_requests and stock_counts applies. payload is the normalized body to send again. counted_qty in that payload is exact decimal text.';
 
 revoke all on table app.stock_count_pending
 from

@@ -44,16 +44,18 @@ export function CountForm({
   /** The server stored this payload and is waiting for a later sync. */
   waiting: CountDraft | null;
   /**
-   * Bumped when a stored request is refused. The field values stay; the next
-   * save uses a new request id. The stored row remains in the pending list.
+   * Bumped when a pinned or stored request is refused. The field values
+   * stay; the next save uses a new request id. The old row remains in the
+   * pending list, so an edited count must not reuse that id.
    */
   requestKey: number;
   onClearServerError: () => void;
   onSubmit: (draft: CountDraft) => void;
 }) {
-  // Reused after a refusal that stored nothing. An unknown outcome resends
-  // `pending` with this same id. A stored request that is later refused
-  // bumps `requestKey` and mints a new id. A confirmed save remounts the form.
+  // Reused after a first-submit refusal, which stored nothing. An unknown
+  // outcome resends `pending` with this same id. A payload refusal of that
+  // pinned resend, or of a stored request, bumps `requestKey`. A confirmed
+  // save remounts the form.
   const [requestId, setRequestId] = useState(() => crypto.randomUUID());
   const [appliedKey, setAppliedKey] = useState(requestKey);
   if (appliedKey !== requestKey) {

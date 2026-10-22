@@ -14,6 +14,7 @@ import {
   retrySafeMessage,
 } from '@/counts/errors';
 import type { CountDraft } from '@/counts/types';
+import type { Json } from '@/lib/database.types';
 
 const mocks = vi.hoisted(() => ({
   schema: vi.fn(),
@@ -341,5 +342,42 @@ describe('counts api', () => {
     });
     mocks.schema.mockReturnValue({ from: () => broken.chain });
     await expect(listPendingCounts()).rejects.toThrow(genericCountError);
+  });
+
+  it('keeps a 14-digit quantity string exact through JSON parse and resend', async () => {
+    const wire =
+      '{"request_id":"d1900000-0000-4000-8000-000000000080","frequency":"daily","counted_at":"2026-10-22T12:00:00.000Z","note":null,"lines":[{"item_id":"c1900000-0000-4000-8000-000000000009","counted_qty":"12345678901234.123456"}]}';
+    const payload = JSON.parse(wire) as Json;
+    const built = query({
+      data: [
+        {
+          request_id: 'd1900000-0000-4000-8000-000000000080',
+          prepared_at: '2026-10-22T12:05:00.000Z',
+          counted_at: '2026-10-22T12:00:00.000Z',
+          item_count: 1,
+          payload,
+        },
+      ],
+      error: null,
+    });
+    mocks.schema.mockReturnValue({ from: () => built.chain });
+
+    const pending = await listPendingCounts();
+    const stored = pending[0]?.payload;
+    const line = (stored as { lines?: { counted_qty?: unknown }[] } | undefined)
+      ?.lines?.[0];
+    expect(line?.counted_qty).toBe('12345678901234.123456');
+    expect(typeof line?.counted_qty).toBe('string');
+
+    const rpc = vi.fn().mockResolvedValue({
+      data: { status: 'waiting_for_sync' },
+      error: null,
+    });
+    mocks.schema.mockReturnValue({ rpc });
+    await recordStoredCount(stored ?? null);
+    expect(rpc).toHaveBeenCalledWith('record_count', { p_count: payload });
+    expect(JSON.stringify(rpc.mock.calls[0]?.[1])).toContain(
+      '"counted_qty":"12345678901234.123456"',
+    );
   });
 });
