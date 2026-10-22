@@ -227,14 +227,14 @@ isOneToOne: false
                   ]
                 },"pos_shifts": {
                   Row: {
-                    "closed_at": string | null,"drawer_cash_net": number | null,"drawer_credit": number | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at": string
+                    "close_recorded_at": string | null,"closed_at": string | null,"drawer_cash_net": number | null,"drawer_credit": number | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at": string
                   }
                   ComputedFields: never
                   Insert: {
-                    "closed_at"?: string | null,"drawer_cash_net"?: number | null,"drawer_credit"?: number | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at"?: string
+                    "close_recorded_at"?: string | null,"closed_at"?: string | null,"drawer_cash_net"?: number | null,"drawer_credit"?: number | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at"?: string
                   }
                   Update: {
-                    "closed_at"?: string | null,"drawer_cash_net"?: number | null,"drawer_credit"?: number | null,"id"?: string,"is_active"?: boolean,"opened_at"?: string,"pos_update_time"?: string,"synced_at"?: string
+                    "close_recorded_at"?: string | null,"closed_at"?: string | null,"drawer_cash_net"?: number | null,"drawer_credit"?: number | null,"id"?: string,"is_active"?: boolean,"opened_at"?: string,"pos_update_time"?: string,"synced_at"?: string
                   }
                   Relationships: [
                     
@@ -571,9 +571,6 @@ isOneToOne: false
                            },
 "assert_pos_write_allowed":
 { Args: Record<PropertyKey, never>; Returns: undefined
-                           },
-"count_sync_margin":
-{ Args: Record<PropertyKey, never>; Returns: string
                            },
 "delete_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined

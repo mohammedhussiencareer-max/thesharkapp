@@ -7,14 +7,15 @@ import { assertLocalSupabaseUrl } from './local-guard';
 
 /**
  * Coverage is the newest ok sync run by id. That run must have finished, and
- * its started_at must be at least 10 minutes after the count time. started_at
- * is the database clock; the count time is the browser clock. Window sync
- * reads orders before shifts. This spec fills the count time first (fifteen
- * minutes ago, after the seeded shift close), then start_pos_sync_run, so the
- * new run's started_at is later and its id is above the seed's earlier ok run.
- * The seeded shift closed about 20 hours ago. No open shift is seeded.
- * A parallel spec can hold the single running sync; this retries that
- * collision. Coverage uses the same service-role start/finish path as the
+ * its started_at must be after close_recorded_at of the latest shift that
+ * opened at or before the count. Both times are the database clock. The seeded
+ * shift is inserted before this spec, so its close is already recorded. This
+ * spec then starts and finishes an ok run, which makes started_at later than
+ * that stamp. Coverage does not depend on the gap between the count time and
+ * the run start. The count time is two minutes ago, after the seeded close and
+ * after the opening. The seeded shift closed about 20 hours ago. No open shift
+ * is seeded. A parallel spec can hold the single running sync; this retries
+ * that collision. Coverage uses the same service-role start/finish path as the
  * sales seed.
  */
 async function coverCountTime(apiUrl: string): Promise<void> {
@@ -101,7 +102,7 @@ test('owner counts a daily item short and sees the shortage', async ({
   await expect(
     page.getByRole('heading', { name: 'الجرد اليومي', exact: true }),
   ).toBeVisible();
-  const counted = new Date(Date.now() - 15 * 60 * 1000);
+  const counted = new Date(Date.now() - 2 * 60 * 1000);
   await page.getByLabel('وقت الجرد').fill(nowCairoDateTimeLocal(counted));
   await expect(page.getByLabel(`الكمية المعدودة ${name}`)).toBeVisible(visible);
   await page.getByLabel(`الكمية المعدودة ${name}`).fill('7');

@@ -27,18 +27,24 @@
 -- outside that shift. A count exactly at the next shift's open is inside it.
 -- Times before an open shift's open are not refused by the open-shift rule.
 --
--- Sync rule: pos_sync_runs.started_at is the database clock (now()).
--- counted_at, shift times, and sale times come from the owner's clock and
--- the POS devices' clocks, so those clocks can disagree. Window mode reads
--- orders before shifts, so a run can record a shift close and still have
--- missed an earlier sale. Coverage is the latest app.pos_sync_runs row with
--- status = 'ok', chosen by identity id (the newest successful attempt), not
--- by the greatest finished_at and not by a failed or running run. That row's
--- finished_at must be non-null, and its started_at must be >= counted_at
--- plus app.count_sync_margin() (10 minutes). A null finished_at, no ok run,
--- or a start earlier than counted_at plus that margin cannot prove the
--- mirror includes sales and shift closes up to the count. The count is
--- refused with 'sync has not covered this count time'.
+-- Sync rule: compare only database-clock times. S is the latest
+-- app.pos_shifts row with opened_at <= counted_at. The shift guards already
+-- make S closed with closed_at <= counted_at when S exists.
+-- app.pos_shifts.close_recorded_at is the database clock at the moment the
+-- mirror stored that close, and a caller cannot set it. The newest
+-- app.pos_sync_runs row with status = 'ok', chosen by identity id, must have
+-- finished_at not null and started_at > S.close_recorded_at. That run began,
+-- on the same database clock, after the mirror stored S's close, so it began
+-- after the close in real time. Every order read in that run, in any mode,
+-- came after every sale of S and of earlier shifts. Window mode reads orders
+-- before shifts, which is safe because the close was already stored before
+-- the run started. When no shift has opened_at <= counted_at, there are no
+-- POS sales before the count, and only an ok, finished run is required.
+-- Otherwise the count is refused with 'sync has not covered this count time'.
+-- A sale still missing, for example one written to Firestore after the shift
+-- close, is not silently lost. Its deduction is back-dated before the count's
+-- watermark, so the ledger refuses it until the later back-dated-recompute
+-- task re-derives the count.
 --
 -- Lock order matches record_sort. app.assert_ledger_write_allowed() is the
 -- first statement. It checks the owner (or service_role) and takes advisory
@@ -74,7 +80,7 @@ comment on table app.stock_counts is 'Append-only stock counts. id is the app.po
 
 comment on column app.stock_counts.request_id is 'Idempotency key generated once per count draft. The same key and the same normalized payload return this count; a different payload is refused.';
 
-comment on column app.stock_counts.counted_at is 'The instant the quantities were observed. Must sit outside every closed shift. The newest ok POS sync must have finished, and its started_at (database clock) must be at least app.count_sync_margin after this instant, because the owner and POS clocks can disagree and window sync reads orders before shifts.';
+comment on column app.stock_counts.counted_at is 'The instant the quantities were observed. Must sit outside every closed shift. When a shift opened at or before this instant, the newest ok POS sync must have finished and its started_at must be after close_recorded_at of the latest such shift. Both times are the database clock: that run began after the mirror stored the close, so every order it read came after every sale of that shift and of earlier shifts. When no shift opened at or before this instant, a finished ok sync is enough. A sale written after the shift close is back-dated before this count''s watermark and the ledger refuses it until a later recompute.';
 
 comment on column app.stock_counts.frequency is 'Which catalog this count belongs to: daily or weekly. The screen in this task records daily only.';
 
@@ -166,28 +172,72 @@ before truncate on app.stock_count_lines for each statement
 execute function app.prevent_count_mutation ();
 
 -- ============================================================================
--- 2. record_count
+-- 2. Database-clock stamp of a stored shift close
 -- ============================================================================
--- One named margin. started_at uses the database clock. counted_at, shift
--- times, and sale times use the owner and POS clocks. Window mode reads
--- orders before shifts, so a run can store a later shift close and still
--- miss an earlier sale. Coverage needs started_at >= counted_at + this.
-create function app.count_sync_margin () returns interval language sql immutable parallel safe
+-- close_recorded_at is the database clock when the mirror stored closed_at.
+-- It is not the POS close time. Backfill closed rows before the trigger:
+-- once the trigger exists, an update that does not change closed_at keeps
+-- the old stamp and would leave a backfill unset.
+alter table app.pos_shifts
+add column close_recorded_at timestamptz null;
+
+comment on column app.pos_shifts.close_recorded_at is 'Database clock when this row stored a non-null closed_at. Set by app.stamp_shift_close_recorded. A caller-supplied value is ignored. Null while the shift is open, and cleared when the shift is reopened. A later ok sync covers a count of this shift only when that run started after this stamp.';
+
+update app.pos_shifts
+set
+  close_recorded_at = pg_catalog.clock_timestamp ()
+where
+  closed_at is not null;
+
+create function app.stamp_shift_close_recorded () returns trigger language plpgsql security definer
 set
   search_path = '' as $$
-  select
-    interval '10 minutes';
+begin
+  if tg_op = 'INSERT' then
+    if new.closed_at is not null then
+      new.close_recorded_at := pg_catalog.clock_timestamp();
+    else
+      new.close_recorded_at := null;
+    end if;
+  elsif new.closed_at is distinct from old.closed_at then
+    if new.closed_at is not null then
+      new.close_recorded_at := pg_catalog.clock_timestamp();
+    else
+      new.close_recorded_at := null;
+    end if;
+  else
+    new.close_recorded_at := old.close_recorded_at;
+  end if;
+
+  return new;
+end;
 $$;
 
-comment on function app.count_sync_margin () is 'Ten minutes of skew for stock-count sync coverage. pos_sync_runs.started_at is the database clock. counted_at, shift times, and sale times are the owner and POS clocks. Window sync reads orders before shifts, so the newest ok run must have started at least this long after counted_at.';
+comment on function app.stamp_shift_close_recorded () is 'Stamps pos_shifts.close_recorded_at from the database clock when a shift close is stored. On insert, a non-null closed_at records clock_timestamp() and a null closed_at stores null. On update, a changed closed_at records clock_timestamp(), or null when the shift reopens. An unchanged closed_at keeps the previous stamp. Caller-supplied values are ignored.';
 
-revoke all on function app.count_sync_margin ()
+revoke all on function app.stamp_shift_close_recorded ()
 from
   public,
   anon,
   authenticated,
   service_role;
 
+create trigger trg_pos_shifts_close_recorded
+before insert or update on app.pos_shifts for each row
+execute function app.stamp_shift_close_recorded ();
+
+alter table app.pos_shifts
+add constraint pos_shifts_close_recorded_chk check (
+  (closed_at is null) = (close_recorded_at is null)
+  and (
+    close_recorded_at is null
+    or pg_catalog.isfinite (close_recorded_at)
+  )
+);
+
+-- ============================================================================
+-- 3. record_count
+-- ============================================================================
 create function app.record_count (p_count jsonb) returns uuid language plpgsql security definer
 set
   search_path = '' as $$
@@ -215,6 +265,8 @@ declare
   v_existing_note text;
   v_sync_started timestamptz;
   v_sync_finished timestamptz;
+  v_close_recorded timestamptz;
+  v_has_prior_shift boolean := false;
   v_active boolean;
   v_item_frequency text;
   v_bal app.item_balances;
@@ -449,6 +501,22 @@ begin
   end if;
 
   select
+    shift.close_recorded_at
+  into
+    v_close_recorded
+  from
+    app.pos_shifts shift
+  where
+    shift.opened_at <= v_counted_at
+  order by
+    shift.opened_at desc,
+    shift.id desc
+  limit
+    1;
+
+  v_has_prior_shift := found;
+
+  select
     run.started_at,
     run.finished_at
   into
@@ -463,11 +531,21 @@ begin
   limit
     1;
 
-  -- Different clocks: started_at is the database clock, counted_at is not.
-  -- Window mode reads orders before shifts, so the run must start at least
-  -- app.count_sync_margin after the count. The error text stays stable.
+  -- started_at and close_recorded_at are both the database clock. When a
+  -- prior shift exists, the run began after the mirror stored that close, so
+  -- it began after the close in real time. Every order read in that run, in
+  -- any mode, came after every sale of that shift and of earlier shifts.
+  -- With no such shift there are no POS sales before the count, so a finished
+  -- ok run is enough. A sale written after the close is back-dated before
+  -- this count's watermark and the ledger refuses it until a later recompute.
   if v_sync_finished is null
-  or v_sync_started < v_counted_at + app.count_sync_margin () then
+  or (
+    v_has_prior_shift
+    and (
+      v_close_recorded is null
+      or v_sync_started <= v_close_recorded
+    )
+  ) then
     raise exception 'sync has not covered this count time'
       using errcode = '22023';
   end if;
@@ -642,7 +720,7 @@ begin
 end;
 $$;
 
-comment on function app.record_count (jsonb) is 'Posts one stock count. Takes advisory lock 7342750000000000001 first, replays request_id before any catalog, shift, sync, or balance read, then refuses a time inside a closed shift (opened_at <= counted_at < closed_at), a time at or after an open shift''s open, or a time the newest ok pos_sync_runs row does not cover. That row, by id, must have a non-null finished_at and started_at >= counted_at plus app.count_sync_margin (10 minutes). started_at is the database clock, while counted_at, shift times, and sale times are the owner and POS clocks, and window sync reads orders before shifts. After the batch post, last_occurred_at moves to counted_at for every counted item, including a zero delta, because a count is an observation and a later back-dated movement before it is refused. Non-zero deltas are one count_adjustment batch: quantity is actual minus the locked on-hand. The same request_id and normalized payload returns the saved id and does not post again.';
+comment on function app.record_count (jsonb) is 'Posts one stock count. Takes advisory lock 7342750000000000001 first, replays request_id before any catalog, shift, sync, or balance read, then refuses a time inside a closed shift (opened_at <= counted_at < closed_at) or a time at or after an open shift''s open. Coverage compares database-clock times only. S is the latest pos_shifts row with opened_at <= counted_at; those guards already make S closed with closed_at <= counted_at. The newest ok pos_sync_runs row, by id, must have a non-null finished_at and started_at > S.close_recorded_at. That run began, on the same database clock, after the mirror stored S''s close, so it began after the close in real time, and every order read in that run, in any mode, came after every sale of S and of earlier shifts. When no shift has opened_at <= counted_at, there are no POS sales before the count and only an ok, finished run is required. A sale still missing, for example one written to Firestore after the shift close, is not silently lost: its deduction is back-dated before the count''s watermark, so the ledger refuses it until the later back-dated-recompute task re-derives the count. After the batch post, last_occurred_at moves to counted_at for every counted item, including a zero delta, because a count is an observation and a later back-dated movement before it is refused. Non-zero deltas are one count_adjustment batch: quantity is actual minus the locked on-hand. The same request_id and normalized payload returns the saved id and does not post again.';
 
 revoke all on function app.record_count (jsonb)
 from
@@ -654,7 +732,7 @@ execute on function app.record_count (jsonb) to authenticated,
 service_role;
 
 -- ============================================================================
--- 3. History. Shortage and surplus values are magnitudes from the stored
+-- 4. History. Shortage and surplus values are magnitudes from the stored
 -- line deltas (themselves the posted movement totals). A surplus is any
 -- positive delta, including one whose value is zero.
 -- ============================================================================
@@ -704,7 +782,7 @@ select
   service_role;
 
 -- ============================================================================
--- 4. Row-level security and grants
+-- 5. Row-level security and grants
 -- ============================================================================
 alter table app.stock_counts enable row level security;
 

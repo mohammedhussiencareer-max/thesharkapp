@@ -339,28 +339,60 @@ select
   );
 
 select
+  has_column (
+    'app',
+    'pos_shifts',
+    'close_recorded_at',
+    'pos_shifts records when a close was stored'
+  );
+
+select
+  has_trigger (
+    'app',
+    'pos_shifts',
+    'trg_pos_shifts_close_recorded',
+    'storing a shift close stamps close_recorded_at'
+  );
+
+select
+  ok (
+    (
+      select
+        p.prosecdef
+        and 'search_path=""' = any (p.proconfig)
+      from
+        pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+      where
+        n.nspname = 'app'
+        and p.proname = 'stamp_shift_close_recorded'
+    ),
+    'stamp_shift_close_recorded is security definer with an empty search_path'
+  );
+
+select
   ok (
     not has_function_privilege(
       'anon',
-      'app.count_sync_margin()'::regprocedure,
+      'app.stamp_shift_close_recorded()'::regprocedure,
       'EXECUTE'
     )
     and not has_function_privilege(
       'authenticated',
-      'app.count_sync_margin()'::regprocedure,
+      'app.stamp_shift_close_recorded()'::regprocedure,
       'EXECUTE'
     )
     and not has_function_privilege(
       'service_role',
-      'app.count_sync_margin()'::regprocedure,
+      'app.stamp_shift_close_recorded()'::regprocedure,
       'EXECUTE'
     )
     and not has_function_privilege(
       'public',
-      'app.count_sync_margin()'::regprocedure,
+      'app.stamp_shift_close_recorded()'::regprocedure,
       'EXECUTE'
     ),
-    'count_sync_margin is not an API function'
+    'stamp_shift_close_recorded is not an API function'
   );
 
 select
@@ -534,10 +566,10 @@ select
 -- ============================================================================
 -- Synthetic catalog and POS mirror. Not restaurant data.
 -- Closed shift is [08:30, 09:30). Open shift starts at 15:00 and stays open.
--- The ok sync run starts at 12:10 and finishes at 12:30. Coverage needs
--- started_at >= counted_at + 10 minutes, so a count at 12:00 is covered and
--- a count at 12:00:01 is not. A later failed run starts at 17:00 and must
--- not extend coverage. Identity ids increase with insert order.
+-- close_recorded_at is the database clock when the closed row is inserted.
+-- The ok sync run starts one second after that stamp and finishes one minute
+-- after it. Coverage is started_at > close_recorded_at, not a gap between
+-- counted_at and started_at. Identity ids increase with insert order.
 -- ============================================================================
 insert into
   app.stock_items (
@@ -646,23 +678,244 @@ values
     '2026-10-22T15:00:00Z'
   );
 
+select
+  ok (
+    (
+      select
+        close_recorded_at is not null
+        and close_recorded_at <= pg_catalog.clock_timestamp ()
+        and close_recorded_at > pg_catalog.clock_timestamp () - interval '1 minute'
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-closed'
+    ),
+    'inserting a closed shift stamps close_recorded_at from the database clock'
+  );
+
+select
+  is (
+    (
+      select
+        close_recorded_at
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-open'
+    ),
+    null::timestamptz,
+    'inserting an open shift leaves close_recorded_at null'
+  );
+
+-- Caller-supplied stamps must be ignored. These rows open before the seeded
+-- shifts, so they are deleted before any count: an open one would refuse
+-- every later count, and a closed one would become the prior shift at 08:00.
 insert into
-  app.pos_sync_runs (mode, status, started_at, finished_at, error)
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time,
+    close_recorded_at
+  )
 values
   (
-    'recent',
-    'ok',
-    '2026-10-22T12:10:00Z',
-    '2026-10-22T12:30:00Z',
-    null
-  ),
-  (
-    'recent',
-    'failed',
-    '2026-10-22T17:00:00Z',
-    '2026-10-22T18:00:00Z',
-    'synthetic failed run'
+    'shift-count-trigger',
+    '2026-10-21T08:00:00Z',
+    '2026-10-21T09:00:00Z',
+    false,
+    '2026-10-21T09:00:00Z',
+    '2000-01-01T00:00:00Z'
   );
+
+select
+  ok (
+    (
+      select
+        close_recorded_at is not null
+        and close_recorded_at <> '2000-01-01T00:00:00Z'::timestamptz
+        and close_recorded_at <= pg_catalog.clock_timestamp ()
+        and close_recorded_at > pg_catalog.clock_timestamp () - interval '1 minute'
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-trigger'
+    ),
+    'inserting a closed shift ignores a caller close_recorded_at'
+  );
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time,
+    close_recorded_at
+  )
+values
+  (
+    'shift-count-trigger-open',
+    '2026-10-21T10:00:00Z',
+    null,
+    true,
+    '2026-10-21T10:00:00Z',
+    '2000-01-01T00:00:00Z'
+  );
+
+select
+  is (
+    (
+      select
+        close_recorded_at
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-trigger-open'
+    ),
+    null::timestamptz,
+    'inserting an open shift clears a caller close_recorded_at'
+  );
+
+update app.pos_shifts
+set
+  closed_at = '2026-10-21T11:00:00Z',
+  close_recorded_at = '1999-01-01T00:00:00Z',
+  is_active = false
+where
+  id = 'shift-count-trigger-open';
+
+select
+  ok (
+    (
+      select
+        close_recorded_at is not null
+        and close_recorded_at <> '1999-01-01T00:00:00Z'::timestamptz
+        and close_recorded_at <= pg_catalog.clock_timestamp ()
+        and close_recorded_at > pg_catalog.clock_timestamp () - interval '1 minute'
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-trigger-open'
+    ),
+    'closing an open shift stamps close_recorded_at and ignores a caller value'
+  );
+
+create temporary table count_trigger_prior on
+commit
+drop as
+select
+  close_recorded_at as stamp
+from
+  app.pos_shifts
+where
+  id = 'shift-count-trigger';
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time,
+    close_recorded_at
+  )
+values
+  (
+    'shift-count-trigger',
+    '2026-10-21T08:00:00Z',
+    '2026-10-21T09:00:00Z',
+    false,
+    '2026-10-21T09:00:00Z',
+    '1999-01-01T00:00:00Z'
+  )
+on conflict (id) do update
+set
+  opened_at = excluded.opened_at,
+  closed_at = excluded.closed_at,
+  is_active = excluded.is_active,
+  pos_update_time = excluded.pos_update_time,
+  close_recorded_at = excluded.close_recorded_at;
+
+select
+  ok (
+    (
+      select
+        shift.close_recorded_at = prior.stamp
+        and shift.close_recorded_at is distinct from '1999-01-01T00:00:00Z'::timestamptz
+      from
+        app.pos_shifts shift
+        cross join count_trigger_prior prior
+      where
+        shift.id = 'shift-count-trigger'
+    ),
+    'an upsert that does not change closed_at keeps close_recorded_at'
+  );
+
+select
+  pg_catalog.pg_sleep (0.05);
+
+update app.pos_shifts
+set
+  closed_at = closed_at + interval '1 hour',
+  close_recorded_at = '1999-01-01T00:00:00Z'
+where
+  id = 'shift-count-trigger';
+
+select
+  ok (
+    (
+      select
+        shift.close_recorded_at > prior.stamp
+        and shift.close_recorded_at is distinct from '1999-01-01T00:00:00Z'::timestamptz
+      from
+        app.pos_shifts shift
+        cross join count_trigger_prior prior
+      where
+        shift.id = 'shift-count-trigger'
+    ),
+    'changing closed_at records a new close_recorded_at and ignores a caller value'
+  );
+
+update app.pos_shifts
+set
+  closed_at = null,
+  close_recorded_at = '1999-01-01T00:00:00Z',
+  is_active = true
+where
+  id = 'shift-count-trigger';
+
+select
+  is (
+    (
+      select
+        close_recorded_at
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-trigger'
+    ),
+    null::timestamptz,
+    'reopening a shift clears close_recorded_at'
+  );
+
+delete from app.pos_shifts
+where
+  id in ('shift-count-trigger', 'shift-count-trigger-open');
+
+insert into
+  app.pos_sync_runs (mode, status, started_at, finished_at, error)
+select
+  'recent',
+  'ok',
+  shift.close_recorded_at + interval '1 second',
+  shift.close_recorded_at + interval '1 minute',
+  null
+from
+  app.pos_shifts shift
+where
+  shift.id = 'shift-count-closed';
 
 select
   set_config(
@@ -1071,12 +1324,32 @@ select
     'a count after an open shift has opened is refused'
   );
 
+-- Coverage compares the database clocks. Move started_at as the table owner,
+-- then count again as the owner. Restore the covering run before later counts.
+reset role;
+
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      close_recorded_at
+    from
+      app.pos_shifts
+    where
+      id = 'shift-count-closed'
+  )
+where
+  status = 'ok';
+
+set
+  local role authenticated;
+
 select
   throws_ok (
     $$select app.record_count(jsonb_build_object(
       'request_id', 'd1900000-0000-4000-8000-000000000014',
       'frequency', 'daily',
-      'counted_at', '2026-10-22T13:00:00Z',
+      'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000099',
         'counted_qty', '1'
@@ -1084,7 +1357,115 @@ select
     ))$$,
     '22023',
     'sync has not covered this count time',
-    'a later failed sync run does not cover a time after the latest ok start'
+    'a run that started exactly when the shift close was recorded does not cover'
+  );
+
+reset role;
+
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      close_recorded_at - interval '1 second'
+    from
+      app.pos_shifts
+    where
+      id = 'shift-count-closed'
+  )
+where
+  status = 'ok';
+
+set
+  local role authenticated;
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000052',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000099',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'sync has not covered this count time',
+    'a run that started before the shift close was recorded does not cover'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000053',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T14:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000099',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'sync has not covered this count time',
+    'a count time far from the sync start is still refused when the run began before the close was recorded'
+  );
+
+reset role;
+
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      close_recorded_at + interval '1 second'
+    from
+      app.pos_shifts
+    where
+      id = 'shift-count-closed'
+  ),
+  finished_at = (
+    select
+      close_recorded_at + interval '1 minute'
+    from
+      app.pos_shifts
+    where
+      id = 'shift-count-closed'
+  )
+where
+  status = 'ok';
+
+set
+  local role authenticated;
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000054',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T14:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000099',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'unknown stock item',
+    'skew between the count time and the sync start does not block once the run began after the close was recorded'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000055',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T08:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000099',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'unknown stock item',
+    'with no shift opened at or before the count, a finished ok run is enough'
   );
 
 select
@@ -1914,23 +2295,7 @@ select
         'counted_qty', '6'
       ))
     ))$$,
-    'a count exactly 10 minutes before the latest ok sync start is covered'
-  );
-
-select
-  throws_ok (
-    $$select app.record_count(jsonb_build_object(
-      'request_id', 'd1900000-0000-4000-8000-000000000038',
-      'frequency', 'daily',
-      'counted_at', '2026-10-22T12:00:01Z',
-      'lines', jsonb_build_array(jsonb_build_object(
-        'item_id', 'c1900000-0000-4000-8000-000000000099',
-        'counted_qty', '1'
-      ))
-    ))$$,
-    '22023',
-    'sync has not covered this count time',
-    'a start 9 minutes 59 seconds after the count is refused even when the run finishes later'
+    'a count after the closed shift is covered when the newest ok run started after that close was recorded'
   );
 
 -- A matching count posts no movement, so the watermark has to move on its own.
@@ -2063,15 +2428,22 @@ select
     'the zero count and the refused movement post nothing'
   );
 
--- A newer ok run with no finish cannot prove coverage, even when it started
--- after the count plus the 10 minute margin. Delete it afterwards as the
--- table owner so the remaining counts still see the run that started at 12:10.
+-- A newer ok run with no finish cannot prove coverage, even though it started
+-- after the shift close was recorded. Delete it afterwards as the table owner
+-- so later counts still see the finished ok run.
 reset role;
 
 insert into
   app.pos_sync_runs (mode, status, started_at, finished_at)
-values
-  ('recent', 'ok', '2026-10-22T12:30:00Z', null);
+select
+  'recent',
+  'ok',
+  shift.close_recorded_at + interval '2 seconds',
+  null
+from
+  app.pos_shifts shift
+where
+  shift.id = 'shift-count-closed';
 
 select
   throws_ok (
@@ -2086,7 +2458,7 @@ select
     ))$$,
     '22023',
     'sync has not covered this count time',
-    'an ok run that started after the count still fails when it has not finished'
+    'an ok run that started after the close was recorded still fails when it has not finished'
   );
 
 delete from app.pos_sync_runs
@@ -2297,8 +2669,8 @@ set
   local role service_role;
 
 -- Item 002's zero count at 12:00 already moved last_occurred_at to 12:00.
--- An equal counted_at is not back-dated, and 12:00 plus 10 minutes is the
--- ok run's started_at.
+-- An equal counted_at is not back-dated. The ok run started after the shift
+-- close was recorded, so this count is covered.
 select
   lives_ok (
     $$select app.record_count(jsonb_build_object(
@@ -2336,6 +2708,51 @@ select
   );
 
 reset role;
+
+-- The newest ok run now starts before the close was recorded. A later failed
+-- run starts after that stamp. Coverage follows the newest ok row, so the
+-- count is refused. The failed row stays so the next test still has no ok run.
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      close_recorded_at - interval '1 second'
+    from
+      app.pos_shifts
+    where
+      id = 'shift-count-closed'
+  )
+where
+  status = 'ok';
+
+insert into
+  app.pos_sync_runs (mode, status, started_at, finished_at, error)
+select
+  'recent',
+  'failed',
+  shift.close_recorded_at + interval '1 minute',
+  shift.close_recorded_at + interval '2 minutes',
+  'synthetic failed run'
+from
+  app.pos_shifts shift
+where
+  shift.id = 'shift-count-closed';
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000056',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000099',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'sync has not covered this count time',
+    'a later failed run does not cover a count when the newest ok run started before the close was recorded'
+  );
 
 delete from app.pos_sync_runs
 where
