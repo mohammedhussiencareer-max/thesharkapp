@@ -1,0 +1,4020 @@
+begin;
+
+select
+  no_plan ();
+
+-- Clean up any existing test rows in the transaction. Count lines reference
+-- movements, so they go before the ledger cleanup. POS rows are removed so
+-- shift and sync coverage in this transaction do not depend on other tests.
+alter table app.stock_count_lines disable trigger trg_stock_count_lines_no_update_delete;
+
+delete from app.stock_count_lines;
+
+alter table app.stock_count_lines enable trigger trg_stock_count_lines_no_update_delete;
+
+alter table app.stock_counts disable trigger trg_stock_counts_no_update_delete;
+
+delete from app.stock_counts;
+
+alter table app.stock_counts enable trigger trg_stock_counts_no_update_delete;
+
+alter table app.sort_batch_lines disable trigger trg_sort_batch_lines_no_update_delete;
+
+delete from app.sort_batch_lines;
+
+alter table app.sort_batch_lines enable trigger trg_sort_batch_lines_no_update_delete;
+
+alter table app.sort_batches disable trigger trg_sort_batches_no_update_delete;
+
+delete from app.sort_batches;
+
+alter table app.sort_batches enable trigger trg_sort_batches_no_update_delete;
+
+alter table app.purchase_lines disable trigger trg_purchase_lines_no_update_delete;
+
+delete from app.purchase_lines;
+
+alter table app.purchase_lines enable trigger trg_purchase_lines_no_update_delete;
+
+alter table app.purchases disable trigger trg_purchases_no_update_delete;
+
+delete from app.purchases;
+
+alter table app.purchases enable trigger trg_purchases_no_update_delete;
+
+alter table app.opening_stock_lines disable trigger trg_opening_stock_lines_no_update_delete;
+
+delete from app.opening_stock_lines;
+
+alter table app.opening_stock_lines enable trigger trg_opening_stock_lines_no_update_delete;
+
+alter table app.opening_stocks disable trigger trg_opening_stocks_no_update_delete;
+
+delete from app.opening_stocks;
+
+alter table app.opening_stocks enable trigger trg_opening_stocks_no_update_delete;
+
+delete from app.provisional_deficits;
+
+alter table app.stock_movements disable trigger trg_stock_movements_no_update_delete;
+
+alter table app.stock_movements disable trigger trg_stock_movements_no_truncate;
+
+delete from app.stock_movements;
+
+alter table app.stock_movements enable trigger trg_stock_movements_no_update_delete;
+
+alter table app.stock_movements enable trigger trg_stock_movements_no_truncate;
+
+delete from app.item_balances;
+
+delete from app.item_unit_conversions;
+
+delete from app.stock_items;
+
+delete from app.pos_sync_run_orders;
+
+delete from app.pos_shift_transactions;
+
+delete from app.pos_order_lines;
+
+delete from app.pos_orders;
+
+delete from app.pos_shifts;
+
+delete from app.pos_sync_runs;
+
+delete from app.owner;
+
+delete from auth.identities
+where
+  user_id in (
+    'b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f',
+    'c4e8a1b2-6d70-4f11-8a22-2b3c4d5e6f70'
+  );
+
+delete from auth.users
+where
+  id in (
+    'b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f',
+    'c4e8a1b2-6d70-4f11-8a22-2b3c4d5e6f70'
+  );
+
+insert into
+  auth.users (
+    instance_id,
+    id,
+    aud,
+    role,
+    email,
+    encrypted_password,
+    email_confirmed_at,
+    confirmation_token,
+    recovery_token,
+    email_change_token_new,
+    email_change
+  )
+values
+  (
+    '00000000-0000-0000-0000-000000000000',
+    'b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f',
+    'authenticated',
+    'authenticated',
+    'owner@theshark.test',
+    '',
+    now(),
+    '',
+    '',
+    '',
+    ''
+  ),
+  (
+    '00000000-0000-0000-0000-000000000000',
+    'c4e8a1b2-6d70-4f11-8a22-2b3c4d5e6f70',
+    'authenticated',
+    'authenticated',
+    'intruder@theshark.test',
+    '',
+    now(),
+    '',
+    '',
+    '',
+    ''
+  );
+
+insert into
+  app.owner (user_id)
+values
+  ('b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f');
+
+-- ============================================================================
+-- Schema, grants, policies, triggers, lock order
+-- ============================================================================
+select
+  has_table ('app', 'stock_counts', 'app.stock_counts exists');
+
+select
+  has_table (
+    'app',
+    'stock_count_lines',
+    'app.stock_count_lines exists'
+  );
+
+select
+  has_table (
+    'app',
+    'stock_count_requests',
+    'app.stock_count_requests exists'
+  );
+
+select
+  has_view (
+    'app',
+    'stock_count_history',
+    'app.stock_count_history exists'
+  );
+
+select
+  has_view (
+    'app',
+    'stock_count_pending',
+    'app.stock_count_pending exists'
+  );
+
+select
+  has_function (
+    'app',
+    'record_count',
+    array['jsonb'],
+    'app.record_count(jsonb) exists'
+  );
+
+select
+  has_index (
+    'app',
+    'stock_counts',
+    'stock_counts_request_id_key',
+    'count request_id is unique'
+  );
+
+select
+  has_index (
+    'app',
+    'stock_counts',
+    'stock_counts_created_at_idx',
+    'counts are indexed by created_at and id'
+  );
+
+select
+  has_index (
+    'app',
+    'stock_counts',
+    'stock_counts_counted_at_idx',
+    'counts are indexed by counted_at'
+  );
+
+select
+  has_index (
+    'app',
+    'stock_count_lines',
+    'stock_count_lines_item_key',
+    'an item appears once per count'
+  );
+
+select
+  has_index (
+    'app',
+    'stock_count_lines',
+    'stock_count_lines_item_id_idx',
+    'count lines are indexed by item'
+  );
+
+select
+  has_trigger (
+    'app',
+    'stock_counts',
+    'trg_stock_counts_no_update_delete',
+    'counts reject update and delete'
+  );
+
+select
+  has_trigger (
+    'app',
+    'stock_counts',
+    'trg_stock_counts_no_truncate',
+    'counts reject truncate'
+  );
+
+select
+  has_trigger (
+    'app',
+    'stock_count_lines',
+    'trg_stock_count_lines_no_update_delete',
+    'count lines reject update and delete'
+  );
+
+select
+  has_trigger (
+    'app',
+    'stock_count_lines',
+    'trg_stock_count_lines_no_truncate',
+    'count lines reject truncate'
+  );
+
+select
+  has_trigger (
+    'app',
+    'stock_count_requests',
+    'trg_stock_count_requests_no_update_delete',
+    'count requests reject update and delete'
+  );
+
+select
+  has_trigger (
+    'app',
+    'stock_count_requests',
+    'trg_stock_count_requests_no_truncate',
+    'count requests reject truncate'
+  );
+
+select
+  ok (
+    (
+      select
+        p.prosecdef
+        and 'search_path=""' = any (p.proconfig)
+      from
+        pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+      where
+        n.nspname = 'app'
+        and p.proname = 'record_count'
+    ),
+    'record_count is security definer with an empty search_path'
+  );
+
+-- First match of each name. Replay reads stock_counts, then the prepare
+-- table, then shift and item guards, then the request insert. Coverage
+-- reads sync runs after that insert. The count document insert is after
+-- post_movements. Later guard reads do not change the first match.
+select
+  ok (
+    (
+      select
+        position('app.assert_ledger_write_allowed' in def) > 0
+        and position('app.assert_ledger_write_allowed' in def) < position('app.assert_no_phone_text' in def)
+        and position('app.assert_no_phone_text' in def) < position('app.stock_counts' in def)
+        and position('app.stock_counts' in def) < position('app.stock_count_requests' in def)
+        and position('app.stock_count_requests' in def) < position('app.pos_shifts' in def)
+        and position('app.pos_shifts' in def) < position('app.stock_items' in def)
+        and position('app.stock_items' in def) < position('insert into' in lower(def))
+        and position('insert into' in lower(def)) < position('app.pos_sync_runs' in def)
+        and position('app.pos_sync_runs' in def) < position('app.lock_and_validate_item_balance' in def)
+        and position('app.lock_and_validate_item_balance' in def) < position('app.post_movements' in def)
+        and position('app.post_movements' in def) < position('app.stock_counts (' in def)
+      from
+        (
+          select
+            pg_catalog.pg_get_functiondef ('app.record_count(jsonb)'::regprocedure) as def
+        ) s
+    ),
+    'record_count locks, replays, prepares, then covers and posts'
+  );
+
+select
+  ok (
+    has_function_privilege(
+      'authenticated',
+      'app.record_count(jsonb)'::regprocedure,
+      'EXECUTE'
+    )
+    and has_function_privilege(
+      'service_role',
+      'app.record_count(jsonb)'::regprocedure,
+      'EXECUTE'
+    )
+    and not has_function_privilege(
+      'anon',
+      'app.record_count(jsonb)'::regprocedure,
+      'EXECUTE'
+    )
+    and not has_function_privilege(
+      'public',
+      'app.record_count(jsonb)'::regprocedure,
+      'EXECUTE'
+    ),
+    'record_count execute is granted to authenticated and service_role only'
+  );
+
+select
+  ok (
+    not has_function_privilege(
+      'anon',
+      'app.prevent_count_mutation()'::regprocedure,
+      'EXECUTE'
+    )
+    and not has_function_privilege(
+      'authenticated',
+      'app.prevent_count_mutation()'::regprocedure,
+      'EXECUTE'
+    )
+    and not has_function_privilege(
+      'service_role',
+      'app.prevent_count_mutation()'::regprocedure,
+      'EXECUTE'
+    )
+    and not has_function_privilege(
+      'public',
+      'app.prevent_count_mutation()'::regprocedure,
+      'EXECUTE'
+    ),
+    'the append-only trigger function is not executable via the API'
+  );
+
+select
+  has_column (
+    'app',
+    'pos_shifts',
+    'close_recorded_at',
+    'pos_shifts records when a close was stored'
+  );
+
+select
+  has_trigger (
+    'app',
+    'pos_shifts',
+    'trg_pos_shifts_close_recorded',
+    'storing a shift close stamps close_recorded_at'
+  );
+
+select
+  ok (
+    (
+      select
+        p.prosecdef
+        and 'search_path=""' = any (p.proconfig)
+      from
+        pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+      where
+        n.nspname = 'app'
+        and p.proname = 'stamp_shift_close_recorded'
+    ),
+    'stamp_shift_close_recorded is security definer with an empty search_path'
+  );
+
+select
+  ok (
+    not has_function_privilege(
+      'anon',
+      'app.stamp_shift_close_recorded()'::regprocedure,
+      'EXECUTE'
+    )
+    and not has_function_privilege(
+      'authenticated',
+      'app.stamp_shift_close_recorded()'::regprocedure,
+      'EXECUTE'
+    )
+    and not has_function_privilege(
+      'service_role',
+      'app.stamp_shift_close_recorded()'::regprocedure,
+      'EXECUTE'
+    )
+    and not has_function_privilege(
+      'public',
+      'app.stamp_shift_close_recorded()'::regprocedure,
+      'EXECUTE'
+    ),
+    'stamp_shift_close_recorded is not an API function'
+  );
+
+select
+  results_eq (
+    $$select pg_catalog.btrim(privilege_type::text) collate "default"
+      from information_schema.table_privileges
+      where table_schema = 'app'
+        and table_name = 'stock_counts'
+        and grantee = 'authenticated'
+      order by 1$$,
+    $$values ('SELECT'::text)$$,
+    'authenticated can only select counts'
+  );
+
+select
+  results_eq (
+    $$select pg_catalog.btrim(privilege_type::text) collate "default"
+      from information_schema.table_privileges
+      where table_schema = 'app'
+        and table_name = 'stock_count_lines'
+        and grantee = 'authenticated'
+      order by 1$$,
+    $$values ('SELECT'::text)$$,
+    'authenticated can only select count lines'
+  );
+
+select
+  results_eq (
+    $$select pg_catalog.btrim(privilege_type::text) collate "default"
+      from information_schema.table_privileges
+      where table_schema = 'app'
+        and table_name = 'stock_counts'
+        and grantee = 'service_role'
+      order by 1$$,
+    $$values ('SELECT'::text)$$,
+    'service_role can only select counts'
+  );
+
+select
+  results_eq (
+    $$select pg_catalog.btrim(privilege_type::text) collate "default"
+      from information_schema.table_privileges
+      where table_schema = 'app'
+        and table_name = 'stock_count_lines'
+        and grantee = 'service_role'
+      order by 1$$,
+    $$values ('SELECT'::text)$$,
+    'service_role can only select count lines'
+  );
+
+select
+  results_eq (
+    $$select pg_catalog.btrim(privilege_type::text) collate "default"
+      from information_schema.table_privileges
+      where table_schema = 'app'
+        and table_name = 'stock_count_history'
+        and grantee = 'authenticated'
+      order by 1$$,
+    $$values ('SELECT'::text)$$,
+    'authenticated can only select count history'
+  );
+
+select
+  results_eq (
+    $$select pg_catalog.btrim(privilege_type::text) collate "default"
+      from information_schema.table_privileges
+      where table_schema = 'app'
+        and table_name = 'stock_count_history'
+        and grantee = 'service_role'
+      order by 1$$,
+    $$values ('SELECT'::text)$$,
+    'service_role can only select count history'
+  );
+
+select
+  results_eq (
+    $$select pg_catalog.btrim(privilege_type::text) collate "default"
+      from information_schema.table_privileges
+      where table_schema = 'app'
+        and table_name = 'stock_count_requests'
+        and grantee = 'authenticated'
+      order by 1$$,
+    $$values ('SELECT'::text)$$,
+    'authenticated can only select count requests'
+  );
+
+select
+  results_eq (
+    $$select pg_catalog.btrim(privilege_type::text) collate "default"
+      from information_schema.table_privileges
+      where table_schema = 'app'
+        and table_name = 'stock_count_requests'
+        and grantee = 'service_role'
+      order by 1$$,
+    $$values ('SELECT'::text)$$,
+    'service_role can only select count requests'
+  );
+
+select
+  results_eq (
+    $$select pg_catalog.btrim(privilege_type::text) collate "default"
+      from information_schema.table_privileges
+      where table_schema = 'app'
+        and table_name = 'stock_count_pending'
+        and grantee = 'authenticated'
+      order by 1$$,
+    $$values ('SELECT'::text)$$,
+    'authenticated can only select pending counts'
+  );
+
+select
+  results_eq (
+    $$select pg_catalog.btrim(privilege_type::text) collate "default"
+      from information_schema.table_privileges
+      where table_schema = 'app'
+        and table_name = 'stock_count_pending'
+        and grantee = 'service_role'
+      order by 1$$,
+    $$values ('SELECT'::text)$$,
+    'service_role can only select pending counts'
+  );
+
+select
+  is_empty (
+    $$select privilege_type
+      from information_schema.table_privileges
+      where table_schema = 'app'
+        and table_name in (
+          'stock_counts',
+          'stock_count_lines',
+          'stock_count_history',
+          'stock_count_requests',
+          'stock_count_pending'
+        )
+        and grantee in ('anon', 'PUBLIC')$$,
+    'anon and public have no privileges on count tables or the history view'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        pg_catalog.pg_policies
+      where
+        schemaname = 'app'
+        and tablename = 'stock_counts'
+        and policyname = 'stock_counts_select_owner'
+        and cmd = 'SELECT'
+        and roles = '{authenticated}'::name[]
+    )
+    and exists (
+      select
+        1
+      from
+        pg_catalog.pg_policies
+      where
+        schemaname = 'app'
+        and tablename = 'stock_count_lines'
+        and policyname = 'stock_count_lines_select_owner'
+        and cmd = 'SELECT'
+        and roles = '{authenticated}'::name[]
+    )
+    and exists (
+      select
+        1
+      from
+        pg_catalog.pg_policies
+      where
+        schemaname = 'app'
+        and tablename = 'stock_count_requests'
+        and policyname = 'stock_count_requests_select_owner'
+        and cmd = 'SELECT'
+        and roles = '{authenticated}'::name[]
+    ),
+    'owner select policies exist on the count tables'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        pg_catalog.pg_policies
+      where
+        schemaname = 'app'
+        and tablename in (
+          'stock_counts',
+          'stock_count_lines',
+          'stock_count_requests'
+        )
+        and cmd <> 'SELECT'
+    ),
+    0::bigint,
+    'count tables have no insert, update, or delete policies'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+      where
+        n.nspname = 'app'
+        and c.relname in (
+          'stock_counts',
+          'stock_count_lines',
+          'stock_count_requests'
+        )
+        and c.relrowsecurity
+    ),
+    3::bigint,
+    'RLS is enabled on the count tables'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+        cross join lateral unnest(coalesce(c.reloptions, array[]::text[])) as opt
+      where
+        n.nspname = 'app'
+        and c.relname = 'stock_count_history'
+        and (
+          opt = 'security_invoker=true'
+          or opt = 'security_invoker=on'
+        )
+    )
+    and exists (
+      select
+        1
+      from
+        pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+        cross join lateral unnest(coalesce(c.reloptions, array[]::text[])) as opt
+      where
+        n.nspname = 'app'
+        and c.relname = 'stock_count_pending'
+        and (
+          opt = 'security_invoker=true'
+          or opt = 'security_invoker=on'
+        )
+    ),
+    'count history and pending views are security invoker'
+  );
+
+-- ============================================================================
+-- Synthetic catalog and POS mirror. Not restaurant data.
+-- Closed shift is [08:30, 09:30). Open shift starts at 15:00 and stays open.
+-- close_recorded_at is the database clock when the closed row is inserted.
+-- The seeded ok run starts and finishes one microsecond after the latest
+-- close stamp, before any prepare. A later submit stays waiting until a
+-- newer ok run, by id, starts after prepared_at and after that stamp.
+-- Coverage does not compare started_at with counted_at.
+-- ============================================================================
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    active
+  )
+values
+  (
+    'c1900000-0000-4000-8000-000000000001',
+    'بلطي جرد اختبار',
+    'seafood',
+    'kg',
+    'daily',
+    true
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000002',
+    'جمبري جرد اختبار',
+    'seafood',
+    'kg',
+    'daily',
+    true
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000003',
+    'كابوريا جرد اختبار',
+    'seafood',
+    'kg',
+    'daily',
+    true
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000004',
+    'توابل جرد اختبار',
+    'ingredient',
+    'kg',
+    'weekly',
+    true
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000005',
+    'موقوف جرد اختبار',
+    'seafood',
+    'kg',
+    'daily',
+    false
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000006',
+    'بدون رصيد جرد اختبار',
+    'seafood',
+    'kg',
+    'daily',
+    true
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000007',
+    'موقوف أسبوعي جرد اختبار',
+    'ingredient',
+    'kg',
+    'weekly',
+    false
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000008',
+    'مطابقة جرد اختبار',
+    'seafood',
+    'kg',
+    'daily',
+    true
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000009',
+    'لم يتحرك جرد اختبار',
+    'seafood',
+    'kg',
+    'daily',
+    true
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000010',
+    'حاجز جرد اختبار',
+    'seafood',
+    'kg',
+    'daily',
+    true
+  );
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+values
+  (
+    'shift-count-closed',
+    '2026-10-22T08:30:00Z',
+    '2026-10-22T09:30:00Z',
+    false,
+    '2026-10-22T09:30:00Z'
+  ),
+  (
+    'shift-count-open',
+    '2026-10-22T15:00:00Z',
+    null,
+    true,
+    '2026-10-22T15:00:00Z'
+  );
+
+select
+  ok (
+    (
+      select
+        close_recorded_at is not null
+        and close_recorded_at <= pg_catalog.clock_timestamp ()
+        and close_recorded_at > pg_catalog.clock_timestamp () - interval '1 minute'
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-closed'
+    ),
+    'inserting a closed shift stamps close_recorded_at from the database clock'
+  );
+
+select
+  is (
+    (
+      select
+        close_recorded_at
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-open'
+    ),
+    null::timestamptz,
+    'inserting an open shift leaves close_recorded_at null'
+  );
+
+-- Caller-supplied stamps must be ignored. These rows open before the seeded
+-- shifts, so they are deleted before any count: an open one would refuse
+-- every later count, and a closed one would become the prior shift at 08:00.
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time,
+    close_recorded_at
+  )
+values
+  (
+    'shift-count-trigger',
+    '2026-10-21T08:00:00Z',
+    '2026-10-21T09:00:00Z',
+    false,
+    '2026-10-21T09:00:00Z',
+    '2000-01-01T00:00:00Z'
+  );
+
+select
+  ok (
+    (
+      select
+        close_recorded_at is not null
+        and close_recorded_at <> '2000-01-01T00:00:00Z'::timestamptz
+        and close_recorded_at <= pg_catalog.clock_timestamp ()
+        and close_recorded_at > pg_catalog.clock_timestamp () - interval '1 minute'
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-trigger'
+    ),
+    'inserting a closed shift ignores a caller close_recorded_at'
+  );
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time,
+    close_recorded_at
+  )
+values
+  (
+    'shift-count-trigger-open',
+    '2026-10-21T10:00:00Z',
+    null,
+    true,
+    '2026-10-21T10:00:00Z',
+    '2000-01-01T00:00:00Z'
+  );
+
+select
+  is (
+    (
+      select
+        close_recorded_at
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-trigger-open'
+    ),
+    null::timestamptz,
+    'inserting an open shift clears a caller close_recorded_at'
+  );
+
+update app.pos_shifts
+set
+  closed_at = '2026-10-21T11:00:00Z',
+  close_recorded_at = '1999-01-01T00:00:00Z',
+  is_active = false
+where
+  id = 'shift-count-trigger-open';
+
+select
+  ok (
+    (
+      select
+        close_recorded_at is not null
+        and close_recorded_at <> '1999-01-01T00:00:00Z'::timestamptz
+        and close_recorded_at <= pg_catalog.clock_timestamp ()
+        and close_recorded_at > pg_catalog.clock_timestamp () - interval '1 minute'
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-trigger-open'
+    ),
+    'closing an open shift stamps close_recorded_at and ignores a caller value'
+  );
+
+create temporary table count_trigger_prior on
+commit
+drop as
+select
+  close_recorded_at as stamp
+from
+  app.pos_shifts
+where
+  id = 'shift-count-trigger';
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time,
+    close_recorded_at
+  )
+values
+  (
+    'shift-count-trigger',
+    '2026-10-21T08:00:00Z',
+    '2026-10-21T09:00:00Z',
+    false,
+    '2026-10-21T09:00:00Z',
+    '1999-01-01T00:00:00Z'
+  )
+on conflict (id) do update
+set
+  opened_at = excluded.opened_at,
+  closed_at = excluded.closed_at,
+  is_active = excluded.is_active,
+  pos_update_time = excluded.pos_update_time,
+  close_recorded_at = excluded.close_recorded_at;
+
+select
+  ok (
+    (
+      select
+        shift.close_recorded_at = prior.stamp
+        and shift.close_recorded_at is distinct from '1999-01-01T00:00:00Z'::timestamptz
+      from
+        app.pos_shifts shift
+        cross join count_trigger_prior prior
+      where
+        shift.id = 'shift-count-trigger'
+    ),
+    'an upsert that does not change closed_at keeps close_recorded_at'
+  );
+
+select
+  pg_catalog.pg_sleep (0.05);
+
+update app.pos_shifts
+set
+  closed_at = closed_at + interval '1 hour',
+  close_recorded_at = '1999-01-01T00:00:00Z'
+where
+  id = 'shift-count-trigger';
+
+select
+  ok (
+    (
+      select
+        shift.close_recorded_at > prior.stamp
+        and shift.close_recorded_at is distinct from '1999-01-01T00:00:00Z'::timestamptz
+      from
+        app.pos_shifts shift
+        cross join count_trigger_prior prior
+      where
+        shift.id = 'shift-count-trigger'
+    ),
+    'changing closed_at records a new close_recorded_at and ignores a caller value'
+  );
+
+update app.pos_shifts
+set
+  closed_at = null,
+  close_recorded_at = '1999-01-01T00:00:00Z',
+  is_active = true
+where
+  id = 'shift-count-trigger';
+
+select
+  is (
+    (
+      select
+        close_recorded_at
+      from
+        app.pos_shifts
+      where
+        id = 'shift-count-trigger'
+    ),
+    null::timestamptz,
+    'reopening a shift clears close_recorded_at'
+  );
+
+delete from app.pos_shifts
+where
+  id in ('shift-count-trigger', 'shift-count-trigger-open');
+
+insert into
+  app.pos_sync_runs (mode, status, started_at, finished_at, error)
+  -- One microsecond after the latest close stamp, and before any prepare.
+  -- A later submit stays waiting until a newer ok run starts after prepared_at.
+select
+  'recent',
+  'ok',
+  pg_catalog.max (shift.close_recorded_at) + interval '1 microsecond',
+  pg_catalog.max (shift.close_recorded_at) + interval '1 microsecond',
+  null
+from
+  app.pos_shifts shift;
+
+-- Inserts a new ok run after this submit, then posts. record_count follows
+-- the newest ok row by id, so the seeded run stays before every prepared_at.
+-- Created before set role so the insert runs as the table owner. Exceptions
+-- propagate, so a refused post still fails the caller.
+create function pg_temp.cover_prepared_count (p_count jsonb) returns jsonb language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_result jsonb;
+  v_prepared timestamptz;
+  v_counted timestamptz;
+  v_close timestamptz;
+  v_start timestamptz;
+begin
+  v_result := app.record_count(p_count);
+
+  if v_result ->> 'status' = 'posted' then
+    return v_result;
+  end if;
+
+  select
+    request.prepared_at,
+    (request.payload ->> 'counted_at')::timestamptz
+  into
+    v_prepared,
+    v_counted
+  from
+    app.stock_count_requests request
+  where
+    request.request_id = (p_count ->> 'request_id')::uuid;
+
+  select
+    pg_catalog.max(shift.close_recorded_at)
+  into
+    v_close
+  from
+    app.pos_shifts shift
+  where
+    shift.opened_at <= v_counted;
+
+  -- After this submit and after every close stamp of shifts opened by the count.
+  v_start := greatest(v_prepared, coalesce(v_close, v_prepared)) + interval '1 millisecond';
+
+  insert into
+    app.pos_sync_runs (mode, status, started_at, finished_at, error)
+  values
+    (
+      'recent',
+      'ok',
+      v_start,
+      v_start + interval '1 minute',
+      null
+    );
+
+  return app.record_count (p_count);
+end;
+$$;
+
+select
+  set_config(
+    'request.jwt.claims',
+    jsonb_build_object(
+      'sub',
+      'b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f',
+      'role',
+      'authenticated'
+    )::text,
+    true
+  );
+
+set
+  local role authenticated;
+
+-- ============================================================================
+-- Validation. None of these calls post a count.
+-- ============================================================================
+select
+  throws_ok (
+    $$select app.record_count('[]'::jsonb)$$,
+    '22023',
+    'p_count must be a jsonb object',
+    'a count payload must be an object'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count('null'::jsonb)$$,
+    '22023',
+    'p_count must be a jsonb object',
+    'a null count payload is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object('note', 1))$$,
+    '22023',
+    'note must be text',
+    'a non-text note is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count('{}'::jsonb)$$,
+    '22023',
+    'request_id is required',
+    'a missing request_id is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'not-a-uuid',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'request_id is required',
+    'a request_id that is not a uuid is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000040',
+      'frequency', 'monthly',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'frequency must be daily or weekly',
+    'a frequency outside daily and weekly is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000041',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'frequency must be daily or weekly',
+    'a missing frequency is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000042',
+      'frequency', 'daily',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'counted_at is required',
+    'a missing counted_at is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000043',
+      'frequency', 'daily',
+      'counted_at', 'infinity',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'counted_at must be a finite timestamp',
+    'an infinite counted_at is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000044',
+      'frequency', 'daily',
+      'counted_at', 'not-a-time',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'counted_at must be a finite timestamp',
+    'an unparseable counted_at is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000045',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'note', repeat('ن', 501),
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'note must be at most 500 characters',
+    'a note longer than 500 characters is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000019',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T09:00:00Z',
+      'note', '01001234567',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    'phone digits in the note are refused before the shift check'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000046',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', '[]'::jsonb
+    ))$$,
+    '22023',
+    'lines must be a jsonb array of 1 to 200 lines',
+    'an empty line list is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000047',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z'
+    ))$$,
+    '22023',
+    'lines must be a jsonb array of 1 to 200 lines',
+    'a missing line list is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000048',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', (
+        select pg_catalog.jsonb_agg(
+          pg_catalog.jsonb_build_object(
+            'item_id', pg_catalog.gen_random_uuid(),
+            'counted_qty', '1'
+          )
+        )
+        from pg_catalog.generate_series(1, 201)
+      )
+    ))$$,
+    '22023',
+    'lines must be a jsonb array of 1 to 200 lines',
+    'more than 200 lines is refused before each line is read'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000049',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', '[1]'::jsonb
+    ))$$,
+    '22023',
+    'each count line must be a jsonb object',
+    'a line that is not an object is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-00000000004a',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001'
+      ))
+    ))$$,
+    '22023',
+    'item_id and counted_qty are required',
+    'a line without a quantity is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-00000000004b',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'not-a-uuid',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'item_id must be a uuid',
+    'an item id that is not a uuid is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-00000000004c',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000001',
+          'counted_qty', '1'
+        ),
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000001',
+          'counted_qty', '2'
+        )
+      )
+    ))$$,
+    '22023',
+    'duplicate item',
+    'the same item twice in one count is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-00000000004d',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '-1'
+      ))
+    ))$$,
+    '22023',
+    'counted_qty must be a finite number >= 0',
+    'a negative counted quantity is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-00000000004e',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '1.1234567'
+      ))
+    ))$$,
+    '22023',
+    'counted_qty must have at most 6 decimal places',
+    'a counted quantity with more than 6 decimal places is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-00000000004f',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '100000000000000'
+      ))
+    ))$$,
+    '22023',
+    'counted_qty is out of range',
+    'a counted quantity that does not fit numeric(20,6) is refused'
+  );
+
+-- ============================================================================
+-- Shift, sync, and catalog guards. Still no count row.
+-- Inside a closed shift is checked before an open shift. An open shift is
+-- checked before sync. Sync is checked before the catalog.
+-- ============================================================================
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000010',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T09:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '7'
+      ))
+    ))$$,
+    '22023',
+    'count time is inside a shift',
+    'a count inside a closed shift is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000011',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T08:30:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '7'
+      ))
+    ))$$,
+    '22023',
+    'count time is inside a shift',
+    'a count exactly at a closed shift open is inside that shift'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000012',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T15:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000099',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'a shift is still open',
+    'an open shift is refused before sync coverage and before an unknown item'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000013',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T16:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '7'
+      ))
+    ))$$,
+    '22023',
+    'a shift is still open',
+    'a count after an open shift has opened is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000015',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000004',
+        'counted_qty', '4'
+      ))
+    ))$$,
+    '22023',
+    'item count frequency does not match',
+    'a weekly item is refused on a daily count'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000016',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000005',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'item is inactive',
+    'an inactive item is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000017',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000007',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'item is inactive',
+    'an inactive weekly item on a daily count is reported inactive'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000018',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000099',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'unknown stock item',
+    'an unknown item is refused when the time is otherwise allowed'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_counts$$,
+    'a refused count does not store a row'
+  );
+
+select
+  is_empty (
+    $$select request_id from app.stock_count_requests$$,
+    'a refused count does not store a prepare row'
+  );
+
+-- Prepare, then sync. These requests use item 001 and do not post, so the
+-- opening at 08:00 is still that item's first movement. Coverage is the
+-- newest finished ok run: started_at must be after prepared_at and after the
+-- latest close stamp of every shift opened at or before counted_at.
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000060',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'prepared_at',
+        '1999-01-01T00:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'the first submit waits for a sync that starts after it'
+  );
+
+select
+  ok (
+    (
+      select
+        request.prepared_at <= pg_catalog.clock_timestamp ()
+        and request.prepared_at > pg_catalog.clock_timestamp () - interval '1 minute'
+        and request.prepared_at is distinct from '1999-01-01T00:00:00Z'::timestamptz
+        and not (request.payload ? 'prepared_at')
+        and request.payload ->> 'frequency' = 'daily'
+        and (request.payload ->> 'counted_at')::timestamptz = '2026-10-22T10:00:00Z'::timestamptz
+        and pg_catalog.jsonb_array_length (request.payload -> 'lines') = 1
+        and request.created_by = 'b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f'::uuid
+      from
+        app.stock_count_requests request
+      where
+        request.request_id = 'd1900000-0000-4000-8000-000000000060'
+    ),
+    'the prepare row stores a server prepared_at and the normalized payload'
+  );
+
+select
+  is (
+    (
+      select
+        item_count
+      from
+        app.stock_count_pending
+      where
+        request_id = 'd1900000-0000-4000-8000-000000000060'
+    ),
+    1,
+    'the pending view lists the prepared count'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000060',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a second call before any new run still waits'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_counts where request_id = 'd1900000-0000-4000-8000-000000000060'$$,
+    'waiting posts nothing'
+  );
+
+reset role;
+
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      prepared_at
+    from
+      app.stock_count_requests
+    where
+      request_id = 'd1900000-0000-4000-8000-000000000060'
+  ),
+  finished_at = (
+    select
+      prepared_at + interval '1 minute'
+    from
+      app.stock_count_requests
+    where
+      request_id = 'd1900000-0000-4000-8000-000000000060'
+  )
+where
+  status = 'ok';
+
+set
+  local role authenticated;
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000060',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a run that started at prepared_at does not cover the count'
+  );
+
+reset role;
+
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      pg_catalog.max (close_recorded_at)
+    from
+      app.pos_shifts
+  ),
+  finished_at = (
+    select
+      pg_catalog.max (close_recorded_at) + interval '1 minute'
+    from
+      app.pos_shifts
+  )
+where
+  status = 'ok';
+
+set
+  local role authenticated;
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000060',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a run that started exactly at the latest close stamp does not cover'
+  );
+
+reset role;
+
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      pg_catalog.max (close_recorded_at) - interval '1 second'
+    from
+      app.pos_shifts
+  )
+where
+  status = 'ok';
+
+set
+  local role authenticated;
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000060',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a run that started before the latest close stamp does not cover'
+  );
+
+-- Shifts can overlap. The latest close stamp of every shift opened before
+-- the count counts, not the stamp of the latest-opened shift. This shift
+-- opened earlier than shift-count-closed and closed later, so its stamp is
+-- later. The run starts after shift-count-closed and after prepared_at, and
+-- one microsecond before the overlap stamp.
+reset role;
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+values
+  (
+    'shift-count-overlap',
+    '2026-10-22T08:00:00Z',
+    '2026-10-22T09:45:00Z',
+    false,
+    '2026-10-22T09:45:00Z'
+  );
+
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      greatest(
+        close_recorded_at - interval '1 microsecond',
+        (
+          select
+            prepared_at + interval '1 microsecond'
+          from
+            app.stock_count_requests
+          where
+            request_id = 'd1900000-0000-4000-8000-000000000060'
+        )
+      )
+    from
+      app.pos_shifts
+    where
+      id = 'shift-count-overlap'
+  ),
+  finished_at = (
+    select
+      close_recorded_at + interval '1 minute'
+    from
+      app.pos_shifts
+    where
+      id = 'shift-count-overlap'
+  )
+where
+  status = 'ok';
+
+select
+  ok (
+    (
+      select
+        run.started_at > closed.close_recorded_at
+        and run.started_at > request.prepared_at
+        and run.started_at < overlap.close_recorded_at
+      from
+        app.pos_sync_runs run
+        cross join app.pos_shifts closed
+        cross join app.pos_shifts overlap
+        cross join app.stock_count_requests request
+      where
+        run.status = 'ok'
+        and closed.id = 'shift-count-closed'
+        and overlap.id = 'shift-count-overlap'
+        and request.request_id = 'd1900000-0000-4000-8000-000000000060'
+    ),
+    'the overlap run starts after the latest-opened shift close stamp and after prepare, and before the overlap stamp'
+  );
+
+set
+  local role authenticated;
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000060',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a run before the latest close stamp of overlapping shifts does not cover'
+  );
+
+reset role;
+
+delete from app.pos_shifts
+where
+  id = 'shift-count-overlap';
+
+set
+  local role authenticated;
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000060',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '8'
+      ))
+    ))$$,
+    '22023',
+    'request_id already used for a different count',
+    'the same request_id with a different payload is refused while waiting'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_counts where request_id = 'd1900000-0000-4000-8000-000000000060'$$,
+    'a different payload while waiting posts nothing'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000062',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a count prepared before a later shift waits'
+  );
+
+reset role;
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+values
+  (
+    'shift-count-after-prepare',
+    '2026-10-22T09:50:00Z',
+    '2026-10-22T10:30:00Z',
+    false,
+    '2026-10-22T10:30:00Z'
+  );
+
+create temporary table count_cover_at on
+commit
+drop as
+select
+  greatest(
+    request.prepared_at,
+    coalesce(
+      (
+        select
+          pg_catalog.max (shift.close_recorded_at)
+        from
+          app.pos_shifts shift
+        where
+          shift.opened_at <= '2026-10-22T10:00:00Z'::timestamptz
+      ),
+      request.prepared_at
+    )
+  ) + interval '1 second' as started_at
+from
+  app.stock_count_requests request
+where
+  request.request_id = 'd1900000-0000-4000-8000-000000000062';
+
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      started_at
+    from
+      count_cover_at
+  ),
+  finished_at = (
+    select
+      started_at + interval '1 minute'
+    from
+      count_cover_at
+  )
+where
+  status = 'ok';
+
+set
+  local role authenticated;
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000062',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '7'
+      ))
+    ))$$,
+    '22023',
+    'count time is inside a shift',
+    'a shift stored after prepare that contains the count time is refused once a run covers it'
+  );
+
+reset role;
+
+delete from app.pos_shifts
+where
+  id = 'shift-count-after-prepare';
+
+set
+  local role authenticated;
+
+select
+  lives_ok (
+    $$select app.record_opening_stock(
+      '2026-10-22T08:00:00Z',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000001',
+          'quantity', '10',
+          'unit', 'kg',
+          'unit_cost', '80',
+          'expected_base_unit', 'kg',
+          'expected_factor', '1'
+        ),
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000002',
+          'quantity', '4',
+          'unit', 'kg',
+          'unit_cost', '25',
+          'expected_base_unit', 'kg',
+          'expected_factor', '1'
+        ),
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000003',
+          'quantity', '2',
+          'unit', 'kg',
+          'unit_cost', '10',
+          'expected_base_unit', 'kg',
+          'expected_factor', '1'
+        ),
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000004',
+          'quantity', '5',
+          'unit', 'kg',
+          'unit_cost', '20',
+          'expected_base_unit', 'kg',
+          'expected_factor', '1'
+        )
+      ),
+      'e1900000-0000-4000-8000-000000000001'
+    )$$,
+    'opening stock is posted before the count'
+  );
+
+select
+  results_eq (
+    $$select item_id, on_hand_qty, on_hand_value, avg_cost
+      from app.item_balances
+      where item_id in (
+        'c1900000-0000-4000-8000-000000000001',
+        'c1900000-0000-4000-8000-000000000002',
+        'c1900000-0000-4000-8000-000000000003',
+        'c1900000-0000-4000-8000-000000000004'
+      )
+      order by item_id$$,
+    $$values
+      (
+        'c1900000-0000-4000-8000-000000000001'::uuid,
+        10::numeric(20, 6),
+        800.00::numeric(14, 2),
+        80::numeric(20, 6)
+      ),
+      (
+        'c1900000-0000-4000-8000-000000000002'::uuid,
+        4::numeric(20, 6),
+        100.00::numeric(14, 2),
+        25::numeric(20, 6)
+      ),
+      (
+        'c1900000-0000-4000-8000-000000000003'::uuid,
+        2::numeric(20, 6),
+        20.00::numeric(14, 2),
+        10::numeric(20, 6)
+      ),
+      (
+        'c1900000-0000-4000-8000-000000000004'::uuid,
+        5::numeric(20, 6),
+        100.00::numeric(14, 2),
+        20::numeric(20, 6)
+      )$$,
+    'opening stock sets on-hand, value, and average cost'
+  );
+
+select
+  throws_ok (
+    $$select pg_temp.cover_prepared_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-00000000001a',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T07:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '7'
+      ))
+    ))$$,
+    'P0001',
+    'back-dated movement not supported yet',
+    'a count earlier than the last movement is refused'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_movements where movement_type = 'count_adjustment'$$,
+    'refused counts post no count adjustment'
+  );
+
+-- The inside-shift request id was not stored, so it can succeed at the
+-- shift's close. That instant is outside the half-open shift.
+select
+  lives_ok (
+    $$select pg_temp.cover_prepared_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000010',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T09:30:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000003',
+        'counted_qty', '2'
+      ))
+    ))$$,
+    'a count exactly at a shift close is allowed when every delta is zero'
+  );
+
+select
+  is_empty (
+    $$select movement.batch_id
+      from app.stock_movements movement
+      join app.stock_counts counted on counted.id = movement.batch_id
+      where counted.request_id = 'd1900000-0000-4000-8000-000000000010'$$,
+    'an all-zero count id is not a ledger batch id'
+  );
+
+select
+  results_eq (
+    $$select line.counted_qty, line.expected_qty, line.delta_qty,
+            line.delta_value, line.movement_id is null
+      from app.stock_count_lines line
+      join app.stock_counts counted on counted.id = line.count_id
+      where counted.request_id = 'd1900000-0000-4000-8000-000000000010'$$,
+    $$values (
+      2::numeric(20, 6),
+      2::numeric(20, 6),
+      0::numeric(20, 6),
+      0.00::numeric(14, 2),
+      true
+    )$$,
+    'a zero line stores the locked on-hand and no movement'
+  );
+
+select
+  is (
+    (
+      select
+        created_by
+      from
+        app.stock_counts
+      where
+        request_id = 'd1900000-0000-4000-8000-000000000010'
+    ),
+    'b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f'::uuid,
+    'the owner is stored as created_by'
+  );
+
+-- ============================================================================
+-- Shortage, surplus, and a zero line in one batch.
+-- ============================================================================
+select
+  lives_ok (
+    $$select pg_temp.cover_prepared_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000030',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'note', '  جرد الصباح  ',
+      'lines', jsonb_build_array(
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000001',
+          'counted_qty', '7'
+        ),
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000002',
+          'counted_qty', '6'
+        ),
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000003',
+          'counted_qty', '2'
+        )
+      )
+    ))$$,
+    'a daily count with shortage, surplus, and a zero line is saved'
+  );
+
+select
+  is (
+    (
+      select
+        note
+      from
+        app.stock_counts
+      where
+        request_id = 'd1900000-0000-4000-8000-000000000030'
+    ),
+    'جرد الصباح',
+    'the count note is trimmed'
+  );
+
+select
+  is (
+    (
+      select
+        counted_at
+      from
+        app.stock_counts
+      where
+        request_id = 'd1900000-0000-4000-8000-000000000030'
+    ),
+    '2026-10-22T10:00:00Z'::timestamptz,
+    'counted_at is the observation time'
+  );
+
+select
+  results_eq (
+    $$select line.line_no, line.item_id, line.counted_qty, line.expected_qty,
+            line.delta_qty, line.delta_value, line.movement_id is null
+      from app.stock_count_lines line
+      join app.stock_counts counted on counted.id = line.count_id
+      where counted.request_id = 'd1900000-0000-4000-8000-000000000030'
+      order by line.line_no$$,
+    $$values
+      (
+        1,
+        'c1900000-0000-4000-8000-000000000001'::uuid,
+        7::numeric(20, 6),
+        10::numeric(20, 6),
+        -3::numeric(20, 6),
+        -240.00::numeric(14, 2),
+        false
+      ),
+      (
+        2,
+        'c1900000-0000-4000-8000-000000000002'::uuid,
+        6::numeric(20, 6),
+        4::numeric(20, 6),
+        2::numeric(20, 6),
+        50.00::numeric(14, 2),
+        false
+      ),
+      (
+        3,
+        'c1900000-0000-4000-8000-000000000003'::uuid,
+        2::numeric(20, 6),
+        2::numeric(20, 6),
+        0::numeric(20, 6),
+        0.00::numeric(14, 2),
+        true
+      )$$,
+    'lines store expected on-hand and the signed delta copied from the posting'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements movement
+      where
+        movement.batch_id = (
+          select
+            id
+          from
+            app.stock_counts
+          where
+            request_id = 'd1900000-0000-4000-8000-000000000030'
+        )
+        and movement.movement_type = 'count_adjustment'
+    ),
+    2::bigint,
+    'the non-zero count id is the one ledger batch'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements movement
+      where
+        movement.batch_id = (
+          select
+            id
+          from
+            app.stock_counts
+          where
+            request_id = 'd1900000-0000-4000-8000-000000000030'
+        )
+        and movement.movement_type <> 'count_adjustment'
+    ),
+    0::bigint,
+    'the count batch has no cost adjustment'
+  );
+
+select
+  results_eq (
+    $$select movement.item_id, movement.quantity, movement.unit_cost,
+            movement.total_cost, movement.shift_id, movement.note
+      from app.stock_movements movement
+      where movement.batch_id = (
+        select id
+        from app.stock_counts
+        where request_id = 'd1900000-0000-4000-8000-000000000030'
+      )
+      order by movement.item_id$$,
+    $$values
+      (
+        'c1900000-0000-4000-8000-000000000001'::uuid,
+        -3::numeric(20, 6),
+        80::numeric(20, 6),
+        -240.00::numeric(14, 2),
+        null::text,
+        null::text
+      ),
+      (
+        'c1900000-0000-4000-8000-000000000002'::uuid,
+        2::numeric(20, 6),
+        25::numeric(20, 6),
+        50.00::numeric(14, 2),
+        null::text,
+        null::text
+      )$$,
+    'shortage and surplus post as signed count adjustments with no shift or note'
+  );
+
+select
+  ok (
+    (
+      select
+        line.movement_id
+      from
+        app.stock_count_lines line
+        join app.stock_counts counted on counted.id = line.count_id
+      where
+        counted.request_id = 'd1900000-0000-4000-8000-000000000030'
+        and line.line_no = 1
+    ) = (
+      select
+        movement.id
+      from
+        app.stock_movements movement
+      where
+        movement.batch_id = (
+          select
+            id
+          from
+            app.stock_counts
+          where
+            request_id = 'd1900000-0000-4000-8000-000000000030'
+        )
+        and movement.item_id = 'c1900000-0000-4000-8000-000000000001'
+        and movement.movement_type = 'count_adjustment'
+    ),
+    'the shortage line points at its count adjustment'
+  );
+
+select
+  results_eq (
+    $$select item_id, on_hand_qty, on_hand_value, avg_cost
+      from app.item_balances
+      where item_id in (
+        'c1900000-0000-4000-8000-000000000001',
+        'c1900000-0000-4000-8000-000000000002',
+        'c1900000-0000-4000-8000-000000000003'
+      )
+      order by item_id$$,
+    $$values
+      (
+        'c1900000-0000-4000-8000-000000000001'::uuid,
+        7::numeric(20, 6),
+        560.00::numeric(14, 2),
+        80::numeric(20, 6)
+      ),
+      (
+        'c1900000-0000-4000-8000-000000000002'::uuid,
+        6::numeric(20, 6),
+        150.00::numeric(14, 2),
+        25::numeric(20, 6)
+      ),
+      (
+        'c1900000-0000-4000-8000-000000000003'::uuid,
+        2::numeric(20, 6),
+        20.00::numeric(14, 2),
+        10::numeric(20, 6)
+      )$$,
+    'balances follow the shortage, the surplus, and the unchanged line'
+  );
+
+select
+  results_eq (
+    $$select frequency, note, item_count, shortage_value, surplus_value, has_surplus
+      from app.stock_count_history
+      where id = (
+        select id
+        from app.stock_counts
+        where request_id = 'd1900000-0000-4000-8000-000000000030'
+      )$$,
+    $$values (
+      'daily'::text,
+      'جرد الصباح'::text,
+      3,
+      240.00::numeric(14, 2),
+      50.00::numeric(14, 2),
+      true
+    )$$,
+    'history sums shortage and surplus and flags the surplus'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000030',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'note',
+        '  جرد الصباح  ',
+        'ignored',
+        true,
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7.000000'
+          ),
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000002',
+            'counted_qty',
+            '6.000000'
+          ),
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000003',
+            'counted_qty',
+            '2.000000'
+          )
+        )
+      )
+    ),
+    jsonb_build_object(
+      'status',
+      'posted',
+      'count_id',
+      (
+        select
+          id
+        from
+          app.stock_counts
+        where
+          request_id = 'd1900000-0000-4000-8000-000000000030'
+      )
+    ),
+    'the same normalized payload replays the saved id'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_counts
+      where
+        request_id = 'd1900000-0000-4000-8000-000000000030'
+    ),
+    1::bigint,
+    'replay does not insert another count'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements
+      where
+        movement_type = 'count_adjustment'
+    ),
+    2::bigint,
+    'replay posts nothing'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000030',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'note', 'جرد الصباح',
+      'lines', jsonb_build_array(
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000002',
+          'counted_qty', '6'
+        ),
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000001',
+          'counted_qty', '7'
+        ),
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000003',
+          'counted_qty', '2'
+        )
+      )
+    ))$$,
+    '22023',
+    'request_id already used for a different count',
+    'the same request_id with reordered lines is refused'
+  );
+
+update app.stock_items
+set
+  active = false
+where
+  id = 'c1900000-0000-4000-8000-000000000001';
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000030',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'note',
+        'جرد الصباح',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7'
+          ),
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000002',
+            'counted_qty',
+            '6'
+          ),
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000003',
+            'counted_qty',
+            '2'
+          )
+        )
+      )
+    ),
+    jsonb_build_object(
+      'status',
+      'posted',
+      'count_id',
+      (
+        select
+          id
+        from
+          app.stock_counts
+        where
+          request_id = 'd1900000-0000-4000-8000-000000000030'
+      )
+    ),
+    'replay returns the saved id without reading the catalog'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000030',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'note', 'جرد الصباح',
+      'lines', jsonb_build_array(
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000001',
+          'counted_qty', '8'
+        ),
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000002',
+          'counted_qty', '6'
+        ),
+        jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000003',
+          'counted_qty', '2'
+        )
+      )
+    ))$$,
+    '22023',
+    'request_id already used for a different count',
+    'a different payload is refused before the inactive-item check'
+  );
+
+update app.stock_items
+set
+  active = true
+where
+  id = 'c1900000-0000-4000-8000-000000000001';
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements
+      where
+        movement_type = 'count_adjustment'
+    ),
+    2::bigint,
+    'a refused replay posts nothing'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.cover_prepared_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000032',
+      'frequency', 'weekly',
+      'counted_at', '2026-10-22T10:30:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000004',
+        'counted_qty', '4'
+      ))
+    ))$$,
+    'a weekly count of a weekly item is saved'
+  );
+
+select
+  results_eq (
+    $$select line.expected_qty, line.delta_qty, line.delta_value, counted.frequency
+      from app.stock_count_lines line
+      join app.stock_counts counted on counted.id = line.count_id
+      where counted.request_id = 'd1900000-0000-4000-8000-000000000032'$$,
+    $$values (
+      5::numeric(20, 6),
+      -1::numeric(20, 6),
+      -20.00::numeric(14, 2),
+      'weekly'::text
+    )$$,
+    'the weekly count stores its own frequency and the book shortage'
+  );
+
+select
+  results_eq (
+    $$select on_hand_qty, on_hand_value, avg_cost
+      from app.item_balances
+      where item_id = 'c1900000-0000-4000-8000-000000000004'$$,
+    $$values (
+      4::numeric(20, 6),
+      80.00::numeric(14, 2),
+      20::numeric(20, 6)
+    )$$,
+    'the weekly shortage reduces on-hand and keeps the average cost'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.cover_prepared_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000033',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:15:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000006',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    'a surplus on an item with no opening is saved at zero value'
+  );
+
+select
+  results_eq (
+    $$select line.expected_qty, line.delta_qty, line.delta_value,
+            line.movement_id is not null
+      from app.stock_count_lines line
+      join app.stock_counts counted on counted.id = line.count_id
+      where counted.request_id = 'd1900000-0000-4000-8000-000000000033'$$,
+    $$values (
+      0::numeric(20, 6),
+      1::numeric(20, 6),
+      0.00::numeric(14, 2),
+      true
+    )$$,
+    'a zero-value surplus still points at its movement'
+  );
+
+select
+  results_eq (
+    $$select shortage_value, surplus_value, has_surplus
+      from app.stock_count_history
+      where id = (
+        select id
+        from app.stock_counts
+        where request_id = 'd1900000-0000-4000-8000-000000000033'
+      )$$,
+    $$values (
+      0.00::numeric(14, 2),
+      0.00::numeric(14, 2),
+      true
+    )$$,
+    'history flags a surplus whose value is zero'
+  );
+
+select
+  results_eq (
+    $$select on_hand_qty, on_hand_value, avg_cost
+      from app.item_balances
+      where item_id = 'c1900000-0000-4000-8000-000000000006'$$,
+    $$values (
+      1::numeric(20, 6),
+      0.00::numeric(14, 2),
+      0::numeric(20, 6)
+    )$$,
+    'a zero-cost surplus leaves average cost at zero'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.cover_prepared_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000031',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T11:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '7'
+      ))
+    ))$$,
+    'a later count of the new on-hand is a zero delta'
+  );
+
+select
+  results_eq (
+    $$select line.expected_qty, line.counted_qty, line.delta_qty, line.movement_id is null
+      from app.stock_count_lines line
+      join app.stock_counts counted on counted.id = line.count_id
+      where counted.request_id = 'd1900000-0000-4000-8000-000000000031'$$,
+    $$values (
+      7::numeric(20, 6),
+      7::numeric(20, 6),
+      0::numeric(20, 6),
+      true
+    )$$,
+    'the later zero count stores the on-hand after the first count'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.cover_prepared_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000035',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T12:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000002',
+        'counted_qty', '6'
+      ))
+    ))$$,
+    'a count after the closed shift is covered when the newest ok run started after that close was recorded'
+  );
+
+-- A matching count posts no movement, so the watermark has to move on its own.
+-- Opening 10 at 08:00, count 10 at 10:00, then a loss at 09:00 must be refused.
+select
+  lives_ok (
+    $$select app.record_opening_stock(
+      '2026-10-22T08:00:00Z',
+      jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000008',
+        'quantity', '10',
+        'unit', 'kg',
+        'unit_cost', '40',
+        'expected_base_unit', 'kg',
+        'expected_factor', '1'
+      )),
+      'e1900000-0000-4000-8000-000000000002'
+    )$$,
+    'opening stock for the matching-count item'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.cover_prepared_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000050',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000008',
+        'counted_qty', '10'
+      ))
+    ))$$,
+    'a count that matches on-hand posts no movement'
+  );
+
+select
+  results_eq (
+    $$select line.delta_qty, line.movement_id is null
+      from app.stock_count_lines line
+      join app.stock_counts counted on counted.id = line.count_id
+      where counted.request_id = 'd1900000-0000-4000-8000-000000000050'$$,
+    $$values (0::numeric(20, 6), true)$$,
+    'the matching count stores a zero delta and no movement'
+  );
+
+select
+  is (
+    (
+      select
+        last_occurred_at
+      from
+        app.item_balances
+      where
+        item_id = 'c1900000-0000-4000-8000-000000000008'
+    ),
+    '2026-10-22T10:00:00Z'::timestamptz + interval '1 microsecond',
+    'a zero-delta count moves the watermark just after the count time'
+  );
+
+select
+  throws_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'c1900000-0000-4000-8000-000000000008',
+      'movement_type', 'waste',
+      'occurred_at', '2026-10-22T09:00:00Z',
+      'quantity', '1'
+    )))$$,
+    'P0001',
+    'back-dated movement not supported yet',
+    'a loss before a later matching count is refused'
+  );
+
+select
+  results_eq (
+    $$select on_hand_qty, last_occurred_at
+      from app.item_balances
+      where item_id = 'c1900000-0000-4000-8000-000000000008'$$,
+    $$values (10::numeric(20, 6), '2026-10-22T10:00:00Z'::timestamptz + interval '1 microsecond')$$,
+    'the refused loss leaves the counted quantity and the watermark'
+  );
+
+-- An item with no movements still gets a balance row from the lock. Counting
+-- it at zero must stamp counted_at so an earlier movement is refused.
+select
+  lives_ok (
+    $$select pg_temp.cover_prepared_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000051',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:20:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000009',
+        'counted_qty', '0'
+      ))
+    ))$$,
+    'a never-moved item can be counted at zero'
+  );
+
+select
+  is (
+    (
+      select
+        last_occurred_at
+      from
+        app.item_balances
+      where
+        item_id = 'c1900000-0000-4000-8000-000000000009'
+    ),
+    '2026-10-22T10:20:00Z'::timestamptz + interval '1 microsecond',
+    'counting a never-moved item at zero sets the watermark just after the count'
+  );
+
+select
+  throws_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'c1900000-0000-4000-8000-000000000009',
+      'movement_type', 'waste',
+      'occurred_at', '2026-10-22T09:00:00Z',
+      'quantity', '1'
+    )))$$,
+    'P0001',
+    'back-dated movement not supported yet',
+    'a movement before a zero count of a never-moved item is refused'
+  );
+
+select
+  is_empty (
+    $$select id
+      from app.stock_movements
+      where item_id = 'c1900000-0000-4000-8000-000000000009'$$,
+    'the zero count and the refused movement post nothing'
+  );
+
+-- Equal-time barrier. Opening 10, count 9, then a sale at exactly counted_at
+-- must be refused. The watermark is one microsecond past the count because
+-- the ledger only refuses occurred_at < last_occurred_at.
+select
+  lives_ok (
+    $$select app.record_opening_stock(
+      '2026-10-22T08:00:00Z',
+      jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000010',
+        'quantity', '10',
+        'unit', 'kg',
+        'unit_cost', '30',
+        'expected_base_unit', 'kg',
+        'expected_factor', '1'
+      )),
+      'e1900000-0000-4000-8000-000000000010'
+    )$$,
+    'opening stock for the equal-time barrier item'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000070',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000010',
+            'counted_qty',
+            '9'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'the barrier count waits until a run starts after the submit'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000070',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000010',
+            'counted_qty',
+            '9'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'the barrier count stays waiting before that run'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_counts where request_id = 'd1900000-0000-4000-8000-000000000070'$$,
+    'the barrier count has not posted yet'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_count_pending
+      where
+        request_id = 'd1900000-0000-4000-8000-000000000070'
+    ),
+    1::bigint,
+    'the pending view lists the barrier count before it posts'
+  );
+
+reset role;
+
+create temporary table count_barrier_cover on
+commit
+drop as
+select
+  greatest(
+    request.prepared_at,
+    coalesce(
+      (
+        select
+          pg_catalog.max (shift.close_recorded_at)
+        from
+          app.pos_shifts shift
+        where
+          shift.opened_at <= '2026-10-22T10:00:00Z'::timestamptz
+      ),
+      request.prepared_at
+    )
+  ) + interval '1 second' as started_at
+from
+  app.stock_count_requests request
+where
+  request.request_id = 'd1900000-0000-4000-8000-000000000070';
+
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      started_at
+    from
+      count_barrier_cover
+  ),
+  finished_at = (
+    select
+      started_at + interval '1 minute'
+    from
+      count_barrier_cover
+  )
+where
+  status = 'ok';
+
+set
+  local role authenticated;
+
+-- The post writes the row this assertion reads. Run it first. Argument order
+-- inside is() is not guaranteed, so the id lookup must not share that statement.
+create temporary table count_barrier_posted on
+commit
+drop as
+select
+  app.record_count (
+    jsonb_build_object(
+      'request_id',
+      'd1900000-0000-4000-8000-000000000070',
+      'frequency',
+      'daily',
+      'counted_at',
+      '2026-10-22T10:00:00Z',
+      'lines',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          'c1900000-0000-4000-8000-000000000010',
+          'counted_qty',
+          '9'
+        )
+      )
+    )
+  ) as result;
+
+select
+  is (
+    (
+      select
+        result
+      from
+        count_barrier_posted
+    ),
+    jsonb_build_object(
+      'status',
+      'posted',
+      'count_id',
+      (
+        select
+          id
+        from
+          app.stock_counts
+        where
+          request_id = 'd1900000-0000-4000-8000-000000000070'
+      )
+    ),
+    'a run that started after prepared_at and after the close stamps posts the count'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000070',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000010',
+            'counted_qty',
+            '9'
+          )
+        )
+      )
+    ),
+    jsonb_build_object(
+      'status',
+      'posted',
+      'count_id',
+      (
+        select
+          id
+        from
+          app.stock_counts
+        where
+          request_id = 'd1900000-0000-4000-8000-000000000070'
+      )
+    ),
+    'replay after posting returns the same id'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements
+      where
+        item_id = 'c1900000-0000-4000-8000-000000000010'
+        and movement_type = 'count_adjustment'
+    ),
+    1::bigint,
+    'replay after posting adds no movement'
+  );
+
+select
+  is_empty (
+    $$select request_id from app.stock_count_pending where request_id = 'd1900000-0000-4000-8000-000000000070'$$,
+    'a posted count leaves the pending view'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000070',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000010',
+        'counted_qty', '8'
+      ))
+    ))$$,
+    '22023',
+    'request_id already used for a different count',
+    'the same request_id with a different payload is refused after posting'
+  );
+
+select
+  throws_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'c1900000-0000-4000-8000-000000000010',
+      'movement_type', 'sale',
+      'occurred_at', '2026-10-22T10:00:00Z',
+      'quantity', '1'
+    )))$$,
+    'P0001',
+    'back-dated movement not supported yet',
+    'a late sale at exactly the count time is refused'
+  );
+
+select
+  results_eq (
+    $$select on_hand_qty, last_occurred_at
+      from app.item_balances
+      where item_id = 'c1900000-0000-4000-8000-000000000010'$$,
+    $$values (
+      9::numeric(20, 6),
+      '2026-10-22T10:00:00Z'::timestamptz + interval '1 microsecond'
+    )$$,
+    'the refused sale leaves the counted quantity and the watermark just after the count'
+  );
+
+-- A newer ok run with no finish cannot prove coverage, even though it started
+-- after the shift close was recorded. Delete it afterwards as the table owner
+-- so later counts still see the finished ok run.
+reset role;
+
+insert into
+  app.pos_sync_runs (mode, status, started_at, finished_at)
+select
+  'recent',
+  'ok',
+  shift.close_recorded_at + interval '2 seconds',
+  null
+from
+  app.pos_shifts shift
+where
+  shift.id = 'shift-count-closed';
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000036',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T11:40:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000003',
+            'counted_qty',
+            '2'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'an unfinished ok run leaves the count waiting'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_counts where request_id = 'd1900000-0000-4000-8000-000000000036'$$,
+    'an unfinished ok run posts nothing'
+  );
+
+delete from app.pos_sync_runs
+where
+  status = 'ok'
+  and finished_at is null;
+
+set
+  local role authenticated;
+
+select
+  lives_ok (
+    $$select pg_temp.cover_prepared_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000034',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T11:30:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000003',
+        'counted_qty', '0'
+      ))
+    ))$$,
+    'counting an item down to zero posts the whole book value'
+  );
+
+select
+  results_eq (
+    $$select line.delta_qty, line.delta_value
+      from app.stock_count_lines line
+      join app.stock_counts counted on counted.id = line.count_id
+      where counted.request_id = 'd1900000-0000-4000-8000-000000000034'$$,
+    $$values (
+      -2::numeric(20, 6),
+      -20.00::numeric(14, 2)
+    )$$,
+    'full depletion stores the whole on-hand value'
+  );
+
+select
+  results_eq (
+    $$select on_hand_qty, on_hand_value, avg_cost
+      from app.item_balances
+      where item_id = 'c1900000-0000-4000-8000-000000000003'$$,
+    $$values (
+      0::numeric(20, 6),
+      0.00::numeric(14, 2),
+      10::numeric(20, 6)
+    )$$,
+    'full depletion zeroes quantity and value and keeps the average cost'
+  );
+
+select
+  throws_ok (
+    $$insert into app.stock_counts (
+      id, request_id, frequency, counted_at
+    ) values (
+      gen_random_uuid(),
+      gen_random_uuid(),
+      'daily',
+      '2026-10-22T10:00:00Z'
+    )$$,
+    '42501',
+    null::text,
+    'the owner cannot insert a count directly'
+  );
+
+-- ============================================================================
+-- RLS
+-- ============================================================================
+select
+  set_config(
+    'request.jwt.claims',
+    jsonb_build_object(
+      'sub',
+      'c4e8a1b2-6d70-4f11-8a22-2b3c4d5e6f70',
+      'role',
+      'authenticated'
+    )::text,
+    true
+  );
+
+set
+  local role authenticated;
+
+select
+  throws_ok (
+    $$select app.record_count('{}'::jsonb)$$,
+    '42501',
+    'insufficient_privilege',
+    'a non-owner cannot record a count'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_counts$$,
+    'a non-owner cannot read counts'
+  );
+
+select
+  is_empty (
+    $$select count_id from app.stock_count_lines$$,
+    'a non-owner cannot read count lines'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_count_history$$,
+    'a non-owner cannot read count history'
+  );
+
+select
+  is_empty (
+    $$select request_id from app.stock_count_requests$$,
+    'a non-owner cannot read count requests'
+  );
+
+select
+  is_empty (
+    $$select request_id from app.stock_count_pending$$,
+    'a non-owner cannot read pending counts'
+  );
+
+reset role;
+
+set
+  local role anon;
+
+select
+  throws_ok (
+    $$select app.record_count('{}'::jsonb)$$,
+    '42501',
+    null::text,
+    'anon cannot execute record_count'
+  );
+
+select
+  throws_ok (
+    $$select id from app.stock_counts$$,
+    '42501',
+    null::text,
+    'anon cannot read counts'
+  );
+
+select
+  throws_ok (
+    $$select count_id from app.stock_count_lines$$,
+    '42501',
+    null::text,
+    'anon cannot read count lines'
+  );
+
+select
+  throws_ok (
+    $$select id from app.stock_count_history$$,
+    '42501',
+    null::text,
+    'anon cannot read count history'
+  );
+
+select
+  throws_ok (
+    $$select request_id from app.stock_count_requests$$,
+    '42501',
+    null::text,
+    'anon cannot read count requests'
+  );
+
+select
+  throws_ok (
+    $$select request_id from app.stock_count_pending$$,
+    '42501',
+    null::text,
+    'anon cannot read pending counts'
+  );
+
+reset role;
+
+-- ============================================================================
+-- Append-only even for the table owner, then service_role
+-- ============================================================================
+select
+  throws_ok (
+    $$update app.stock_counts set note = 'x'$$,
+    '55000',
+    'app.stock_counts is append-only; UPDATE is not allowed',
+    'append-only trigger blocks count updates'
+  );
+
+select
+  throws_ok (
+    $$delete from app.stock_counts$$,
+    '55000',
+    'app.stock_counts is append-only; DELETE is not allowed',
+    'append-only trigger blocks count deletes'
+  );
+
+select
+  throws_ok (
+    $$truncate app.stock_counts cascade$$,
+    '55000',
+    'app.stock_counts is append-only; TRUNCATE is not allowed',
+    'append-only trigger blocks count truncate'
+  );
+
+select
+  throws_ok (
+    $$update app.stock_count_lines set counted_qty = 1$$,
+    '55000',
+    'app.stock_count_lines is append-only; UPDATE is not allowed',
+    'append-only trigger blocks count line updates'
+  );
+
+select
+  throws_ok (
+    $$delete from app.stock_count_lines$$,
+    '55000',
+    'app.stock_count_lines is append-only; DELETE is not allowed',
+    'append-only trigger blocks count line deletes'
+  );
+
+select
+  throws_ok (
+    $$truncate app.stock_count_lines$$,
+    '55000',
+    'app.stock_count_lines is append-only; TRUNCATE is not allowed',
+    'append-only trigger blocks count line truncate'
+  );
+
+select
+  throws_ok (
+    $$update app.stock_count_requests set payload = '{}'::jsonb$$,
+    '55000',
+    'app.stock_count_requests is append-only; UPDATE is not allowed',
+    'append-only trigger blocks count request updates'
+  );
+
+select
+  throws_ok (
+    $$delete from app.stock_count_requests$$,
+    '55000',
+    'app.stock_count_requests is append-only; DELETE is not allowed',
+    'append-only trigger blocks count request deletes'
+  );
+
+select
+  throws_ok (
+    $$truncate app.stock_count_requests cascade$$,
+    '55000',
+    'app.stock_count_requests is append-only; TRUNCATE is not allowed',
+    'append-only trigger blocks count request truncate'
+  );
+
+select
+  set_config(
+    'request.jwt.claims',
+    jsonb_build_object('role', 'service_role')::text,
+    true
+  );
+
+set
+  local role service_role;
+
+-- Item 002's count at 12:00 moved last_occurred_at to one microsecond past
+-- 12:00. A second count at that same instant is now back-dated. One second
+-- later is still a zero delta and still inside the covered window.
+select
+  lives_ok (
+    $$select pg_temp.cover_prepared_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000037',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T12:00:01Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000002',
+        'counted_qty', '6'
+      ))
+    ))$$,
+    'service_role can record a zero count'
+  );
+
+select
+  ok (
+    (
+      select
+        created_by is null
+      from
+        app.stock_counts
+      where
+        request_id = 'd1900000-0000-4000-8000-000000000037'
+    ),
+    'service_role with no sub stores a null created_by'
+  );
+
+select
+  is_empty (
+    $$select movement.batch_id
+      from app.stock_movements movement
+      join app.stock_counts counted on counted.id = movement.batch_id
+      where counted.request_id = 'd1900000-0000-4000-8000-000000000037'$$,
+    'the service_role zero count posts no movement'
+  );
+
+reset role;
+
+-- The newest ok run now starts before the close was recorded. A later failed
+-- run starts after that stamp. Coverage follows the newest ok row, so the
+-- count stays waiting. Deleting the ok rows leaves the same request waiting.
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      pg_catalog.max (close_recorded_at) - interval '1 second'
+    from
+      app.pos_shifts
+  )
+where
+  status = 'ok';
+
+insert into
+  app.pos_sync_runs (mode, status, started_at, finished_at, error)
+select
+  'recent',
+  'failed',
+  shift.close_recorded_at + interval '1 minute',
+  shift.close_recorded_at + interval '2 minutes',
+  'synthetic failed run'
+from
+  app.pos_shifts shift
+where
+  shift.id = 'shift-count-closed';
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000056',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a later failed run does not cover a count when the newest ok run started before the close was recorded'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_counts where request_id = 'd1900000-0000-4000-8000-000000000056'$$,
+    'an uncovered count posts nothing'
+  );
+
+delete from app.pos_sync_runs
+where
+  status = 'ok';
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000056',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'the same count stays waiting when no ok sync run exists'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000039',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000001',
+            'counted_qty',
+            '7'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a new count stays waiting when no ok sync run exists'
+  );
+
+-- A 14-digit, 6-decimal quantity is stored as exact text. JavaScript would
+-- turn the JSON number 12345678901234.123456 into 12345678901234.123, and
+-- the resend would be refused. Both replay paths compare that same text.
+select
+  set_config(
+    'request.jwt.claims',
+    jsonb_build_object(
+      'sub',
+      'b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f',
+      'role',
+      'authenticated'
+    )::text,
+    true
+  );
+
+set
+  local role authenticated;
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000080',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T12:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000009',
+            'counted_qty',
+            '12345678901234.123456'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a 14-digit, 6-decimal quantity prepares'
+  );
+
+select
+  is (
+    (
+      select
+        request.payload -> 'lines' -> 0
+      from
+        app.stock_count_requests request
+      where
+        request.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    jsonb_build_object(
+      'item_id',
+      'c1900000-0000-4000-8000-000000000009',
+      'counted_qty',
+      '12345678901234.123456'
+    ),
+    'the stored quantity is the exact decimal text, not a JSON number'
+  );
+
+select
+  is (
+    (
+      select
+        pending.payload -> 'lines' -> 0 ->> 'counted_qty'
+      from
+        app.stock_count_pending pending
+      where
+        pending.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    '12345678901234.123456',
+    'the pending view returns the exact quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      (
+        select
+          request.payload
+        from
+          app.stock_count_requests request
+        where
+          request.request_id = 'd1900000-0000-4000-8000-000000000080'
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'the prepare replay accepts the stored quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000080',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T12:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000009',
+            'counted_qty',
+            '012345678901234.123456'
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'the prepare replay matches a leading zero to the same quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000080',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T12:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000009',
+            'counted_qty',
+            '12345678901234.123456'::numeric
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'the prepare replay matches the same quantity sent as a JSON number'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000080',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T12:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000009',
+        'counted_qty', '12345678901234.123455'
+      ))
+    ))$$,
+    '22023',
+    'request_id already used for a different count',
+    'the prepare replay refuses a different 14-digit quantity'
+  );
+
+select
+  is (
+    (
+      pg_temp.cover_prepared_count (
+        (
+          select
+            request.payload
+          from
+            app.stock_count_requests request
+          where
+            request.request_id = 'd1900000-0000-4000-8000-000000000080'
+        )
+      )
+    ) ->> 'status',
+    'posted',
+    'the stored 14-digit quantity posts after a covering sync'
+  );
+
+select
+  is (
+    (
+      select
+        line.counted_qty::text
+      from
+        app.stock_count_lines line
+        join app.stock_counts counted on counted.id = line.count_id
+      where
+        counted.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    (
+      select
+        request.payload -> 'lines' -> 0 ->> 'counted_qty'
+      from
+        app.stock_count_requests request
+      where
+        request.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    'the posted line and the stored payload use the same quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      (
+        select
+          request.payload
+        from
+          app.stock_count_requests request
+        where
+          request.request_id = 'd1900000-0000-4000-8000-000000000080'
+      )
+    ),
+    (
+      select
+        jsonb_build_object('status', 'posted', 'count_id', counted.id)
+      from
+        app.stock_counts counted
+      where
+        counted.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    'the posted replay accepts the stored quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000080',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T12:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000009',
+            'counted_qty',
+            '012345678901234.123456'
+          )
+        )
+      )
+    ),
+    (
+      select
+        jsonb_build_object('status', 'posted', 'count_id', counted.id)
+      from
+        app.stock_counts counted
+      where
+        counted.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    'the posted replay matches a leading zero to the same quantity text'
+  );
+
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000080',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T12:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000009',
+            'counted_qty',
+            '12345678901234.123456'::numeric
+          )
+        )
+      )
+    ),
+    (
+      select
+        jsonb_build_object('status', 'posted', 'count_id', counted.id)
+      from
+        app.stock_counts counted
+      where
+        counted.request_id = 'd1900000-0000-4000-8000-000000000080'
+    ),
+    'the posted replay matches the same quantity sent as a JSON number'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000080',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T12:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000009',
+        'counted_qty', '12345678901234.123455'
+      ))
+    ))$$,
+    '22023',
+    'request_id already used for a different count',
+    'the posted replay refuses a different 14-digit quantity'
+  );
+
+select
+  *
+from
+  finish ();
+
+rollback;

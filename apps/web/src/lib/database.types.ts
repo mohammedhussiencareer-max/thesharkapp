@@ -227,14 +227,14 @@ isOneToOne: false
                   ]
                 },"pos_shifts": {
                   Row: {
-                    "closed_at": string | null,"drawer_cash_net": number | null,"drawer_credit": number | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at": string
+                    "close_recorded_at": string | null,"closed_at": string | null,"drawer_cash_net": number | null,"drawer_credit": number | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at": string
                   }
                   ComputedFields: never
                   Insert: {
-                    "closed_at"?: string | null,"drawer_cash_net"?: number | null,"drawer_credit"?: number | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at"?: string
+                    "close_recorded_at"?: string | null,"closed_at"?: string | null,"drawer_cash_net"?: number | null,"drawer_credit"?: number | null,"id": string,"is_active": boolean,"opened_at": string,"pos_update_time": string,"synced_at"?: string
                   }
                   Update: {
-                    "closed_at"?: string | null,"drawer_cash_net"?: number | null,"drawer_credit"?: number | null,"id"?: string,"is_active"?: boolean,"opened_at"?: string,"pos_update_time"?: string,"synced_at"?: string
+                    "close_recorded_at"?: string | null,"closed_at"?: string | null,"drawer_cash_net"?: number | null,"drawer_credit"?: number | null,"id"?: string,"is_active"?: boolean,"opened_at"?: string,"pos_update_time"?: string,"synced_at"?: string
                   }
                   Relationships: [
                     
@@ -397,6 +397,72 @@ isOneToOne: false
       referencedColumns: ["id"]
     }
                   ]
+                },"stock_count_lines": {
+                  Row: {
+                    "count_id": string,"counted_qty": number,"delta_qty": number,"delta_value": number,"expected_qty": number,"item_id": string,"line_no": number,"movement_id": number | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "count_id": string,"counted_qty": number,"delta_qty": number,"delta_value": number,"expected_qty": number,"item_id": string,"line_no": number,"movement_id"?: number | null
+                  }
+                  Update: {
+                    "count_id"?: string,"counted_qty"?: number,"delta_qty"?: number,"delta_value"?: number,"expected_qty"?: number,"item_id"?: string,"line_no"?: number,"movement_id"?: number | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "stock_count_lines_count_id_fkey"
+      columns: ["count_id"]
+isOneToOne: false
+      referencedRelation: "stock_count_history"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "stock_count_lines_count_id_fkey"
+      columns: ["count_id"]
+isOneToOne: false
+      referencedRelation: "stock_counts"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "stock_count_lines_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "stock_count_lines_movement_id_fkey"
+      columns: ["movement_id"]
+isOneToOne: false
+      referencedRelation: "stock_movements"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"stock_count_requests": {
+                  Row: {
+                    "created_by": string | null,"payload": NonNullable<Json>,"prepared_at": string,"request_id": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_by"?: string | null,"payload": NonNullable<Json>,"prepared_at": string,"request_id": string
+                  }
+                  Update: {
+                    "created_by"?: string | null,"payload"?: NonNullable<Json>,"prepared_at"?: string,"request_id"?: string
+                  }
+                  Relationships: [
+                    
+                  ]
+                },"stock_counts": {
+                  Row: {
+                    "counted_at": string,"created_at": string,"created_by": string | null,"frequency": string,"id": string,"note": string | null,"request_id": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "counted_at": string,"created_at"?: string,"created_by"?: string | null,"frequency": string,"id": string,"note"?: string | null,"request_id": string
+                  }
+                  Update: {
+                    "counted_at"?: string,"created_at"?: string,"created_by"?: string | null,"frequency"?: string,"id"?: string,"note"?: string | null,"request_id"?: string
+                  }
+                  Relationships: [
+                    
+                  ]
                 },"stock_items": {
                   Row: {
                     "active": boolean,"base_unit": string,"count_frequency": string,"created_at": string,"id": string,"kind": string,"loss_pct": number,"name": string,"parent_item_id": string | null
@@ -481,6 +547,28 @@ isOneToOne: false
       referencedRelation: "stock_items"
       referencedColumns: ["id"]
     }
+                  ]
+                },"stock_count_history": {
+                  Row: {
+                    "counted_at": string | null,"created_at": string | null,"frequency": string | null,"has_surplus": boolean | null,"id": string | null,"item_count": number | null,"note": string | null,"shortage_value": number | null,"surplus_value": number | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    
+                  ]
+                },"stock_count_pending": {
+                  Row: {
+                    "counted_at": string | null,"created_by": string | null,"frequency": string | null,"item_count": number | null,"note": string | null,"payload": Json | null,"prepared_at": string | null,"request_id": string | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                           "counted_at"?: never,"created_by"?: string | null,"frequency"?: never,"item_count"?: never,"note"?: never,"payload"?: Json | null,"prepared_at"?: string | null,"request_id"?: string | null
+                         }
+                        Update: {
+                           "counted_at"?: never,"created_by"?: string | null,"frequency"?: never,"item_count"?: never,"note"?: never,"payload"?: Json | null,"prepared_at"?: string | null,"request_id"?: string | null
+                         }
+                        Relationships: [
+                    
                   ]
                 }
           }
@@ -568,6 +656,9 @@ isOneToOne: false
                            },
 "post_sort":
 { Args: { "p_mixed_item": string,"p_occurred_at": string,"p_qty_taken": number,"p_shift_id"?: string,"p_sizes": Json }; Returns: string
+                           },
+"record_count":
+{ Args: { "p_count": Json }; Returns: Json
                            },
 "record_opening_stock":
 { Args: { "p_lines": Json,"p_occurred_at": string,"p_request_id": string }; Returns: string
