@@ -1,5 +1,6 @@
 import { useId, useState, type FormEvent } from 'react';
 import { driverPay } from '@/expenses/amount';
+import { pendingResendMessage } from '@/expenses/errors';
 import { fieldClass, kindLabels } from '@/expenses/labels';
 import {
   isMonthlyKind,
@@ -21,6 +22,7 @@ export function ExpenseForm({
   month,
   disabled,
   serverError,
+  pending = null,
   onMonthChange,
   onSubmit,
 }: {
@@ -28,14 +30,20 @@ export function ExpenseForm({
   month: string;
   disabled: boolean;
   serverError: string | null;
+  /** Set only after an unknown outcome. Null when the save was not sent or was refused. */
+  pending?: ExpenseDraft | null;
   onMonthChange: (month: string) => void;
   onSubmit: (draft: ExpenseDraft) => void;
 }) {
   const amountErrorId = useId();
   const headingId = useId();
+  // Reused after a definite refusal, because that attempt was not stored.
+  // An unknown outcome resends `pending` with this same id. A confirmed
+  // save remounts the form and mints a new id.
   const [requestId] = useState(() => crypto.randomUUID());
   const [values, setValues] = useState<ExpenseFormValues>(emptyExpenseForm);
   const [errors, setErrors] = useState<ExpenseFormErrors>({});
+  const locked = pending !== null;
   const category =
     categories.find((row) => row.id === values.categoryId) ?? null;
   const kind = category?.kind ?? null;
@@ -48,6 +56,7 @@ export function ExpenseForm({
     : undefined;
 
   function change(patch: Partial<ExpenseFormValues>) {
+    if (locked) return;
     setValues((current) => ({ ...current, ...patch }));
     setErrors({});
   }
@@ -55,6 +64,10 @@ export function ExpenseForm({
   function onSubmitForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (disabled) return;
+    if (pending) {
+      onSubmit(pending);
+      return;
+    }
     const result = validateExpenseForm(values, { categories, month });
     if (!result.ok) {
       setErrors(result.errors);
@@ -79,7 +92,7 @@ export function ExpenseForm({
         <select
           className={fieldClass}
           value={values.categoryId}
-          disabled={disabled}
+          disabled={disabled || locked}
           onChange={(event) => change({ categoryId: event.target.value })}
         >
           <option value="">اختار التصنيف</option>
@@ -101,8 +114,11 @@ export function ExpenseForm({
             className={fieldClass}
             type="month"
             value={month}
-            disabled={disabled}
-            onChange={(event) => onMonthChange(event.target.value)}
+            disabled={disabled || locked}
+            onChange={(event) => {
+              if (locked) return;
+              onMonthChange(event.target.value);
+            }}
           />
         </label>
       ) : null}
@@ -117,6 +133,7 @@ export function ExpenseForm({
             min={monthEnd ? `${month}-01` : undefined}
             max={monthEnd}
             disabled={disabled}
+            readOnly={locked}
             onChange={(event) => change({ date: event.target.value })}
           />
         </label>
@@ -132,6 +149,7 @@ export function ExpenseForm({
               autoComplete="off"
               value={values.hours}
               disabled={disabled}
+              readOnly={locked}
               onChange={(event) => change({ hours: event.target.value })}
             />
           </label>
@@ -144,6 +162,7 @@ export function ExpenseForm({
               autoComplete="off"
               value={values.hourlyRate}
               disabled={disabled}
+              readOnly={locked}
               onChange={(event) => change({ hourlyRate: event.target.value })}
             />
           </label>
@@ -155,6 +174,7 @@ export function ExpenseForm({
               autoComplete="off"
               value={values.driverLabel}
               disabled={disabled}
+              readOnly={locked}
               onChange={(event) => change({ driverLabel: event.target.value })}
             />
           </label>
@@ -177,6 +197,7 @@ export function ExpenseForm({
               aria-describedby={errors.amount ? amountErrorId : undefined}
               value={values.amount}
               disabled={disabled}
+              readOnly={locked}
               onChange={(event) => change({ amount: event.target.value })}
             />
           </label>
@@ -191,7 +212,7 @@ export function ExpenseForm({
         <input
           type="checkbox"
           checked={values.isEstimate}
-          disabled={disabled}
+          disabled={disabled || locked}
           onChange={(event) => change({ isEstimate: event.target.checked })}
         />
         تقدير
@@ -203,6 +224,7 @@ export function ExpenseForm({
           type="date"
           value={values.paidOn}
           disabled={disabled}
+          readOnly={locked}
           onChange={(event) => change({ paidOn: event.target.value })}
         />
       </label>
@@ -214,10 +236,12 @@ export function ExpenseForm({
           rows={3}
           value={values.note}
           disabled={disabled}
+          readOnly={locked}
           onChange={(event) => change({ note: event.target.value })}
         />
       </label>
       {errors.note ? <p role="alert">{errors.note}</p> : null}
+      {pending ? <p>{pendingResendMessage}</p> : null}
       <button className={primaryButton} type="submit" disabled={disabled}>
         حفظ المصروف
       </button>

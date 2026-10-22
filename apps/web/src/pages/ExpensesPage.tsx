@@ -13,11 +13,49 @@ import {
 import { CategoryManager } from '@/expenses/CategoryManager';
 import { ExpenseForm } from '@/expenses/ExpenseForm';
 import { ExpenseList } from '@/expenses/ExpenseList';
+import {
+  isPayloadRefusal,
+  isUnknownOutcome,
+  mapExpenseError,
+  retrySafeMessage,
+} from '@/expenses/errors';
 import type { ExpenseDraft, ExpenseKind, ExpenseMonth } from '@/expenses/types';
 import { fieldClass } from '@/expenses/labels';
 import { messageFrom } from '@/items/errors';
 import { cairoMonthInput, formatCairo, formatMonth } from '@/lib/cairo';
 import { pageShell, secondaryButton } from '@/lib/page-style';
+
+type VoidAttempt = { requestId: string; reason: string };
+
+type WriteResult = {
+  saved: boolean;
+  /** Null when the write was stored or was not sent. */
+  error: unknown;
+};
+
+function reportedExpenseError(error: unknown): string {
+  if (error instanceof Error && error.message.trim() !== '') {
+    return error.message;
+  }
+  if (isUnknownOutcome(error)) return retrySafeMessage;
+  return mapExpenseError(error);
+}
+
+/**
+ * A pin stays until this exact payload succeeds or the same replay is refused
+ * by a rule the payload itself breaks. A permission or contention error can
+ * fire before the server's request_id replay, so it leaves the original
+ * unknown and keeps the pin. The first attempt pins only an unknown outcome.
+ */
+function pinnedAfter<T>(
+  current: T | null,
+  attempt: T,
+  error: unknown,
+): T | null {
+  if (current && current !== attempt) return current;
+  if (current) return isPayloadRefusal(error) ? null : current;
+  return isUnknownOutcome(error) ? attempt : null;
+}
 
 export function ExpensesPage() {
   const initialMonth = cairoMonthInput();
@@ -33,10 +71,16 @@ export function ExpensesPage() {
   const [readLoads, setReadLoads] = useState(0);
   const [loadId, setLoadId] = useState(0);
   const [formEpoch, setFormEpoch] = useState(0);
+  const [pendingExpense, setPendingExpense] = useState<ExpenseDraft | null>(
+    null,
+  );
   const [pendingVoids, setPendingVoids] = useState<
-    ReadonlyMap<string, { requestId: string; reason: string }>
+    ReadonlyMap<string, VoidAttempt>
   >(new Map());
   const pendingVoidsRef = useRef(pendingVoids);
+  // Ids of voids that were sent and refused. A refusal is not stored, so a
+  // correction reuses the id. Cleared once that void succeeds.
+  const voidRequestIdsRef = useRef(new Map<string, string>());
   const seqRef = useRef(0);
   const readsRef = useRef(0);
   const savingRef = useRef(false);
@@ -100,14 +144,15 @@ export function ExpensesPage() {
   async function runWrite(
     action: () => Promise<void>,
     setError: (message: string | null) => void,
-  ): Promise<boolean> {
+  ): Promise<WriteResult> {
     if (savingRef.current || needsReloadRef.current || readsRef.current > 0) {
-      return false;
+      return { saved: false, error: null };
     }
     savingRef.current = true;
     setSaving(true);
     setError(null);
     let saved = false;
+    let failure: unknown = null;
     try {
       await action();
       saved = true;
@@ -127,17 +172,70 @@ export function ExpensesPage() {
         setLoadError(messageFrom(error));
       }
     } catch (error) {
-      if (!saved) setError(messageFrom(error));
+      if (!saved) {
+        failure = error;
+        setError(messageFrom(error));
+      }
     } finally {
       savingRef.current = false;
       setSaving(false);
     }
-    return saved;
+    return { saved, error: failure };
+  }
+
+  function clearVoidPin(id: string) {
+    voidRequestIdsRef.current.delete(id);
+    if (!pendingVoidsRef.current.has(id)) return;
+    const done = new Map(pendingVoidsRef.current);
+    done.delete(id);
+    pendingVoidsRef.current = done;
+    setPendingVoids(done);
+  }
+
+  function applyVoidPin(id: string, next: VoidAttempt | null) {
+    const current = pendingVoidsRef.current.get(id) ?? null;
+    if (next === current) return;
+    const updated = new Map(pendingVoidsRef.current);
+    if (next) updated.set(id, next);
+    else updated.delete(id);
+    pendingVoidsRef.current = updated;
+    setPendingVoids(updated);
   }
 
   async function submitExpense(draft: ExpenseDraft) {
-    const saved = await runWrite(() => addExpenseEntry(draft), setFormError);
-    if (saved) setFormEpoch((value) => value + 1);
+    const result = await runWrite(() => addExpenseEntry(draft), setFormError);
+    if (result.saved) {
+      setPendingExpense(null);
+      setFormEpoch((value) => value + 1);
+      return;
+    }
+    // Not sent: the form stays editable and nothing is pinned.
+    if (!result.error) return;
+    setFormError(reportedExpenseError(result.error));
+    setPendingExpense((current) => pinnedAfter(current, draft, result.error));
+  }
+
+  async function voidEntry(id: string, typedReason: string) {
+    const pinned = pendingVoidsRef.current.get(id) ?? null;
+    const requestId =
+      pinned?.requestId ??
+      voidRequestIdsRef.current.get(id) ??
+      crypto.randomUUID();
+    const attempt = pinned ?? { requestId, reason: typedReason };
+    const result = await runWrite(
+      () => voidExpenseEntry(id, attempt.reason, attempt.requestId),
+      setListError,
+    );
+    if (result.saved) {
+      clearVoidPin(id);
+      return;
+    }
+    // Not sent: leave an existing pin alone, and do not store this attempt.
+    if (!result.error) return;
+    voidRequestIdsRef.current.set(id, attempt.requestId);
+    setListError(reportedExpenseError(result.error));
+    const current = pendingVoidsRef.current.get(id) ?? null;
+    applyVoidPin(id, pinnedAfter(current, attempt, result.error));
   }
 
   return (
@@ -180,6 +278,7 @@ export function ExpensesPage() {
           month={month}
           disabled={busy || !ready}
           serverError={formError}
+          pending={pendingExpense}
           onMonthChange={changeMonth}
           onSubmit={(draft) => void submitExpense(draft)}
         />
@@ -215,23 +314,7 @@ export function ExpensesPage() {
               )
             }
             onVoid={(id, typedReason) => {
-              // Keep the request id and the reason together until a reply
-              // confirms the void, so a retry sends the same payload.
-              const pending = pendingVoidsRef.current.get(id) ?? {
-                requestId: crypto.randomUUID(),
-                reason: typedReason,
-              };
-              const withPending = new Map(pendingVoidsRef.current);
-              withPending.set(id, pending);
-              pendingVoidsRef.current = withPending;
-              setPendingVoids(withPending);
-              void runWrite(async () => {
-                await voidExpenseEntry(id, pending.reason, pending.requestId);
-                const done = new Map(pendingVoidsRef.current);
-                done.delete(id);
-                pendingVoidsRef.current = done;
-                setPendingVoids(done);
-              }, setListError);
+              void voidEntry(id, typedReason);
             }}
           />
           <AllocationTable days={data.days} />
@@ -239,9 +322,13 @@ export function ExpensesPage() {
             categories={data.categories}
             disabled={busy}
             serverError={categoryError}
-            onAdd={(name, kind: ExpenseKind) =>
-              runWrite(() => addExpenseCategory(name, kind), setCategoryError)
-            }
+            onAdd={async (name, kind: ExpenseKind) => {
+              const result = await runWrite(
+                () => addExpenseCategory(name, kind),
+                setCategoryError,
+              );
+              return result.saved;
+            }}
             onRename={(id, name) =>
               void runWrite(
                 () => renameExpenseCategory(id, name),

@@ -5,7 +5,11 @@ import {
   loadExpenseMonth,
   voidExpenseEntry,
 } from '@/expenses/api';
-import { retrySafeMessage } from '@/expenses/errors';
+import {
+  isPayloadRefusal,
+  isUnknownOutcome,
+  retrySafeMessage,
+} from '@/expenses/errors';
 import type { ExpenseDraft } from '@/expenses/types';
 import { genericCatalogError } from '@/items/errors';
 
@@ -364,6 +368,98 @@ describe('expense api', () => {
         driverLabel: null,
       }),
     ).rejects.toThrow('التصنيف ده متوقف');
+  });
+
+  it('keeps a refusal definite and a lost reply unknown', async () => {
+    let writeError: { code?: string; message: string } | null = {
+      code: '22023',
+      message: 'مينفعش تكتب أرقام تليفونات أو أرقام قومية',
+    };
+    mocks.schema.mockReturnValue({
+      rpc() {
+        if (!writeError) throw new Error('Failed to fetch');
+        return Promise.resolve({ data: null, error: writeError });
+      },
+    });
+    const id = 'a17e0000-0000-4000-8000-0000000000af';
+
+    await expect(voidExpenseEntry('est', 'سبب', id)).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof Error &&
+        error.message === 'مينفعش تكتب أرقام تليفونات أو أرقام قومية' &&
+        isPayloadRefusal(error) &&
+        !isUnknownOutcome(error) &&
+        (error.cause as { code?: string }).code === '22023',
+    );
+
+    writeError = { code: '42501', message: 'permission denied' };
+    await expect(voidExpenseEntry('est', 'سبب', id)).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof Error &&
+        error.message === 'مفيش صلاحية' &&
+        !isPayloadRefusal(error) &&
+        !isUnknownOutcome(error),
+    );
+
+    writeError = {
+      code: '23505',
+      message:
+        'duplicate key value violates unique constraint "expense_entries_request_id_key"',
+    };
+    await expect(voidExpenseEntry('est', 'سبب', id)).rejects.toThrow(
+      retrySafeMessage,
+    );
+    await expect(voidExpenseEntry('est', 'سبب', id)).rejects.toSatisfy(
+      (error: unknown) => isUnknownOutcome(error) && !isPayloadRefusal(error),
+    );
+
+    writeError = { code: 'PGRST003', message: 'upstream timed out' };
+    await expect(voidExpenseEntry('est', 'سبب', id)).rejects.toThrow(
+      retrySafeMessage,
+    );
+    await expect(voidExpenseEntry('est', 'سبب', id)).rejects.toSatisfy(
+      (error: unknown) => isUnknownOutcome(error),
+    );
+
+    writeError = { code: '0A000', message: 'feature not supported' };
+    await expect(voidExpenseEntry('est', 'سبب', id)).rejects.toThrow(
+      genericCatalogError,
+    );
+    await expect(voidExpenseEntry('est', 'سبب', id)).rejects.toSatisfy(
+      (error: unknown) => !isUnknownOutcome(error) && isPayloadRefusal(error),
+    );
+
+    writeError = null;
+    await expect(
+      addExpenseEntry({
+        requestId: id,
+        categoryId: 'cat-rent',
+        amount: '10.00',
+        periodMonth: '2030-04-01',
+        expenseDate: null,
+        paidOn: null,
+        isEstimate: false,
+        note: null,
+        hours: null,
+        hourlyRate: null,
+        driverLabel: null,
+      }),
+    ).rejects.toThrow(retrySafeMessage);
+    await expect(
+      addExpenseEntry({
+        requestId: id,
+        categoryId: 'cat-rent',
+        amount: '10.00',
+        periodMonth: '2030-04-01',
+        expenseDate: null,
+        paidOn: null,
+        isEstimate: false,
+        note: null,
+        hours: null,
+        hourlyRate: null,
+        driverLabel: null,
+      }),
+    ).rejects.toSatisfy((error: unknown) => isUnknownOutcome(error));
   });
 
   it('tells the owner to retry when the save reply is lost', async () => {

@@ -4,6 +4,21 @@ import { genericCatalogError } from '@/items/errors';
 export const retrySafeMessage =
   'حصل خطأ. اضغط حفظ تاني — لو الطلب اتسجل مش هيتسجل مرتين.';
 
+/** Shown while a lost save is still waiting, so the next حفظ sends it unchanged. */
+export const pendingResendMessage =
+  'الحفظ اللي فات ممكن يكون اتسجل — هيتبعت تاني من غير تغيير';
+
+/** Shown while a lost void is still waiting, so the next confirm sends it unchanged. */
+export const pendingVoidMessage =
+  'الإلغاء اللي فات ممكن يكون اتسجل — هيتبعت تاني بنفس السبب';
+
+/** In-transaction refusals only. The allow-list lives in write-outcome.ts. */
+export {
+  isDefiniteRefusal,
+  isPayloadRefusal,
+  isUnknownOutcome,
+} from '@/lib/write-outcome';
+
 const differentRequestMessage =
   'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع مصاريف الشهر قبل ما تسجّل تاني';
 

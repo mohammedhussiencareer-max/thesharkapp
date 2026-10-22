@@ -1,6 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { mapExpenseError, retrySafeMessage } from '@/expenses/errors';
+import {
+  isDefiniteRefusal as exportedDefiniteRefusal,
+  isPayloadRefusal as exportedPayloadRefusal,
+  isUnknownOutcome as exportedUnknownOutcome,
+  mapExpenseError,
+  retrySafeMessage,
+} from '@/expenses/errors';
 import { genericCatalogError } from '@/items/errors';
+import {
+  isDefiniteRefusal,
+  isPayloadRefusal,
+  isUnknownOutcome,
+} from '@/lib/write-outcome';
 
 describe('mapExpenseError', () => {
   it('maps the database messages the form can hit', () => {
@@ -52,5 +63,13 @@ describe('mapExpenseError', () => {
       genericCatalogError,
     );
     expect(mapExpenseError(null)).toBe(genericCatalogError);
+  });
+});
+
+describe('write outcome re-export', () => {
+  it('shares the allow-list classifier', () => {
+    expect(exportedUnknownOutcome).toBe(isUnknownOutcome);
+    expect(exportedDefiniteRefusal).toBe(isDefiniteRefusal);
+    expect(exportedPayloadRefusal).toBe(isPayloadRefusal);
   });
 });

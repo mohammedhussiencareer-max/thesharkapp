@@ -1,4 +1,8 @@
-import { mapExpenseError, retrySafeMessage } from '@/expenses/errors';
+import {
+  isUnknownOutcome,
+  mapExpenseError,
+  retrySafeMessage,
+} from '@/expenses/errors';
 import { markSuperseded } from '@/expenses/status';
 import {
   isExpenseKind,
@@ -77,10 +81,15 @@ async function writeEntry(
   }
   if (!result.error) return;
   const mapped = mapExpenseError(result.error);
-  if (mapped === genericCatalogError) {
-    throw new Error(retrySafeMessage, { cause: result.error });
-  }
-  throw new Error(mapped);
+  // A definite refusal already rolled back, so its mapped text stands.
+  // An unknown outcome (anything off the allow-list, including 23505 and
+  // PostgREST codes) is retry-safe when there is no specific Arabic mapping.
+  // The original error stays on `cause` so the page can tell those apart.
+  const message =
+    mapped === genericCatalogError && isUnknownOutcome(result.error)
+      ? retrySafeMessage
+      : mapped;
+  throw new Error(message, { cause: result.error });
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

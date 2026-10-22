@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { pendingVoidMessage } from '@/expenses/errors';
 import { fieldClass, kindLabels } from '@/expenses/labels';
 import { entryStatusLabel } from '@/expenses/status';
 import type { ExpenseLine } from '@/expenses/types';
@@ -108,11 +109,7 @@ export function ExpenseList({
                       }}
                     />
                   </label>
-                  {pending ? (
-                    <p>
-                      الإلغاء اللي فات ممكن يكون اتسجل — هيتبعت تاني بنفس السبب
-                    </p>
-                  ) : null}
+                  {pending ? <p>{pendingVoidMessage}</p> : null}
                   {reasonError ? <p role="alert">{reasonError}</p> : null}
                   <button
                     className={secondaryButton}
