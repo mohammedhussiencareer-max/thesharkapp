@@ -27,24 +27,28 @@
 -- outside that shift. A count exactly at the next shift's open is inside it.
 -- Times before an open shift's open are not refused by the open-shift rule.
 --
--- Sync rule: compare only database-clock times. S is the latest
--- app.pos_shifts row with opened_at <= counted_at. The shift guards already
--- make S closed with closed_at <= counted_at when S exists.
--- app.pos_shifts.close_recorded_at is the database clock at the moment the
--- mirror stored that close, and a caller cannot set it. The newest
--- app.pos_sync_runs row with status = 'ok', chosen by identity id, must have
--- finished_at not null and started_at > S.close_recorded_at. That run began,
--- on the same database clock, after the mirror stored S's close, so it began
--- after the close in real time. Every order read in that run, in any mode,
--- came after every sale of S and of earlier shifts. Window mode reads orders
--- before shifts, which is safe because the close was already stored before
--- the run started. When no shift has opened_at <= counted_at, there are no
--- POS sales before the count, and only an ok, finished run is required.
+-- Sync rule. Let C be the latest app.pos_shifts.close_recorded_at among all
+-- shifts with opened_at <= counted_at (shifts can overlap, so the latest
+-- stamp, not the latest-opened shift). The shift guards already make all of
+-- them closed with closed_at <= counted_at. close_recorded_at is the
+-- database clock at the moment the mirror stored that close, and a caller
+-- cannot set it. The newest app.pos_sync_runs row with status = 'ok', chosen
+-- by identity id, must have finished_at not null, started_at > C when such a
+-- shift exists, and started_at >= counted_at.
+-- (1) started_at > C compares database-clock times only: the run began after
+-- the mirror stored every close, so it began after them in real time, and
+-- every order it read, in any mode, came after every sale of those shifts.
+-- Window mode reads orders before shifts, which is safe because the closes
+-- were stored before the run started.
+-- (2) started_at >= counted_at is freshness: a shift opened on the POS before
+-- the count is in the run's read. It compares the database clock with the
+-- owner/POS clock, so skew can still hide a shift opened within the skew of
+-- the count. No database-side proof can remove that cross-clock gap.
 -- Otherwise the count is refused with 'sync has not covered this count time'.
--- A sale still missing, for example one written to Firestore after the shift
--- close, is not silently lost. Its deduction is back-dated before the count's
--- watermark, so the ledger refuses it until the later back-dated-recompute
--- task re-derives the count.
+-- A sale or shift still missing (for example written to Firestore after the
+-- shift close, or inside the skew gap) is not silently lost. Its deduction is
+-- back-dated before the count's watermark, so the ledger refuses it until the
+-- later back-dated-recompute task re-derives the count.
 --
 -- Lock order matches record_sort. app.assert_ledger_write_allowed() is the
 -- first statement. It checks the owner (or service_role) and takes advisory
@@ -80,7 +84,7 @@ comment on table app.stock_counts is 'Append-only stock counts. id is the app.po
 
 comment on column app.stock_counts.request_id is 'Idempotency key generated once per count draft. The same key and the same normalized payload return this count; a different payload is refused.';
 
-comment on column app.stock_counts.counted_at is 'The instant the quantities were observed. Must sit outside every closed shift. When a shift opened at or before this instant, the newest ok POS sync must have finished and its started_at must be after close_recorded_at of the latest such shift. Both times are the database clock: that run began after the mirror stored the close, so every order it read came after every sale of that shift and of earlier shifts. When no shift opened at or before this instant, a finished ok sync is enough. A sale written after the shift close is back-dated before this count''s watermark and the ledger refuses it until a later recompute.';
+comment on column app.stock_counts.counted_at is 'The instant the quantities were observed. Must sit outside every closed shift and before any open shift''s open. The newest ok POS sync must have finished, must have started at or after this instant, and must have started after the latest close_recorded_at of every shift opened at or before it. A late sale or shift is back-dated before this count''s watermark and the ledger refuses it until a later recompute.';
 
 comment on column app.stock_counts.frequency is 'Which catalog this count belongs to: daily or weekly. The screen in this task records daily only.';
 
@@ -500,21 +504,19 @@ begin
       using errcode = '22023';
   end if;
 
+  -- The guards above leave every shift opened at or before the count closed
+  -- by then. Overlapping shifts are possible, so take the latest close stamp
+  -- of all of them, not the stamp of the latest-opened one.
   select
-    shift.close_recorded_at
+    pg_catalog.max(shift.close_recorded_at),
+    pg_catalog.count(*) > 0
   into
-    v_close_recorded
+    v_close_recorded,
+    v_has_prior_shift
   from
     app.pos_shifts shift
   where
-    shift.opened_at <= v_counted_at
-  order by
-    shift.opened_at desc,
-    shift.id desc
-  limit
-    1;
-
-  v_has_prior_shift := found;
+    shift.opened_at <= v_counted_at;
 
   select
     run.started_at,
@@ -531,14 +533,17 @@ begin
   limit
     1;
 
-  -- started_at and close_recorded_at are both the database clock. When a
-  -- prior shift exists, the run began after the mirror stored that close, so
-  -- it began after the close in real time. Every order read in that run, in
-  -- any mode, came after every sale of that shift and of earlier shifts.
-  -- With no such shift there are no POS sales before the count, so a finished
-  -- ok run is enough. A sale written after the close is back-dated before
-  -- this count's watermark and the ledger refuses it until a later recompute.
+  -- Two proofs. (1) started_at and close_recorded_at are both the database
+  -- clock: the run began after the mirror stored the latest close of every
+  -- shift opened before the count, so every order it read came after every
+  -- sale of those shifts. (2) started_at >= counted_at is the freshness check:
+  -- the run began after the count, so a shift opened on the POS before the
+  -- count is in its read. (2) crosses clocks (database versus owner/POS), so
+  -- skew can still hide a shift opened within the skew of the count. Such a
+  -- late shift or sale is not silent: its deduction is back-dated before this
+  -- count's watermark and the ledger refuses it until a later recompute.
   if v_sync_finished is null
+  or v_sync_started < v_counted_at
   or (
     v_has_prior_shift
     and (
@@ -720,7 +725,7 @@ begin
 end;
 $$;
 
-comment on function app.record_count (jsonb) is 'Posts one stock count. Takes advisory lock 7342750000000000001 first, replays request_id before any catalog, shift, sync, or balance read, then refuses a time inside a closed shift (opened_at <= counted_at < closed_at) or a time at or after an open shift''s open. Coverage compares database-clock times only. S is the latest pos_shifts row with opened_at <= counted_at; those guards already make S closed with closed_at <= counted_at. The newest ok pos_sync_runs row, by id, must have a non-null finished_at and started_at > S.close_recorded_at. That run began, on the same database clock, after the mirror stored S''s close, so it began after the close in real time, and every order read in that run, in any mode, came after every sale of S and of earlier shifts. When no shift has opened_at <= counted_at, there are no POS sales before the count and only an ok, finished run is required. A sale still missing, for example one written to Firestore after the shift close, is not silently lost: its deduction is back-dated before the count''s watermark, so the ledger refuses it until the later back-dated-recompute task re-derives the count. After the batch post, last_occurred_at moves to counted_at for every counted item, including a zero delta, because a count is an observation and a later back-dated movement before it is refused. Non-zero deltas are one count_adjustment batch: quantity is actual minus the locked on-hand. The same request_id and normalized payload returns the saved id and does not post again.';
+comment on function app.record_count (jsonb) is 'Posts one stock count. Takes advisory lock 7342750000000000001 first, replays request_id before any catalog, shift, sync, or balance read, then refuses a time inside a closed shift (opened_at <= counted_at < closed_at) or a time at or after an open shift''s open. Coverage compares database-clock times only. C is the latest close_recorded_at among all pos_shifts with opened_at <= counted_at (shifts may overlap); those guards already make them closed by counted_at. The newest ok pos_sync_runs row, by id, must have a non-null finished_at, started_at >= counted_at (freshness, crosses clocks), and started_at > C when such a shift exists (database clock only: that run began after the mirror stored every close, so every order it read came after every sale of those shifts). A sale still missing, for example one written to Firestore after the shift close, is not silently lost: its deduction is back-dated before the count''s watermark, so the ledger refuses it until the later back-dated-recompute task re-derives the count. After the batch post, last_occurred_at moves to counted_at for every counted item, including a zero delta, because a count is an observation and a later back-dated movement before it is refused. Non-zero deltas are one count_adjustment batch: quantity is actual minus the locked on-hand. The same request_id and normalized payload returns the saved id and does not post again.';
 
 revoke all on function app.record_count (jsonb)
 from

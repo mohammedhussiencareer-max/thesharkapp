@@ -906,16 +906,22 @@ where
 
 insert into
   app.pos_sync_runs (mode, status, started_at, finished_at, error)
+  -- After every close stamp and after every count time used here, whatever
+  -- the wall clock is when the test runs.
 select
   'recent',
   'ok',
-  shift.close_recorded_at + interval '1 second',
-  shift.close_recorded_at + interval '1 minute',
+  greatest(
+    pg_catalog.max (shift.close_recorded_at) + interval '1 second',
+    '2026-10-23T00:00:00Z'::timestamptz
+  ),
+  greatest(
+    pg_catalog.max (shift.close_recorded_at) + interval '1 second',
+    '2026-10-23T00:00:00Z'::timestamptz
+  ) + interval '1 minute',
   null
 from
-  app.pos_shifts shift
-where
-  shift.id = 'shift-count-closed';
+  app.pos_shifts shift;
 
 select
   set_config(
@@ -1332,11 +1338,9 @@ update app.pos_sync_runs
 set
   started_at = (
     select
-      close_recorded_at
+      pg_catalog.max (close_recorded_at)
     from
       app.pos_shifts
-    where
-      id = 'shift-count-closed'
   )
 where
   status = 'ok';
@@ -1357,7 +1361,7 @@ select
     ))$$,
     '22023',
     'sync has not covered this count time',
-    'a run that started exactly when the shift close was recorded does not cover'
+    'a run that started exactly at the latest close stamp does not cover'
   );
 
 reset role;
@@ -1366,11 +1370,9 @@ update app.pos_sync_runs
 set
   started_at = (
     select
-      close_recorded_at - interval '1 second'
+      pg_catalog.max (close_recorded_at) - interval '1 second'
     from
       app.pos_shifts
-    where
-      id = 'shift-count-closed'
   )
 where
   status = 'ok';
@@ -1391,7 +1393,7 @@ select
     ))$$,
     '22023',
     'sync has not covered this count time',
-    'a run that started before the shift close was recorded does not cover'
+    'a run that started before the latest close stamp does not cover'
   );
 
 select
@@ -1414,13 +1416,64 @@ reset role;
 
 update app.pos_sync_runs
 set
+  -- After every close stamp and after every count time used here, whatever
+  -- the wall clock is when the test runs.
   started_at = (
     select
-      close_recorded_at + interval '1 second'
+      greatest(
+        pg_catalog.max (close_recorded_at) + interval '1 second',
+        '2026-10-23T00:00:00Z'::timestamptz
+      )
+    from
+      app.pos_shifts
+  ),
+  finished_at = (
+    select
+      greatest(
+        pg_catalog.max (close_recorded_at) + interval '1 second',
+        '2026-10-23T00:00:00Z'::timestamptz
+      ) + interval '1 minute'
+    from
+      app.pos_shifts
+  )
+where
+  status = 'ok';
+
+set
+  local role authenticated;
+
+-- Shifts can overlap. The latest close stamp of every shift opened before
+-- the count counts, not the stamp of the latest-opened shift. This shift
+-- opened earlier than shift-count-closed and closed later, so its stamp is
+-- later; a run between the two stamps does not cover.
+reset role;
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+values
+  (
+    'shift-count-overlap',
+    '2026-10-22T08:00:00Z',
+    '2026-10-22T09:45:00Z',
+    false,
+    '2026-10-22T09:45:00Z'
+  );
+
+update app.pos_sync_runs
+set
+  started_at = (
+    select
+      close_recorded_at - interval '1 microsecond'
     from
       app.pos_shifts
     where
-      id = 'shift-count-closed'
+      id = 'shift-count-overlap'
   ),
   finished_at = (
     select
@@ -1428,10 +1481,133 @@ set
     from
       app.pos_shifts
     where
-      id = 'shift-count-closed'
+      id = 'shift-count-overlap'
   )
 where
   status = 'ok';
+
+select
+  ok (
+    (
+      select
+        run.started_at > closed.close_recorded_at
+      from
+        app.pos_sync_runs run
+        cross join app.pos_shifts closed
+      where
+        run.status = 'ok'
+        and closed.id = 'shift-count-closed'
+    ),
+    'the overlap run starts after the latest-opened shift''s close stamp'
+  );
+
+set
+  local role authenticated;
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000901',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000099',
+        'counted_qty', '1'
+      ))
+    ))$$,
+    '22023',
+    'sync has not covered this count time',
+    'a run before the latest close stamp of overlapping shifts does not cover'
+  );
+
+-- Freshness: a run must start at or after counted_at, so a shift opened on
+-- the POS before the count but unknown to the mirror is in its read. Remove
+-- the open shift for this case so the shift guard does not refuse first.
+reset role;
+
+delete from app.pos_shifts
+where
+  id in ('shift-count-overlap', 'shift-count-open');
+
+update app.pos_sync_runs
+set
+  -- After every close stamp and after every count time used here, whatever
+  -- the wall clock is when the test runs.
+  started_at = (
+    select
+      greatest(
+        pg_catalog.max (close_recorded_at) + interval '1 second',
+        '2026-10-23T00:00:00Z'::timestamptz
+      )
+    from
+      app.pos_shifts
+  ),
+  finished_at = (
+    select
+      greatest(
+        pg_catalog.max (close_recorded_at) + interval '1 second',
+        '2026-10-23T00:00:00Z'::timestamptz
+      ) + interval '1 minute'
+    from
+      app.pos_shifts
+  )
+where
+  status = 'ok';
+
+select
+  set_config(
+    'test.count_after_run',
+    (
+      select
+        (run.started_at + interval '1 second')::text
+      from
+        app.pos_sync_runs run
+      where
+        run.status = 'ok'
+    ),
+    true
+  );
+
+set
+  local role authenticated;
+
+select
+  throws_ok (
+    format(
+      $f$select app.record_count(jsonb_build_object(
+        'request_id', 'd1900000-0000-4000-8000-000000000902',
+        'frequency', 'daily',
+        'counted_at', %L,
+        'lines', jsonb_build_array(jsonb_build_object(
+          'item_id', 'c1900000-0000-4000-8000-000000000099',
+          'counted_qty', '1'
+        ))
+      ))$f$,
+      current_setting('test.count_after_run')
+    ),
+    '22023',
+    'sync has not covered this count time',
+    'a run that started before counted_at does not cover, even after every close stamp'
+  );
+
+reset role;
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+values
+  (
+    'shift-count-open',
+    '2026-10-22T15:00:00Z',
+    null,
+    true,
+    '2026-10-22T15:00:00Z'
+  );
 
 set
   local role authenticated;
@@ -2716,11 +2892,9 @@ update app.pos_sync_runs
 set
   started_at = (
     select
-      close_recorded_at - interval '1 second'
+      pg_catalog.max (close_recorded_at) - interval '1 second'
     from
       app.pos_shifts
-    where
-      id = 'shift-count-closed'
   )
 where
   status = 'ok';

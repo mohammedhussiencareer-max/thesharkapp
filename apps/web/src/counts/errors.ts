@@ -27,7 +27,7 @@ export const openShiftMessage =
   'فيه وردية لسه مفتوحة. اقفلها الأول وبعدين اعمل الجرد';
 
 export const syncCoverageMessage =
-  'لازم مزامنة جديدة تشتغل بعد ما قفلة الوردية تتسجل';
+  'لازم مزامنة جديدة تبدأ بعد وقت الجرد وبعد ما قفلة الوردية تتسجل';
 
 export const frequencyMessage = 'الصنف مش من أصناف الجرد ده';
 
