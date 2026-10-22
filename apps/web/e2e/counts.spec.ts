@@ -7,10 +7,11 @@ import { assertLocalSupabaseUrl } from './local-guard';
 
 /**
  * Coverage is the newest ok sync run by id. That run must have finished, and
- * its started_at must be at or after the count time, because the run only
- * reads POS data that existed when it started. This spec fills the count
- * time first (two minutes ago), then start_pos_sync_run, so the new run's
- * started_at is later and its id is above the seed's earlier ok run.
+ * its started_at must be at least 10 minutes after the count time. started_at
+ * is the database clock; the count time is the browser clock. Window sync
+ * reads orders before shifts. This spec fills the count time first (fifteen
+ * minutes ago, after the seeded shift close), then start_pos_sync_run, so the
+ * new run's started_at is later and its id is above the seed's earlier ok run.
  * The seeded shift closed about 20 hours ago. No open shift is seeded.
  * A parallel spec can hold the single running sync; this retries that
  * collision. Coverage uses the same service-role start/finish path as the
@@ -100,7 +101,7 @@ test('owner counts a daily item short and sees the shortage', async ({
   await expect(
     page.getByRole('heading', { name: 'الجرد اليومي', exact: true }),
   ).toBeVisible();
-  const counted = new Date(Date.now() - 2 * 60 * 1000);
+  const counted = new Date(Date.now() - 15 * 60 * 1000);
   await page.getByLabel('وقت الجرد').fill(nowCairoDateTimeLocal(counted));
   await expect(page.getByLabel(`الكمية المعدودة ${name}`)).toBeVisible(visible);
   await page.getByLabel(`الكمية المعدودة ${name}`).fill('7');

@@ -191,7 +191,7 @@ export function CountsPage() {
       ) : null}
       {snapshot !== null ? (
         <>
-          {items.length === 0 ? (
+          {items.length === 0 && pending === null ? (
             <p>مفيش أصناف جرد يومي نشطة</p>
           ) : (
             <CountForm

@@ -14,6 +14,12 @@
 -- Recompute of an earlier count is a later task; this function keeps the
 -- ledger's 'back-dated movement not supported yet' refusal.
 --
+-- A count is an observation. After the batch post, still under the ledger
+-- lock, last_occurred_at becomes counted_at for every counted item, including
+-- a zero delta that posted no movement. A later movement before that
+-- observation is refused. lock_and_validate_item_balance already inserts a
+-- zero balance row when the item has never moved.
+--
 -- Shift rule: counted_at must not fall inside a closed shift, using the
 -- half-open interval opened_at <= counted_at < closed_at, and must not be
 -- at or after the open time of a shift that is still open (closed_at is
@@ -21,15 +27,18 @@
 -- outside that shift. A count exactly at the next shift's open is inside it.
 -- Times before an open shift's open are not refused by the open-shift rule.
 --
--- Sync rule: a run proves coverage only of POS data that existed when it
--- started, because it reads Firestore during the run. A sale after started_at
--- and before counted_at can be missing even when finished_at is at or after
--- the count. Coverage is the latest app.pos_sync_runs row with status = 'ok',
--- chosen by identity id (the newest successful attempt), not by the greatest
--- finished_at and not by a failed or running run. That row's finished_at must
--- be non-null and its started_at must be >= counted_at. A null finished_at,
--- no ok run, or a start before the count cannot prove the mirror includes
--- sales and shift closes up to the count, so the count is refused.
+-- Sync rule: pos_sync_runs.started_at is the database clock (now()).
+-- counted_at, shift times, and sale times come from the owner's clock and
+-- the POS devices' clocks, so those clocks can disagree. Window mode reads
+-- orders before shifts, so a run can record a shift close and still have
+-- missed an earlier sale. Coverage is the latest app.pos_sync_runs row with
+-- status = 'ok', chosen by identity id (the newest successful attempt), not
+-- by the greatest finished_at and not by a failed or running run. That row's
+-- finished_at must be non-null, and its started_at must be >= counted_at
+-- plus app.count_sync_margin() (10 minutes). A null finished_at, no ok run,
+-- or a start earlier than counted_at plus that margin cannot prove the
+-- mirror includes sales and shift closes up to the count. The count is
+-- refused with 'sync has not covered this count time'.
 --
 -- Lock order matches record_sort. app.assert_ledger_write_allowed() is the
 -- first statement. It checks the owner (or service_role) and takes advisory
@@ -65,7 +74,7 @@ comment on table app.stock_counts is 'Append-only stock counts. id is the app.po
 
 comment on column app.stock_counts.request_id is 'Idempotency key generated once per count draft. The same key and the same normalized payload return this count; a different payload is refused.';
 
-comment on column app.stock_counts.counted_at is 'The instant the quantities were observed. Must sit outside every closed shift. The newest ok POS sync must have finished, and its started_at must be at or after this instant.';
+comment on column app.stock_counts.counted_at is 'The instant the quantities were observed. Must sit outside every closed shift. The newest ok POS sync must have finished, and its started_at (database clock) must be at least app.count_sync_margin after this instant, because the owner and POS clocks can disagree and window sync reads orders before shifts.';
 
 comment on column app.stock_counts.frequency is 'Which catalog this count belongs to: daily or weekly. The screen in this task records daily only.';
 
@@ -159,6 +168,26 @@ execute function app.prevent_count_mutation ();
 -- ============================================================================
 -- 2. record_count
 -- ============================================================================
+-- One named margin. started_at uses the database clock. counted_at, shift
+-- times, and sale times use the owner and POS clocks. Window mode reads
+-- orders before shifts, so a run can store a later shift close and still
+-- miss an earlier sale. Coverage needs started_at >= counted_at + this.
+create function app.count_sync_margin () returns interval language sql immutable parallel safe
+set
+  search_path = '' as $$
+  select
+    interval '10 minutes';
+$$;
+
+comment on function app.count_sync_margin () is 'Ten minutes of skew for stock-count sync coverage. pos_sync_runs.started_at is the database clock. counted_at, shift times, and sale times are the owner and POS clocks. Window sync reads orders before shifts, so the newest ok run must have started at least this long after counted_at.';
+
+revoke all on function app.count_sync_margin ()
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 create function app.record_count (p_count jsonb) returns uuid language plpgsql security definer
 set
   search_path = '' as $$
@@ -434,7 +463,11 @@ begin
   limit
     1;
 
-  if v_sync_finished is null or v_sync_started < v_counted_at then
+  -- Different clocks: started_at is the database clock, counted_at is not.
+  -- Window mode reads orders before shifts, so the run must start at least
+  -- app.count_sync_margin after the count. The error text stays stable.
+  if v_sync_finished is null
+  or v_sync_started < v_counted_at + app.count_sync_margin () then
     raise exception 'sync has not covered this count time'
       using errcode = '22023';
   end if;
@@ -591,11 +624,25 @@ begin
     end if;
   end loop;
 
+  -- A count is an observation at counted_at. Advance the balance watermark
+  -- for every counted item, including a zero delta that posted no movement,
+  -- so a later back-dated movement before this observation is refused.
+  -- lock_and_validate_item_balance already inserted a zero balance row when
+  -- the item had never moved.
+  update app.item_balances as balance
+  set
+    last_occurred_at = greatest (
+      coalesce(balance.last_occurred_at, v_counted_at),
+      v_counted_at
+    )
+  where
+    balance.item_id = any (v_item_ids);
+
   return v_count_id;
 end;
 $$;
 
-comment on function app.record_count (jsonb) is 'Posts one stock count. Takes advisory lock 7342750000000000001 first, replays request_id before any catalog, shift, sync, or balance read, then refuses a time inside a closed shift (opened_at <= counted_at < closed_at), a time at or after an open shift''s open, or a time the newest ok pos_sync_runs row does not cover (that row, by id, must have finished and started_at >= counted_at). Non-zero deltas are one count_adjustment batch: quantity is actual minus the locked on-hand. The same request_id and normalized payload returns the saved id and does not post again.';
+comment on function app.record_count (jsonb) is 'Posts one stock count. Takes advisory lock 7342750000000000001 first, replays request_id before any catalog, shift, sync, or balance read, then refuses a time inside a closed shift (opened_at <= counted_at < closed_at), a time at or after an open shift''s open, or a time the newest ok pos_sync_runs row does not cover. That row, by id, must have a non-null finished_at and started_at >= counted_at plus app.count_sync_margin (10 minutes). started_at is the database clock, while counted_at, shift times, and sale times are the owner and POS clocks, and window sync reads orders before shifts. After the batch post, last_occurred_at moves to counted_at for every counted item, including a zero delta, because a count is an observation and a later back-dated movement before it is refused. Non-zero deltas are one count_adjustment batch: quantity is actual minus the locked on-hand. The same request_id and normalized payload returns the saved id and does not post again.';
 
 revoke all on function app.record_count (jsonb)
 from

@@ -572,6 +572,9 @@ isOneToOne: false
 "assert_pos_write_allowed":
 { Args: Record<PropertyKey, never>; Returns: undefined
                            },
+"count_sync_margin":
+{ Args: Record<PropertyKey, never>; Returns: string
+                           },
 "delete_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
                            },

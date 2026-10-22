@@ -236,7 +236,7 @@ describe('CountsPage', () => {
       expect(recordCount).toHaveBeenCalledTimes(1);
     });
     expect(vi.mocked(recordCount).mock.calls[0]?.[0]?.lines).toEqual([
-      { itemId: 'shrimp', countedQty: '6' },
+      { itemId: 'shrimp', itemName: 'جمبري', countedQty: '6' },
     ]);
   });
 
@@ -422,7 +422,9 @@ describe('CountsPage', () => {
     const first = vi.mocked(recordCount).mock.calls[0]?.[0];
     const edited = vi.mocked(recordCount).mock.calls[2]?.[0];
     expect(edited?.requestId).toBe(first?.requestId);
-    expect(edited?.lines).toEqual([{ itemId: 'tilapia', countedQty: '8' }]);
+    expect(edited?.lines).toEqual([
+      { itemId: 'tilapia', itemName: 'بلطي', countedQty: '8' },
+    ]);
   });
 
   it('clears the pin after the pinned payload succeeds and mints a new request id', async () => {
@@ -489,5 +491,62 @@ describe('CountsPage', () => {
     expect(
       screen.getByRole('button', { name: 'إعادة المحاولة' }),
     ).toBeEnabled();
+  });
+
+  it('keeps the pinned lines when a refresh removes and restores the item', async () => {
+    await renderPage();
+    fillShortage();
+    vi.mocked(recordCount).mockRejectedValueOnce(
+      new TypeError('Failed to fetch'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    let releaseItems: (rows: CountItem[]) => void = () => undefined;
+    vi.mocked(listDailyItems).mockReturnValueOnce(
+      new Promise((resolve) => {
+        releaseItems = resolve;
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'تحديث' }));
+    await act(async () => {
+      releaseItems([]);
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+
+    expect(
+      screen.queryByText('مفيش أصناف جرد يومي نشطة'),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText('بلطي')).toBeInTheDocument();
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('7');
+    expect(screen.getByLabelText('وقت الجرد')).toHaveValue('2026-10-22T12:00');
+
+    vi.mocked(recordCount).mockRejectedValueOnce(
+      new TypeError('Failed to fetch'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordCount).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(recordCount).mock.calls[0]?.[0],
+    );
+
+    vi.mocked(listDailyItems).mockReturnValueOnce(
+      new Promise((resolve) => {
+        releaseItems = resolve;
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'تحديث' }));
+    await act(async () => {
+      releaseItems([tilapia, shrimp]);
+      await Promise.resolve();
+    });
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('7');
+    expect(screen.getByLabelText('وقت الجرد')).toHaveAttribute('readonly');
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
   });
 });

@@ -42,6 +42,7 @@ export type CountAssessment = {
 
 type PricedLine = {
   itemId: string;
+  itemName: string;
   counted: Dec;
   onHand: Dec;
   onHandValue: Dec;
@@ -52,10 +53,18 @@ function emptyErrors(): CountErrors {
   return { quantities: {} };
 }
 
-function storedDecimal(raw: string): Dec | null {
+/** On-hand quantity or book value. The ledger allows a negative balance. */
+function storedSignedDecimal(raw: string): Dec | null {
   const parsed = parseUserDecimal(raw);
-  if (!parsed || isNegative(parsed)) return null;
+  if (!parsed) return null;
   if (parsed.scale > 6 || integerDigits(parsed) > 14) return null;
+  return parsed;
+}
+
+/** Average cost stays non-negative, matching the ledger check. */
+function storedDecimal(raw: string): Dec | null {
+  const parsed = storedSignedDecimal(raw);
+  if (!parsed || isNegative(parsed)) return null;
   return parsed;
 }
 
@@ -79,8 +88,8 @@ function parseCounted(
 function balanceOf(
   item: CountItem,
 ): { onHand: Dec; onHandValue: Dec; avg: Dec } | null {
-  const onHand = storedDecimal(item.onHandQty);
-  const onHandValue = storedDecimal(item.onHandValue);
+  const onHand = storedSignedDecimal(item.onHandQty);
+  const onHandValue = storedSignedDecimal(item.onHandValue);
   const avg = storedDecimal(item.avgCost);
   if (!onHand || !onHandValue || !avg) return null;
   if (onHandValue.scale > 2 || integerDigits(onHandValue) > 12) return null;
@@ -138,6 +147,7 @@ export function assessCount(
     }
     priced.push({
       itemId: item.id,
+      itemName: item.name,
       counted: parsed.value,
       onHand: balance.onHand,
       onHandValue: balance.onHandValue,
@@ -184,6 +194,7 @@ export function assessCount(
       note: note.length > 0 ? note : null,
       lines: priced.map((line) => ({
         itemId: line.itemId,
+        itemName: line.itemName,
         countedQty: formatDec(line.counted),
       })),
     },

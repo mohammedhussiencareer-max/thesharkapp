@@ -339,6 +339,31 @@ select
   );
 
 select
+  ok (
+    not has_function_privilege(
+      'anon',
+      'app.count_sync_margin()'::regprocedure,
+      'EXECUTE'
+    )
+    and not has_function_privilege(
+      'authenticated',
+      'app.count_sync_margin()'::regprocedure,
+      'EXECUTE'
+    )
+    and not has_function_privilege(
+      'service_role',
+      'app.count_sync_margin()'::regprocedure,
+      'EXECUTE'
+    )
+    and not has_function_privilege(
+      'public',
+      'app.count_sync_margin()'::regprocedure,
+      'EXECUTE'
+    ),
+    'count_sync_margin is not an API function'
+  );
+
+select
   results_eq (
     $$select pg_catalog.btrim(privilege_type::text) collate "default"
       from information_schema.table_privileges
@@ -509,9 +534,10 @@ select
 -- ============================================================================
 -- Synthetic catalog and POS mirror. Not restaurant data.
 -- Closed shift is [08:30, 09:30). Open shift starts at 15:00 and stays open.
--- The ok sync run starts at 12:00 and finishes at 12:30, so a count at or
--- before 12:00 is covered. A later failed run starts at 17:00 and must not
--- extend coverage. Identity ids increase with insert order.
+-- The ok sync run starts at 12:10 and finishes at 12:30. Coverage needs
+-- started_at >= counted_at + 10 minutes, so a count at 12:00 is covered and
+-- a count at 12:00:01 is not. A later failed run starts at 17:00 and must
+-- not extend coverage. Identity ids increase with insert order.
 -- ============================================================================
 insert into
   app.stock_items (
@@ -578,6 +604,22 @@ values
     'kg',
     'weekly',
     false
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000008',
+    'مطابقة جرد اختبار',
+    'seafood',
+    'kg',
+    'daily',
+    true
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000009',
+    'لم يتحرك جرد اختبار',
+    'seafood',
+    'kg',
+    'daily',
+    true
   );
 
 insert into
@@ -610,7 +652,7 @@ values
   (
     'recent',
     'ok',
-    '2026-10-22T12:00:00Z',
+    '2026-10-22T12:10:00Z',
     '2026-10-22T12:30:00Z',
     null
   ),
@@ -1872,7 +1914,7 @@ select
         'counted_qty', '6'
       ))
     ))$$,
-    'a count exactly at the latest ok sync start is covered'
+    'a count exactly 10 minutes before the latest ok sync start is covered'
   );
 
 select
@@ -1880,7 +1922,7 @@ select
     $$select app.record_count(jsonb_build_object(
       'request_id', 'd1900000-0000-4000-8000-000000000038',
       'frequency', 'daily',
-      'counted_at', '2026-10-22T12:15:00Z',
+      'counted_at', '2026-10-22T12:00:01Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000099',
         'counted_qty', '1'
@@ -1888,12 +1930,142 @@ select
     ))$$,
     '22023',
     'sync has not covered this count time',
-    'a finish at or after the count does not cover a run that started earlier'
+    'a start 9 minutes 59 seconds after the count is refused even when the run finishes later'
+  );
+
+-- A matching count posts no movement, so the watermark has to move on its own.
+-- Opening 10 at 08:00, count 10 at 10:00, then a loss at 09:00 must be refused.
+select
+  lives_ok (
+    $$select app.record_opening_stock(
+      '2026-10-22T08:00:00Z',
+      jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000008',
+        'quantity', '10',
+        'unit', 'kg',
+        'unit_cost', '40',
+        'expected_base_unit', 'kg',
+        'expected_factor', '1'
+      )),
+      'e1900000-0000-4000-8000-000000000002'
+    )$$,
+    'opening stock for the matching-count item'
+  );
+
+select
+  lives_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000050',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000008',
+        'counted_qty', '10'
+      ))
+    ))$$,
+    'a count that matches on-hand posts no movement'
+  );
+
+select
+  results_eq (
+    $$select line.delta_qty, line.movement_id is null
+      from app.stock_count_lines line
+      join app.stock_counts counted on counted.id = line.count_id
+      where counted.request_id = 'd1900000-0000-4000-8000-000000000050'$$,
+    $$values (0::numeric(20, 6), true)$$,
+    'the matching count stores a zero delta and no movement'
+  );
+
+select
+  is (
+    (
+      select
+        last_occurred_at
+      from
+        app.item_balances
+      where
+        item_id = 'c1900000-0000-4000-8000-000000000008'
+    ),
+    '2026-10-22T10:00:00Z'::timestamptz,
+    'a zero-delta count moves the watermark to the count time'
+  );
+
+select
+  throws_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'c1900000-0000-4000-8000-000000000008',
+      'movement_type', 'waste',
+      'occurred_at', '2026-10-22T09:00:00Z',
+      'quantity', '1'
+    )))$$,
+    'P0001',
+    'back-dated movement not supported yet',
+    'a loss before a later matching count is refused'
+  );
+
+select
+  results_eq (
+    $$select on_hand_qty, last_occurred_at
+      from app.item_balances
+      where item_id = 'c1900000-0000-4000-8000-000000000008'$$,
+    $$values (10::numeric(20, 6), '2026-10-22T10:00:00Z'::timestamptz)$$,
+    'the refused loss leaves the counted quantity and the watermark'
+  );
+
+-- An item with no movements still gets a balance row from the lock. Counting
+-- it at zero must stamp counted_at so an earlier movement is refused.
+select
+  lives_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000051',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:20:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000009',
+        'counted_qty', '0'
+      ))
+    ))$$,
+    'a never-moved item can be counted at zero'
+  );
+
+select
+  is (
+    (
+      select
+        last_occurred_at
+      from
+        app.item_balances
+      where
+        item_id = 'c1900000-0000-4000-8000-000000000009'
+    ),
+    '2026-10-22T10:20:00Z'::timestamptz,
+    'counting a never-moved item at zero sets the watermark'
+  );
+
+select
+  throws_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'c1900000-0000-4000-8000-000000000009',
+      'movement_type', 'waste',
+      'occurred_at', '2026-10-22T09:00:00Z',
+      'quantity', '1'
+    )))$$,
+    'P0001',
+    'back-dated movement not supported yet',
+    'a movement before a zero count of a never-moved item is refused'
+  );
+
+select
+  is_empty (
+    $$select id
+      from app.stock_movements
+      where item_id = 'c1900000-0000-4000-8000-000000000009'$$,
+    'the zero count and the refused movement post nothing'
   );
 
 -- A newer ok run with no finish cannot prove coverage, even when it started
--- after the count. Delete it afterwards as the table owner so the remaining
--- counts still see the run that started at 12:00.
+-- after the count plus the 10 minute margin. Delete it afterwards as the
+-- table owner so the remaining counts still see the run that started at 12:10.
 reset role;
 
 insert into
@@ -2124,12 +2296,15 @@ select
 set
   local role service_role;
 
+-- Item 002's zero count at 12:00 already moved last_occurred_at to 12:00.
+-- An equal counted_at is not back-dated, and 12:00 plus 10 minutes is the
+-- ok run's started_at.
 select
   lives_ok (
     $$select app.record_count(jsonb_build_object(
       'request_id', 'd1900000-0000-4000-8000-000000000037',
       'frequency', 'daily',
-      'counted_at', '2026-10-22T11:50:00Z',
+      'counted_at', '2026-10-22T12:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000002',
         'counted_qty', '6'

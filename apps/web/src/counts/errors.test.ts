@@ -27,13 +27,15 @@ describe('mapCountError', () => {
     expect(
       mapCountError({ code: '22023', message: 'a shift is still open' }),
     ).toBe(openShiftMessage);
-    expect(syncCoverageMessage).toBe('لازم مزامنة جديدة تتعمل بعد وقت الجرد');
+    expect(syncCoverageMessage).toBe(
+      'لازم مزامنة تبدأ بعد وقت الجرد بـ ١٠ دقايق على الأقل',
+    );
     expect(
       mapCountError({
         code: '22023',
         message: 'sync has not covered this count time',
       }),
-    ).toBe('لازم مزامنة جديدة تتعمل بعد وقت الجرد');
+    ).toBe('لازم مزامنة تبدأ بعد وقت الجرد بـ ١٠ دقايق على الأقل');
     expect(
       mapCountError({
         code: '22023',

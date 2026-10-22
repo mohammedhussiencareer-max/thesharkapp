@@ -26,7 +26,8 @@ export const insideShiftMessage =
 export const openShiftMessage =
   'فيه وردية لسه مفتوحة. اقفلها الأول وبعدين اعمل الجرد';
 
-export const syncCoverageMessage = 'لازم مزامنة جديدة تتعمل بعد وقت الجرد';
+export const syncCoverageMessage =
+  'لازم مزامنة تبدأ بعد وقت الجرد بـ ١٠ دقايق على الأقل';
 
 export const frequencyMessage = 'الصنف مش من أصناف الجرد ده';
 

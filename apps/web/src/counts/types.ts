@@ -9,6 +9,8 @@ export type CountItem = {
 
 export type CountLineDraft = {
   itemId: string;
+  /** Catalog name when the draft was built. Display only; the RPC does not send it. */
+  itemName?: string;
   countedQty: string;
 };
 

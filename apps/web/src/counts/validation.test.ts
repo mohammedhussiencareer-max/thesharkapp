@@ -73,7 +73,7 @@ describe('assessCount', () => {
   });
 
   it('refuses a bad balance, a duplicate, and more than 200 lines', () => {
-    const bad = assessCount(values(), [item({ onHandQty: '-1' })]);
+    const bad = assessCount(values(), [item({ avgCost: '-1' })]);
     expect(bad.errors.form).toBe(badBalanceMessage);
     expect(bad.preview).toBeNull();
     expect(bad.draft).toBeNull();
@@ -99,6 +99,36 @@ describe('assessCount', () => {
       item(),
     ]);
     expect(result.preview?.hasSurplus).toBe(true);
-    expect(result.draft?.lines).toEqual([{ itemId: 'fish', countedQty: '12' }]);
+    expect(result.draft?.lines).toEqual([
+      { itemId: 'fish', itemName: 'بلطي', countedQty: '12' },
+    ]);
+  });
+
+  it('accepts a negative on-hand and prices a count back to zero', () => {
+    const negative = item({
+      onHandQty: '-1',
+      onHandValue: '-10.00',
+      avgCost: '10',
+    });
+    const result = assessCount(values({ quantities: { fish: '0' } }), [
+      negative,
+    ]);
+    expect(result.errors.form).toBeUndefined();
+    expect(result.draft).toMatchObject({
+      lines: [{ itemId: 'fish', itemName: 'بلطي', countedQty: '0' }],
+    });
+    expect(result.preview?.lines).toEqual([
+      {
+        itemId: 'fish',
+        deltaQty: '1',
+        deltaValue: '10.00',
+        surplus: true,
+      },
+    ]);
+    expect(result.preview?.surplusValue).toBe('10.00');
+    expect(
+      assessCount(values({ quantities: { fish: '-1' } }), [negative]).errors
+        .quantities.fish,
+    ).toBe(quantityNegativeMessage);
   });
 });

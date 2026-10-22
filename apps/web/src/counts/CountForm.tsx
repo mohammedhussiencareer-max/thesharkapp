@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import { nowCairoDateTimeLocal } from '@/purchases/time';
+import { formatCairoDateTime, nowCairoDateTimeLocal } from '@/purchases/time';
 import { pendingResendMessage, surplusWarning } from '@/counts/errors';
 import { formatQty, formatSignedMoney } from '@/counts/format';
 import { formatMoneyText } from '@/purchases/decimal';
@@ -15,6 +15,13 @@ function emptyValues(): CountValues {
     note: '',
     quantities: {},
   };
+}
+
+/** datetime-local value for a pinned ISO count time, in the Cairo wall clock. */
+function pinnedCountTime(iso: string): string {
+  const formatted = formatCairoDateTime(iso);
+  const match = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})$/.exec(formatted);
+  return match ? `${match[1]}T${match[2]}` : iso;
 }
 
 export function CountForm({
@@ -104,7 +111,9 @@ export function CountForm({
             type="datetime-local"
             disabled={disabled}
             readOnly={pending !== null}
-            value={values.countedAt}
+            value={
+              pending ? pinnedCountTime(pending.countedAt) : values.countedAt
+            }
             onChange={(event) => edit({ countedAt: event.target.value })}
           />
         </label>
@@ -114,44 +123,66 @@ export function CountForm({
             className={fieldClass}
             disabled={disabled}
             readOnly={pending !== null}
-            value={values.note}
+            value={pending ? (pending.note ?? '') : values.note}
             onChange={(event) => edit({ note: event.target.value })}
           />
         </label>
       </div>
       <div className="flex flex-col gap-3">
-        {items.map((item) => {
-          const line = previewByItem.get(item.id);
-          const fieldError = submitted?.quantities[item.id];
-          return (
-            <div
-              key={item.id}
-              className={`flex flex-col gap-2 rounded border border-neutral-300 p-3${line?.surplus ? ' bg-amber-50' : ''}`}
-            >
-              <p className="font-medium">{item.name}</p>
-              <p>{`الرصيد ${formatQty(item.onHandQty)} — متوسط التكلفة ${formatQty(item.avgCost)} ج.م`}</p>
-              <label className="flex flex-col gap-1">
-                {`الكمية المعدودة ${item.name}`}
-                <input
-                  className={fieldClass}
-                  inputMode="decimal"
-                  disabled={disabled}
-                  readOnly={pending !== null}
-                  aria-invalid={fieldError ? true : undefined}
-                  value={values.quantities[item.id] ?? ''}
-                  onChange={(event) =>
-                    editQuantity(item.id, event.target.value)
-                  }
-                />
-              </label>
-              {fieldError ? <p role="alert">{fieldError}</p> : null}
-              {line ? (
-                <p>{`الفرق ${formatQty(line.deltaQty)} — القيمة ${formatSignedMoney(line.deltaValue)}`}</p>
-              ) : null}
-              {line?.surplus ? <p>{surplusWarning}</p> : null}
-            </div>
-          );
-        })}
+        {pending
+          ? pending.lines.map((line) => {
+              const name = line.itemName ?? line.itemId;
+              return (
+                <div
+                  key={line.itemId}
+                  className="flex flex-col gap-2 rounded border border-neutral-300 p-3"
+                >
+                  <p className="font-medium">{name}</p>
+                  <label className="flex flex-col gap-1">
+                    {`الكمية المعدودة ${name}`}
+                    <input
+                      className={fieldClass}
+                      inputMode="decimal"
+                      disabled={disabled}
+                      readOnly
+                      value={line.countedQty}
+                    />
+                  </label>
+                </div>
+              );
+            })
+          : items.map((item) => {
+              const line = previewByItem.get(item.id);
+              const fieldError = submitted?.quantities[item.id];
+              return (
+                <div
+                  key={item.id}
+                  className={`flex flex-col gap-2 rounded border border-neutral-300 p-3${line?.surplus ? ' bg-amber-50' : ''}`}
+                >
+                  <p className="font-medium">{item.name}</p>
+                  <p>{`الرصيد ${formatQty(item.onHandQty)} — متوسط التكلفة ${formatQty(item.avgCost)} ج.م`}</p>
+                  <label className="flex flex-col gap-1">
+                    {`الكمية المعدودة ${item.name}`}
+                    <input
+                      className={fieldClass}
+                      inputMode="decimal"
+                      disabled={disabled}
+                      readOnly={pending !== null}
+                      aria-invalid={fieldError ? true : undefined}
+                      value={values.quantities[item.id] ?? ''}
+                      onChange={(event) =>
+                        editQuantity(item.id, event.target.value)
+                      }
+                    />
+                  </label>
+                  {fieldError ? <p role="alert">{fieldError}</p> : null}
+                  {line ? (
+                    <p>{`الفرق ${formatQty(line.deltaQty)} — القيمة ${formatSignedMoney(line.deltaValue)}`}</p>
+                  ) : null}
+                  {line?.surplus ? <p>{surplusWarning}</p> : null}
+                </div>
+              );
+            })}
       </div>
       {preview ? (
         <section
