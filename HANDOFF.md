@@ -9,7 +9,7 @@ See [CLAUDE.md](CLAUDE.md) and [AI-WORKFLOW.md](AI-WORKFLOW.md). Design approved
 ## Hosted Supabase
 
 - Project `theshark`, ref `pltkoohfodvvmymlsycz`, region `eu-central-1`, free plan. URL and publishable key are in `apps/web/.env.production` (public values).
-- Migrations reach the hosted project through the Supabase MCP `apply_migration`, named after the file's suffix, only after the PR is merged. Applied: `baseline`, `owner_access`, `stock_ledger_core`, `owner_item_catalog`, `pos_sales` (2026-10-16) `pos_refunds_drawer`, `purchases_opening` and `expenses` (2026-10-21; hosted fingerprints match local, views included). `sorting` is applied after the task 18 PR merges. Advisors: `authenticated` may execute `is_owner`, `post_movements`, `post_sort`, `record_purchase`, `record_opening_stock`, the expense write RPCs, `record_sort` and the POS sync RPCs (intended: each checks the owner or service_role itself); `pos_sync_run_orders` has RLS with no policy (internal, no grants); leaked-password protection needs a paid plan.
+- Migrations reach the hosted project through the Supabase MCP `apply_migration`, named after the file's suffix, only after the PR is merged. Applied: `baseline`, `owner_access`, `stock_ledger_core`, `owner_item_catalog`, `pos_sales` (2026-10-16) `pos_refunds_drawer`, `purchases_opening` and `expenses` (2026-10-21; hosted fingerprints match local, views included). `sorting` (2026-10-22). `counts` is applied after the task 19 PR merges. Advisors: `authenticated` may execute `is_owner`, `post_movements`, `post_sort`, `record_purchase`, `record_opening_stock`, the expense write RPCs, `record_sort`, `record_count` and the POS sync RPCs (intended: each checks the owner or service_role itself); `pos_sync_run_orders` has RLS with no policy (internal, no grants); leaked-password protection needs a paid plan.
 - Dashboard settings done by the owner: signups disabled, schema `app` exposed in the Data API. Recommended but optional: turn off "Automatically expose new tables".
 - Owner account linked in `app.owner`. Verified from outside: signup returns `signup_disabled`; anon gets `permission denied for schema app`.
 
@@ -27,9 +27,9 @@ See [CLAUDE.md](CLAUDE.md) and [AI-WORKFLOW.md](AI-WORKFLOW.md). Design approved
 
 ## Open PRs
 
-- Task 18 (issue #21, fish sorting screen) is in review. Implementer: grok CLI (grok-4.7) until its weekly quota ends, then Grok via Cursor.
+- Task 19 (issue #23, daily stock count) is in review. Implementer: grok CLI (grok-4.7) until its weekly quota ends, then Grok via Cursor.
 
-Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner item catalog screen) → bae0ebe; PR #14 (task 13, POS sales sync) → c052d70; PR #17 (task 15, shift sales with refunds and drawer reconciliation) → e7d6068; PR #18 (task 16, purchases and opening stock with idempotent saves) → 3e40613; PR #20 (task 17, expenses with exact daily allocation) → 3b44997. Implementer: Grok 4.7 via Cursor; the Argon trial is over (paused, low weekly quota).
+Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner item catalog screen) → bae0ebe; PR #14 (task 13, POS sales sync) → c052d70; PR #17 (task 15, shift sales with refunds and drawer reconciliation) → e7d6068; PR #18 (task 16, purchases and opening stock with idempotent saves) → 3e40613; PR #20 (task 17, expenses with exact daily allocation) → 3b44997; PR #22 (task 18, fish sorting screen) → 4617b29; PR #25 (expense writes pin only on an unknown outcome) → b33f27b. Implementer: Grok 4.7 via Cursor; the Argon trial is over (paused, low weekly quota).
 
 ## Repository
 
@@ -37,8 +37,8 @@ Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner it
 
 ## Next
 
-- Finish task 15: shift sales screen, refunds from shift transactions, and drawer totals stored for reconciliation only. Net sales are completed order totals minus those refunds. A refunded order stays complete; its cost follows the cancel decision later (default «اتعمل»).
-- Purchases + opening stock, sorting, and count screens on the ledger; recipes (import + add/edit screen) and POS→recipe mapping; deduction engine.
+- Back-dated movements: recompute instead of refusing.
+- Recipes (import + add/edit screen) and POS→recipe mapping; deduction engine (cancel/refund cost decisions, waste); daily profit report; weekly count; server-side sync (Edge Function); PWA; daily backup with a restore test.
 
 ## Needs the owner
 
