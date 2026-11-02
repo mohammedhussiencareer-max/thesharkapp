@@ -57,7 +57,9 @@ export function CountsPage() {
   const [cardError, setCardError] = useState<string | null>(null);
   const [pending, setPending] = useState<CountDraft | null>(null);
   const [waiting, setWaiting] = useState<CountDraft | null>(null);
-  const [waitNotice, setWaitNotice] = useState(false);
+  // The request id whose waiting_for_sync reply is shown, so its own
+  // later success clears it even when no local draft matches (a card).
+  const [waitNotice, setWaitNotice] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [formEpoch, setFormEpoch] = useState(0);
   const [requestKey, setRequestKey] = useState(0);
@@ -150,9 +152,11 @@ export function CountsPage() {
     if (fromForm || matches(pending) || matches(waiting)) {
       setPending((current) => (matches(current) ? null : current));
       setWaiting((current) => (matches(current) ? null : current));
-      setWaitNotice(false);
       setFormEpoch((value) => value + 1);
     }
+    setWaitNotice((current) =>
+      current !== null && current === requestId ? null : current,
+    );
     // Stays set until the reload applies data, or a visible retryable error
     // replaces it. A stale read clears the lock instead of leaving it stuck.
     setNeedsReload(true);
@@ -173,7 +177,7 @@ export function CountsPage() {
       const replay =
         pending?.requestId === draft.requestId ||
         waiting?.requestId === draft.requestId;
-      setWaitNotice(false);
+      setWaitNotice(null);
       setPending((current) =>
         current?.requestId === draft.requestId ? null : current,
       );
@@ -186,7 +190,7 @@ export function CountsPage() {
     if (isUnknownOutcome(error)) {
       // A lost reply may have posted. The next حفظ resends this payload,
       // including when the lost call was the waiting resend.
-      setWaitNotice(false);
+      setWaitNotice(null);
       setPending((current) => (current && current !== draft ? current : draft));
       setWaiting((current) => (current && current !== draft ? current : null));
     }
@@ -202,7 +206,7 @@ export function CountsPage() {
         setWaiting(draft);
         setPending(null);
       }
-      setWaitNotice(true);
+      setWaitNotice(requestId ?? draft?.requestId ?? null);
       setSuccess(null);
       await refreshAfterWait();
       return false;
@@ -272,7 +276,7 @@ export function CountsPage() {
           setWaiting((current) =>
             current?.requestId === requestId ? null : current,
           );
-          setWaitNotice(false);
+          setWaitNotice(null);
         }
       } else {
         setNeedsReload(true);
@@ -293,7 +297,7 @@ export function CountsPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الجرد اليومي</h1>
-      {waiting || waitNotice ? (
+      {waiting || waitNotice !== null ? (
         <p role="status">{waitingForSyncMessage}</p>
       ) : null}
       {success ? <p role="status">{success}</p> : null}

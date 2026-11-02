@@ -904,4 +904,48 @@ describe('CountsPage', () => {
       expect(screen.getByRole('button', { name: 'سجّل الجرد' })).toBeEnabled();
     });
   });
+
+  it('clears the waiting notice when the same pending card later posts', async () => {
+    const stored = {
+      request_id: 'd1900000-0000-4000-8000-000000000061',
+      frequency: 'daily',
+      counted_at: '2026-10-22T10:00:00.000Z',
+      note: null,
+      lines: [{ item_id: 'tilapia', counted_qty: '7.000000' }],
+    };
+    const card = {
+      requestId: stored.request_id,
+      preparedAt: '2026-10-22T10:05:00.000Z',
+      countedAt: stored.counted_at,
+      itemCount: 1,
+      payload: stored,
+    };
+    vi.mocked(listPendingCounts).mockResolvedValue([card]);
+    render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    await screen.findByRole('heading', { name: 'جرد مستني المزامنة' });
+
+    vi.mocked(recordStoredCount).mockResolvedValueOnce({
+      status: 'waiting_for_sync',
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    expect(await screen.findByText(waitingForSyncMessage)).toBeInTheDocument();
+
+    vi.mocked(recordStoredCount).mockResolvedValueOnce({
+      status: 'posted',
+      countId: 'a1900000-0000-4000-8000-000000000061',
+    });
+    vi.mocked(listPendingCounts).mockResolvedValue([]);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'سجّل الجرد' })).toBeEnabled();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    expect(await screen.findByText('اتسجل الجرد')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByText(waitingForSyncMessage)).not.toBeInTheDocument();
+    });
+  });
 });
