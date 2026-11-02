@@ -28,10 +28,17 @@ export type CountDraft = {
   lines: CountLineDraft[];
 };
 
+/** One typed count line. The unit is the one on screen when the owner typed. */
+export type CountQuantityDraft = {
+  countedQty: string;
+  /** Null while the field is blank. A later catalog change must not replace it. */
+  expectedBaseUnit: BaseUnit | null;
+};
+
 export type CountValues = {
   countedAt: string;
   note: string;
-  quantities: Record<string, string>;
+  quantities: Record<string, CountQuantityDraft>;
 };
 
 export type CountWriteResult =

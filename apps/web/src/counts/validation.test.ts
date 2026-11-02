@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   atLeastOneMessage,
   badBalanceMessage,
+  countUnitReentryMessage,
   duplicateItemMessage,
   phoneMessage,
   quantityNegativeMessage,
@@ -27,7 +28,9 @@ function values(patch: Partial<CountValues> = {}): CountValues {
   return {
     countedAt: '2026-10-22T12:00',
     note: '',
-    quantities: { fish: '7' },
+    quantities: {
+      fish: { countedQty: '7', expectedBaseUnit: 'kg' },
+    },
     ...patch,
   };
 }
@@ -35,7 +38,12 @@ function values(patch: Partial<CountValues> = {}): CountValues {
 describe('assessCount', () => {
   it('accepts Arabic-Indic digits and omits a blank row', () => {
     const result = assessCount(
-      values({ quantities: { fish: '٧٫٥', other: '' } }),
+      values({
+        quantities: {
+          fish: { countedQty: '٧٫٥', expectedBaseUnit: 'kg' },
+          other: { countedQty: '', expectedBaseUnit: null },
+        },
+      }),
       [item(), item({ id: 'other', name: 'جمبري' })],
     );
     expect(result.draft).toMatchObject({
@@ -55,12 +63,22 @@ describe('assessCount', () => {
 
   it('refuses a negative quantity, a fine scale, a phone note, and an empty count', () => {
     expect(
-      assessCount(values({ quantities: { fish: '-1' } }), [item()]).errors
-        .quantities.fish,
+      assessCount(
+        values({
+          quantities: { fish: { countedQty: '-1', expectedBaseUnit: 'kg' } },
+        }),
+        [item()],
+      ).errors.quantities.fish,
     ).toBe(quantityNegativeMessage);
     expect(
-      assessCount(values({ quantities: { fish: '1.1234567' } }), [item()])
-        .errors.quantities.fish,
+      assessCount(
+        values({
+          quantities: {
+            fish: { countedQty: '1.1234567', expectedBaseUnit: 'kg' },
+          },
+        }),
+        [item()],
+      ).errors.quantities.fish,
     ).toBe(quantityScaleMessage);
     expect(
       assessCount(values({ note: '01001234567' }), [item()]).errors.note,
@@ -89,16 +107,24 @@ describe('assessCount', () => {
         name: `صنف ${index}`,
       }),
     );
-    const quantities = Object.fromEntries(many.map((row) => [row.id, '1']));
+    const quantities: CountValues['quantities'] = Object.fromEntries(
+      many.map((row) => [
+        row.id,
+        { countedQty: '1', expectedBaseUnit: 'kg' as const },
+      ]),
+    );
     const tooMany = assessCount(values({ quantities }), many);
     expect(tooMany.errors.form).toBe(tooManyMessage);
     expect(tooMany.draft).toBeNull();
   });
 
   it('allows a surplus and keeps it in the draft', () => {
-    const result = assessCount(values({ quantities: { fish: '12' } }), [
-      item(),
-    ]);
+    const result = assessCount(
+      values({
+        quantities: { fish: { countedQty: '12', expectedBaseUnit: 'kg' } },
+      }),
+      [item()],
+    );
     expect(result.preview?.hasSurplus).toBe(true);
     expect(result.draft?.lines).toEqual([
       {
@@ -116,9 +142,12 @@ describe('assessCount', () => {
       onHandValue: '-10.00',
       avgCost: '10',
     });
-    const result = assessCount(values({ quantities: { fish: '0' } }), [
-      negative,
-    ]);
+    const result = assessCount(
+      values({
+        quantities: { fish: { countedQty: '0', expectedBaseUnit: 'kg' } },
+      }),
+      [negative],
+    );
     expect(result.errors.form).toBeUndefined();
     expect(result.draft).toMatchObject({
       lines: [
@@ -140,8 +169,42 @@ describe('assessCount', () => {
     ]);
     expect(result.preview?.surplusValue).toBe('10.00');
     expect(
-      assessCount(values({ quantities: { fish: '-1' } }), [negative]).errors
-        .quantities.fish,
+      assessCount(
+        values({
+          quantities: { fish: { countedQty: '-1', expectedBaseUnit: 'kg' } },
+        }),
+        [negative],
+      ).errors.quantities.fish,
     ).toBe(quantityNegativeMessage);
+  });
+
+  it('refuses a typed line when the catalog unit is no longer the captured unit', () => {
+    expect(countUnitReentryMessage).toBe('وحدة الصنف اتغيرت، اكتب الكمية تاني');
+    const changed = assessCount(values(), [item({ baseUnit: 'piece' })]);
+    expect(changed.errors.quantities.fish).toBe(countUnitReentryMessage);
+    expect(changed.errors.form).toBeUndefined();
+    expect(changed.preview).toBeNull();
+    expect(changed.draft).toBeNull();
+
+    const missing = assessCount(
+      values({
+        quantities: { fish: { countedQty: '7', expectedBaseUnit: null } },
+      }),
+      [item()],
+    );
+    expect(missing.errors.quantities.fish).toBe(countUnitReentryMessage);
+    expect(missing.draft).toBeNull();
+
+    const cleared = assessCount(
+      values({
+        quantities: {
+          fish: { countedQty: '  ', expectedBaseUnit: 'kg' },
+        },
+      }),
+      [item({ baseUnit: 'piece' })],
+    );
+    expect(cleared.errors.quantities.fish).toBeUndefined();
+    expect(cleared.errors.form).toBe(atLeastOneMessage);
+    expect(cleared.draft).toBeNull();
   });
 });

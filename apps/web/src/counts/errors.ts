@@ -38,6 +38,9 @@ export const unknownItemMessage = 'الصنف مش موجود';
 
 export const baseUnitChangedMessage = 'وحدة الصنف اتغيرت، راجع الجرد';
 
+/** A typed line still carries the unit from entry. The owner must type it again. */
+export const countUnitReentryMessage = 'وحدة الصنف اتغيرت، اكتب الكمية تاني';
+
 export const phoneMessage = 'مينفعش تكتب أرقام تليفونات أو أرقام قومية';
 
 export const quantityScaleMessage =

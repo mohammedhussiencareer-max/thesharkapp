@@ -13,6 +13,7 @@ import {
 import {
   atLeastOneMessage,
   badBalanceMessage,
+  countUnitReentryMessage,
   duplicateItemMessage,
   noteLengthMessage,
   phoneMessage,
@@ -43,7 +44,7 @@ export type CountAssessment = {
 type PricedLine = {
   itemId: string;
   itemName: string;
-  baseUnit: CountItem['baseUnit'];
+  expectedBaseUnit: CountItem['baseUnit'];
   counted: Dec;
   onHand: Dec;
   onHandValue: Dec;
@@ -126,7 +127,18 @@ export function assessCount(
   let qtyFailed = false;
   let balanceFailed = false;
   for (const item of catalog) {
-    const raw = values.quantities[item.id] ?? '';
+    const entry = values.quantities[item.id];
+    const raw = entry?.countedQty ?? '';
+    // A blank field is not part of this count, even if an old unit is still stored.
+    if (raw.trim() === '') continue;
+    // The payload must carry the unit captured at entry. A missing or
+    // different catalog unit means this quantity is no longer that count.
+    const captured = entry?.expectedBaseUnit ?? null;
+    if (captured !== item.baseUnit) {
+      errors.quantities[item.id] = countUnitReentryMessage;
+      qtyFailed = true;
+      continue;
+    }
     const parsed = parseCounted(raw);
     if (!parsed.ok) {
       errors.quantities[item.id] = parsed.error;
@@ -149,7 +161,7 @@ export function assessCount(
     priced.push({
       itemId: item.id,
       itemName: item.name,
-      baseUnit: item.baseUnit,
+      expectedBaseUnit: captured,
       counted: parsed.value,
       onHand: balance.onHand,
       onHandValue: balance.onHandValue,
@@ -198,7 +210,7 @@ export function assessCount(
         itemId: line.itemId,
         itemName: line.itemName,
         countedQty: formatDec(line.counted),
-        expectedBaseUnit: line.baseUnit,
+        expectedBaseUnit: line.expectedBaseUnit,
       })),
     },
   };

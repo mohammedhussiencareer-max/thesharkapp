@@ -1029,4 +1029,102 @@ describe('CountsPage', () => {
     );
     expect(screen.queryByText(waitingForSyncMessage)).not.toBeInTheDocument();
   });
+
+  it('shows the catalog base unit next to each quantity', async () => {
+    vi.mocked(listDailyItems).mockResolvedValue([
+      tilapia,
+      { ...shrimp, baseUnit: 'piece' },
+    ]);
+    await renderPage();
+    expect(
+      screen.getByLabelText('الكمية المعدودة بلطي').parentElement,
+    ).toHaveTextContent('كيلو');
+    expect(
+      screen.getByLabelText('الكمية المعدودة جمبري').parentElement,
+    ).toHaveTextContent('قطعة');
+  });
+
+  it('blocks a save when the unit changes after the quantity was typed', async () => {
+    await renderPage();
+    fillShortage();
+    expect(
+      screen.getByLabelText('الكمية المعدودة بلطي').parentElement,
+    ).toHaveTextContent('كيلو');
+
+    vi.mocked(listDailyItems).mockResolvedValueOnce([
+      { ...tilapia, baseUnit: 'piece' },
+      shrimp,
+    ]);
+    fireEvent.click(screen.getByRole('button', { name: 'تحديث' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'وحدة الصنف اتغيرت، اكتب الكمية تاني',
+    );
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('7');
+    expect(
+      screen.getByLabelText('الكمية المعدودة بلطي').parentElement,
+    ).toHaveTextContent('كيلو');
+    expect(
+      screen.getByLabelText('الكمية المعدودة بلطي').parentElement,
+    ).not.toHaveTextContent('قطعة');
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(recordCount).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('الكمية المعدودة بلطي'), {
+      target: { value: '' },
+    });
+    expect(
+      screen.queryByText('وحدة الصنف اتغيرت، اكتب الكمية تاني'),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText('الكمية المعدودة بلطي').parentElement,
+    ).toHaveTextContent('قطعة');
+
+    fireEvent.change(screen.getByLabelText('الكمية المعدودة بلطي'), {
+      target: { value: '7' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordCount).toHaveBeenCalledTimes(1);
+    });
+    expect(vi.mocked(recordCount).mock.calls[0]?.[0]?.lines).toEqual([
+      {
+        itemId: 'tilapia',
+        itemName: 'بلطي',
+        countedQty: '7',
+        expectedBaseUnit: 'piece',
+      },
+    ]);
+  });
+
+  it('keeps a typed quantity when a refresh leaves the unit unchanged', async () => {
+    await renderPage();
+    fillShortage();
+    vi.mocked(listDailyItems).mockResolvedValueOnce([
+      { ...tilapia, onHandQty: '8' },
+      shrimp,
+    ]);
+    fireEvent.click(screen.getByRole('button', { name: 'تحديث' }));
+    expect(await screen.findByText(/الرصيد 8/)).toBeInTheDocument();
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('7');
+    expect(
+      screen.getByLabelText('الكمية المعدودة بلطي').parentElement,
+    ).toHaveTextContent('كيلو');
+    expect(
+      screen.queryByText('وحدة الصنف اتغيرت، اكتب الكمية تاني'),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordCount).toHaveBeenCalledTimes(1);
+    });
+    expect(vi.mocked(recordCount).mock.calls[0]?.[0]?.lines).toEqual([
+      {
+        itemId: 'tilapia',
+        itemName: 'بلطي',
+        countedQty: '7',
+        expectedBaseUnit: 'kg',
+      },
+    ]);
+  });
 });
