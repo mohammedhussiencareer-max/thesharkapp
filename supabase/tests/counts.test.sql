@@ -293,8 +293,8 @@ select
     'record_count is security definer with an empty search_path'
   );
 
--- First match of each name. Replay reads stock_counts, then the prepare
--- table, then shift and item guards, then the request insert. Coverage
+-- First match of each name. Replay reads stock_counts, then pos_shifts is
+-- locked in share mode, then the prepare table, then shift and item guards, then the request insert. Coverage
 -- reads sync runs after that insert. The count document insert is after
 -- post_movements. Later guard reads do not change the first match.
 select
@@ -304,9 +304,10 @@ select
         position('app.assert_ledger_write_allowed' in def) > 0
         and position('app.assert_ledger_write_allowed' in def) < position('app.assert_no_phone_text' in def)
         and position('app.assert_no_phone_text' in def) < position('app.stock_counts' in def)
-        and position('app.stock_counts' in def) < position('app.stock_count_requests' in def)
-        and position('app.stock_count_requests' in def) < position('app.pos_shifts' in def)
-        and position('app.pos_shifts' in def) < position('app.stock_items' in def)
+        and position('app.stock_counts' in def) < position('lock table app.pos_shifts in share mode' in def)
+        and position('lock table app.pos_shifts in share mode' in def) < position('app.stock_count_requests' in def)
+        and position('app.stock_count_requests' in def) < position('app.pos_shifts shift' in def)
+        and position('app.pos_shifts shift' in def) < position('app.stock_items' in def)
         and position('app.stock_items' in def) < position('insert into' in lower(def))
         and position('insert into' in lower(def)) < position('app.pos_sync_runs' in def)
         and position('app.pos_sync_runs' in def) < position('app.lock_and_validate_item_balance' in def)
@@ -319,6 +320,21 @@ select
         ) s
     ),
     'record_count locks, replays, prepares, then covers and posts'
+  );
+
+select
+  ok (
+    (
+      select
+        position('lock table app.pos_shifts in share mode' in def) > 0
+        and position('lock table app.pos_shifts in share mode' in def) < position('app.pos_shifts shift' in def)
+      from
+        (
+          select
+            pg_catalog.pg_get_functiondef ('app.record_count(jsonb)'::regprocedure) as def
+        ) s
+    ),
+    'record_count locks pos_shifts before any shift guard or coverage read'
   );
 
 select
@@ -1585,6 +1601,27 @@ select
     'a refused count does not store a prepare row'
   );
 
+-- The coverage read and the shift guards see one mirror state: record_count
+-- holds app.pos_shifts in SHARE mode, so a concurrent ingest cannot commit a
+-- close between them. No earlier statement in this transaction holds it.
+select
+  is (
+    (
+      select
+        pg_catalog.count (*)
+      from
+        pg_catalog.pg_locks lock_row
+      where
+        lock_row.locktype = 'relation'
+        and lock_row.relation = 'app.pos_shifts'::regclass
+        and lock_row.mode = 'ShareLock'
+        and lock_row.pid = pg_catalog.pg_backend_pid ()
+        and lock_row.granted
+    ),
+    0::bigint,
+    'no share lock on pos_shifts is held before the first stored count'
+  );
+
 -- Prepare, then sync. These requests use item 001 and do not post, so the
 -- opening at 08:00 is still that item's first movement. Coverage is the
 -- newest finished ok run: started_at must be after prepared_at and after the
@@ -1614,6 +1651,24 @@ select
     ),
     jsonb_build_object('status', 'waiting_for_sync'),
     'the first submit waits for a sync that starts after it'
+  );
+
+select
+  is (
+    (
+      select
+        pg_catalog.count (*)
+      from
+        pg_catalog.pg_locks lock_row
+      where
+        lock_row.locktype = 'relation'
+        and lock_row.relation = 'app.pos_shifts'::regclass
+        and lock_row.mode = 'ShareLock'
+        and lock_row.pid = pg_catalog.pg_backend_pid ()
+        and lock_row.granted
+    ),
+    1::bigint,
+    'record_count holds pos_shifts in share mode until the transaction ends'
   );
 
 select

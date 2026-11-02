@@ -263,6 +263,11 @@ export function CountsPage() {
         // The form is hidden when nothing is active, so a card refusal
         // has to render beside the pending list.
         setCardError(reportedCountError(error));
+        // A definite refusal of this card ends its wait, even with no local
+        // draft for it (after a reload). An unknown outcome keeps the notice.
+        if (requestId && !isUnknownOutcome(error)) {
+          setWaitNotice((current) => (current === requestId ? null : current));
+        }
         if (
           requestId &&
           (pending?.requestId === requestId ||

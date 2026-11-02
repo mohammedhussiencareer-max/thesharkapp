@@ -64,7 +64,9 @@
 -- Lock order matches record_sort. app.assert_ledger_write_allowed() is the
 -- first statement. It checks the owner (or service_role) and takes advisory
 -- lock 7342750000000000001 before the request_id replay and before
--- lock_and_validate_item_balance locks item_balances. Replay compares the
+-- lock_and_validate_item_balance locks item_balances. After the posted
+-- replay, app.pos_shifts is locked in SHARE mode so the coverage read and
+-- the shift guards see one mirror state while ingest runs concurrently. Replay compares the
 -- normalized payload only and returns before any catalog, shift, sync, or
 -- balance read. counted_qty in that payload is numeric(20, 6) text, never a
 -- JSON number: a 14-digit, 6-decimal number does not round-trip through
@@ -562,6 +564,14 @@ begin
       v_existing_id
     );
   end if;
+
+  -- The coverage read and the shift guards must see one mirror state. POS
+  -- ingest does not take the posting lock, so under read committed a close
+  -- committed between those statements could pass the guards without its
+  -- stamp in the coverage check. SHARE mode blocks shift inserts and updates
+  -- until this transaction ends and waits for any in-flight ingest to commit
+  -- first. Ingest never waits on the posting lock, so no lock cycle exists.
+  lock table app.pos_shifts in share mode;
 
   select
     request.payload,
