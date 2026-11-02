@@ -43,6 +43,7 @@ export type CountAssessment = {
 type PricedLine = {
   itemId: string;
   itemName: string;
+  baseUnit: CountItem['baseUnit'];
   counted: Dec;
   onHand: Dec;
   onHandValue: Dec;
@@ -148,6 +149,7 @@ export function assessCount(
     priced.push({
       itemId: item.id,
       itemName: item.name,
+      baseUnit: item.baseUnit,
       counted: parsed.value,
       onHand: balance.onHand,
       onHandValue: balance.onHandValue,
@@ -196,6 +198,7 @@ export function assessCount(
         itemId: line.itemId,
         itemName: line.itemName,
         countedQty: formatDec(line.counted),
+        expectedBaseUnit: line.baseUnit,
       })),
     },
   };

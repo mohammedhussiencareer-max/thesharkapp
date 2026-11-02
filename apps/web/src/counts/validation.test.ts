@@ -15,6 +15,7 @@ function item(patch: Partial<CountItem> = {}): CountItem {
   return {
     id: 'fish',
     name: 'بلطي',
+    baseUnit: 'kg',
     onHandQty: '10',
     onHandValue: '100.00',
     avgCost: '10.05',
@@ -40,7 +41,7 @@ describe('assessCount', () => {
     expect(result.draft).toMatchObject({
       countedAt: '2026-10-22T09:00:00.000Z',
       note: null,
-      lines: [{ itemId: 'fish', countedQty: '7.5' }],
+      lines: [{ itemId: 'fish', countedQty: '7.5', expectedBaseUnit: 'kg' }],
     });
     expect(result.preview?.lines).toHaveLength(1);
   });
@@ -100,7 +101,12 @@ describe('assessCount', () => {
     ]);
     expect(result.preview?.hasSurplus).toBe(true);
     expect(result.draft?.lines).toEqual([
-      { itemId: 'fish', itemName: 'بلطي', countedQty: '12' },
+      {
+        itemId: 'fish',
+        itemName: 'بلطي',
+        countedQty: '12',
+        expectedBaseUnit: 'kg',
+      },
     ]);
   });
 
@@ -115,7 +121,14 @@ describe('assessCount', () => {
     ]);
     expect(result.errors.form).toBeUndefined();
     expect(result.draft).toMatchObject({
-      lines: [{ itemId: 'fish', itemName: 'بلطي', countedQty: '0' }],
+      lines: [
+        {
+          itemId: 'fish',
+          itemName: 'بلطي',
+          countedQty: '0',
+          expectedBaseUnit: 'kg',
+        },
+      ],
     });
     expect(result.preview?.lines).toEqual([
       {

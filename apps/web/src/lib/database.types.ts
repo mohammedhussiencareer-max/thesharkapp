@@ -399,14 +399,14 @@ isOneToOne: false
                   ]
                 },"stock_count_lines": {
                   Row: {
-                    "count_id": string,"counted_qty": number,"delta_qty": number,"delta_value": number,"expected_qty": number,"item_id": string,"line_no": number,"movement_id": number | null
+                    "count_id": string,"counted_qty": number,"delta_qty": number,"delta_value": number,"expected_base_unit": string,"expected_qty": number,"item_id": string,"line_no": number,"movement_id": number | null
                   }
                   ComputedFields: never
                   Insert: {
-                    "count_id": string,"counted_qty": number,"delta_qty": number,"delta_value": number,"expected_qty": number,"item_id": string,"line_no": number,"movement_id"?: number | null
+                    "count_id": string,"counted_qty": number,"delta_qty": number,"delta_value": number,"expected_base_unit": string,"expected_qty": number,"item_id": string,"line_no": number,"movement_id"?: number | null
                   }
                   Update: {
-                    "count_id"?: string,"counted_qty"?: number,"delta_qty"?: number,"delta_value"?: number,"expected_qty"?: number,"item_id"?: string,"line_no"?: number,"movement_id"?: number | null
+                    "count_id"?: string,"counted_qty"?: number,"delta_qty"?: number,"delta_value"?: number,"expected_base_unit"?: string,"expected_qty"?: number,"item_id"?: string,"line_no"?: number,"movement_id"?: number | null
                   }
                   Relationships: [
                     {

@@ -15,6 +15,7 @@ import {
 } from '@/counts/errors';
 import type { CountDraft } from '@/counts/types';
 import type { Json } from '@/lib/database.types';
+import { pageSize, PageCapError } from '@/lib/paged';
 
 const mocks = vi.hoisted(() => ({
   schema: vi.fn(),
@@ -30,7 +31,8 @@ function query(result: { data: unknown; error: unknown }) {
     filters: { op: string; column: string; value: unknown }[];
     orders: { column: string; ascending: boolean | undefined }[];
     ranges: { from: number; to: number }[];
-  } = { filters: [], orders: [], ranges: [] };
+    limits: number[];
+  } = { filters: [], orders: [], ranges: [], limits: [] };
   const chain: Record<string, unknown> = {};
   chain.select = (columns?: unknown) => {
     captured.select = columns;
@@ -40,12 +42,16 @@ function query(result: { data: unknown; error: unknown }) {
     captured.orders.push({ column, ascending: options?.ascending });
     return chain;
   };
-  for (const op of ['eq', 'gte', 'lt', 'in'] as const) {
+  for (const op of ['eq', 'gt', 'gte', 'lt', 'in'] as const) {
     chain[op] = (column: string, value: unknown) => {
       captured.filters.push({ op, column, value });
       return chain;
     };
   }
+  chain.limit = (count: number) => {
+    captured.limits.push(count);
+    return chain;
+  };
   chain.range = (from: number, to: number) => {
     captured.ranges.push({ from, to });
     return chain;
@@ -62,8 +68,8 @@ const draft: CountDraft = {
   countedAt: '2026-10-22T10:00:00.000Z',
   note: 'جرد الصباح',
   lines: [
-    { itemId: 'tilapia', countedQty: '7.000000' },
-    { itemId: 'shrimp', countedQty: '6' },
+    { itemId: 'tilapia', countedQty: '7.000000', expectedBaseUnit: 'kg' },
+    { itemId: 'shrimp', countedQty: '6', expectedBaseUnit: 'kg' },
   ],
 };
 
@@ -92,8 +98,12 @@ describe('counts api', () => {
         counted_at: '2026-10-22T10:00:00.000Z',
         note: 'جرد الصباح',
         lines: [
-          { item_id: 'tilapia', counted_qty: '7.000000' },
-          { item_id: 'shrimp', counted_qty: '6' },
+          {
+            item_id: 'tilapia',
+            counted_qty: '7.000000',
+            expected_base_unit: 'kg',
+          },
+          { item_id: 'shrimp', counted_qty: '6', expected_base_unit: 'kg' },
         ],
       },
     });
@@ -114,7 +124,9 @@ describe('counts api', () => {
       frequency: 'daily',
       counted_at: draft.countedAt,
       note: draft.note,
-      lines: [{ item_id: 'tilapia', counted_qty: '7' }],
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
     };
     const rpc = vi.fn().mockResolvedValue({
       data: { status: 'waiting_for_sync' },
@@ -183,6 +195,7 @@ describe('counts api', () => {
         {
           id: 'shrimp',
           name: 'جمبري',
+          base_unit: 'kg',
           active: true,
           count_frequency: 'daily',
           item_balances: {
@@ -194,6 +207,7 @@ describe('counts api', () => {
         {
           id: 'spice',
           name: 'توابل',
+          base_unit: 'kg',
           active: true,
           count_frequency: 'weekly',
           item_balances: null,
@@ -201,6 +215,7 @@ describe('counts api', () => {
         {
           id: 'stopped',
           name: 'موقوف',
+          base_unit: 'kg',
           active: false,
           count_frequency: 'daily',
           item_balances: null,
@@ -208,6 +223,7 @@ describe('counts api', () => {
         {
           id: 'tilapia',
           name: 'بلطي',
+          base_unit: 'kg',
           active: true,
           count_frequency: 'daily',
           item_balances: {
@@ -226,8 +242,10 @@ describe('counts api', () => {
     expect(built.captured.orders).toEqual([{ column: 'id', ascending: true }]);
     expect(String(built.captured.select)).toContain('on_hand_qty::text');
     expect(items.map((row) => row.name)).toEqual(['بلطي', 'جمبري']);
+    expect(String(built.captured.select)).toContain('base_unit');
     expect(items[0]).toMatchObject({
       id: 'tilapia',
+      baseUnit: 'kg',
       onHandQty: '10',
       onHandValue: '100.00',
       avgCost: '10.05',
@@ -281,22 +299,56 @@ describe('counts api', () => {
     });
   });
 
-  it('reads pending counts in prepare order and keeps the stored payload', async () => {
-    const payload = {
+  it('reads pending counts by request id and shows them in prepare order', async () => {
+    const later = {
+      request_id: 'd1900000-0000-4000-8000-000000000061',
+      frequency: 'daily',
+      counted_at: '2026-10-22T11:00:00.000Z',
+      note: null,
+      lines: [
+        { item_id: 'shrimp', counted_qty: '3', expected_base_unit: 'kg' },
+      ],
+    };
+    const earlier = {
       request_id: 'd1900000-0000-4000-8000-000000000060',
       frequency: 'daily',
       counted_at: '2026-10-22T10:00:00.000Z',
       note: null,
-      lines: [{ item_id: 'tilapia', counted_qty: '7' }],
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
+    };
+    const sameTime = {
+      request_id: 'd1900000-0000-4000-8000-000000000062',
+      frequency: 'daily',
+      counted_at: '2026-10-22T10:00:00.000Z',
+      note: null,
+      lines: [
+        { item_id: 'shrimp', counted_qty: '1', expected_base_unit: 'kg' },
+      ],
     };
     const built = query({
       data: [
         {
-          request_id: 'd1900000-0000-4000-8000-000000000060',
-          prepared_at: '2026-10-22T10:05:00.000Z',
-          counted_at: '2026-10-22T10:00:00.000Z',
+          request_id: later.request_id,
+          prepared_at: '2026-10-22T11:05:00.000Z',
+          counted_at: later.counted_at,
           item_count: 1,
-          payload,
+          payload: later,
+        },
+        {
+          request_id: earlier.request_id,
+          prepared_at: '2026-10-22T10:05:00.000Z',
+          counted_at: earlier.counted_at,
+          item_count: 1,
+          payload: earlier,
+        },
+        {
+          request_id: sameTime.request_id,
+          prepared_at: '2026-10-22T10:05:00.000Z',
+          counted_at: sameTime.counted_at,
+          item_count: 1,
+          payload: sameTime,
         },
       ],
       error: null,
@@ -313,20 +365,24 @@ describe('counts api', () => {
 
     expect(tables).toEqual(['stock_count_pending']);
     expect(built.captured.orders).toEqual([
-      { column: 'prepared_at', ascending: true },
       { column: 'request_id', ascending: true },
     ]);
-    expect(built.captured.ranges).toEqual([{ from: 0, to: 999 }]);
+    expect(built.captured.limits).toEqual([pageSize]);
+    expect(built.captured.ranges).toEqual([]);
+    expect(built.captured.filters).toEqual([]);
     expect(String(built.captured.select)).toContain('payload');
-    expect(pending).toEqual([
-      {
-        requestId: 'd1900000-0000-4000-8000-000000000060',
-        preparedAt: '2026-10-22T10:05:00.000Z',
-        countedAt: '2026-10-22T10:00:00.000Z',
-        itemCount: 1,
-        payload,
-      },
+    expect(pending.map((row) => row.requestId)).toEqual([
+      earlier.request_id,
+      sameTime.request_id,
+      later.request_id,
     ]);
+    expect(pending[0]).toEqual({
+      requestId: earlier.request_id,
+      preparedAt: '2026-10-22T10:05:00.000Z',
+      countedAt: earlier.counted_at,
+      itemCount: 1,
+      payload: earlier,
+    });
 
     const broken = query({
       data: [
@@ -346,7 +402,7 @@ describe('counts api', () => {
 
   it('keeps a 14-digit quantity string exact through JSON parse and resend', async () => {
     const wire =
-      '{"request_id":"d1900000-0000-4000-8000-000000000080","frequency":"daily","counted_at":"2026-10-22T12:00:00.000Z","note":null,"lines":[{"item_id":"c1900000-0000-4000-8000-000000000009","counted_qty":"12345678901234.123456"}]}';
+      '{"request_id":"d1900000-0000-4000-8000-000000000080","frequency":"daily","counted_at":"2026-10-22T12:00:00.000Z","note":null,"lines":[{"item_id":"c1900000-0000-4000-8000-000000000009","counted_qty":"12345678901234.123456","expected_base_unit":"kg"}]}';
     const payload = JSON.parse(wire) as Json;
     const built = query({
       data: [
@@ -378,6 +434,124 @@ describe('counts api', () => {
     expect(rpc).toHaveBeenCalledWith('record_count', { p_count: payload });
     expect(JSON.stringify(rpc.mock.calls[0]?.[1])).toContain(
       '"counted_qty":"12345678901234.123456"',
+    );
+  });
+
+  it('does not skip a pending request when an earlier page loses a row', async () => {
+    const total = pageSize + 2;
+    const ids = Array.from(
+      { length: total },
+      (_, index) =>
+        `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`,
+    );
+    const vanished = ids[0] ?? '';
+    const shifted = ids[pageSize] ?? '';
+    let dropped = false;
+    const calls: { gt: string | null; limit: number | null }[] = [];
+
+    function row(id: string) {
+      return {
+        request_id: id,
+        prepared_at: '2026-10-22T10:00:00.000Z',
+        counted_at: '2026-10-22T09:00:00.000Z',
+        item_count: 1,
+        payload: {
+          request_id: id,
+          lines: [
+            { item_id: 'tilapia', counted_qty: '1', expected_base_unit: 'kg' },
+          ],
+        },
+      };
+    }
+
+    mocks.schema.mockReturnValue({
+      from: () => {
+        let gt: string | null = null;
+        let limit: number | null = null;
+        const chain: Record<string, unknown> = {};
+        chain.select = () => chain;
+        chain.order = () => chain;
+        chain.gt = (_column: string, value: string) => {
+          gt = value;
+          return chain;
+        };
+        chain.limit = (count: number) => {
+          limit = count;
+          return chain;
+        };
+        chain.range = () => {
+          throw new Error('offset range');
+        };
+        chain.then = (
+          resolve: (value: unknown) => unknown,
+          reject?: (reason: unknown) => unknown,
+        ) => {
+          calls.push({ gt, limit });
+          const visible = ids.filter((id) => !(dropped && id === vanished));
+          const page = visible
+            .filter((id) => gt === null || id > gt)
+            .slice(0, limit ?? visible.length)
+            .map(row);
+          if (gt === null) dropped = true;
+          return Promise.resolve({ data: page, error: null }).then(
+            resolve,
+            reject,
+          );
+        };
+        return chain;
+      },
+    });
+
+    const pending = await listPendingCounts();
+    const seen = pending.map((count) => count.requestId);
+
+    expect(calls[0]).toEqual({ gt: null, limit: pageSize });
+    expect(calls[1]?.gt).toBe(ids[pageSize - 1]);
+    expect(seen).toContain(shifted);
+    expect(seen).toEqual(ids);
+  });
+
+  it('stops a pending read after the page cap', async () => {
+    mocks.schema.mockReturnValue({
+      from: () => {
+        let gt: string | null = null;
+        const chain: Record<string, unknown> = {};
+        chain.select = () => chain;
+        chain.order = () => chain;
+        chain.gt = (_column: string, value: string) => {
+          gt = value;
+          return chain;
+        };
+        chain.limit = () => chain;
+        chain.then = (
+          resolve: (value: unknown) => unknown,
+          reject?: (reason: unknown) => unknown,
+        ) => {
+          const start =
+            gt === null
+              ? 0
+              : Number.parseInt(gt.slice(gt.lastIndexOf('-') + 1), 16) + 1;
+          const data = Array.from({ length: pageSize }, (_, offset) => {
+            const index = start + offset;
+            const requestId = `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`;
+            return {
+              request_id: requestId,
+              prepared_at: '2026-10-22T10:00:00.000Z',
+              counted_at: '2026-10-22T09:00:00.000Z',
+              item_count: 1,
+              payload: { request_id: requestId },
+            };
+          });
+          return Promise.resolve({ data, error: null }).then(resolve, reject);
+        };
+        return chain;
+      },
+    });
+
+    await expect(listPendingCounts()).rejects.toThrow(genericCountError);
+    await expect(listPendingCounts()).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof Error && error.cause instanceof PageCapError,
     );
   });
 });

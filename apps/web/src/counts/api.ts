@@ -1,5 +1,6 @@
 import type { Json } from '@/lib/database.types';
-import { fetchAllPages, PageCapError } from '@/lib/paged';
+import { isBaseUnit } from '@/items/types';
+import { fetchAllPages, maxPages, pageSize, PageCapError } from '@/lib/paged';
 import { supabase } from '@/lib/supabase';
 import {
   genericCountError,
@@ -132,7 +133,7 @@ export async function listDailyItems(): Promise<CountItem[]> {
       appDb()
         .from('stock_items')
         .select(
-          'id, name, active, count_frequency, item_balances(on_hand_qty_text:on_hand_qty::text, on_hand_value_text:on_hand_value::text, avg_cost_text:avg_cost::text)',
+          'id, name, base_unit, active, count_frequency, item_balances(on_hand_qty_text:on_hand_qty::text, on_hand_value_text:on_hand_value::text, avg_cost_text:avg_cost::text)',
         )
         .order('id', { ascending: true })
         .range(from, to),
@@ -142,10 +143,12 @@ export async function listDailyItems(): Promise<CountItem[]> {
     (row) => row.active === true && row.count_frequency === 'daily',
   );
   return daily.sort(byNameThenId).map((row) => {
+    if (!isBaseUnit(row.base_unit)) throw new Error(genericCountError);
     const balance = balanceOf(row.item_balances);
     return {
       id: row.id,
       name: row.name,
+      baseUnit: row.base_unit,
       onHandQty: balance.onHandQty,
       onHandValue: balance.onHandValue,
       avgCost: balance.avgCost,
@@ -225,6 +228,7 @@ function countPayload(draft: CountDraft): Json {
     lines: draft.lines.map((line) => ({
       item_id: line.itemId,
       counted_qty: line.countedQty,
+      expected_base_unit: line.expectedBaseUnit,
     })),
   };
 }
@@ -266,7 +270,7 @@ export async function recordCount(
   return parseCountWrite(data);
 }
 
-/** Resend the stored payload unchanged, including exact counted_qty strings. */
+/** Resend the stored payload unchanged, including exact counted_qty strings and the pinned unit. */
 export async function recordStoredCount(
   payload: Json,
 ): Promise<CountWriteResult> {
@@ -276,22 +280,77 @@ export async function recordStoredCount(
   return parseCountWrite(data);
 }
 
-export async function listPendingCounts(): Promise<PendingCount[]> {
-  const data = await readPages(
-    (from, to) =>
-      appDb()
-        .from('stock_count_pending')
-        .select('request_id, prepared_at, counted_at, item_count, payload')
-        .order('prepared_at', { ascending: true })
-        .order('request_id', { ascending: true })
-        .range(from, to),
-    (row) => {
+type PendingRow = {
+  request_id: string | null;
+  prepared_at: string | null;
+  counted_at: string | null;
+  item_count: number | null;
+  payload: Json | null;
+};
+
+function byPreparedThenRequest(left: PendingRow, right: PendingRow): number {
+  const at =
+    timeValue(left.prepared_at ?? '') - timeValue(right.prepared_at ?? '');
+  if (at !== 0) return at;
+  const leftId = left.request_id ?? '';
+  const rightId = right.request_id ?? '';
+  return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+}
+
+/**
+ * Pending rows leave the view when they post. Offset pages would then skip
+ * the row that shifted into the previous page. request_id is unique and does
+ * not change, so the next page starts after the last id already read.
+ */
+type PendingPage = {
+  data: PendingRow[] | null;
+  error: Parameters<typeof throwIfError>[0];
+};
+
+async function loadPendingPage(after: string | null): Promise<PendingPage> {
+  const pending = appDb()
+    .from('stock_count_pending')
+    .select('request_id, prepared_at, counted_at, item_count, payload')
+    .order('request_id', { ascending: true });
+  if (after === null) return pending.limit(pageSize);
+  return pending.gt('request_id', after).limit(pageSize);
+}
+
+async function readPendingPages(): Promise<PendingRow[]> {
+  const rows: PendingRow[] = [];
+  let after: string | null = null;
+  for (let page = 0; page < maxPages; page += 1) {
+    const result = await loadPendingPage(after);
+    throwIfError(result.error);
+    const batch = result.data ?? [];
+    if (batch.length > pageSize) throw new Error(genericCountError);
+    for (const row of batch) {
       if (typeof row.request_id !== 'string' || row.request_id.length === 0) {
         throw new Error(genericCountError);
       }
-      return row.request_id;
-    },
-  );
+    }
+    rows.push(...batch);
+    if (batch.length < pageSize) return rows;
+    const last = batch[batch.length - 1]?.request_id;
+    if (typeof last !== 'string' || (after !== null && last <= after)) {
+      throw new Error(genericCountError);
+    }
+    after = last;
+  }
+  throw new PageCapError();
+}
+
+export async function listPendingCounts(): Promise<PendingCount[]> {
+  let data: PendingRow[];
+  try {
+    data = await readPendingPages();
+  } catch (error) {
+    if (error instanceof PageCapError) {
+      throw new Error(genericCountError, { cause: error });
+    }
+    throw error;
+  }
+  data.sort(byPreparedThenRequest);
   return data.map((row) => {
     if (
       typeof row.request_id !== 'string' ||

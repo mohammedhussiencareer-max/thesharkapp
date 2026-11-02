@@ -36,6 +36,8 @@ export const inactiveItemMessage = 'الصنف موقوف';
 
 export const unknownItemMessage = 'الصنف مش موجود';
 
+export const baseUnitChangedMessage = 'وحدة الصنف اتغيرت، راجع الجرد';
+
 export const phoneMessage = 'مينفعش تكتب أرقام تليفونات أو أرقام قومية';
 
 export const quantityScaleMessage =
@@ -82,6 +84,7 @@ const exactReasons: ReadonlyArray<readonly [string, string]> = [
   ['item count frequency does not match', frequencyMessage],
   ['item is inactive', inactiveItemMessage],
   ['unknown stock item', unknownItemMessage],
+  ['item base unit changed', baseUnitChangedMessage],
   ['request_id already used for a different count', requestIdConflictMessage],
   ['note must be at most 500 characters', noteLengthMessage],
   ['lines must be a jsonb array of 1 to 200 lines', tooManyMessage],

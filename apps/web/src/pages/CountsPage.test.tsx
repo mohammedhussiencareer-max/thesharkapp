@@ -43,6 +43,7 @@ const waiting: CountWriteResult = { status: 'waiting_for_sync' };
 const tilapia: CountItem = {
   id: 'tilapia',
   name: 'بلطي',
+  baseUnit: 'kg',
   onHandQty: '10',
   onHandValue: '100.00',
   avgCost: '10.05',
@@ -51,6 +52,7 @@ const tilapia: CountItem = {
 const shrimp: CountItem = {
   id: 'shrimp',
   name: 'جمبري',
+  baseUnit: 'kg',
   onHandQty: '4',
   onHandValue: '100.00',
   avgCost: '25',
@@ -233,7 +235,7 @@ describe('CountsPage', () => {
     expect(vi.mocked(recordCount).mock.calls[0]?.[0]).toMatchObject({
       countedAt: '2026-10-22T09:00:00.000Z',
       note: 'صباح',
-      lines: [{ itemId: 'tilapia', countedQty: '7' }],
+      lines: [{ itemId: 'tilapia', countedQty: '7', expectedBaseUnit: 'kg' }],
     });
     expect(vi.mocked(recordCount).mock.calls[0]?.[0]?.requestId).toBeTruthy();
   });
@@ -253,7 +255,12 @@ describe('CountsPage', () => {
       expect(recordCount).toHaveBeenCalledTimes(1);
     });
     expect(vi.mocked(recordCount).mock.calls[0]?.[0]?.lines).toEqual([
-      { itemId: 'shrimp', itemName: 'جمبري', countedQty: '6' },
+      {
+        itemId: 'shrimp',
+        itemName: 'جمبري',
+        countedQty: '6',
+        expectedBaseUnit: 'kg',
+      },
     ]);
   });
 
@@ -433,7 +440,12 @@ describe('CountsPage', () => {
     expect(edited?.requestId).toBeTruthy();
     expect(edited?.requestId).not.toBe(first?.requestId);
     expect(edited?.lines).toEqual([
-      { itemId: 'tilapia', itemName: 'بلطي', countedQty: '8' },
+      {
+        itemId: 'tilapia',
+        itemName: 'بلطي',
+        countedQty: '8',
+        expectedBaseUnit: 'kg',
+      },
     ]);
   });
 
@@ -579,6 +591,7 @@ describe('CountsPage', () => {
             lines: sent.lines.map((line) => ({
               item_id: line.itemId,
               counted_qty: line.countedQty,
+              expected_base_unit: line.expectedBaseUnit,
             })),
           },
         },
@@ -711,6 +724,7 @@ describe('CountsPage', () => {
             lines: sent.lines.map((line) => ({
               item_id: line.itemId,
               counted_qty: line.countedQty,
+              expected_base_unit: line.expectedBaseUnit,
             })),
           },
         },
@@ -758,7 +772,12 @@ describe('CountsPage', () => {
     expect(edited?.requestId).toBeTruthy();
     expect(edited?.requestId).not.toBe(storedId);
     expect(edited?.lines).toEqual([
-      { itemId: 'tilapia', itemName: 'بلطي', countedQty: '8' },
+      {
+        itemId: 'tilapia',
+        itemName: 'بلطي',
+        countedQty: '8',
+        expectedBaseUnit: 'kg',
+      },
     ]);
     expect(
       screen.getByRole('heading', { name: 'جرد مستني المزامنة' }),
@@ -771,7 +790,9 @@ describe('CountsPage', () => {
       frequency: 'daily',
       counted_at: '2026-10-22T10:00:00.000Z',
       note: null,
-      lines: [{ item_id: 'tilapia', counted_qty: '7' }],
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
     };
     const when = formatCairoDateTime(stored.counted_at);
     vi.mocked(listPendingCounts).mockResolvedValueOnce([
@@ -813,7 +834,9 @@ describe('CountsPage', () => {
       frequency: 'daily',
       counted_at: '2026-10-22T08:00:00.000Z',
       note: null,
-      lines: [{ item_id: 'shrimp', counted_qty: '3' }],
+      lines: [
+        { item_id: 'shrimp', counted_qty: '3', expected_base_unit: 'kg' },
+      ],
     };
     vi.mocked(listPendingCounts).mockResolvedValue([
       {
@@ -866,7 +889,9 @@ describe('CountsPage', () => {
       frequency: 'daily',
       counted_at: '2026-10-22T10:00:00.000Z',
       note: null,
-      lines: [{ item_id: 'tilapia', counted_qty: '7' }],
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
     };
     vi.mocked(listDailyItems).mockResolvedValue([]);
     vi.mocked(listPendingCounts).mockResolvedValue([
@@ -911,7 +936,13 @@ describe('CountsPage', () => {
       frequency: 'daily',
       counted_at: '2026-10-22T10:00:00.000Z',
       note: null,
-      lines: [{ item_id: 'tilapia', counted_qty: '7.000000' }],
+      lines: [
+        {
+          item_id: 'tilapia',
+          counted_qty: '7.000000',
+          expected_base_unit: 'kg',
+        },
+      ],
     };
     const card = {
       requestId: stored.request_id,
@@ -955,7 +986,13 @@ describe('CountsPage', () => {
       frequency: 'daily',
       counted_at: '2026-10-22T10:00:00.000Z',
       note: null,
-      lines: [{ item_id: 'tilapia', counted_qty: '7.000000' }],
+      lines: [
+        {
+          item_id: 'tilapia',
+          counted_qty: '7.000000',
+          expected_base_unit: 'kg',
+        },
+      ],
     };
     vi.mocked(listPendingCounts).mockResolvedValue([
       {

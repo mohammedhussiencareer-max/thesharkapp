@@ -161,6 +161,14 @@ select
   );
 
 select
+  has_column (
+    'app',
+    'stock_count_lines',
+    'expected_base_unit',
+    'a count line records the base unit the owner saw'
+  );
+
+select
   has_table (
     'app',
     'stock_count_requests',
@@ -795,6 +803,14 @@ values
     'kg',
     'daily',
     true
+  ),
+  (
+    'c1900000-0000-4000-8000-000000000011',
+    'وحدة جرد اختبار',
+    'seafood',
+    'kg',
+    'daily',
+    true
   );
 
 insert into
@@ -1176,7 +1192,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1192,7 +1209,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1207,7 +1225,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1222,7 +1241,8 @@ select
       'frequency', 'daily',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1238,7 +1258,8 @@ select
       'counted_at', 'infinity',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1254,7 +1275,8 @@ select
       'counted_at', 'not-a-time',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1271,7 +1293,8 @@ select
       'note', repeat('ن', 501),
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1288,7 +1311,8 @@ select
       'note', '01001234567',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1331,7 +1355,8 @@ select
         select pg_catalog.jsonb_agg(
           pg_catalog.jsonb_build_object(
             'item_id', pg_catalog.gen_random_uuid(),
-            'counted_qty', '1'
+            'counted_qty', '1',
+            'expected_base_unit', 'kg'
           )
         )
         from pg_catalog.generate_series(1, 201)
@@ -1378,7 +1403,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'not-a-uuid',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1395,11 +1421,13 @@ select
       'lines', jsonb_build_array(
         jsonb_build_object(
           'item_id', 'c1900000-0000-4000-8000-000000000001',
-          'counted_qty', '1'
+          'counted_qty', '1',
+          'expected_base_unit', 'kg'
         ),
         jsonb_build_object(
           'item_id', 'c1900000-0000-4000-8000-000000000001',
-          'counted_qty', '2'
+          'counted_qty', '2',
+          'expected_base_unit', 'kg'
         )
       )
     ))$$,
@@ -1416,7 +1444,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '-1'
+        'counted_qty', '-1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1432,7 +1461,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '1.1234567'
+        'counted_qty', '1.1234567',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1448,12 +1478,80 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '100000000000000'
+        'counted_qty', '100000000000000',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
     'counted_qty is out of range',
     'a counted quantity that does not fit numeric(20,6) is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000090',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '10'
+      ))
+    ))$$,
+    '22023',
+    'expected_base_unit is required',
+    'a line without a base unit is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000091',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '10',
+        'expected_base_unit', '   '
+      ))
+    ))$$,
+    '22023',
+    'expected_base_unit is required',
+    'a blank base unit is refused'
+  );
+
+select
+  is_empty (
+    $$select request_id from app.stock_count_requests
+      where request_id in (
+        'd1900000-0000-4000-8000-000000000090',
+        'd1900000-0000-4000-8000-000000000091'
+      )$$,
+    'a missing base unit does not store a prepare row'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000092',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000001',
+        'counted_qty', '10',
+        'expected_base_unit', 'piece'
+      ))
+    ))$$,
+    '22023',
+    'item base unit changed',
+    'a first submit whose base unit is not the item unit is refused'
+  );
+
+select
+  is_empty (
+    $$select request_id from app.stock_count_requests
+      where request_id = 'd1900000-0000-4000-8000-000000000092'$$,
+    'a mismatched base unit does not store a prepare row'
   );
 
 -- ============================================================================
@@ -1469,7 +1567,8 @@ select
       'counted_at', '2026-10-22T09:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '7'
+        'counted_qty', '7',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1485,7 +1584,8 @@ select
       'counted_at', '2026-10-22T08:30:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '7'
+        'counted_qty', '7',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1501,7 +1601,8 @@ select
       'counted_at', '2026-10-22T15:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000099',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1517,7 +1618,8 @@ select
       'counted_at', '2026-10-22T16:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '7'
+        'counted_qty', '7',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1533,7 +1635,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000004',
-        'counted_qty', '4'
+        'counted_qty', '4',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1549,7 +1652,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000005',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1565,7 +1669,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000007',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1581,7 +1686,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000099',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -1644,7 +1750,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7'
+            '7',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -1721,7 +1829,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7'
+            '7',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -1778,7 +1888,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7'
+            '7',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -1825,7 +1937,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7'
+            '7',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -1866,7 +1980,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7'
+            '7',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -1970,7 +2086,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7'
+            '7',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -1996,7 +2114,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '8'
+        'counted_qty', '8',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -2026,7 +2145,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7'
+            '7',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -2105,7 +2226,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '7'
+        'counted_qty', '7',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -2212,7 +2334,8 @@ select
       'counted_at', '2026-10-22T07:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '7'
+        'counted_qty', '7',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     'P0001',
@@ -2236,7 +2359,8 @@ select
       'counted_at', '2026-10-22T09:30:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000003',
-        'counted_qty', '2'
+        'counted_qty', '2',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     'a count exactly at a shift close is allowed when every delta is zero'
@@ -2295,15 +2419,18 @@ select
       'lines', jsonb_build_array(
         jsonb_build_object(
           'item_id', 'c1900000-0000-4000-8000-000000000001',
-          'counted_qty', '7'
+          'counted_qty', '7',
+          'expected_base_unit', 'kg'
         ),
         jsonb_build_object(
           'item_id', 'c1900000-0000-4000-8000-000000000002',
-          'counted_qty', '6'
+          'counted_qty', '6',
+          'expected_base_unit', 'kg'
         ),
         jsonb_build_object(
           'item_id', 'c1900000-0000-4000-8000-000000000003',
-          'counted_qty', '2'
+          'counted_qty', '2',
+          'expected_base_unit', 'kg'
         )
       )
     ))$$,
@@ -2555,19 +2682,25 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7.000000'
+            '7.000000',
+            'expected_base_unit',
+            'kg'
           ),
           jsonb_build_object(
             'item_id',
             'c1900000-0000-4000-8000-000000000002',
             'counted_qty',
-            '6.000000'
+            '6.000000',
+            'expected_base_unit',
+            'kg'
           ),
           jsonb_build_object(
             'item_id',
             'c1900000-0000-4000-8000-000000000003',
             'counted_qty',
-            '2.000000'
+            '2.000000',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -2626,15 +2759,18 @@ select
       'lines', jsonb_build_array(
         jsonb_build_object(
           'item_id', 'c1900000-0000-4000-8000-000000000002',
-          'counted_qty', '6'
+          'counted_qty', '6',
+          'expected_base_unit', 'kg'
         ),
         jsonb_build_object(
           'item_id', 'c1900000-0000-4000-8000-000000000001',
-          'counted_qty', '7'
+          'counted_qty', '7',
+          'expected_base_unit', 'kg'
         ),
         jsonb_build_object(
           'item_id', 'c1900000-0000-4000-8000-000000000003',
-          'counted_qty', '2'
+          'counted_qty', '2',
+          'expected_base_unit', 'kg'
         )
       )
     ))$$,
@@ -2667,19 +2803,25 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7'
+            '7',
+            'expected_base_unit',
+            'kg'
           ),
           jsonb_build_object(
             'item_id',
             'c1900000-0000-4000-8000-000000000002',
             'counted_qty',
-            '6'
+            '6',
+            'expected_base_unit',
+            'kg'
           ),
           jsonb_build_object(
             'item_id',
             'c1900000-0000-4000-8000-000000000003',
             'counted_qty',
-            '2'
+            '2',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -2710,15 +2852,18 @@ select
       'lines', jsonb_build_array(
         jsonb_build_object(
           'item_id', 'c1900000-0000-4000-8000-000000000001',
-          'counted_qty', '8'
+          'counted_qty', '8',
+          'expected_base_unit', 'kg'
         ),
         jsonb_build_object(
           'item_id', 'c1900000-0000-4000-8000-000000000002',
-          'counted_qty', '6'
+          'counted_qty', '6',
+          'expected_base_unit', 'kg'
         ),
         jsonb_build_object(
           'item_id', 'c1900000-0000-4000-8000-000000000003',
-          'counted_qty', '2'
+          'counted_qty', '2',
+          'expected_base_unit', 'kg'
         )
       )
     ))$$,
@@ -2755,7 +2900,8 @@ select
       'counted_at', '2026-10-22T10:30:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000004',
-        'counted_qty', '4'
+        'counted_qty', '4',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     'a weekly count of a weekly item is saved'
@@ -2797,7 +2943,8 @@ select
       'counted_at', '2026-10-22T10:15:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000006',
-        'counted_qty', '1'
+        'counted_qty', '1',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     'a surplus on an item with no opening is saved at zero value'
@@ -2857,7 +3004,8 @@ select
       'counted_at', '2026-10-22T11:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000001',
-        'counted_qty', '7'
+        'counted_qty', '7',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     'a later count of the new on-hand is a zero delta'
@@ -2886,7 +3034,8 @@ select
       'counted_at', '2026-10-22T12:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000002',
-        'counted_qty', '6'
+        'counted_qty', '6',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     'a count after the closed shift is covered when the newest ok run started after that close was recorded'
@@ -2919,7 +3068,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000008',
-        'counted_qty', '10'
+        'counted_qty', '10',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     'a count that matches on-hand posts no movement'
@@ -2981,7 +3131,8 @@ select
       'counted_at', '2026-10-22T10:20:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000009',
-        'counted_qty', '0'
+        'counted_qty', '0',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     'a never-moved item can be counted at zero'
@@ -3058,7 +3209,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000010',
             'counted_qty',
-            '9'
+            '9',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -3083,7 +3236,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000010',
             'counted_qty',
-            '9'
+            '9',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -3177,7 +3332,9 @@ select
           'item_id',
           'c1900000-0000-4000-8000-000000000010',
           'counted_qty',
-          '9'
+          '9',
+          'expected_base_unit',
+          'kg'
         )
       )
     )
@@ -3223,7 +3380,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000010',
             'counted_qty',
-            '9'
+            '9',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -3273,7 +3432,8 @@ select
       'counted_at', '2026-10-22T10:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000010',
-        'counted_qty', '8'
+        'counted_qty', '8',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -3339,7 +3499,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000003',
             'counted_qty',
-            '2'
+            '2',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -3370,7 +3532,8 @@ select
       'counted_at', '2026-10-22T11:30:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000003',
-        'counted_qty', '0'
+        'counted_qty', '0',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     'counting an item down to zero posts the whole book value'
@@ -3624,7 +3787,8 @@ select
       'counted_at', '2026-10-22T12:00:01Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000002',
-        'counted_qty', '6'
+        'counted_qty', '6',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     'service_role can record a zero count'
@@ -3697,7 +3861,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7'
+            '7',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -3732,7 +3898,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7'
+            '7',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -3757,7 +3925,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000001',
             'counted_qty',
-            '7'
+            '7',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -3800,7 +3970,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000009',
             'counted_qty',
-            '12345678901234.123456'
+            '12345678901234.123456',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -3823,7 +3995,9 @@ select
       'item_id',
       'c1900000-0000-4000-8000-000000000009',
       'counted_qty',
-      '12345678901234.123456'
+      '12345678901234.123456',
+      'expected_base_unit',
+      'kg'
     ),
     'the stored quantity is the exact decimal text, not a JSON number'
   );
@@ -3874,7 +4048,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000009',
             'counted_qty',
-            '012345678901234.123456'
+            '012345678901234.123456',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -3899,7 +4075,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000009',
             'counted_qty',
-            '12345678901234.123456'::numeric
+            '12345678901234.123456'::numeric,
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -3916,7 +4094,8 @@ select
       'counted_at', '2026-10-22T12:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000009',
-        'counted_qty', '12345678901234.123455'
+        'counted_qty', '12345678901234.123455',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
@@ -4003,7 +4182,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000009',
             'counted_qty',
-            '012345678901234.123456'
+            '012345678901234.123456',
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -4035,7 +4216,9 @@ select
             'item_id',
             'c1900000-0000-4000-8000-000000000009',
             'counted_qty',
-            '12345678901234.123456'::numeric
+            '12345678901234.123456'::numeric,
+            'expected_base_unit',
+            'kg'
           )
         )
       )
@@ -4059,12 +4242,201 @@ select
       'counted_at', '2026-10-22T12:00:00Z',
       'lines', jsonb_build_array(jsonb_build_object(
         'item_id', 'c1900000-0000-4000-8000-000000000009',
-        'counted_qty', '12345678901234.123455'
+        'counted_qty', '12345678901234.123455',
+        'expected_base_unit', 'kg'
       ))
     ))$$,
     '22023',
     'request_id already used for a different count',
     'the posted replay refuses a different 14-digit quantity'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000080',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T12:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000009',
+        'counted_qty', '12345678901234.123456',
+        'expected_base_unit', 'piece'
+      ))
+    ))$$,
+    '22023',
+    'request_id already used for a different count',
+    'the posted replay refuses a different base unit'
+  );
+
+-- Item 011 has no movements, so the ledger still allows a base_unit change.
+-- Prepare pins kg. A later submit of that same payload must not post as piece.
+select
+  is (
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'd1900000-0000-4000-8000-000000000093',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-10-22T10:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'c1900000-0000-4000-8000-000000000011',
+            'counted_qty',
+            '10',
+            'expected_base_unit',
+            '  kg  '
+          )
+        )
+      )
+    ),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a count of an unmoved item stores the trimmed base unit and waits'
+  );
+
+select
+  is (
+    (
+      select
+        request.payload -> 'lines' -> 0 ->> 'expected_base_unit'
+      from
+        app.stock_count_requests request
+      where
+        request.request_id = 'd1900000-0000-4000-8000-000000000093'
+    ),
+    'kg',
+    'the stored base unit is trimmed'
+  );
+
+select
+  throws_ok (
+    $$select app.record_count(jsonb_build_object(
+      'request_id', 'd1900000-0000-4000-8000-000000000093',
+      'frequency', 'daily',
+      'counted_at', '2026-10-22T10:00:00Z',
+      'lines', jsonb_build_array(jsonb_build_object(
+        'item_id', 'c1900000-0000-4000-8000-000000000011',
+        'counted_qty', '10',
+        'expected_base_unit', 'piece'
+      ))
+    ))$$,
+    '22023',
+    'request_id already used for a different count',
+    'the prepare replay refuses a different base unit'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_counts
+      where request_id = 'd1900000-0000-4000-8000-000000000093'$$,
+    'a different base unit while waiting posts nothing'
+  );
+
+reset role;
+
+update app.stock_items
+set
+  base_unit = 'piece'
+where
+  id = 'c1900000-0000-4000-8000-000000000011';
+
+select
+  is (
+    (
+      select
+        base_unit
+      from
+        app.stock_items
+      where
+        id = 'c1900000-0000-4000-8000-000000000011'
+    ),
+    'piece',
+    'the table owner can change the base unit of an item with no movements'
+  );
+
+insert into
+  app.pos_sync_runs (mode, status, started_at, finished_at, error)
+select
+  'recent',
+  'ok',
+  greatest(
+    request.prepared_at,
+    coalesce(
+      (
+        select
+          pg_catalog.max (shift.close_recorded_at)
+        from
+          app.pos_shifts shift
+        where
+          shift.opened_at <= (request.payload ->> 'counted_at')::timestamptz
+      ),
+      request.prepared_at
+    )
+  ) + interval '1 millisecond',
+  greatest(
+    request.prepared_at,
+    coalesce(
+      (
+        select
+          pg_catalog.max (shift.close_recorded_at)
+        from
+          app.pos_shifts shift
+        where
+          shift.opened_at <= (request.payload ->> 'counted_at')::timestamptz
+      ),
+      request.prepared_at
+    )
+  ) + interval '1 minute',
+  null
+from
+  app.stock_count_requests request
+where
+  request.request_id = 'd1900000-0000-4000-8000-000000000093';
+
+set
+  local role authenticated;
+
+select
+  throws_ok (
+    $$select app.record_count((
+      select request.payload
+      from app.stock_count_requests request
+      where request.request_id = 'd1900000-0000-4000-8000-000000000093'
+    ))$$,
+    '22023',
+    'item base unit changed',
+    'a covering sync refuses the count after the base unit changes'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_counts
+      where request_id = 'd1900000-0000-4000-8000-000000000093'$$,
+    'a base unit change after prepare posts nothing'
+  );
+
+select
+  is_empty (
+    $$select id from app.stock_movements
+      where item_id = 'c1900000-0000-4000-8000-000000000011'$$,
+    'a refused count of the changed unit posts no movement'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_count_requests request
+      where
+        request.request_id = 'd1900000-0000-4000-8000-000000000093'
+    ),
+    1::bigint,
+    'the prepared count remains after the unit change is refused'
   );
 
 select

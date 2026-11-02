@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { isPayloadRefusal, isUnknownOutcome } from '@/lib/write-outcome';
 import {
   backDatedCountMessage,
+  baseUnitChangedMessage,
   frequencyMessage,
   inactiveItemMessage,
   insideShiftMessage,
@@ -42,6 +43,12 @@ describe('mapCountError', () => {
     expect(
       mapCountError({ code: '22023', message: 'unknown stock item' }),
     ).toBe(unknownItemMessage);
+    expect(
+      mapCountError({ code: '22023', message: 'item base unit changed' }),
+    ).toBe(baseUnitChangedMessage);
+    expect(
+      isPayloadRefusal({ code: '22023', message: 'item base unit changed' }),
+    ).toBe(true);
     expect(
       mapCountError({
         code: '22023',

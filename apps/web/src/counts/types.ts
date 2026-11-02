@@ -1,8 +1,11 @@
 import type { Json } from '@/lib/database.types';
+import type { BaseUnit } from '@/items/types';
 
 export type CountItem = {
   id: string;
   name: string;
+  /** Catalog base unit at the time this row was read. */
+  baseUnit: BaseUnit;
   onHandQty: string;
   /** Ledger book value, numeric(14,2) text. A shortage prices from this, not qty × average. */
   onHandValue: string;
@@ -14,6 +17,8 @@ export type CountLineDraft = {
   /** Catalog name when the draft was built. Display only; the RPC does not send it. */
   itemName?: string;
   countedQty: string;
+  /** Base unit shown for this item when the line was counted. */
+  expectedBaseUnit: BaseUnit;
 };
 
 export type CountDraft = {
