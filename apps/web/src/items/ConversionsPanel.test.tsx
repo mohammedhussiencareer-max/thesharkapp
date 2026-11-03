@@ -749,4 +749,99 @@ describe('ConversionsPanel', () => {
       expect(addConversion).toHaveBeenCalledTimes(1);
     });
   });
+
+  it('replays an unknown conversion after a later permission refusal', async () => {
+    vi.mocked(listConversions).mockResolvedValue(snapshot([]));
+    vi.mocked(addConversion)
+      .mockRejectedValueOnce(new Error('تعذر الاتصال'))
+      .mockRejectedValueOnce(
+        Object.assign(new Error('مش مسموح'), { code: '42501' }),
+      )
+      .mockResolvedValueOnce(undefined);
+    render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByRole('option', { name: 'كرتونة' }),
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كرتونة' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '6' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('تعذر الاتصال');
+
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('مش مسموح');
+
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(3);
+    });
+    const first = sentTiming(0);
+    const refused = sentTiming(1);
+    const replayed = sentTiming(2);
+    expect(refused.requestId).toBe(first.requestId);
+    expect(replayed.requestId).toBe(first.requestId);
+    expect(replayed.effectiveFrom).toBe(first.effectiveFrom);
+    expect(vi.mocked(addConversion).mock.calls[2]?.[4]).toEqual(
+      vi.mocked(addConversion).mock.calls[0]?.[4],
+    );
+  });
+
+  it('requires a reason for an explicit start inside the current minute', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-15T09:00:45.000Z'));
+    vi.mocked(listConversions).mockResolvedValue(snapshot([]));
+    vi.mocked(costingImpact).mockResolvedValue({
+      orders: 1,
+      shifts: 1,
+      movements: 0,
+    });
+    render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByRole('button', { name: 'ضيف التحويل' }),
+    ).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText('وقت السريان'), {
+      target: { value: 'custom' },
+    });
+    fireEvent.change(screen.getByLabelText('الوقت'), {
+      target: { value: '2026-07-15T12:00' },
+    });
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كرتونة' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '4' },
+    });
+    expect(screen.getByLabelText('سبب التغيير')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(screen.getByText('اكتب سبب التغيير بأثر رجعي')).toBeInTheDocument();
+    expect(addConversion).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('سبب التغيير'), {
+      target: { value: 'تصحيح' },
+    });
+    expect(
+      await screen.findByText('ممكن يأثر على 1 طلب في 1 وردية (تقدير)'),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(1);
+    });
+    expect(sentTiming(0).effectiveFrom).toBe('2026-07-15T09:00:00.000Z');
+    expect(addConversion).toHaveBeenCalledWith(
+      'oil',
+      'كرتونة',
+      '4',
+      'kg',
+      expect.objectContaining({
+        effectiveFrom: '2026-07-15T09:00:00.000Z',
+        reason: 'تصحيح',
+      }),
+    );
+  });
 });

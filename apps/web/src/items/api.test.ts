@@ -294,6 +294,31 @@ describe('catalog api', () => {
     expect(unknownRetry).toBe(unknownFirst);
   });
 
+  it('replays a create after an unknown outcome and a later permission refusal', async () => {
+    const replayed = { ...draft, name: 'صنف معاد' };
+    const rpc = vi
+      .fn()
+      .mockResolvedValueOnce({
+        data: null,
+        error: { message: 'network down' },
+      })
+      .mockResolvedValueOnce({
+        data: null,
+        error: { code: '42501', message: 'insufficient_privilege' },
+      })
+      .mockResolvedValueOnce({ data: 'c', error: null });
+    mocks.schema.mockReturnValue({ rpc });
+
+    await expect(createItem(replayed)).rejects.toThrow();
+    await expect(createItem(replayed)).rejects.toThrow();
+    await createItem(replayed);
+    const ids = rpc.mock.calls.map(
+      (call) => (call[1] as { p_request_id: string }).p_request_id,
+    );
+    expect(ids[1]).toBe(ids[0]);
+    expect(ids[2]).toBe(ids[0]);
+  });
+
   it('throws the Arabic message for a frozen base unit', async () => {
     const items = query({
       data: null,

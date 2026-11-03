@@ -14,7 +14,6 @@ import {
 } from '@/items/api';
 import {
   buildDatedWrite,
-  currentMinuteMs,
   defaultEffectiveMode,
   effectiveFromPayload,
   impactErrorMessage,
@@ -25,7 +24,7 @@ import {
   type EffectiveMode,
 } from '@/items/effective';
 import { heldWrite, holdWrite, settleRequest } from '@/items/request-id';
-import { messageFrom } from '@/items/errors';
+import { CostingChangedError, messageFrom } from '@/items/errors';
 import {
   frequencyOptions,
   kindOptions,
@@ -115,9 +114,14 @@ export function ItemForm({
   const [priceReason, setPriceReason] = useState('');
   const [priceError, setPriceError] = useState<string | null>(null);
   const timingTouched = useRef(false);
-  const [mountMinute] = useState(() => currentMinuteMs(Date.now()));
-  const [submitMinute, setSubmitMinute] = useState<number | null>(null);
-  const nowMs = submitMinute ?? mountMinute;
+  const scheduleLoad = useRef(0);
+  // Actual clock for the backdating rule. A null start is still the server's
+  // current minute. An explicit time, including the shift start, is backdated
+  // when it is earlier than this instant.
+  const [mountNow] = useState(() => Date.now());
+  const [submitNow, setSubmitNow] = useState<number | null>(null);
+  const [refreshingSchedule, setRefreshingSchedule] = useState(false);
+  const nowMs = submitNow ?? mountNow;
   const title = editingId ? 'تعديل الصنف' : 'صنف جديد';
   const editing = items.find((item) => item.id === editingId);
   const identityLocked = editing?.identityLocked === true;
@@ -134,6 +138,7 @@ export function ItemForm({
 
   useEffect(() => {
     if (!editingId) return;
+    const request = ++scheduleLoad.current;
     let cancelled = false;
     void (async () => {
       try {
@@ -141,18 +146,32 @@ export function ItemForm({
           currentShiftStart(),
           listCostingSchedule(editingId),
         ]);
-        if (cancelled) return;
+        if (cancelled || request !== scheduleLoad.current) return;
         setShiftStart(shift);
         setSchedule(nextSchedule);
         if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
       } catch (error) {
-        if (!cancelled) setExtraError(messageFrom(error));
+        if (!cancelled && request === scheduleLoad.current) {
+          setExtraError(messageFrom(error));
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
   }, [editingId]);
+
+  async function reloadLossSchedule(): Promise<void> {
+    if (!editingId) return;
+    const request = ++scheduleLoad.current;
+    try {
+      const next = await listCostingSchedule(editingId);
+      if (request !== scheduleLoad.current) return;
+      setSchedule(next);
+    } catch (error) {
+      if (request === scheduleLoad.current) setExtraError(messageFrom(error));
+    }
+  }
 
   const lossCustomIso =
     mode === 'custom' ? cairoDateTimeLocalToIso(customLocal) : null;
@@ -223,6 +242,20 @@ export function ItemForm({
     }
   }
 
+  async function finishLoss(intent: string, work: () => Promise<void>) {
+    setRefreshingSchedule(true);
+    try {
+      await work();
+      settleRequest(intent);
+      await reloadLossSchedule();
+    } catch (error) {
+      settleRequest(intent, error);
+      if (error instanceof CostingChangedError) await reloadLossSchedule();
+    } finally {
+      setRefreshingSchedule(false);
+    }
+  }
+
   function saveCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const result = validateItemForm(values, { items, editingId });
@@ -257,7 +290,6 @@ export function ItemForm({
       mode,
       customLocal,
       reason: lossReason.trim(),
-      token: schedule?.lossToken ?? '',
     });
   }
 
@@ -277,7 +309,7 @@ export function ItemForm({
       setErrors({ lossPercent: lossError });
       return;
     }
-    if (!lossDirty) return;
+    if (!lossDirty || refreshingSchedule) return;
     if (!schedule) {
       setExtraError('لسه بنحمّل بيانات الفاقد');
       return;
@@ -289,19 +321,19 @@ export function ItemForm({
     const intent = lossIntent(lossPct);
     const stored = heldWrite(intent);
     if (stored) {
-      void finish(intent, () =>
+      void finishLoss(intent, () =>
         onSubmit({ kind: 'loss', lossPct, write: stored }),
       );
       return;
     }
-    const minute = currentMinuteMs(Date.now());
-    setSubmitMinute(minute);
-    const minuteIso = new Date(minute).toISOString();
+    const now = Date.now();
+    setSubmitNow(now);
+    const nowIso = new Date(now).toISOString();
     const backdatedNow = needsBackdatedReason(
       mode,
       shiftStart,
       lossCustomIso,
-      minute,
+      now,
     );
     if (backdatedNow && lossReason.trim().length === 0) {
       setExtraError('اكتب سبب التغيير بأثر رجعي');
@@ -312,7 +344,7 @@ export function ItemForm({
       shiftStart,
       customIso: lossCustomIso,
       versions: schedule.lossVersions,
-      nowIso: minuteIso,
+      nowIso,
       token: schedule.lossToken,
       reason: lossReason,
       requestId: '00000000-0000-4000-8000-000000000000',
@@ -336,7 +368,7 @@ export function ItemForm({
       ...built.write,
       requestId,
     }));
-    void finish(intent, () => onSubmit({ kind: 'loss', lossPct, write }));
+    void finishLoss(intent, () => onSubmit({ kind: 'loss', lossPct, write }));
   }
 
   function savePrice() {
@@ -623,7 +655,7 @@ export function ItemForm({
               <button
                 className={primaryButton}
                 type="button"
-                disabled={submitting || locked}
+                disabled={submitting || locked || refreshingSchedule}
                 onClick={saveLoss}
               >
                 حفظ الفاقد

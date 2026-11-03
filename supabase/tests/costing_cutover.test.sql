@@ -1789,7 +1789,7 @@ select
     pg_catalog.date_trunc ('minute', pg_catalog.now ()),
     pg_catalog.date_trunc ('minute', pg_catalog.now ()) + interval '30 seconds',
     md5(''),
-    null
+    'فجوة دقيقة'
   );
 
 select
@@ -1877,6 +1877,60 @@ select
     ),
     null::numeric,
     'the sub-minute gap stays empty after the corrected now write'
+  );
+
+-- Halfway through the time already elapsed in this minute: earlier than
+-- now(), and inside the minute whenever the clock is not exactly on it.
+-- Only a null effective_from is exempt from the reason.
+select
+  throws_ok (
+    $$select app.set_item_loss(
+      'd4000000-0000-4000-8000-000000000195',
+      (select id from app.stock_items where name = 'صنف بلا فاقد'),
+      0.15,
+      pg_catalog.date_trunc('minute', pg_catalog.now())
+        + (
+          pg_catalog.now() - pg_catalog.date_trunc('minute', pg_catalog.now())
+        ) / 2,
+      null,
+      (
+        select app.item_costing_schedule(si.id) -> 'loss' ->> 'token'
+        from app.stock_items si
+        where si.name = 'صنف بلا فاقد'
+      ),
+      null
+    )$$,
+    '22023'::char(5),
+    'reason is required for a backdated change',
+    'an explicit start inside the current minute needs a reason'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_conversion(
+      'd4000000-0000-4000-8000-000000000196',
+      (select id from app.stock_items where name = 'صنف بلا فاقد'),
+      'liter',
+      0.92,
+      pg_catalog.date_trunc('minute', pg_catalog.now())
+        + (
+          pg_catalog.now() - pg_catalog.date_trunc('minute', pg_catalog.now())
+        ) / 2,
+      null,
+      (
+        select conv ->> 'token'
+        from jsonb_array_elements(
+          app.item_costing_schedule(
+            (select id from app.stock_items where name = 'صنف بلا فاقد')
+          ) -> 'conversions'
+        ) conv
+        where conv ->> 'unit_code' = 'liter'
+      ),
+      null
+    )$$,
+    '22023'::char(5),
+    'reason is required for a backdated change',
+    'a shift start inside the current minute needs a reason'
   );
 
 -- The stored effective_to is already in the past. Replay must return the

@@ -7,7 +7,11 @@ import {
 import type { ItemExpectation } from '@/items/expectation';
 import { emptyScheduleToken } from '@/items/effective';
 import { exactDecimal } from '@/lib/decimal';
-import { isDefiniteRefusal, isUnknownOutcome } from '@/lib/write-outcome';
+import {
+  isDefiniteRefusal,
+  isPayloadRefusal,
+  isUnknownOutcome,
+} from '@/lib/write-outcome';
 import { supabase } from '@/lib/supabase';
 import {
   isBaseUnit,
@@ -126,20 +130,32 @@ function coversNow(row: Record<string, unknown>, nowMs: number): boolean {
   return !Number.isNaN(to) && nowMs < to;
 }
 
-const pendingRequests = new Map<string, string>();
+type PendingRequest = {
+  requestId: string;
+  /** Set once a send's outcome was unknown. See settleRequest. */
+  unresolved: boolean;
+};
+
+const pendingRequests = new Map<string, PendingRequest>();
 
 function requestIdFor(key: string): string {
   const existing = pendingRequests.get(key);
-  if (existing) return existing;
-  const next = crypto.randomUUID();
-  pendingRequests.set(key, next);
-  return next;
+  if (existing) return existing.requestId;
+  const requestId = crypto.randomUUID();
+  pendingRequests.set(key, { requestId, unresolved: false });
+  return requestId;
 }
 
 function finishRequest(key: string, error: unknown): void {
-  if (error === undefined || !isUnknownOutcome(error)) {
+  const current = pendingRequests.get(key);
+  if (!current) return;
+  if (error === undefined) {
     pendingRequests.delete(key);
+    return;
   }
+  if (isUnknownOutcome(error)) current.unresolved = true;
+  if (current.unresolved && !isPayloadRefusal(error)) return;
+  pendingRequests.delete(key);
 }
 
 export async function listItems(): Promise<CatalogItem[]> {
@@ -424,7 +440,6 @@ async function callDated(
   timing: DatedWrite | undefined,
 ): Promise<void> {
   const requestId = timing?.requestId ?? requestIdFor(key);
-  if (!timing) pendingRequests.set(key, requestId);
   try {
     const { error } = await call(requestId);
     throwIfError(error);

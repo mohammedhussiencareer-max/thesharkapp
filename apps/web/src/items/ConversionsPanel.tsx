@@ -20,7 +20,6 @@ import {
 import { EffectiveTimeFields } from '@/items/EffectiveTimeFields';
 import {
   buildDatedWrite,
-  currentMinuteMs,
   defaultEffectiveMode,
   effectiveFromPayload,
   emptyScheduleToken,
@@ -71,9 +70,9 @@ function useDatedTiming(
   token: string,
   disabled: boolean,
 ) {
-  const [mountMinute] = useState(() => currentMinuteMs(Date.now()));
-  const [evaluatedMinute, setEvaluatedMinute] = useState<number | null>(null);
-  const clockMs = evaluatedMinute ?? mountMinute;
+  const [mountNow] = useState(() => Date.now());
+  const [evaluatedNow, setEvaluatedNow] = useState<number | null>(null);
+  const clockMs = evaluatedNow ?? mountNow;
   const [chosenMode, setChosenMode] = useState<EffectiveMode | null>(null);
   const mode = chosenMode ?? defaultEffectiveMode(shiftStart);
   const [customLocal, setCustomLocal] = useState('');
@@ -120,7 +119,6 @@ function useDatedTiming(
       mode,
       customLocal,
       reason: reason.trim(),
-      token,
     });
   }
 
@@ -130,18 +128,13 @@ function useDatedTiming(
   ):
     | { ok: true; intent: string; write: DatedWrite }
     | { ok: false; error: string } {
-    const minute = currentMinuteMs(Date.now());
-    setEvaluatedMinute(minute);
+    const now = Date.now();
+    setEvaluatedNow(now);
     const intent = intentFor(unit, factorKey);
     const stored = heldWrite(intent);
     if (stored) return { ok: true, intent, write: stored };
-    const nowIso = new Date(minute).toISOString();
-    const backdatedNow = needsBackdatedReason(
-      mode,
-      shiftStart,
-      customIso,
-      minute,
-    );
+    const nowIso = new Date(now).toISOString();
+    const backdatedNow = needsBackdatedReason(mode, shiftStart, customIso, now);
     if (backdatedNow && reason.trim().length === 0) {
       return { ok: false, error: 'اكتب سبب التغيير بأثر رجعي' };
     }

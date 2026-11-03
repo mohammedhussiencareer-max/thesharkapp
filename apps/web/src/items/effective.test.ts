@@ -36,6 +36,68 @@ describe('effective time', () => {
     ).toBe(true);
   });
 
+  it('requires a reason for an explicit or shift start inside the current minute', () => {
+    const submitted = Date.parse('2026-07-15T09:00:45.000Z');
+    const sameMinute = '2026-07-15T09:00:30.000Z';
+    expect(needsBackdatedReason('now', sameMinute, null, submitted)).toBe(
+      false,
+    );
+    expect(needsBackdatedReason('shift', sameMinute, null, submitted)).toBe(
+      true,
+    );
+    expect(needsBackdatedReason('custom', null, sameMinute, submitted)).toBe(
+      true,
+    );
+
+    const versions: {
+      effectiveFrom: string;
+      effectiveTo: string | null;
+    }[] = [];
+    const explicit = buildDatedWrite({
+      mode: 'custom',
+      shiftStart: null,
+      customIso: sameMinute,
+      versions,
+      nowIso: '2026-07-15T09:00:45.000Z',
+      token: 'token',
+      reason: '',
+      requestId: 'req-same-minute',
+    });
+    expect(explicit).toEqual({
+      ok: false,
+      error: 'اكتب سبب التغيير بأثر رجعي',
+    });
+
+    const shiftStart = buildDatedWrite({
+      mode: 'shift',
+      shiftStart: sameMinute,
+      customIso: null,
+      versions,
+      nowIso: '2026-07-15T09:00:45.000Z',
+      token: 'token',
+      reason: '',
+      requestId: 'req-shift-minute',
+    });
+    expect(shiftStart).toEqual({
+      ok: false,
+      error: 'اكتب سبب التغيير بأثر رجعي',
+    });
+
+    const serverNow = buildDatedWrite({
+      mode: 'now',
+      shiftStart: sameMinute,
+      customIso: null,
+      versions,
+      nowIso: '2026-07-15T09:00:45.000Z',
+      token: 'token',
+      reason: '',
+      requestId: 'req-now-minute',
+    });
+    expect(serverNow.ok && serverNow.write.effectiveFrom).toBeNull();
+    expect(serverNow.ok && serverNow.write.reason).toBeNull();
+    expect(serverNow.ok && serverNow.write.effectiveTo).toBeNull();
+  });
+
   it('keeps the end of a finite version the edit starts inside', () => {
     const versions = [
       {

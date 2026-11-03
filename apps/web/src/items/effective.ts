@@ -13,7 +13,9 @@ export type SchedulePoint = {
 /**
  * Default the owner sees: the open shift's start when one exists, otherwise now.
  * "now" is sent as null. The server stamps the current minute and keeps the
- * replay marker "now". The current minute is not backdating.
+ * replay marker "now". Only that null start is exempt from the backdating
+ * reason. An explicit timestamp, including the shift start, is backdated when
+ * it is earlier than the actual submission time.
  */
 export function defaultEffectiveMode(shiftStart: string | null): EffectiveMode {
   return shiftStart ? 'shift' : 'now';
@@ -60,6 +62,7 @@ export function needsBackdatedReason(
   customIso: string | null,
   nowMs: number,
 ): boolean {
+  if (mode === 'now') return false;
   const chosen = chosenInstantMs(mode, shiftStart, customIso, nowMs);
   if (chosen === null) return false;
   return chosen < nowMs;
@@ -132,13 +135,17 @@ export function buildDatedWrite(input: {
   if (input.mode === 'custom' && !input.customIso) {
     return { ok: false, error: 'الوقت مش مظبوط' };
   }
+  // A null start is resolved to the current minute on the server, and its
+  // end is chosen from that minute. An explicit start is compared with the
+  // actual submission time, so an earlier instant in the same minute is
+  // backdated.
   const minuteIso = currentMinuteIso(input.nowIso);
-  const nowMs = Date.parse(minuteIso);
+  const submittedMs = Date.parse(input.nowIso);
   const backdated = needsBackdatedReason(
     input.mode,
     input.shiftStart,
     input.customIso,
-    nowMs,
+    Number.isNaN(submittedMs) ? Date.parse(minuteIso) : submittedMs,
   );
   const reason = input.reason.trim();
   if (backdated && reason.length === 0) {
@@ -153,7 +160,11 @@ export function buildDatedWrite(input: {
     ok: true,
     write: {
       effectiveFrom,
-      effectiveTo: nextVersionStart(input.versions, effectiveFrom, minuteIso),
+      effectiveTo: nextVersionStart(
+        input.versions,
+        effectiveFrom,
+        effectiveFrom === null ? minuteIso : input.nowIso,
+      ),
       token: input.token,
       reason: backdated ? reason : null,
       requestId: input.requestId,

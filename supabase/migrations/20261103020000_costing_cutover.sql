@@ -456,10 +456,11 @@ begin
       using errcode = '40001';
   end if;
 
-  -- The current minute is not backdating. An explicit instant in that minute
-  -- matches the minute-precision forms and needs no reason.
+  -- Only a null effective_from is the server's current minute and needs no
+  -- reason. An explicit timestamp, including a shift start in the same
+  -- minute, is backdated when it is earlier than the actual clock.
   if not v_from_is_now
-  and v_effective_from < pg_catalog.date_trunc('minute', pg_catalog.now())
+  and v_effective_from < pg_catalog.now()
   and v_reason is null then
     raise exception 'reason is required for a backdated change'
       using errcode = '22023';
@@ -859,10 +860,10 @@ begin
       using errcode = '40001';
   end if;
 
-  -- The current minute is not backdating. An explicit instant in that minute
-  -- matches the minute-precision forms and needs no reason.
+  -- Same rule as set_item_loss: only a null effective_from is exempt.
+  -- An explicit timestamp earlier than the actual clock needs a reason.
   if not v_from_is_now
-  and v_effective_from < pg_catalog.date_trunc('minute', pg_catalog.now())
+  and v_effective_from < pg_catalog.now()
   and v_reason is null then
     raise exception 'reason is required for a backdated change'
       using errcode = '22023';
