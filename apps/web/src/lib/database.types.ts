@@ -5,7 +5,21 @@ export type Database = {
   
   "app": {
           Tables: {
-            "expense_categories": {
+            "costing_changes": {
+                  Row: {
+                    "actor_id": string | null,"id": number,"kind": string,"payload": NonNullable<Json>,"reason": string | null,"recorded_at": string,"request_id": string,"result": NonNullable<Json>
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "actor_id"?: string | null,"id"?: never,"kind": string,"payload": NonNullable<Json>,"reason"?: string | null,"recorded_at"?: string,"request_id": string,"result": NonNullable<Json>
+                  }
+                  Update: {
+                    "actor_id"?: string | null,"id"?: never,"kind"?: string,"payload"?: NonNullable<Json>,"reason"?: string | null,"recorded_at"?: string,"request_id"?: string,"result"?: NonNullable<Json>
+                  }
+                  Relationships: [
+                    
+                  ]
+                },"expense_categories": {
                   Row: {
                     "active": boolean,"created_at": string,"id": string,"kind": string,"name": string
                   }
@@ -74,6 +88,114 @@ isOneToOne: true
       columns: ["item_id"]
 isOneToOne: true
       referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"item_conversion_versions": {
+                  Row: {
+                    "created_change_id": number,"effective_from": string,"effective_to": string | null,"factor_to_base": number,"id": string,"item_id": string,"superseded_change_id": number | null,"unit_code": string,"valid_during": unknown
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_change_id": number,"effective_from": string,"effective_to"?: string | null,"factor_to_base": number,"id"?: string,"item_id": string,"superseded_change_id"?: number | null,"unit_code": string,"valid_during"?: never
+                  }
+                  Update: {
+                    "created_change_id"?: number,"effective_from"?: string,"effective_to"?: string | null,"factor_to_base"?: number,"id"?: string,"item_id"?: string,"superseded_change_id"?: number | null,"unit_code"?: string,"valid_during"?: never
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "item_conversion_versions_created_change_id_fkey"
+      columns: ["created_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "item_conversion_versions_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "item_conversion_versions_superseded_change_id_fkey"
+      columns: ["superseded_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "item_conversion_versions_unit_code_fkey"
+      columns: ["unit_code"]
+isOneToOne: false
+      referencedRelation: "units"
+      referencedColumns: ["code"]
+    }
+                  ]
+                },"item_loss_versions": {
+                  Row: {
+                    "created_change_id": number,"effective_from": string,"effective_to": string | null,"id": string,"item_id": string,"loss_pct": number,"superseded_change_id": number | null,"valid_during": unknown
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_change_id": number,"effective_from": string,"effective_to"?: string | null,"id"?: string,"item_id": string,"loss_pct": number,"superseded_change_id"?: number | null,"valid_during"?: never
+                  }
+                  Update: {
+                    "created_change_id"?: number,"effective_from"?: string,"effective_to"?: string | null,"id"?: string,"item_id"?: string,"loss_pct"?: number,"superseded_change_id"?: number | null,"valid_during"?: never
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "item_loss_versions_created_change_id_fkey"
+      columns: ["created_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "item_loss_versions_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "item_loss_versions_superseded_change_id_fkey"
+      columns: ["superseded_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"item_opening_prices": {
+                  Row: {
+                    "approved_at": string,"approved_by": string | null,"base_unit": string,"created_change_id": number,"id": string,"item_id": string,"superseded_change_id": number | null,"unit_cost": number,"zero_cost_reason": string | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "approved_at"?: string,"approved_by"?: string | null,"base_unit": string,"created_change_id": number,"id"?: string,"item_id": string,"superseded_change_id"?: number | null,"unit_cost": number,"zero_cost_reason"?: string | null
+                  }
+                  Update: {
+                    "approved_at"?: string,"approved_by"?: string | null,"base_unit"?: string,"created_change_id"?: number,"id"?: string,"item_id"?: string,"superseded_change_id"?: number | null,"unit_cost"?: number,"zero_cost_reason"?: string | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "item_opening_prices_base_unit_fkey"
+      columns: ["base_unit"]
+isOneToOne: false
+      referencedRelation: "units"
+      referencedColumns: ["code"]
+    },{
+      foreignKeyName: "item_opening_prices_created_change_id_fkey"
+      columns: ["created_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "item_opening_prices_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "item_opening_prices_superseded_change_id_fkey"
+      columns: ["superseded_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
       referencedColumns: ["id"]
     }
                   ]
@@ -536,6 +658,12 @@ isOneToOne: false
                   }
                   Relationships: [
                     {
+      foreignKeyName: "stock_items_base_unit_fkey"
+      columns: ["base_unit"]
+isOneToOne: false
+      referencedRelation: "units"
+      referencedColumns: ["code"]
+    },{
       foreignKeyName: "stock_items_parent_item_id_fkey"
       columns: ["parent_item_id"]
 isOneToOne: false
@@ -568,6 +696,20 @@ isOneToOne: false
       referencedRelation: "stock_items"
       referencedColumns: ["id"]
     }
+                  ]
+                },"units": {
+                  Row: {
+                    "code": string,"dimension": string,"label_ar": string,"metric_scale": number | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "code": string,"dimension": string,"label_ar": string,"metric_scale"?: number | null
+                  }
+                  Update: {
+                    "code"?: string,"dimension"?: string,"label_ar"?: string,"metric_scale"?: number | null
+                  }
+                  Relationships: [
+                    
                   ]
                 }
           }
@@ -672,6 +814,12 @@ isOneToOne: false
 "batch_is_forward":
 { Args: { "p_item_ids": (string)[],"p_occurred_at": (string)[] }; Returns: boolean
                            },
+"costing_replay_result":
+{ Args: { "p_payload": Json,"p_request_id": string }; Returns: Json
+                           },
+"costing_schedule_line":
+{ Args: { "p_effective_from": string,"p_effective_to": string,"p_id": string,"p_payload": number }; Returns: string
+                           },
 "delete_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
                            },
@@ -699,8 +847,20 @@ isOneToOne: false
 "ingest_pos_batch":
 { Args: { "p_orders": Json,"p_run_id": number,"p_scope": Json,"p_shifts": Json }; Returns: Json
                            },
+"insert_owner_costing_change":
+{ Args: { "p_payload": Json,"p_reason": string,"p_request_id": string,"p_result": Json }; Returns: Json
+                           },
 "is_owner":
 { Args: Record<PropertyKey, never>; Returns: boolean
+                           },
+"item_costing_schedule":
+{ Args: { "p_item_id": string }; Returns: Json
+                           },
+"item_factor_at":
+{ Args: { "p_at": string,"p_item_id": string,"p_unit_code": string }; Returns: number
+                           },
+"item_loss_at":
+{ Args: { "p_at": string,"p_item_id": string }; Returns: number
                            },
 "lock_and_validate_item_balance":
 { Args: { "p_item_id": string,"p_occurred_at": string }; Returns: {
@@ -783,8 +943,20 @@ isOneToOne: false
 "resolve_shift_id":
 { Args: { "p_at": string }; Returns: string
                            },
+"schedule_token":
+{ Args: { "p_family": string,"p_item_id": string,"p_unit_code": string }; Returns: string
+                           },
 "set_expense_category_active":
 { Args: { "p_active": boolean,"p_id": string }; Returns: undefined
+                           },
+"set_item_conversion":
+{ Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_factor": number,"p_item_id": string,"p_reason": string,"p_request_id": string,"p_unit_code": string }; Returns: Json
+                           },
+"set_item_loss":
+{ Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_item_id": string,"p_loss_pct": number,"p_reason": string,"p_request_id": string }; Returns: Json
+                           },
+"set_item_opening_price":
+{ Args: { "p_expected_current_id": string,"p_item_id": string,"p_request_id": string,"p_unit_cost": number,"p_zero_cost_reason": string }; Returns: Json
                            },
 "set_month_expense_complete":
 { Args: { "p_complete": boolean,"p_month": string }; Returns: undefined
