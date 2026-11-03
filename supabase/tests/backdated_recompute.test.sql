@@ -423,6 +423,15 @@ values
     'daily',
     0,
     null
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000040',
+    '27a-piaster-cover',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
   );
 
 create function pg_temp.ledger_counts () returns jsonb language sql as $$
@@ -2891,6 +2900,110 @@ select
       array['e2700000-0000-4000-8000-000000000032']::uuid[]
     ),
     'partial deficit cover canary: sale of 5 into stock 2, then purchase 1, then purchase 4, rebuilds with no new cost adjustment'
+  );
+
+-- Same piaster case as stock_ledger_core §86. Average 100.50, a provisional
+-- sale of 0.02 kg costing 2.01, then two purchases of 0.01 kg at 101. The
+-- forward cover shares are 1.01 and then the remaining 1.00, so the sale's
+-- effective cost is -2.02. Pricing both shares from the unit cost would
+-- leave -2.01.
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000040',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:00:00Z',
+        'quantity',
+        1,
+        'unit_cost',
+        100.50
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000040',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-10-16T08:10:00Z',
+        'quantity',
+        1
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000040',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-10-16T08:20:00Z',
+        'quantity',
+        0.02
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000040',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:30:00Z',
+        'quantity',
+        0.01,
+        'unit_cost',
+        101
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000040',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-10-16T08:40:00Z',
+        'quantity',
+        0.01,
+        'unit_cost',
+        101
+      )
+    )
+  );
+
+select
+  results_eq (
+    $$select
+        (
+          select
+            (sm.total_cost + coalesce(sum(ca.total_cost), 0))::numeric(14, 2)
+          from app.stock_movements sm
+          left join app.stock_movements ca
+            on ca.adjusts_movement_id = sm.id
+            and ca.movement_type = 'cost_adjustment'
+          where sm.item_id = ib.item_id
+            and sm.movement_type = 'sale'
+            and sm.is_provisional
+            and sm.quantity = -0.020000
+          group by sm.id, sm.total_cost
+        ),
+        pd.qty_uncovered,
+        pd.value_uncovered
+      from app.item_balances ib
+      join app.provisional_deficits pd on pd.item_id = ib.item_id
+      where ib.item_id = 'e2700000-0000-4000-8000-000000000040'$$,
+    $$values (
+      -2.02::numeric(14, 2),
+      0.000000::numeric(20, 6),
+      0.00::numeric(14, 2)
+    )$$,
+    'piaster cover canary: provisional sale of 0.02 kg at avg 100.50, covered by two 0.01 kg purchases at 101, has effective cost -2.02 and no remaining deficit'
+  );
+
+select
+  ok (
+    pg_temp.rebuild_stable (
+      array['e2700000-0000-4000-8000-000000000040']::uuid[]
+    ),
+    'piaster cover canary: rebuild inserts no cost adjustment and leaves balances and deficits unchanged'
   );
 
 -- Two in-range purchases whose replayed sum exceeds numeric(14,2). A
