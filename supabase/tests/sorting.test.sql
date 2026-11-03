@@ -1164,20 +1164,78 @@ select
   );
 
 select
-  throws_ok (
-    $$select app.record_sort(jsonb_build_object(
-      'request_id', 'd1800000-0000-4000-8000-000000000031',
-      'mixed_item_id', 'c1800000-0000-4000-8000-000000000001',
-      'occurred_at', '2026-10-22T10:00:00Z',
-      'qty_taken', '1',
-      'lines', jsonb_build_array(jsonb_build_object(
-        'item_id', 'c1800000-0000-4000-8000-000000000002',
-        'quantity', '1'
-      ))
-    ))$$,
-    'P0001',
-    'back-dated movement not supported yet',
-    'a sort earlier than the last movement is refused'
+  app.record_purchase (
+    jsonb_build_object(
+      'purchased_at',
+      '2026-10-22T12:00:00Z',
+      'request_id',
+      'd1800000-0000-4000-8000-000000000032',
+      'lines',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          'c1800000-0000-4000-8000-000000000001',
+          'quantity',
+          '1',
+          'unit',
+          'kg',
+          'amount_paid',
+          '100',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '1'
+        )
+      )
+    )
+  );
+
+select
+  app.record_sort (
+    jsonb_build_object(
+      'request_id',
+      'd1800000-0000-4000-8000-000000000031',
+      'mixed_item_id',
+      'c1800000-0000-4000-8000-000000000001',
+      'occurred_at',
+      '2026-10-22T11:30:00Z',
+      'qty_taken',
+      '1',
+      'lines',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          'c1800000-0000-4000-8000-000000000002',
+          'quantity',
+          '1'
+        )
+      )
+    )
+  );
+
+select
+  results_eq (
+    $$select item_id, on_hand_qty, on_hand_value, avg_cost
+      from app.item_balances
+      where item_id in (
+        'c1800000-0000-4000-8000-000000000001',
+        'c1800000-0000-4000-8000-000000000002'
+      )
+      order by item_id$$,
+    $$values
+      (
+        'c1800000-0000-4000-8000-000000000001'::uuid,
+        5::numeric(20, 6),
+        300.00::numeric(14, 2),
+        60::numeric(20, 6)
+      ),
+      (
+        'c1800000-0000-4000-8000-000000000002'::uuid,
+        71::numeric(20, 6),
+        3450.00::numeric(14, 2),
+        round(3450::numeric / 71, 6)::numeric(20, 6)
+      )$$,
+    'a sort between later purchases keeps the historical raw cost'
   );
 
 select

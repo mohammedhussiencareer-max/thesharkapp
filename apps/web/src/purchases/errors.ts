@@ -18,9 +18,14 @@ export class ConversionChangedError extends Error {
 }
 
 const backDatedMarker = 'back-dated movement not supported yet';
+const beforeOpeningMarker = 'movement is before opening stock';
 
 export function backDatedMessage(itemName: string): string {
   return `مينفعش تسجّل حركة لـ ${itemName} بتاريخ أقدم من آخر حركة ليه — التعديل بأثر رجعي جاي في مرحلة لاحقة`;
+}
+
+export function beforeOpeningMessage(itemName: string): string {
+  return `مينفعش تسجّل حركة لـ ${itemName} قبل رصيده الافتتاحي`;
 }
 
 const namedReasons: ReadonlyArray<readonly [string, (name: string) => string]> =
@@ -141,6 +146,14 @@ export function mapPurchaseError(error: unknown): string {
         ? details.trim()
         : 'الصنف';
     return backDatedMessage(name);
+  }
+
+  if (text.includes(beforeOpeningMarker)) {
+    const name =
+      details.trim() && !details.includes('occurred_at')
+        ? details.trim()
+        : 'الصنف';
+    return beforeOpeningMessage(name);
   }
 
   for (const [prefix, toArabic] of namedReasons) {

@@ -111,6 +111,26 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"movement_attributions": {
+                  Row: {
+                    "attributed_at": string,"movement_id": number,"shift_id": string | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "attributed_at"?: string,"movement_id": number,"shift_id"?: string | null
+                  }
+                  Update: {
+                    "attributed_at"?: string,"movement_id"?: number,"shift_id"?: string | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "movement_attributions_movement_id_fkey"
+      columns: ["movement_id"]
+isOneToOne: true
+      referencedRelation: "stock_movements"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"opening_stock_lines": {
                   Row: {
                     "item_id": string,"line_no": number,"opening_id": string,"quantity": number,"unit": string,"unit_cost": number
@@ -164,6 +184,32 @@ isOneToOne: false
                   }
                   Relationships: [
                     
+                  ]
+                },"period_revisions": {
+                  Row: {
+                    "amount": number,"bucket": string,"cause_batch_id": string,"created_at": string,"id": number,"item_id": string,"shift_id": string | null,"source_movement_id": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "amount": number,"bucket": string,"cause_batch_id": string,"created_at"?: string,"id"?: never,"item_id": string,"shift_id"?: string | null,"source_movement_id": number
+                  }
+                  Update: {
+                    "amount"?: number,"bucket"?: string,"cause_batch_id"?: string,"created_at"?: string,"id"?: never,"item_id"?: string,"shift_id"?: string | null,"source_movement_id"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "period_revisions_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "period_revisions_source_movement_id_fkey"
+      columns: ["source_movement_id"]
+isOneToOne: true
+      referencedRelation: "stock_movements"
+      referencedColumns: ["id"]
+    }
                   ]
                 },"pos_order_lines": {
                   Row: {
@@ -341,6 +387,20 @@ isOneToOne: false
                   }
                   Update: {
                     "batch_id"?: string,"created_at"?: string,"created_by"?: string | null,"id"?: string,"invoice_no"?: string | null,"note"?: string | null,"purchased_at"?: string,"request_id"?: string,"supplier"?: string | null,"total_paid"?: number
+                  }
+                  Relationships: [
+                    
+                  ]
+                },"shift_report_flags": {
+                  Row: {
+                    "profit_delta": number,"revised_at": string,"shift_id": string,"sort_transfer_delta": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "profit_delta": number,"revised_at": string,"shift_id": string,"sort_transfer_delta": number
+                  }
+                  Update: {
+                    "profit_delta"?: number,"revised_at"?: string,"shift_id"?: string,"sort_transfer_delta"?: number
                   }
                   Relationships: [
                     
@@ -588,6 +648,9 @@ isOneToOne: false
 "apply_outflow_movement":
 { Args: { "p_batch_id": string,"p_item_id": string,"p_movement_type": Database["app"]['Enums']["movement_type"],"p_note": string,"p_occurred_at": string,"p_out_qty": number,"p_override_total_cost"?: number,"p_shift_id": string,"p_source_id": string,"p_source_type": string }; Returns: undefined
                            },
+"assert_count_barrier":
+{ Args: { "p_item_ids": (string)[],"p_occurred_at": (string)[],"p_set": (string)[] }; Returns: undefined
+                           },
 "assert_expense_write_allowed":
 { Args: Record<PropertyKey, never>; Returns: undefined
                            },
@@ -597,8 +660,17 @@ isOneToOne: false
 "assert_no_phone_text":
 { Args: { "p_text": string }; Returns: undefined
                            },
+"assert_not_before_opening":
+{ Args: { "p_item_ids": (string)[],"p_occurred_at": (string)[],"p_types": (string)[] }; Returns: undefined
+                           },
 "assert_pos_write_allowed":
 { Args: Record<PropertyKey, never>; Returns: undefined
+                           },
+"assert_recompute_range":
+{ Args: { "p_allow_negative": boolean,"p_scale": number,"p_value": number }; Returns: number
+                           },
+"batch_is_forward":
+{ Args: { "p_item_ids": (string)[],"p_occurred_at": (string)[] }; Returns: boolean
                            },
 "delete_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
@@ -645,17 +717,35 @@ isOneToOne: false
         isOneToOne: true
         isSetofReturn: false
       } },
+"note_period_revision":
+{ Args: { "p_amount": number,"p_bucket": string,"p_cause": string,"p_item_id": string,"p_shift_id": string,"p_source_id": number }; Returns: undefined
+                           },
 "pos_money":
 { Args: { "p_value": number }; Returns: number
                            },
 "pos_qty":
 { Args: { "p_value": number }; Returns: number
                            },
+"post_backdated_batch":
+{ Args: { "p_batch_id": string,"p_pending": Json }; Returns: (number)[]
+                           },
 "post_movements":
 { Args: { "p_movements": Json }; Returns: string
                            },
 "post_sort":
 { Args: { "p_mixed_item": string,"p_occurred_at": string,"p_qty_taken": number,"p_shift_id"?: string,"p_sizes": Json }; Returns: string
+                           },
+"prepare_balance_locks":
+{ Args: { "p_item_ids": (string)[] }; Returns: undefined
+                           },
+"profit_bucket":
+{ Args: { "p_type": Database["app"]['Enums']["movement_type"] }; Returns: string
+                           },
+"rebuild_derived_balances":
+{ Args: { "p_cause_batch": string,"p_item_ids": (string)[] }; Returns: undefined
+                           },
+"recompute_item_set":
+{ Args: { "p_item_ids": (string)[] }; Returns: (string)[]
                            },
 "record_count":
 { Args: { "p_count": Json }; Returns: Json
@@ -675,11 +765,32 @@ isOneToOne: false
 "replace_pos_order_lines":
 { Args: { "p_lines": Json,"p_order_id": string }; Returns: undefined
                            },
+"replay_execute":
+{ Args: { "p_cause": string,"p_item_ids": (string)[],"p_pending": Json,"p_write": boolean }; Returns: undefined
+                           },
+"replay_inflow":
+{ Args: { "p_in_qty": number,"p_is_pending": boolean,"p_item_id": string,"p_line_key": number,"p_movement_id": number,"p_note": string,"p_occurred_at": string,"p_shift_id": string,"p_source_id": string,"p_source_type": string,"p_total_cost": number,"p_type": Database["app"]['Enums']["movement_type"],"p_unit_cost": number }; Returns: undefined
+                           },
+"replay_outflow":
+{ Args: { "p_forced_total": number,"p_is_pending": boolean,"p_item_id": string,"p_line_key": number,"p_movement_id": number,"p_note": string,"p_occurred_at": string,"p_out_qty": number,"p_shift_id": string,"p_source_id": string,"p_source_type": string,"p_type": Database["app"]['Enums']["movement_type"] }; Returns: undefined
+                           },
+"replay_prepare_tables":
+{ Args: Record<PropertyKey, never>; Returns: undefined
+                           },
+"replay_touch_deficit_flag":
+{ Args: { "p_item_id": string }; Returns: undefined
+                           },
+"resolve_shift_id":
+{ Args: { "p_at": string }; Returns: string
+                           },
 "set_expense_category_active":
 { Args: { "p_active": boolean,"p_id": string }; Returns: undefined
                            },
 "set_month_expense_complete":
 { Args: { "p_complete": boolean,"p_month": string }; Returns: undefined
+                           },
+"shift_for_target":
+{ Args: { "p_movement_id": number }; Returns: string
                            },
 "start_pos_sync_run":
 { Args: { "p_mode": string }; Returns: number

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   backDatedMessage,
+  beforeOpeningMessage,
   genericPurchaseError,
   mapPurchaseError,
   permissionMessage,
@@ -18,6 +19,23 @@ describe('mapPurchaseError', () => {
     expect(backDatedMessage('زيت')).toBe(
       'مينفعش تسجّل حركة لـ زيت بتاريخ أقدم من آخر حركة ليه — التعديل بأثر رجعي جاي في مرحلة لاحقة',
     );
+  });
+
+  it('names the item when a movement is before opening stock', () => {
+    expect(
+      mapPurchaseError({
+        code: 'P0001',
+        message: 'movement is before opening stock',
+        details: 'زيت',
+      }),
+    ).toBe(beforeOpeningMessage('زيت'));
+    expect(
+      mapPurchaseError({
+        code: 'P0001',
+        message: 'movement is before opening stock',
+        details: 'occurred_at 2026-10-21 is before opening',
+      }),
+    ).toBe(beforeOpeningMessage('الصنف'));
   });
 
   it('points to the saved list when a request id was reused with edits', () => {
