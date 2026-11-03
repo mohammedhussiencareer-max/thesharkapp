@@ -109,6 +109,19 @@ export type DatedWrite = {
   requestId: string;
 };
 
+/** One editor action. Each kind performs exactly one write. */
+export type ItemSave =
+  | { kind: 'create'; draft: ItemDraft }
+  | { kind: 'details'; draft: ItemDraft }
+  | { kind: 'loss'; lossPct: string; write: DatedWrite }
+  | {
+      kind: 'price';
+      price: string;
+      reason: string | null;
+      expectedId: string | null;
+      requestId: string;
+    };
+
 export function isStockKind(value: string): value is StockKind {
   return (stockKinds as readonly string[]).includes(value);
 }

@@ -2,7 +2,9 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { OpeningGrid } from '@/purchases/OpeningGrid';
 import { cairoDateTimeLocalToIso } from '@/purchases/time';
+import { unitLookupErrorMessage } from '@/purchases/units-at';
 import type { OpeningDraft, StockChoice } from '@/purchases/types';
+import { unitUnavailableMessage } from '@/purchases/validation';
 
 const oil: StockChoice = {
   id: 'oil',
@@ -279,5 +281,140 @@ describe('OpeningGrid', () => {
     );
     expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
     expect(screen.getByLabelText('كمية زيت')).toBeDisabled();
+  });
+
+  it('keeps a selected unit and blocks save when a later lookup fails', async () => {
+    const july = cairoDateTimeLocalToIso('2026-07-15T12:00');
+    const january = cairoDateTimeLocalToIso('2020-01-15T10:00');
+    if (july === null || january === null) {
+      throw new Error('cairo time did not parse');
+    }
+    let failJanuary = true;
+    const carton = {
+      unit: 'carton',
+      factorToBase: '12',
+      label: 'كرتونة',
+    };
+    const resolveUnits = vi.fn((_ids: readonly string[], at: string) =>
+      at === january && failJanuary
+        ? Promise.reject(new Error('down'))
+        : Promise.resolve({ oil: [carton] }),
+    );
+    const onSubmit = vi.fn<(draft: OpeningDraft) => void>();
+    render(
+      <OpeningGrid
+        items={[oil]}
+        locked={false}
+        submitting={false}
+        serverError={null}
+        onClearServerError={vi.fn()}
+        onSubmit={onSubmit}
+        resolveUnits={resolveUnits}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('وقت الرصيد'), {
+      target: { value: '2026-07-15T12:00' },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('option', { name: 'كرتونة' })).toHaveValue(
+        'carton',
+      );
+    });
+    fireEvent.change(screen.getByLabelText('وحدة زيت'), {
+      target: { value: 'carton' },
+    });
+    fireEvent.change(screen.getByLabelText('كمية زيت'), {
+      target: { value: '2' },
+    });
+    fireEvent.change(screen.getByLabelText('تكلفة زيت'), {
+      target: { value: '10' },
+    });
+    fireEvent.change(screen.getByLabelText('وقت الرصيد'), {
+      target: { value: '2020-01-15T10:00' },
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      unitLookupErrorMessage,
+    );
+    expect(screen.getByLabelText('وحدة زيت')).toHaveValue('carton');
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    failJanuary = false;
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    expect(screen.getByLabelText('وحدة زيت')).toHaveValue('carton');
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(onSubmit.mock.calls[0]?.[0].lines[0]).toMatchObject({
+      quantity: '2',
+      unit: 'carton',
+      expectedFactor: '12',
+    });
+  });
+
+  it('blocks save when the selected unit is gone at the new time', async () => {
+    const july = cairoDateTimeLocalToIso('2026-07-15T12:00');
+    const january = cairoDateTimeLocalToIso('2020-01-15T10:00');
+    if (july === null || january === null) {
+      throw new Error('cairo time did not parse');
+    }
+    const resolveUnits = vi.fn((_ids: readonly string[], at: string) =>
+      Promise.resolve({
+        oil:
+          at === january
+            ? []
+            : [{ unit: 'carton', factorToBase: '12', label: 'كرتونة' }],
+      }),
+    );
+    const onSubmit = vi.fn<(draft: OpeningDraft) => void>();
+    render(
+      <OpeningGrid
+        items={[oil]}
+        locked={false}
+        submitting={false}
+        serverError={null}
+        onClearServerError={vi.fn()}
+        onSubmit={onSubmit}
+        resolveUnits={resolveUnits}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('وقت الرصيد'), {
+      target: { value: '2026-07-15T12:00' },
+    });
+    await waitFor(() => {
+      expect(resolveUnits).toHaveBeenCalledWith(['oil'], july);
+    });
+    fireEvent.change(screen.getByLabelText('وحدة زيت'), {
+      target: { value: 'carton' },
+    });
+    fireEvent.change(screen.getByLabelText('كمية زيت'), {
+      target: { value: '2' },
+    });
+    fireEvent.change(screen.getByLabelText('تكلفة زيت'), {
+      target: { value: '10' },
+    });
+    fireEvent.change(screen.getByLabelText('وقت الرصيد'), {
+      target: { value: '2020-01-15T10:00' },
+    });
+
+    expect(await screen.findByText(unitUnavailableMessage)).toBeInTheDocument();
+    expect(screen.getByLabelText('وحدة زيت')).toHaveValue('carton');
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('وحدة زيت'), {
+      target: { value: 'kg' },
+    });
+    expect(screen.queryByText(unitUnavailableMessage)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(onSubmit.mock.calls[0]?.[0].lines[0]).toMatchObject({
+      quantity: '2',
+      unit: 'kg',
+      expectedFactor: '1',
+    });
   });
 });

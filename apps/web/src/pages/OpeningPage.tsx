@@ -29,6 +29,7 @@ export function OpeningPage() {
   const [serverError, setServerError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [formEpoch, setFormEpoch] = useState(0);
+  const [unitsNonce, setUnitsNonce] = useState(0);
   const seqRef = useRef(0);
   const loadsRef = useRef(0);
   const busy = saving || needsReload || loads > 0;
@@ -100,6 +101,9 @@ export function OpeningPage() {
       if (!saved) {
         setServerError(messageFrom(error));
         if (error instanceof ConversionChangedError) {
+          // Same items and timestamp. Block the next save until this
+          // lookup replaces the factor the server just rejected.
+          setUnitsNonce((value) => value + 1);
           try {
             const next = await readChoices();
             if (next) setItems(next);
@@ -165,6 +169,7 @@ export function OpeningPage() {
           onClearServerError={() => setServerError(null)}
           onSubmit={(draft) => void handleSubmit(draft)}
           resolveUnits={listUnitsAt}
+          reloadKey={unitsNonce}
         />
       ) : null}
     </main>

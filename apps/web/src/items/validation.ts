@@ -166,6 +166,8 @@ export function validateItemForm(
   context: {
     items: readonly Pick<CatalogItem, 'id' | 'kind' | 'parentItemId'>[];
     editingId?: string;
+    /** Details saves do not validate the loss field. Create still does. */
+    includeLoss?: boolean;
   },
 ): { ok: true; draft: ItemDraft } | { ok: false; errors: ItemFormErrors } {
   const errors: ItemFormErrors = {};
@@ -180,8 +182,11 @@ export function validateItemForm(
     errors.countFrequency = 'دورية الجرد مش مظبوطة';
   }
 
-  const lossBlank = values.lossPercent.trim() === '';
-  const lossMessage = lossPercentMessage(values.lossPercent);
+  const includeLoss = context.includeLoss !== false;
+  const lossBlank = !includeLoss || values.lossPercent.trim() === '';
+  const lossMessage = includeLoss
+    ? lossPercentMessage(values.lossPercent)
+    : null;
   const lossPct = lossBlank
     ? null
     : lossMessage === null

@@ -260,6 +260,7 @@ declare
   v_replay jsonb;
   v_token text;
   v_new_token text;
+  v_canonical_to timestamptz;
   v_result jsonb;
   v_change_id bigint;
   v_superseded uuid[] := '{}'::uuid[];
@@ -390,9 +391,75 @@ begin
       using errcode = '40001';
   end if;
 
-  -- The current minute is not backdating.
+  -- The end is the covering version's own end, or the next start when the
+  -- resolved instant is in a gap. A client that computed the end from a
+  -- different instant must not fill a gap it did not see.
+  select
+    case
+      when exists (
+        select
+          1
+        from
+          app.item_loss_versions v
+        where
+          v.item_id = p_item_id
+          and v.superseded_change_id is null
+          and v.effective_from <= v_effective_from
+          and (
+            v.effective_to is null
+            or v_effective_from < v.effective_to
+          )
+      ) then (
+        select
+          v.effective_to
+        from
+          app.item_loss_versions v
+        where
+          v.item_id = p_item_id
+          and v.superseded_change_id is null
+          and v.effective_from <= v_effective_from
+          and (
+            v.effective_to is null
+            or v_effective_from < v.effective_to
+          )
+        order by
+          v.effective_from desc
+        limit
+          1
+      )
+      else (
+        select
+          min(v.effective_from)
+        from
+          app.item_loss_versions v
+        where
+          v.item_id = p_item_id
+          and v.superseded_change_id is null
+          and v.effective_from > v_effective_from
+      )
+    end
+  into v_canonical_to;
+
+  -- "now" is resolved to the current minute after the client chose the end.
+  -- When that minute sits inside a version, an end past that version's own
+  -- end would cover a gap the client did not see. A null canonical end is
+  -- an open schedule, so a finite requested end stays inside it. An explicit
+  -- interval is the one the token-checked schedule showed, including a
+  -- spanning replacement, so this guard does not apply to it.
+  if v_from_is_now
+  and v_canonical_to is not null
+  and (
+    p_effective_to is null
+    or p_effective_to > v_canonical_to
+  ) then
+    raise exception 'configuration changed'
+      using errcode = '40001';
+  end if;
+
+  -- The current minute is not backdating. An explicit instant in that minute
+  -- matches the minute-precision forms and needs no reason.
   if not v_from_is_now
-  and v_effective_from < pg_catalog.now()
+  and v_effective_from < pg_catalog.date_trunc('minute', pg_catalog.now())
   and v_reason is null then
     raise exception 'reason is required for a backdated change'
       using errcode = '22023';
@@ -560,6 +627,7 @@ declare
   v_replay jsonb;
   v_token text;
   v_new_token text;
+  v_canonical_to timestamptz;
   v_result jsonb;
   v_change_id bigint;
   v_superseded uuid[] := '{}'::uuid[];
@@ -728,9 +796,73 @@ begin
       using errcode = '40001';
   end if;
 
-  -- The current minute is not backdating.
+  -- Same end rule as set_item_loss, scoped to this unit.
+  select
+    case
+      when exists (
+        select
+          1
+        from
+          app.item_conversion_versions v
+        where
+          v.item_id = p_item_id
+          and v.unit_code = v_unit
+          and v.superseded_change_id is null
+          and v.effective_from <= v_effective_from
+          and (
+            v.effective_to is null
+            or v_effective_from < v.effective_to
+          )
+      ) then (
+        select
+          v.effective_to
+        from
+          app.item_conversion_versions v
+        where
+          v.item_id = p_item_id
+          and v.unit_code = v_unit
+          and v.superseded_change_id is null
+          and v.effective_from <= v_effective_from
+          and (
+            v.effective_to is null
+            or v_effective_from < v.effective_to
+          )
+        order by
+          v.effective_from desc
+        limit
+          1
+      )
+      else (
+        select
+          min(v.effective_from)
+        from
+          app.item_conversion_versions v
+        where
+          v.item_id = p_item_id
+          and v.unit_code = v_unit
+          and v.superseded_change_id is null
+          and v.effective_from > v_effective_from
+      )
+    end
+  into v_canonical_to;
+
+  -- Same "now" guard as set_item_loss: the resolved minute must not extend
+  -- past the end derived from the schedule. An explicit interval can still
+  -- span the versions the caller saw.
+  if v_from_is_now
+  and v_canonical_to is not null
+  and (
+    p_effective_to is null
+    or p_effective_to > v_canonical_to
+  ) then
+    raise exception 'configuration changed'
+      using errcode = '40001';
+  end if;
+
+  -- The current minute is not backdating. An explicit instant in that minute
+  -- matches the minute-precision forms and needs no reason.
   if not v_from_is_now
-  and v_effective_from < pg_catalog.now()
+  and v_effective_from < pg_catalog.date_trunc('minute', pg_catalog.now())
   and v_reason is null then
     raise exception 'reason is required for a backdated change'
       using errcode = '22023';

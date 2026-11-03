@@ -8,7 +8,10 @@ import { nowCairoDateTimeLocal } from '@/purchases/time';
 import { useResolvedUnits } from '@/purchases/units-at';
 import {
   choiceLabel,
+  choicesIncluding,
   unitChoices,
+  unitIsAvailable,
+  unitUnavailableMessage,
   validateOpening,
   type OpeningFieldErrors,
   type OpeningValues,
@@ -41,6 +44,7 @@ function OpeningRow({
   unitCost,
   errors,
   disabled,
+  unavailable,
   onChange,
 }: {
   item: StockChoice;
@@ -49,14 +53,15 @@ function OpeningRow({
   unitCost: string;
   errors: OpeningFieldErrors[string];
   disabled: boolean;
+  unavailable: boolean;
   onChange: (patch: {
     quantity?: string;
     unit?: string;
     unitCost?: string;
   }) => void;
 }) {
-  const choices = unitChoices(item);
-  const selected = choices.find((choice) => choice.unit === unit) ?? choices[0];
+  const choices = choicesIncluding(item, unit);
+  const selected = unitChoices(item).find((choice) => choice.unit === unit);
   return (
     <article
       aria-label={item.name}
@@ -109,6 +114,7 @@ function OpeningRow({
           {`1 ${choiceLabel(selected, item.baseUnit)} = ${formatStoredFactor(selected.factorToBase)} ${unitLabels[item.baseUnit]}`}
         </p>
       ) : null}
+      {unavailable ? <p role="alert">{unitUnavailableMessage}</p> : null}
       {errors?.quantity ? <p role="alert">{errors.quantity}</p> : null}
       {errors?.unitCost ? <p role="alert">{errors.unitCost}</p> : null}
     </article>
@@ -123,6 +129,7 @@ export function OpeningGrid({
   onClearServerError,
   onSubmit,
   resolveUnits,
+  reloadKey = 0,
 }: {
   items: readonly StockChoice[];
   locked: boolean;
@@ -134,6 +141,8 @@ export function OpeningGrid({
     itemIds: readonly string[],
     atIso: string,
   ) => Promise<Record<string, UnitOption[]>>;
+  /** Bumped after a rejected factor so the same instant is fetched again. */
+  reloadKey?: number;
 }) {
   // One id for this draft. A failed save retries it; a new form gets a new one.
   const [requestId] = useState(() => crypto.randomUUID());
@@ -143,37 +152,41 @@ export function OpeningGrid({
   const [values, setValues] = useState<OpeningValues>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [fields, setFields] = useState<OpeningFieldErrors>({});
-  const { items: resolvedItems, loading: unitsLoading } = useResolvedUnits(
-    items,
-    occurredAt,
-    resolveUnits,
-  );
+  const {
+    items: resolvedItems,
+    error: unitsError,
+    ready: unitsReady,
+    retry: retryUnits,
+  } = useResolvedUnits(items, occurredAt, resolveUnits, reloadKey);
   const disabled = locked || submitting;
-  const blocked = disabled || unitsLoading;
   const byId = new Map(resolvedItems.map((item) => [item.id, item]));
   const groups = groupCatalog(items.map(asCatalog), false);
 
-  function chosenUnit(unit: string, item: StockChoice): string {
-    const choices = unitChoices(item);
-    if (choices.some((choice) => choice.unit === unit)) return unit;
-    return item.baseUnit;
+  function rowValue(item: StockChoice) {
+    return (
+      values[item.id] ?? {
+        quantity: '',
+        unit: item.baseUnit,
+        unitCost: '',
+      }
+    );
   }
 
-  function rowValue(item: StockChoice) {
-    const stored = values[item.id] ?? {
-      quantity: '',
-      unit: item.baseUnit,
-      unitCost: '',
-    };
-    return { ...stored, unit: chosenUnit(stored.unit, item) };
+  function rowUnavailable(item: StockChoice): boolean {
+    const stored = values[item.id];
+    if (!unitsReady || !stored) return false;
+    return !unitIsAvailable(item, stored.unit);
   }
+
+  const unitBlocked = resolvedItems.some(rowUnavailable);
+  const blocked = disabled || !unitsReady || unitBlocked;
 
   function settledValues(): OpeningValues {
     const next: OpeningValues = {};
     for (const item of resolvedItems) {
       const stored = values[item.id];
       if (!stored) continue;
-      next[item.id] = { ...stored, unit: chosenUnit(stored.unit, item) };
+      next[item.id] = stored;
     }
     return next;
   }
@@ -193,7 +206,7 @@ export function OpeningGrid({
 
   function onSubmitForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (blocked) return;
+    if (disabled || !unitsReady || unitBlocked) return;
     const result = validateOpening(settledValues(), resolvedItems, occurredAt);
     if (!result.ok) {
       setFormError(result.formError);
@@ -216,6 +229,7 @@ export function OpeningGrid({
         unitCost={row.unitCost}
         errors={fields[item.id]}
         disabled={disabled}
+        unavailable={rowUnavailable(item)}
         onChange={(patch) => change(item, patch)}
       />
     );
@@ -224,6 +238,18 @@ export function OpeningGrid({
   return (
     <form className="flex flex-col gap-4" noValidate onSubmit={onSubmitForm}>
       {serverError ? <p role="alert">{serverError}</p> : null}
+      {unitsError ? (
+        <div className="flex flex-col gap-2">
+          <p role="alert">{unitsError}</p>
+          <button
+            className="w-fit rounded border border-neutral-300 px-3 py-2"
+            type="button"
+            onClick={retryUnits}
+          >
+            إعادة المحاولة
+          </button>
+        </div>
+      ) : null}
       {formError ? <p role="alert">{formError}</p> : null}
       <label className="flex max-w-xs flex-col gap-1">
         وقت الرصيد

@@ -83,11 +83,11 @@ test('owner manages the item catalog', async ({ page }) => {
 
   await oilCard.getByRole('button', { name: 'تعديل' }).click();
   await page.getByLabel('السعر الافتتاحي المعتمد للوحدة').fill('25');
-  await page.getByRole('button', { name: 'حفظ', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'تعديل الصنف' })).toHaveCount(
-    0,
+  await page.getByRole('button', { name: 'حفظ السعر', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'تعديل الصنف' })).toBeVisible(
     visible,
   );
+  await page.getByRole('button', { name: 'إلغاء' }).click();
   await oilCard.getByRole('button', { name: 'تعديل' }).click();
   await expect(page.getByLabel('السعر الافتتاحي المعتمد للوحدة')).toHaveValue(
     /25/,
@@ -97,7 +97,7 @@ test('owner manages the item catalog', async ({ page }) => {
 
   await mixedCard.getByRole('button', { name: 'تعديل' }).click();
   await page.getByLabel('الاسم').fill(renamed);
-  await page.getByRole('button', { name: 'حفظ', exact: true }).click();
+  await page.getByRole('button', { name: 'حفظ البيانات', exact: true }).click();
   await expect(
     page.getByRole('heading', { name: renamed, exact: true }),
   ).toBeVisible(visible);

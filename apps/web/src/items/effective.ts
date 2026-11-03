@@ -43,6 +43,17 @@ export function chosenInstantMs(
   return Number.isNaN(parsed) ? null : parsed;
 }
 
+/** Matches date_trunc('minute', now()) on the server. */
+export function currentMinuteIso(nowIso: string): string {
+  const parsed = Date.parse(nowIso);
+  if (Number.isNaN(parsed)) return nowIso;
+  return new Date(Math.floor(parsed / 60_000) * 60_000).toISOString();
+}
+
+export function currentMinuteMs(nowMs: number): number {
+  return Math.floor(nowMs / 60_000) * 60_000;
+}
+
 export function needsBackdatedReason(
   mode: EffectiveMode,
   shiftStart: string | null,
@@ -97,6 +108,10 @@ export function impactLine(orders: number, shifts: number): string {
   return `ممكن يأثر على ${orders} طلب في ${shifts} وردية (تقدير)`;
 }
 
+export const impactLoadingMessage = 'جاري تقدير الأثر…';
+export const impactErrorMessage = 'مش قادرين نقدّر الأثر. حاول تاني.';
+export const impactPendingMessage = 'لسه بنقدّر الأثر';
+
 /**
  * A dated loss or conversion write. "now" stores a null start. The end is the
  * covering version's own end, or the next version when the start is in a gap.
@@ -117,7 +132,8 @@ export function buildDatedWrite(input: {
   if (input.mode === 'custom' && !input.customIso) {
     return { ok: false, error: 'الوقت مش مظبوط' };
   }
-  const nowMs = Date.parse(input.nowIso);
+  const minuteIso = currentMinuteIso(input.nowIso);
+  const nowMs = Date.parse(minuteIso);
   const backdated = needsBackdatedReason(
     input.mode,
     input.shiftStart,
@@ -137,11 +153,7 @@ export function buildDatedWrite(input: {
     ok: true,
     write: {
       effectiveFrom,
-      effectiveTo: nextVersionStart(
-        input.versions,
-        effectiveFrom,
-        input.nowIso,
-      ),
+      effectiveTo: nextVersionStart(input.versions, effectiveFrom, minuteIso),
       token: input.token,
       reason: backdated ? reason : null,
       requestId: input.requestId,

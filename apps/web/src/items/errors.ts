@@ -14,6 +14,9 @@ export class StaleWriteError extends Error {
 }
 
 export class CostingChangedError extends StaleWriteError {
+  /** 40001 aborts before commit, so the request id stored nothing. */
+  readonly code = '40001';
+
   constructor() {
     super();
     this.name = 'CostingChangedError';

@@ -42,7 +42,14 @@ type PostgrestError = {
 function throwIfError(error: PostgrestError | null): void {
   if (!error) return;
   if (error.code === '40001') throw new CostingChangedError();
-  throw new Error(mapCatalogError(error));
+  const mapped = new Error(mapCatalogError(error));
+  // The Arabic message is what the owner reads. The sqlstate stays on the
+  // error so a definite refusal retires its request id and an unknown
+  // outcome, including 23505, keeps it.
+  if (isDefiniteRefusal(error)) {
+    Object.assign(mapped, { code: error.code });
+  }
+  throw mapped;
 }
 
 function toNumber(value: unknown): number {

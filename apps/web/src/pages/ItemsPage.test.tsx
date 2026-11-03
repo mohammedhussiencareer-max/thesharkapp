@@ -6,20 +6,28 @@ import {
   within,
 } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   addConversion,
+  costingImpact,
   createItem,
   currentShiftStart,
   listConversions,
+  listCostingSchedule,
   listItems,
   setItemLoss,
   setOpeningPrice,
   updateConversion,
   updateItem,
 } from '@/items/api';
-import { emptyScheduleToken } from '@/items/effective';
+import {
+  emptyScheduleToken,
+  impactErrorMessage,
+  impactLoadingMessage,
+  impactPendingMessage,
+} from '@/items/effective';
 import { StaleWriteError } from '@/items/errors';
+import { resetHeldWrites } from '@/items/request-id';
 import type { BaseUnit, CatalogItem, UnitConversion } from '@/items/types';
 import { ItemsPage } from '@/pages/ItemsPage';
 
@@ -145,6 +153,7 @@ async function renderCatalog(items: CatalogItem[] = catalog) {
 
 describe('ItemsPage', () => {
   beforeEach(() => {
+    resetHeldWrites();
     vi.mocked(listItems).mockReset();
     vi.mocked(listItems).mockResolvedValue([]);
     vi.mocked(createItem).mockReset();
@@ -161,6 +170,22 @@ describe('ItemsPage', () => {
     vi.mocked(setOpeningPrice).mockResolvedValue(undefined);
     vi.mocked(currentShiftStart).mockReset();
     vi.mocked(currentShiftStart).mockResolvedValue(null);
+    vi.mocked(costingImpact).mockReset();
+    vi.mocked(costingImpact).mockResolvedValue({
+      orders: 2,
+      shifts: 1,
+      movements: 4,
+    });
+    vi.mocked(listCostingSchedule).mockReset();
+    vi.mocked(listCostingSchedule).mockResolvedValue({
+      lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      lossVersions: [],
+      conversions: [],
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('shows a loading state and then the grouped Arabic catalog', async () => {
@@ -375,7 +400,7 @@ describe('ItemsPage', () => {
     fireEvent.change(screen.getByLabelText('النوع'), {
       target: { value: 'seafood' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
     expect(
       screen.getByText('مينفعش تغيّر نوع السمك المخلوط وعنده أحجام'),
     ).toBeInTheDocument();
@@ -387,7 +412,7 @@ describe('ItemsPage', () => {
     fireEvent.change(screen.getByLabelText('الاسم'), {
       target: { value: 'بوري جديد' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
 
     await waitFor(() => {
       expect(updateItem).toHaveBeenCalledWith(
@@ -528,7 +553,7 @@ describe('ItemsPage', () => {
     });
     fireEvent.click(within(box).getByRole('button', { name: 'حفظ المعامل' }));
 
-    const save = () => screen.getByRole('button', { name: /^حفظ$/ });
+    const save = () => screen.getByRole('button', { name: 'حفظ البيانات' });
     await waitFor(() => expect(save()).toBeDisabled());
     expect(within(box).getByRole('button', { name: 'تعديل' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
@@ -566,7 +591,7 @@ describe('ItemsPage', () => {
       await within(box).findByText('1 كرتونة = 1 قطعة'),
     ).toBeInTheDocument();
     fireEvent.click(within(box).getByRole('button', { name: 'تعديل' }));
-    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
 
     await waitFor(() =>
       expect(
@@ -602,7 +627,7 @@ describe('ItemsPage', () => {
     fireEvent.change(screen.getByLabelText('الاسم'), {
       target: { value: 'بوري جديد' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
 
     expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
     const size = screen.getByRole('article', { name: 'بوري كبير' });
@@ -615,8 +640,9 @@ describe('ItemsPage', () => {
 
     resolveSave();
     await waitFor(() => {
-      expect(screen.queryByRole('form')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
     });
+    expect(screen.getByLabelText('الاسم')).toHaveValue('بوري جديد');
   });
 
   it('keeps the editor closed until the saved name reloads', async () => {
@@ -633,17 +659,19 @@ describe('ItemsPage', () => {
     fireEvent.change(screen.getByLabelText('الاسم'), {
       target: { value: 'بوري جديد' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
 
     await waitFor(() => {
-      expect(screen.queryByRole('form')).not.toBeInTheDocument();
+      expect(
+        screen.getByRole('button', { name: 'حفظ البيانات' }),
+      ).toBeDisabled();
     });
     const edit = within(
       screen.getByRole('article', { name: 'بوري مخلوط' }),
     ).getByRole('button', { name: 'تعديل' });
     expect(edit).toBeDisabled();
     fireEvent.click(edit);
-    expect(screen.queryByRole('form')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('الاسم')).toHaveValue('بوري جديد');
 
     resolveReload(
       catalog.map((row) =>
@@ -701,7 +729,7 @@ describe('ItemsPage', () => {
     fireEvent.change(screen.getByLabelText('الاسم'), {
       target: { value: 'بوري جديد' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
     await waitFor(() => expect(updates).toBe(1));
 
     first.unmount();
@@ -728,7 +756,7 @@ describe('ItemsPage', () => {
     fireEvent.change(screen.getByLabelText('الاسم'), {
       target: { value: 'اسم تاني' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'البيانات اتغيّرت من مكان تاني — اتعملها تحديث، راجعها واحفظ تاني',
@@ -923,7 +951,7 @@ describe('ItemsPage', () => {
 
     fireEvent.click(within(renamedCard).getByRole('button', { name: 'تعديل' }));
     expect(screen.getByLabelText('الاسم')).toHaveValue('علبة كبيرة');
-    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
 
     await waitFor(() => {
       expect(updateItem).toHaveBeenCalledWith(
@@ -945,7 +973,7 @@ describe('ItemsPage', () => {
     fireEvent.change(screen.getByLabelText('الاسم'), {
       target: { value: 'بوري جديد' },
     });
-    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'حصل خطأ. حاول تاني.',
@@ -1007,7 +1035,7 @@ describe('ItemsPage', () => {
     });
 
     fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
-    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
     await waitFor(() => {
       expect(updateItem).toHaveBeenCalledTimes(1);
     });
@@ -1017,10 +1045,11 @@ describe('ItemsPage', () => {
 
     releaseSave();
     await waitFor(() => {
-      expect(
-        screen.queryByRole('form', { name: 'تعديل الصنف' }),
-      ).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
     });
+    expect(
+      screen.getByRole('form', { name: 'تعديل الصنف' }),
+    ).toBeInTheDocument();
   });
 
   it('locks the page while a stale-snapshot catalog reload is in flight', async () => {
@@ -1056,9 +1085,9 @@ describe('ItemsPage', () => {
     await waitFor(() => {
       expect(loads).toBe(2);
     });
-    expect(screen.getByRole('button', { name: /^حفظ$/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'حفظ البيانات' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
-    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
     expect(updateItem).not.toHaveBeenCalled();
 
     resolveStaleReload([{ ...oil, baseUnit: 'liter' }]);
@@ -1108,7 +1137,7 @@ describe('ItemsPage', () => {
     fireEvent.change(screen.getByLabelText('الاسم'), {
       target: { value: 'زيت جديد' },
     });
-    fireEvent.click(screen.getByRole('button', { name: /^حفظ$/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
     await waitFor(() => {
       expect(loads).toBe(2);
     });
@@ -1141,25 +1170,14 @@ describe('ItemsPage', () => {
     expect(
       await screen.findByText('ممكن يأثر على 2 طلب في 1 وردية (تقدير)'),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
     expect(screen.getByText('اكتب سبب التغيير بأثر رجعي')).toBeInTheDocument();
     expect(setItemLoss).not.toHaveBeenCalled();
 
     fireEvent.change(screen.getByLabelText('سبب التغيير'), {
       target: { value: 'تصحيح' },
     });
-    fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
-      target: { value: '0' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
-    expect(screen.getByText('اكتب سبب إن السعر صفر')).toBeInTheDocument();
-    expect(setOpeningPrice).not.toHaveBeenCalled();
-
-    fireEvent.change(screen.getByLabelText('سبب إن السعر صفر'), {
-      target: { value: 'لسه من غير سعر' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
-
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
     await waitFor(() => {
       expect(setItemLoss).toHaveBeenCalledWith(
         'shrimp',
@@ -1172,17 +1190,168 @@ describe('ItemsPage', () => {
         }),
       );
     });
-    expect(setOpeningPrice).toHaveBeenCalledWith(
-      'shrimp',
-      '0',
-      'لسه من غير سعر',
-      null,
-      expect.any(String),
+    expect(setOpeningPrice).not.toHaveBeenCalled();
+    expect(updateItem).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
+      target: { value: '0' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    expect(screen.getByText('اكتب سبب إن السعر صفر')).toBeInTheDocument();
+    expect(setOpeningPrice).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('سبب إن السعر صفر'), {
+      target: { value: 'لسه من غير سعر' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    await waitFor(() => {
+      expect(setOpeningPrice).toHaveBeenCalledWith(
+        'shrimp',
+        '0',
+        'لسه من غير سعر',
+        null,
+        expect.any(String),
+      );
+    });
+    expect(setItemLoss).toHaveBeenCalledTimes(1);
+  });
+
+  function lossRequest(index: number): {
+    requestId: string;
+    effectiveFrom: string | null;
+  } {
+    const timing = vi.mocked(setItemLoss).mock.calls[index]?.[2] as
+      { requestId: string; effectiveFrom: string | null } | undefined;
+    return timing ?? { requestId: '', effectiveFrom: null };
+  }
+
+  it('asks for a reason when the clock passes a future loss instant before submit', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-15T09:00:00.000Z'));
+    vi.mocked(setItemLoss).mockRejectedValueOnce(new Error('تعذر الاتصال'));
+    await renderCatalog();
+    const shrimp = screen.getByRole('article', { name: 'جمبري' });
+    fireEvent.click(within(shrimp).getByRole('button', { name: 'تعديل' }));
+    fireEvent.change(screen.getByLabelText('نسبة الفاقد'), {
+      target: { value: '10' },
+    });
+    await waitFor(() => {
+      expect(listCostingSchedule).toHaveBeenCalled();
+    });
+    fireEvent.change(screen.getByLabelText('وقت السريان'), {
+      target: { value: 'custom' },
+    });
+    fireEvent.change(screen.getByLabelText('الوقت'), {
+      target: { value: '2026-07-15T12:02' },
+    });
+    expect(screen.queryByLabelText('سبب التغيير')).not.toBeInTheDocument();
+
+    vi.setSystemTime(new Date('2026-07-15T09:05:00.000Z'));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    expect(screen.getByLabelText('سبب التغيير')).toBeInTheDocument();
+    expect(screen.getByText('اكتب سبب التغيير بأثر رجعي')).toBeInTheDocument();
+    expect(setItemLoss).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('سبب التغيير'), {
+      target: { value: 'تصحيح' },
+    });
+    expect(
+      await screen.findByText('ممكن يأثر على 2 طلب في 1 وردية (تقدير)'),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    await waitFor(() => {
+      expect(setItemLoss).toHaveBeenCalledTimes(1);
+    });
+    expect(lossRequest(0).effectiveFrom).toBe('2026-07-15T09:02:00.000Z');
+
+    vi.setSystemTime(new Date('2026-07-15T10:00:00.000Z'));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    await waitFor(() => {
+      expect(setItemLoss).toHaveBeenCalledTimes(2);
+    });
+    expect(lossRequest(1).requestId).toBe(lossRequest(0).requestId);
+    expect(lossRequest(1).effectiveFrom).toBe(lossRequest(0).effectiveFrom);
+  });
+
+  it('blocks a backdated loss while the impact estimate is pending or rejected', async () => {
+    vi.mocked(currentShiftStart).mockResolvedValue('2020-01-01T00:00:00.000Z');
+    let rejectImpact: (error: unknown) => void = () => undefined;
+    vi.mocked(costingImpact).mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectImpact = reject;
+        }),
     );
-    expect(updateItem).toHaveBeenCalledWith(
-      'shrimp',
-      expect.objectContaining({ name: 'جمبري', lossPct: '0.1' }),
-      expect.objectContaining({ name: 'جمبري' }),
+    await renderCatalog();
+    const shrimp = screen.getByRole('article', { name: 'جمبري' });
+    fireEvent.click(within(shrimp).getByRole('button', { name: 'تعديل' }));
+    fireEvent.change(screen.getByLabelText('نسبة الفاقد'), {
+      target: { value: '10' },
+    });
+    expect(await screen.findByText(impactLoadingMessage)).toBeInTheDocument();
+    expect(screen.queryByText(/0 طلب/)).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('سبب التغيير'), {
+      target: { value: 'تصحيح' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    expect(screen.getByText(impactPendingMessage)).toBeInTheDocument();
+    expect(setItemLoss).not.toHaveBeenCalled();
+
+    rejectImpact(new Error('nope'));
+    expect(await screen.findByText(impactErrorMessage)).toBeInTheDocument();
+    expect(screen.queryByText(/0 طلب/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    expect(setItemLoss).not.toHaveBeenCalled();
+
+    vi.mocked(costingImpact).mockResolvedValue({
+      orders: 4,
+      shifts: 2,
+      movements: 1,
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(
+      await screen.findByText('ممكن يأثر على 4 طلب في 2 وردية (تقدير)'),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    await waitFor(() => {
+      expect(setItemLoss).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('reuses an opening-price request id only when the outcome is unknown', async () => {
+    await renderCatalog();
+    const shrimp = screen.getByRole('article', { name: 'جمبري' });
+    fireEvent.click(within(shrimp).getByRole('button', { name: 'تعديل' }));
+    fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
+      target: { value: '15' },
+    });
+    vi.mocked(setOpeningPrice).mockRejectedValueOnce(new Error('تعذر الاتصال'));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('تعذر الاتصال');
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    await waitFor(() => {
+      expect(setOpeningPrice).toHaveBeenCalledTimes(2);
+    });
+    const first = vi.mocked(setOpeningPrice).mock.calls[0]?.[4];
+    const retry = vi.mocked(setOpeningPrice).mock.calls[1]?.[4];
+    expect(retry).toBe(first);
+
+    fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
+      target: { value: '16' },
+    });
+    vi.mocked(setOpeningPrice).mockRejectedValueOnce(
+      Object.assign(new Error('مرفوض'), { code: '22023' }),
     );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('مرفوض');
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    await waitFor(() => {
+      expect(setOpeningPrice).toHaveBeenCalledTimes(4);
+    });
+    const refused = vi.mocked(setOpeningPrice).mock.calls[2]?.[4];
+    const refusedRetry = vi.mocked(setOpeningPrice).mock.calls[3]?.[4];
+    expect(refusedRetry).not.toBe(refused);
+    expect(refused).not.toBe(first);
   });
 });

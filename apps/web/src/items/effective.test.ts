@@ -155,6 +155,39 @@ describe('effective time', () => {
     });
   });
 
+  it('ends a now edit at the current minute so a sub-minute gap stays empty', () => {
+    const versions = [
+      {
+        effectiveFrom: '2026-07-15T09:00:00.000Z',
+        effectiveTo: '2026-07-15T09:00:30.000Z',
+      },
+      {
+        effectiveFrom: '2026-07-15T09:01:00.000Z',
+        effectiveTo: null,
+      },
+    ];
+    const written = buildDatedWrite({
+      mode: 'now',
+      shiftStart: null,
+      customIso: null,
+      versions,
+      nowIso: '2026-07-15T09:00:45.000Z',
+      token: 'token',
+      reason: '',
+      requestId: 'req-subminute',
+    });
+    expect(written).toEqual({
+      ok: true,
+      write: {
+        effectiveFrom: null,
+        effectiveTo: '2026-07-15T09:00:30.000Z',
+        token: 'token',
+        reason: null,
+        requestId: 'req-subminute',
+      },
+    });
+  });
+
   it('sends a null start and no reason for now', () => {
     expect(impactLine(3, 1)).toBe('ممكن يأثر على 3 طلب في 1 وردية (تقدير)');
     const written = buildDatedWrite({

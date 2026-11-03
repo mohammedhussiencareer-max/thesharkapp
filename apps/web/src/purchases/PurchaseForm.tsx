@@ -10,9 +10,12 @@ type ReviewedPurchase = Omit<PurchaseDraft, 'requestId'>;
 import { nowCairoDateTimeLocal } from '@/purchases/time';
 import {
   choiceLabel,
+  choicesIncluding,
   previewPurchaseLine,
   unitChoices,
+  unitIsAvailable,
   unitLabel,
+  unitUnavailableMessage,
   validatePurchase,
   type PurchaseErrors,
   type PurchaseLineValues,
@@ -37,13 +40,6 @@ function emptyLine(key: string): PurchaseLineValues {
   return { key, itemId: '', quantity: '', unit: '', amount: '' };
 }
 
-function chosenUnit(unit: string, item: StockChoice | undefined): string {
-  if (!item || unit === '') return unit;
-  const choices = unitChoices(item);
-  if (choices.some((choice) => choice.unit === unit)) return unit;
-  return item.baseUnit;
-}
-
 export function PurchaseForm({
   items,
   locked,
@@ -52,6 +48,7 @@ export function PurchaseForm({
   onClearServerError,
   onSubmit,
   resolveUnits,
+  reloadKey = 0,
 }: {
   items: readonly StockChoice[];
   locked: boolean;
@@ -64,6 +61,8 @@ export function PurchaseForm({
     itemIds: readonly string[],
     atIso: string,
   ) => Promise<Record<string, UnitOption[]>>;
+  /** Bumped after a rejected factor so the same instant is fetched again. */
+  reloadKey?: number;
 }) {
   const keyRef = useRef(1);
   // One id for this draft. A failed save retries it; a new form gets a new one.
@@ -79,25 +78,27 @@ export function PurchaseForm({
   }));
   const [errors, setErrors] = useState<PurchaseErrors>({ lines: {} });
   const [draft, setDraft] = useState<ReviewedPurchase | null>(null);
-  const { items: resolvedItems, loading: unitsLoading } = useResolvedUnits(
-    items,
-    values.purchasedAt,
-    resolveUnits,
-  );
-  const disabled = locked || submitting;
-  const blocked = disabled || unitsLoading;
-
-  function settledValues(): PurchaseValues {
-    return {
-      ...values,
-      lines: values.lines.map((line) => {
-        const item = resolvedItems.find(
-          (candidate) => candidate.id === line.itemId,
-        );
-        return { ...line, unit: chosenUnit(line.unit, item) };
-      }),
-    };
+  const [seenReload, setSeenReload] = useState(reloadKey);
+  if (seenReload !== reloadKey) {
+    setSeenReload(reloadKey);
+    setDraft(null);
   }
+  const {
+    items: resolvedItems,
+    error: unitsError,
+    ready: unitsReady,
+    retry: retryUnits,
+  } = useResolvedUnits(items, values.purchasedAt, resolveUnits, reloadKey);
+  const disabled = locked || submitting;
+  const unavailableUnit = (line: PurchaseLineValues): boolean => {
+    if (!unitsReady || !line.itemId || !line.unit) return false;
+    const item = resolvedItems.find(
+      (candidate) => candidate.id === line.itemId,
+    );
+    return item ? !unitIsAvailable(item, line.unit) : false;
+  };
+  const unitBlocked = values.lines.some(unavailableUnit);
+  const blocked = disabled || !unitsReady || unitBlocked;
 
   function edit(patch: Partial<PurchaseValues>) {
     onClearServerError();
@@ -140,9 +141,19 @@ export function PurchaseForm({
 
   function onSubmitForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (blocked) return;
+    if (disabled || !unitsReady) return;
     if (!draft) {
-      const result = validatePurchase(settledValues(), resolvedItems);
+      if (unitBlocked) {
+        const nextErrors: PurchaseErrors = { lines: {} };
+        for (const line of values.lines) {
+          if (unavailableUnit(line)) {
+            nextErrors.lines[line.key] = { unit: unitUnavailableMessage };
+          }
+        }
+        setErrors(nextErrors);
+        return;
+      }
+      const result = validatePurchase(values, resolvedItems);
       if (!result.ok) {
         setErrors(result.errors);
         return;
@@ -156,6 +167,18 @@ export function PurchaseForm({
   return (
     <form className="flex flex-col gap-4" noValidate onSubmit={onSubmitForm}>
       {serverError ? <p role="alert">{serverError}</p> : null}
+      {unitsError ? (
+        <div className="flex flex-col gap-2">
+          <p role="alert">{unitsError}</p>
+          <button
+            className={secondaryButton}
+            type="button"
+            onClick={retryUnits}
+          >
+            إعادة المحاولة
+          </button>
+        </div>
+      ) : null}
       {errors.form ? <p role="alert">{errors.form}</p> : null}
       {draft ? (
         <section aria-label="مراجعة المشتريات" className="flex flex-col gap-3">
@@ -251,10 +274,13 @@ export function PurchaseForm({
             const item = resolvedItems.find(
               (candidate) => candidate.id === line.itemId,
             );
-            const unit = chosenUnit(line.unit, item);
-            const shown = unit === line.unit ? line : { ...line, unit };
-            const choices = item ? unitChoices(item) : [];
-            const preview = previewPurchaseLine(shown, resolvedItems);
+            const choices = item ? choicesIncluding(item, line.unit) : [];
+            const known = item
+              ? unitChoices(item).find((choice) => choice.unit === line.unit)
+              : undefined;
+            const preview = known
+              ? previewPurchaseLine(line, resolvedItems)
+              : null;
             const lineErrors = errors.lines[line.key] ?? {};
             return (
               <fieldset
@@ -311,7 +337,7 @@ export function PurchaseForm({
                     <select
                       className={fieldClass}
                       disabled={disabled || !item}
-                      value={unit}
+                      value={line.unit}
                       onChange={(event) =>
                         updateLine(line.key, { unit: event.target.value })
                       }
@@ -340,19 +366,13 @@ export function PurchaseForm({
                     />
                   </label>
                 </div>
-                {item && unit && unit !== item.baseUnit ? (
+                {item && known && known.unit !== item.baseUnit ? (
                   <p>
-                    {`1 ${choiceLabel(
-                      choices.find((choice) => choice.unit === unit) ?? {
-                        unit,
-                        factorToBase: '1',
-                      },
-                      item.baseUnit,
-                    )} = ${formatStoredFactor(
-                      choices.find((choice) => choice.unit === unit)
-                        ?.factorToBase ?? '',
-                    )} ${unitLabels[item.baseUnit]}`}
+                    {`1 ${choiceLabel(known, item.baseUnit)} = ${formatStoredFactor(known.factorToBase)} ${unitLabels[item.baseUnit]}`}
                   </p>
+                ) : null}
+                {unitsReady && item && line.unit && !known ? (
+                  <p role="alert">{unitUnavailableMessage}</p>
                 ) : null}
                 {preview ? (
                   <p>

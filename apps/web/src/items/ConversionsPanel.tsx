@@ -20,14 +20,18 @@ import {
 import { EffectiveTimeFields } from '@/items/EffectiveTimeFields';
 import {
   buildDatedWrite,
+  currentMinuteMs,
   defaultEffectiveMode,
   effectiveFromPayload,
   emptyScheduleToken,
+  impactErrorMessage,
   impactLine,
+  impactPendingMessage,
   needsBackdatedReason,
   nextVersionStart,
   type EffectiveMode,
 } from '@/items/effective';
+import { heldWrite, holdWrite, settleRequest } from '@/items/request-id';
 import { messageFrom, StaleWriteError } from '@/items/errors';
 import { formatStoredFactor } from '@/items/format';
 import { unitLabels } from '@/items/labels';
@@ -56,16 +60,9 @@ function storedFactorText(value: UnitConversion['storedFactor']): string {
   return typeof value === 'string' ? value : String(value);
 }
 
-function useRequestIds() {
-  const ids = useRef(new Map<string, string>());
-  return (key: string) => {
-    const existing = ids.current.get(key);
-    if (existing) return existing;
-    const next = crypto.randomUUID();
-    ids.current.set(key, next);
-    return next;
-  };
-}
+type ImpactView =
+  | { status: 'ready'; key: string; text: string }
+  | { status: 'error'; key: string };
 
 function useDatedTiming(
   itemId: string,
@@ -74,65 +71,110 @@ function useDatedTiming(
   token: string,
   disabled: boolean,
 ) {
-  const requestId = useRequestIds();
-  const [nowMs] = useState(() => Date.now());
+  const [mountMinute] = useState(() => currentMinuteMs(Date.now()));
+  const [evaluatedMinute, setEvaluatedMinute] = useState<number | null>(null);
+  const clockMs = evaluatedMinute ?? mountMinute;
   const [chosenMode, setChosenMode] = useState<EffectiveMode | null>(null);
   const mode = chosenMode ?? defaultEffectiveMode(shiftStart);
   const [customLocal, setCustomLocal] = useState('');
   const [reason, setReason] = useState('');
+  const [impactAttempt, setImpactAttempt] = useState(0);
   const customIso =
     mode === 'custom' ? cairoDateTimeLocalToIso(customLocal) : null;
-  const backdated = needsBackdatedReason(mode, shiftStart, customIso, nowMs);
+  const backdated = needsBackdatedReason(mode, shiftStart, customIso, clockMs);
   const from = backdated
     ? effectiveFromPayload(mode, shiftStart, customIso)
     : null;
   const to = from
-    ? nextVersionStart(versions, from, new Date(nowMs).toISOString())
+    ? nextVersionStart(versions, from, new Date(clockMs).toISOString())
     : null;
   const impactKey = from ? `${from}|${to ?? ''}` : '';
-  const [impactText, setImpactText] = useState<{
-    key: string;
-    text: string;
-  } | null>(null);
-  const shownImpact =
-    impactText?.key === impactKey && impactText.text.length > 0
-      ? impactText.text
-      : null;
+  const [impact, setImpact] = useState<ImpactView | null>(null);
+  const shown = impact?.key === impactKey ? impact : null;
 
   useEffect(() => {
     if (!from || impactKey.length === 0) return;
     let cancelled = false;
     void costingImpact(from, to, itemId)
-      .then((impact) => {
+      .then((next) => {
         if (cancelled) return;
-        setImpactText({
+        setImpact({
           key: impactKey,
-          text: impactLine(impact.orders, impact.shifts),
+          status: 'ready',
+          text: impactLine(next.orders, next.shifts),
         });
       })
       .catch(() => {
-        if (!cancelled) setImpactText({ key: impactKey, text: '' });
+        if (!cancelled) setImpact({ key: impactKey, status: 'error' });
       });
     return () => {
       cancelled = true;
     };
-  }, [from, impactKey, itemId, to]);
+  }, [from, impactAttempt, impactKey, itemId, to]);
+
+  function intentFor(unit: string, factorKey: string): string {
+    return JSON.stringify({
+      itemId,
+      unit,
+      factorKey,
+      mode,
+      customLocal,
+      reason: reason.trim(),
+      token,
+    });
+  }
 
   function build(
+    unit: string,
     factorKey: string,
-  ): { ok: true; write: DatedWrite } | { ok: false; error: string } {
-    return buildDatedWrite({
+  ):
+    | { ok: true; intent: string; write: DatedWrite }
+    | { ok: false; error: string } {
+    const minute = currentMinuteMs(Date.now());
+    setEvaluatedMinute(minute);
+    const intent = intentFor(unit, factorKey);
+    const stored = heldWrite(intent);
+    if (stored) return { ok: true, intent, write: stored };
+    const nowIso = new Date(minute).toISOString();
+    const backdatedNow = needsBackdatedReason(
+      mode,
+      shiftStart,
+      customIso,
+      minute,
+    );
+    if (backdatedNow && reason.trim().length === 0) {
+      return { ok: false, error: 'اكتب سبب التغيير بأثر رجعي' };
+    }
+    if (backdatedNow) {
+      const fromNow = effectiveFromPayload(mode, shiftStart, customIso);
+      const toNow = nextVersionStart(versions, fromNow, nowIso);
+      const key = `${fromNow ?? ''}|${toNow ?? ''}`;
+      if (shown?.status !== 'ready' || shown.key !== key) {
+        return {
+          ok: false,
+          error:
+            shown?.status === 'error' && shown.key === key
+              ? impactErrorMessage
+              : impactPendingMessage,
+        };
+      }
+    }
+    const preview = buildDatedWrite({
       mode,
       shiftStart,
       customIso,
       versions,
-      nowIso: new Date(nowMs).toISOString(),
+      nowIso,
       token,
       reason,
-      requestId: requestId(
-        `${factorKey}:${mode}:${customIso ?? ''}:${reason.trim()}`,
-      ),
+      requestId: '00000000-0000-4000-8000-000000000000',
     });
+    if (!preview.ok) return preview;
+    const write = holdWrite(intent, (requestId) => ({
+      ...preview.write,
+      requestId,
+    }));
+    return { ok: true, intent, write };
   }
 
   const fields = (
@@ -142,15 +184,23 @@ function useDatedTiming(
       customLocal={customLocal}
       reason={reason}
       backdated={backdated}
-      impact={shownImpact}
+      impact={shown?.status === 'ready' ? shown.text : null}
+      impactStatus={
+        !backdated ? 'idle' : shown === null ? 'loading' : shown.status
+      }
       disabled={disabled}
       onMode={setChosenMode}
       onCustomLocal={setCustomLocal}
       onReason={setReason}
+      onRetryImpact={() => setImpactAttempt((value) => value + 1)}
     />
   );
 
-  return { fields, build };
+  return {
+    fields,
+    build,
+    settle: settleRequest,
+  };
 }
 
 function ConversionRow({
@@ -199,13 +249,16 @@ function ConversionRow({
       setError(parsed.error);
       return;
     }
-    const built = timing.build(parsed.factor);
+    const built = timing.build(conversion.unit, parsed.factor);
     if (!built.ok) {
       setError(built.error);
       return;
     }
     setError(null);
-    void onSave(parsed.factor, built.write);
+    void onSave(parsed.factor, built.write).then(
+      () => timing.settle(built.intent),
+      (error: unknown) => timing.settle(built.intent, error),
+    );
   }
 
   return (
@@ -242,13 +295,16 @@ function ConversionRow({
               type="button"
               disabled={disabled}
               onClick={() => {
-                const built = timing.build('delete');
+                const built = timing.build(conversion.unit, 'delete');
                 if (!built.ok) {
                   setError(built.error);
                   return;
                 }
                 setError(null);
-                void onDelete(built.write);
+                void onDelete(built.write).then(
+                  () => timing.settle(built.intent),
+                  (error: unknown) => timing.settle(built.intent, error),
+                );
               }}
             >
               احذف التحويل
@@ -297,6 +353,11 @@ export function ConversionsPanel({
   const [customCode, setCustomCode] = useState('');
   const [customLabel, setCustomLabel] = useState('');
   const [factor, setFactor] = useState('');
+  const [createdUnit, setCreatedUnit] = useState<{
+    code: string;
+    inputCode: string;
+    label: string;
+  } | null>(null);
   const addCode = unit === '__new__' ? customCode.trim() : unit.trim();
   const addEntry = schedule?.conversions.find(
     (candidate) => candidate.unitCode === addCode,
@@ -420,6 +481,7 @@ export function ConversionsPanel({
     } catch (error) {
       setActionError(messageFrom(error));
       if (error instanceof StaleWriteError) await load();
+      throw error;
     } finally {
       setBusy(false);
       onBusyChange?.(false);
@@ -446,30 +508,57 @@ export function ConversionsPanel({
       setActionError(parsed.error);
       return;
     }
-    const built = addTiming.build(parsed.factor);
+    const built = addTiming.build(parsed.unit, parsed.factor);
     if (!built.ok) {
       setActionError(built.error);
       return;
     }
     const expectedBaseUnit = baseUnit;
     const label = customLabel.trim();
+    const freshUnit = unit === '__new__';
     void run(async () => {
-      const unitCode =
-        unit === '__new__'
-          ? await addCustomUnit(parsed.unit, label)
-          : parsed.unit;
-      await addConversion(
-        item.id,
-        unitCode,
-        parsed.factor,
-        expectedBaseUnit,
-        built.write,
-      );
-      setUnit('');
-      setCustomCode('');
-      setCustomLabel('');
-      setFactor('');
-    });
+      try {
+        let unitCode = parsed.unit;
+        if (freshUnit) {
+          const remembered =
+            createdUnit &&
+            createdUnit.inputCode === parsed.unit &&
+            createdUnit.label === label
+              ? createdUnit.code
+              : null;
+          unitCode = remembered ?? (await addCustomUnit(parsed.unit, label));
+          if (!remembered) {
+            setCreatedUnit({
+              code: unitCode,
+              inputCode: parsed.unit,
+              label,
+            });
+          }
+          const options = await listUnitOptions();
+          setMeta((current) =>
+            current && current.itemId === item.id
+              ? { ...current, unitOptions: options }
+              : current,
+          );
+        }
+        await addConversion(
+          item.id,
+          unitCode,
+          parsed.factor,
+          expectedBaseUnit,
+          built.write,
+        );
+        addTiming.settle(built.intent);
+        setCreatedUnit(null);
+        setUnit('');
+        setCustomCode('');
+        setCustomLabel('');
+        setFactor('');
+      } catch (error) {
+        addTiming.settle(built.intent, error, freshUnit);
+        throw error;
+      }
+    }).catch(() => undefined);
   }
 
   if ((rows === null || baseUnit === null) && loadError) {

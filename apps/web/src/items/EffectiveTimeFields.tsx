@@ -1,4 +1,8 @@
-import type { EffectiveMode } from '@/items/effective';
+import {
+  impactErrorMessage,
+  impactLoadingMessage,
+  type EffectiveMode,
+} from '@/items/effective';
 
 const fieldClass = 'w-full rounded border border-neutral-300 px-3 py-2';
 
@@ -9,10 +13,12 @@ export function EffectiveTimeFields({
   reason,
   backdated,
   impact,
+  impactStatus,
   disabled,
   onMode,
   onCustomLocal,
   onReason,
+  onRetryImpact,
 }: {
   mode: EffectiveMode;
   shiftStart: string | null;
@@ -20,10 +26,12 @@ export function EffectiveTimeFields({
   reason: string;
   backdated: boolean;
   impact: string | null;
+  impactStatus: 'idle' | 'loading' | 'ready' | 'error';
   disabled: boolean;
   onMode: (mode: EffectiveMode) => void;
   onCustomLocal: (value: string) => void;
   onReason: (value: string) => void;
+  onRetryImpact: () => void;
 }) {
   return (
     <div className="flex flex-col gap-2">
@@ -69,7 +77,22 @@ export function EffectiveTimeFields({
           />
         </label>
       ) : null}
-      {impact ? <p>{impact}</p> : null}
+      {backdated && impactStatus === 'loading' ? (
+        <p>{impactLoadingMessage}</p>
+      ) : null}
+      {backdated && impactStatus === 'error' ? (
+        <div className="flex flex-col gap-2">
+          <p role="alert">{impactErrorMessage}</p>
+          <button
+            className="w-fit rounded border border-neutral-300 px-3 py-2"
+            type="button"
+            onClick={onRetryImpact}
+          >
+            إعادة المحاولة
+          </button>
+        </div>
+      ) : null}
+      {backdated && impactStatus === 'ready' && impact ? <p>{impact}</p> : null}
     </div>
   );
 }

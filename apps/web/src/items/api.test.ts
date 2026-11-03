@@ -259,6 +259,41 @@ describe('catalog api', () => {
     );
   });
 
+  it('retires a create request id after a definite refusal and reuses it when the outcome is unknown', async () => {
+    const refused = { ...draft, name: 'صنف مرفوض' };
+    const unknown = { ...draft, name: 'صنف مجهول' };
+    const rpc = vi
+      .fn()
+      .mockResolvedValueOnce({
+        data: null,
+        error: { code: '22023', message: 'bad' },
+      })
+      .mockResolvedValueOnce({ data: 'a', error: null })
+      .mockResolvedValueOnce({
+        data: null,
+        error: { message: 'network down' },
+      })
+      .mockResolvedValueOnce({ data: 'b', error: null });
+    mocks.schema.mockReturnValue({ rpc });
+
+    await expect(createItem(refused)).rejects.toThrow();
+    await createItem(refused);
+    const refusedFirst = (rpc.mock.calls[0]?.[1] as { p_request_id: string })
+      .p_request_id;
+    const refusedRetry = (rpc.mock.calls[1]?.[1] as { p_request_id: string })
+      .p_request_id;
+    expect(refusedFirst).toEqual(expect.any(String));
+    expect(refusedRetry).not.toBe(refusedFirst);
+
+    await expect(createItem(unknown)).rejects.toThrow();
+    await createItem(unknown);
+    const unknownFirst = (rpc.mock.calls[2]?.[1] as { p_request_id: string })
+      .p_request_id;
+    const unknownRetry = (rpc.mock.calls[3]?.[1] as { p_request_id: string })
+      .p_request_id;
+    expect(unknownRetry).toBe(unknownFirst);
+  });
+
   it('throws the Arabic message for a frozen base unit', async () => {
     const items = query({
       data: null,

@@ -1096,12 +1096,17 @@ values
     '2024-01-01T08:00:00Z'
   );
 
+set
+  local role authenticated;
+
 select
   is (
     app.current_shift_start (),
     '2024-01-01T08:00:00Z'::timestamptz,
     'current_shift_start is the open shift'
   );
+
+reset role;
 
 insert into
   app.pos_orders (
@@ -1148,6 +1153,9 @@ values
     repeat('b', 64)
   );
 
+set
+  local role authenticated;
+
 select
   is (
     app.costing_impact (
@@ -1174,6 +1182,8 @@ select
     ),
     'costing_impact counts complete orders and that item''s movements'
   );
+
+reset role;
 
 -- ============================================================================
 -- Custom units, atomic create, and null effective_from.
@@ -1464,6 +1474,9 @@ select
     'a null conversion effective_from is the current minute'
   );
 
+set
+  local role authenticated;
+
 select
   ok (
     (
@@ -1489,6 +1502,8 @@ select
     ),
     'a conversion from now is in force at the start of the same minute'
   );
+
+reset role;
 
 select
   throws_ok (
@@ -1744,6 +1759,126 @@ select
     'an edit inside a gap leaves the later version row in place'
   );
 
+-- A version ends 30 seconds into the current minute. The next version starts
+-- at the next minute. "now" resolves to the truncated minute, inside the
+-- first version, so an end at the next minute would fill the gap.
+select
+  app.create_stock_item (
+    'd4000000-0000-4000-8000-000000000190',
+    'صنف دقيقة',
+    'ingredient',
+    'kg',
+    'weekly',
+    null,
+    null,
+    true
+  );
+
+select
+  app.set_item_loss (
+    'd4000000-0000-4000-8000-000000000191',
+    (
+      select
+        id
+      from
+        app.stock_items
+      where
+        name = 'صنف دقيقة'
+    ),
+    0.10,
+    pg_catalog.date_trunc ('minute', pg_catalog.now ()),
+    pg_catalog.date_trunc ('minute', pg_catalog.now ()) + interval '30 seconds',
+    md5(''),
+    null
+  );
+
+select
+  app.set_item_loss (
+    'd4000000-0000-4000-8000-000000000192',
+    (
+      select
+        id
+      from
+        app.stock_items
+      where
+        name = 'صنف دقيقة'
+    ),
+    0.20,
+    pg_catalog.date_trunc ('minute', pg_catalog.now ()) + interval '1 minute',
+    null,
+    (
+      select
+        app.item_costing_schedule (si.id) -> 'loss' ->> 'token'
+      from
+        app.stock_items si
+      where
+        si.name = 'صنف دقيقة'
+    ),
+    null
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_loss(
+      'd4000000-0000-4000-8000-000000000193',
+      (select id from app.stock_items where name = 'صنف دقيقة'),
+      0.30,
+      null,
+      pg_catalog.date_trunc('minute', pg_catalog.now()) + interval '1 minute',
+      (
+        select app.item_costing_schedule(si.id) -> 'loss' ->> 'token'
+        from app.stock_items si
+        where si.name = 'صنف دقيقة'
+      ),
+      null
+    )$$,
+    '40001'::char(5),
+    'configuration changed',
+    'a now write must not fill the sub-minute gap up to the next version'
+  );
+
+select
+  app.set_item_loss (
+    'd4000000-0000-4000-8000-000000000194',
+    (
+      select
+        id
+      from
+        app.stock_items
+      where
+        name = 'صنف دقيقة'
+    ),
+    0.30,
+    null,
+    pg_catalog.date_trunc ('minute', pg_catalog.now ()) + interval '30 seconds',
+    (
+      select
+        app.item_costing_schedule (si.id) -> 'loss' ->> 'token'
+      from
+        app.stock_items si
+      where
+        si.name = 'صنف دقيقة'
+    ),
+    null
+  );
+
+select
+  is (
+    app.item_loss_at (
+      (
+        select
+          id
+        from
+          app.stock_items
+        where
+          name = 'صنف دقيقة'
+      ),
+      pg_catalog.date_trunc ('minute', pg_catalog.now ()) + interval '45 seconds'
+    ),
+    null::numeric,
+    'the sub-minute gap stays empty after the corrected now write'
+  );
+
 -- The stored effective_to is already in the past. Replay must return the
 -- stored result before the range check against now().
 reset role;
@@ -1914,6 +2049,87 @@ select
     '42501'::char(5),
     'insufficient_privilege',
     'a non-owner cannot create a stock item'
+  );
+
+select
+  throws_ok (
+    $$select * from app.item_units_at(array[]::uuid[], '2020-01-01T00:00:00Z')$$,
+    '42501'::char(5),
+    'insufficient_privilege',
+    'a non-owner cannot call item_units_at'
+  );
+
+select
+  throws_ok (
+    $$select app.current_shift_start()$$,
+    '42501'::char(5),
+    'insufficient_privilege',
+    'a non-owner cannot call current_shift_start'
+  );
+
+select
+  throws_ok (
+    $$select app.costing_impact('2020-01-01T00:00:00Z', '2020-02-01T00:00:00Z', null)$$,
+    '42501'::char(5),
+    'insufficient_privilege',
+    'a non-owner cannot call costing_impact'
+  );
+
+select
+  is_empty (
+    $$select * from app.item_units_current$$,
+    'item_units_current exposes no rows to a non-owner'
+  );
+
+select
+  is_empty (
+    $$select * from app.unit_aliases$$,
+    'unit_aliases exposes no rows to a non-owner'
+  );
+
+reset role;
+
+set
+  local role anon;
+
+select
+  throws_ok (
+    $$select * from app.item_units_current$$,
+    '42501'::char(5),
+    'permission denied for schema app',
+    'anon cannot read item_units_current'
+  );
+
+select
+  throws_ok (
+    $$select * from app.unit_aliases$$,
+    '42501'::char(5),
+    'permission denied for schema app',
+    'anon cannot read unit_aliases'
+  );
+
+select
+  throws_ok (
+    $$select * from app.item_units_at(array[]::uuid[], '2020-01-01T00:00:00Z')$$,
+    '42501'::char(5),
+    'permission denied for schema app',
+    'anon cannot call item_units_at'
+  );
+
+select
+  throws_ok (
+    $$select app.current_shift_start()$$,
+    '42501'::char(5),
+    'permission denied for schema app',
+    'anon cannot call current_shift_start'
+  );
+
+select
+  throws_ok (
+    $$select app.costing_impact('2020-01-01T00:00:00Z', null, null)$$,
+    '42501'::char(5),
+    'permission denied for schema app',
+    'anon cannot call costing_impact'
   );
 
 reset role;

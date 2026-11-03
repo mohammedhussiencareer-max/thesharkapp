@@ -1,13 +1,23 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   addConversion,
+  addCustomUnit,
+  costingImpact,
+  currentShiftStart,
   deleteConversion,
   listConversions,
+  listUnitOptions,
   updateConversion,
 } from '@/items/api';
 import { ConversionsPanel } from '@/items/ConversionsPanel';
+import {
+  impactErrorMessage,
+  impactLoadingMessage,
+  impactPendingMessage,
+} from '@/items/effective';
 import { StaleWriteError } from '@/items/errors';
+import { resetHeldWrites } from '@/items/request-id';
 import type { BaseUnit, CatalogItem, UnitConversion } from '@/items/types';
 
 vi.mock('@/items/api', () => ({
@@ -54,12 +64,45 @@ const item: CatalogItem = {
   onHandValue: 0,
 };
 
+function sentTiming(index: number): {
+  requestId: string;
+  effectiveFrom: string | null;
+} {
+  const timing = vi.mocked(addConversion).mock.calls[index]?.[4] as
+    { requestId: string; effectiveFrom: string | null } | undefined;
+  return timing ?? { requestId: '', effectiveFrom: null };
+}
+
 describe('ConversionsPanel', () => {
   beforeEach(() => {
+    resetHeldWrites();
     vi.mocked(listConversions).mockReset();
     vi.mocked(addConversion).mockReset();
     vi.mocked(updateConversion).mockReset();
     vi.mocked(deleteConversion).mockReset();
+    vi.mocked(addConversion).mockResolvedValue(undefined);
+    vi.mocked(addCustomUnit).mockReset();
+    vi.mocked(addCustomUnit).mockImplementation((code: string) =>
+      Promise.resolve(code),
+    );
+    vi.mocked(currentShiftStart).mockReset();
+    vi.mocked(currentShiftStart).mockResolvedValue(null);
+    vi.mocked(costingImpact).mockReset();
+    vi.mocked(costingImpact).mockResolvedValue({
+      orders: 0,
+      shifts: 0,
+      movements: 0,
+    });
+    vi.mocked(listUnitOptions).mockReset();
+    vi.mocked(listUnitOptions).mockResolvedValue([
+      { code: 'كيس', labelAr: 'كيس' },
+      { code: 'كرتونة', labelAr: 'كرتونة' },
+      { code: 'piece', labelAr: 'قطعة' },
+    ]);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('shows the exact stored factor instead of a rounded quantity', async () => {
@@ -418,6 +461,292 @@ describe('ConversionsPanel', () => {
 
     await waitFor(() => {
       expect(onItemStale).toHaveBeenCalledWith('oil');
+    });
+  });
+
+  it('uses a new request id for each unit when the factor is the same', async () => {
+    vi.mocked(listConversions).mockResolvedValue(snapshot([]));
+    render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByRole('option', { name: 'كرتونة' }),
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كرتونة' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '4' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(1);
+    });
+
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'piece' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '4' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(2);
+    });
+
+    const first = sentTiming(0).requestId;
+    const second = sentTiming(1).requestId;
+    expect(first).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
+    expect(second).not.toBe(first);
+    expect(vi.mocked(addConversion).mock.calls[0]?.[1]).toBe('كرتونة');
+    expect(vi.mocked(addConversion).mock.calls[1]?.[1]).toBe('piece');
+    expect(vi.mocked(addConversion).mock.calls[0]?.[2]).toBe('4');
+    expect(vi.mocked(addConversion).mock.calls[1]?.[2]).toBe('4');
+  });
+
+  it('reuses a request id only for an unknown retry of the same conversion', async () => {
+    vi.mocked(listConversions).mockResolvedValue(snapshot([]));
+    vi.mocked(addConversion)
+      .mockRejectedValueOnce(new Error('تعذر الاتصال'))
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(
+        Object.assign(new Error('مرفوض'), { code: '22023' }),
+      )
+      .mockResolvedValueOnce(undefined);
+    render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByRole('option', { name: 'كرتونة' }),
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كرتونة' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '8' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('تعذر الاتصال');
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(2);
+    });
+    expect(sentTiming(1).requestId).toBe(sentTiming(0).requestId);
+
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كرتونة' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '8' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('مرفوض');
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(4);
+    });
+    expect(sentTiming(3).requestId).not.toBe(sentTiming(2).requestId);
+    expect(sentTiming(2).requestId).not.toBe(sentTiming(0).requestId);
+  });
+
+  function addFreshUnit() {
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: '__new__' },
+    });
+    fireEvent.change(screen.getByLabelText('كود الوحدة'), {
+      target: { value: 'دلو' },
+    });
+    fireEvent.change(screen.getByLabelText('اسم الوحدة'), {
+      target: { value: 'دلو كبير' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '3' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+  }
+
+  it('keeps a created unit when the conversion is interrupted and the retry succeeds', async () => {
+    vi.mocked(listConversions).mockResolvedValue(snapshot([]));
+    let listed = 0;
+    vi.mocked(listUnitOptions).mockImplementation(() => {
+      listed += 1;
+      const options = [
+        { code: 'كيس', labelAr: 'كيس' },
+        { code: 'كرتونة', labelAr: 'كرتونة' },
+        { code: 'piece', labelAr: 'قطعة' },
+      ];
+      if (listed > 1) options.push({ code: 'دلو-1', labelAr: 'دلو كبير' });
+      return Promise.resolve(options);
+    });
+    vi.mocked(addCustomUnit).mockResolvedValue('دلو-1');
+    vi.mocked(addConversion).mockRejectedValueOnce(new Error('تعذر الاتصال'));
+    render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByRole('option', { name: 'كيس' }),
+    ).toBeInTheDocument();
+
+    addFreshUnit();
+    expect(await screen.findByRole('alert')).toHaveTextContent('تعذر الاتصال');
+    expect(
+      await screen.findByRole('option', { name: 'دلو كبير' }),
+    ).toBeInTheDocument();
+    expect(addCustomUnit).toHaveBeenCalledTimes(1);
+    expect(addCustomUnit).toHaveBeenCalledWith('دلو', 'دلو كبير');
+    expect(vi.mocked(addConversion).mock.calls[0]?.[1]).toBe('دلو-1');
+
+    vi.mocked(addConversion).mockResolvedValueOnce(undefined);
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(2);
+    });
+    expect(addCustomUnit).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(addConversion).mock.calls[1]?.[1]).toBe('دلو-1');
+    expect(sentTiming(1).requestId).toBe(sentTiming(0).requestId);
+  });
+
+  it('keeps a created unit when the conversion is refused and the retry succeeds', async () => {
+    vi.mocked(listConversions).mockResolvedValue(snapshot([]));
+    vi.mocked(addCustomUnit).mockResolvedValue('دلو-1');
+    vi.mocked(addConversion).mockRejectedValueOnce(
+      Object.assign(new Error('مرفوض'), { code: 'P0001' }),
+    );
+    render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByRole('option', { name: 'كيس' }),
+    ).toBeInTheDocument();
+
+    addFreshUnit();
+    expect(await screen.findByRole('alert')).toHaveTextContent('مرفوض');
+    expect(addCustomUnit).toHaveBeenCalledTimes(1);
+
+    vi.mocked(addConversion).mockResolvedValueOnce(undefined);
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(2);
+    });
+    expect(addCustomUnit).toHaveBeenCalledTimes(1);
+    expect(sentTiming(1).requestId).toBe(sentTiming(0).requestId);
+    expect(vi.mocked(addConversion).mock.calls[1]?.[1]).toBe('دلو-1');
+  });
+
+  it('asks for a reason when a future instant has become backdated before submit', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-15T09:00:00.000Z'));
+    vi.mocked(listConversions).mockResolvedValue(snapshot([]));
+    vi.mocked(costingImpact).mockResolvedValue({
+      orders: 3,
+      shifts: 1,
+      movements: 0,
+    });
+    vi.mocked(addConversion).mockRejectedValueOnce(new Error('تعذر الاتصال'));
+    render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByRole('button', { name: 'ضيف التحويل' }),
+    ).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText('وقت السريان'), {
+      target: { value: 'custom' },
+    });
+    fireEvent.change(screen.getByLabelText('الوقت'), {
+      target: { value: '2026-07-15T12:02' },
+    });
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كرتونة' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '4' },
+    });
+    expect(screen.queryByLabelText('سبب التغيير')).not.toBeInTheDocument();
+
+    vi.setSystemTime(new Date('2026-07-15T09:05:00.000Z'));
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(screen.getByLabelText('سبب التغيير')).toBeInTheDocument();
+    expect(screen.getByText('اكتب سبب التغيير بأثر رجعي')).toBeInTheDocument();
+    expect(addConversion).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('سبب التغيير'), {
+      target: { value: 'تصحيح' },
+    });
+    expect(
+      await screen.findByText('ممكن يأثر على 3 طلب في 1 وردية (تقدير)'),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(1);
+    });
+    expect(sentTiming(0).effectiveFrom).toBe('2026-07-15T09:02:00.000Z');
+    expect(addConversion).toHaveBeenCalledWith(
+      'oil',
+      'كرتونة',
+      '4',
+      'kg',
+      expect.objectContaining({
+        effectiveFrom: '2026-07-15T09:02:00.000Z',
+        reason: 'تصحيح',
+      }),
+    );
+
+    vi.setSystemTime(new Date('2026-07-15T10:00:00.000Z'));
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(2);
+    });
+    expect(sentTiming(1).requestId).toBe(sentTiming(0).requestId);
+    expect(sentTiming(1).effectiveFrom).toBe('2026-07-15T09:02:00.000Z');
+  });
+
+  it('blocks a backdated conversion while the impact estimate is pending or rejected', async () => {
+    vi.mocked(currentShiftStart).mockResolvedValue('2020-01-01T00:00:00.000Z');
+    vi.mocked(listConversions).mockResolvedValue(snapshot([]));
+    let rejectImpact: (error: unknown) => void = () => undefined;
+    vi.mocked(costingImpact).mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectImpact = reject;
+        }),
+    );
+    render(<ConversionsPanel item={item} />);
+    expect(await screen.findByText(impactLoadingMessage)).toBeInTheDocument();
+    expect(screen.queryByText(/0 طلب/)).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'ضيف التحويل' })).toBeEnabled();
+    });
+
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كرتونة' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '4' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(screen.getByText('اكتب سبب التغيير بأثر رجعي')).toBeInTheDocument();
+    expect(addConversion).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('سبب التغيير'), {
+      target: { value: 'تصحيح' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(screen.getByText(impactPendingMessage)).toBeInTheDocument();
+    expect(addConversion).not.toHaveBeenCalled();
+
+    rejectImpact(new Error('nope'));
+    expect(await screen.findByText(impactErrorMessage)).toBeInTheDocument();
+    expect(screen.queryByText(/0 طلب/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(addConversion).not.toHaveBeenCalled();
+
+    vi.mocked(costingImpact).mockResolvedValue({
+      orders: 4,
+      shifts: 2,
+      movements: 0,
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(
+      await screen.findByText('ممكن يأثر على 4 طلب في 2 وردية (تقدير)'),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(1);
     });
   });
 });

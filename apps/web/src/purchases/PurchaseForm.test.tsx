@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { backDatedMessage } from '@/purchases/errors';
 import { PurchaseForm } from '@/purchases/PurchaseForm';
 import { cairoDateTimeLocalToIso } from '@/purchases/time';
+import { unitLookupErrorMessage } from '@/purchases/units-at';
 import type { PurchaseDraft, StockChoice } from '@/purchases/types';
+import { unitUnavailableMessage } from '@/purchases/validation';
 
 const oil: StockChoice = {
   id: 'oil',
@@ -250,5 +252,157 @@ describe('PurchaseForm', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('keeps a selected unit and blocks review when a later lookup fails', async () => {
+    const july = cairoDateTimeLocalToIso('2026-07-15T12:00');
+    const january = cairoDateTimeLocalToIso('2020-01-15T10:00');
+    if (july === null || january === null) {
+      throw new Error('cairo time did not parse');
+    }
+    let failJanuary = true;
+    const carton = {
+      unit: 'carton',
+      factorToBase: '12',
+      label: 'كرتونة',
+    };
+    const resolveUnits = vi.fn((_ids: readonly string[], at: string) =>
+      at === january && failJanuary
+        ? Promise.reject(new Error('down'))
+        : Promise.resolve({ oil: [carton] }),
+    );
+    const onSubmit = vi.fn<(draft: PurchaseDraft) => void>();
+    render(
+      <PurchaseForm
+        items={[oil]}
+        locked={false}
+        submitting={false}
+        serverError={null}
+        onClearServerError={vi.fn()}
+        onSubmit={onSubmit}
+        resolveUnits={resolveUnits}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('وقت الشراء'), {
+      target: { value: '2026-07-15T12:00' },
+    });
+    await waitFor(() => {
+      expect(resolveUnits).toHaveBeenCalledWith(['oil'], july);
+    });
+    fireEvent.change(screen.getByLabelText('الصنف'), {
+      target: { value: 'oil' },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('option', { name: 'كرتونة' })).toHaveValue(
+        'carton',
+      );
+    });
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'carton' },
+    });
+    fireEvent.change(screen.getByLabelText('الكمية'), {
+      target: { value: '2' },
+    });
+    fireEvent.change(screen.getByLabelText('المبلغ'), {
+      target: { value: '24' },
+    });
+
+    fireEvent.change(screen.getByLabelText('وقت الشراء'), {
+      target: { value: '2020-01-15T10:00' },
+    });
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      unitLookupErrorMessage,
+    );
+    expect(screen.getByLabelText('الوحدة')).toHaveValue('carton');
+    expect(screen.getByRole('button', { name: 'مراجعة' })).toBeDisabled();
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    failJanuary = false;
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'مراجعة' })).toBeEnabled();
+    });
+    expect(screen.getByLabelText('الوحدة')).toHaveValue('carton');
+    fireEvent.click(screen.getByRole('button', { name: 'مراجعة' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(onSubmit.mock.calls[0]?.[0].lines[0]).toMatchObject({
+      quantity: '2',
+      unit: 'carton',
+      baseQuantity: '24',
+      expectedFactor: '12',
+    });
+  });
+
+  it('blocks review when the selected unit is gone at the new time', async () => {
+    const july = cairoDateTimeLocalToIso('2026-07-15T12:00');
+    const january = cairoDateTimeLocalToIso('2020-01-15T10:00');
+    if (july === null || january === null) {
+      throw new Error('cairo time did not parse');
+    }
+    const resolveUnits = vi.fn((_ids: readonly string[], at: string) =>
+      Promise.resolve({
+        oil:
+          at === january
+            ? []
+            : [{ unit: 'carton', factorToBase: '12', label: 'كرتونة' }],
+      }),
+    );
+    const onSubmit = vi.fn<(draft: PurchaseDraft) => void>();
+    render(
+      <PurchaseForm
+        items={[oil]}
+        locked={false}
+        submitting={false}
+        serverError={null}
+        onClearServerError={vi.fn()}
+        onSubmit={onSubmit}
+        resolveUnits={resolveUnits}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('وقت الشراء'), {
+      target: { value: '2026-07-15T12:00' },
+    });
+    fireEvent.change(screen.getByLabelText('الصنف'), {
+      target: { value: 'oil' },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('option', { name: 'كرتونة' })).toHaveValue(
+        'carton',
+      );
+    });
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'carton' },
+    });
+    fireEvent.change(screen.getByLabelText('الكمية'), {
+      target: { value: '2' },
+    });
+    fireEvent.change(screen.getByLabelText('المبلغ'), {
+      target: { value: '24' },
+    });
+    fireEvent.change(screen.getByLabelText('وقت الشراء'), {
+      target: { value: '2020-01-15T10:00' },
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      unitUnavailableMessage,
+    );
+    expect(screen.getByLabelText('الوحدة')).toHaveValue('carton');
+    expect(screen.getByRole('button', { name: 'مراجعة' })).toBeDisabled();
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'kg' },
+    });
+    expect(screen.queryByText(unitUnavailableMessage)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'مراجعة' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(onSubmit.mock.calls[0]?.[0].lines[0]).toMatchObject({
+      quantity: '2',
+      unit: 'kg',
+      baseQuantity: '2',
+      expectedFactor: '1',
+    });
   });
 });

@@ -7,7 +7,11 @@ import {
   setOpeningPrice,
   updateItem,
 } from '@/items/api';
-import { expectationFromItem, type ItemExpectation } from '@/items/expectation';
+import {
+  expectationFromDraft,
+  expectationFromItem,
+  type ItemExpectation,
+} from '@/items/expectation';
 import { sameEditor, type ItemEditor } from '@/items/editor';
 import {
   CostingChangedError,
@@ -20,7 +24,7 @@ import {
 import { groupCatalog } from '@/items/group';
 import { ItemForm } from '@/items/ItemForm';
 import { ItemList } from '@/items/ItemList';
-import type { CatalogItem, ItemDraft } from '@/items/types';
+import type { CatalogItem, ItemSave } from '@/items/types';
 import { emptyItemForm, itemToFormValues } from '@/items/validation';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
 
@@ -152,37 +156,44 @@ export function ItemsPage() {
     setEditor({ type: 'edit', id: item.id });
   }
 
-  async function handleSubmit(draft: ItemDraft) {
+  async function handleSubmit(action: ItemSave) {
     const started = formModeRef.current;
     if (!started || busy || catalogLoadsRef.current > 0) return;
     setSaving(true);
     setFormError(null);
     let saved = false;
     try {
-      if (started.type === 'edit') {
+      if (action.kind === 'create') {
+        if (started.type !== 'create') return;
+        await createItem(action.draft);
+      } else if (started.type !== 'edit') {
+        return;
+      } else if (action.kind === 'details') {
         const expected = expectedRef.current;
         if (!expected) throw new StaleWriteError();
-        await updateItem(started.id, draft, expected);
-        if (draft.lossWrite && draft.lossPct !== null) {
-          await setItemLoss(started.id, draft.lossPct, draft.lossWrite);
-        }
-        if (draft.openingWrite) {
-          await setOpeningPrice(
-            started.id,
-            draft.openingWrite.price,
-            draft.openingWrite.reason,
-            draft.openingWrite.expectedId,
-            draft.openingWrite.requestId,
-          );
-        }
+        await updateItem(started.id, action.draft, expected);
+        expectedRef.current = expectationFromDraft(action.draft);
+      } else if (action.kind === 'loss') {
+        await setItemLoss(started.id, action.lossPct, action.write);
       } else {
-        await createItem(draft);
+        await setOpeningPrice(
+          started.id,
+          action.price,
+          action.reason,
+          action.expectedId,
+          action.requestId,
+        );
       }
       saved = true;
-      // Locked from the moment the save lands until fresh rows are applied,
-      // whichever read applies them.
+      // Locked from the moment the save lands until fresh rows are applied.
+      // The editor stays open so a sibling section keeps its pending value.
       setNeedsReload(true);
-      if (sameEditor(formModeRef.current, started)) setEditor(null);
+      if (
+        action.kind === 'create' &&
+        sameEditor(formModeRef.current, started)
+      ) {
+        setEditor(null);
+      }
       const next = await readCatalog();
       if (next) {
         setItems(next);
@@ -212,6 +223,7 @@ export function ItemsPage() {
         setNeedsReload(true);
         setLoadError(messageFrom(error));
       }
+      if (!saved) throw error;
     } finally {
       setSaving(false);
     }
@@ -282,11 +294,7 @@ export function ItemsPage() {
           </div>
           {showForm ? (
             <ItemForm
-              key={
-                formMode?.type === 'edit'
-                  ? `${formMode.id}:${formEpoch}`
-                  : 'create'
-              }
+              key={formMode?.type === 'edit' ? formMode.id : 'create'}
               items={items}
               editingId={editingItem?.id}
               initial={
@@ -296,7 +304,8 @@ export function ItemsPage() {
               locked={busy}
               serverError={formError}
               onClearServerError={() => setFormError(null)}
-              onSubmit={(draft) => void handleSubmit(draft)}
+              detailsKey={formEpoch}
+              onSubmit={(action) => handleSubmit(action)}
               onCancel={() => {
                 if (busy) return;
                 setEditor(null);
