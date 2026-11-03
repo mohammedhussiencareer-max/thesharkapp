@@ -3,11 +3,13 @@ import { formatStoredFactor } from '@/items/format';
 import { kindLabels, unitLabels } from '@/items/labels';
 import type { StockKind } from '@/items/types';
 import { formatMoneyText } from '@/purchases/decimal';
-import type { PurchaseDraft, StockChoice } from '@/purchases/types';
+import type { PurchaseDraft, StockChoice, UnitOption } from '@/purchases/types';
+import { useResolvedUnits } from '@/purchases/units-at';
 
 type ReviewedPurchase = Omit<PurchaseDraft, 'requestId'>;
 import { nowCairoDateTimeLocal } from '@/purchases/time';
 import {
+  choiceLabel,
   previewPurchaseLine,
   unitChoices,
   unitLabel,
@@ -35,6 +37,13 @@ function emptyLine(key: string): PurchaseLineValues {
   return { key, itemId: '', quantity: '', unit: '', amount: '' };
 }
 
+function chosenUnit(unit: string, item: StockChoice | undefined): string {
+  if (!item || unit === '') return unit;
+  const choices = unitChoices(item);
+  if (choices.some((choice) => choice.unit === unit)) return unit;
+  return item.baseUnit;
+}
+
 export function PurchaseForm({
   items,
   locked,
@@ -42,6 +51,7 @@ export function PurchaseForm({
   serverError,
   onClearServerError,
   onSubmit,
+  resolveUnits,
 }: {
   items: readonly StockChoice[];
   locked: boolean;
@@ -49,6 +59,11 @@ export function PurchaseForm({
   serverError: string | null;
   onClearServerError: () => void;
   onSubmit: (draft: PurchaseDraft) => void;
+  /** Dated unit list for the form's own timestamp. Catalog tests omit it. */
+  resolveUnits?: (
+    itemIds: readonly string[],
+    atIso: string,
+  ) => Promise<Record<string, UnitOption[]>>;
 }) {
   const keyRef = useRef(1);
   // One id for this draft. A failed save retries it; a new form gets a new one.
@@ -62,7 +77,25 @@ export function PurchaseForm({
   }));
   const [errors, setErrors] = useState<PurchaseErrors>({ lines: {} });
   const [draft, setDraft] = useState<ReviewedPurchase | null>(null);
+  const { items: resolvedItems, loading: unitsLoading } = useResolvedUnits(
+    items,
+    values.purchasedAt,
+    resolveUnits,
+  );
   const disabled = locked || submitting;
+  const blocked = disabled || unitsLoading;
+
+  function settledValues(): PurchaseValues {
+    return {
+      ...values,
+      lines: values.lines.map((line) => {
+        const item = resolvedItems.find(
+          (candidate) => candidate.id === line.itemId,
+        );
+        return { ...line, unit: chosenUnit(line.unit, item) };
+      }),
+    };
+  }
 
   function edit(patch: Partial<PurchaseValues>) {
     onClearServerError();
@@ -79,7 +112,9 @@ export function PurchaseForm({
         if (line.key !== key) return line;
         const next = { ...line, ...patch };
         if (patch.itemId !== undefined) {
-          const item = items.find((candidate) => candidate.id === patch.itemId);
+          const item = resolvedItems.find(
+            (candidate) => candidate.id === patch.itemId,
+          );
           const choices = item ? unitChoices(item) : [];
           if (!choices.some((choice) => choice.unit === next.unit)) {
             next.unit = item?.baseUnit ?? '';
@@ -103,9 +138,9 @@ export function PurchaseForm({
 
   function onSubmitForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (disabled) return;
+    if (blocked) return;
     if (!draft) {
-      const result = validatePurchase(values, items);
+      const result = validatePurchase(settledValues(), resolvedItems);
       if (!result.ok) {
         setErrors(result.errors);
         return;
@@ -158,7 +193,7 @@ export function PurchaseForm({
             >
               رجوع
             </button>
-            <button className={primaryButton} type="submit" disabled={disabled}>
+            <button className={primaryButton} type="submit" disabled={blocked}>
               حفظ
             </button>
           </div>
@@ -171,7 +206,7 @@ export function PurchaseForm({
               <input
                 className={fieldClass}
                 type="datetime-local"
-                disabled={disabled}
+                disabled={blocked}
                 value={values.purchasedAt}
                 onChange={(event) => edit({ purchasedAt: event.target.value })}
               />
@@ -211,11 +246,13 @@ export function PurchaseForm({
           {errors.invoiceNo ? <p role="alert">{errors.invoiceNo}</p> : null}
           {errors.note ? <p role="alert">{errors.note}</p> : null}
           {values.lines.map((line, index) => {
-            const item = items.find(
+            const item = resolvedItems.find(
               (candidate) => candidate.id === line.itemId,
             );
+            const unit = chosenUnit(line.unit, item);
+            const shown = unit === line.unit ? line : { ...line, unit };
             const choices = item ? unitChoices(item) : [];
-            const preview = previewPurchaseLine(line, items);
+            const preview = previewPurchaseLine(shown, resolvedItems);
             const lineErrors = errors.lines[line.key] ?? {};
             return (
               <fieldset
@@ -272,15 +309,15 @@ export function PurchaseForm({
                     <select
                       className={fieldClass}
                       disabled={disabled || !item}
-                      value={line.unit}
+                      value={unit}
                       onChange={(event) =>
                         updateLine(line.key, { unit: event.target.value })
                       }
                     >
                       {choices.map((choice) => (
                         <option key={choice.unit} value={choice.unit}>
-                          {choice.unit === item?.baseUnit
-                            ? unitLabels[item.baseUnit]
+                          {item
+                            ? choiceLabel(choice, item.baseUnit)
                             : choice.unit}
                         </option>
                       ))}
@@ -301,10 +338,16 @@ export function PurchaseForm({
                     />
                   </label>
                 </div>
-                {item && line.unit && line.unit !== item.baseUnit ? (
+                {item && unit && unit !== item.baseUnit ? (
                   <p>
-                    {`1 ${line.unit} = ${formatStoredFactor(
-                      choices.find((choice) => choice.unit === line.unit)
+                    {`1 ${choiceLabel(
+                      choices.find((choice) => choice.unit === unit) ?? {
+                        unit,
+                        factorToBase: '1',
+                      },
+                      item.baseUnit,
+                    )} = ${formatStoredFactor(
+                      choices.find((choice) => choice.unit === unit)
                         ?.factorToBase ?? '',
                     )} ${unitLabels[item.baseUnit]}`}
                   </p>
@@ -346,7 +389,7 @@ export function PurchaseForm({
             >
               ضيف سطر
             </button>
-            <button className={primaryButton} type="submit" disabled={disabled}>
+            <button className={primaryButton} type="submit" disabled={blocked}>
               مراجعة
             </button>
           </div>

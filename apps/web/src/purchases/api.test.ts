@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   listPurchases,
   listStockChoices,
+  listUnitsAt,
   recordOpeningStock,
   recordPurchase,
 } from '@/purchases/api';
@@ -167,11 +168,11 @@ describe('purchases api', () => {
         parentItemId: null,
         active: true,
         hasMovements: false,
-        conversions: [{ unit: 'لتر', factorToBase: '0.920000' }],
+        conversions: [],
       },
     ]);
     expect(items.captured.select).toBe(
-      'id, name, kind, base_unit, parent_item_id, active, item_balances(item_id), item_unit_conversions(unit, factor_text:factor_to_base::text)',
+      'id, name, kind, base_unit, parent_item_id, active, item_balances(item_id)',
     );
     // Inactive rows are dropped after paging, never filtered on the server.
     expect(items.captured.filters).toEqual([]);
@@ -228,6 +229,44 @@ describe('purchases api', () => {
     const seen = new Set(choices.map((choice) => choice.id));
     for (const id of ids.slice(1)) expect(seen.has(id)).toBe(true);
     expect(choices).toHaveLength(1002);
+  });
+
+  it('loads units at the form timestamp and skips the base row', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      data: [
+        {
+          item_id: 'oil',
+          unit_code: 'kg',
+          label_ar: 'كيلو',
+          factor_text: '1',
+          factor_to_base: 1,
+          source: 'base',
+          version_id: null,
+          effective_from: null,
+        },
+        {
+          item_id: 'oil',
+          unit_code: 'liter',
+          label_ar: 'لتر',
+          factor_text: '0.920000',
+          factor_to_base: 0.92,
+          source: 'explicit',
+          version_id: 'v1',
+          effective_from: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+      error: null,
+    });
+    mocks.schema.mockReturnValue({ rpc });
+    await expect(
+      listUnitsAt(['oil'], '2026-07-15T09:00:00.000Z'),
+    ).resolves.toEqual({
+      oil: [{ unit: 'liter', factorToBase: '0.920000', label: 'لتر' }],
+    });
+    expect(rpc).toHaveBeenCalledWith('item_units_at', {
+      p_item_ids: ['oil'],
+      p_at: '2026-07-15T09:00:00.000Z',
+    });
   });
 
   it('lists purchases newest first with exact money text', async () => {

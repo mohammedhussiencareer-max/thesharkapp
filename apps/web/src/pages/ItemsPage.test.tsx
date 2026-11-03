@@ -10,11 +10,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   addConversion,
   createItem,
+  currentShiftStart,
   listConversions,
   listItems,
+  setItemLoss,
+  setOpeningPrice,
   updateConversion,
   updateItem,
 } from '@/items/api';
+import { emptyScheduleToken } from '@/items/effective';
 import { StaleWriteError } from '@/items/errors';
 import type { BaseUnit, CatalogItem, UnitConversion } from '@/items/types';
 import { ItemsPage } from '@/pages/ItemsPage';
@@ -23,10 +27,31 @@ vi.mock('@/items/api', () => ({
   listItems: vi.fn(),
   createItem: vi.fn(),
   updateItem: vi.fn(),
+  setItemLoss: vi.fn(),
+  setOpeningPrice: vi.fn(),
   listConversions: vi.fn(),
   addConversion: vi.fn(),
   updateConversion: vi.fn(),
   deleteConversion: vi.fn(),
+  currentShiftStart: vi.fn(() => Promise.resolve(null)),
+  listCostingSchedule: vi.fn(() =>
+    Promise.resolve({
+      lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      lossVersions: [],
+      conversions: [],
+    }),
+  ),
+  costingImpact: vi.fn(() =>
+    Promise.resolve({ orders: 2, shifts: 1, movements: 4 }),
+  ),
+  listUnitOptions: vi.fn(() =>
+    Promise.resolve([
+      { code: 'piece', labelAr: 'قطعة' },
+      { code: 'كرتونة', labelAr: 'كرتونة' },
+      { code: 'كيس', labelAr: 'كيس' },
+    ]),
+  ),
+  addCustomUnit: vi.fn((code: string) => Promise.resolve(code)),
 }));
 
 function item(
@@ -36,7 +61,6 @@ function item(
     baseUnit: 'kg',
     countFrequency: 'daily',
     lossPct: 0,
-    storedLossPct: 0,
     parentItemId: null,
     active: true,
     onHandQty: 0,
@@ -44,7 +68,6 @@ function item(
     onHandValue: 0,
     ...overrides,
   };
-  if (overrides.storedLossPct === undefined) row.storedLossPct = row.lossPct;
   return row;
 }
 
@@ -132,6 +155,12 @@ describe('ItemsPage', () => {
     vi.mocked(listConversions).mockResolvedValue({ baseUnit: 'kg', rows: [] });
     vi.mocked(addConversion).mockReset();
     vi.mocked(addConversion).mockResolvedValue(undefined);
+    vi.mocked(setItemLoss).mockReset();
+    vi.mocked(setItemLoss).mockResolvedValue(undefined);
+    vi.mocked(setOpeningPrice).mockReset();
+    vi.mocked(setOpeningPrice).mockResolvedValue(undefined);
+    vi.mocked(currentShiftStart).mockReset();
+    vi.mocked(currentShiftStart).mockResolvedValue(null);
   });
 
   it('shows a loading state and then the grouped Arabic catalog', async () => {
@@ -390,8 +419,11 @@ describe('ItemsPage', () => {
     expect(
       await within(box).findByText('مفيش تحويلات للصنف ده'),
     ).toBeInTheDocument();
+    expect(
+      await within(box).findByRole('option', { name: 'قطعة' }),
+    ).toBeInTheDocument();
 
-    fireEvent.change(within(box).getByLabelText('اسم الوحدة'), {
+    fireEvent.change(within(box).getByLabelText('الوحدة'), {
       target: { value: 'piece' },
     });
     fireEvent.change(within(box).getByLabelText('المعامل'), {
@@ -403,7 +435,7 @@ describe('ItemsPage', () => {
     ).toBeInTheDocument();
     expect(addConversion).not.toHaveBeenCalled();
 
-    fireEvent.change(within(box).getByLabelText('اسم الوحدة'), {
+    fireEvent.change(within(box).getByLabelText('الوحدة'), {
       target: { value: 'كرتونة' },
     });
     fireEvent.change(within(box).getByLabelText('المعامل'), {
@@ -414,7 +446,13 @@ describe('ItemsPage', () => {
     expect(
       await within(box).findByText('1 كرتونة = 12 قطعة'),
     ).toBeInTheDocument();
-    expect(addConversion).toHaveBeenCalledWith('box', 'كرتونة', '12', 'piece');
+    expect(addConversion).toHaveBeenCalledWith(
+      'box',
+      'كرتونة',
+      '12',
+      'piece',
+      expect.objectContaining({ effectiveFrom: null, reason: null }),
+    );
   });
 
   it('locks the inactive filter while an inactive item conversion saves', async () => {
@@ -794,6 +832,12 @@ describe('ItemsPage', () => {
       '3',
       '1',
       'piece',
+      expect.objectContaining({
+        effectiveFrom: null,
+        effectiveTo: null,
+        reason: null,
+        token: emptyScheduleToken,
+      }),
     ]);
   });
 
@@ -973,7 +1017,9 @@ describe('ItemsPage', () => {
 
     releaseSave();
     await waitFor(() => {
-      expect(screen.queryByRole('form')).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('form', { name: 'تعديل الصنف' }),
+      ).not.toBeInTheDocument();
     });
   });
 
@@ -1079,5 +1125,64 @@ describe('ItemsPage', () => {
     expect(
       screen.getByRole('button', { name: 'إعادة المحاولة' }),
     ).toBeEnabled();
+  });
+
+  it('asks for a reason when a loss starts at the open shift and sets an opening price', async () => {
+    vi.mocked(currentShiftStart).mockResolvedValueOnce(
+      '2020-01-01T00:00:00.000Z',
+    );
+    await renderCatalog();
+    const shrimp = screen.getByRole('article', { name: 'جمبري' });
+    fireEvent.click(within(shrimp).getByRole('button', { name: 'تعديل' }));
+    fireEvent.change(screen.getByLabelText('نسبة الفاقد'), {
+      target: { value: '10' },
+    });
+
+    expect(
+      await screen.findByText('ممكن يأثر على 2 طلب في 1 وردية (تقدير)'),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(screen.getByText('اكتب سبب التغيير بأثر رجعي')).toBeInTheDocument();
+    expect(setItemLoss).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('سبب التغيير'), {
+      target: { value: 'تصحيح' },
+    });
+    fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
+      target: { value: '0' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(screen.getByText('اكتب سبب إن السعر صفر')).toBeInTheDocument();
+    expect(setOpeningPrice).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('سبب إن السعر صفر'), {
+      target: { value: 'لسه من غير سعر' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+
+    await waitFor(() => {
+      expect(setItemLoss).toHaveBeenCalledWith(
+        'shrimp',
+        '0.1',
+        expect.objectContaining({
+          effectiveFrom: '2020-01-01T00:00:00.000Z',
+          effectiveTo: null,
+          token: emptyScheduleToken,
+          reason: 'تصحيح',
+        }),
+      );
+    });
+    expect(setOpeningPrice).toHaveBeenCalledWith(
+      'shrimp',
+      '0',
+      'لسه من غير سعر',
+      null,
+      expect.any(String),
+    );
+    expect(updateItem).toHaveBeenCalledWith(
+      'shrimp',
+      expect.objectContaining({ name: 'جمبري', lossPct: '0.1' }),
+      expect.objectContaining({ name: 'جمبري' }),
+    );
   });
 });

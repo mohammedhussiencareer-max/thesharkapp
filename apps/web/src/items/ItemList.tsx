@@ -41,9 +41,11 @@ function ItemCard({
       <ul className="flex flex-wrap gap-2 text-sm">
         <li>{unitLabels[item.baseUnit]}</li>
         <li>{frequencyLabels[item.countFrequency]}</li>
-        {item.lossPct > 0 ? (
+        {item.lossPct === null ? (
+          <li>فاقد مش متحدد</li>
+        ) : (
           <li>فاقد {formatLossPercent(item.lossPct)}</li>
-        ) : null}
+        )}
       </ul>
       <dl className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-3">
         <div>

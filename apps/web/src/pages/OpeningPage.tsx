@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
-import { listStockChoices, recordOpeningStock } from '@/purchases/api';
+import {
+  listStockChoices,
+  listUnitsAt,
+  recordOpeningStock,
+} from '@/purchases/api';
 import {
   ConversionChangedError,
   genericPurchaseError,
@@ -160,6 +164,7 @@ export function OpeningPage() {
           serverError={serverError}
           onClearServerError={() => setServerError(null)}
           onSubmit={(draft) => void handleSubmit(draft)}
+          resolveUnits={listUnitsAt}
         />
       ) : null}
     </main>

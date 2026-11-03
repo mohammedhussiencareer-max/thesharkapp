@@ -68,7 +68,11 @@ alter table app.stock_movements enable trigger trg_stock_movements_no_truncate;
 
 delete from app.item_balances;
 
+alter table app.item_unit_conversions disable trigger trg_item_unit_conversions_frozen;
+
 delete from app.item_unit_conversions;
+
+alter table app.item_unit_conversions enable trigger trg_item_unit_conversions_frozen;
 
 delete from app.stock_items;
 

@@ -10,7 +10,6 @@ export type ItemExpectation = {
   kind: StockKind;
   baseUnit: BaseUnit;
   countFrequency: CountFrequency;
-  lossPct: number | string;
   parentItemId: string | null;
   active: boolean;
 };
@@ -21,7 +20,6 @@ export function expectationFromItem(item: CatalogItem): ItemExpectation {
     kind: item.kind,
     baseUnit: item.baseUnit,
     countFrequency: item.countFrequency,
-    lossPct: item.storedLossPct,
     parentItemId: item.parentItemId,
     active: item.active,
   };

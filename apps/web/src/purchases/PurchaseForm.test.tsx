@@ -1,7 +1,8 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { backDatedMessage } from '@/purchases/errors';
 import { PurchaseForm } from '@/purchases/PurchaseForm';
+import { cairoDateTimeLocalToIso } from '@/purchases/time';
 import type { PurchaseDraft, StockChoice } from '@/purchases/types';
 
 const oil: StockChoice = {
@@ -103,5 +104,72 @@ describe('PurchaseForm', () => {
       'مينفعش تسجّل حركة لـ زيت بتاريخ أقدم من آخر حركة ليه — التعديل بأثر رجعي جاي في مرحلة لاحقة',
     );
     expect(screen.getByRole('button', { name: 'مراجعة' })).toBeDisabled();
+  });
+
+  it('reloads the unit factor when the purchase time changes', async () => {
+    const july = cairoDateTimeLocalToIso('2026-07-15T12:00');
+    const january = cairoDateTimeLocalToIso('2020-01-15T10:00');
+    if (july === null || january === null) {
+      throw new Error('cairo time did not parse');
+    }
+    const resolveUnits = vi.fn((_ids: readonly string[], at: string) =>
+      Promise.resolve({
+        oil: [
+          {
+            unit: 'liter',
+            factorToBase: at === january ? '0.5' : '0.92',
+            label: 'لتر',
+          },
+        ],
+      }),
+    );
+    render(
+      <PurchaseForm
+        items={[oil]}
+        locked={false}
+        submitting={false}
+        serverError={null}
+        onClearServerError={vi.fn()}
+        onSubmit={vi.fn()}
+        resolveUnits={resolveUnits}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(resolveUnits).toHaveBeenCalled();
+    });
+    fireEvent.change(screen.getByLabelText('وقت الشراء'), {
+      target: { value: '2026-07-15T12:00' },
+    });
+    await waitFor(() => {
+      expect(resolveUnits).toHaveBeenCalledWith(['oil'], july);
+    });
+    fireEvent.change(screen.getByLabelText('الصنف'), {
+      target: { value: 'oil' },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('option', { name: 'لتر' })).toHaveValue('liter');
+    });
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'liter' },
+    });
+    fireEvent.change(screen.getByLabelText('الكمية'), {
+      target: { value: '2' },
+    });
+    fireEvent.change(screen.getByLabelText('المبلغ'), {
+      target: { value: '50' },
+    });
+    expect(screen.getByText('تكلفة كيلو: 27.173913 ج.م')).toBeInTheDocument();
+    expect(screen.getByText('1 لتر = 0.92 كيلو')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('وقت الشراء'), {
+      target: { value: '2020-01-15T10:00' },
+    });
+    await waitFor(() => {
+      expect(resolveUnits).toHaveBeenCalledWith(['oil'], january);
+    });
+    expect(await screen.findByText('تكلفة كيلو: 50 ج.م')).toBeInTheDocument();
+    expect(screen.getByText('1 لتر = 0.5 كيلو')).toBeInTheDocument();
+    expect(screen.getByLabelText('الوحدة')).toHaveValue('liter');
   });
 });

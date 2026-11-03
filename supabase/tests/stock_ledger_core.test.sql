@@ -18,7 +18,11 @@ alter table app.stock_movements enable trigger trg_stock_movements_no_truncate;
 
 delete from app.item_balances;
 
+alter table app.item_unit_conversions disable trigger trg_item_unit_conversions_frozen;
+
 delete from app.item_unit_conversions;
+
+alter table app.item_unit_conversions enable trigger trg_item_unit_conversions_frozen;
 
 delete from app.stock_items;
 
@@ -157,6 +161,8 @@ select
 -- ============================================================================
 -- Seed test catalog items & conversions
 -- ============================================================================
+alter table app.stock_items disable trigger trg_stock_items_loss_pct_frozen;
+
 insert into
   app.stock_items (
     id,
@@ -319,6 +325,8 @@ values
     null
   );
 
+alter table app.stock_items enable trigger trg_stock_items_loss_pct_frozen;
+
 insert into
   app.stock_items (
     id,
@@ -430,6 +438,8 @@ values
     '10000000-0000-4000-8000-000000000023'
   );
 
+alter table app.item_unit_conversions disable trigger trg_item_unit_conversions_frozen;
+
 insert into
   app.item_unit_conversions (item_id, unit, factor_to_base)
 values
@@ -443,6 +453,52 @@ values
     'carton',
     144
   );
+
+alter table app.item_unit_conversions enable trigger trg_item_unit_conversions_frozen;
+
+-- Readers use the dated factor. g on a kg item is implicit; carton needs a version.
+insert into
+  app.units (code, label_ar, dimension, metric_scale)
+values
+  ('carton', 'كرتونة', 'custom', null);
+
+insert into
+  app.costing_changes (
+    request_id,
+    kind,
+    actor_id,
+    reason,
+    payload,
+    result
+  )
+values
+  (
+    '10000000-0000-4000-8000-0000000000c1',
+    'owner',
+    null,
+    null,
+    '{"fn":"test_stock_ledger_seed"}'::jsonb,
+    '{"ok":true}'::jsonb
+  );
+
+insert into
+  app.item_conversion_versions (
+    effective_from,
+    created_change_id,
+    item_id,
+    unit_code,
+    factor_to_base
+  )
+select
+  '2000-01-01T00:00:00Z',
+  cc.id,
+  '10000000-0000-4000-8000-000000000020',
+  'carton',
+  144
+from
+  app.costing_changes cc
+where
+  cc.request_id = '10000000-0000-4000-8000-0000000000c1';
 
 -- ============================================================================
 -- 9..13: stock_items parent_item_id constraints

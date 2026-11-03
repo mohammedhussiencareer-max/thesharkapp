@@ -52,7 +52,8 @@ export function emptyItemForm(): ItemFormValues {
 }
 
 export function fractionToLossPercentInput(fraction: number): string {
-  if (!Number.isFinite(fraction) || fraction <= 0) return '0';
+  if (!Number.isFinite(fraction) || fraction < 0) return '';
+  if (fraction === 0) return '0';
   const percent = Math.round(fraction * 100000) / 1000;
   return String(percent);
 }
@@ -63,7 +64,8 @@ export function itemToFormValues(item: CatalogItem): ItemFormValues {
     kind: item.kind,
     baseUnit: item.baseUnit,
     countFrequency: item.countFrequency,
-    lossPercent: fractionToLossPercentInput(item.lossPct),
+    lossPercent:
+      item.lossPct === null ? '' : fractionToLossPercentInput(item.lossPct),
     parentItemId: item.parentItemId ?? '',
     active: item.active,
   };
@@ -143,6 +145,7 @@ export function parseLossPercent(raw: string): number | null {
 }
 
 function lossPercentMessage(raw: string): string | null {
+  if (raw.trim() === '') return null;
   const trimmed = normalizeDecimal(raw);
   if (trimmed === null || compareDecimal(trimmed, '99.999') > 0) {
     return lossRangeMessage;
@@ -177,11 +180,18 @@ export function validateItemForm(
     errors.countFrequency = 'دورية الجرد مش مظبوطة';
   }
 
+  const lossBlank = values.lossPercent.trim() === '';
   const lossMessage = lossPercentMessage(values.lossPercent);
-  const lossPct =
-    lossMessage === null ? lossPercentToFraction(values.lossPercent) : null;
+  const lossPct = lossBlank
+    ? null
+    : lossMessage === null
+      ? lossPercentToFraction(values.lossPercent)
+      : null;
   const lossWhole = lossPct?.split('.')[0] ?? '1';
-  if (lossMessage !== null || lossPct === null || lossWhole !== '0') {
+  if (
+    !lossBlank &&
+    (lossMessage !== null || lossPct === null || lossWhole !== '0')
+  ) {
     errors.lossPercent = lossMessage ?? lossRangeMessage;
   }
 
@@ -216,7 +226,7 @@ export function validateItemForm(
     errors.kind = 'مينفعش تغيّر نوع السمك المخلوط وعنده أحجام';
   }
 
-  if (Object.keys(errors).length > 0 || lossPct === null) {
+  if (Object.keys(errors).length > 0 || (!lossBlank && lossPct === null)) {
     return { ok: false, errors };
   }
 
@@ -262,4 +272,33 @@ export function validateConversion(
     return { ok: false, error: factorPositiveMessage };
   }
   return { ok: true, unit, factor: factorText };
+}
+
+export function decimalsEqual(left: string, right: string): boolean {
+  if (left.trim() === '' && right.trim() === '') return true;
+  const normalizedLeft = normalizeDecimal(left);
+  const normalizedRight = normalizeDecimal(right);
+  if (normalizedLeft === null || normalizedRight === null) return false;
+  return compareDecimal(normalizedLeft, normalizedRight) === 0;
+}
+
+/** Opening unit cost. Empty means the owner left the field blank. */
+export function parseUnitCost(
+  raw: string,
+):
+  | { ok: true; empty: true }
+  | { ok: true; text: string }
+  | { ok: false; error: string } {
+  if (raw.trim() === '') return { ok: true, empty: true };
+  const text = normalizeDecimal(raw);
+  if (text === null) {
+    return { ok: false, error: 'السعر لازم يكون رقم من صفر وطالع' };
+  }
+  const parts = text.split('.');
+  const whole = parts[0] ?? '0';
+  const fraction = parts[1] ?? '';
+  if (whole.length > 14 || fraction.length > 6) {
+    return { ok: false, error: 'السعر أدق من المسموح' };
+  }
+  return { ok: true, text };
 }

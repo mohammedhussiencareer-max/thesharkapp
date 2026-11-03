@@ -39,9 +39,12 @@ test('owner records opening stock and a purchase in a converted unit', async ({
 
   const oilCard = page.getByRole('article', { name: oil, exact: true });
   await oilCard.getByRole('button', { name: 'التحويلات' }).click();
-  await oilCard.getByLabel('اسم الوحدة').fill('لتر');
-  await oilCard.getByLabel('المعامل').fill('0.92');
-  await oilCard.getByRole('button', { name: 'ضيف التحويل' }).click();
+  const addForm = oilCard.getByRole('form', { name: 'إضافة تحويل' });
+  await expect(addForm.getByLabel('الوحدة')).toBeEnabled(visible);
+  await addForm.getByLabel('الوحدة').selectOption({ label: 'لتر' });
+  await addForm.getByLabel('المعامل').fill('0.92');
+  await addForm.getByLabel('وقت السريان').selectOption({ label: 'الآن' });
+  await addForm.getByRole('button', { name: 'ضيف التحويل' }).click();
   await expect(oilCard.getByText('1 لتر = 0.92 كيلو')).toBeVisible(visible);
 
   await page.getByRole('link', { name: 'الرئيسية' }).click();

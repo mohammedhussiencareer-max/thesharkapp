@@ -1,9 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { createItem, listItems, updateItem } from '@/items/api';
+import {
+  createItem,
+  listItems,
+  setItemLoss,
+  setOpeningPrice,
+  updateItem,
+} from '@/items/api';
 import { expectationFromItem, type ItemExpectation } from '@/items/expectation';
 import { sameEditor, type ItemEditor } from '@/items/editor';
 import {
+  CostingChangedError,
+  costingChangedMessage,
   genericCatalogError,
   messageFrom,
   StaleWriteError,
@@ -155,6 +163,18 @@ export function ItemsPage() {
         const expected = expectedRef.current;
         if (!expected) throw new StaleWriteError();
         await updateItem(started.id, draft, expected);
+        if (draft.lossWrite && draft.lossPct !== null) {
+          await setItemLoss(started.id, draft.lossPct, draft.lossWrite);
+        }
+        if (draft.openingWrite) {
+          await setOpeningPrice(
+            started.id,
+            draft.openingWrite.price,
+            draft.openingWrite.reason,
+            draft.openingWrite.expectedId,
+            draft.openingWrite.requestId,
+          );
+        }
       } else {
         await createItem(draft);
       }
@@ -178,6 +198,9 @@ export function ItemsPage() {
       ) {
         try {
           await reloadCatalog(started.id);
+          if (error instanceof CostingChangedError) {
+            setFormError(costingChangedMessage);
+          }
         } catch (reloadError) {
           setFormError(messageFrom(reloadError));
         }

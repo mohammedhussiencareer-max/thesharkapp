@@ -1,6 +1,7 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { OpeningGrid } from '@/purchases/OpeningGrid';
+import { cairoDateTimeLocalToIso } from '@/purchases/time';
 import type { OpeningDraft, StockChoice } from '@/purchases/types';
 
 const oil: StockChoice = {
@@ -90,6 +91,79 @@ describe('OpeningGrid', () => {
           expectedBaseUnit: 'kg',
           expectedFactor: '1',
         },
+      ],
+    });
+  });
+
+  it('refreshes the opening unit when the balance time changes', async () => {
+    const onSubmit = vi.fn<(draft: OpeningDraft) => void>();
+    const july = cairoDateTimeLocalToIso('2026-07-15T12:00');
+    const january = cairoDateTimeLocalToIso('2020-01-15T10:00');
+    if (july === null || january === null) {
+      throw new Error('cairo time did not parse');
+    }
+    const resolveUnits = vi.fn((_ids: readonly string[], at: string) =>
+      Promise.resolve({
+        oil: [
+          {
+            unit: 'liter',
+            factorToBase: at === january ? '0.5' : '0.92',
+            label: 'لتر',
+          },
+        ],
+      }),
+    );
+    render(
+      <OpeningGrid
+        items={[oil]}
+        locked={false}
+        submitting={false}
+        serverError={null}
+        onClearServerError={vi.fn()}
+        onSubmit={onSubmit}
+        resolveUnits={resolveUnits}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('وقت الرصيد'), {
+      target: { value: '2026-07-15T12:00' },
+    });
+    await waitFor(() => {
+      expect(resolveUnits).toHaveBeenCalledWith(['oil'], july);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('option', { name: 'لتر' })).toHaveValue('liter');
+    });
+    fireEvent.change(screen.getByLabelText('وحدة زيت'), {
+      target: { value: 'liter' },
+    });
+    fireEvent.change(screen.getByLabelText('كمية زيت'), {
+      target: { value: '2' },
+    });
+    fireEvent.change(screen.getByLabelText('تكلفة زيت'), {
+      target: { value: '50' },
+    });
+    expect(screen.getByText('1 لتر = 0.92 كيلو')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('وقت الرصيد'), {
+      target: { value: '2020-01-15T10:00' },
+    });
+    await waitFor(() => {
+      expect(resolveUnits).toHaveBeenCalledWith(['oil'], january);
+    });
+    expect(await screen.findByText('1 لتر = 0.5 كيلو')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalled();
+    });
+    expect(onSubmit.mock.calls[0]?.[0]).toMatchObject({
+      occurredAt: january,
+      lines: [
+        expect.objectContaining({
+          itemId: 'oil',
+          unit: 'liter',
+          expectedFactor: '0.5',
+        }),
       ],
     });
   });

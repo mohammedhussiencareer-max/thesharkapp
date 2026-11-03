@@ -25,6 +25,7 @@ vi.mock('@/purchases/api', () => ({
   listStockChoices: vi.fn(),
   listPurchases: vi.fn(),
   recordPurchase: vi.fn(),
+  listUnitsAt: vi.fn(() => Promise.resolve({})),
 }));
 
 const oil: StockChoice = {

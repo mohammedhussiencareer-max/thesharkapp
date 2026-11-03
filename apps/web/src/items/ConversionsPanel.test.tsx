@@ -15,6 +15,25 @@ vi.mock('@/items/api', () => ({
   addConversion: vi.fn(),
   updateConversion: vi.fn(),
   deleteConversion: vi.fn(),
+  currentShiftStart: vi.fn(() => Promise.resolve(null)),
+  listCostingSchedule: vi.fn(() =>
+    Promise.resolve({
+      lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      lossVersions: [],
+      conversions: [],
+    }),
+  ),
+  costingImpact: vi.fn(() =>
+    Promise.resolve({ orders: 0, shifts: 0, movements: 0 }),
+  ),
+  listUnitOptions: vi.fn(() =>
+    Promise.resolve([
+      { code: 'كيس', labelAr: 'كيس' },
+      { code: 'كرتونة', labelAr: 'كرتونة' },
+      { code: 'piece', labelAr: 'قطعة' },
+    ]),
+  ),
+  addCustomUnit: vi.fn((code: string) => Promise.resolve(code)),
 }));
 
 function snapshot(rows: UnitConversion[], baseUnit: BaseUnit = 'kg') {
@@ -28,7 +47,6 @@ const item: CatalogItem = {
   baseUnit: 'kg',
   countFrequency: 'weekly',
   lossPct: 0,
-  storedLossPct: 0,
   parentItemId: null,
   active: true,
   onHandQty: 0,
@@ -112,6 +130,12 @@ describe('ConversionsPanel', () => {
         '12345678.123456789',
         '12345678.123456789',
         'kg',
+        expect.objectContaining({
+          effectiveFrom: null,
+          effectiveTo: null,
+          token: 'd41d8cd98f00b204e9800998ecf8427e',
+          reason: null,
+        }),
       );
     });
   });
@@ -158,8 +182,11 @@ describe('ConversionsPanel', () => {
     expect(
       await screen.findByText('مفيش تحويلات للصنف ده'),
     ).toBeInTheDocument();
+    expect(
+      await screen.findByRole('option', { name: 'كيس' }),
+    ).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText('اسم الوحدة'), {
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
       target: { value: 'كيس' },
     });
     fireEvent.change(screen.getByLabelText('المعامل'), {
@@ -170,7 +197,13 @@ describe('ConversionsPanel', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'البيانات اتغيّرت من مكان تاني — اتعملها تحديث، راجعها واحفظ تاني',
     );
-    expect(addConversion).toHaveBeenCalledWith('oil', 'كيس', '25', 'kg');
+    expect(addConversion).toHaveBeenCalledWith(
+      'oil',
+      'كيس',
+      '25',
+      'kg',
+      expect.objectContaining({ effectiveFrom: null, reason: null }),
+    );
     expect(await screen.findByText('1 كيس = 2 لتر')).toBeInTheDocument();
     expect(screen.queryByText('1 كيس = 2 كيلو')).not.toBeInTheDocument();
     expect(screen.queryByText('1 كيس = 25 كيلو')).not.toBeInTheDocument();
@@ -217,6 +250,7 @@ describe('ConversionsPanel', () => {
         '25',
         '2',
         'liter',
+        expect.objectContaining({ effectiveFrom: null, reason: null }),
       );
     });
     await waitFor(() => {
@@ -227,7 +261,13 @@ describe('ConversionsPanel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'احذف التحويل' }));
     await waitFor(() => {
-      expect(deleteConversion).toHaveBeenCalledWith('oil', 'كيس', '2', 'liter');
+      expect(deleteConversion).toHaveBeenCalledWith(
+        'oil',
+        'كيس',
+        '2',
+        'liter',
+        expect.objectContaining({ effectiveFrom: null, reason: null }),
+      );
     });
   });
 
@@ -255,7 +295,14 @@ describe('ConversionsPanel', () => {
       'البيانات اتغيّرت من مكان تاني — اتعملها تحديث، راجعها واحفظ تاني',
     );
     expect(await screen.findByText('1 كيس = 2 لتر')).toBeInTheDocument();
-    expect(updateConversion).toHaveBeenCalledWith('oil', 'كيس', '2', '2', 'kg');
+    expect(updateConversion).toHaveBeenCalledWith(
+      'oil',
+      'كيس',
+      '2',
+      '2',
+      'kg',
+      expect.objectContaining({ effectiveFrom: null, reason: null }),
+    );
     expect(onItemStale).toHaveBeenCalled();
   });
 
@@ -272,8 +319,11 @@ describe('ConversionsPanel', () => {
     render(<ConversionsPanel item={item} />);
 
     expect(await screen.findByText('1 كرتونة = 12 كيلو')).toBeInTheDocument();
+    expect(
+      await screen.findByRole('option', { name: 'كيس' }),
+    ).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText('اسم الوحدة'), {
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
       target: { value: 'كيس' },
     });
     fireEvent.change(screen.getByLabelText('المعامل'), {

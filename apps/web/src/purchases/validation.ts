@@ -375,3 +375,9 @@ export function unitLabel(unit: string, baseUnit: BaseUnit): string {
   if (isBaseUnit(unit)) return unitLabels[unit];
   return unit === baseUnit ? unitLabels[baseUnit] : unit;
 }
+
+export function choiceLabel(choice: UnitOption, baseUnit: BaseUnit): string {
+  const label = choice.label?.trim() ?? '';
+  if (label.length > 0) return label;
+  return unitLabel(choice.unit, baseUnit);
+}

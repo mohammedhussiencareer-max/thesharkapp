@@ -1,4 +1,27 @@
-import { useId, useState, type ChangeEvent, type FormEvent } from 'react';
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+} from 'react';
+import { EffectiveTimeFields } from '@/items/EffectiveTimeFields';
+import {
+  costingImpact,
+  currentShiftStart,
+  listCostingSchedule,
+} from '@/items/api';
+import {
+  buildDatedWrite,
+  defaultEffectiveMode,
+  effectiveFromPayload,
+  impactLine,
+  needsBackdatedReason,
+  nextVersionStart,
+  type EffectiveMode,
+} from '@/items/effective';
+import { messageFrom } from '@/items/errors';
 import {
   frequencyOptions,
   kindOptions,
@@ -10,10 +33,15 @@ import {
   isCountFrequency,
   isStockKind,
   type CatalogItem,
+  type CostingImpact,
+  type CostingSchedule,
   type ItemDraft,
 } from '@/items/types';
+import { cairoDateTimeLocalToIso } from '@/purchases/time';
 import {
+  decimalsEqual,
   emptyItemForm,
+  parseUnitCost,
   validateItemForm,
   type ItemFormErrors,
   type ItemFormValues,
@@ -50,14 +78,110 @@ export function ItemForm({
   const titleId = useId();
   const [values, setValues] = useState(initial ?? emptyItemForm);
   const [errors, setErrors] = useState<ItemFormErrors>({});
+  const [extraError, setExtraError] = useState<string | null>(null);
+  const [shiftStart, setShiftStart] = useState<string | null>(null);
+  const [schedule, setSchedule] = useState<CostingSchedule | null>(null);
+  const [mode, setMode] = useState<EffectiveMode>('now');
+  const [customLocal, setCustomLocal] = useState('');
+  const [lossReason, setLossReason] = useState('');
+  const [impact, setImpact] = useState<{
+    key: string;
+    value: CostingImpact;
+  } | null>(null);
+  const [priceText, setPriceText] = useState(
+    () => items.find((item) => item.id === editingId)?.openingPriceText ?? '',
+  );
+  const [priceReason, setPriceReason] = useState('');
+  const [priceError, setPriceError] = useState<string | null>(null);
+  const requestIds = useRef(new Map<string, string>());
+  const timingTouched = useRef(false);
+  const [nowMs] = useState(() => Date.now());
   const title = editingId ? 'تعديل الصنف' : 'صنف جديد';
+  const editing = items.find((item) => item.id === editingId);
+  const identityLocked = editing?.identityLocked === true;
+  const initialLoss = initial?.lossPercent ?? '';
+  const lossDirty =
+    editingId !== undefined && values.lossPercent.trim() !== initialLoss.trim();
+  const parsedPrice = parseUnitCost(priceText);
+  const zeroPrice =
+    parsedPrice.ok && !('empty' in parsedPrice) && parsedPrice.text === '0';
   const parents = items
     .filter((item) => item.kind === 'fish_mixed')
     .slice()
     .sort((a, b) => a.name.localeCompare(b.name, 'ar'));
 
+  function requestId(key: string): string {
+    const existing = requestIds.current.get(key);
+    if (existing) return existing;
+    const next = crypto.randomUUID();
+    requestIds.current.set(key, next);
+    return next;
+  }
+
+  useEffect(() => {
+    if (!editingId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [shift, nextSchedule] = await Promise.all([
+          currentShiftStart(),
+          listCostingSchedule(editingId),
+        ]);
+        if (cancelled) return;
+        setShiftStart(shift);
+        setSchedule(nextSchedule);
+        if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
+      } catch (error) {
+        if (!cancelled) setExtraError(messageFrom(error));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [editingId]);
+
+  const lossCustomIso =
+    mode === 'custom' ? cairoDateTimeLocalToIso(customLocal) : null;
+  const lossBackdated =
+    editingId !== undefined &&
+    lossDirty &&
+    needsBackdatedReason(mode, shiftStart, lossCustomIso, nowMs);
+  const lossFrom = lossBackdated
+    ? effectiveFromPayload(mode, shiftStart, lossCustomIso)
+    : null;
+  const lossTo = lossFrom
+    ? nextVersionStart(
+        schedule?.lossVersions ?? [],
+        lossFrom,
+        new Date(nowMs).toISOString(),
+      )
+    : null;
+  const impactKey = lossFrom ? `${lossFrom}|${lossTo ?? ''}` : '';
+  const shownImpact = impact?.key === impactKey ? impact.value : null;
+
+  useEffect(() => {
+    if (!editingId || !lossFrom || impactKey.length === 0) return;
+    let cancelled = false;
+    void costingImpact(lossFrom, lossTo, editingId)
+      .then((next) => {
+        if (!cancelled) setImpact({ key: impactKey, value: next });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setImpact({
+            key: impactKey,
+            value: { orders: 0, shifts: 0, movements: null },
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editingId, impactKey, lossFrom, lossTo]);
+
   function change(patch: Partial<ItemFormValues>) {
     onClearServerError();
+    setExtraError(null);
     setValues((current) => ({ ...current, ...patch }));
     setErrors({});
   }
@@ -81,7 +205,67 @@ export function ItemForm({
       setErrors(result.errors);
       return;
     }
-    onSubmit(result.draft);
+    let draft: ItemDraft = result.draft;
+    setPriceError(null);
+    if (editingId) {
+      if (initialLoss.trim() !== '' && values.lossPercent.trim() === '') {
+        setErrors({
+          lossPercent: 'اكتب نسبة الفاقد. صفر فاقد معتمد يتكتب 0.',
+        });
+        return;
+      }
+      if (lossDirty && draft.lossPct !== null) {
+        if (!schedule) {
+          setExtraError('لسه بنحمّل بيانات الفاقد');
+          return;
+        }
+        const built = buildDatedWrite({
+          mode,
+          shiftStart,
+          customIso: lossCustomIso,
+          versions: schedule.lossVersions,
+          nowIso: new Date(nowMs).toISOString(),
+          token: schedule.lossToken,
+          reason: lossReason,
+          requestId: requestId(
+            `loss:${draft.lossPct}:${mode}:${lossCustomIso ?? ''}:${lossReason.trim()}`,
+          ),
+        });
+        if (!built.ok) {
+          setExtraError(built.error);
+          return;
+        }
+        draft = { ...draft, lossWrite: built.write };
+      }
+      const parsedPrice = parseUnitCost(priceText);
+      if (!parsedPrice.ok) {
+        setPriceError(parsedPrice.error);
+        return;
+      }
+      const hadPrice = Boolean(editing?.openingPriceText);
+      if ('empty' in parsedPrice) {
+        if (hadPrice) {
+          setPriceError('اكتب السعر الافتتاحي المعتمد للوحدة');
+          return;
+        }
+      } else if (!decimalsEqual(priceText, editing?.openingPriceText ?? '')) {
+        const price = parsedPrice.text;
+        if (price === '0' && priceReason.trim() === '') {
+          setPriceError('اكتب سبب إن السعر صفر');
+          return;
+        }
+        draft = {
+          ...draft,
+          openingWrite: {
+            price,
+            reason: price === '0' ? priceReason.trim() : null,
+            expectedId: editing?.openingPriceId ?? null,
+            requestId: requestId(`price:${price}:${priceReason.trim()}`),
+          },
+        };
+      }
+    }
+    onSubmit(draft);
   }
 
   return (
@@ -95,6 +279,7 @@ export function ItemForm({
         {title}
       </h2>
       {serverError ? <p role="alert">{serverError}</p> : null}
+      {extraError ? <p role="alert">{extraError}</p> : null}
       <div className="flex flex-col gap-1">
         <label className="flex flex-col gap-1">
           الاسم
@@ -114,7 +299,7 @@ export function ItemForm({
           النوع
           <select
             className={fieldClass}
-            disabled={submitting || locked}
+            disabled={submitting || locked || identityLocked}
             value={values.kind}
             onChange={onKind}
           >
@@ -133,7 +318,7 @@ export function ItemForm({
             السمك المخلوط
             <select
               className={fieldClass}
-              disabled={submitting || locked}
+              disabled={submitting || locked || identityLocked}
               value={values.parentItemId}
               onChange={(event) => change({ parentItemId: event.target.value })}
             >
@@ -156,7 +341,7 @@ export function ItemForm({
           الوحدة الأساسية
           <select
             className={fieldClass}
-            disabled={submitting || locked}
+            disabled={submitting || locked || identityLocked}
             value={values.baseUnit}
             onChange={(event) => {
               const baseUnit = event.target.value;
@@ -172,6 +357,11 @@ export function ItemForm({
           </select>
         </label>
         {errors.baseUnit ? <p role="alert">{errors.baseUnit}</p> : null}
+        {identityLocked ? (
+          <p className="text-sm text-neutral-600">
+            الصنف ده اتحدد أو عليه حركات، فالنوع والوحدة الأساسية والأب متقفلين
+          </p>
+        ) : null}
       </div>
       <div className="flex flex-col gap-1">
         <label className="flex flex-col gap-1">
@@ -210,10 +400,77 @@ export function ItemForm({
           />
         </label>
         <p className="text-sm text-neutral-600">
-          اكتبها نسبة مئوية من 0 لحد 99.999
+          {editing && values.lossPercent.trim() === ''
+            ? 'مش متحدد. اكتب 0 لو الفاقد المعتمد صفر.'
+            : 'اكتبها نسبة مئوية من 0 لحد 99.999. سيبها فاضية لو لسه مش متحدد.'}
         </p>
         {errors.lossPercent ? <p role="alert">{errors.lossPercent}</p> : null}
+        {editingId && lossDirty ? (
+          <EffectiveTimeFields
+            mode={mode}
+            shiftStart={shiftStart}
+            customLocal={customLocal}
+            reason={lossReason}
+            backdated={lossBackdated}
+            impact={
+              shownImpact
+                ? impactLine(shownImpact.orders, shownImpact.shifts)
+                : null
+            }
+            disabled={submitting || locked}
+            onMode={(next) => {
+              timingTouched.current = true;
+              setExtraError(null);
+              setMode(next);
+            }}
+            onCustomLocal={(value) => {
+              timingTouched.current = true;
+              setExtraError(null);
+              setCustomLocal(value);
+            }}
+            onReason={(value) => {
+              timingTouched.current = true;
+              setExtraError(null);
+              setLossReason(value);
+            }}
+          />
+        ) : null}
       </div>
+      {editingId ? (
+        <div className="flex flex-col gap-2">
+          <label className="flex flex-col gap-1">
+            السعر الافتتاحي المعتمد للوحدة
+            <input
+              className={fieldClass}
+              dir="ltr"
+              inputMode="decimal"
+              disabled={submitting || locked}
+              value={priceText}
+              onChange={(event) => {
+                onClearServerError();
+                setPriceError(null);
+                setPriceText(event.target.value);
+              }}
+            />
+          </label>
+          {zeroPrice ? (
+            <label className="flex flex-col gap-1">
+              سبب إن السعر صفر
+              <input
+                className={fieldClass}
+                autoComplete="off"
+                disabled={submitting || locked}
+                value={priceReason}
+                onChange={(event) => {
+                  setPriceError(null);
+                  setPriceReason(event.target.value);
+                }}
+              />
+            </label>
+          ) : null}
+          {priceError ? <p role="alert">{priceError}</p> : null}
+        </div>
+      ) : null}
       <label className="flex items-center gap-2">
         <input
           type="checkbox"

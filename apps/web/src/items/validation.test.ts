@@ -93,6 +93,13 @@ describe('validateConversion', () => {
 });
 
 describe('validateItemForm', () => {
+  it('sends an approved zero and leaves a blank loss unset', () => {
+    const zero = validateItemForm(values({ lossPercent: '0' }), { items: [] });
+    const blank = validateItemForm(values({ lossPercent: '' }), { items: [] });
+    expect(zero.ok && zero.draft.lossPct).toBe('0');
+    expect(blank.ok && blank.draft.lossPct).toBeNull();
+  });
+
   it('requires a fish_mixed parent for a fish size', () => {
     const missing = validateItemForm(
       values({ kind: 'fish_size', countFrequency: 'daily', name: 'كبير' }),

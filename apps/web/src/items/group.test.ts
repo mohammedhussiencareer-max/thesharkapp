@@ -9,7 +9,6 @@ function item(
     baseUnit: 'kg',
     countFrequency: 'daily',
     lossPct: 0,
-    storedLossPct: 0,
     parentItemId: null,
     active: true,
     onHandQty: 0,
@@ -17,7 +16,6 @@ function item(
     onHandValue: 0,
     ...overrides,
   };
-  if (overrides.storedLossPct === undefined) row.storedLossPct = row.lossPct;
   return row;
 }
 

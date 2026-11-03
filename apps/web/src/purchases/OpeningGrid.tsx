@@ -3,9 +3,11 @@ import { formatStoredFactor } from '@/items/format';
 import { groupCatalog } from '@/items/group';
 import { kindLabels, unitLabels } from '@/items/labels';
 import type { CatalogItem } from '@/items/types';
-import type { OpeningDraft, StockChoice } from '@/purchases/types';
+import type { OpeningDraft, StockChoice, UnitOption } from '@/purchases/types';
 import { nowCairoDateTimeLocal } from '@/purchases/time';
+import { useResolvedUnits } from '@/purchases/units-at';
 import {
+  choiceLabel,
   unitChoices,
   validateOpening,
   type OpeningFieldErrors,
@@ -24,7 +26,6 @@ function asCatalog(item: StockChoice): CatalogItem {
     baseUnit: item.baseUnit,
     countFrequency: 'daily',
     lossPct: 0,
-    storedLossPct: '0',
     parentItemId: item.parentItemId,
     active: true,
     onHandQty: 0,
@@ -85,9 +86,7 @@ function OpeningRow({
           >
             {choices.map((choice) => (
               <option key={choice.unit} value={choice.unit}>
-                {choice.unit === item.baseUnit
-                  ? unitLabels[item.baseUnit]
-                  : choice.unit}
+                {choiceLabel(choice, item.baseUnit)}
               </option>
             ))}
           </select>
@@ -107,7 +106,7 @@ function OpeningRow({
       </div>
       {selected && selected.unit !== item.baseUnit ? (
         <p>
-          {`1 ${selected.unit} = ${formatStoredFactor(selected.factorToBase)} ${unitLabels[item.baseUnit]}`}
+          {`1 ${choiceLabel(selected, item.baseUnit)} = ${formatStoredFactor(selected.factorToBase)} ${unitLabels[item.baseUnit]}`}
         </p>
       ) : null}
       {errors?.quantity ? <p role="alert">{errors.quantity}</p> : null}
@@ -123,6 +122,7 @@ export function OpeningGrid({
   serverError,
   onClearServerError,
   onSubmit,
+  resolveUnits,
 }: {
   items: readonly StockChoice[];
   locked: boolean;
@@ -130,6 +130,10 @@ export function OpeningGrid({
   serverError: string | null;
   onClearServerError: () => void;
   onSubmit: (draft: OpeningDraft) => void;
+  resolveUnits?: (
+    itemIds: readonly string[],
+    atIso: string,
+  ) => Promise<Record<string, UnitOption[]>>;
 }) {
   // One id for this draft. A failed save retries it; a new form gets a new one.
   const [requestId] = useState(() => crypto.randomUUID());
@@ -137,14 +141,39 @@ export function OpeningGrid({
   const [values, setValues] = useState<OpeningValues>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [fields, setFields] = useState<OpeningFieldErrors>({});
+  const { items: resolvedItems, loading: unitsLoading } = useResolvedUnits(
+    items,
+    occurredAt,
+    resolveUnits,
+  );
   const disabled = locked || submitting;
-  const byId = new Map(items.map((item) => [item.id, item]));
+  const blocked = disabled || unitsLoading;
+  const byId = new Map(resolvedItems.map((item) => [item.id, item]));
   const groups = groupCatalog(items.map(asCatalog), false);
 
+  function chosenUnit(unit: string, item: StockChoice): string {
+    const choices = unitChoices(item);
+    if (choices.some((choice) => choice.unit === unit)) return unit;
+    return item.baseUnit;
+  }
+
   function rowValue(item: StockChoice) {
-    return (
-      values[item.id] ?? { quantity: '', unit: item.baseUnit, unitCost: '' }
-    );
+    const stored = values[item.id] ?? {
+      quantity: '',
+      unit: item.baseUnit,
+      unitCost: '',
+    };
+    return { ...stored, unit: chosenUnit(stored.unit, item) };
+  }
+
+  function settledValues(): OpeningValues {
+    const next: OpeningValues = {};
+    for (const item of resolvedItems) {
+      const stored = values[item.id];
+      if (!stored) continue;
+      next[item.id] = { ...stored, unit: chosenUnit(stored.unit, item) };
+    }
+    return next;
   }
 
   function change(
@@ -162,8 +191,8 @@ export function OpeningGrid({
 
   function onSubmitForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (disabled) return;
-    const result = validateOpening(values, items, occurredAt);
+    if (blocked) return;
+    const result = validateOpening(settledValues(), resolvedItems, occurredAt);
     if (!result.ok) {
       setFormError(result.formError);
       setFields(result.fields);
@@ -250,7 +279,7 @@ export function OpeningGrid({
           {groups.packaging.map(renderItem)}
         </section>
       ) : null}
-      <button className={primaryButton} type="submit" disabled={disabled}>
+      <button className={primaryButton} type="submit" disabled={blocked}>
         حفظ
       </button>
     </form>

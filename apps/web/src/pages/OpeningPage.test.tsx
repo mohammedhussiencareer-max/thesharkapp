@@ -12,6 +12,7 @@ import type { StockChoice } from '@/purchases/types';
 vi.mock('@/purchases/api', () => ({
   listStockChoices: vi.fn(),
   recordOpeningStock: vi.fn(),
+  listUnitsAt: vi.fn(() => Promise.resolve({})),
 }));
 
 function choice(

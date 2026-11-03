@@ -4,6 +4,7 @@ import { messageFrom } from '@/items/errors';
 import {
   listPurchases,
   listStockChoices,
+  listUnitsAt,
   recordPurchase,
 } from '@/purchases/api';
 import {
@@ -263,6 +264,7 @@ export function PurchasesPage() {
               serverError={serverError}
               onClearServerError={() => setServerError(null)}
               onSubmit={(next) => void handleSubmit(next)}
+              resolveUnits={listUnitsAt}
             />
           )}
           <PurchaseList purchases={snapshot.purchases} />
