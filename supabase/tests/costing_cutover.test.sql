@@ -1380,6 +1380,129 @@ select
   );
 
 select
+  is (
+    (
+      select
+        v.effective_from
+      from
+        app.item_loss_versions v
+        join app.stock_items si on si.id = v.item_id
+      where
+        si.name = 'صنف بلا فاقد'
+        and v.superseded_change_id is null
+    ),
+    pg_catalog.date_trunc ('minute', pg_catalog.now ()),
+    'a null effective_from is the current minute and needs no reason'
+  );
+
+select
+  is (
+    (
+      select
+        v.effective_from
+      from
+        app.item_loss_versions v
+        join app.stock_items si on si.id = v.item_id
+      where
+        si.name = 'صنف شراء'
+        and v.superseded_change_id is null
+    ),
+    pg_catalog.date_trunc ('minute', pg_catalog.now ()),
+    'create_stock_item starts the first loss at the current minute'
+  );
+
+-- The purchase form submits the start of the current minute. A conversion
+-- saved as "now" must already be in force at that instant, which is before
+-- the call whenever the clock is not exactly on the minute.
+select
+  app.set_item_conversion (
+    'd4000000-0000-4000-8000-000000000123',
+    (
+      select
+        id
+      from
+        app.stock_items
+      where
+        name = 'صنف بلا فاقد'
+    ),
+    'liter',
+    0.92,
+    null,
+    null,
+    md5(''),
+    null
+  );
+
+select
+  is (
+    (
+      select
+        payload ->> 'effective_from'
+      from
+        app.costing_changes
+      where
+        request_id = 'd4000000-0000-4000-8000-000000000123'
+    ),
+    'now',
+    'a null conversion effective_from stays the replay marker now'
+  );
+
+select
+  is (
+    (
+      select
+        v.effective_from
+      from
+        app.item_conversion_versions v
+        join app.stock_items si on si.id = v.item_id
+      where
+        si.name = 'صنف بلا فاقد'
+        and v.unit_code = 'liter'
+        and v.superseded_change_id is null
+    ),
+    pg_catalog.date_trunc ('minute', pg_catalog.now ()),
+    'a null conversion effective_from is the current minute'
+  );
+
+select
+  ok (
+    (
+      select
+        factor_to_base = 0.92
+      from
+        app.item_units_at (
+          array[
+            (
+              select
+                id
+              from
+                app.stock_items
+              where
+                name = 'صنف بلا فاقد'
+            )
+          ],
+          pg_catalog.date_trunc ('minute', pg_catalog.now ())
+        )
+      where
+        unit_code = 'liter'
+        and source = 'explicit'
+    ),
+    'a conversion from now is in force at the start of the same minute'
+  );
+
+select
+  throws_ok (
+    $$select app.item_factor_at(
+      (select id from app.stock_items where name = 'صنف بلا فاقد'),
+      'liter',
+      pg_catalog.date_trunc('minute', pg_catalog.now()) - interval '1 second'
+    )$$,
+    '22023'::char(5),
+    'unknown unit "liter" for item صنف بلا فاقد',
+    'a conversion from now is not in force in the previous minute'
+  );
+
+select
   app.create_stock_item (
     'd4000000-0000-4000-8000-000000000160',
     'صنف موقوف',

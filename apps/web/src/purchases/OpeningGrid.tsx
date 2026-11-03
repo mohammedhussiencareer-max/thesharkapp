@@ -137,6 +137,8 @@ export function OpeningGrid({
 }) {
   // One id for this draft. A failed save retries it; a new form gets a new one.
   const [requestId] = useState(() => crypto.randomUUID());
+  // The current Cairo minute, captured when this form mounts, including after
+  // navigation. The unit lookup and the save both parse this same value.
   const [occurredAt, setOccurredAt] = useState(() => nowCairoDateTimeLocal());
   const [values, setValues] = useState<OpeningValues>({});
   const [formError, setFormError] = useState<string | null>(null);

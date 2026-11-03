@@ -235,7 +235,10 @@ $$;
 comment on function app.resolve_unit_code (text) is 'Maps posted unit text to a unit code. An exact code wins. Otherwise one alias. A label that is not an alias does not match.';
 
 -- ============================================================================
--- C. Null effective_from means the server now() and is stored as the text now.
+-- C. Null effective_from means the current minute, date_trunc('minute', now()),
+-- and is stored in the replay payload as the text now. The current minute
+-- matches the minute-precision purchase and opening forms, and it is not
+-- backdating, so it needs no reason.
 -- ============================================================================
 create or replace function app.set_item_loss (
   p_request_id uuid,
@@ -354,10 +357,10 @@ begin
     return v_replay;
   end if;
 
-  -- Null means this transaction's now(), and only after replay so a retry
+  -- Null means the current minute, and only after replay so a retry
   -- still matches the stored payload text "now".
   if v_from_is_now then
-    v_effective_from := pg_catalog.now();
+    v_effective_from := pg_catalog.date_trunc('minute', pg_catalog.now());
   else
     v_effective_from := p_effective_from;
   end if;
@@ -387,7 +390,9 @@ begin
       using errcode = '40001';
   end if;
 
-  if v_effective_from < pg_catalog.now()
+  -- The current minute is not backdating.
+  if not v_from_is_now
+  and v_effective_from < pg_catalog.now()
   and v_reason is null then
     raise exception 'reason is required for a backdated change'
       using errcode = '22023';
@@ -529,7 +534,7 @@ comment on function app.set_item_loss (
   timestamptz,
   text,
   text
-) is 'Replaces the loss schedule on [effective_from, effective_to). Null effective_from means the server now() and is stored as the text now. A past instant requires a reason. Owner only.';
+) is 'Replaces the loss schedule on [effective_from, effective_to). Null effective_from means the current minute, date_trunc(''minute'', now()), and is stored as the text now. The current minute needs no reason. An earlier instant requires a reason. Owner only.';
 
 create or replace function app.set_item_conversion (
   p_request_id uuid,
@@ -663,10 +668,10 @@ begin
     return v_replay;
   end if;
 
-  -- Null means this transaction's now(), and only after replay so a retry
+  -- Null means the current minute, and only after replay so a retry
   -- still matches the stored payload text "now".
   if v_from_is_now then
-    v_effective_from := pg_catalog.now();
+    v_effective_from := pg_catalog.date_trunc('minute', pg_catalog.now());
   else
     v_effective_from := p_effective_from;
   end if;
@@ -723,7 +728,9 @@ begin
       using errcode = '40001';
   end if;
 
-  if v_effective_from < pg_catalog.now()
+  -- The current minute is not backdating.
+  if not v_from_is_now
+  and v_effective_from < pg_catalog.now()
   and v_reason is null then
     raise exception 'reason is required for a backdated change'
       using errcode = '22023';
@@ -880,7 +887,7 @@ comment on function app.set_item_conversion (
   timestamptz,
   text,
   text
-) is 'Replaces one unit conversion on [effective_from, effective_to). Null effective_from means the server now() and is stored as the text now. A null factor leaves a gap. A past instant requires a reason. Owner only.';
+) is 'Replaces one unit conversion on [effective_from, effective_to). Null effective_from means the current minute, date_trunc(''minute'', now()), and is stored as the text now. The current minute needs no reason. A null factor leaves a gap. An earlier instant requires a reason. Owner only.';
 
 -- ============================================================================
 -- D. Custom units and atomic item creation.
@@ -1128,7 +1135,13 @@ begin
     insert into
       app.item_loss_versions (effective_from, effective_to, created_change_id, item_id, loss_pct)
     values
-      (pg_catalog.now(), null, v_change_id, v_item_id, v_loss);
+      (
+        pg_catalog.date_trunc('minute', pg_catalog.now()),
+        null,
+        v_change_id,
+        v_item_id,
+        v_loss
+      );
   end if;
 
   return v_item_id;
@@ -1144,7 +1157,7 @@ comment on function app.create_stock_item (
   uuid,
   numeric,
   boolean
-) is 'Creates one stock item, active or not, and, when loss_pct is not null, its first loss version from now() in the same transaction. A null loss leaves the item unconfigured. Owner only. The same request_id returns the stored item id.';
+) is 'Creates one stock item, active or not, and, when loss_pct is not null, its first loss version from the current minute, date_trunc(''minute'', now()), in the same transaction. A null loss leaves the item unconfigured. Owner only. The same request_id returns the stored item id.';
 
 -- ============================================================================
 -- E. Legacy conversion writers cannot carry a schedule token. They refuse.

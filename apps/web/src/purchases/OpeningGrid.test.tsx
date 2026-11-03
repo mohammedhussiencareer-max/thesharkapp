@@ -168,6 +168,81 @@ describe('OpeningGrid', () => {
     });
   });
 
+  it('looks up units at the current minute the opening will submit', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-15T09:00:37.000Z'));
+    try {
+      const minute = '2026-07-15T09:00:00.000Z';
+      const resolveUnits = vi.fn(() =>
+        Promise.resolve({
+          oil: [{ unit: 'liter', factorToBase: '0.92', label: 'لتر' }],
+        }),
+      );
+      const onSubmit = vi.fn<(draft: OpeningDraft) => void>();
+      const view = render(
+        <OpeningGrid
+          items={[oil]}
+          locked={false}
+          submitting={false}
+          serverError={null}
+          onClearServerError={vi.fn()}
+          onSubmit={onSubmit}
+          resolveUnits={resolveUnits}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(resolveUnits).toHaveBeenCalledWith(['oil'], minute);
+      });
+      expect(screen.getByLabelText('وقت الرصيد')).toHaveValue(
+        '2026-07-15T12:00',
+      );
+      expect(resolveUnits).not.toHaveBeenCalledWith(
+        ['oil'],
+        '2026-07-15T09:00:37.000Z',
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole('option', { name: 'لتر' })).toHaveValue(
+          'liter',
+        );
+      });
+      fireEvent.change(screen.getByLabelText('وحدة زيت'), {
+        target: { value: 'liter' },
+      });
+      fireEvent.change(screen.getByLabelText('كمية زيت'), {
+        target: { value: '2' },
+      });
+      fireEvent.change(screen.getByLabelText('تكلفة زيت'), {
+        target: { value: '50' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      expect(onSubmit.mock.calls[0]?.[0].occurredAt).toBe(minute);
+
+      view.unmount();
+      vi.setSystemTime(new Date('2026-07-15T09:01:10.000Z'));
+      render(
+        <OpeningGrid
+          items={[oil]}
+          locked={false}
+          submitting={false}
+          serverError={null}
+          onClearServerError={vi.fn()}
+          onSubmit={vi.fn()}
+          resolveUnits={resolveUnits}
+        />,
+      );
+      await waitFor(() => {
+        expect(resolveUnits).toHaveBeenCalledWith(
+          ['oil'],
+          '2026-07-15T09:01:00.000Z',
+        );
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('shows a field error and stays locked while the page is busy', () => {
     const onSubmit = vi.fn();
     const { rerender } = render(

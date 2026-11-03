@@ -172,4 +172,83 @@ describe('PurchaseForm', () => {
     expect(screen.getByText('1 لتر = 0.5 كيلو')).toBeInTheDocument();
     expect(screen.getByLabelText('الوحدة')).toHaveValue('liter');
   });
+
+  it('looks up units at the current minute the purchase will submit', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-15T09:00:37.000Z'));
+    try {
+      const minute = '2026-07-15T09:00:00.000Z';
+      const resolveUnits = vi.fn(() =>
+        Promise.resolve({
+          oil: [{ unit: 'liter', factorToBase: '0.92', label: 'لتر' }],
+        }),
+      );
+      const onSubmit = vi.fn<(draft: PurchaseDraft) => void>();
+      const view = render(
+        <PurchaseForm
+          items={[oil]}
+          locked={false}
+          submitting={false}
+          serverError={null}
+          onClearServerError={vi.fn()}
+          onSubmit={onSubmit}
+          resolveUnits={resolveUnits}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(resolveUnits).toHaveBeenCalledWith(['oil'], minute);
+      });
+      expect(screen.getByLabelText('وقت الشراء')).toHaveValue(
+        '2026-07-15T12:00',
+      );
+      expect(resolveUnits).not.toHaveBeenCalledWith(
+        ['oil'],
+        '2026-07-15T09:00:37.000Z',
+      );
+
+      fireEvent.change(screen.getByLabelText('الصنف'), {
+        target: { value: 'oil' },
+      });
+      fireEvent.change(screen.getByLabelText('الكمية'), {
+        target: { value: '2' },
+      });
+      await waitFor(() => {
+        expect(screen.getByRole('option', { name: 'لتر' })).toHaveValue(
+          'liter',
+        );
+      });
+      fireEvent.change(screen.getByLabelText('الوحدة'), {
+        target: { value: 'liter' },
+      });
+      fireEvent.change(screen.getByLabelText('المبلغ'), {
+        target: { value: '50' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'مراجعة' }));
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      expect(onSubmit.mock.calls[0]?.[0].purchasedAt).toBe(minute);
+
+      view.unmount();
+      vi.setSystemTime(new Date('2026-07-15T09:01:10.000Z'));
+      render(
+        <PurchaseForm
+          items={[oil]}
+          locked={false}
+          submitting={false}
+          serverError={null}
+          onClearServerError={vi.fn()}
+          onSubmit={vi.fn()}
+          resolveUnits={resolveUnits}
+        />,
+      );
+      await waitFor(() => {
+        expect(resolveUnits).toHaveBeenCalledWith(
+          ['oil'],
+          '2026-07-15T09:01:00.000Z',
+        );
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

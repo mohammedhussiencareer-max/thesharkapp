@@ -19,6 +19,9 @@ export function useResolvedUnits(
   ) => Promise<UnitLookup>,
 ): { items: readonly StockChoice[]; loading: boolean } {
   const ids = items.map((item) => item.id).join('\n');
+  // The same Cairo parse the purchase and opening writers use, so the lookup
+  // sees the units that will be in force for the submitted instant. A new
+  // mount (navigation) fetches again.
   const at = cairoDateTimeLocalToIso(atLocal);
   const key = `${ids}\n${at ?? ''}`;
   const [result, setResult] = useState<UnitLookupResult | null>(null);

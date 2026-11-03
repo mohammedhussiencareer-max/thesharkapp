@@ -68,6 +68,8 @@ export function PurchaseForm({
   const keyRef = useRef(1);
   // One id for this draft. A failed save retries it; a new form gets a new one.
   const [requestId] = useState(() => crypto.randomUUID());
+  // The current Cairo minute, captured when this form mounts, including after
+  // navigation. The unit lookup and the save both parse this same value.
   const [values, setValues] = useState<PurchaseValues>(() => ({
     purchasedAt: nowCairoDateTimeLocal(),
     supplier: '',

@@ -12,13 +12,14 @@ export type SchedulePoint = {
 
 /**
  * Default the owner sees: the open shift's start when one exists, otherwise now.
- * "now" is sent as null so the server stamps the transaction time.
+ * "now" is sent as null. The server stamps the current minute and keeps the
+ * replay marker "now". The current minute is not backdating.
  */
 export function defaultEffectiveMode(shiftStart: string | null): EffectiveMode {
   return shiftStart ? 'shift' : 'now';
 }
 
-/** Null means the server's now(). Any other choice is an absolute timestamp. */
+/** Null means the server's current minute. Any other choice is an absolute timestamp. */
 export function effectiveFromPayload(
   mode: EffectiveMode,
   shiftStart: string | null,
