@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   addConversion,
@@ -598,7 +604,11 @@ describe('ConversionsPanel', () => {
       await screen.findByRole('option', { name: 'دلو كبير' }),
     ).toBeInTheDocument();
     expect(addCustomUnit).toHaveBeenCalledTimes(1);
-    expect(addCustomUnit).toHaveBeenCalledWith('دلو', 'دلو كبير');
+    expect(addCustomUnit).toHaveBeenCalledWith(
+      'دلو',
+      'دلو كبير',
+      expect.any(String),
+    );
     expect(vi.mocked(addConversion).mock.calls[0]?.[1]).toBe('دلو-1');
 
     vi.mocked(addConversion).mockResolvedValueOnce(undefined);
@@ -999,5 +1009,114 @@ describe('ConversionsPanel', () => {
     expect(
       vi.mocked(updateConversion).mock.calls.map((call) => call[2]),
     ).toEqual(['4', '4', '5', '4']);
+  });
+
+  it('replays a deletion from the add form instead of sending the factor delete', async () => {
+    vi.mocked(listConversions).mockResolvedValue(
+      snapshot([
+        { itemId: 'oil', unit: 'كيس', factorToBase: 2, storedFactor: '2' },
+      ]),
+    );
+    vi.mocked(deleteConversion).mockRejectedValueOnce(
+      new Error('تعذر الاتصال'),
+    );
+    render(<ConversionsPanel item={item} />);
+    expect(await screen.findByText('1 كيس = 2 كيلو')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'احذف التحويل' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(screen.getByLabelText('معامل كيس')).toBeDisabled();
+    expect(deleteConversion).toHaveBeenCalledTimes(1);
+    const heldId = (
+      vi.mocked(deleteConversion).mock.calls[0]?.[4] as { requestId: string }
+    ).requestId;
+
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '99' },
+    });
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كيس' },
+    });
+    const addForm = screen.getByRole('form', { name: 'إضافة تحويل' });
+    expect(within(addForm).getByLabelText('المعامل')).toBeDisabled();
+    expect(within(addForm).getByLabelText('المعامل')).toHaveValue('99');
+    expect(
+      screen.getAllByRole('button', { name: 'إعادة المحاولة' }),
+    ).toHaveLength(2);
+
+    vi.mocked(deleteConversion).mockResolvedValueOnce(undefined);
+    fireEvent.click(
+      within(addForm).getByRole('button', { name: 'إعادة المحاولة' }),
+    );
+    await waitFor(() => {
+      expect(deleteConversion).toHaveBeenCalledTimes(2);
+    });
+    expect(addConversion).not.toHaveBeenCalled();
+    expect(updateConversion).not.toHaveBeenCalled();
+    expect(vi.mocked(deleteConversion).mock.calls[1]).toEqual([
+      'oil',
+      'كيس',
+      '2',
+      'kg',
+      expect.objectContaining({
+        requestId: heldId,
+        effectiveFrom: null,
+        reason: null,
+      }),
+    ]);
+  });
+
+  it('replays the original custom unit after the panel is closed and opened', async () => {
+    vi.mocked(listConversions).mockResolvedValue(snapshot([]));
+    vi.mocked(addCustomUnit).mockRejectedValueOnce(new Error('تعذر الاتصال'));
+    const view = render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByRole('option', { name: 'كيس' }),
+    ).toBeInTheDocument();
+
+    addFreshUnit();
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(addCustomUnit).toHaveBeenCalledTimes(1);
+    expect(addConversion).not.toHaveBeenCalled();
+    const creationId = vi.mocked(addCustomUnit).mock.calls[0]?.[2];
+    expect(addCustomUnit).toHaveBeenCalledWith('دلو', 'دلو كبير', creationId);
+    view.unmount();
+
+    render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByRole('option', { name: 'كيس' }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: '__new__' },
+    });
+    expect(screen.queryByText(unknownSaveMessage)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('اسم الوحدة')).toBeEnabled();
+    fireEvent.change(screen.getByLabelText('كود الوحدة'), {
+      target: { value: 'دلو' },
+    });
+    expect(screen.getByLabelText('اسم الوحدة')).toBeDisabled();
+    expect(screen.getByLabelText('اسم الوحدة')).toHaveValue('');
+    expect(screen.getByText(unknownSaveMessage)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => {
+      expect(addCustomUnit).toHaveBeenCalledTimes(2);
+    });
+    expect(addCustomUnit).toHaveBeenNthCalledWith(
+      2,
+      'دلو',
+      'دلو كبير',
+      creationId,
+    );
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(1);
+    });
+    expect(addConversion).toHaveBeenCalledWith(
+      'oil',
+      'دلو',
+      '3',
+      'kg',
+      expect.objectContaining({ effectiveFrom: null, reason: null }),
+    );
   });
 });

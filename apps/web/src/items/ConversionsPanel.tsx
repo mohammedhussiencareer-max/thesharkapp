@@ -30,11 +30,7 @@ import {
   nextVersionStart,
   type EffectiveMode,
 } from '@/items/effective';
-import {
-  isConfirmedConfigurationChange,
-  messageFrom,
-  StaleWriteError,
-} from '@/items/errors';
+import { messageFrom, StaleWriteError } from '@/items/errors';
 import {
   beginAction,
   conversionSubject,
@@ -43,7 +39,6 @@ import {
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
-import { isPayloadRefusal } from '@/lib/write-outcome';
 import { formatStoredFactor } from '@/items/format';
 import { unitLabels } from '@/items/labels';
 import type {
@@ -75,7 +70,49 @@ type ImpactView =
   | { status: 'ready'; key: string; text: string }
   | { status: 'error'; key: string };
 
-type ConversionAction = { factor: string; write: DatedWrite };
+/**
+ * One outstanding conversion, stored in the module map. Replay uses this
+ * record alone: kind, arguments, request ids, and any stage already completed.
+ */
+type ConversionAction =
+  | {
+      kind: 'set_conversion';
+      itemId: string;
+      unit: string;
+      factor: string;
+      expectedFactor: string;
+      baseUnit: BaseUnit;
+      write: DatedWrite;
+      via: 'add' | 'edit';
+    }
+  | {
+      kind: 'remove_conversion';
+      itemId: string;
+      unit: string;
+      expectedFactor: string;
+      baseUnit: BaseUnit;
+      write: DatedWrite;
+    }
+  | {
+      kind: 'create_unit_then_conversion';
+      itemId: string;
+      inputCode: string;
+      label: string;
+      /** Server code once the custom unit exists. Null until that call returns. */
+      createdCode: string | null;
+      unitRequestId: string;
+      factor: string;
+      baseUnit: BaseUnit;
+      write: DatedWrite;
+    };
+
+function actionSubject(action: ConversionAction): string {
+  const unit =
+    action.kind === 'create_unit_then_conversion'
+      ? action.inputCode
+      : action.unit;
+  return conversionSubject(action.itemId, unit);
+}
 
 function useDatedTiming(
   itemId: string,
@@ -190,8 +227,7 @@ function ConversionRow({
   shiftStart,
   versions,
   token,
-  onSave,
-  onDelete,
+  onReplay,
 }: {
   conversion: UnitConversion;
   baseLabel: string;
@@ -200,8 +236,7 @@ function ConversionRow({
   shiftStart: string | null;
   versions: readonly CostingVersion[];
   token: string;
-  onSave: (factor: string, timing: DatedWrite) => Promise<boolean>;
-  onDelete: (timing: DatedWrite) => Promise<boolean>;
+  onReplay: (action: ConversionAction) => Promise<void>;
 }) {
   const subject = conversionSubject(conversion.itemId, conversion.unit);
   const [factor, setFactor] = useState(() =>
@@ -232,25 +267,14 @@ function ConversionRow({
     if (flight.current) return;
     flight.current = true;
     try {
-      const accepted =
-        action.factor === 'delete'
-          ? await onDelete(action.write)
-          : await onSave(action.factor, action.write);
-      if (
-        accepted === false &&
-        unknownAction<ConversionAction>(subject) === null
-      ) {
-        settleAction(subject);
-      }
-    } catch {
-      // The panel already settled this action and showed the error.
+      await onReplay(action);
     } finally {
       flight.current = false;
       setActionEpoch((value) => value + 1);
     }
   }
 
-  function begin(factorKey: string) {
+  function begin(create: (write: DatedWrite) => ConversionAction) {
     if (disabled || blocked || flight.current || hasAction(subject)) return;
     const built = timing.build();
     if (!built.ok) {
@@ -258,10 +282,9 @@ function ConversionRow({
       return;
     }
     setError(null);
-    const action = beginAction(subject, (requestId) => ({
-      factor: factorKey,
-      write: { ...built.write, requestId },
-    }));
+    const action = beginAction(subject, (requestId) =>
+      create({ ...built.write, requestId }),
+    );
     void finish(action);
   }
 
@@ -273,7 +296,17 @@ function ConversionRow({
       setError(parsed.error);
       return;
     }
-    begin(parsed.factor);
+    const nextFactor = parsed.factor;
+    begin((write) => ({
+      kind: 'set_conversion',
+      via: 'edit',
+      itemId: conversion.itemId,
+      unit: conversion.unit,
+      factor: nextFactor,
+      expectedFactor: storedFactorText(conversion.storedFactor),
+      baseUnit,
+      write,
+    }));
   }
 
   function retry() {
@@ -322,7 +355,16 @@ function ConversionRow({
               className={secondaryButton}
               type="button"
               disabled={sectionDisabled}
-              onClick={() => begin('delete')}
+              onClick={() =>
+                begin((write) => ({
+                  kind: 'remove_conversion',
+                  itemId: conversion.itemId,
+                  unit: conversion.unit,
+                  expectedFactor: storedFactorText(conversion.storedFactor),
+                  baseUnit,
+                  write,
+                }))
+              }
             >
               احذف التحويل
             </button>
@@ -353,6 +395,7 @@ export function ConversionsPanel({
   const onItemStaleRef = useRef(onItemStale);
   const itemBaseUnitRef = useRef(item.baseUnit);
   const addFlight = useRef(false);
+  const replayFlight = useRef(new Set<string>());
   useEffect(() => {
     onItemStaleRef.current = onItemStale;
     itemBaseUnitRef.current = item.baseUnit;
@@ -517,69 +560,96 @@ export function ConversionsPanel({
     }
   }
 
-  function settleRow(rowSubject: string, error?: unknown) {
-    if (error === undefined) {
-      settleAction(rowSubject);
-      return;
+  async function perform(action: ConversionAction): Promise<void> {
+    switch (action.kind) {
+      case 'remove_conversion':
+        await deleteConversion(
+          action.itemId,
+          action.unit,
+          action.expectedFactor,
+          action.baseUnit,
+          action.write,
+        );
+        return;
+      case 'set_conversion':
+        if (action.via === 'add') {
+          await addConversion(
+            action.itemId,
+            action.unit,
+            action.factor,
+            action.baseUnit,
+            action.write,
+          );
+          return;
+        }
+        await updateConversion(
+          action.itemId,
+          action.unit,
+          action.factor,
+          action.expectedFactor,
+          action.baseUnit,
+          action.write,
+        );
+        return;
+      case 'create_unit_then_conversion': {
+        let unitCode = action.createdCode;
+        if (unitCode === null) {
+          unitCode = await addCustomUnit(
+            action.inputCode,
+            action.label,
+            action.unitRequestId,
+          );
+          action.createdCode = unitCode;
+          setCreatedUnit({
+            code: unitCode,
+            inputCode: action.inputCode,
+            label: action.label,
+          });
+          const options = await listUnitOptions();
+          setMeta((current) =>
+            current && current.itemId === action.itemId
+              ? { ...current, unitOptions: options }
+              : current,
+          );
+        }
+        await addConversion(
+          action.itemId,
+          unitCode,
+          action.factor,
+          action.baseUnit,
+          action.write,
+        );
+        return;
+      }
+      default: {
+        const unreachable: never = action;
+        return unreachable;
+      }
     }
-    if (hasAction(rowSubject)) settleAction(rowSubject, error);
   }
 
-  async function sendHeldAdd(code: string, action: ConversionAction) {
-    if (!baseUnit || addFlight.current) return;
-    addFlight.current = true;
-    const subject = conversionSubject(item.id, code);
-    const label = customLabel.trim();
-    const freshUnit = unit === '__new__';
-    const expectedBaseUnit = baseUnit;
+  function clearSubmittedAdd(action: ConversionAction) {
+    const clears =
+      action.kind === 'create_unit_then_conversion' ||
+      (action.kind === 'set_conversion' && action.via === 'add');
+    if (!clears) return;
+    if (action.kind === 'create_unit_then_conversion') setCreatedUnit(null);
+    setUnit('');
+    setCustomCode('');
+    setCustomLabel('');
+    setFactor('');
+  }
+
+  async function replay(action: ConversionAction): Promise<void> {
+    const subject = actionSubject(action);
+    if (replayFlight.current.has(subject)) return;
+    replayFlight.current.add(subject);
     try {
       const accepted = await run(async () => {
         try {
-          let unitCode = code;
-          if (freshUnit) {
-            const remembered =
-              createdUnit &&
-              createdUnit.inputCode === code &&
-              createdUnit.label === label
-                ? createdUnit.code
-                : null;
-            if (!remembered) {
-              try {
-                unitCode = await addCustomUnit(code, label);
-              } catch (unitError) {
-                if (
-                  isPayloadRefusal(unitError) ||
-                  isConfirmedConfigurationChange(unitError) ||
-                  unitError instanceof StaleWriteError
-                ) {
-                  settleAction(subject);
-                }
-                throw unitError;
-              }
-              setCreatedUnit({ code: unitCode, inputCode: code, label });
-            } else {
-              unitCode = remembered;
-            }
-            const options = await listUnitOptions();
-            setMeta((current) =>
-              current && current.itemId === item.id
-                ? { ...current, unitOptions: options }
-                : current,
-            );
-          }
-          await addConversion(
-            item.id,
-            unitCode,
-            action.factor,
-            expectedBaseUnit,
-            action.write,
-          );
+          await perform(action);
           settleAction(subject);
-          setCreatedUnit(null);
-          setUnit('');
-          setCustomCode('');
-          setCustomLabel('');
-          setFactor('');
+          clearSubmittedAdd(action);
         } catch (error) {
           if (hasAction(subject)) settleAction(subject, error);
           throw error;
@@ -594,9 +664,17 @@ export function ConversionsPanel({
     } catch {
       // run already settled this action and showed the error.
     } finally {
-      addFlight.current = false;
+      replayFlight.current.delete(subject);
       setActionEpoch((value) => value + 1);
     }
+  }
+
+  function send(action: ConversionAction) {
+    if (addFlight.current) return;
+    addFlight.current = true;
+    void replay(action).finally(() => {
+      addFlight.current = false;
+    });
   }
 
   function onAdd(event: FormEvent<HTMLFormElement>) {
@@ -605,12 +683,13 @@ export function ConversionsPanel({
     const code = unit === '__new__' ? customCode.trim() : unit.trim();
     const subject = conversionSubject(item.id, code);
     if (hasAction(subject)) return;
-    if (unit === '__new__') {
+    const freshUnit = unit === '__new__';
+    const label = customLabel.trim();
+    if (freshUnit) {
       if (code.length < 1 || code.length > 20) {
         setActionError('كود الوحدة من حرف لحد 20');
         return;
       }
-      const label = customLabel.trim();
       if (label.length < 1 || label.length > 40) {
         setActionError('اسم الوحدة من حرف لحد 40');
         return;
@@ -626,21 +705,50 @@ export function ConversionsPanel({
       setActionError(built.error);
       return;
     }
-    const action = beginAction(subject, (requestId) => ({
-      factor: parsed.factor,
-      write: { ...built.write, requestId },
-    }));
-    void sendHeldAdd(code, action);
+    const snapshotBaseUnit = baseUnit;
+    const action = beginAction(subject, (requestId) => {
+      const write = { ...built.write, requestId };
+      if (freshUnit) {
+        const createdCode =
+          createdUnit &&
+          createdUnit.inputCode === code &&
+          createdUnit.label === label
+            ? createdUnit.code
+            : null;
+        return {
+          kind: 'create_unit_then_conversion' as const,
+          itemId: item.id,
+          inputCode: code,
+          label,
+          createdCode,
+          unitRequestId: crypto.randomUUID(),
+          factor: parsed.factor,
+          baseUnit: snapshotBaseUnit,
+          write,
+        };
+      }
+      return {
+        kind: 'set_conversion' as const,
+        via: 'add' as const,
+        itemId: item.id,
+        unit: code,
+        factor: parsed.factor,
+        expectedFactor: parsed.factor,
+        baseUnit: snapshotBaseUnit,
+        write,
+      };
+    });
+    send(action);
   }
 
   function retryAdd() {
-    if (!baseUnit || busy || locked || addFlight.current) return;
+    if (busy || locked || addFlight.current) return;
     const code = unit === '__new__' ? customCode.trim() : unit.trim();
     const action = unknownAction<ConversionAction>(
       conversionSubject(item.id, code),
     );
     if (!action) return;
-    void sendHeldAdd(code, action);
+    send(action);
   }
 
   if ((rows === null || baseUnit === null) && loadError) {
@@ -693,43 +801,7 @@ export function ConversionsPanel({
             shiftStart={shiftStart}
             versions={entry?.versions ?? noVersions}
             token={entry?.token ?? emptyScheduleToken}
-            onSave={(nextFactor, timing) => {
-              const rowSubject = conversionSubject(item.id, conversion.unit);
-              return run(async () => {
-                try {
-                  await updateConversion(
-                    item.id,
-                    conversion.unit,
-                    nextFactor,
-                    storedFactorText(conversion.storedFactor),
-                    baseUnit,
-                    timing,
-                  );
-                  settleRow(rowSubject);
-                } catch (error) {
-                  settleRow(rowSubject, error);
-                  throw error;
-                }
-              });
-            }}
-            onDelete={(timing) => {
-              const rowSubject = conversionSubject(item.id, conversion.unit);
-              return run(async () => {
-                try {
-                  await deleteConversion(
-                    item.id,
-                    conversion.unit,
-                    storedFactorText(conversion.storedFactor),
-                    baseUnit,
-                    timing,
-                  );
-                  settleRow(rowSubject);
-                } catch (error) {
-                  settleRow(rowSubject, error);
-                  throw error;
-                }
-              });
-            }}
+            onReplay={replay}
           />
         );
       })}

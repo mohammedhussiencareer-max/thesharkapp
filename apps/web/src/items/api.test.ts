@@ -18,7 +18,7 @@ import {
   StaleWriteError,
 } from '@/items/errors';
 import { emptyScheduleToken } from '@/items/effective';
-import { resetHeldWrites } from '@/items/request-id';
+import { resetHeldWrites, unitSubject } from '@/items/request-id';
 import type { DatedWrite, ItemDraft } from '@/items/types';
 
 const mocks = vi.hoisted(() => ({
@@ -644,5 +644,48 @@ describe('catalog api', () => {
     await expect(
       addConversion('oil', 'كيس', '2', 'kg', nowTiming),
     ).rejects.toThrow('الوحدة دي موجودة قبل كده');
+  });
+
+  it('keeps separate request ids when a colon sits in either unit field', async () => {
+    expect(unitSubject('a:b', 'c')).toBe(
+      `unit:${JSON.stringify(['a:b', 'c'])}`,
+    );
+    expect(unitSubject('a', 'b:c')).toBe(
+      `unit:${JSON.stringify(['a', 'b:c'])}`,
+    );
+    expect(unitSubject('a:b', 'c')).not.toBe(unitSubject('a', 'b:c'));
+    expect(unitSubject(' a:b ', ' c ')).toBe(unitSubject('a:b', 'c'));
+
+    const network = { data: null, error: { message: 'network down' } };
+    const rpc = vi
+      .fn()
+      .mockResolvedValueOnce(network)
+      .mockResolvedValueOnce(network)
+      .mockResolvedValueOnce({ data: 'a:b', error: null })
+      .mockResolvedValueOnce({ data: 'a', error: null });
+    mocks.schema.mockReturnValue({ rpc });
+
+    await expect(addCustomUnit('a:b', 'c')).rejects.toThrow();
+    await expect(addCustomUnit('a', 'b:c')).rejects.toThrow();
+    const first = (rpc.mock.calls[0]?.[1] as { p_request_id: string })
+      .p_request_id;
+    const second = (rpc.mock.calls[1]?.[1] as { p_request_id: string })
+      .p_request_id;
+    expect(first).not.toBe(second);
+
+    await expect(addCustomUnit('a:b', 'c')).resolves.toBe('a:b');
+    await expect(addCustomUnit('a', 'b:c')).resolves.toBe('a');
+    expect(
+      (rpc.mock.calls[2]?.[1] as { p_request_id: string }).p_request_id,
+    ).toBe(first);
+    expect(
+      (rpc.mock.calls[3]?.[1] as { p_request_id: string }).p_request_id,
+    ).toBe(second);
+    expect(rpc.mock.calls[2]?.[1]).toEqual(
+      expect.objectContaining({ p_code: 'a:b', p_label_ar: 'c' }),
+    );
+    expect(rpc.mock.calls[3]?.[1]).toEqual(
+      expect.objectContaining({ p_code: 'a', p_label_ar: 'b:c' }),
+    );
   });
 });

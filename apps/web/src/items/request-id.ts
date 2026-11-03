@@ -34,7 +34,7 @@ export function priceSubject(itemId: string): string {
 }
 
 export function conversionSubject(itemId: string, unit: string): string {
-  return `conversion:${itemId}:${unit}`;
+  return `conversion:${JSON.stringify([itemId, unit])}`;
 }
 
 /** One create action per submitted draft. */
@@ -50,9 +50,12 @@ export function createSubject(draft: ItemDraft): string {
   })}`;
 }
 
-/** One custom-unit action per code and label. */
+/**
+ * One custom-unit action per trimmed code and label. The tuple is encoded so
+ * a colon inside either field cannot collide with the other pair.
+ */
 export function unitSubject(code: string, label: string): string {
-  return `unit:${code.trim()}:${label.trim()}`;
+  return `unit:${JSON.stringify([code.trim(), label.trim()])}`;
 }
 
 export function hasAction(subject: string): boolean {
