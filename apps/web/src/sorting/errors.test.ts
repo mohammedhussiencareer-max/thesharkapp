@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { isDefiniteRefusal, isUnknownOutcome } from '@/lib/write-outcome';
 import {
   backDatedSortMessage,
+  beforeOpeningSortMessage,
   isDefiniteRefusal as exportedDefiniteRefusal,
   isUnknownOutcome as exportedUnknownOutcome,
   mapSortError,
@@ -71,6 +72,23 @@ describe('mapSortError', () => {
     expect(mapSortError({ code: '23505', message: 'duplicate key' })).toBe(
       retrySafeMessage,
     );
+  });
+
+  it('names the item when a sort is before opening stock', () => {
+    expect(
+      mapSortError({
+        code: 'P0001',
+        message: 'movement is before opening stock',
+        details: 'بوري',
+      }),
+    ).toBe(beforeOpeningSortMessage('بوري'));
+    expect(
+      mapSortError({
+        code: 'P0001',
+        message: 'movement is before opening stock',
+        details: 'occurred_at 2026-10-22 is before opening',
+      }),
+    ).toBe(beforeOpeningSortMessage('الصنف'));
   });
 
   it('uses the shared back-dated sentence with the fallback item name', () => {

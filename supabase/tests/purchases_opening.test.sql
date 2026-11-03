@@ -1117,60 +1117,69 @@ select
   );
 
 select
-  lives_ok (
-    $test$
-    do $body$
-    declare
-      v_detail text;
-      v_message text;
-      v_state text;
-      v_purchases bigint;
-      v_fresh bigint;
-    begin
-      select count(*) into v_purchases from app.purchases;
-      begin
-        perform app.record_purchase(
-          jsonb_build_object(
-            'purchased_at', '2026-10-21T09:00:00Z',
-            'request_id', 'b1000000-0000-4000-8000-000000000005',
-            'lines', jsonb_build_array(
-              jsonb_build_object(
-                'item_id', '20000000-0000-4000-8000-000000000005',
-                'quantity', '1', 'unit', 'kg', 'amount_paid', '10',
-                'expected_base_unit', 'kg', 'expected_factor', '1'
-              ),
-              jsonb_build_object(
-                'item_id', '20000000-0000-4000-8000-000000000002',
-                'quantity', '1', 'unit', 'kg', 'amount_paid', '10',
-                'expected_base_unit', 'kg', 'expected_factor', '1'
-              )
-            )
-          )
-        );
-        raise exception 'expected back-dated failure';
-      exception
-        when others then
-          get stacked diagnostics
-            v_message = message_text,
-            v_state = returned_sqlstate,
-            v_detail = pg_exception_detail;
-          if v_state is distinct from 'P0001'
-          or v_message is distinct from 'back-dated movement not supported yet'
-          or v_detail is distinct from 'جمبري اختبار' then
-            raise exception 'bad diagnostics state=% message=% detail=%',
-              v_state, v_message, v_detail;
-          end if;
-      end;
-      select count(*) into v_fresh
-      from app.stock_movements
-      where item_id = '20000000-0000-4000-8000-000000000005';
-      if (select count(*) from app.purchases) <> v_purchases or v_fresh <> 0 then
-        raise exception 'back-dated purchase saved rows';
-      end if;
-    end
-    $body$;
-    $test$,
-    'back-dated line raises the ledger error, names the item, and saves nothing'
+  app.record_purchase (
+    jsonb_build_object(
+      'purchased_at',
+      '2026-10-21T09:00:00Z',
+      'request_id',
+      'b1000000-0000-4000-8000-000000000005',
+      'lines',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          '20000000-0000-4000-8000-000000000005',
+          'quantity',
+          '1',
+          'unit',
+          'kg',
+          'amount_paid',
+          '10',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '1'
+        ),
+        jsonb_build_object(
+          'item_id',
+          '20000000-0000-4000-8000-000000000002',
+          'quantity',
+          '1',
+          'unit',
+          'kg',
+          'amount_paid',
+          '10',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '1'
+        )
+      )
+    )
+  );
+
+select
+  results_eq (
+    $$select item_id, on_hand_qty, on_hand_value, avg_cost
+      from app.item_balances
+      where item_id in (
+        '20000000-0000-4000-8000-000000000002',
+        '20000000-0000-4000-8000-000000000005'
+      )
+      order by item_id$$,
+    $$values
+      (
+        '20000000-0000-4000-8000-000000000002'::uuid,
+        21::numeric(20, 6),
+        3010.00::numeric(14, 2),
+        round(3010::numeric / 21, 6)::numeric(20, 6)
+      ),
+      (
+        '20000000-0000-4000-8000-000000000005'::uuid,
+        1::numeric(20, 6),
+        10.00::numeric(14, 2),
+        10::numeric(20, 6)
+      )$$,
+    'a back-dated purchase is costed in time order and keeps amount_paid'
   );
 
 select
@@ -1181,8 +1190,8 @@ select
       from
         app.purchases
     ),
-    4::bigint,
-    'failed purchase calls save no header'
+    5::bigint,
+    'the back-dated purchase is stored'
   );
 
 select
@@ -1193,8 +1202,8 @@ select
       from
         app.stock_movements
     ),
-    7::bigint,
-    'failed purchase calls save no movement'
+    9::bigint,
+    'the back-dated purchase stores both lines'
   );
 
 select
@@ -1522,7 +1531,7 @@ select
       from
         app.purchases
     ),
-    5::bigint,
+    6::bigint,
     'validation failures save no purchase'
   );
 
@@ -1534,7 +1543,7 @@ select
       from
         app.stock_movements
     ),
-    9::bigint,
+    11::bigint,
     'validation failures save no movement'
   );
 
@@ -1563,7 +1572,7 @@ select
       from
         app.purchase_lines
     ),
-    6::bigint,
+    8::bigint,
     'owner can read purchase lines'
   );
 
@@ -1678,7 +1687,7 @@ select
       where
         item_id = '20000000-0000-4000-8000-000000000005'
     ),
-    1::bigint,
+    2::bigint,
     'same purchase request id adds no movement'
   );
 
@@ -1709,7 +1718,7 @@ select
       where
         item_id = '20000000-0000-4000-8000-000000000005'
     ),
-    1::bigint,
+    2::bigint,
     'refused purchase replay adds no movement'
   );
 

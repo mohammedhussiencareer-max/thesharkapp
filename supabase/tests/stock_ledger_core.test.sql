@@ -1795,46 +1795,91 @@ select
 -- ============================================================================
 -- 54..67: Guards (including non-finite numbers)
 -- ============================================================================
--- 54: Back-dated movement against existing item_balances.last_occurred_at
+-- 54: A sale between two purchases is costed at the average then in force.
 select
-  throws_ok (
-    $$select app.post_movements(
-      jsonb_build_array(
-        jsonb_build_object(
-          'item_id', '10000000-0000-4000-8000-000000000001',
-          'movement_type', 'sale',
-          'occurred_at', '2026-10-16T09:59:59Z',
-          'quantity', 1
-        )
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000001',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-10-16T09:59:59Z',
+        'quantity',
+        1
       )
-    )$$,
-    'P0001'::char(5),
-    'back-dated movement not supported yet',
-    'Guard: back-dated movement raises P0001 with required message'
+    )
   );
 
--- 55: Back-dated movement within the same batch array
 select
-  throws_ok (
-    $$select app.post_movements(
-      jsonb_build_array(
-        jsonb_build_object(
-          'item_id', '10000000-0000-4000-8000-000000000001',
-          'movement_type', 'sale',
-          'occurred_at', '2026-10-16T11:00:00Z',
-          'quantity', 1
-        ),
-        jsonb_build_object(
-          'item_id', '10000000-0000-4000-8000-000000000001',
-          'movement_type', 'sale',
-          'occurred_at', '2026-10-16T10:30:00Z',
-          'quantity', 1
-        )
-      )
+  results_eq (
+    $$select ib.on_hand_qty, ib.on_hand_value, ib.avg_cost, sm.total_cost
+      from app.item_balances ib
+      join app.stock_movements sm
+        on sm.item_id = ib.item_id
+       and sm.movement_type = 'sale'
+       and sm.occurred_at = '2026-10-16T09:59:59Z'
+      where ib.item_id = '10000000-0000-4000-8000-000000000001'$$,
+    $$values (
+      16::numeric(20, 6),
+      2400.00::numeric(14, 2),
+      150::numeric(20, 6),
+      -150.00::numeric(14, 2)
     )$$,
-    'P0001'::char(5),
-    'back-dated movement not supported yet',
-    'Guard: out-of-order timestamps for the same item inside a single batch raise P0001'
+    'a sale dated between two purchases is costed at the average then in force'
+  );
+
+-- 55: Out-of-order sales in one batch are each priced at their own time.
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000001',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-10-16T11:00:00Z',
+        'quantity',
+        1
+      ),
+      jsonb_build_object(
+        'item_id',
+        '10000000-0000-4000-8000-000000000001',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-10-16T10:30:00Z',
+        'quantity',
+        1
+      )
+    )
+  );
+
+select
+  results_eq (
+    $$select ib.on_hand_qty, ib.on_hand_value, ib.avg_cost,
+             (select sm.total_cost
+                from app.stock_movements sm
+               where sm.item_id = ib.item_id
+                 and sm.movement_type = 'sale'
+                 and sm.occurred_at = '2026-10-16T10:30:00Z'),
+             (select sm.total_cost
+                from app.stock_movements sm
+               where sm.item_id = ib.item_id
+                 and sm.movement_type = 'sale'
+                 and sm.occurred_at = '2026-10-16T11:00:00Z')
+      from app.item_balances ib
+      where ib.item_id = '10000000-0000-4000-8000-000000000001'$$,
+    $$values (
+      14::numeric(20, 6),
+      2100.00::numeric(14, 2),
+      150::numeric(20, 6),
+      -150.00::numeric(14, 2),
+      -150.00::numeric(14, 2)
+    )$$,
+    'out-of-order sales in one batch are each priced at their own time'
   );
 
 -- 56: Sort with a size of the wrong parent

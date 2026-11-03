@@ -59,9 +59,14 @@ export const badCostMessage = 'متوسط التكلفة مش مظبوط';
 export const invalidPayloadMessage = 'البيانات مش مظبوطة';
 
 const backDatedMarker = 'back-dated movement not supported yet';
+const beforeOpeningMarker = 'movement is before opening stock';
 
 export function backDatedSortMessage(itemName: string): string {
   return `مينفعش تسجّل حركة لـ ${itemName} بتاريخ أقدم من آخر حركة ليه — التعديل بأثر رجعي جاي في مرحلة لاحقة`;
+}
+
+export function beforeOpeningSortMessage(itemName: string): string {
+  return `مينفعش تسجّل حركة لـ ${itemName} قبل رصيده الافتتاحي`;
 }
 
 const exactReasons: ReadonlyArray<readonly [string, string]> = [
@@ -125,6 +130,14 @@ export function mapSortError(error: unknown): string {
         ? details.trim()
         : 'الصنف';
     return backDatedSortMessage(name);
+  }
+
+  if (text.includes(beforeOpeningMarker)) {
+    const name =
+      details.trim() && !details.includes('occurred_at')
+        ? details.trim()
+        : 'الصنف';
+    return beforeOpeningSortMessage(name);
   }
 
   const reasons = [...exactReasons].sort(

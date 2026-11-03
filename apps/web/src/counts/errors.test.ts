@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { isPayloadRefusal, isUnknownOutcome } from '@/lib/write-outcome';
 import {
   backDatedCountMessage,
+  beforeOpeningCountMessage,
   baseUnitChangedMessage,
   frequencyMessage,
   inactiveItemMessage,
@@ -95,6 +96,39 @@ describe('mapCountError', () => {
     ).toBe(backDatedCountMessage('الصنف'));
     expect(exportedPayloadRefusal({ code: 'P0001', message: 'x' })).toBe(
       isPayloadRefusal({ code: 'P0001', message: 'x' }),
+    );
+  });
+
+  it('names the item when a count is before opening stock', () => {
+    expect(
+      mapCountError({
+        code: 'P0001',
+        message: 'movement is before opening stock',
+        details: 'بلطي',
+      }),
+    ).toBe(beforeOpeningCountMessage('بلطي'));
+    expect(
+      mapCountError({
+        code: 'P0001',
+        message: 'movement is before opening stock',
+        details: 'occurred_at 2026-10-22 is before opening',
+      }),
+    ).toBe(beforeOpeningCountMessage('الصنف'));
+    expect(
+      mapCountError({
+        code: 'P0001',
+        message: 'movement is before opening stock',
+        details: '',
+      }),
+    ).toBe(beforeOpeningCountMessage('الصنف'));
+    expect(
+      mapCountError({
+        code: 'P0001',
+        message: 'movement is before opening stock',
+      }),
+    ).toBe(beforeOpeningCountMessage('الصنف'));
+    expect(beforeOpeningCountMessage('بلطي')).toBe(
+      'مينفعش تسجّل حركة لـ بلطي قبل رصيده الافتتاحي',
     );
   });
 });
