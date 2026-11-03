@@ -33,7 +33,8 @@ test('owner records expenses and sees the daily allocation', async ({
     page.getByRole('heading', { name: 'المصاريف', exact: true }),
   ).toBeVisible();
 
-  await page.getByLabel('الشهر').fill('2030-04');
+  // exact: once the month loads, "مصاريف الشهر كاملة" and "إجمالي الشهر" also match.
+  await page.getByLabel('الشهر', { exact: true }).fill('2030-04');
   const table = page.getByRole('table', { name: 'توزيع الشهر' });
   await expect(table).toBeVisible(visible);
   await voidOpenExpenses(page);
