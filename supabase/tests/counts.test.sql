@@ -2339,8 +2339,8 @@ select
       ))
     ))$$,
     'P0001',
-    'back-dated movement not supported yet',
-    'a count earlier than the last movement is refused'
+    'movement is before opening stock',
+    'a count earlier than opening stock is refused'
   );
 
 select

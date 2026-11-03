@@ -490,19 +490,19 @@ begin
       sm.item_id = v_item
       and sm.movement_type = 'opening';
 
-    v_new_open := null;
-
-    for v_i in 1..v_n loop
-      if p_item_ids[v_i] = v_item and p_types[v_i] = 'opening' then
-        if v_new_open is null or p_occurred_at[v_i] < v_new_open then
-          v_new_open := p_occurred_at[v_i];
-        end if;
-      end if;
-    end loop;
-
+    -- A stored opening is the floor. A pending opening supplies one only
+    -- when the item has none yet, so a later batch cannot move the floor back.
     if v_open is null then
-      v_open := v_new_open;
-    elsif v_new_open is not null and v_new_open < v_open then
+      v_new_open := null;
+
+      for v_i in 1..v_n loop
+        if p_item_ids[v_i] = v_item and p_types[v_i] = 'opening' then
+          if v_new_open is null or p_occurred_at[v_i] < v_new_open then
+            v_new_open := p_occurred_at[v_i];
+          end if;
+        end if;
+      end loop;
+
       v_open := v_new_open;
     end if;
 
@@ -2247,6 +2247,94 @@ from
   authenticated,
   service_role;
 
+-- The count path reaches this helper before it posts. Finiteness stays first.
+-- An instant strictly before the item's earliest stored opening is refused
+-- before the generic chronological refusal, with the item name as the detail.
+create or replace function app.lock_and_validate_item_balance (p_item_id uuid, p_occurred_at timestamptz) returns app.item_balances language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_bal app.item_balances;
+  v_open timestamptz;
+  v_name text;
+begin
+  if p_occurred_at is null then
+    raise exception 'occurred_at is required'
+      using errcode = '22023';
+  end if;
+
+  -- An infinite timestamp would become last_occurred_at and block every later movement.
+  if not pg_catalog.isfinite(p_occurred_at) then
+    raise exception 'occurred_at must be a finite timestamp'
+      using errcode = '22023';
+  end if;
+
+  select
+    min(sm.occurred_at)
+  into v_open
+  from
+    app.stock_movements sm
+  where
+    sm.item_id = p_item_id
+    and sm.movement_type = 'opening';
+
+  if v_open is not null and p_occurred_at < v_open then
+    select
+      si.name
+    into v_name
+    from
+      app.stock_items si
+    where
+      si.id = p_item_id;
+
+    raise exception 'movement is before opening stock'
+      using errcode = 'P0001',
+      detail = v_name;
+  end if;
+
+  insert into
+    app.item_balances (
+      item_id,
+      on_hand_qty,
+      on_hand_value,
+      avg_cost,
+      last_occurred_at,
+      has_uncovered_deficit
+    )
+  values
+    (p_item_id, 0, 0, 0, null, false)
+  on conflict (item_id) do nothing;
+
+  select
+    ib.*
+  into v_bal
+  from
+    app.item_balances ib
+  where
+    ib.item_id = p_item_id
+  for update;
+
+  if v_bal.last_occurred_at is not null and p_occurred_at < v_bal.last_occurred_at then
+    raise exception 'back-dated movement not supported yet'
+      using errcode = 'P0001',
+      detail = pg_catalog.format(
+        'occurred_at %s is before last_occurred_at %s',
+        p_occurred_at,
+        v_bal.last_occurred_at
+      );
+  end if;
+
+  return v_bal;
+end;
+$$;
+
+revoke all on function app.lock_and_validate_item_balance (uuid, timestamptz)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 create or replace function app.apply_inflow_movement (
   p_batch_id uuid,
   p_item_id uuid,
@@ -3287,6 +3375,13 @@ begin
     v_notes := pg_catalog.array_append(v_notes, v_note);
   end loop;
 
+  for v_i in 1..v_n loop
+    if not pg_catalog.isfinite(v_times[v_i]) then
+      raise exception 'occurred_at must be a finite timestamp'
+        using errcode = '22023';
+    end if;
+  end loop;
+
   perform app.assert_not_before_opening (v_item_ids, v_times, v_types);
 
   if app.batch_is_forward (v_item_ids, v_times) then
@@ -3359,13 +3454,6 @@ begin
       end if;
     end loop;
   else
-    for v_i in 1..v_n loop
-      if not pg_catalog.isfinite(v_times[v_i]) then
-        raise exception 'occurred_at must be a finite timestamp'
-          using errcode = '22023';
-      end if;
-    end loop;
-
     v_pending := '[]'::jsonb;
 
     for v_i in 1..v_n loop
@@ -3581,6 +3669,11 @@ begin
 
   v_loss_qty := v_qty_taken - v_sum_sizes;
 
+  if not pg_catalog.isfinite(p_occurred_at) then
+    raise exception 'occurred_at must be a finite timestamp'
+      using errcode = '22023';
+  end if;
+
   perform app.assert_not_before_opening (v_check_items, v_check_times, v_check_types);
 
   v_batch_id := pg_catalog.gen_random_uuid();
@@ -3701,11 +3794,6 @@ begin
       );
     end loop;
   else
-    if not pg_catalog.isfinite(p_occurred_at) then
-      raise exception 'occurred_at must be a finite timestamp'
-        using errcode = '22023';
-    end if;
-
     v_key := v_key + 1;
     v_pending := v_pending || pg_catalog.jsonb_build_array(
       pg_catalog.jsonb_build_object(

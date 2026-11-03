@@ -73,9 +73,14 @@ export const surplusWarning = 'زيادة — راجع البيانات';
 export const historySurplusWarning = 'فيه زيادة محتاجة مراجعة';
 
 const backDatedMarker = 'back-dated movement not supported yet';
+const beforeOpeningMarker = 'movement is before opening stock';
 
 export function backDatedCountMessage(itemName: string): string {
   return `مينفعش تسجّل حركة لـ ${itemName} بتاريخ أقدم من آخر حركة ليه — التعديل بأثر رجعي جاي في مرحلة لاحقة`;
+}
+
+export function beforeOpeningCountMessage(itemName: string): string {
+  return `مينفعش تسجّل حركة لـ ${itemName} قبل رصيده الافتتاحي`;
 }
 
 const exactReasons: ReadonlyArray<readonly [string, string]> = [
@@ -136,6 +141,14 @@ export function mapCountError(error: unknown): string {
         ? details.trim()
         : 'الصنف';
     return backDatedCountMessage(name);
+  }
+
+  if (text.includes(beforeOpeningMarker)) {
+    const name =
+      details.trim() && !details.includes('occurred_at')
+        ? details.trim()
+        : 'الصنف';
+    return beforeOpeningCountMessage(name);
   }
 
   const reasons = [...exactReasons].sort(

@@ -306,6 +306,123 @@ values
     'daily',
     0,
     'e2700000-0000-4000-8000-000000000025'
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000027',
+    '27a-frac-raw',
+    'fish_mixed',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000028',
+    '27a-frac-size-a',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    'e2700000-0000-4000-8000-000000000027'
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000029',
+    '27a-frac-size-b',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    'e2700000-0000-4000-8000-000000000027'
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000030',
+    '27a-frac-size-c',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    'e2700000-0000-4000-8000-000000000027'
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000031',
+    '27a-frac-sale',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000032',
+    '27a-partial-cover',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000033',
+    '27a-second-open',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000034',
+    '27a-count-before',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000035',
+    '27a-zero-before',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000036',
+    '27a-inf-sale',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000037',
+    '27a-inf-raw',
+    'fish_mixed',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000038',
+    '27a-inf-size',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    'e2700000-0000-4000-8000-000000000037'
+  ),
+  (
+    'e2700000-0000-4000-8000-000000000039',
+    '27a-overflow',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
   );
 
 create function pg_temp.ledger_counts () returns jsonb language sql as $$
@@ -2259,6 +2376,570 @@ select
     'forward canary: a later post and a second rebuild still insert nothing'
   );
 
+-- 17. A stored opening is the floor. A pending opening cannot move it back.
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000033',
+        'movement_type',
+        'opening',
+        'occurred_at',
+        '2026-11-03T10:00:00Z',
+        'quantity',
+        10,
+        'unit_cost',
+        100
+      )
+    )
+  );
+
+select
+  ok (
+    pg_temp.expect_refusal (
+      $sql$select app.post_movements(jsonb_build_array(jsonb_build_object(
+        'item_id', 'e2700000-0000-4000-8000-000000000033',
+        'movement_type', 'opening',
+        'occurred_at', '2026-11-03T09:00:00Z',
+        'quantity', 1,
+        'unit_cost', 50
+      )))$sql$,
+      'P0001',
+      'movement is before opening stock',
+      '27a-second-open'
+    ),
+    'an earlier second opening is refused and writes nothing'
+  );
+
+select
+  ok (
+    pg_temp.expect_refusal (
+      $sql$select app.post_movements(jsonb_build_array(
+        jsonb_build_object(
+          'item_id', 'e2700000-0000-4000-8000-000000000033',
+          'movement_type', 'opening',
+          'occurred_at', '2026-11-03T09:00:00Z',
+          'quantity', 1,
+          'unit_cost', 50
+        ),
+        jsonb_build_object(
+          'item_id', 'e2700000-0000-4000-8000-000000000033',
+          'movement_type', 'sale',
+          'occurred_at', '2026-11-03T09:30:00Z',
+          'quantity', 1
+        )
+      ))$sql$,
+      'P0001',
+      'movement is before opening stock',
+      '27a-second-open'
+    ),
+    'an earlier second opening plus a sale between the two times is refused and writes nothing'
+  );
+
+select
+  results_eq (
+    $$select movement_type::text, occurred_at
+      from app.stock_movements
+      where item_id = 'e2700000-0000-4000-8000-000000000033'
+      order by occurred_at, id$$,
+    $$values ('opening'::text, '2026-11-03T10:00:00Z'::timestamptz)$$,
+    'an earlier second opening leaves only the stored opening'
+  );
+
+-- 18. A count before opening stock uses the opening diagnostic, before the
+-- generic chronological refusal, for both a normal delta and a zero delta.
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000034',
+        'movement_type',
+        'opening',
+        'occurred_at',
+        '2026-11-03T07:30:00Z',
+        'quantity',
+        10,
+        'unit_cost',
+        100
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000035',
+        'movement_type',
+        'opening',
+        'occurred_at',
+        '2026-11-03T07:30:00Z',
+        'quantity',
+        10,
+        'unit_cost',
+        100
+      )
+    )
+  );
+
+create temporary table review_sync_before as
+select
+  count(*)::bigint as n
+from
+  app.pos_sync_runs;
+
+-- Prepares the count, covers it with an ok sync, then posts. An exception
+-- from the post rolls the prepare and the sync insert back with the statement.
+create function pg_temp.cover_prepared_count (p_count jsonb) returns jsonb language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_result jsonb;
+  v_prepared timestamptz;
+  v_counted timestamptz;
+  v_close timestamptz;
+  v_start timestamptz;
+begin
+  v_result := app.record_count (p_count);
+
+  if v_result ->> 'status' = 'posted' then
+    return v_result;
+  end if;
+
+  select
+    request.prepared_at,
+    (request.payload ->> 'counted_at')::timestamptz
+  into
+    v_prepared,
+    v_counted
+  from
+    app.stock_count_requests request
+  where
+    request.request_id = (p_count ->> 'request_id')::uuid;
+
+  select
+    pg_catalog.max(shift.close_recorded_at)
+  into
+    v_close
+  from
+    app.pos_shifts shift
+  where
+    shift.opened_at <= v_counted;
+
+  v_start := greatest(v_prepared, coalesce(v_close, v_prepared)) + interval '1 millisecond';
+
+  insert into
+    app.pos_sync_runs (mode, status, started_at, finished_at, error)
+  values
+    (
+      'recent',
+      'ok',
+      v_start,
+      v_start + interval '1 minute',
+      null
+    );
+
+  return app.record_count (p_count);
+end;
+$$;
+
+select
+  ok (
+    pg_temp.expect_refusal (
+      $sql$select pg_temp.cover_prepared_count(jsonb_build_object(
+        'request_id', 'e2700000-0000-4000-8000-00000000c034',
+        'frequency', 'daily',
+        'counted_at', '2026-11-03T07:00:00Z',
+        'lines', jsonb_build_array(jsonb_build_object(
+          'item_id', 'e2700000-0000-4000-8000-000000000034',
+          'counted_qty', '7',
+          'expected_base_unit', 'kg'
+        ))
+      ))$sql$,
+      'P0001',
+      'movement is before opening stock',
+      '27a-count-before'
+    ),
+    'a normal-delta count before opening stock is refused and writes nothing'
+  );
+
+select
+  ok (
+    pg_temp.expect_refusal (
+      $sql$select pg_temp.cover_prepared_count(jsonb_build_object(
+        'request_id', 'e2700000-0000-4000-8000-00000000c035',
+        'frequency', 'daily',
+        'counted_at', '2026-11-03T07:00:00Z',
+        'lines', jsonb_build_array(jsonb_build_object(
+          'item_id', 'e2700000-0000-4000-8000-000000000035',
+          'counted_qty', '10',
+          'expected_base_unit', 'kg'
+        ))
+      ))$sql$,
+      'P0001',
+      'movement is before opening stock',
+      '27a-zero-before'
+    ),
+    'a zero-delta count before opening stock is refused and writes nothing'
+  );
+
+select
+  is_empty (
+    $$select request_id from app.stock_count_requests
+      where request_id in (
+        'e2700000-0000-4000-8000-00000000c034',
+        'e2700000-0000-4000-8000-00000000c035'
+      )$$,
+    'counts before opening stock leave no count request'
+  );
+
+select
+  is_empty (
+    $$select request_id from app.stock_counts
+      where request_id in (
+        'e2700000-0000-4000-8000-00000000c034',
+        'e2700000-0000-4000-8000-00000000c035'
+      )$$,
+    'counts before opening stock leave no stock count'
+  );
+
+select
+  is_empty (
+    $$select item_id from app.stock_count_lines
+      where item_id in (
+        'e2700000-0000-4000-8000-000000000034',
+        'e2700000-0000-4000-8000-000000000035'
+      )$$,
+    'counts before opening stock leave no count line'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.pos_sync_runs
+    ),
+    (
+      select
+        n
+      from
+        review_sync_before
+    ),
+    'counts before opening stock leave no sync run'
+  );
+
+select
+  results_eq (
+    $$select item_id, on_hand_qty, on_hand_value
+      from app.item_balances
+      where item_id in (
+        'e2700000-0000-4000-8000-000000000034',
+        'e2700000-0000-4000-8000-000000000035'
+      )
+      order by item_id$$,
+    $$values
+      (
+        'e2700000-0000-4000-8000-000000000034'::uuid,
+        10::numeric(20, 6),
+        1000.00::numeric(14, 2)
+      ),
+      (
+        'e2700000-0000-4000-8000-000000000035'::uuid,
+        10::numeric(20, 6),
+        1000.00::numeric(14, 2)
+      )$$,
+    'counts before opening stock leave the opening balance'
+  );
+
+-- 19. Finiteness is still the refusal when an opening is already stored.
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000036',
+        'movement_type',
+        'opening',
+        'occurred_at',
+        '2026-11-03T10:00:00Z',
+        'quantity',
+        10,
+        'unit_cost',
+        100
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000037',
+        'movement_type',
+        'opening',
+        'occurred_at',
+        '2026-11-03T10:00:00Z',
+        'quantity',
+        10,
+        'unit_cost',
+        100
+      )
+    )
+  );
+
+select
+  ok (
+    pg_temp.expect_refusal (
+      $sql$select app.post_movements(jsonb_build_array(jsonb_build_object(
+        'item_id', 'e2700000-0000-4000-8000-000000000036',
+        'movement_type', 'sale',
+        'occurred_at', '-infinity',
+        'quantity', 1
+      )))$sql$,
+      '22023',
+      'occurred_at must be a finite timestamp',
+      null
+    ),
+    'a sale at -infinity is refused as a non-finite timestamp when an opening is stored'
+  );
+
+select
+  ok (
+    pg_temp.expect_refusal (
+      $sql$select app.post_sort(
+        'e2700000-0000-4000-8000-000000000037',
+        '-infinity',
+        1,
+        jsonb_build_array(jsonb_build_object(
+          'item_id', 'e2700000-0000-4000-8000-000000000038',
+          'quantity', 1
+        )),
+        null
+      )$sql$,
+      '22023',
+      'occurred_at must be a finite timestamp',
+      null
+    ),
+    'a sort at -infinity is refused as a non-finite timestamp when an opening is stored'
+  );
+
+-- 20. Forward fixtures with fractional money survive a rebuild unchanged.
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000027',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-11-05T08:00:00Z',
+        'quantity',
+        0.04,
+        'unit_cost',
+        0.5
+      )
+    )
+  );
+
+select
+  app.post_sort (
+    'e2700000-0000-4000-8000-000000000027',
+    '2026-11-05T09:00:00Z',
+    0.04,
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000028',
+        'quantity',
+        0.01
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000029',
+        'quantity',
+        0.01
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000030',
+        'quantity',
+        0.01
+      )
+    ),
+    null
+  );
+
+select
+  ok (
+    pg_temp.rebuild_stable (
+      array[
+        'e2700000-0000-4000-8000-000000000027',
+        'e2700000-0000-4000-8000-000000000028',
+        'e2700000-0000-4000-8000-000000000029',
+        'e2700000-0000-4000-8000-000000000030'
+      ]::uuid[]
+    ),
+    'fractional sort canary: 0.04 kg worth 0.02 with 0.01 loss and three sizes rebuilds with no new cost adjustment'
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000031',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-11-05T08:00:00Z',
+        'quantity',
+        3,
+        'unit_cost',
+        33.333333
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000031',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-11-05T09:00:00Z',
+        'quantity',
+        1
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000031',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-11-05T10:00:00Z',
+        'quantity',
+        1
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000031',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-11-05T11:00:00Z',
+        'quantity',
+        1
+      )
+    )
+  );
+
+select
+  ok (
+    pg_temp.rebuild_stable (
+      array['e2700000-0000-4000-8000-000000000031']::uuid[]
+    ),
+    'fractional outflow canary: 3 kg at 100/3, two 1 kg sales, then a drain, rebuilds with no new cost adjustment'
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000032',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-11-05T08:00:00Z',
+        'quantity',
+        2,
+        'unit_cost',
+        100
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000032',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        '2026-11-05T09:00:00Z',
+        'quantity',
+        5
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000032',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-11-05T10:00:00Z',
+        'quantity',
+        1,
+        'unit_cost',
+        200
+      ),
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000032',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-11-05T11:00:00Z',
+        'quantity',
+        4,
+        'unit_cost',
+        200
+      )
+    )
+  );
+
+select
+  ok (
+    pg_temp.rebuild_stable (
+      array['e2700000-0000-4000-8000-000000000032']::uuid[]
+    ),
+    'partial deficit cover canary: sale of 5 into stock 2, then purchase 1, then purchase 4, rebuilds with no new cost adjustment'
+  );
+
+-- Two in-range purchases whose replayed sum exceeds numeric(14,2). A
+-- 100001-row component is not built here: the replay cap stays the literal
+-- 100000 and a fixture of that size is too slow for this suite.
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'e2700000-0000-4000-8000-000000000039',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-11-05T12:00:00Z',
+        'quantity',
+        1,
+        'unit_cost',
+        600000000000
+      )
+    )
+  );
+
+select
+  ok (
+    pg_temp.expect_refusal (
+      $sql$select app.post_movements(jsonb_build_array(jsonb_build_object(
+        'item_id', 'e2700000-0000-4000-8000-000000000039',
+        'movement_type', 'purchase',
+        'occurred_at', '2026-11-05T08:00:00Z',
+        'quantity', 1,
+        'unit_cost', 600000000000
+      )))$sql$,
+      '22023',
+      'recompute result is out of range',
+      null
+    ),
+    'a replay whose value exceeds numeric(14,2) is refused and writes nothing'
+  );
+
+select
+  results_eq (
+    $$select count(*)::bigint, sum(total_cost)
+      from app.stock_movements
+      where item_id = 'e2700000-0000-4000-8000-000000000039'$$,
+    $$values (1::bigint, 600000000000.00::numeric)$$,
+    'an out-of-range recompute leaves the in-range purchase'
+  );
+
 -- 16. Append-only tables and privileges.
 select
   ok (
@@ -2462,6 +3143,108 @@ select
   );
 
 reset role;
+
+-- Catalog privileges, not an invoke. An EXECUTE grant to authenticated would
+-- still fail the invoke above, because a non-owner jwt is refused by the
+-- ledger lock before the body runs.
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        unnest(
+          array[
+            'app.rebuild_derived_balances(uuid[],uuid)',
+            'app.post_backdated_batch(uuid,jsonb)',
+            'app.replay_prepare_tables()',
+            'app.replay_touch_deficit_flag(uuid)',
+            'app.replay_outflow(bigint,uuid,app.movement_type,timestamptz,numeric,numeric,boolean,integer,text,text,text,text)',
+            'app.replay_inflow(bigint,uuid,app.movement_type,timestamptz,numeric,numeric,numeric,boolean,integer,text,text,text,text)',
+            'app.replay_execute(uuid[],jsonb,uuid,boolean)',
+            'app.recompute_item_set(uuid[])',
+            'app.assert_not_before_opening(uuid[],timestamptz[],text[])',
+            'app.assert_count_barrier(uuid[],timestamptz[],uuid[])',
+            'app.assert_recompute_range(numeric,integer,boolean)',
+            'app.note_period_revision(bigint,text,text,numeric,uuid,uuid)',
+            'app.resolve_shift_id(timestamptz)',
+            'app.shift_for_target(bigint)',
+            'app.profit_bucket(app.movement_type)',
+            'app.batch_is_forward(uuid[],timestamptz[])',
+            'app.prepare_balance_locks(uuid[])',
+            'app.prevent_append_only_mutation()',
+            'app.prevent_shift_flag_direct_write()'
+          ]::regprocedure[]
+        ) as fn
+    ),
+    19::bigint,
+    'privilege check names every new function in the recompute migration'
+  );
+
+select
+  is_empty (
+    $$select r.role, fn::text
+      from unnest(array[
+        'app.rebuild_derived_balances(uuid[],uuid)',
+        'app.post_backdated_batch(uuid,jsonb)',
+        'app.replay_prepare_tables()',
+        'app.replay_touch_deficit_flag(uuid)',
+        'app.replay_outflow(bigint,uuid,app.movement_type,timestamptz,numeric,numeric,boolean,integer,text,text,text,text)',
+        'app.replay_inflow(bigint,uuid,app.movement_type,timestamptz,numeric,numeric,numeric,boolean,integer,text,text,text,text)',
+        'app.replay_execute(uuid[],jsonb,uuid,boolean)',
+        'app.recompute_item_set(uuid[])',
+        'app.assert_not_before_opening(uuid[],timestamptz[],text[])',
+        'app.assert_count_barrier(uuid[],timestamptz[],uuid[])',
+        'app.assert_recompute_range(numeric,integer,boolean)',
+        'app.note_period_revision(bigint,text,text,numeric,uuid,uuid)',
+        'app.resolve_shift_id(timestamptz)',
+        'app.shift_for_target(bigint)',
+        'app.profit_bucket(app.movement_type)',
+        'app.batch_is_forward(uuid[],timestamptz[])',
+        'app.prepare_balance_locks(uuid[])',
+        'app.prevent_append_only_mutation()',
+        'app.prevent_shift_flag_direct_write()'
+      ]::regprocedure[]) as fn
+      cross join (values ('anon'), ('authenticated'), ('service_role'), ('public')) as r (role)
+      where has_function_privilege(r.role, fn, 'execute')$$,
+    'new recompute functions are not executable by anon, authenticated, service_role, or public'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+      where
+        n.nspname = 'ledger_scratch'
+        and c.relkind = 'r'
+    ),
+    7::bigint,
+    'ledger_scratch has the seven replay tables'
+  );
+
+select
+  is_empty (
+    $$select r.role
+      from (values ('anon'), ('authenticated'), ('service_role'), ('public')) as r (role)
+      where has_schema_privilege(r.role, 'ledger_scratch', 'usage')$$,
+    'ledger_scratch usage is denied to anon, authenticated, service_role, and public'
+  );
+
+select
+  is_empty (
+    $$select r.role, c.relname
+      from pg_catalog.pg_class c
+      join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+      cross join (values ('anon'), ('authenticated'), ('service_role'), ('public')) as r (role)
+      where n.nspname = 'ledger_scratch'
+        and c.relkind = 'r'
+        and has_table_privilege(r.role, c.oid, 'select')$$,
+    'ledger_scratch tables are not selectable by anon, authenticated, service_role, or public'
+  );
 
 select
   *
