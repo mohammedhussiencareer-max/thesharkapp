@@ -12,8 +12,13 @@ import {
   updateItem,
 } from '@/items/api';
 import type { ItemExpectation } from '@/items/expectation';
-import { StaleWriteError } from '@/items/errors';
+import {
+  CostingChangedError,
+  costingChangedMessage,
+  StaleWriteError,
+} from '@/items/errors';
 import { emptyScheduleToken } from '@/items/effective';
+import { resetHeldWrites } from '@/items/request-id';
 import type { DatedWrite, ItemDraft } from '@/items/types';
 
 const mocks = vi.hoisted(() => ({
@@ -94,6 +99,7 @@ const nowTiming: DatedWrite = {
 
 describe('catalog api', () => {
   beforeEach(() => {
+    resetHeldWrites();
     mocks.schema.mockReset();
   });
 
@@ -319,6 +325,59 @@ describe('catalog api', () => {
     expect(ids[2]).toBe(ids[0]);
   });
 
+  it('retires a create when configuration changed proves the request was not stored', async () => {
+    const changed = { ...draft, name: 'صنف تعارض' };
+    const rpc = vi
+      .fn()
+      .mockResolvedValueOnce({
+        data: null,
+        error: { message: 'network down' },
+      })
+      .mockResolvedValueOnce({
+        data: null,
+        error: { code: '40001', message: 'configuration changed' },
+      })
+      .mockResolvedValueOnce({ data: 'd', error: null });
+    mocks.schema.mockReturnValue({ rpc });
+
+    await expect(createItem(changed)).rejects.toThrow();
+    await expect(createItem(changed)).rejects.toThrow();
+    await createItem(changed);
+    const ids = rpc.mock.calls.map(
+      (call) => (call[1] as { p_request_id: string }).p_request_id,
+    );
+    expect(ids[1]).toBe(ids[0]);
+    expect(ids[2]).not.toBe(ids[0]);
+  });
+
+  it('keeps a create request id through a generic serialization failure', async () => {
+    const serialized = { ...draft, name: 'صنف تسلسل' };
+    const rpc = vi
+      .fn()
+      .mockResolvedValueOnce({
+        data: null,
+        error: { message: 'network down' },
+      })
+      .mockResolvedValueOnce({
+        data: null,
+        error: {
+          code: '40001',
+          message: 'could not serialize access due to concurrent update',
+        },
+      })
+      .mockResolvedValueOnce({ data: 'e', error: null });
+    mocks.schema.mockReturnValue({ rpc });
+
+    await expect(createItem(serialized)).rejects.toThrow();
+    await expect(createItem(serialized)).rejects.toThrow();
+    await createItem(serialized);
+    const ids = rpc.mock.calls.map(
+      (call) => (call[1] as { p_request_id: string }).p_request_id,
+    );
+    expect(ids[1]).toBe(ids[0]);
+    expect(ids[2]).toBe(ids[0]);
+  });
+
   it('throws the Arabic message for a frozen base unit', async () => {
     const items = query({
       data: null,
@@ -380,7 +439,19 @@ describe('catalog api', () => {
     });
   });
 
-  it('maps a stale conversion update to StaleWriteError', async () => {
+  it('throws CostingChangedError only for a post-replay configuration change', async () => {
+    mocks.schema.mockReturnValue({
+      rpc: () =>
+        Promise.resolve({
+          data: null,
+          error: { code: '40001', message: 'configuration changed' },
+        }),
+    });
+
+    await expect(
+      setItemLoss('shrimp', '0.1', nowTiming),
+    ).rejects.toBeInstanceOf(CostingChangedError);
+
     mocks.schema.mockReturnValue({
       rpc: () =>
         Promise.resolve({
@@ -388,10 +459,12 @@ describe('catalog api', () => {
           error: { code: '40001', message: 'conversion changed' },
         }),
     });
-
     await expect(
-      updateConversion('oil', 'كيس', '3', '1.000000000', 'kg', nowTiming),
-    ).rejects.toBeInstanceOf(StaleWriteError);
+      updateConversion('oil', 'كيس', '3', '1', 'kg', nowTiming),
+    ).rejects.toThrow(costingChangedMessage);
+    await expect(
+      updateConversion('oil', 'كيس', '3', '1', 'kg', nowTiming),
+    ).rejects.not.toBeInstanceOf(StaleWriteError);
   });
 
   it('reads current units and writes the dated conversion', async () => {

@@ -156,18 +156,18 @@ export function ItemsPage() {
     setEditor({ type: 'edit', id: item.id });
   }
 
-  async function handleSubmit(action: ItemSave) {
+  async function handleSubmit(action: ItemSave): Promise<boolean> {
     const started = formModeRef.current;
-    if (!started || busy || catalogLoadsRef.current > 0) return;
+    if (!started || busy || catalogLoadsRef.current > 0) return false;
     setSaving(true);
     setFormError(null);
     let saved = false;
     try {
       if (action.kind === 'create') {
-        if (started.type !== 'create') return;
+        if (started.type !== 'create') return false;
         await createItem(action.draft);
       } else if (started.type !== 'edit') {
-        return;
+        return false;
       } else if (action.kind === 'details') {
         const expected = expectedRef.current;
         if (!expected) throw new StaleWriteError();
@@ -227,6 +227,7 @@ export function ItemsPage() {
     } finally {
       setSaving(false);
     }
+    return saved;
   }
 
   const editingItem =

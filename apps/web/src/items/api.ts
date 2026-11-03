@@ -6,12 +6,15 @@ import {
 } from '@/items/errors';
 import type { ItemExpectation } from '@/items/expectation';
 import { emptyScheduleToken } from '@/items/effective';
-import { exactDecimal } from '@/lib/decimal';
 import {
-  isDefiniteRefusal,
-  isPayloadRefusal,
-  isUnknownOutcome,
-} from '@/lib/write-outcome';
+  beginAction,
+  conversionSubject,
+  createSubject,
+  settleAction,
+  unitSubject,
+} from '@/items/request-id';
+import { exactDecimal } from '@/lib/decimal';
+import { isDefiniteRefusal } from '@/lib/write-outcome';
 import { supabase } from '@/lib/supabase';
 import {
   isBaseUnit,
@@ -45,7 +48,11 @@ type PostgrestError = {
 
 function throwIfError(error: PostgrestError | null): void {
   if (!error) return;
-  if (error.code === '40001') throw new CostingChangedError();
+  // Only the writers' post-replay message proves this request stored nothing.
+  // A generic serialization_failure stays a plain 40001 and keeps its action.
+  if (error.code === '40001' && error.message === 'configuration changed') {
+    throw new CostingChangedError();
+  }
   const mapped = new Error(mapCatalogError(error));
   // The Arabic message is what the owner reads. The sqlstate stays on the
   // error so a definite refusal retires its request id and an unknown
@@ -130,34 +137,6 @@ function coversNow(row: Record<string, unknown>, nowMs: number): boolean {
   return !Number.isNaN(to) && nowMs < to;
 }
 
-type PendingRequest = {
-  requestId: string;
-  /** Set once a send's outcome was unknown. See settleRequest. */
-  unresolved: boolean;
-};
-
-const pendingRequests = new Map<string, PendingRequest>();
-
-function requestIdFor(key: string): string {
-  const existing = pendingRequests.get(key);
-  if (existing) return existing.requestId;
-  const requestId = crypto.randomUUID();
-  pendingRequests.set(key, { requestId, unresolved: false });
-  return requestId;
-}
-
-function finishRequest(key: string, error: unknown): void {
-  const current = pendingRequests.get(key);
-  if (!current) return;
-  if (error === undefined) {
-    pendingRequests.delete(key);
-    return;
-  }
-  if (isUnknownOutcome(error)) current.unresolved = true;
-  if (current.unresolved && !isPayloadRefusal(error)) return;
-  pendingRequests.delete(key);
-}
-
 export async function listItems(): Promise<CatalogItem[]> {
   const { data, error } = await appDb()
     .from('stock_items')
@@ -219,8 +198,8 @@ export async function listItems(): Promise<CatalogItem[]> {
 }
 
 export async function createItem(draft: ItemDraft): Promise<void> {
-  const key = `create:${JSON.stringify(itemPayload(draft))}:${draft.lossPct ?? ''}`;
-  const requestId = requestIdFor(key);
+  const subject = createSubject(draft);
+  const requestId = beginAction(subject, (id) => id);
   try {
     const { data, error } = await appDb().rpc('create_stock_item', {
       p_request_id: requestId,
@@ -236,9 +215,9 @@ export async function createItem(draft: ItemDraft): Promise<void> {
     if (typeof data !== 'string' || data.length === 0) {
       throw new Error(genericCatalogError);
     }
-    finishRequest(key, undefined);
+    settleAction(subject);
   } catch (error) {
-    finishRequest(key, error);
+    settleAction(subject, error);
     throw error;
   }
 }
@@ -435,22 +414,10 @@ export async function costingImpact(
 }
 
 async function callDated(
-  key: string,
-  call: (requestId: string) => PromiseLike<{ error: PostgrestError | null }>,
-  timing: DatedWrite | undefined,
+  call: () => PromiseLike<{ error: PostgrestError | null }>,
 ): Promise<void> {
-  const requestId = timing?.requestId ?? requestIdFor(key);
-  try {
-    const { error } = await call(requestId);
-    throwIfError(error);
-    if (!timing) finishRequest(key, undefined);
-  } catch (error) {
-    if (!timing) finishRequest(key, error);
-    if (isDefiniteRefusal(error) || error instanceof CostingChangedError) {
-      throw error;
-    }
-    throw error;
-  }
+  const { error } = await call();
+  throwIfError(error);
 }
 
 export async function setItemLoss(
@@ -458,19 +425,16 @@ export async function setItemLoss(
   lossFraction: string,
   timing: DatedWrite,
 ): Promise<void> {
-  await callDated(
-    `loss:${itemId}:${lossFraction}:${timing.effectiveFrom ?? 'now'}`,
-    (requestId) =>
-      appDb().rpc('set_item_loss', {
-        p_request_id: timing.requestId || requestId,
-        p_item_id: itemId,
-        p_loss_pct: numericColumn(lossFraction),
-        p_effective_from: nullableText(timing.effectiveFrom),
-        p_effective_to: nullableText(timing.effectiveTo),
-        p_expected_token: timing.token,
-        p_reason: nullableText(timing.reason),
-      }),
-    timing,
+  await callDated(() =>
+    appDb().rpc('set_item_loss', {
+      p_request_id: timing.requestId,
+      p_item_id: itemId,
+      p_loss_pct: numericColumn(lossFraction),
+      p_effective_from: nullableText(timing.effectiveFrom),
+      p_effective_to: nullableText(timing.effectiveTo),
+      p_expected_token: timing.token,
+      p_reason: nullableText(timing.reason),
+    }),
   );
 }
 
@@ -480,20 +444,17 @@ export async function setItemConversion(
   factor: string | null,
   timing: DatedWrite,
 ): Promise<void> {
-  await callDated(
-    `conv:${itemId}:${unitCode}:${factor ?? ''}:${timing.effectiveFrom ?? 'now'}`,
-    () =>
-      appDb().rpc('set_item_conversion', {
-        p_request_id: timing.requestId,
-        p_item_id: itemId,
-        p_unit_code: unitCode,
-        p_factor: nullableNumeric(factor),
-        p_effective_from: nullableText(timing.effectiveFrom),
-        p_effective_to: nullableText(timing.effectiveTo),
-        p_expected_token: timing.token,
-        p_reason: nullableText(timing.reason),
-      }),
-    timing,
+  await callDated(() =>
+    appDb().rpc('set_item_conversion', {
+      p_request_id: timing.requestId,
+      p_item_id: itemId,
+      p_unit_code: unitCode,
+      p_factor: nullableNumeric(factor),
+      p_effective_from: nullableText(timing.effectiveFrom),
+      p_effective_to: nullableText(timing.effectiveTo),
+      p_expected_token: timing.token,
+      p_reason: nullableText(timing.reason),
+    }),
   );
 }
 
@@ -502,8 +463,8 @@ export async function addCustomUnit(
   labelAr: string,
   requestId?: string,
 ): Promise<string> {
-  const key = `unit:${code}:${labelAr}`;
-  const id = requestId ?? requestIdFor(key);
+  const subject = unitSubject(code, labelAr);
+  const id = requestId ?? beginAction(subject, (next) => next);
   try {
     const { data, error } = await appDb().rpc('add_custom_unit', {
       p_request_id: id,
@@ -514,10 +475,10 @@ export async function addCustomUnit(
     if (typeof data !== 'string' || data.length === 0) {
       throw new Error(genericCatalogError);
     }
-    if (!requestId) finishRequest(key, undefined);
+    if (!requestId) settleAction(subject);
     return data;
   } catch (error) {
-    if (!requestId) finishRequest(key, error);
+    if (!requestId) settleAction(subject, error);
     throw error;
   }
 }
@@ -542,18 +503,34 @@ export async function setOpeningPrice(
 function datedOrNow(
   itemId: string,
   unit: string,
+  timing: DatedWrite | undefined,
+): { owned: boolean; write: DatedWrite } {
+  if (timing) return { owned: false, write: timing };
+  const write = beginAction(conversionSubject(itemId, unit), (requestId) => ({
+    effectiveFrom: null,
+    effectiveTo: null,
+    token: emptyScheduleToken,
+    reason: null,
+    requestId,
+  }));
+  return { owned: true, write };
+}
+
+async function sendOwnedConversion(
+  itemId: string,
+  unit: string,
   factor: string | null,
   timing: DatedWrite | undefined,
-): DatedWrite {
-  return (
-    timing ?? {
-      effectiveFrom: null,
-      effectiveTo: null,
-      token: emptyScheduleToken,
-      reason: null,
-      requestId: requestIdFor(`conv:${itemId}:${unit}:${factor ?? ''}:now`),
-    }
-  );
+): Promise<void> {
+  const sent = datedOrNow(itemId, unit, timing);
+  const subject = conversionSubject(itemId, unit);
+  try {
+    await setItemConversion(itemId, unit, factor, sent.write);
+    if (sent.owned) settleAction(subject);
+  } catch (error) {
+    if (sent.owned) settleAction(subject, error);
+    throw error;
+  }
 }
 
 export async function addConversion(
@@ -563,12 +540,7 @@ export async function addConversion(
   _expectedBaseUnit: BaseUnit,
   timing?: DatedWrite,
 ): Promise<void> {
-  await setItemConversion(
-    itemId,
-    unit.trim(),
-    factorToBase,
-    datedOrNow(itemId, unit, factorToBase, timing),
-  );
+  await sendOwnedConversion(itemId, unit.trim(), factorToBase, timing);
 }
 
 export async function updateConversion(
@@ -579,12 +551,7 @@ export async function updateConversion(
   _expectedBaseUnit: BaseUnit,
   timing?: DatedWrite,
 ): Promise<void> {
-  await setItemConversion(
-    itemId,
-    unit,
-    factorToBase,
-    datedOrNow(itemId, unit, factorToBase, timing),
-  );
+  await sendOwnedConversion(itemId, unit, factorToBase, timing);
 }
 
 export async function deleteConversion(
@@ -594,10 +561,5 @@ export async function deleteConversion(
   _expectedBaseUnit: BaseUnit,
   timing?: DatedWrite,
 ): Promise<void> {
-  await setItemConversion(
-    itemId,
-    unit,
-    null,
-    datedOrNow(itemId, unit, null, timing),
-  );
+  await sendOwnedConversion(itemId, unit, null, timing);
 }

@@ -30,8 +30,20 @@ import {
   nextVersionStart,
   type EffectiveMode,
 } from '@/items/effective';
-import { heldWrite, holdWrite, settleRequest } from '@/items/request-id';
-import { messageFrom, StaleWriteError } from '@/items/errors';
+import {
+  isConfirmedConfigurationChange,
+  messageFrom,
+  StaleWriteError,
+} from '@/items/errors';
+import {
+  beginAction,
+  conversionSubject,
+  hasAction,
+  settleAction,
+  unknownAction,
+} from '@/items/request-id';
+import { UnknownSave } from '@/items/UnknownSave';
+import { isPayloadRefusal } from '@/lib/write-outcome';
 import { formatStoredFactor } from '@/items/format';
 import { unitLabels } from '@/items/labels';
 import type {
@@ -62,6 +74,8 @@ function storedFactorText(value: UnitConversion['storedFactor']): string {
 type ImpactView =
   | { status: 'ready'; key: string; text: string }
   | { status: 'error'; key: string };
+
+type ConversionAction = { factor: string; write: DatedWrite };
 
 function useDatedTiming(
   itemId: string,
@@ -111,28 +125,10 @@ function useDatedTiming(
     };
   }, [from, impactAttempt, impactKey, itemId, to]);
 
-  function intentFor(unit: string, factorKey: string): string {
-    return JSON.stringify({
-      itemId,
-      unit,
-      factorKey,
-      mode,
-      customLocal,
-      reason: reason.trim(),
-    });
-  }
-
-  function build(
-    unit: string,
-    factorKey: string,
-  ):
-    | { ok: true; intent: string; write: DatedWrite }
-    | { ok: false; error: string } {
+  function build():
+    { ok: true; write: DatedWrite } | { ok: false; error: string } {
     const now = Date.now();
     setEvaluatedNow(now);
-    const intent = intentFor(unit, factorKey);
-    const stored = heldWrite(intent);
-    if (stored) return { ok: true, intent, write: stored };
     const nowIso = new Date(now).toISOString();
     const backdatedNow = needsBackdatedReason(mode, shiftStart, customIso, now);
     if (backdatedNow && reason.trim().length === 0) {
@@ -152,7 +148,7 @@ function useDatedTiming(
         };
       }
     }
-    const preview = buildDatedWrite({
+    return buildDatedWrite({
       mode,
       shiftStart,
       customIso,
@@ -162,12 +158,6 @@ function useDatedTiming(
       reason,
       requestId: '00000000-0000-4000-8000-000000000000',
     });
-    if (!preview.ok) return preview;
-    const write = holdWrite(intent, (requestId) => ({
-      ...preview.write,
-      requestId,
-    }));
-    return { ok: true, intent, write };
   }
 
   const fields = (
@@ -189,11 +179,7 @@ function useDatedTiming(
     />
   );
 
-  return {
-    fields,
-    build,
-    settle: settleRequest,
-  };
+  return { fields, build };
 }
 
 function ConversionRow({
@@ -214,19 +200,26 @@ function ConversionRow({
   shiftStart: string | null;
   versions: readonly CostingVersion[];
   token: string;
-  onSave: (factor: string, timing: DatedWrite) => Promise<void>;
-  onDelete: (timing: DatedWrite) => Promise<void>;
+  onSave: (factor: string, timing: DatedWrite) => Promise<boolean>;
+  onDelete: (timing: DatedWrite) => Promise<boolean>;
 }) {
+  const subject = conversionSubject(conversion.itemId, conversion.unit);
   const [factor, setFactor] = useState(() =>
     formatStoredFactor(conversion.storedFactor),
   );
   const [error, setError] = useState<string | null>(null);
+  const [actionEpoch, setActionEpoch] = useState(0);
+  const flight = useRef(false);
+  const held =
+    actionEpoch < 0 ? null : unknownAction<ConversionAction>(subject);
+  const blocked = held !== null;
+  const sectionDisabled = disabled || blocked;
   const timing = useDatedTiming(
     conversion.itemId,
     shiftStart,
     versions,
     token,
-    disabled,
+    sectionDisabled,
   );
   const name = conversion.label ?? conversion.unit;
   const when = conversion.effectiveFrom
@@ -235,23 +228,58 @@ function ConversionRow({
   const automatic = conversion.source === 'implicit' ? ' تلقائي' : '';
   const readOnly = conversion.source === 'implicit';
 
-  function onSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const parsed = validateConversion(conversion.unit, factor, baseUnit);
-    if (!parsed.ok) {
-      setError(parsed.error);
-      return;
+  async function finish(action: ConversionAction) {
+    if (flight.current) return;
+    flight.current = true;
+    try {
+      const accepted =
+        action.factor === 'delete'
+          ? await onDelete(action.write)
+          : await onSave(action.factor, action.write);
+      if (
+        accepted === false &&
+        unknownAction<ConversionAction>(subject) === null
+      ) {
+        settleAction(subject);
+      }
+    } catch {
+      // The panel already settled this action and showed the error.
+    } finally {
+      flight.current = false;
+      setActionEpoch((value) => value + 1);
     }
-    const built = timing.build(conversion.unit, parsed.factor);
+  }
+
+  function begin(factorKey: string) {
+    if (disabled || blocked || flight.current || hasAction(subject)) return;
+    const built = timing.build();
     if (!built.ok) {
       setError(built.error);
       return;
     }
     setError(null);
-    void onSave(parsed.factor, built.write).then(
-      () => timing.settle(built.intent),
-      (error: unknown) => timing.settle(built.intent, error),
-    );
+    const action = beginAction(subject, (requestId) => ({
+      factor: factorKey,
+      write: { ...built.write, requestId },
+    }));
+    void finish(action);
+  }
+
+  function onSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (disabled || blocked || flight.current || hasAction(subject)) return;
+    const parsed = validateConversion(conversion.unit, factor, baseUnit);
+    if (!parsed.ok) {
+      setError(parsed.error);
+      return;
+    }
+    begin(parsed.factor);
+  }
+
+  function retry() {
+    if (!held || disabled || flight.current) return;
+    setError(null);
+    void finish(held);
   }
 
   return (
@@ -275,34 +303,31 @@ function ConversionRow({
                 className={fieldClass}
                 dir="ltr"
                 inputMode="decimal"
-                disabled={disabled}
+                disabled={sectionDisabled}
                 value={factor}
-                onChange={(event) => setFactor(event.target.value)}
+                onChange={(event) => {
+                  if (sectionDisabled) return;
+                  setFactor(event.target.value);
+                }}
               />
             </label>
-            <button className={primaryButton} type="submit" disabled={disabled}>
+            <button
+              className={primaryButton}
+              type="submit"
+              disabled={sectionDisabled}
+            >
               حفظ المعامل
             </button>
             <button
               className={secondaryButton}
               type="button"
-              disabled={disabled}
-              onClick={() => {
-                const built = timing.build(conversion.unit, 'delete');
-                if (!built.ok) {
-                  setError(built.error);
-                  return;
-                }
-                setError(null);
-                void onDelete(built.write).then(
-                  () => timing.settle(built.intent),
-                  (error: unknown) => timing.settle(built.intent, error),
-                );
-              }}
+              disabled={sectionDisabled}
+              onClick={() => begin('delete')}
             >
               احذف التحويل
             </button>
           </div>
+          {held ? <UnknownSave disabled={disabled} onRetry={retry} /> : null}
           {error ? <p role="alert">{error}</p> : null}
         </form>
       )}
@@ -327,6 +352,7 @@ export function ConversionsPanel({
   const aliveRef = useRef(false);
   const onItemStaleRef = useRef(onItemStale);
   const itemBaseUnitRef = useRef(item.baseUnit);
+  const addFlight = useRef(false);
   useEffect(() => {
     onItemStaleRef.current = onItemStale;
     itemBaseUnitRef.current = item.baseUnit;
@@ -342,6 +368,7 @@ export function ConversionsPanel({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [actionEpoch, setActionEpoch] = useState(0);
   const [unit, setUnit] = useState('');
   const [customCode, setCustomCode] = useState('');
   const [customLabel, setCustomLabel] = useState('');
@@ -359,12 +386,20 @@ export function ConversionsPanel({
   const shiftStart = metaReady ? (meta?.shiftStart ?? null) : null;
   const unitOptions = metaReady ? (meta?.unitOptions ?? []) : [];
   const controlsDisabled = busy || locked || !metaReady || schedule === null;
+  const addSubject =
+    addCode.length === 0 ? '' : conversionSubject(item.id, addCode);
+  const addHeld =
+    addSubject.length === 0 || actionEpoch < 0
+      ? null
+      : unknownAction<ConversionAction>(addSubject);
+  const addBlocked = addHeld !== null;
+  const addDisabled = controlsDisabled || addBlocked;
   const addTiming = useDatedTiming(
     item.id,
     shiftStart,
     addEntry?.versions ?? noVersions,
     addEntry?.token ?? emptyScheduleToken,
-    controlsDisabled,
+    addDisabled,
   );
 
   const applySnapshot = useCallback(
@@ -463,14 +498,15 @@ export function ConversionsPanel({
     };
   }, [item.id]);
 
-  async function run(work: () => Promise<void>) {
-    if (busy || locked) return;
+  async function run(work: () => Promise<void>): Promise<boolean> {
+    if (busy || locked) return false;
     setBusy(true);
     onBusyChange?.(true);
     setActionError(null);
     try {
       await work();
       await load();
+      return true;
     } catch (error) {
       setActionError(messageFrom(error));
       if (error instanceof StaleWriteError) await load();
@@ -481,10 +517,94 @@ export function ConversionsPanel({
     }
   }
 
+  function settleRow(rowSubject: string, error?: unknown) {
+    if (error === undefined) {
+      settleAction(rowSubject);
+      return;
+    }
+    if (hasAction(rowSubject)) settleAction(rowSubject, error);
+  }
+
+  async function sendHeldAdd(code: string, action: ConversionAction) {
+    if (!baseUnit || addFlight.current) return;
+    addFlight.current = true;
+    const subject = conversionSubject(item.id, code);
+    const label = customLabel.trim();
+    const freshUnit = unit === '__new__';
+    const expectedBaseUnit = baseUnit;
+    try {
+      const accepted = await run(async () => {
+        try {
+          let unitCode = code;
+          if (freshUnit) {
+            const remembered =
+              createdUnit &&
+              createdUnit.inputCode === code &&
+              createdUnit.label === label
+                ? createdUnit.code
+                : null;
+            if (!remembered) {
+              try {
+                unitCode = await addCustomUnit(code, label);
+              } catch (unitError) {
+                if (
+                  isPayloadRefusal(unitError) ||
+                  isConfirmedConfigurationChange(unitError) ||
+                  unitError instanceof StaleWriteError
+                ) {
+                  settleAction(subject);
+                }
+                throw unitError;
+              }
+              setCreatedUnit({ code: unitCode, inputCode: code, label });
+            } else {
+              unitCode = remembered;
+            }
+            const options = await listUnitOptions();
+            setMeta((current) =>
+              current && current.itemId === item.id
+                ? { ...current, unitOptions: options }
+                : current,
+            );
+          }
+          await addConversion(
+            item.id,
+            unitCode,
+            action.factor,
+            expectedBaseUnit,
+            action.write,
+          );
+          settleAction(subject);
+          setCreatedUnit(null);
+          setUnit('');
+          setCustomCode('');
+          setCustomLabel('');
+          setFactor('');
+        } catch (error) {
+          if (hasAction(subject)) settleAction(subject, error);
+          throw error;
+        }
+      });
+      if (
+        accepted === false &&
+        unknownAction<ConversionAction>(subject) === null
+      ) {
+        settleAction(subject);
+      }
+    } catch {
+      // run already settled this action and showed the error.
+    } finally {
+      addFlight.current = false;
+      setActionEpoch((value) => value + 1);
+    }
+  }
+
   function onAdd(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!baseUnit) return;
+    if (!baseUnit || controlsDisabled || addFlight.current) return;
     const code = unit === '__new__' ? customCode.trim() : unit.trim();
+    const subject = conversionSubject(item.id, code);
+    if (hasAction(subject)) return;
     if (unit === '__new__') {
       if (code.length < 1 || code.length > 20) {
         setActionError('كود الوحدة من حرف لحد 20');
@@ -501,57 +621,26 @@ export function ConversionsPanel({
       setActionError(parsed.error);
       return;
     }
-    const built = addTiming.build(parsed.unit, parsed.factor);
+    const built = addTiming.build();
     if (!built.ok) {
       setActionError(built.error);
       return;
     }
-    const expectedBaseUnit = baseUnit;
-    const label = customLabel.trim();
-    const freshUnit = unit === '__new__';
-    void run(async () => {
-      try {
-        let unitCode = parsed.unit;
-        if (freshUnit) {
-          const remembered =
-            createdUnit &&
-            createdUnit.inputCode === parsed.unit &&
-            createdUnit.label === label
-              ? createdUnit.code
-              : null;
-          unitCode = remembered ?? (await addCustomUnit(parsed.unit, label));
-          if (!remembered) {
-            setCreatedUnit({
-              code: unitCode,
-              inputCode: parsed.unit,
-              label,
-            });
-          }
-          const options = await listUnitOptions();
-          setMeta((current) =>
-            current && current.itemId === item.id
-              ? { ...current, unitOptions: options }
-              : current,
-          );
-        }
-        await addConversion(
-          item.id,
-          unitCode,
-          parsed.factor,
-          expectedBaseUnit,
-          built.write,
-        );
-        addTiming.settle(built.intent);
-        setCreatedUnit(null);
-        setUnit('');
-        setCustomCode('');
-        setCustomLabel('');
-        setFactor('');
-      } catch (error) {
-        addTiming.settle(built.intent, error, freshUnit);
-        throw error;
-      }
-    }).catch(() => undefined);
+    const action = beginAction(subject, (requestId) => ({
+      factor: parsed.factor,
+      write: { ...built.write, requestId },
+    }));
+    void sendHeldAdd(code, action);
+  }
+
+  function retryAdd() {
+    if (!baseUnit || busy || locked || addFlight.current) return;
+    const code = unit === '__new__' ? customCode.trim() : unit.trim();
+    const action = unknownAction<ConversionAction>(
+      conversionSubject(item.id, code),
+    );
+    if (!action) return;
+    void sendHeldAdd(code, action);
   }
 
   if ((rows === null || baseUnit === null) && loadError) {
@@ -604,29 +693,43 @@ export function ConversionsPanel({
             shiftStart={shiftStart}
             versions={entry?.versions ?? noVersions}
             token={entry?.token ?? emptyScheduleToken}
-            onSave={(nextFactor, timing) =>
-              run(() =>
-                updateConversion(
-                  item.id,
-                  conversion.unit,
-                  nextFactor,
-                  storedFactorText(conversion.storedFactor),
-                  baseUnit,
-                  timing,
-                ),
-              )
-            }
-            onDelete={(timing) =>
-              run(() =>
-                deleteConversion(
-                  item.id,
-                  conversion.unit,
-                  storedFactorText(conversion.storedFactor),
-                  baseUnit,
-                  timing,
-                ),
-              )
-            }
+            onSave={(nextFactor, timing) => {
+              const rowSubject = conversionSubject(item.id, conversion.unit);
+              return run(async () => {
+                try {
+                  await updateConversion(
+                    item.id,
+                    conversion.unit,
+                    nextFactor,
+                    storedFactorText(conversion.storedFactor),
+                    baseUnit,
+                    timing,
+                  );
+                  settleRow(rowSubject);
+                } catch (error) {
+                  settleRow(rowSubject, error);
+                  throw error;
+                }
+              });
+            }}
+            onDelete={(timing) => {
+              const rowSubject = conversionSubject(item.id, conversion.unit);
+              return run(async () => {
+                try {
+                  await deleteConversion(
+                    item.id,
+                    conversion.unit,
+                    storedFactorText(conversion.storedFactor),
+                    baseUnit,
+                    timing,
+                  );
+                  settleRow(rowSubject);
+                } catch (error) {
+                  settleRow(rowSubject, error);
+                  throw error;
+                }
+              });
+            }}
           />
         );
       })}
@@ -666,9 +769,12 @@ export function ConversionsPanel({
           الوحدة
           <select
             className={fieldClass}
-            disabled={controlsDisabled}
+            disabled={addDisabled}
             value={unit}
-            onChange={(event) => setUnit(event.target.value)}
+            onChange={(event) => {
+              if (addDisabled) return;
+              setUnit(event.target.value);
+            }}
           >
             <option value="">اختار</option>
             {unitOptions.map((option) => (
@@ -687,9 +793,12 @@ export function ConversionsPanel({
                 className={fieldClass}
                 dir="ltr"
                 autoComplete="off"
-                disabled={controlsDisabled}
+                disabled={addDisabled}
                 value={customCode}
-                onChange={(event) => setCustomCode(event.target.value)}
+                onChange={(event) => {
+                  if (addDisabled) return;
+                  setCustomCode(event.target.value);
+                }}
               />
             </label>
             <label className="flex flex-col gap-1">
@@ -697,9 +806,12 @@ export function ConversionsPanel({
               <input
                 className={fieldClass}
                 autoComplete="off"
-                disabled={controlsDisabled}
+                disabled={addDisabled}
                 value={customLabel}
-                onChange={(event) => setCustomLabel(event.target.value)}
+                onChange={(event) => {
+                  if (addDisabled) return;
+                  setCustomLabel(event.target.value);
+                }}
               />
             </label>
           </>
@@ -710,9 +822,12 @@ export function ConversionsPanel({
             className={fieldClass}
             dir="ltr"
             inputMode="decimal"
-            disabled={controlsDisabled}
+            disabled={addDisabled}
             value={factor}
-            onChange={(event) => setFactor(event.target.value)}
+            onChange={(event) => {
+              if (addDisabled) return;
+              setFactor(event.target.value);
+            }}
           />
         </label>
         {addTiming.fields}
@@ -720,11 +835,10 @@ export function ConversionsPanel({
           1 من الوحدة دي = كام {baseLabel}
         </p>
         {actionError ? <p role="alert">{actionError}</p> : null}
-        <button
-          className={primaryButton}
-          type="submit"
-          disabled={controlsDisabled}
-        >
+        {addHeld ? (
+          <UnknownSave disabled={busy || locked} onRetry={retryAdd} />
+        ) : null}
+        <button className={primaryButton} type="submit" disabled={addDisabled}>
           ضيف التحويل
         </button>
       </form>

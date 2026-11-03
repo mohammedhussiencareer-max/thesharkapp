@@ -14,7 +14,11 @@ export class StaleWriteError extends Error {
 }
 
 export class CostingChangedError extends StaleWriteError {
-  /** 40001 aborts before commit, so the request id stored nothing. */
+  /**
+   * Thrown only when a costing writer raises 40001 with the message
+   * `configuration changed` after the request-id replay lookup. That proves
+   * this request id stored nothing. A generic 40001 does not.
+   */
   readonly code = '40001';
 
   constructor() {
@@ -22,6 +26,31 @@ export class CostingChangedError extends StaleWriteError {
     this.name = 'CostingChangedError';
     this.message = costingChangedMessage;
   }
+}
+
+/**
+ * True only for the writers' post-replay conflict. The Arabic owner message
+ * is not enough: a generic serialization failure is also 40001.
+ */
+export function isConfirmedConfigurationChange(error: unknown): boolean {
+  let current: unknown = error;
+  const seen = new Set<object>();
+  for (let depth = 0; depth < 5; depth += 1) {
+    if (typeof current !== 'object' || current === null) return false;
+    if (seen.has(current)) return false;
+    seen.add(current);
+    if (current instanceof CostingChangedError) return true;
+    const record = current as {
+      code?: unknown;
+      message?: unknown;
+      cause?: unknown;
+    };
+    if (record.code === '40001' && record.message === 'configuration changed') {
+      return true;
+    }
+    current = record.cause;
+  }
+  return false;
 }
 
 const checkReasons: ReadonlyArray<readonly [string, string]> = [

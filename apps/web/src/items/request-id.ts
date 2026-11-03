@@ -1,65 +1,106 @@
-import type { DatedWrite } from '@/items/types';
-import { isPayloadRefusal, isUnknownOutcome } from '@/lib/write-outcome';
+import {
+  isConfirmedConfigurationChange,
+  StaleWriteError,
+} from '@/items/errors';
+import type { ItemDraft } from '@/items/types';
+import { isPayloadRefusal } from '@/lib/write-outcome';
+
+/** Shown while the last save for a subject might already be stored. */
+export const unknownSaveMessage = 'آخر حفظ مش متأكد إنه اتسجل';
 
 type Held = {
   requestId: string;
-  write: DatedWrite;
+  payload: unknown;
   /**
-   * True once a send's outcome was unknown. A later 42501 can fire before
-   * the server replays the request id, so it does not prove the original
-   * failed. The payload stays until success or a refusal of the payload itself.
+   * Set once an outcome did not prove the action is absent. The section stays
+   * locked and the only send is a retry of this payload.
    */
-  unresolved: boolean;
+  unknown: boolean;
 };
 
 const held = new Map<string, Held>();
 
-/** Test isolation. Production callers never clear another action's id. */
+/** Test isolation. Production callers never clear another subject's action. */
 export function resetHeldWrites(): void {
   held.clear();
 }
 
-/** The write stored for an unknown-outcome retry of this exact action. */
-export function heldWrite(intent: string): DatedWrite | null {
-  return held.get(intent)?.write ?? null;
+export function lossSubject(itemId: string): string {
+  return `loss:${itemId}`;
+}
+
+export function priceSubject(itemId: string): string {
+  return `price:${itemId}`;
+}
+
+export function conversionSubject(itemId: string, unit: string): string {
+  return `conversion:${itemId}:${unit}`;
+}
+
+/** One create action per submitted draft. */
+export function createSubject(draft: ItemDraft): string {
+  return `create:${JSON.stringify({
+    name: draft.name.trim(),
+    kind: draft.kind,
+    baseUnit: draft.baseUnit,
+    countFrequency: draft.countFrequency,
+    parentItemId: draft.parentItemId,
+    lossPct: draft.lossPct,
+    active: draft.active,
+  })}`;
+}
+
+/** One custom-unit action per code and label. */
+export function unitSubject(code: string, label: string): string {
+  return `unit:${code.trim()}:${label.trim()}`;
+}
+
+export function hasAction(subject: string): boolean {
+  return held.has(subject);
+}
+
+/** The payload whose outcome is still unknown. Null while a send is in flight. */
+export function unknownAction<T>(subject: string): T | null {
+  const current = held.get(subject);
+  if (!current?.unknown) return null;
+  return current.payload as T;
 }
 
 /**
- * One id per action intent. A retry of the same intent reuses the write that
- * was first submitted, including its effective end.
+ * At most one outstanding action per subject. A second begin returns the
+ * payload already held, including its request id.
  */
-export function holdWrite(
-  intent: string,
-  create: (requestId: string) => DatedWrite,
-): DatedWrite {
-  const existing = held.get(intent);
-  if (existing) return existing.write;
+export function beginAction<T>(
+  subject: string,
+  create: (requestId: string) => T,
+): T {
+  const existing = held.get(subject);
+  if (existing) return existing.payload as T;
   const requestId = crypto.randomUUID();
-  const write = create(requestId);
-  held.set(intent, { requestId, write, unresolved: false });
-  return write;
+  const payload = create(requestId);
+  held.set(subject, { requestId, payload, unknown: false });
+  return payload;
 }
 
 /**
- * Drop the id after success, or after a refusal that proves nothing was stored.
- * An unknown outcome stays unresolved. A later permission or contention error
- * keeps that payload; only `isPayloadRefusal` clears it. `untilSuccess` keeps
- * the id through a rolled-back failure so a two-step retry sends the same
- * conversion payload.
+ * Success, a payload refusal, a known stale write, or a confirmed
+ * `configuration changed` retires the action. 42501, a generic 40001, and a
+ * lost response keep it and mark the outcome unknown.
  */
-export function settleRequest(
-  intent: string,
-  error?: unknown,
-  untilSuccess = false,
-): void {
+export function settleAction(subject: string, error?: unknown): void {
   if (error === undefined) {
-    held.delete(intent);
+    held.delete(subject);
     return;
   }
-  const current = held.get(intent);
+  const current = held.get(subject);
   if (!current) return;
-  if (isUnknownOutcome(error)) current.unresolved = true;
-  if (untilSuccess) return;
-  if (current.unresolved && !isPayloadRefusal(error)) return;
-  held.delete(intent);
+  if (
+    isConfirmedConfigurationChange(error) ||
+    isPayloadRefusal(error) ||
+    error instanceof StaleWriteError
+  ) {
+    held.delete(subject);
+    return;
+  }
+  current.unknown = true;
 }

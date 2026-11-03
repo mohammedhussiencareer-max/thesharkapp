@@ -23,8 +23,17 @@ import {
   nextVersionStart,
   type EffectiveMode,
 } from '@/items/effective';
-import { heldWrite, holdWrite, settleRequest } from '@/items/request-id';
-import { CostingChangedError, messageFrom } from '@/items/errors';
+import { isConfirmedConfigurationChange, messageFrom } from '@/items/errors';
+import {
+  beginAction,
+  createSubject,
+  hasAction,
+  lossSubject,
+  priceSubject,
+  settleAction,
+  unknownAction,
+} from '@/items/request-id';
+import { UnknownSave } from '@/items/UnknownSave';
 import {
   frequencyOptions,
   kindOptions,
@@ -37,6 +46,8 @@ import {
   isStockKind,
   type CatalogItem,
   type CostingSchedule,
+  type DatedWrite,
+  type ItemDraft,
   type ItemSave,
 } from '@/items/types';
 
@@ -56,6 +67,14 @@ const primaryButton =
   'rounded bg-neutral-900 px-3 py-2 text-white disabled:opacity-60';
 const secondaryButton =
   'rounded border border-neutral-300 px-3 py-2 disabled:opacity-60';
+
+type LossAction = { lossPct: string; write: DatedWrite };
+type PriceAction = {
+  price: string;
+  reason: string | null;
+  expectedId: string | null;
+  requestId: string;
+};
 
 export function ItemForm({
   items,
@@ -77,7 +96,7 @@ export function ItemForm({
   locked?: boolean;
   serverError: string | null;
   onClearServerError: () => void;
-  onSubmit: (action: ItemSave) => Promise<void>;
+  onSubmit: (action: ItemSave) => Promise<boolean>;
   onCancel: () => void;
   /** Bumped after a stale details reload. Resets details only. */
   detailsKey?: number;
@@ -115,12 +134,17 @@ export function ItemForm({
   const [priceError, setPriceError] = useState<string | null>(null);
   const timingTouched = useRef(false);
   const scheduleLoad = useRef(0);
+  const lossFlight = useRef(false);
+  const priceFlight = useRef(false);
+  const createFlight = useRef(false);
   // Actual clock for the backdating rule. A null start is still the server's
   // current minute. An explicit time, including the shift start, is backdated
   // when it is earlier than this instant.
   const [mountNow] = useState(() => Date.now());
   const [submitNow, setSubmitNow] = useState<number | null>(null);
   const [refreshingSchedule, setRefreshingSchedule] = useState(false);
+  const [actionEpoch, setActionEpoch] = useState(0);
+  const [submittedDraft, setSubmittedDraft] = useState<ItemDraft | null>(null);
   const nowMs = submitNow ?? mountNow;
   const title = editingId ? 'تعديل الصنف' : 'صنف جديد';
   const editing = items.find((item) => item.id === editingId);
@@ -128,6 +152,25 @@ export function ItemForm({
   const initialLoss = initial?.lossPercent ?? '';
   const lossDirty =
     editingId !== undefined && values.lossPercent.trim() !== initialLoss.trim();
+  const heldNow = actionEpoch;
+  const lossHeld =
+    editingId === undefined || heldNow < 0
+      ? null
+      : unknownAction<LossAction>(lossSubject(editingId));
+  const priceHeld =
+    editingId === undefined || heldNow < 0
+      ? null
+      : unknownAction<PriceAction>(priceSubject(editingId));
+  const createHeld =
+    submittedDraft === null || heldNow < 0
+      ? null
+      : unknownAction<string>(createSubject(submittedDraft));
+  const lossBlocked = lossHeld !== null;
+  const priceBlocked = priceHeld !== null;
+  const createBlocked = createHeld !== null;
+  const detailsDisabled = submitting || locked || createBlocked;
+  const lossDisabled = submitting || locked || lossBlocked || createBlocked;
+  const priceDisabled = submitting || locked || priceBlocked;
   const parsedPrice = parseUnitCost(priceText);
   const zeroPrice =
     parsedPrice.ok && !('empty' in parsedPrice) && parsedPrice.text === '0';
@@ -233,42 +276,93 @@ export function ItemForm({
     });
   }
 
-  async function finish(intent: string, work: () => Promise<void>) {
+  async function finishLoss(action: LossAction) {
+    if (!editingId || lossFlight.current) return;
+    lossFlight.current = true;
+    const subject = lossSubject(editingId);
+    setRefreshingSchedule(true);
     try {
-      await work();
-      settleRequest(intent);
+      const accepted = await onSubmit({
+        kind: 'loss',
+        lossPct: action.lossPct,
+        write: action.write,
+      });
+      // A refused send never reached the database. A retry whose page is
+      // busy still has an unknown outcome and must keep its payload.
+      if (accepted !== true) {
+        if (unknownAction<LossAction>(subject) === null) settleAction(subject);
+        return;
+      }
+      settleAction(subject);
+      await reloadLossSchedule();
     } catch (error) {
-      settleRequest(intent, error);
+      settleAction(subject, error);
+      if (isConfirmedConfigurationChange(error)) await reloadLossSchedule();
+    } finally {
+      lossFlight.current = false;
+      setRefreshingSchedule(false);
+      setActionEpoch((value) => value + 1);
     }
   }
 
-  async function finishLoss(intent: string, work: () => Promise<void>) {
-    setRefreshingSchedule(true);
+  async function finishPrice(action: PriceAction) {
+    if (!editingId || priceFlight.current) return;
+    priceFlight.current = true;
+    const subject = priceSubject(editingId);
     try {
-      await work();
-      settleRequest(intent);
-      await reloadLossSchedule();
+      const accepted = await onSubmit({
+        kind: 'price',
+        price: action.price,
+        reason: action.reason,
+        expectedId: action.expectedId,
+        requestId: action.requestId,
+      });
+      if (accepted !== true) {
+        if (unknownAction<PriceAction>(subject) === null) settleAction(subject);
+        return;
+      }
+      settleAction(subject);
     } catch (error) {
-      settleRequest(intent, error);
-      if (error instanceof CostingChangedError) await reloadLossSchedule();
+      settleAction(subject, error);
     } finally {
-      setRefreshingSchedule(false);
+      priceFlight.current = false;
+      setActionEpoch((value) => value + 1);
     }
   }
 
   function saveCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (detailsDisabled || createFlight.current) return;
+    if (submittedDraft && hasAction(createSubject(submittedDraft))) return;
     const result = validateItemForm(values, { items, editingId });
     if (!result.ok) {
       setErrors(result.errors);
       return;
     }
-    void onSubmit({ kind: 'create', draft: result.draft }).catch(
-      () => undefined,
-    );
+    createFlight.current = true;
+    setSubmittedDraft(result.draft);
+    void onSubmit({ kind: 'create', draft: result.draft })
+      .catch(() => undefined)
+      .finally(() => {
+        createFlight.current = false;
+        setActionEpoch((value) => value + 1);
+      });
+  }
+
+  function retryCreate() {
+    if (!submittedDraft || submitting || locked || createFlight.current) return;
+    if (unknownAction<string>(createSubject(submittedDraft)) === null) return;
+    createFlight.current = true;
+    void onSubmit({ kind: 'create', draft: submittedDraft })
+      .catch(() => undefined)
+      .finally(() => {
+        createFlight.current = false;
+        setActionEpoch((value) => value + 1);
+      });
   }
 
   function saveDetails() {
+    if (detailsDisabled) return;
     const result = validateItemForm(values, {
       items,
       editingId,
@@ -283,17 +377,32 @@ export function ItemForm({
     );
   }
 
-  function lossIntent(lossPct: string): string {
-    return JSON.stringify({
-      item: editingId,
-      lossPct,
-      mode,
-      customLocal,
-      reason: lossReason.trim(),
-    });
+  function retryLoss() {
+    if (
+      !editingId ||
+      submitting ||
+      locked ||
+      refreshingSchedule ||
+      lossFlight.current
+    ) {
+      return;
+    }
+    const action = unknownAction<LossAction>(lossSubject(editingId));
+    if (!action) return;
+    void finishLoss(action);
   }
 
   function saveLoss() {
+    if (
+      !editingId ||
+      submitting ||
+      locked ||
+      refreshingSchedule ||
+      lossFlight.current ||
+      hasAction(lossSubject(editingId))
+    ) {
+      return;
+    }
     if (initialLoss.trim() !== '' && values.lossPercent.trim() === '') {
       setErrors({
         lossPercent: 'اكتب نسبة الفاقد. صفر فاقد معتمد يتكتب 0.',
@@ -309,7 +418,7 @@ export function ItemForm({
       setErrors({ lossPercent: lossError });
       return;
     }
-    if (!lossDirty || refreshingSchedule) return;
+    if (!lossDirty) return;
     if (!schedule) {
       setExtraError('لسه بنحمّل بيانات الفاقد');
       return;
@@ -318,14 +427,6 @@ export function ItemForm({
       ? checked.draft.lossPct
       : lossPercentToFraction(values.lossPercent);
     if (!lossPct) return;
-    const intent = lossIntent(lossPct);
-    const stored = heldWrite(intent);
-    if (stored) {
-      void finishLoss(intent, () =>
-        onSubmit({ kind: 'loss', lossPct, write: stored }),
-      );
-      return;
-    }
     const now = Date.now();
     setSubmitNow(now);
     const nowIso = new Date(now).toISOString();
@@ -364,14 +465,30 @@ export function ItemForm({
         return;
       }
     }
-    const write = holdWrite(intent, (requestId) => ({
-      ...built.write,
-      requestId,
+    const action = beginAction(lossSubject(editingId), (requestId) => ({
+      lossPct,
+      write: { ...built.write, requestId },
     }));
-    void finishLoss(intent, () => onSubmit({ kind: 'loss', lossPct, write }));
+    void finishLoss(action);
+  }
+
+  function retryPrice() {
+    if (!editingId || submitting || locked || priceFlight.current) return;
+    const action = unknownAction<PriceAction>(priceSubject(editingId));
+    if (!action) return;
+    void finishPrice(action);
   }
 
   function savePrice() {
+    if (
+      !editingId ||
+      submitting ||
+      locked ||
+      priceFlight.current ||
+      hasAction(priceSubject(editingId))
+    ) {
+      return;
+    }
     setPriceError(null);
     const parsed = parseUnitCost(priceText);
     if (!parsed.ok) {
@@ -390,28 +507,13 @@ export function ItemForm({
       return;
     }
     const reason = price === '0' ? priceReason.trim() : null;
-    const intent = JSON.stringify({
-      item: editingId,
+    const action = beginAction(priceSubject(editingId), (requestId) => ({
       price,
       reason,
       expectedId: editing?.openingPriceId ?? null,
-    });
-    const requestId = holdWrite(intent, (id) => ({
-      effectiveFrom: null,
-      effectiveTo: null,
-      token: '',
-      reason,
-      requestId: id,
-    })).requestId;
-    void finish(intent, () =>
-      onSubmit({
-        kind: 'price',
-        price,
-        reason,
-        expectedId: editing?.openingPriceId ?? null,
-        requestId,
-      }),
-    );
+      requestId,
+    }));
+    void finishPrice(action);
   }
 
   return (
@@ -437,9 +539,12 @@ export function ItemForm({
               className={fieldClass}
               name="item-name"
               autoComplete="off"
-              disabled={submitting || locked}
+              disabled={detailsDisabled}
               value={values.name}
-              onChange={(event) => change({ name: event.target.value })}
+              onChange={(event) => {
+                if (detailsDisabled) return;
+                change({ name: event.target.value });
+              }}
             />
           </label>
           {errors.name ? <p role="alert">{errors.name}</p> : null}
@@ -449,9 +554,12 @@ export function ItemForm({
             النوع
             <select
               className={fieldClass}
-              disabled={submitting || locked || identityLocked}
+              disabled={detailsDisabled || identityLocked}
               value={values.kind}
-              onChange={onKind}
+              onChange={(event) => {
+                if (detailsDisabled) return;
+                onKind(event);
+              }}
             >
               {kindOptions.map((option) => (
                 <option key={option.value} value={option.value}>
@@ -468,11 +576,12 @@ export function ItemForm({
               السمك المخلوط
               <select
                 className={fieldClass}
-                disabled={submitting || locked || identityLocked}
+                disabled={detailsDisabled || identityLocked}
                 value={values.parentItemId}
-                onChange={(event) =>
-                  change({ parentItemId: event.target.value })
-                }
+                onChange={(event) => {
+                  if (detailsDisabled) return;
+                  change({ parentItemId: event.target.value });
+                }}
               >
                 <option value="">اختار</option>
                 {parents.map((parent) => (
@@ -493,9 +602,10 @@ export function ItemForm({
             الوحدة الأساسية
             <select
               className={fieldClass}
-              disabled={submitting || locked || identityLocked}
+              disabled={detailsDisabled || identityLocked}
               value={values.baseUnit}
               onChange={(event) => {
+                if (detailsDisabled) return;
                 const baseUnit = event.target.value;
                 if (!isBaseUnit(baseUnit)) return;
                 change({ baseUnit });
@@ -521,9 +631,10 @@ export function ItemForm({
             الجرد
             <select
               className={fieldClass}
-              disabled={submitting || locked}
+              disabled={detailsDisabled}
               value={values.countFrequency}
               onChange={(event) => {
+                if (detailsDisabled) return;
                 const countFrequency = event.target.value;
                 if (!isCountFrequency(countFrequency)) return;
                 change({ countFrequency });
@@ -547,9 +658,12 @@ export function ItemForm({
               className={fieldClass}
               dir="ltr"
               inputMode="decimal"
-              disabled={submitting || locked}
+              disabled={lossDisabled}
               value={values.lossPercent}
-              onChange={(event) => change({ lossPercent: event.target.value })}
+              onChange={(event) => {
+                if (lossDisabled) return;
+                change({ lossPercent: event.target.value });
+              }}
             />
           </label>
           <p className="text-sm text-neutral-600">
@@ -577,23 +691,32 @@ export function ItemForm({
                     ? 'loading'
                     : shownImpact.status
               }
-              disabled={submitting || locked}
+              disabled={lossDisabled}
               onRetryImpact={() => setImpactAttempt((value) => value + 1)}
               onMode={(next) => {
+                if (lossDisabled) return;
                 timingTouched.current = true;
                 setExtraError(null);
                 setMode(next);
               }}
               onCustomLocal={(value) => {
+                if (lossDisabled) return;
                 timingTouched.current = true;
                 setExtraError(null);
                 setCustomLocal(value);
               }}
               onReason={(value) => {
+                if (lossDisabled) return;
                 timingTouched.current = true;
                 setExtraError(null);
                 setLossReason(value);
               }}
+            />
+          ) : null}
+          {lossHeld ? (
+            <UnknownSave
+              disabled={submitting || locked || refreshingSchedule}
+              onRetry={retryLoss}
             />
           ) : null}
         </div>
@@ -605,9 +728,10 @@ export function ItemForm({
                 className={fieldClass}
                 dir="ltr"
                 inputMode="decimal"
-                disabled={submitting || locked}
+                disabled={priceDisabled}
                 value={priceText}
                 onChange={(event) => {
+                  if (priceDisabled) return;
                   onClearServerError();
                   setPriceError(null);
                   setPriceText(event.target.value);
@@ -620,9 +744,10 @@ export function ItemForm({
                 <input
                   className={fieldClass}
                   autoComplete="off"
-                  disabled={submitting || locked}
+                  disabled={priceDisabled}
                   value={priceReason}
                   onChange={(event) => {
+                    if (priceDisabled) return;
                     setPriceError(null);
                     setPriceReason(event.target.value);
                   }}
@@ -630,24 +755,36 @@ export function ItemForm({
               </label>
             ) : null}
             {priceError ? <p role="alert">{priceError}</p> : null}
+            {priceHeld ? (
+              <UnknownSave
+                disabled={submitting || locked}
+                onRetry={retryPrice}
+              />
+            ) : null}
           </div>
         ) : null}
         <label className="flex items-center gap-2">
           <input
             type="checkbox"
-            disabled={submitting || locked}
+            disabled={detailsDisabled}
             checked={values.active}
-            onChange={(event) => change({ active: event.target.checked })}
+            onChange={(event) => {
+              if (detailsDisabled) return;
+              change({ active: event.target.checked });
+            }}
           />
           شغال
         </label>
+        {createHeld ? (
+          <UnknownSave disabled={submitting || locked} onRetry={retryCreate} />
+        ) : null}
         <div className="flex flex-wrap gap-2">
           {editingId ? (
             <>
               <button
                 className={primaryButton}
                 type="button"
-                disabled={submitting || locked}
+                disabled={detailsDisabled}
                 onClick={saveDetails}
               >
                 حفظ البيانات
@@ -655,7 +792,7 @@ export function ItemForm({
               <button
                 className={primaryButton}
                 type="button"
-                disabled={submitting || locked || refreshingSchedule}
+                disabled={lossDisabled || refreshingSchedule}
                 onClick={saveLoss}
               >
                 حفظ الفاقد
@@ -663,7 +800,7 @@ export function ItemForm({
               <button
                 className={primaryButton}
                 type="button"
-                disabled={submitting || locked}
+                disabled={priceDisabled}
                 onClick={savePrice}
               >
                 حفظ السعر
@@ -673,7 +810,7 @@ export function ItemForm({
             <button
               className={primaryButton}
               type="submit"
-              disabled={submitting || locked}
+              disabled={detailsDisabled}
             >
               حفظ
             </button>

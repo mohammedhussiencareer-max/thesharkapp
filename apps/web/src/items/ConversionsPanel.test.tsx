@@ -7,6 +7,7 @@ import {
   currentShiftStart,
   deleteConversion,
   listConversions,
+  listCostingSchedule,
   listUnitOptions,
   updateConversion,
 } from '@/items/api';
@@ -16,8 +17,8 @@ import {
   impactLoadingMessage,
   impactPendingMessage,
 } from '@/items/effective';
-import { StaleWriteError } from '@/items/errors';
-import { resetHeldWrites } from '@/items/request-id';
+import { CostingChangedError, StaleWriteError } from '@/items/errors';
+import { resetHeldWrites, unknownSaveMessage } from '@/items/request-id';
 import type { BaseUnit, CatalogItem, UnitConversion } from '@/items/types';
 
 vi.mock('@/items/api', () => ({
@@ -99,6 +100,12 @@ describe('ConversionsPanel', () => {
       { code: 'كرتونة', labelAr: 'كرتونة' },
       { code: 'piece', labelAr: 'قطعة' },
     ]);
+    vi.mocked(listCostingSchedule).mockReset();
+    vi.mocked(listCostingSchedule).mockResolvedValue({
+      lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      lossVersions: [],
+      conversions: [],
+    });
   });
 
   afterEach(() => {
@@ -526,8 +533,8 @@ describe('ConversionsPanel', () => {
       target: { value: '8' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('تعذر الاتصال');
-    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
     await waitFor(() => {
       expect(addConversion).toHaveBeenCalledTimes(2);
     });
@@ -595,7 +602,7 @@ describe('ConversionsPanel', () => {
     expect(vi.mocked(addConversion).mock.calls[0]?.[1]).toBe('دلو-1');
 
     vi.mocked(addConversion).mockResolvedValueOnce(undefined);
-    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
     await waitFor(() => {
       expect(addConversion).toHaveBeenCalledTimes(2);
     });
@@ -625,7 +632,7 @@ describe('ConversionsPanel', () => {
       expect(addConversion).toHaveBeenCalledTimes(2);
     });
     expect(addCustomUnit).toHaveBeenCalledTimes(1);
-    expect(sentTiming(1).requestId).toBe(sentTiming(0).requestId);
+    expect(sentTiming(1).requestId).not.toBe(sentTiming(0).requestId);
     expect(vi.mocked(addConversion).mock.calls[1]?.[1]).toBe('دلو-1');
   });
 
@@ -686,8 +693,11 @@ describe('ConversionsPanel', () => {
       }),
     );
 
+    expect(
+      await screen.findByRole('button', { name: 'إعادة المحاولة' }),
+    ).toBeInTheDocument();
     vi.setSystemTime(new Date('2026-07-15T10:00:00.000Z'));
-    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
     await waitFor(() => {
       expect(addConversion).toHaveBeenCalledTimes(2);
     });
@@ -770,12 +780,12 @@ describe('ConversionsPanel', () => {
       target: { value: '6' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('تعذر الاتصال');
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('مش مسموح');
 
-    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
     await waitFor(() => {
       expect(addConversion).toHaveBeenCalledTimes(3);
     });
@@ -843,5 +853,151 @@ describe('ConversionsPanel', () => {
         reason: 'تصحيح',
       }),
     );
+  });
+
+  it('retires an unknown conversion when configuration changed proves it was not stored', async () => {
+    let token = 'token-1';
+    vi.mocked(listConversions).mockResolvedValue(
+      snapshot([
+        {
+          itemId: 'oil',
+          unit: 'piece',
+          label: 'قطعة',
+          factorToBase: 1,
+          storedFactor: '1',
+        },
+      ]),
+    );
+    vi.mocked(listCostingSchedule).mockImplementation(() =>
+      Promise.resolve({
+        lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+        lossVersions: [],
+        conversions: [{ unitCode: 'كرتونة', token, versions: [] }],
+      }),
+    );
+    vi.mocked(addConversion)
+      .mockRejectedValueOnce(new Error('تعذر الاتصال'))
+      .mockImplementationOnce(() => {
+        token = 'token-2';
+        return Promise.reject(new CostingChangedError());
+      });
+    render(<ConversionsPanel item={item} />);
+    expect(await screen.findByText('1 قطعة = 1 كيلو')).toBeInTheDocument();
+    expect(
+      await screen.findByRole('option', { name: 'كرتونة' }),
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كرتونة' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '4' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(screen.getByLabelText('المعامل')).toBeDisabled();
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ المعامل' })).toBeEnabled();
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '9' },
+    });
+    expect(screen.getByLabelText('المعامل')).toHaveValue('4');
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(addConversion).toHaveBeenCalledTimes(1);
+    expect(sentTiming(0).requestId).not.toBe('');
+    expect(vi.mocked(addConversion).mock.calls[0]?.[4]).toEqual(
+      expect.objectContaining({ token: 'token-1' }),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'البيانات اتغيرت — حدّث الصفحة وجرّب تاني',
+    );
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'ضيف التحويل' })).toBeEnabled();
+    });
+    expect(addConversion).toHaveBeenCalledTimes(2);
+    expect(sentTiming(1).requestId).toBe(sentTiming(0).requestId);
+    expect(vi.mocked(addConversion).mock.calls[1]?.[4]).toEqual(
+      expect.objectContaining({ token: 'token-1' }),
+    );
+
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '5' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(3);
+    });
+    expect(sentTiming(2).requestId).not.toBe(sentTiming(0).requestId);
+    expect(vi.mocked(addConversion).mock.calls[2]?.[2]).toBe('5');
+    expect(vi.mocked(addConversion).mock.calls[2]?.[4]).toEqual(
+      expect.objectContaining({ token: 'token-2' }),
+    );
+  });
+
+  it('applies a later return to an earlier factor with a fresh request id', async () => {
+    vi.mocked(listConversions).mockResolvedValue(
+      snapshot([
+        {
+          itemId: 'oil',
+          unit: 'كرتونة',
+          factorToBase: 4,
+          storedFactor: '4',
+        },
+      ]),
+    );
+    vi.mocked(updateConversion)
+      .mockRejectedValueOnce(new Error('تعذر الاتصال'))
+      .mockResolvedValue(undefined);
+    render(<ConversionsPanel item={item} />);
+    expect(await screen.findByText('1 كرتونة = 4 كيلو')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(screen.getByLabelText('معامل كرتونة')).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('معامل كرتونة'), {
+      target: { value: '5' },
+    });
+    expect(screen.getByLabelText('معامل كرتونة')).toHaveValue('4');
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+    expect(updateConversion).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => {
+      expect(updateConversion).toHaveBeenCalledTimes(2);
+    });
+    const ids = () =>
+      vi.mocked(updateConversion).mock.calls.map((call) => {
+        const timing = call[5] as { requestId: string };
+        return timing.requestId;
+      });
+    expect(ids()[1]).toBe(ids()[0]);
+    expect(vi.mocked(updateConversion).mock.calls[1]?.[2]).toBe('4');
+    await waitFor(() => {
+      expect(screen.getByLabelText('معامل كرتونة')).toBeEnabled();
+    });
+
+    fireEvent.change(screen.getByLabelText('معامل كرتونة'), {
+      target: { value: '5' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+    await waitFor(() => {
+      expect(updateConversion).toHaveBeenCalledTimes(3);
+    });
+    fireEvent.change(screen.getByLabelText('معامل كرتونة'), {
+      target: { value: '4' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+    await waitFor(() => {
+      expect(updateConversion).toHaveBeenCalledTimes(4);
+    });
+    expect(ids()[2]).not.toBe(ids()[0]);
+    expect(ids()[3]).not.toBe(ids()[2]);
+    expect(ids()[3]).not.toBe(ids()[0]);
+    expect(
+      vi.mocked(updateConversion).mock.calls.map((call) => call[2]),
+    ).toEqual(['4', '4', '5', '4']);
   });
 });

@@ -83,13 +83,15 @@ export function EffectiveTimeFields({
       {backdated && impactStatus === 'error' ? (
         <div className="flex flex-col gap-2">
           <p role="alert">{impactErrorMessage}</p>
-          <button
-            className="w-fit rounded border border-neutral-300 px-3 py-2"
-            type="button"
-            onClick={onRetryImpact}
-          >
-            إعادة المحاولة
-          </button>
+          {disabled ? null : (
+            <button
+              className="w-fit rounded border border-neutral-300 px-3 py-2"
+              type="button"
+              onClick={onRetryImpact}
+            >
+              إعادة المحاولة
+            </button>
+          )}
         </div>
       ) : null}
       {backdated && impactStatus === 'ready' && impact ? <p>{impact}</p> : null}
