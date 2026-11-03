@@ -159,7 +159,7 @@ select
   throws_ok (
     'truncate table app.units cascade',
     '55000',
-    null::text,
+    'app.units is immutable; TRUNCATE is not allowed',
     'units cannot be truncated'
   );
 
@@ -261,6 +261,27 @@ values
   (
     'e4010000-0000-4000-8000-000000000009',
     'صنف تغطية كاملة',
+    'ingredient',
+    'kg',
+    'weekly'
+  ),
+  (
+    'e4010000-0000-4000-8000-000000000010',
+    'صنف مدى',
+    'ingredient',
+    'kg',
+    'weekly'
+  ),
+  (
+    'e4010000-0000-4000-8000-000000000011',
+    'صنف فجوة',
+    'ingredient',
+    'kg',
+    'weekly'
+  ),
+  (
+    'e4010000-0000-4000-8000-000000000012',
+    'صنف توقيت',
     'ingredient',
     'kg',
     'weekly'
@@ -709,6 +730,91 @@ select
   );
 
 select
+  is (
+    app.set_item_conversion (
+      'e4010000-0000-4000-8000-000000000111',
+      'e4010000-0000-4000-8000-000000000002',
+      'carton',
+      12,
+      '2026-01-01 00:00:00+00',
+      null,
+      md5(''),
+      'كرتونة'
+    ),
+    (
+      select
+        result
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000111'
+    ),
+    'same conversion request returns the stored result'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000111'
+    ),
+    1::bigint,
+    'same conversion request inserts nothing'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.item_conversion_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000002'
+    ),
+    1::bigint,
+    'conversion replay does not add a version'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_conversion(
+      'e4010000-0000-4000-8000-000000000111',
+      'e4010000-0000-4000-8000-000000000002',
+      'carton',
+      13,
+      '2026-01-01 00:00:00+00',
+      null,
+      'stale-token',
+      'كرتونة'
+    )$$,
+    '22023',
+    'request_id already used for a different change',
+    'same conversion request_id with different args is rejected before the token check'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_conversion(
+      'e4010000-0000-4000-8000-000000000114',
+      'e4010000-0000-4000-8000-000000000002',
+      'carton',
+      13,
+      '2026-07-01 00:00:00+00',
+      null,
+      md5(''),
+      'سبب'
+    )$$,
+    '40001',
+    'configuration changed',
+    'stale conversion token is rejected'
+  );
+
+select
   lives_ok (
     $$select app.set_item_conversion(
       'e4010000-0000-4000-8000-000000000112',
@@ -843,6 +949,65 @@ select
     'a conversion in the base unit is rejected'
   );
 
+select
+  throws_ok (
+    $$insert into app.item_conversion_versions (
+      effective_from, created_change_id, item_id, unit_code, factor_to_base
+    ) values (
+      '2026-02-01 00:00:00+00',
+      (select id from app.costing_changes where request_id = 'e4010000-0000-4000-8000-0000000001f1'),
+      'e4010000-0000-4000-8000-000000000002',
+      'carton',
+      3
+    )$$,
+    '23P01',
+    null::text,
+    'exclusion constraint blocks an overlapping current conversion version'
+  );
+
+select
+  throws_ok (
+    $$update app.item_conversion_versions
+      set factor_to_base = 99
+      where item_id = 'e4010000-0000-4000-8000-000000000002'
+        and unit_code = 'carton'
+        and superseded_change_id is null$$,
+    '55000',
+    'app.item_conversion_versions is immutable; only superseded_change_id may be set once',
+    'conversion payload cannot be updated'
+  );
+
+select
+  throws_ok (
+    $$update app.item_conversion_versions
+      set superseded_change_id = (
+        select id from app.costing_changes
+        where request_id = 'e4010000-0000-4000-8000-0000000001f1'
+      )
+      where item_id = 'e4010000-0000-4000-8000-000000000002'
+        and superseded_change_id is not null$$,
+    '55000',
+    'app.item_conversion_versions is immutable; only superseded_change_id may be set once',
+    'a conversion version cannot be superseded twice'
+  );
+
+select
+  throws_ok (
+    $$delete from app.item_conversion_versions
+      where item_id = 'e4010000-0000-4000-8000-000000000002'$$,
+    '55000',
+    'app.item_conversion_versions is immutable; DELETE is not allowed',
+    'conversion versions cannot be deleted'
+  );
+
+select
+  throws_ok (
+    'truncate table app.item_conversion_versions',
+    '55000',
+    'app.item_conversion_versions is immutable; TRUNCATE is not allowed',
+    'conversion versions cannot be truncated'
+  );
+
 set
   local role authenticated;
 
@@ -935,6 +1100,758 @@ select
         request_id = 'e4010000-0000-4000-8000-000000000123'
     ) is null,
     'a future change stores a null reason'
+  );
+
+-- Timestamps in the stored payload are UTC text, so a retry does not depend on TimeZone.
+set
+  local timezone to 'UTC';
+
+select
+  lives_ok (
+    $$select app.set_item_loss(
+      'e4010000-0000-4000-8000-000000000151',
+      'e4010000-0000-4000-8000-000000000012',
+      0.15,
+      '2026-08-01 12:30:00+00',
+      '2026-09-01 18:45:00.5+00',
+      md5(''),
+      'توقيت فاقد'
+    )$$,
+    'publish loss under UTC'
+  );
+
+select
+  lives_ok (
+    $$select app.set_item_conversion(
+      'e4010000-0000-4000-8000-000000000152',
+      'e4010000-0000-4000-8000-000000000012',
+      'carton',
+      6,
+      '2026-08-01 12:30:00+00',
+      '2026-09-01 18:45:00.5+00',
+      md5(''),
+      'توقيت تحويل'
+    )$$,
+    'publish conversion under UTC'
+  );
+
+select
+  is (
+    (
+      select
+        payload ->> 'effective_from'
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000151'
+    ),
+    '2026-08-01T12:30:00.000000Z',
+    'loss payload effective_from is UTC text'
+  );
+
+select
+  is (
+    (
+      select
+        payload ->> 'effective_to'
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000152'
+    ),
+    '2026-09-01T18:45:00.500000Z',
+    'conversion payload effective_to is UTC text'
+  );
+
+set
+  local timezone to 'Africa/Cairo';
+
+select
+  is (
+    app.set_item_loss (
+      'e4010000-0000-4000-8000-000000000151',
+      'e4010000-0000-4000-8000-000000000012',
+      0.15,
+      '2026-08-01 12:30:00+00',
+      '2026-09-01 18:45:00.5+00',
+      md5(''),
+      'توقيت فاقد'
+    ),
+    (
+      select
+        result
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000151'
+    ),
+    'same loss request under Africa/Cairo returns the stored result'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.item_loss_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000012'
+    ),
+    1::bigint,
+    'cairo loss replay inserts nothing'
+  );
+
+select
+  is (
+    app.set_item_conversion (
+      'e4010000-0000-4000-8000-000000000152',
+      'e4010000-0000-4000-8000-000000000012',
+      'carton',
+      6,
+      '2026-08-01 12:30:00+00',
+      '2026-09-01 18:45:00.5+00',
+      md5(''),
+      'توقيت تحويل'
+    ),
+    (
+      select
+        result
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000152'
+    ),
+    'same conversion request under Africa/Cairo returns the stored result'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.item_conversion_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000012'
+    ),
+    1::bigint,
+    'cairo conversion replay inserts nothing'
+  );
+
+set
+  local timezone to 'UTC';
+
+-- Three consecutive loss versions, then a replacement that cuts all of them.
+select
+  lives_ok (
+    $$select app.set_item_loss(
+      'e4010000-0000-4000-8000-000000000161',
+      'e4010000-0000-4000-8000-000000000010',
+      0.11,
+      '2026-01-01 00:00:00+00',
+      '2026-02-01 00:00:00+00',
+      md5(''),
+      'مدى أول'
+    )$$,
+    'publish the first of three consecutive loss versions'
+  );
+
+select
+  lives_ok (
+    format(
+      $$select app.set_item_loss(
+        'e4010000-0000-4000-8000-000000000162',
+        'e4010000-0000-4000-8000-000000000010',
+        0.22,
+        '2026-02-01 00:00:00+00',
+        '2026-03-01 00:00:00+00',
+        %L,
+        'مدى ثان'
+      )$$,
+      app.item_costing_schedule ('e4010000-0000-4000-8000-000000000010') -> 'loss' ->> 'token'
+    ),
+    'publish the second of three consecutive loss versions'
+  );
+
+select
+  lives_ok (
+    format(
+      $$select app.set_item_loss(
+        'e4010000-0000-4000-8000-000000000163',
+        'e4010000-0000-4000-8000-000000000010',
+        0.33,
+        '2026-03-01 00:00:00+00',
+        null,
+        %L,
+        'مدى ثالث'
+      )$$,
+      app.item_costing_schedule ('e4010000-0000-4000-8000-000000000010') -> 'loss' ->> 'token'
+    ),
+    'publish the third of three consecutive loss versions'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.item_loss_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000010'
+        and superseded_change_id is null
+    ),
+    3::bigint,
+    'three consecutive loss versions are current'
+  );
+
+select
+  lives_ok (
+    format(
+      $$select app.set_item_loss(
+        'e4010000-0000-4000-8000-000000000164',
+        'e4010000-0000-4000-8000-000000000010',
+        0.44,
+        '2026-01-15 00:00:00+00',
+        '2026-03-15 00:00:00+00',
+        %L,
+        'مدى وسط'
+      )$$,
+      app.item_costing_schedule ('e4010000-0000-4000-8000-000000000010') -> 'loss' ->> 'token'
+    ),
+    'replace an interval spanning three loss versions'
+  );
+
+select
+  is (
+    (
+      select
+        jsonb_array_length(result -> 'superseded')
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000164'
+    ),
+    3::int,
+    'a spanning replacement supersedes exactly those three versions'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.item_loss_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000010'
+        and superseded_change_id is null
+        and effective_from = '2026-01-01 00:00:00+00'
+        and effective_to = '2026-01-15 00:00:00+00'
+        and loss_pct = 0.11
+    ),
+    'spanning replacement keeps a left fragment of the first version'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.item_loss_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000010'
+        and superseded_change_id is null
+        and effective_from = '2026-03-15 00:00:00+00'
+        and effective_to is null
+        and loss_pct = 0.33
+    ),
+    'spanning replacement keeps a right fragment of the third version'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.item_loss_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000010'
+        and superseded_change_id is null
+        and loss_pct = 0.22
+    ),
+    0::bigint,
+    'the middle version contributes no fragment'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.item_loss_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000010'
+        and superseded_change_id is null
+        and effective_from = '2026-01-15 00:00:00+00'
+        and effective_to = '2026-03-15 00:00:00+00'
+        and loss_pct = 0.44
+    ),
+    'spanning replacement inserts the new loss across the covered interval'
+  );
+
+select
+  is (
+    app.item_loss_at (
+      'e4010000-0000-4000-8000-000000000010',
+      '2026-01-14 00:00:00+00'
+    )::text,
+    '0.11000',
+    'loss just before the spanning replacement stays on the first version'
+  );
+
+select
+  is (
+    app.item_loss_at (
+      'e4010000-0000-4000-8000-000000000010',
+      '2026-01-15 00:00:00+00'
+    )::text,
+    '0.44000',
+    'loss at the spanning replacement start is the new value'
+  );
+
+select
+  is (
+    app.item_loss_at (
+      'e4010000-0000-4000-8000-000000000010',
+      '2026-02-01 00:00:00+00'
+    )::text,
+    '0.44000',
+    'loss inside the superseded middle version is the new value'
+  );
+
+select
+  is (
+    app.item_loss_at (
+      'e4010000-0000-4000-8000-000000000010',
+      '2026-03-14 00:00:00+00'
+    )::text,
+    '0.44000',
+    'loss just before the spanning replacement end is the new value'
+  );
+
+select
+  is (
+    app.item_loss_at (
+      'e4010000-0000-4000-8000-000000000010',
+      '2026-03-15 00:00:00+00'
+    )::text,
+    '0.33000',
+    'loss at the spanning replacement end is the right fragment'
+  );
+
+select
+  is (
+    app.item_costing_schedule ('e4010000-0000-4000-8000-000000000010') -> 'loss' ->> 'token',
+    (
+      select
+        result ->> 'token'
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000164'
+    ),
+    'spanning replacement token matches the schedule read'
+  );
+
+select
+  lives_ok (
+    format(
+      $$select app.set_item_loss(
+        'e4010000-0000-4000-8000-000000000165',
+        'e4010000-0000-4000-8000-000000000010',
+        0.55,
+        '2026-01-15 00:00:00+00',
+        '2026-03-15 00:00:00+00',
+        %L,
+        'حد مطابق'
+      )$$,
+      app.item_costing_schedule ('e4010000-0000-4000-8000-000000000010') -> 'loss' ->> 'token'
+    ),
+    'replace a loss interval exactly on existing boundaries'
+  );
+
+select
+  is (
+    (
+      select
+        jsonb_array_length(result -> 'superseded')
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000165'
+    ),
+    1::int,
+    'boundary replacement supersedes one version'
+  );
+
+select
+  is (
+    (
+      select
+        jsonb_array_length(result -> 'inserted')
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000165'
+    ),
+    1::int,
+    'boundary replacement creates no fragments'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.item_loss_versions v
+        join app.costing_changes c on c.id = v.created_change_id
+      where
+        c.request_id = 'e4010000-0000-4000-8000-000000000164'
+        and v.effective_from = '2026-01-01 00:00:00+00'
+        and v.effective_to = '2026-01-15 00:00:00+00'
+        and v.superseded_change_id is null
+    )
+    and exists (
+      select
+        1
+      from
+        app.item_loss_versions v
+        join app.costing_changes c on c.id = v.created_change_id
+      where
+        c.request_id = 'e4010000-0000-4000-8000-000000000164'
+        and v.effective_from = '2026-03-15 00:00:00+00'
+        and v.effective_to is null
+        and v.superseded_change_id is null
+    ),
+    'boundary replacement keeps the neighboring rows'
+  );
+
+select
+  lives_ok (
+    format(
+      $$select app.set_item_loss(
+        'e4010000-0000-4000-8000-000000000166',
+        'e4010000-0000-4000-8000-000000000010',
+        0.66,
+        '2026-04-01 00:00:00+00',
+        null,
+        %L,
+        'ذيل مفتوح'
+      )$$,
+      app.item_costing_schedule ('e4010000-0000-4000-8000-000000000010') -> 'loss' ->> 'token'
+    ),
+    'replace the open-ended tail of the last loss version'
+  );
+
+select
+  is (
+    (
+      select
+        jsonb_array_length(result -> 'superseded')
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000166'
+    ),
+    1::int,
+    'open-ended replacement supersedes the last version'
+  );
+
+select
+  is (
+    (
+      select
+        jsonb_array_length(result -> 'inserted')
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000166'
+    ),
+    2::int,
+    'open-ended replacement keeps a left fragment and a new open row'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.item_loss_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000010'
+        and superseded_change_id is null
+        and effective_from = '2026-03-15 00:00:00+00'
+        and effective_to = '2026-04-01 00:00:00+00'
+        and loss_pct = 0.33
+    )
+    and exists (
+      select
+        1
+      from
+        app.item_loss_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000010'
+        and superseded_change_id is null
+        and effective_from = '2026-04-01 00:00:00+00'
+        and effective_to is null
+        and loss_pct = 0.66
+    )
+    and not exists (
+      select
+        1
+      from
+        app.item_loss_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000010'
+        and superseded_change_id is null
+        and effective_to is null
+        and effective_from < '2026-04-01 00:00:00+00'
+    ),
+    'open-ended replacement creates no right fragment'
+  );
+
+select
+  is (
+    app.item_loss_at (
+      'e4010000-0000-4000-8000-000000000010',
+      '2026-03-20 00:00:00+00'
+    )::text,
+    '0.33000',
+    'loss before the open-ended replacement stays on the fragment'
+  );
+
+select
+  is (
+    app.item_loss_at (
+      'e4010000-0000-4000-8000-000000000010',
+      '2026-04-01 00:00:00+00'
+    )::text,
+    '0.66000',
+    'loss at the open-ended replacement start is the new value'
+  );
+
+select
+  is (
+    app.item_costing_schedule ('e4010000-0000-4000-8000-000000000010') -> 'loss' ->> 'token',
+    (
+      select
+        result ->> 'token'
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000166'
+    ),
+    'open-ended replacement token matches the schedule read'
+  );
+
+select
+  lives_ok (
+    $$select app.set_item_conversion(
+      'e4010000-0000-4000-8000-000000000171',
+      'e4010000-0000-4000-8000-000000000011',
+      'carton',
+      12,
+      '2026-01-01 00:00:00+00',
+      '2026-03-01 00:00:00+00',
+      md5(''),
+      'قبل الفجوة'
+    )$$,
+    'publish the first carton version around a later gap'
+  );
+
+select
+  lives_ok (
+    format(
+      $$select app.set_item_conversion(
+        'e4010000-0000-4000-8000-000000000172',
+        'e4010000-0000-4000-8000-000000000011',
+        'carton',
+        9,
+        '2026-05-01 00:00:00+00',
+        '2026-08-01 00:00:00+00',
+        %L,
+        'بعد الفجوة'
+      )$$,
+      (
+        select
+          conv ->> 'token'
+        from
+          jsonb_array_elements(
+            app.item_costing_schedule ('e4010000-0000-4000-8000-000000000011') -> 'conversions'
+          ) conv
+        where
+          conv ->> 'unit_code' = 'carton'
+      )
+    ),
+    'publish the second carton version after the gap'
+  );
+
+select
+  lives_ok (
+    format(
+      $$select app.set_item_conversion(
+        'e4010000-0000-4000-8000-000000000173',
+        'e4010000-0000-4000-8000-000000000011',
+        'carton',
+        null,
+        '2026-02-01 00:00:00+00',
+        '2026-06-01 00:00:00+00',
+        %L,
+        'مسح عبر الفجوة'
+      )$$,
+      (
+        select
+          conv ->> 'token'
+        from
+          jsonb_array_elements(
+            app.item_costing_schedule ('e4010000-0000-4000-8000-000000000011') -> 'conversions'
+          ) conv
+        where
+          conv ->> 'unit_code' = 'carton'
+      )
+    ),
+    'null factor removes coverage across two versions and the gap'
+  );
+
+select
+  is (
+    (
+      select
+        jsonb_array_length(result -> 'superseded')
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000173'
+    ),
+    2::int,
+    'removal across a gap supersedes both versions'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.item_conversion_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000011'
+        and unit_code = 'carton'
+        and superseded_change_id is null
+        and effective_from = '2026-01-01 00:00:00+00'
+        and effective_to = '2026-02-01 00:00:00+00'
+        and factor_to_base = 12
+    )
+    and exists (
+      select
+        1
+      from
+        app.item_conversion_versions
+      where
+        item_id = 'e4010000-0000-4000-8000-000000000011'
+        and unit_code = 'carton'
+        and superseded_change_id is null
+        and effective_from = '2026-06-01 00:00:00+00'
+        and effective_to = '2026-08-01 00:00:00+00'
+        and factor_to_base = 9
+    ),
+    'removal across a gap keeps the outside fragments'
+  );
+
+select
+  ok (
+    app.item_factor_at (
+      'e4010000-0000-4000-8000-000000000011',
+      'carton',
+      '2026-01-15 00:00:00+00'
+    ) = 12,
+    'carton lookup works before the multi-version removal'
+  );
+
+select
+  throws_ok (
+    $$select app.item_factor_at(
+      'e4010000-0000-4000-8000-000000000011',
+      'carton',
+      '2026-02-01 00:00:00+00'
+    )$$,
+    '22023',
+    'unknown unit "carton" for item صنف فجوة',
+    'carton lookup raises inside the multi-version removal'
+  );
+
+select
+  throws_ok (
+    $$select app.item_factor_at(
+      'e4010000-0000-4000-8000-000000000011',
+      'carton',
+      '2026-04-01 00:00:00+00'
+    )$$,
+    '22023',
+    'unknown unit "carton" for item صنف فجوة',
+    'carton lookup raises inside the pre-existing gap'
+  );
+
+select
+  ok (
+    app.item_factor_at (
+      'e4010000-0000-4000-8000-000000000011',
+      'carton',
+      '2026-06-01 00:00:00+00'
+    ) = 9,
+    'carton lookup works on the right fragment after the removal'
+  );
+
+select
+  throws_ok (
+    $$select app.item_factor_at(
+      'e4010000-0000-4000-8000-000000000011',
+      'carton',
+      '2026-08-01 00:00:00+00'
+    )$$,
+    '22023',
+    'unknown unit "carton" for item صنف فجوة',
+    'carton lookup raises at the half-open end of the right fragment'
+  );
+
+select
+  is (
+    (
+      select
+        conv ->> 'token'
+      from
+        jsonb_array_elements(
+          app.item_costing_schedule ('e4010000-0000-4000-8000-000000000011') -> 'conversions'
+        ) conv
+      where
+        conv ->> 'unit_code' = 'carton'
+    ),
+    (
+      select
+        result ->> 'token'
+      from
+        app.costing_changes
+      where
+        request_id = 'e4010000-0000-4000-8000-000000000173'
+    ),
+    'removal across a gap token matches the schedule read'
   );
 
 -- 7. Opening price
@@ -1193,6 +2110,48 @@ select
     'a second current opening price is rejected'
   );
 
+select
+  throws_ok (
+    $$update app.item_opening_prices
+      set unit_cost = 1
+      where item_id = 'e4010000-0000-4000-8000-000000000003'
+        and superseded_change_id is null$$,
+    '55000',
+    'app.item_opening_prices is immutable; only superseded_change_id may be set once',
+    'opening price payload cannot be updated'
+  );
+
+select
+  throws_ok (
+    $$update app.item_opening_prices
+      set superseded_change_id = (
+        select id from app.costing_changes
+        where request_id = 'e4010000-0000-4000-8000-0000000001f1'
+      )
+      where item_id = 'e4010000-0000-4000-8000-000000000003'
+        and superseded_change_id is not null$$,
+    '55000',
+    'app.item_opening_prices is immutable; only superseded_change_id may be set once',
+    'an opening price cannot be superseded twice'
+  );
+
+select
+  throws_ok (
+    $$delete from app.item_opening_prices
+      where item_id = 'e4010000-0000-4000-8000-000000000003'$$,
+    '55000',
+    'app.item_opening_prices is immutable; DELETE is not allowed',
+    'opening prices cannot be deleted'
+  );
+
+select
+  throws_ok (
+    'truncate table app.item_opening_prices',
+    '55000',
+    'app.item_opening_prices is immutable; TRUNCATE is not allowed',
+    'opening prices cannot be truncated'
+  );
+
 -- 8. Freeze
 select
   throws_ok (
@@ -1219,6 +2178,79 @@ select
     '23514',
     'cannot change parent_item_id of an item that is configured or has movements',
     'configured item cannot change parent_item_id'
+  );
+
+select
+  throws_ok (
+    $$update app.stock_items set base_unit = 'liter'
+      where id = 'e4010000-0000-4000-8000-000000000002'$$,
+    '23514',
+    'cannot change base_unit of an item that is configured or has movements',
+    'a conversion reference alone freezes base_unit'
+  );
+
+select
+  throws_ok (
+    $$update app.stock_items set kind = 'packaging'
+      where id = 'e4010000-0000-4000-8000-000000000002'$$,
+    '23514',
+    'cannot change kind of an item that is configured or has movements',
+    'a conversion reference alone freezes kind'
+  );
+
+select
+  throws_ok (
+    $$update app.stock_items set base_unit = 'liter'
+      where id = 'e4010000-0000-4000-8000-000000000003'$$,
+    '23514',
+    'cannot change base_unit of an item that is configured or has movements',
+    'an opening price alone freezes base_unit'
+  );
+
+select
+  throws_ok (
+    $$update app.stock_items set kind = 'packaging'
+      where id = 'e4010000-0000-4000-8000-000000000003'$$,
+    '23514',
+    'cannot change kind of an item that is configured or has movements',
+    'an opening price alone freezes kind'
+  );
+
+select
+  ok (
+    (
+      select
+        (t.tgtype & 1) = 0
+        and (t.tgtype & 2) = 2
+        and (t.tgtype & 16) = 16
+        and (t.tgtype & 4) = 0
+        and (t.tgtype & 8) = 0
+        and (t.tgtype & 32) = 0
+        and p.proname = 'trg_stock_items_base_unit_lock'
+        and (
+          select
+            pg_catalog.array_agg (
+              a.attname::text
+              order by
+                u.ord
+            )
+          from
+            pg_catalog.unnest (t.tgattr::smallint[]) with ordinality as u (attnum, ord)
+            join pg_catalog.pg_attribute a on a.attrelid = t.tgrelid
+            and a.attnum = u.attnum
+        ) = array['base_unit', 'kind', 'parent_item_id']::text[]
+      from
+        pg_catalog.pg_trigger t
+        join pg_catalog.pg_class c on c.oid = t.tgrelid
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        join pg_catalog.pg_proc p on p.oid = t.tgfoid
+      where
+        n.nspname = 'app'
+        and c.relname = 'stock_items'
+        and t.tgname = 'trg_stock_items_configured_identity_lock'
+        and not t.tgisinternal
+    ),
+    'identity lock is a before statement trigger on base_unit, kind, and parent_item_id'
   );
 
 select
@@ -1316,7 +2348,7 @@ select
   throws_ok (
     'truncate table app.costing_changes cascade',
     '55000',
-    null::text,
+    'app.costing_changes is append-only; TRUNCATE is not allowed',
     'costing_changes cannot be truncated'
   );
 
@@ -1476,6 +2508,7 @@ select
           array[
             'app.schedule_token(text,uuid,text)',
             'app.costing_schedule_line(uuid,timestamptz,timestamptz,numeric)',
+            'app.costing_timestamptz_text(timestamptz)',
             'app.costing_replay_result(uuid,jsonb)',
             'app.insert_owner_costing_change(uuid,text,jsonb,jsonb)',
             'app.trg_units_immutable()',
@@ -1488,7 +2521,7 @@ select
           ]::regprocedure[]
         ) as fn
     ),
-    11::bigint,
+    12::bigint,
     'privilege check names every internal costing helper'
   );
 
@@ -1498,6 +2531,7 @@ select
       from unnest(array[
         'app.schedule_token(text,uuid,text)',
         'app.costing_schedule_line(uuid,timestamptz,timestamptz,numeric)',
+        'app.costing_timestamptz_text(timestamptz)',
         'app.costing_replay_result(uuid,jsonb)',
         'app.insert_owner_costing_change(uuid,text,jsonb,jsonb)',
         'app.trg_units_immutable()',
@@ -1639,6 +2673,18 @@ select
     )::text,
     '0.10000',
     'a non-owner can read a loss lookup'
+  );
+
+select
+  throws_ok (
+    $$select app.item_factor_at(
+      'e4010000-0000-4000-8000-000000000002',
+      'ml',
+      '2026-06-01 00:00:00+00'
+    )$$,
+    '22023',
+    'unknown unit "ml" for item e4010000-0000-4000-8000-000000000002',
+    'a non-owner unknown-unit error does not include the item name'
   );
 
 select

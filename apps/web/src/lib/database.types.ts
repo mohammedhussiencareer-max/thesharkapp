@@ -820,6 +820,9 @@ isOneToOne: false
 "costing_schedule_line":
 { Args: { "p_effective_from": string,"p_effective_to": string,"p_id": string,"p_payload": number }; Returns: string
                            },
+"costing_timestamptz_text":
+{ Args: { "p_at": string }; Returns: string
+                           },
 "delete_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
                            },

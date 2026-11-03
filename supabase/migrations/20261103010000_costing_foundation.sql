@@ -421,6 +421,17 @@ set
     ) || '|' || pg_catalog.trim_scale(p_payload)::text;
 $$;
 
+-- UTC text, so an identical retry under another TimeZone builds the same payload.
+create function app.costing_timestamptz_text (p_at timestamptz) returns text language sql immutable
+set
+  search_path = '' as $$
+  select
+    case
+      when p_at is null then null::text
+      else pg_catalog.to_char(p_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+    end;
+$$;
+
 create function app.schedule_token (p_family text, p_item_id uuid, p_unit_code text) returns text language plpgsql stable security definer
 set
   search_path = '' as $$
@@ -653,9 +664,9 @@ begin
     'loss_pct',
     v_loss,
     'effective_from',
-    p_effective_from,
+    app.costing_timestamptz_text (p_effective_from),
     'effective_to',
-    p_effective_to,
+    app.costing_timestamptz_text (p_effective_to),
     'expected_token',
     p_expected_token,
     'reason',
@@ -943,9 +954,9 @@ begin
     'factor',
     v_factor,
     'effective_from',
-    p_effective_from,
+    app.costing_timestamptz_text (p_effective_from),
     'effective_to',
-    p_effective_to,
+    app.costing_timestamptz_text (p_effective_to),
     'expected_token',
     p_expected_token,
     'reason',
@@ -987,7 +998,13 @@ begin
     where
       u.code = v_unit
   ) then
-    raise exception 'unknown unit "%" for item %', v_unit, v_name
+    -- Owners keep the item name. Anyone else gets the id they already passed.
+    if coalesce(app.is_owner(), false) then
+      raise exception 'unknown unit "%" for item %', v_unit, v_name
+        using errcode = '22023';
+    end if;
+
+    raise exception 'unknown unit "%" for item %', v_unit, p_item_id
       using errcode = '22023';
   end if;
 
@@ -1351,10 +1368,8 @@ begin
   end if;
 
   select
-    si.base_unit,
-    si.name
-  into v_base,
-    v_name
+    si.base_unit
+  into v_base
   from
     app.stock_items si
   where
@@ -1363,6 +1378,17 @@ begin
   if not found then
     raise exception 'unknown stock_item id: %', p_item_id
       using errcode = '22023';
+  end if;
+
+  -- The name is protected catalog data. Only an owner sees it in an error.
+  if coalesce(app.is_owner(), false) then
+    select
+      si.name
+    into v_name
+    from
+      app.stock_items si
+    where
+      si.id = p_item_id;
   end if;
 
   v_unit := p_unit_code;
@@ -1417,12 +1443,17 @@ begin
     return v_from_scale / v_to_scale;
   end if;
 
-  raise exception 'unknown unit "%" for item %', v_unit, v_name
+  if v_name is not null then
+    raise exception 'unknown unit "%" for item %', v_unit, v_name
+      using errcode = '22023';
+  end if;
+
+  raise exception 'unknown unit "%" for item %', v_unit, p_item_id
     using errcode = '22023';
 end;
 $$;
 
-comment on function app.item_factor_at (uuid, text, timestamptz) is 'Factor from p_unit_code to the item base unit at p_at. Base unit is 1. An explicit version wins over an implicit mass or volume factor.';
+comment on function app.item_factor_at (uuid, text, timestamptz) is 'Factor from p_unit_code to the item base unit at p_at. Base unit is 1. An explicit version wins over an implicit mass or volume factor. A non-owner unknown-unit error names the item id, not the catalog name.';
 
 create function app.set_item_opening_price (
   p_request_id uuid,
@@ -1887,6 +1918,13 @@ from
   service_role;
 
 revoke all on function app.costing_schedule_line (uuid, timestamptz, timestamptz, numeric)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+revoke all on function app.costing_timestamptz_text (timestamptz)
 from
   public,
   anon,
