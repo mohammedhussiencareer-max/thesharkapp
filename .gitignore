@@ -16,6 +16,9 @@ coverage/
 *.xlsm
 *service-account*.json
 .secrets/
+*.dump
+*.tar.gz
+backups/
 supabase/.branches/
 supabase/.temp/
 test-results/

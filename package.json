@@ -12,6 +12,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "build": "pnpm -r --if-present build",
+    "backup:test": "node --test scripts/backup/*.test.mjs",
     "desktop:dev": "pnpm --filter desktop dev",
     "desktop:build": "pnpm --filter desktop installer",
     "desktop:check": "pnpm --filter desktop check",

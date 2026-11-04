@@ -25,6 +25,12 @@ See [CLAUDE.md](CLAUDE.md) and [AI-WORKFLOW.md](AI-WORKFLOW.md). Design approved
 - One sync at a time (55P03 `another POS sync is running`; runs older than 30 minutes are failed as abandoned first). Orders missing from a complete scoped read are marked `missing_from_pos`, never deleted.
 - Real run 2026-10-16: 4 shifts / 216 orders inserted; rerun 216 unchanged, 0 missing.
 
+## Backup
+
+- Design: private repo `thesharkapp-backups` runs the daily schedule (02:17 UTC); this repo holds the code in `scripts/backup/` (dump, manifest, restore, compare, retention, drift guard, `ci-roundtrip.sh`). How it works: [docs/BACKUP.md](docs/BACKUP.md). Disaster steps in Egyptian Arabic: [docs/RESTORE-RUNBOOK.md](docs/RESTORE-RUNBOOK.md).
+- Owner decisions 2026-11-04: read-only `backup_reader` role (owner sets the password with psql `\password`), 3 repo secrets in the private repo, no encryption, one restore drill into a temporary second free project, restore may load rows directly into an empty database (CLAUDE.md exception).
+- CI job `backup-roundtrip` runs the full dump and restore on two local stacks with negative cases. Still to do by the owner/orchestrator: create the private repo and its workflows, run `provision-backup-reader.sql` on the hosted project, and do the real-run checks listed in docs/BACKUP.md ("Open checks").
+
 ## Open PRs
 
 - Task 19 (issue #23, daily stock count) is in review. Implementer: grok CLI (grok-4.7) until its weekly quota ends, then Grok via Cursor.
