@@ -80,8 +80,11 @@ stack_start() {
   stack_workdir=${1:-}
   local -a wd=()
   if [ -n "$stack_workdir" ]; then wd=(--workdir "$stack_workdir"); fi
-  supa start --exclude "$stack_exclude" ${wd[@]+"${wd[@]}"} >/dev/null ||
+  if ! supa start --exclude "$stack_exclude" ${wd[@]+"${wd[@]}"} >"$work_dir/start.log" 2>&1; then
+    # Local synthetic stacks only, so the CLI's own output is safe to show.
+    tail -n 20 "$work_dir/start.log" >&3 || true
     fail STACK_START "supabase start failed"
+  fi
   wait_db
 }
 
