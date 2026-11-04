@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { assertRoleSafe, planRestorePrep } from './checks.mjs';
 import {
   BackupError,
+  FORBIDDEN_USAGE_SCHEMAS,
   SCOPE_SCHEMAS,
   assertMajors,
   checkDumpTarget,
@@ -42,6 +43,7 @@ export function readServerVersionNum(psql = runPsql) {
 export function checkRole(psql = runPsql) {
   const output = psql({
     sql: readFileSync(roleSql, 'utf8'),
+    vars: { forbidden_usage: JSON.stringify(FORBIDDEN_USAGE_SCHEMAS) },
     code: 'ROLE_QUERY_FAILED',
   });
   const [line] = rows(output).slice(-1);

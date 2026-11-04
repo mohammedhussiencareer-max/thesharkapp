@@ -58,11 +58,31 @@ export function isoWeekKey(day) {
   return `${date.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
 }
 
+export const MAX_DELETIONS_LIMIT = 50;
+
+export function assertPolicy(policy) {
+  for (const [name, value] of Object.entries(policy)) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new BackupError(
+        'USAGE',
+        `retention policy ${name} must be a nonnegative integer`,
+      );
+    }
+  }
+  if (policy.maxDeletions > MAX_DELETIONS_LIMIT) {
+    throw new BackupError(
+      'USAGE',
+      `retention policy maxDeletions must be at most ${MAX_DELETIONS_LIMIT}`,
+    );
+  }
+}
+
 export function planRetention({
   backups,
   currentRunFailed = false,
   policy = POLICY,
 }) {
+  assertPolicy(policy);
   const verified = [];
   const ignored = [];
   for (const backup of backups) {
@@ -117,6 +137,16 @@ export function planRetention({
   };
 }
 
+function parseLimit(text) {
+  if (typeof text !== 'string' || !/^\d{1,3}$/.test(text)) {
+    throw new BackupError(
+      'USAGE',
+      `--max-deletions needs an integer from 0 to ${MAX_DELETIONS_LIMIT}`,
+    );
+  }
+  return Number(text);
+}
+
 function parseArgs(argv) {
   const options = { dryRun: false, failed: false, input: null, max: null };
   for (let i = 0; i < argv.length; i += 1) {
@@ -130,7 +160,7 @@ function parseArgs(argv) {
       options.input = argv[i];
     } else if (arg === '--max-deletions') {
       i += 1;
-      options.max = Number(argv[i]);
+      options.max = parseLimit(argv[i]);
     } else {
       throw new BackupError('USAGE', `unknown argument ${arg}`);
     }
@@ -140,9 +170,6 @@ function parseArgs(argv) {
       'USAGE',
       'usage: retention.mjs --input <file|-> [--dry-run] [--current-run-failed] [--max-deletions N]',
     );
-  }
-  if (options.max !== null && !Number.isInteger(options.max)) {
-    throw new BackupError('USAGE', '--max-deletions needs an integer');
   }
   return options;
 }

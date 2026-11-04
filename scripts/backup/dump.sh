@@ -30,12 +30,13 @@ run_id=${BACKUP_RUN_ID:-${GITHUB_RUN_ID:-0}}
 printf '%s' "$run_id" | grep -Eq '^[0-9]+(-[0-9]+)?$' ||
   fail USAGE "BACKUP_RUN_ID must be digits, optionally followed by -digits"
 
-require_tools node pg_dump pg_restore psql tar gzip sha256sum
+require_tools node tar gzip sha256sum
+setup_pg_path
+require_tools pg_dump pg_restore psql
 
 step "checking the target"
 enforce_role=$(guard dump-target)
 export PGSSLMODE=${PGSSLMODE:-verify-full}
-setup_pg_path
 assert_majors pg_dump pg_restore psql
 if [ "$enforce_role" = 1 ]; then
   step "checking the backup role is read-only"

@@ -2,8 +2,10 @@
 select to_regclass('supabase_migrations.schema_migrations') is not null as has_migrations \gset
 \if :has_migrations
 select coalesce(jsonb_agg(version order by version), '[]'::jsonb)::text as migrations from supabase_migrations.schema_migrations \gset
+select coalesce(jsonb_object_agg(version, md5(coalesce(array_to_string(statements, E'\n'), ''))), '{}'::jsonb)::text as migration_hashes from supabase_migrations.schema_migrations \gset
 \else
 \set migrations '[]'
+\set migration_hashes '{}'
 \endif
 with auth_users as (
   select c.oid
@@ -139,8 +141,8 @@ fp (key, attrs) as (
       'def', case when r.relkind in ('v', 'm') then md5(pg_catalog.pg_get_viewdef(r.oid, true)) end,
       'seq', case when ps.seqrelid is not null then jsonb_build_object(
         'type', pg_catalog.format_type(ps.seqtypid, null),
-        'start', ps.seqstart, 'increment', ps.seqincrement,
-        'min', ps.seqmin, 'max', ps.seqmax, 'cache', ps.seqcache, 'cycle', ps.seqcycle
+        'start', ps.seqstart::text, 'increment', ps.seqincrement::text,
+        'min', ps.seqmin::text, 'max', ps.seqmax::text, 'cache', ps.seqcache::text, 'cycle', ps.seqcycle
       ) end
     )
   from rel r
@@ -284,14 +286,15 @@ select jsonb_build_object(
       from pg_catalog.pg_roles
       where oid in (select o from acl_roles)
     ),
-    'migrations', :'migrations'::jsonb
+    'migrations', :'migrations'::jsonb,
+    'migrationHashes', :'migration_hashes'::jsonb
   ),
   'tables', (
     select coalesce(jsonb_object_agg(tq.t, jsonb_build_object('rows', tq.n, 'hash', tq.h)), '{}'::jsonb)
     from (:tables_q) tq
   ),
   'sequences', (
-    select coalesce(jsonb_object_agg(schemaname || '.' || sequencename, jsonb_build_object('lastValue', last_value)), '{}'::jsonb)
+    select coalesce(jsonb_object_agg(schemaname || '.' || sequencename, jsonb_build_object('lastValue', last_value::text)), '{}'::jsonb)
     from pg_catalog.pg_sequences
     where schemaname = 'app'
   ),

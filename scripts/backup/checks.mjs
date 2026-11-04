@@ -1,7 +1,9 @@
 import {
   APP_EXTENSIONS,
   BackupError,
-  OWNER_AUDIT_COLUMNS,
+  FORBIDDEN_EXTENSIONS,
+  OWNER_COLUMNS,
+  OWNER_FK_COLUMNS,
   PLATFORM_EXTENSIONS,
   PLATFORM_ROLES,
   PLATFORM_SCHEMAS,
@@ -22,26 +24,47 @@ export function evaluateDrift(facts) {
       violations.push(`schema ${schema} is outside the backup scope`);
     }
   }
-  for (const object of list(facts.publicObjects)) {
-    violations.push(`application object in public: ${object}`);
+  for (const object of list(facts.outOfScopeObjects)) {
+    violations.push(`application object outside the backup scope: ${object}`);
   }
   const extensions = new Set([...PLATFORM_EXTENSIONS, ...APP_EXTENSIONS]);
   for (const extension of list(facts.extensions)) {
-    if (!extensions.has(extension)) {
+    if (FORBIDDEN_EXTENSIONS.includes(extension)) {
+      violations.push(
+        `extension ${extension} is installed; its data is outside the backup`,
+      );
+    } else if (!extensions.has(extension)) {
       violations.push(`extension ${extension} is not in the allowlist`);
     }
   }
-  if (Number(facts.storageObjects) > 0) {
-    violations.push(`storage holds ${facts.storageObjects} object(s)`);
+  if (Number(facts.storageBuckets) > 0) {
+    violations.push(
+      `storage holds ${facts.storageBuckets} bucket(s); objects are outside the backup`,
+    );
   }
-  if (Number(facts.cronJobs) > 0) {
-    violations.push(`${facts.cronJobs} cron job(s) exist`);
-  }
-  const mapped = new Set([...list(facts.ownerFkMap), ...OWNER_AUDIT_COLUMNS]);
-  for (const column of list(facts.ownerLikeColumns)) {
-    if (!mapped.has(column)) {
+  const fkAllowed = new Set(OWNER_COLUMNS);
+  const reported = new Set();
+  for (const column of list(facts.ownerFkMap)) {
+    if (!fkAllowed.has(column)) {
+      reported.add(column);
       violations.push(
-        `column ${column} looks like an owner reference but is not mapped`,
+        `column ${column} references auth.users but is not in the owner column allowlist`,
+      );
+    }
+  }
+  if (Array.isArray(facts.ownerFkMap)) {
+    for (const column of OWNER_FK_COLUMNS) {
+      if (!facts.ownerFkMap.includes(column)) {
+        violations.push(
+          `allowlisted owner FK column ${column} does not reference auth.users`,
+        );
+      }
+    }
+  }
+  for (const column of list(facts.ownerLikeColumns)) {
+    if (!fkAllowed.has(column) && !reported.has(column)) {
+      violations.push(
+        `column ${column} looks like an owner reference but is not in the owner column allowlist`,
       );
     }
   }
@@ -93,6 +116,11 @@ export function evaluateRole(facts) {
   if (list(facts.schemaCreate).length > 0) {
     violations.push(
       `role can create objects in: ${list(facts.schemaCreate).join(', ')}`,
+    );
+  }
+  if (list(facts.forbiddenUsage).length > 0) {
+    violations.push(
+      `role can enter platform schemas: ${list(facts.forbiddenUsage).join(', ')}`,
     );
   }
   return violations;

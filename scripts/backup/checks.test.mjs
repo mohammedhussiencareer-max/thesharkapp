@@ -7,6 +7,7 @@ import {
   evaluateRole,
   planRestorePrep,
 } from './checks.mjs';
+import { FORBIDDEN_USAGE_SCHEMAS, OWNER_FK_COLUMNS } from './config.mjs';
 
 const clean = {
   schemas: [
@@ -23,16 +24,15 @@ const clean = {
     'supabase_migrations',
     'vault',
   ],
-  publicObjects: [],
+  outOfScopeObjects: [],
   extensions: ['btree_gist', 'pg_graphql', 'pgcrypto', 'plpgsql', 'uuid-ossp'],
-  storageObjects: 0,
-  cronJobs: 0,
+  storageBuckets: -1,
   ownerLikeColumns: [
     'app.owner.user_id',
     'app.stock_movements.created_by',
     'app.costing_changes.actor_id',
   ],
-  ownerFkMap: ['app.owner.user_id', 'app.costing_changes.actor_id'],
+  ownerFkMap: [...OWNER_FK_COLUMNS],
   otherAuthRefs: [],
   missingAuditColumns: [],
 };
@@ -55,22 +55,20 @@ test('every kind of out-of-scope object is named with the fix', () => {
   const drifted = {
     ...clean,
     schemas: [...clean.schemas, 'analytics_app'],
-    publicObjects: ['r notes'],
+    outOfScopeObjects: ['public.table notes'],
     extensions: [...clean.extensions, 'postgis'],
-    storageObjects: 3,
-    cronJobs: 2,
+    storageBuckets: 3,
     ownerLikeColumns: [...clean.ownerLikeColumns, 'app.reports.reviewed_by'],
     otherAuthRefs: ['app.x.session_id'],
     missingAuditColumns: ['app.gone.created_by'],
   };
   const violations = evaluateDrift(drifted);
-  assert.equal(violations.length, 8);
+  assert.equal(violations.length, 7);
   for (const needle of [
     'schema analytics_app',
-    'public: r notes',
+    'scope: public.table notes',
     'extension postgis',
-    'storage holds 3',
-    '2 cron job',
+    'storage holds 3 bucket',
     'app.reports.reviewed_by',
     'app.x.session_id',
     'app.gone.created_by',
@@ -90,7 +88,97 @@ test('every kind of out-of-scope object is named with the fix', () => {
 });
 
 test('missing fact arrays are treated as empty', () => {
-  assert.deepEqual(evaluateDrift({ storageObjects: 0, cronJobs: 0 }), []);
+  assert.deepEqual(evaluateDrift({ storageBuckets: 0 }), []);
+});
+
+test('application objects in a platform schema are named, whatever the schema', () => {
+  const found = [
+    'extensions.table business_records',
+    'auth.view customer_view',
+    'storage.function export_rows',
+    'realtime.sequence orders_seq',
+    'vault.matview totals',
+  ];
+  const violations = evaluateDrift({ ...clean, outOfScopeObjects: found });
+  assert.equal(violations.length, found.length);
+  for (const object of found) {
+    assert.ok(
+      violations.some((v) => v.includes(object)),
+      object,
+    );
+  }
+  assert.equal(
+    codeOf(() =>
+      assertNoDrift({
+        ...clean,
+        outOfScopeObjects: ['extensions.table business_records'],
+      }),
+    ),
+    'DRIFT',
+  );
+});
+
+test('pg_cron and pg_net fail the guard with their own message', () => {
+  for (const extension of ['pg_cron', 'pg_net']) {
+    const violations = evaluateDrift({
+      ...clean,
+      extensions: [...clean.extensions, extension],
+    });
+    assert.equal(violations.length, 1, extension);
+    assert.match(
+      violations[0],
+      new RegExp(`extension ${extension} is installed`),
+    );
+  }
+});
+
+test('storage buckets fail the guard only when they could be counted', () => {
+  assert.deepEqual(evaluateDrift({ ...clean, storageBuckets: 0 }), []);
+  assert.deepEqual(evaluateDrift({ ...clean, storageBuckets: -1 }), []);
+  const violations = evaluateDrift({ ...clean, storageBuckets: 1 });
+  assert.equal(violations.length, 1);
+  assert.match(violations[0], /storage holds 1 bucket/);
+});
+
+test('owner foreign keys must be on the maintained allowlist', () => {
+  const unknown = evaluateDrift({
+    ...clean,
+    ownerFkMap: [...clean.ownerFkMap, 'app.stock_items.supplier_user'],
+    ownerLikeColumns: [
+      ...clean.ownerLikeColumns,
+      'app.stock_items.supplier_user',
+    ],
+  });
+  assert.equal(unknown.length, 1);
+  assert.match(
+    unknown[0],
+    /app\.stock_items\.supplier_user references auth\.users but is not in the owner column allowlist/,
+  );
+  const fkAsAudit = evaluateDrift({
+    ...clean,
+    ownerFkMap: [...clean.ownerFkMap, 'app.purchases.created_by'],
+  });
+  assert.deepEqual(fkAsAudit, []);
+});
+
+test('an owner-like column is rejected unless the allowlist names it', () => {
+  const violations = evaluateDrift({
+    ...clean,
+    ownerLikeColumns: [...clean.ownerLikeColumns, 'app.reports.approved_by'],
+  });
+  assert.equal(violations.length, 1);
+  assert.match(violations[0], /app\.reports\.approved_by looks like an owner/);
+});
+
+test('an allowlisted owner FK that no longer references auth.users is named', () => {
+  const violations = evaluateDrift({
+    ...clean,
+    ownerFkMap: clean.ownerFkMap.filter(
+      (ref) => ref !== 'app.item_opening_prices.approved_by',
+    ),
+  });
+  assert.equal(violations.length, 1);
+  assert.match(violations[0], /app\.item_opening_prices\.approved_by does not/);
 });
 
 const safeRole = {
@@ -103,6 +191,7 @@ const safeRole = {
   memberships: [],
   writable: [],
   schemaCreate: [],
+  forbiddenUsage: [],
 };
 
 test('the read-only backup role passes', () => {
@@ -121,6 +210,7 @@ test('each unsafe role attribute is rejected', () => {
     memberships: ['pg_read_all_data'],
     writable: ['stock_items'],
     schemaCreate: ['app'],
+    forbiddenUsage: ['storage'],
   };
   for (const [key, value] of Object.entries(cases)) {
     const violations = evaluateRole({ ...safeRole, [key]: value });
@@ -134,6 +224,18 @@ test('each unsafe role attribute is rejected', () => {
     codeOf(() => assertRoleSafe(null)),
     'ROLE_UNSAFE',
   );
+});
+
+test('every forbidden platform schema is named when the role can enter it', () => {
+  assert.deepEqual(
+    [...FORBIDDEN_USAGE_SCHEMAS],
+    ['auth', 'cron', 'net', 'storage', 'vault'],
+  );
+  for (const schema of FORBIDDEN_USAGE_SCHEMAS) {
+    const violations = evaluateRole({ ...safeRole, forbiddenUsage: [schema] });
+    assert.equal(violations.length, 1, schema);
+    assert.ok(violations[0].includes(schema), schema);
+  }
 });
 
 const metadata = {

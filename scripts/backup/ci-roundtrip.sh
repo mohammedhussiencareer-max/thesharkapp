@@ -20,7 +20,10 @@ mode=${1:-}
 confirm_value=DESTROY-LOCAL-SUPABASE
 old_owner=a17e0000-0000-4000-8000-000000000001
 new_owner=a17e0000-0000-4000-8000-000000000002
-stack_exclude=studio,imgproxy,mailpit,edge-runtime,vector,logflare,realtime,storage-api
+# Stack B (the empty restore target) skips storage-api; stack A keeps it so the
+# drift guard reads a real storage.buckets.
+stack_a_exclude=studio,imgproxy,mailpit,edge-runtime,vector,logflare,realtime
+stack_exclude=$stack_a_exclude,storage-api
 stack_workdir=""
 archives="$work_dir/archives"
 neg_dir="$work_dir/negatives"
@@ -35,9 +38,9 @@ if [ "${CI:-}" != true ] && [ "${BACKUP_ROUNDTRIP_CONFIRM:-}" != "$confirm_value
   fail ROUNDTRIP_CONFIRM "this wipes the local Supabase stack; set BACKUP_ROUNDTRIP_CONFIRM=$confirm_value"
 fi
 
-require_tools node psql tar gzip sha256sum awk sed
+require_tools node tar gzip sha256sum awk sed
 setup_pg_path
-require_tools pg_dump pg_restore
+require_tools psql pg_dump pg_restore
 
 unset PGSERVICE PGSERVICEFILE PGHOSTADDR PGSSLROOTCERT PGSSLCERT PGSSLKEY PGOPTIONS PGPASSFILE
 PGHOST=127.0.0.1
@@ -48,8 +51,15 @@ PGDATABASE=postgres
 PGSSLMODE=disable
 export PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE PGSSLMODE
 export BACKUP_ALLOW_LOOPBACK=1
-export BACKUP_PRINT_STDERR=1
 export BACKUP_STRICT_SEQUENCES=1
+# Server text is printed only by the synthetic "full" run. restore-archive loads
+# a real archive and prints fixed messages and SQLSTATE codes only.
+unset BACKUP_PRINT_STDERR
+if [ "$mode" = full ]; then
+  export BACKUP_SYNTHETIC_DIAGNOSTICS=1
+else
+  unset BACKUP_SYNTHETIC_DIAGNOSTICS
+fi
 
 supa() {
   if command -v supabase >/dev/null 2>&1; then
@@ -74,15 +84,28 @@ wait_db() {
   fail STACK_START "the local database did not become ready"
 }
 
-# stack_start [workdir] : a fresh local stack; with a workdir it holds config.toml only (no migrations).
+wait_storage() {
+  local i found
+  for i in $(seq 1 30); do
+    found=$(psql -X -q -A -t -c "select to_regclass('storage.buckets') is not null" || true)
+    if [ "$found" = t ]; then return 0; fi
+    sleep 2
+  done
+  fail STACK_START "storage.buckets did not appear in stack A"
+}
+
+# stack_start [workdir] [exclude] : a fresh local stack; with a workdir it holds config.toml only (no migrations).
 stack_start() {
   stack_stop
   stack_workdir=${1:-}
+  local exclude=${2:-$stack_exclude}
   local -a wd=()
   if [ -n "$stack_workdir" ]; then wd=(--workdir "$stack_workdir"); fi
-  if ! supa start --exclude "$stack_exclude" ${wd[@]+"${wd[@]}"} >"$work_dir/start.log" 2>&1; then
-    # Local synthetic stacks only, so the CLI's own output is safe to show.
-    tail -n 20 "$work_dir/start.log" >&3 || true
+  if ! supa start --exclude "$exclude" ${wd[@]+"${wd[@]}"} >"$work_dir/start.log" 2>&1; then
+    # The CLI log can hold server text, so only the synthetic run shows it.
+    if [ "${BACKUP_SYNTHETIC_DIAGNOSTICS:-0}" = 1 ]; then
+      tail -n 20 "$work_dir/start.log" >&3 || true
+    fi
     fail STACK_START "supabase start failed"
   fi
   wait_db
@@ -101,8 +124,42 @@ make_empty_project() {
   ' "$repo_root/supabase/config.toml" >"$dir/supabase/config.toml"
 }
 
+writer_pid=""
+writer_stop="$work_dir/writer.stop"
+writer_log="$work_dir/writer.err"
+reader_password=""
+
+# The writer is a background loop that inserts one expense per round through
+# the real RPC. It ends when the stop file appears, or on its first failure.
+start_writer() {
+  rm -f "$writer_stop"
+  : >"$writer_log"
+  (
+    while [ ! -e "$writer_stop" ]; do
+      psql -X -q -v ON_ERROR_STOP=1 -v "owner=$old_owner" \
+        -f "$here/testdata/writer.sql" >/dev/null 2>>"$writer_log" || exit 1
+      sleep 0.1
+    done
+  ) &
+  writer_pid=$!
+}
+
+stop_writer() {
+  if [ -n "$writer_pid" ]; then
+    : >"$writer_stop"
+    wait "$writer_pid" 2>/dev/null || true
+    writer_pid=""
+  fi
+}
+
+writer_rows() {
+  psql -X -q -A -t -v ON_ERROR_STOP=1 -c \
+    "select count(*) from app.expense_entries where note = 'ci-writer'"
+}
+
 # Installed only after the confirm check, so an unconfirmed run never stops the stack.
 stack_cleanup() {
+  stop_writer
   if [ "${BACKUP_ROUNDTRIP_KEEP_STACK:-0}" != 1 ]; then stack_stop; fi
 }
 exit_hook=stack_cleanup
@@ -136,6 +193,37 @@ expect_fail() {
     fail NEGATIVE_WRONG "$label: expected $needle in the output"
   fi
   info "negative ok: $label"
+}
+
+reader_psql() {
+  PGUSER=backup_reader PGPASSWORD=$reader_password \
+    psql -X -q -A -t -v ON_ERROR_STOP=1 -v VERBOSITY=sqlstate "$@"
+}
+
+# expect_denied <label> <SQLSTATE or a|b> <sql> : backup_reader must be refused with that code.
+# A write is refused with 25006 by the read-only default; "begin read write"
+# gets past it, so the privilege check (42501) is what stops the statement.
+expect_denied() {
+  local label=$1 codes=$2 rc=0
+  reader_psql -c "$3" >"$work_dir/den.out" 2>"$work_dir/den.err" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    fail DENIAL_PASSED "$label: backup_reader was allowed"
+  fi
+  if ! grep -Eq "(^|[^0-9A-Za-z])($codes)([^0-9A-Za-z]|\$)" "$work_dir/den.err"; then
+    node "$backup_dir/sanitize.mjs" "$work_dir/den.err" 2>&3 || true
+    fail DENIAL_WRONG "$label: expected SQLSTATE $codes"
+  fi
+  info "denied ok: $label"
+}
+
+# expect_reader_count <label> <sql> : backup_reader must read a positive number.
+expect_reader_count() {
+  local label=$1 out
+  out=$(reader_psql -c "$2") || fail DENIAL_CONTROL "$label: backup_reader could not read it"
+  case "$out" in
+    '' | *[!0-9]* | 0) fail DENIAL_CONTROL "$label: expected a positive count" ;;
+  esac
+  info "allowed ok: $label"
 }
 
 extract_manifest() {
@@ -179,9 +267,10 @@ run_full() {
   mkdir -p "$archives/admin" "$archives/reader" "$neg_dir"
 
   step "stack A: fresh start and migrations"
-  stack_start ""
+  stack_start "" "$stack_a_exclude"
   supa --yes db reset >/dev/null || fail STACK_RESET "supabase db reset failed"
   wait_db
+  wait_storage
 
   step "stack A: seeding synthetic data through the real RPCs"
   create_user "$old_owner" "seed-owner@theshark.test"
@@ -189,7 +278,6 @@ run_full() {
     fail SEED_FAILED "the synthetic seed failed"
 
   step "stack A: provisioning backup_reader"
-  local reader_password
   reader_password=$(node -e 'process.stdout.write(require("node:crypto").randomBytes(18).toString("hex"))')
   psql -X -q -v ON_ERROR_STOP=1 -f "$here/provision-backup-reader.sql" >/dev/null ||
     fail PROVISION_FAILED "provision-backup-reader.sql failed"
@@ -210,6 +298,76 @@ run_full() {
   check_migration_metadata "$archives/admin-x/manifest.json"
   info "the admin and backup_reader manifests are identical"
 
+  step "stack A: migration history matches the manifest"
+  node_cli node "$here/manifest.mjs" migrations-check "$archives/admin-x/manifest.json" >/dev/null
+  node -e '
+    const fs = require("node:fs");
+    const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const versions = Object.keys(m.metadata.migrationHashes);
+    if (versions.length === 0) process.exit(1);
+    m.metadata.migrationHashes[versions[0]] = "0".repeat(32);
+    fs.writeFileSync(process.argv[2], JSON.stringify(m));
+  ' "$archives/admin-x/manifest.json" "$work_dir/mutated-hashes.json" ||
+    fail MIGRATIONS_METADATA "the manifest holds no migration hashes"
+  expect_fail "migration statements changed" "has different statements" \
+    node "$here/manifest.mjs" migrations-check "$work_dir/mutated-hashes.json"
+
+  step "stack A: backup_reader is refused outside its grant"
+  expect_reader_count "app tables" "select count(*) from app.stock_items"
+  expect_reader_count "migration versions and statements" \
+    "select least(count(version), count(statements)) from supabase_migrations.schema_migrations"
+  expect_denied "auth.users" 42501 "select 1 from auth.users limit 1"
+  expect_denied "storage.buckets" 42501 "select 1 from storage.buckets limit 1"
+  expect_denied "storage.objects" 42501 "select 1 from storage.objects limit 1"
+  expect_denied "vault.secrets" '42501|3F000' "select 1 from vault.secrets limit 1"
+  expect_denied "cron.job" '42501|3F000' "select 1 from cron.job limit 1"
+  expect_denied "net.http_request_queue" '42501|3F000' "select 1 from net.http_request_queue limit 1"
+  expect_denied "migration name column" 42501 "select name from supabase_migrations.schema_migrations limit 1"
+  expect_denied "pg_authid" 42501 "select rolpassword from pg_catalog.pg_authid limit 1"
+  expect_denied "write under the read-only default" 25006 \
+    "update app.stock_items set name = name where false"
+  expect_denied "update without privilege" 42501 \
+    "begin read write; update app.stock_items set name = name where false; rollback"
+  expect_denied "insert without privilege" 42501 \
+    "begin read write; insert into app.stock_items (id) values (gen_random_uuid()); rollback"
+  expect_denied "delete without privilege" 42501 \
+    "begin read write; delete from app.stock_items where false; rollback"
+  expect_denied "create table in app" 42501 \
+    "begin read write; create table app.rogue_reader_write (id int); rollback"
+  expect_denied "create role" 42501 "begin read write; create role rogue_reader_role; rollback"
+  expect_denied "call an app RPC" 42501 \
+    "begin read write; select app.add_expense_entry(p_category_id => gen_random_uuid(), p_request_id => gen_random_uuid()); rollback"
+
+  step "stack A: dump as backup_reader while a writer inserts expenses"
+  start_writer
+  local i rows_before rows_after
+  for i in $(seq 1 30); do
+    if ! kill -0 "$writer_pid" 2>/dev/null; then
+      node "$backup_dir/sanitize.mjs" "$writer_log" 2>&3 || true
+      fail WRITER_FAILED "the concurrent writer stopped (is app.add_expense_entry accepted?)"
+    fi
+    rows_before=$(writer_rows)
+    if [ "$rows_before" -ge 3 ]; then break; fi
+    sleep 1
+  done
+  [ "$rows_before" -ge 3 ] || fail WRITER_FAILED "the concurrent writer inserted fewer than 3 rows in 30 s"
+  local concurrent_archive
+  concurrent_archive=$(PGUSER=backup_reader PGPASSWORD=$reader_password BACKUP_FORCE_ROLE_CHECK=1 \
+    "$here/dump.sh" "$archives/concurrent" 2>&3)
+  rows_after=$(writer_rows)
+  if ! kill -0 "$writer_pid" 2>/dev/null; then
+    node "$backup_dir/sanitize.mjs" "$writer_log" 2>&3 || true
+    fail WRITER_FAILED "the concurrent writer stopped during the dump"
+  fi
+  stop_writer
+  [ "$rows_after" -gt "$rows_before" ] ||
+    fail WRITER_IDLE "the writer inserted nothing while the dump ran ($rows_before -> $rows_after)"
+  info "the writer inserted $((rows_after - rows_before)) rows while the dump ran"
+  extract_manifest "$concurrent_archive" "$archives/concurrent-x"
+  node_cli node "$here/manifest.mjs" build "$work_dir/live-manifest.json" --skip-drift >/dev/null
+  expect_fail "the live database moved on after the snapshot" "DIFF data app.expense_entries" \
+    node "$here/compare.mjs" --strict-sequences "$archives/concurrent-x/manifest.json" "$work_dir/live-manifest.json"
+
   step "stack A: negative cases for the dump"
   expect_fail "loopback refused" "[LOOPBACK_REFUSED]" \
     env BACKUP_ALLOW_LOOPBACK=0 "$here/dump.sh" "$neg_dir/out"
@@ -225,6 +383,12 @@ run_full() {
   sql 'create table public.rogue_scope_test (id int)'
   expect_fail "rogue public table" "[DRIFT]" "$here/dump.sh" "$neg_dir/out"
   sql 'drop table public.rogue_scope_test'
+  sql "insert into storage.buckets (id, name) values ('ci-rogue-bucket', 'ci-rogue-bucket')"
+  expect_fail "storage bucket present" "storage holds 1 bucket" "$here/dump.sh" "$neg_dir/out"
+  sql "set storage.allow_delete_query = 'true'; delete from storage.buckets where id = 'ci-rogue-bucket'"
+  local buckets
+  buckets=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c 'select count(*) from storage.buckets')
+  [ "$buckets" = 0 ] || fail NEGATIVE_LEFT_DATA "the test bucket could not be removed from storage.buckets"
 
   step "stack B: empty project"
   make_empty_project "$work_dir/stack-b"
@@ -288,6 +452,15 @@ run_full() {
   assert_target_empty
   create_user "$old_owner" "seed-owner-original@theshark.test"
   restore_archive "$archive" preserve
+
+  step "stack B: restore the backup_reader archive taken during writes"
+  sql 'drop schema app, ledger_scratch cascade'
+  assert_target_empty
+  restore_archive "$concurrent_archive" preserve
+  node_cli node "$here/manifest.mjs" build "$work_dir/restored-concurrent.json" --skip-drift >/dev/null
+  node_cli node "$here/compare.mjs" --strict-sequences \
+    "$archives/concurrent-x/manifest.json" "$work_dir/restored-concurrent.json" >/dev/null
+  info "the restored manifest equals the manifest of the dump taken during writes"
 
   info "round trip ok"
 }

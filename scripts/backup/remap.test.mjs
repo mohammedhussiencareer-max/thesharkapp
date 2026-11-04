@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { OWNER_AUDIT_COLUMNS } from './config.mjs';
+import {
+  OWNER_AUDIT_COLUMNS,
+  OWNER_COLUMNS,
+  OWNER_FK_COLUMNS,
+} from './config.mjs';
 import {
   applyRemap,
   buildRemapSql,
+  checkOwnerExists,
   checkOwnerSubset,
   normaliseUuid,
   parseColumnRef,
@@ -86,16 +91,101 @@ test('parseColumnRef accepts app.table.column only', () => {
 test('remapColumnList unions, dedupes and sorts', () => {
   const columns = remapColumnList({
     ownerFkMap: ['app.owner.user_id', 'app.purchases.created_by'],
-    ownerAuditColumns: ['app.purchases.created_by', 'app.a.b'],
+    ownerAuditColumns: [
+      'app.purchases.created_by',
+      'app.sort_batches.created_by',
+    ],
   });
   assert.deepEqual(
     columns.map((c) => c.ref),
-    ['app.a.b', 'app.owner.user_id', 'app.purchases.created_by'],
+    [
+      'app.owner.user_id',
+      'app.purchases.created_by',
+      'app.sort_batches.created_by',
+    ],
   );
   assert.equal(
     codeOf(() => remapColumnList({ ownerFkMap: ['auth.users.id'] })),
     'BAD_COLUMN_REF',
   );
+});
+
+test('a column outside the maintained allowlist is rejected from either manifest list', () => {
+  for (const bad of [
+    'app.stock_items.id',
+    'app.stock_movements.id',
+    'app.owner.id',
+    'app.purchases.supplier_id',
+  ]) {
+    for (const key of ['ownerFkMap', 'ownerAuditColumns']) {
+      assert.throws(
+        () =>
+          remapColumnList({
+            ownerFkMap: ['app.owner.user_id'],
+            ownerAuditColumns: ['app.purchases.created_by'],
+            [key]: [bad],
+          }),
+        (error) =>
+          error.code === 'BAD_COLUMN_REF' &&
+          error.message.includes(bad) &&
+          error.message.includes('allowlist'),
+        `${key} ${bad}`,
+      );
+    }
+  }
+  assert.equal(
+    codeOf(() => remapColumnList({ ownerFkMap: 'app.owner.user_id' })),
+    'BAD_COLUMN_REF',
+  );
+  assert.equal(
+    codeOf(() => remapColumnList({ ownerAuditColumns: { a: 1 } })),
+    'BAD_COLUMN_REF',
+  );
+});
+
+test('every configured owner column is a valid app column reference', () => {
+  const columns = remapColumnList({
+    ownerFkMap: OWNER_FK_COLUMNS,
+    ownerAuditColumns: OWNER_AUDIT_COLUMNS,
+  });
+  assert.equal(columns.length, OWNER_COLUMNS.length);
+  assert.deepEqual(
+    OWNER_FK_COLUMNS.filter((ref) => OWNER_AUDIT_COLUMNS.includes(ref)),
+    [],
+  );
+  assert.ok(OWNER_FK_COLUMNS.includes('app.owner.user_id'));
+  assert.ok(OWNER_FK_COLUMNS.includes('app.item_opening_prices.approved_by'));
+});
+
+test('a manifest with an unknown owner column is refused before any database call', () => {
+  const { calls, psql } = fakePsql();
+  const hostile = {
+    ...metadata,
+    ownerFkMap: [...metadata.ownerFkMap, 'app.stock_items.id'],
+  };
+  for (const mode of ['preserve', 'remap']) {
+    assert.throws(
+      () =>
+        checkOwnerExists({
+          metadata: hostile,
+          mode,
+          newOwner: mode === 'remap' ? NEW : undefined,
+          psql,
+        }),
+      (error) => error.code === 'BAD_COLUMN_REF',
+    );
+    assert.throws(
+      () =>
+        applyRemap({
+          metadata: hostile,
+          mode,
+          newOwner: mode === 'remap' ? NEW : undefined,
+          psql,
+        }),
+      (error) => error.code === 'BAD_COLUMN_REF',
+    );
+  }
+  assert.deepEqual(calls, []);
 });
 
 test('the configured audit allowlist is valid and covers the known columns', () => {

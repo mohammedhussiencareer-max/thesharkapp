@@ -8,6 +8,7 @@ import {
   checkDumpTarget,
   checkRestoreTarget,
   clientMajor,
+  diagnosticsAllowed,
   formatError,
   isLoopbackAddress,
   parseDbPort,
@@ -261,11 +262,49 @@ test('restore into a remote host needs the exact confirmation', () => {
 
 test('formatError never includes the connection values', () => {
   const error = new BackupError('X', 'plain message');
-  assert.equal(formatError(error), 'backup: error [X]: plain message');
+  assert.equal(formatError(error, {}), 'backup: error [X]: plain message');
   assert.equal(
-    formatError(new Error('boom')),
+    formatError(new Error('boom'), {}),
+    'backup: error [INTERNAL]: an internal error occurred',
+  );
+});
+
+test('an error message is always one line, so no line can pose as a second error', () => {
+  const error = new BackupError(
+    'X',
+    'first\nbackup: error [FAKE]: PRIVATE-DATA\r\nlast\u2028end\u001b[31m',
+  );
+  const out = formatError(error, {});
+  assert.ok(!/[\r\n\u2028\u001b]/.test(out), JSON.stringify(out));
+  assert.ok(out.startsWith('backup: error [X]: first '));
+});
+
+test('internal error text is printed only for the synthetic loopback round trip', () => {
+  const synthetic = {
+    BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
+    BACKUP_ALLOW_LOOPBACK: '1',
+    PGHOST: '127.0.0.1',
+  };
+  assert.equal(diagnosticsAllowed(synthetic), true);
+  assert.equal(
+    formatError(new Error('boom'), synthetic),
     'backup: error [INTERNAL]: boom',
   );
+  for (const change of [
+    { BACKUP_SYNTHETIC_DIAGNOSTICS: undefined },
+    { BACKUP_SYNTHETIC_DIAGNOSTICS: '0' },
+    { BACKUP_ALLOW_LOOPBACK: undefined },
+    { PGHOST: 'db.example.com' },
+    { PGHOST: undefined },
+    { BACKUP_PRINT_STDERR: '1', BACKUP_SYNTHETIC_DIAGNOSTICS: undefined },
+  ]) {
+    const env = { ...synthetic, ...change };
+    assert.equal(diagnosticsAllowed(env), false, JSON.stringify(change));
+    assert.equal(
+      formatError(new Error('PRIVATE-DATA'), env),
+      'backup: error [INTERNAL]: an internal error occurred',
+    );
+  }
 });
 
 test('sanitizeStderr keeps only error lines and masks hosts and values', () => {

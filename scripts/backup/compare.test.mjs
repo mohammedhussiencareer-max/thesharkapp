@@ -15,7 +15,7 @@ function manifest() {
       'app.stock_items': { rows: 3, hash: 'aaa' },
       'app.owner': { rows: 1, hash: 'bbb' },
     },
-    sequences: { 'app.costing_changes_id_seq': { lastValue: 4 } },
+    sequences: { 'app.costing_changes_id_seq': { lastValue: '4' } },
     fingerprint: {
       'function app.is_owner()': {
         def: 'd1',
@@ -65,7 +65,7 @@ test('missing and extra tables are named', () => {
 
 test('a sequence that went backwards is named', () => {
   const actual = manifest();
-  actual.sequences['app.costing_changes_id_seq'].lastValue = 3;
+  actual.sequences['app.costing_changes_id_seq'].lastValue = '3';
   assert.deepEqual(names(compareManifests(manifest(), actual)), [
     'sequence app.costing_changes_id_seq',
   ]);
@@ -75,12 +75,108 @@ test('a sequence that went backwards is named', () => {
 
 test('a sequence that moved forward passes unless strict', () => {
   const actual = manifest();
-  actual.sequences['app.costing_changes_id_seq'].lastValue = 5;
+  actual.sequences['app.costing_changes_id_seq'].lastValue = '5';
   assert.deepEqual(compareManifests(manifest(), actual), []);
   assert.deepEqual(
     names(compareManifests(manifest(), actual, { strictSequences: true })),
     ['sequence app.costing_changes_id_seq'],
   );
+});
+
+function withSequence(lastValue) {
+  const result = manifest();
+  result.sequences['app.costing_changes_id_seq'] = { lastValue };
+  return result;
+}
+
+test('sequence values above 2^53 are compared exactly, strict or not', () => {
+  const low = '9007199254740992';
+  const high = '9007199254740993';
+  assert.equal(Number(low), Number(high), 'the premise: numbers collide');
+  for (const strictSequences of [true, false]) {
+    assert.deepEqual(
+      compareManifests(withSequence(low), withSequence(low), {
+        strictSequences,
+      }),
+      [],
+    );
+  }
+  assert.deepEqual(
+    names(
+      compareManifests(withSequence(high), withSequence(low), {
+        strictSequences: true,
+      }),
+    ),
+    ['sequence app.costing_changes_id_seq'],
+  );
+  assert.deepEqual(
+    names(
+      compareManifests(withSequence(low), withSequence(high), {
+        strictSequences: true,
+      }),
+    ),
+    ['sequence app.costing_changes_id_seq'],
+  );
+  assert.deepEqual(
+    names(compareManifests(withSequence(high), withSequence(low))),
+    ['sequence app.costing_changes_id_seq'],
+  );
+  assert.deepEqual(compareManifests(withSequence(low), withSequence(high)), []);
+});
+
+test('sequence comparison holds at the bigint limits', () => {
+  const max = '9223372036854775807';
+  const nearMax = '9223372036854775806';
+  assert.deepEqual(
+    compareManifests(withSequence(max), withSequence(max), {
+      strictSequences: true,
+    }),
+    [],
+  );
+  assert.equal(
+    compareManifests(withSequence(max), withSequence(nearMax)).length,
+    1,
+  );
+  assert.equal(
+    compareManifests(withSequence(nearMax), withSequence(max), {
+      strictSequences: true,
+    }).length,
+    1,
+  );
+  assert.deepEqual(
+    compareManifests(withSequence('-9223372036854775808'), withSequence('1')),
+    [],
+  );
+});
+
+test('fingerprinted sequence definitions that differ above 2^53 are named', () => {
+  const def = (max) => ({
+    'sequence app.s': { seq: { max, start: '1', cache: '1' } },
+  });
+  const expected = { ...manifest(), fingerprint: def('9223372036854775807') };
+  const actual = { ...manifest(), fingerprint: def('9223372036854775806') };
+  assert.deepEqual(names(compareManifests(expected, actual)), [
+    'sequence app.s',
+  ]);
+});
+
+test('a sequence value that is not a decimal string or a safe integer is refused', () => {
+  for (const bad of [
+    9223372036854776000,
+    1.5,
+    '1e3',
+    '0x10',
+    'abc',
+    {},
+    true,
+  ]) {
+    assert.throws(
+      () => compareManifests(withSequence(bad), withSequence('1')),
+      { code: 'MANIFEST_INVALID' },
+      String(bad),
+    );
+  }
+  assert.deepEqual(compareManifests(withSequence(4), withSequence('4')), []);
 });
 
 test('a dropped function is named', () => {

@@ -13,8 +13,9 @@ backup_init
 
 archive=${1:-}
 [ -n "$archive" ] || fail USAGE "usage: verify-archive.sh <archive.tar.gz>"
-require_tools node pg_restore tar gzip sha256sum
+require_tools node tar gzip sha256sum
 setup_pg_path
+require_tools pg_restore
 
 package="$work_dir/package"
 mkdir -p "$package"

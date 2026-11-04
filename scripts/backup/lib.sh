@@ -2,6 +2,8 @@
 # Shared helpers. Source after "set -euo pipefail". Never enables xtrace.
 # All stderr goes to a work-dir file; only "backup: ..." lines reach the user
 # channel (fd 3), so row data, connection strings and secrets are never printed.
+# The one exception is BACKUP_SYNTHETIC_DIAGNOSTICS=1, set only by the synthetic
+# "ci-roundtrip.sh full"; every other run prints fixed messages and SQLSTATE codes.
 set +x
 
 backup_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -44,7 +46,9 @@ on_exit() {
     if [ -z "$work_dir" ] || [ ! -e "$work_dir/reported" ]; then
       printf 'backup: error [FAILED]: step "%s" failed\n' "$current_step" >&3
     fi
-    if [ "${BACKUP_PRINT_STDERR:-0}" = 1 ] && [ -s "${BACKUP_STDERR_FILE:-/nonexistent}" ]; then
+    # Server text is printed only by the synthetic round trip (ci-roundtrip.sh
+    # full); sanitize.mjs refuses unless the target is loopback as well.
+    if [ "${BACKUP_SYNTHETIC_DIAGNOSTICS:-0}" = 1 ] && [ -s "${BACKUP_STDERR_FILE:-/nonexistent}" ]; then
       node "$backup_dir/sanitize.mjs" "$BACKUP_STDERR_FILE" 2>&3 || true
     fi
   fi
@@ -85,7 +89,8 @@ node_cli() {
   "$@" 2>"$err" || rc=$?
   cat "$err" >>"$BACKUP_STDERR_FILE"
   if [ "$rc" -ne 0 ]; then
-    if grep -E '^backup: error \[[A-Z_]+\]: ' "$err" >&3; then
+    # Only the first such line: formatError prints exactly one line per error.
+    if grep -E -m 1 '^backup: error \[[A-Z_]+\]: ' "$err" >&3; then
       : >"$work_dir/reported"
     fi
   fi

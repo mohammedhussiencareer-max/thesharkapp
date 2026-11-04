@@ -1,6 +1,9 @@
 import { readFileSync } from 'node:fs';
-import { isMain } from './config.mjs';
+import { diagnosticsAllowed, isMain } from './config.mjs';
 
+// Best effort only, and used only for the synthetic round trip. Postgres embeds
+// raw values in messages, so a value crafted to look like a finished message
+// cannot be told apart; production never prints server text (see psql.mjs).
 const KEEP = /^(pg_dump|pg_restore|psql|ERROR|FATAL|backup)\b/;
 // Echo lines: server/tool lines that may repeat row data or SQL text.
 // 1 = DETAIL/CONTEXT/HINT/LOCATION, 2 = LINE n, 3 = query/command echoes.
@@ -8,6 +11,8 @@ const ECHO =
   /^(?:(?:pg_dump|pg_restore|psql)\S*:\s+)?(?:(?:detail|hint):\s+)?(?:(DETAIL|CONTEXT|HINT|LOCATION)\s*:|(LINE\s+\d+)\s*:|(STATEMENT|QUERY|Query was|Command was)\s*:)/i;
 const MAX_LINE = 300;
 const MAX_LINES = 20;
+const MAX_JOIN = 200;
+const LINE_BREAK = /\r\n|[\n\r\v\f\u0085\u2028\u2029]/;
 const OPEN = {
   '"': '"',
   "'": "'",
@@ -24,6 +29,47 @@ const WORD = /[\p{L}\p{N}_]/u;
 function cutAtFirstQuote(line) {
   const at = line.search(ANY_QUOTE);
   return `${line.slice(0, at).trimEnd()} <q>`;
+}
+
+function findClose(line, at) {
+  const ch = line[at];
+  const close = OPEN[ch];
+  for (let j = at + 1; j < line.length; j += 1) {
+    if (line[j] !== close) {
+      continue;
+    }
+    if (close === ch && line[j + 1] === close) {
+      j += 1;
+      continue;
+    }
+    return j;
+  }
+  return -1;
+}
+
+// True when the line ends inside a quoted literal or an open parenthesis, so
+// the next physical line is still part of the same message.
+function endsOpen(line) {
+  let depth = 0;
+  let i = 0;
+  while (i < line.length) {
+    const ch = line[i];
+    if (OPEN[ch] === undefined) {
+      if (ch === '(') {
+        depth += 1;
+      } else if (ch === ')' && depth > 0) {
+        depth -= 1;
+      }
+      i += 1;
+      continue;
+    }
+    const found = findClose(line, i);
+    if (found < 0) {
+      return true;
+    }
+    i = found + 1;
+  }
+  return depth > 0;
 }
 
 // Replaces the inside of every quoted literal. A quote that cannot be paired
@@ -43,18 +89,7 @@ function redactQuotes(line) {
       i += 1;
       continue;
     }
-    let found = -1;
-    for (let j = i + 1; j < line.length; j += 1) {
-      if (line[j] !== close) {
-        continue;
-      }
-      if (close === ch && line[j + 1] === close) {
-        j += 1;
-        continue;
-      }
-      found = j;
-      break;
-    }
+    const found = findClose(line, i);
     if (found < 0) {
       return cutAtFirstQuote(line);
     }
@@ -173,18 +208,42 @@ function sanitizeLine(line) {
   return fit(maskBytes(redactQuotes(redactPairs(maskValues(line)))));
 }
 
+// A message is one logical line: physical lines are joined while a quote or a
+// parenthesis stays open, so a value with embedded newlines is redacted whole.
+// If it never closes within MAX_JOIN lines, the rest of the input is dropped.
 export function sanitizeStderr(text) {
+  const physical = String(text).split(LINE_BREAK);
   const lines = [];
-  for (const raw of String(text).split(/\r?\n/)) {
-    const clean = sanitizeLine(raw.trim());
+  let at = 0;
+  let truncated = false;
+  while (at < physical.length && lines.length < MAX_LINES) {
+    let logical = physical[at].trim();
+    at += 1;
+    if (KEEP.test(logical) || ECHO.test(logical)) {
+      let joined = 1;
+      while (at < physical.length && endsOpen(logical)) {
+        if (joined >= MAX_JOIN) {
+          truncated = true;
+          break;
+        }
+        logical += ` ${physical[at].trim()}`;
+        at += 1;
+        joined += 1;
+      }
+    }
+    const clean = sanitizeLine(logical.replace(/\p{Cc}/gu, ' ').trim());
     if (clean !== null) {
       lines.push(clean);
+    }
+    if (truncated) {
+      lines.push('backup: output truncated after an unterminated value');
+      break;
     }
   }
   return lines.slice(0, MAX_LINES).join('\n');
 }
 
-if (isMain(import.meta.url) && process.argv[2]) {
+if (isMain(import.meta.url) && process.argv[2] && diagnosticsAllowed()) {
   const out = sanitizeStderr(readFileSync(process.argv[2], 'utf8'));
   if (out) {
     console.error(out);

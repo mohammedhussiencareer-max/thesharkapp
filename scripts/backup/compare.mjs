@@ -40,11 +40,33 @@ function describeAttrs(a, b) {
 
 const notEqual = (a, b) => !isDeepStrictEqual(a, b);
 
+// bigint values are decimal strings in the manifest: a JSON number loses
+// precision above 2^53.
+function sequenceValue(entry) {
+  const value = entry?.lastValue ?? null;
+  if (value === null) {
+    return null;
+  }
+  if (typeof value === 'string' && /^-?\d+$/.test(value)) {
+    return BigInt(value);
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value)) {
+    return BigInt(value);
+  }
+  throw new BackupError(
+    'MANIFEST_INVALID',
+    'a sequence value is not a decimal string',
+  );
+}
+
+const sequenceDiffers = (expected, actual) =>
+  sequenceValue(expected) !== sequenceValue(actual);
+
 // A live source can advance a sequence after the dump read it, so the
 // restored value may only be at or above the manifest value.
 function sequenceMoved(expected, actual) {
-  const before = expected.lastValue ?? null;
-  const after = actual.lastValue ?? null;
+  const before = sequenceValue(expected);
+  const after = sequenceValue(actual);
   return before !== null && (after === null || after < before);
 }
 
@@ -94,7 +116,7 @@ export function compareManifests(
       expected.sequences,
       actual.sequences,
       () => 'value differs',
-      strictSequences ? notEqual : sequenceMoved,
+      strictSequences ? sequenceDiffers : sequenceMoved,
     ),
     ...compareSection(
       '',

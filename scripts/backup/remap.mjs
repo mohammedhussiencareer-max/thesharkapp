@@ -1,5 +1,11 @@
 import { readFileSync } from 'node:fs';
-import { BackupError, DUMP_SCHEMA, isMain, runCli } from './config.mjs';
+import {
+  BackupError,
+  DUMP_SCHEMA,
+  OWNER_COLUMNS,
+  isMain,
+  runCli,
+} from './config.mjs';
 import { runPsql } from './psql.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -25,9 +31,22 @@ export function parseColumnRef(ref) {
 }
 
 export function remapColumnList({ ownerFkMap = [], ownerAuditColumns = [] }) {
+  if (!Array.isArray(ownerFkMap) || !Array.isArray(ownerAuditColumns)) {
+    throw new BackupError(
+      'BAD_COLUMN_REF',
+      'the manifest owner column lists must be arrays',
+    );
+  }
+  const allowed = new Set(OWNER_COLUMNS);
   const refs = new Set([...ownerFkMap, ...ownerAuditColumns]);
   return [...refs].sort().map((ref) => {
     const parsed = parseColumnRef(ref);
+    if (!allowed.has(ref)) {
+      throw new BackupError(
+        'BAD_COLUMN_REF',
+        `owner column ${ref} is not in the maintained owner column allowlist`,
+      );
+    }
     return { ref, ...parsed };
   });
 }
@@ -85,6 +104,7 @@ function lines(output) {
 
 export function checkOwnerExists({ metadata, mode, newOwner, psql = runPsql }) {
   const plan = planRemap({ mode, oldOwner: metadata.ownerUuid, newOwner });
+  remapColumnList(metadata);
   const [found] = lines(
     psql({
       sql: "select exists (select 1 from auth.users where id = :'new'::uuid);",

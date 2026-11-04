@@ -20,6 +20,14 @@ export const DUMP_SCHEMA = 'app';
 export const STRUCTURE_ONLY_SCHEMA = 'ledger_scratch';
 export const SCOPE_SCHEMAS = [DUMP_SCHEMA, STRUCTURE_ONLY_SCHEMA];
 
+// Owner foreign keys to auth.users. Add a column here when a new table
+// references auth.users; never remove one while old archives may exist.
+export const OWNER_FK_COLUMNS = [
+  'app.costing_changes.actor_id',
+  'app.item_opening_prices.approved_by',
+  'app.owner.user_id',
+];
+
 // Owner audit columns that are not foreign keys. Add a column here when a new
 // table stores auth.uid() without referencing auth.users.
 export const OWNER_AUDIT_COLUMNS = [
@@ -56,9 +64,23 @@ export const PLATFORM_SCHEMAS = [
   'vault',
 ];
 
+// Every owner column the restore may remap.
+export const OWNER_COLUMNS = [...OWNER_FK_COLUMNS, ...OWNER_AUDIT_COLUMNS];
+
+// The application uses neither: their jobs and queues live outside the dump.
+export const FORBIDDEN_EXTENSIONS = ['pg_cron', 'pg_net'];
+
+// Schemas backup_reader must not be able to enter.
+export const FORBIDDEN_USAGE_SCHEMAS = [
+  'auth',
+  'cron',
+  'net',
+  'storage',
+  'vault',
+];
+
 export const PLATFORM_EXTENSIONS = [
   'pg_graphql',
-  'pg_net',
   'pg_stat_statements',
   'pgcrypto',
   'pgjwt',
@@ -70,6 +92,29 @@ export const PLATFORM_EXTENSIONS = [
 
 // Extensions the application needs and the restore pre-creates.
 export const APP_EXTENSIONS = ['btree_gist'];
+
+// Roles that own Supabase platform objects. postgres is deliberately absent: it
+// runs the app's migrations, so its objects outside schemas app and
+// ledger_scratch are application data the dump would silently omit.
+export const PLATFORM_OBJECT_OWNERS = [
+  'dashboard_user',
+  'pgbouncer',
+  'supabase_admin',
+  'supabase_auth_admin',
+  'supabase_functions_admin',
+  'supabase_read_only_user',
+  'supabase_realtime_admin',
+  'supabase_replication_admin',
+  'supabase_storage_admin',
+];
+
+// Platform objects that postgres owns (schema.name). Add one when the drift
+// guard names a platform object that is not application data.
+export const PLATFORM_POSTGRES_OBJECTS = [
+  'graphql_public.graphql',
+  'supabase_migrations.schema_migrations',
+  'supabase_migrations.seed_files',
+];
 
 // Roles a fresh Supabase project already has; a missing one refuses the restore.
 export const PLATFORM_ROLES = [
@@ -95,10 +140,24 @@ export class BackupError extends Error {
   }
 }
 
-export function formatError(error) {
-  const code = error instanceof BackupError ? error.code : 'INTERNAL';
-  const message = error instanceof Error ? error.message : String(error);
-  return `backup: error [${code}]: ${message}`;
+// Server text may be printed only by the synthetic round trip against a
+// loopback database. Every other run prints fixed messages and SQLSTATE codes.
+export function diagnosticsAllowed(env = process.env) {
+  return (
+    env.BACKUP_SYNTHETIC_DIAGNOSTICS === '1' &&
+    env.BACKUP_ALLOW_LOOPBACK === '1' &&
+    env.PGHOST === '127.0.0.1'
+  );
+}
+
+export function formatError(error, env = process.env) {
+  const known = error instanceof BackupError;
+  const code = known ? error.code : 'INTERNAL';
+  let message = 'an internal error occurred';
+  if (known || diagnosticsAllowed(env)) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+  return `backup: error [${code}]: ${message.replace(/[\p{Cc}\u2028\u2029]+/gu, ' ')}`;
 }
 
 export function runCli(fn) {

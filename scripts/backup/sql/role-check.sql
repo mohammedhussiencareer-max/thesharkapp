@@ -71,6 +71,26 @@ select
       where
         n.nspname in ('app', 'ledger_scratch')
         and has_schema_privilege(r.oid, n.oid, 'CREATE')
+    ),
+    'forbiddenUsage',
+    (
+      select
+        coalesce(
+          jsonb_agg(
+            n.nspname
+            order by
+              n.nspname
+          ),
+          '[]'::jsonb
+        )
+      from
+        pg_catalog.pg_namespace n
+      where
+        n.nspname in (
+          select
+            jsonb_array_elements_text(:'forbidden_usage'::jsonb)
+        )
+        and has_schema_privilege(r.oid, n.oid, 'USAGE')
     )
   )::text
 from

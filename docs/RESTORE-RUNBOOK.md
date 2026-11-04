@@ -86,7 +86,19 @@ psql -c "drop schema if exists app, ledger_scratch cascade"
 tar -xzf <النسخة>.tar.gz manifest.json
 ```
 
-2. اربط المشروع وعلّم الإصدارات إنها اتطبقت:
+2. تأكد إن الكود عندك هو نفس الكود اللي اتعملت بيه النسخة. الأمر `migration repair` بيكتب أرقام الإصدارات بس، فلازم تتأكد الأول إن ملفات الـ migrations مطابقة. محتاج Docker شغال:
+
+```
+git checkout "$(node -p "require('./manifest.json').metadata.appCommit")"
+supabase start
+supabase db reset
+PGHOST=127.0.0.1 PGPORT=55422 PGUSER=postgres PGPASSWORD=postgres PGDATABASE=postgres PGSSLMODE=disable node scripts/backup/manifest.mjs migrations-check manifest.json
+```
+
+- لازم يطلع السطر: `migration history matches the backup`.
+- لو طلع إن إصدارات مختلفة، متكملش. الكود ده مش اللي عمل النسخة. وقف واسأل.
+
+3. اربط المشروع وعلّم الإصدارات إنها اتطبقت:
 
 ```
 supabase link --project-ref <project ref>
@@ -94,7 +106,8 @@ supabase migration repair --status applied $(node -p "require('./manifest.json')
 supabase migration list
 ```
 
-3. لازم القايمة تبين إن المحلي والبعيد زي بعض.
+4. لازم القايمة تبين إن المحلي والبعيد زي بعض.
+5. ارجع للفرع الأساسي: `git checkout main`.
 
 ## 8. أنشئ مستخدم النسخ الاحتياطي من جديد
 
@@ -110,15 +123,20 @@ psql "host=<host> port=5432 dbname=postgres user=postgres.<project ref> sslmode=
 
 ## 9. حدّث التطبيق وجرّبه
 
-1. حدّث `apps/web/.env.production` بالـ URL والـ publishable key الجديدين.
-2. افتح التطبيق وسجل دخول بحساب المالك.
-3. شوف المخزون، وجرّب شراء، وشوف شهر المصروفات.
-4. لو حاجة مش مظبوطة، متكتبش بيانات جديدة. وقف واسأل.
+التطبيق المثبّت على الكمبيوتر بيحفظ عنوان المشروع والمفتاح جواه وقت البناء، وكمان بيمنع الاتصال بأي مشروع غير القديم. تعديل `.env.production` لوحده مش هيغيّر حاجة في التطبيق المثبّت. لازم تبني التطبيق من جديد وتثبّته.
+
+1. حدّث `apps/web/.env.production` بالـ URL والمفتاح الجديدين (`VITE_SUPABASE_URL` و`VITE_SUPABASE_ANON_KEY`).
+2. حدّث `apps/desktop/src-tauri/tauri.conf.json`: في `app.security.csp` وتحت `connect-src` بدّل عنوان المشروع القديم بالجديد: `'self' https://<project ref الجديد>.supabase.co`. متلمسش `devCsp`.
+3. ابني ملف التثبيت بالأمر `pnpm desktop:build`، وشغّل ملف الـ setup الجديد على كمبيوتر المالك. بيتثبّت فوق القديم.
+4. اتأكد إن التطبيق بيكلم المشروع الجديد: افتح التطبيق، سجل دخول بحساب المالك، وقارن كمية مخزون واحدة بالنسخة. لو الشاشة فاضية أو الدخول فشل بخطأ شبكة، يبقى العنوان أو الـ CSP لسه القديم. متكتبش بيانات جديدة قبل ما ده يشتغل.
+5. شوف المخزون، وجرّب شراء، وشوف شهر المصروفات.
+6. لو حاجة مش مظبوطة، متكتبش بيانات جديدة. وقف واسأل.
+7. اعمل commit لتعديل `tauri.conf.json` عشان البناء الجاي يفضل على المشروع الجديد.
 
 ## تمرين الاستعادة (مرة واحدة قبل ما تعتمد على النسخ)
 
 1. استنى 3 أيام خضرا من النسخ اليومي.
 2. اعمل مشروع Supabase مجاني تاني مؤقت.
 3. اتبع الخطوات من 1 لـ 5 عليه.
-4. افتح التطبيق على المشروع المؤقت وجرّب الدخول.
+4. ابني التطبيق على عنوان المشروع المؤقت (الخطوة 9) وجرّب الدخول. ده بيستبدل التطبيق المثبّت، فبعد ما تخلص ارجع ابنيه وثبّته على المشروع الأصلي.
 5. امسح المشروع المؤقت بس بعد موافقتك.

@@ -19,3 +19,4 @@ scripts/backup/sql/manifest.sql
 scripts/backup/sql/session.sql
 scripts/backup/sql/snapshot-session.sql
 scripts/backup/testdata/seed.sql
+scripts/backup/testdata/writer.sql

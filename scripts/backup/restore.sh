@@ -28,12 +28,13 @@ case "$mode" in
   *) fail USAGE "$usage" ;;
 esac
 
-require_tools node pg_restore psql tar gzip sha256sum
+require_tools node tar gzip sha256sum
+setup_pg_path
+require_tools pg_restore psql
 
 step "checking the restore target"
 guard restore-target >/dev/null
 export PGSSLMODE=${PGSSLMODE:-verify-full}
-setup_pg_path
 
 step "verifying the archive"
 package="$work_dir/package"

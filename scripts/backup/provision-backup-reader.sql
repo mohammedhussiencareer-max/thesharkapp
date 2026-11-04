@@ -70,26 +70,17 @@ grant
 select
   on sequences to backup_reader;
 
--- Migration versions are saved as metadata (the version column only).
+-- Migration versions and a hash of their statements are saved as metadata
+-- (the version and statements columns only; the hash is computed, not stored).
 do $$
 begin
   if to_regclass('supabase_migrations.schema_migrations') is not null then
     grant usage on schema supabase_migrations to backup_reader;
-    grant select (version) on supabase_migrations.schema_migrations to backup_reader;
+    grant select (version, statements) on supabase_migrations.schema_migrations to backup_reader;
   end if;
 end
 $$;
 
--- The drift guard counts storage objects and cron jobs (one column each, no content).
-do $$
-begin
-  if to_regclass('storage.objects') is not null then
-    grant usage on schema storage to backup_reader;
-    grant select (id) on storage.objects to backup_reader;
-  end if;
-  if to_regclass('cron.job') is not null then
-    grant usage on schema cron to backup_reader;
-    grant select (jobid) on cron.job to backup_reader;
-  end if;
-end
-$$;
+-- Nothing else: backup_reader gets no access to the auth, storage, vault, cron
+-- or net schemas. The drift guard cannot read storage.buckets with this role;
+-- see docs/BACKUP.md for the manual check.

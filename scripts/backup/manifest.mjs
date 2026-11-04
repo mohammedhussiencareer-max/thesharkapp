@@ -7,6 +7,8 @@ import {
   BackupError,
   OWNER_AUDIT_COLUMNS,
   PLATFORM_EXTENSIONS,
+  PLATFORM_OBJECT_OWNERS,
+  PLATFORM_POSTGRES_OBJECTS,
   SCOPE_SCHEMAS,
   isMain,
   readPinnedMajor,
@@ -51,6 +53,8 @@ function queryVars(snapshot) {
   const vars = {
     audit_cols: JSON.stringify(OWNER_AUDIT_COLUMNS),
     platform_ext: JSON.stringify(PLATFORM_EXTENSIONS),
+    platform_owners: JSON.stringify(PLATFORM_OBJECT_OWNERS),
+    platform_objects: JSON.stringify(PLATFORM_POSTGRES_OBJECTS),
   };
   if (snapshot !== undefined && snapshot !== null && snapshot !== '') {
     if (!SNAPSHOT.test(snapshot)) {
@@ -68,6 +72,41 @@ export function readDriftFacts({ psql = runPsql, snapshot } = {}) {
     code: 'DRIFT_QUERY_FAILED',
   });
   return parseJson(output, 'DRIFT_QUERY_FAILED');
+}
+
+// Keep the md5 expression identical to the one in sql/manifest.sql.
+export const MIGRATION_HASH_EXPR =
+  "md5(coalesce(array_to_string(statements, E'\\n'), ''))";
+
+export function readMigrationHashes({ psql = runPsql } = {}) {
+  const output = psql({
+    sql: `select coalesce(jsonb_object_agg(version, ${MIGRATION_HASH_EXPR}), '{}'::jsonb)::text from supabase_migrations.schema_migrations;`,
+    code: 'MIGRATIONS_QUERY_FAILED',
+  });
+  return parseJson(output, 'MIGRATIONS_QUERY_FAILED');
+}
+
+export function checkMigrationHashes(manifest, actual) {
+  const expected = manifest?.metadata?.migrationHashes;
+  if (!expected || typeof expected !== 'object' || Array.isArray(expected)) {
+    throw new BackupError(
+      'MANIFEST_INVALID',
+      'the manifest has no migration hashes',
+    );
+  }
+  const differences = [];
+  for (const version of [
+    ...new Set([...Object.keys(expected), ...Object.keys(actual)]),
+  ].sort()) {
+    if (!(version in actual)) {
+      differences.push(`${version} is not in this database`);
+    } else if (!(version in expected)) {
+      differences.push(`${version} is not in the backup`);
+    } else if (expected[version] !== actual[version]) {
+      differences.push(`${version} has different statements`);
+    }
+  }
+  return differences;
 }
 
 function toolVersion(command) {
@@ -170,9 +209,28 @@ if (isMain(import.meta.url)) {
       assertNoDrift(readDriftFacts({ snapshot }));
       return 'drift guard: no application objects outside the backup scope';
     }
+    if (command === 'migrations-check') {
+      if (!rest[0]) {
+        throw new BackupError(
+          'USAGE',
+          'usage: manifest.mjs migrations-check <manifest.json>',
+        );
+      }
+      const manifest = JSON.parse(readFileSync(rest[0], 'utf8'));
+      const differences = checkMigrationHashes(manifest, readMigrationHashes());
+      if (differences.length > 0) {
+        throw new BackupError(
+          'MIGRATIONS_DIFFER',
+          `${differences.length} migration(s) differ: ${differences.slice(0, 20).join('; ')}`,
+        );
+      }
+      return `migration history matches the backup (${
+        Object.keys(manifest.metadata.migrationHashes).length
+      } versions)`;
+    }
     throw new BackupError(
       'USAGE',
-      'usage: manifest.mjs build <out.json> | drift',
+      'usage: manifest.mjs build <out.json> | drift | migrations-check <manifest.json>',
     );
   });
 }

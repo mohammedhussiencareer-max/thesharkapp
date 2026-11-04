@@ -123,6 +123,129 @@ test('non-error lines are dropped, long lines and line count are capped', () => 
   assert.equal(sanitizeStderr(many).split('\n').length, 20);
 });
 
+const FORGED = 'PRIVATE-DATA';
+
+function assertNoForged(out) {
+  assert.ok(!out.includes(FORGED), `leaked ${FORGED}: ${out}`);
+}
+
+test('a quoted value with embedded newlines is redacted as one message', () => {
+  const out = sanitizeStderr(
+    [
+      'psql:<stdin>:3: ERROR:  invalid input syntax for type uuid: "',
+      `ERROR: ${FORGED}`,
+      '"',
+      'ERROR:  relation "later" does not exist',
+    ].join('\n'),
+  );
+  assertNoForged(out);
+  assert.ok(out.includes('type uuid: "<q>"'), out);
+  assert.ok(out.includes('relation "<q>" does not exist'), out);
+  assert.equal(out.split('\n').length, 2);
+
+  const inner = sanitizeStderr(
+    `ERROR:  invalid input syntax for type uuid: "first\nERROR: ${FORGED}\nlast"\nERROR:  next`,
+  );
+  assertNoForged(inner);
+  assert.equal(
+    inner,
+    'ERROR:  invalid input syntax for type uuid: "<q>"\nERROR:  next',
+  );
+});
+
+test('single, curly and guillemet quoted values span lines too', () => {
+  for (const [open, close] of [
+    ["'", "'"],
+    ['“', '”'],
+    ['«', '»'],
+  ]) {
+    const out = sanitizeStderr(
+      `ERROR:  bad value ${open}x\nERROR: ${FORGED}\ny${close} for column\nERROR:  after`,
+    );
+    assertNoForged(out);
+    assert.ok(out.endsWith('\nERROR:  after'), out);
+  }
+});
+
+test('other line separators cannot hide a second message inside a value', () => {
+  for (const sep of ['\r', '\u2028', '\u2029', '\u0085', '\v', '\f', '\r\n']) {
+    const out = sanitizeStderr(
+      `ERROR:  bad value "x${sep}ERROR: ${FORGED}${sep}y" now`,
+    );
+    assertNoForged(out);
+    assert.equal(out, 'ERROR:  bad value "<q>" now', JSON.stringify(sep));
+  }
+});
+
+test('parentheses that stay open join the next lines', () => {
+  const out = sanitizeStderr(
+    [
+      'DETAIL:  Failing row contains (1,',
+      `ERROR: ${FORGED}`,
+      'x).',
+      'ERROR:  Key (a)=(first',
+      `ERROR: ${FORGED}-2`,
+      'last) already exists.',
+    ].join('\n'),
+  );
+  assertNoForged(out);
+  assert.equal(
+    out,
+    'DETAIL:  Failing row contains (<redacted>).\nERROR:  Key (<redacted>)=(<redacted>) already exists.',
+  );
+});
+
+test('echoed statements that span lines keep only their label', () => {
+  const out = sanitizeStderr(
+    [
+      "LINE 1: insert into t values ('a",
+      `ERROR: ${FORGED}`,
+      "b')",
+      'pg_restore: error: could not execute query: ERROR:  syntax error',
+      'Command was: CREATE TABLE app.t (',
+      `  note text DEFAULT 'ERROR: ${FORGED}'`,
+      ');',
+      'STATEMENT:  insert into t values (',
+      `ERROR: ${FORGED}-2`,
+      ')',
+    ].join('\n'),
+  );
+  assertNoForged(out);
+  assert.deepEqual(out.split('\n'), [
+    'LINE 1: <redacted>',
+    'pg_restore: error: could not execute query: ERROR:  syntax error',
+    'Command was: <redacted>',
+    'STATEMENT: <redacted>',
+  ]);
+});
+
+test('a value that never closes drops the rest of the input instead of leaking it', () => {
+  const unterminated = sanitizeStderr(
+    `ERROR:  bad value "abc\nERROR: ${FORGED}\nERROR:  more`,
+  );
+  assertNoForged(unterminated);
+  assert.equal(unterminated, 'ERROR:  bad value <q>');
+
+  const long = [
+    'ERROR:  bad value "abc',
+    ...Array.from({ length: 400 }, (_, i) => `ERROR: ${FORGED}-${i}`),
+  ].join('\n');
+  const out = sanitizeStderr(long);
+  assertNoForged(out);
+  assert.equal(
+    out,
+    'ERROR:  bad value <q>\nbackup: output truncated after an unterminated value',
+  );
+});
+
+test('control characters never reach the output', () => {
+  const out = sanitizeStderr(
+    `ERROR:  bad \u001b[31mred\u0007 thing\u009b\nERROR:  \u001b]0;title\u0007ok`,
+  );
+  assert.ok(!/\p{Cc}/u.test(out.replace(/\n/g, '')), JSON.stringify(out));
+  assert.ok(out.includes('ERROR:  bad'));
+});
+
 test('sanitizing is idempotent (error lines are sanitized twice on the way out)', () => {
   const text = [
     'psql:<stdin>:12: ERROR:  invalid input syntax for type uuid: "Ahmed"',

@@ -20,7 +20,7 @@ inner_fail() {
 cli_log=$(mktemp "${errors}.XXXXXX")
 if ! node "$here/manifest.mjs" build "$package/manifest.json" --snapshot "$snapshot" \
   >/dev/null 2>"$cli_log"; then
-  grep -E '^backup: error \[[A-Z_]+\]: ' "$cli_log" >>"$errors" || true
+  grep -E -m 1 '^backup: error \[[A-Z_]+\]: ' "$cli_log" >>"$errors" || true
   cat "$cli_log" >&2
   rm -f "$cli_log"
   inner_fail MANIFEST_FAILED "the manifest could not be built"

@@ -112,7 +112,7 @@ test('only the newest verified backup per Cairo day is kept', () => {
   ];
   const plan = planRetention({
     backups: [...sameDay, ...daily(30).slice(1)],
-    policy: { ...POLICY, minVerified: 1, maxDeletions: 100 },
+    policy: { ...POLICY, minVerified: 1, maxDeletions: 50 },
   });
   assert.ok(plan.delete.includes(sameDay[1].tag));
   assert.ok(!plan.delete.includes(sameDay[0].tag));
@@ -176,6 +176,62 @@ test('a gap in the history keeps what exists', () => {
   const plan = planRetention({ backups: daily(40, { skipEvery: 3 }) });
   assert.ok(plan.keep.length > 0);
   assert.ok(plan.delete.length <= POLICY.maxDeletions);
+});
+
+test('a negative, fractional or oversized deletion limit is refused', () => {
+  const sameDay = Array.from({ length: 30 }, (_, i) => ({
+    tag: formatTag(new Date(newest - i * 60000), 2000 + i),
+    verified: true,
+  }));
+  for (const maxDeletions of [-1, -5, 1.5, Number.NaN, 51, 1e9, '5']) {
+    assert.throws(
+      () =>
+        planRetention({
+          backups: sameDay,
+          policy: { ...POLICY, minVerified: 1, maxDeletions },
+        }),
+      { code: 'USAGE' },
+      String(maxDeletions),
+    );
+  }
+  const zero = planRetention({
+    backups: sameDay,
+    policy: { ...POLICY, minVerified: 1, maxDeletions: 0 },
+  });
+  assert.deepEqual(zero.delete, []);
+  assert.equal(zero.deferred, 29);
+  assert.throws(
+    () => planRetention({ backups: sameDay, policy: { ...POLICY, daily: -1 } }),
+    { code: 'USAGE' },
+  );
+});
+
+test('the CLI rejects a negative or malformed --max-deletions', () => {
+  const script = fileURLToPath(new URL('./retention.mjs', import.meta.url));
+  const input = JSON.stringify(daily(60));
+  for (const value of ['-1', '-0', '1.5', '', 'abc', '51', '1e1', ' 3']) {
+    const result = spawnSync(
+      process.execPath,
+      [script, '--dry-run', '--input', '-', '--max-deletions', value],
+      { input, encoding: 'utf8' },
+    );
+    assert.equal(result.status, 1, `"${value}"`);
+    assert.match(result.stderr, /\[USAGE\]/, `"${value}"`);
+    assert.equal(result.stdout, '', `"${value}" printed a plan`);
+  }
+  const missing = spawnSync(
+    process.execPath,
+    [script, '--input', '-', '--max-deletions'],
+    { input, encoding: 'utf8' },
+  );
+  assert.equal(missing.status, 1);
+  const ok = spawnSync(
+    process.execPath,
+    [script, '--input', '-', '--max-deletions', '2'],
+    { input, encoding: 'utf8' },
+  );
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(ok.stdout.trim().split('\n').length, 2);
 });
 
 test('the CLI is a dry run that prints keep and delete lines', () => {

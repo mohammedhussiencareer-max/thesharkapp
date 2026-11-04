@@ -18,7 +18,31 @@ const safeRole = {
   memberships: [],
   writable: [],
   schemaCreate: [],
+  forbiddenUsage: [],
 };
+
+test('the role check asks about the forbidden platform schemas', () => {
+  const calls = [];
+  const psql = (call) => {
+    calls.push(call);
+    return `${JSON.stringify(safeRole)}\n`;
+  };
+  checkRole(psql);
+  assert.deepEqual(JSON.parse(calls[0].vars.forbidden_usage), [
+    'auth',
+    'cron',
+    'net',
+    'storage',
+    'vault',
+  ]);
+  assert.throws(
+    () =>
+      checkRole(() =>
+        JSON.stringify({ ...safeRole, forbiddenUsage: ['cron'] }),
+      ),
+    { code: 'ROLE_UNSAFE', message: /platform schemas: cron/ },
+  );
+});
 
 test('server version is read from the first output line', () => {
   assert.equal(
