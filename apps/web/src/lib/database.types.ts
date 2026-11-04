@@ -513,6 +513,102 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"recipe_lines": {
+                  Row: {
+                    "child_recipe_id": string | null,"id": string,"line_no": number,"quantity": number,"stock_item_id": string | null,"unit": string,"version_id": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "child_recipe_id"?: string | null,"id"?: string,"line_no": number,"quantity": number,"stock_item_id"?: string | null,"unit": string,"version_id": string
+                  }
+                  Update: {
+                    "child_recipe_id"?: string | null,"id"?: string,"line_no"?: number,"quantity"?: number,"stock_item_id"?: string | null,"unit"?: string,"version_id"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "recipe_lines_child_recipe_id_fkey"
+      columns: ["child_recipe_id"]
+isOneToOne: false
+      referencedRelation: "recipes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "recipe_lines_stock_item_id_fkey"
+      columns: ["stock_item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "recipe_lines_unit_fkey"
+      columns: ["unit"]
+isOneToOne: false
+      referencedRelation: "units"
+      referencedColumns: ["code"]
+    },{
+      foreignKeyName: "recipe_lines_version_id_fkey"
+      columns: ["version_id"]
+isOneToOne: false
+      referencedRelation: "recipe_versions"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"recipe_versions": {
+                  Row: {
+                    "batch_qty": number | null,"batch_unit": string | null,"created_change_id": number,"effective_from": string,"effective_to": string | null,"id": string,"recipe_id": string,"superseded_change_id": number | null,"valid_during": unknown
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "batch_qty"?: number | null,"batch_unit"?: string | null,"created_change_id": number,"effective_from": string,"effective_to"?: string | null,"id"?: string,"recipe_id": string,"superseded_change_id"?: number | null,"valid_during"?: never
+                  }
+                  Update: {
+                    "batch_qty"?: number | null,"batch_unit"?: string | null,"created_change_id"?: number,"effective_from"?: string,"effective_to"?: string | null,"id"?: string,"recipe_id"?: string,"superseded_change_id"?: number | null,"valid_during"?: never
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "recipe_versions_batch_unit_fkey"
+      columns: ["batch_unit"]
+isOneToOne: false
+      referencedRelation: "units"
+      referencedColumns: ["code"]
+    },{
+      foreignKeyName: "recipe_versions_created_change_id_fkey"
+      columns: ["created_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "recipe_versions_recipe_id_fkey"
+      columns: ["recipe_id"]
+isOneToOne: false
+      referencedRelation: "recipes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "recipe_versions_superseded_change_id_fkey"
+      columns: ["superseded_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"recipes": {
+                  Row: {
+                    "active": boolean,"created_change_id": number,"id": string,"kind": string,"name": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "active"?: boolean,"created_change_id": number,"id"?: string,"kind": string,"name": string
+                  }
+                  Update: {
+                    "active"?: boolean,"created_change_id"?: number,"id"?: string,"kind"?: string,"name"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "recipes_created_change_id_fkey"
+      columns: ["created_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"shift_report_flags": {
                   Row: {
                     "profit_delta": number,"revised_at": string,"shift_id": string,"sort_transfer_delta": number
@@ -866,6 +962,9 @@ isOneToOne: false
 "costing_timestamptz_text":
 { Args: { "p_at": string }; Returns: string
                            },
+"create_recipe":
+{ Args: { "p_kind": string,"p_name": string,"p_request_id": string }; Returns: Json
+                           },
 "create_stock_item":
 { Args: { "p_active": boolean,"p_base_unit": string,"p_count_frequency": string,"p_kind": string,"p_loss_pct": number,"p_name": string,"p_parent_item_id": string,"p_request_id": string }; Returns: string
                            },
@@ -874,6 +973,9 @@ isOneToOne: false
                            },
 "delete_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
+                           },
+"expand_recipe":
+{ Args: { "p_at": string,"p_output_qty": number,"p_output_unit": string,"p_recipe_id": string }; Returns: Json
                            },
 "expense_daily":
 { Args: { "p_from": string,"p_to": string }; Returns: {
@@ -962,6 +1064,33 @@ isOneToOne: false
 "rebuild_derived_balances":
 { Args: { "p_cause_batch": string,"p_item_ids": (string)[] }; Returns: undefined
                            },
+"recipe_expand_exact":
+{ Args: { "p_at": string,"p_recipe_id": string,"p_scale": number }; Returns: Json
+                           },
+"recipe_lines_normalize":
+{ Args: { "p_lines": Json }; Returns: Json
+                           },
+"recipe_payload_assert_no_price_keys":
+{ Args: { "p_depth": number,"p_node": Json }; Returns: undefined
+                           },
+"recipe_schedule":
+{ Args: { "p_recipe_id": string }; Returns: Json
+                           },
+"recipe_schedule_line":
+{ Args: { "p_batch_qty": number,"p_batch_unit": string,"p_effective_from": string,"p_effective_to": string,"p_id": string }; Returns: string
+                           },
+"recipe_schedule_token":
+{ Args: { "p_recipe_id": string }; Returns: string
+                           },
+"recipe_unit_factor":
+{ Args: { "p_from_unit": string,"p_to_unit": string }; Returns: number
+                           },
+"recipe_validate_publication":
+{ Args: { "p_from": string,"p_recipe_id": string,"p_to": string }; Returns: undefined
+                           },
+"recipe_walk":
+{ Args: { "p_at": string,"p_recipe_id": string,"p_scale": number,"p_validate": boolean }; Returns: Json
+                           },
 "recompute_item_set":
 { Args: { "p_item_ids": (string)[] }; Returns: (string)[]
                            },
@@ -1024,6 +1153,9 @@ isOneToOne: false
 "set_month_expense_complete":
 { Args: { "p_complete": boolean,"p_month": string }; Returns: undefined
                            },
+"set_recipe_version":
+{ Args: { "p_batch_qty": number,"p_batch_unit": string,"p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_lines": Json,"p_reason": string,"p_recipe_id": string,"p_request_id": string }; Returns: Json
+                           },
 "shift_for_target":
 { Args: { "p_movement_id": number }; Returns: string
                            },
@@ -1032,6 +1164,9 @@ isOneToOne: false
                            },
 "text_has_long_digit_run":
 { Args: { "p_text": string }; Returns: boolean
+                           },
+"update_recipe":
+{ Args: { "p_active": boolean,"p_expected_active": boolean,"p_expected_name": string,"p_name": string,"p_recipe_id": string,"p_request_id": string }; Returns: Json
                            },
 "update_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
