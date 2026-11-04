@@ -509,6 +509,118 @@ describe('ItemsPage', () => {
     );
   });
 
+  async function saveFirstBoxConversion(
+    refresh: () => Promise<CatalogItem[]>,
+  ): Promise<{ loads: () => number }> {
+    const box = item({
+      id: 'box',
+      name: 'علبة',
+      kind: 'packaging',
+      baseUnit: 'piece',
+      countFrequency: 'weekly',
+    });
+    served = [box];
+    let loads = 0;
+    vi.mocked(listItems).mockImplementation(() => {
+      loads += 1;
+      return loads === 1 ? Promise.resolve([box]) : refresh();
+    });
+    const rows: UnitConversion[] = [];
+    vi.mocked(listConversions).mockImplementation(() =>
+      Promise.resolve(listed([...rows], 'piece')),
+    );
+    vi.mocked(addConversion).mockImplementation((itemId, unit, factor) => {
+      rows.push({
+        itemId,
+        unit,
+        factorToBase: Number(factor),
+        storedFactor: factor,
+      });
+      return Promise.resolve();
+    });
+
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole('article', { name: 'علبة' });
+    fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
+    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+    expect(
+      await within(card).findByText('مفيش تحويلات للصنف ده'),
+    ).toBeInTheDocument();
+    expect(
+      await within(card).findByRole('option', { name: 'كرتونة' }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText('النوع')).toBeEnabled();
+    expect(screen.getByLabelText('الوحدة الأساسية')).toBeEnabled();
+
+    fireEvent.change(within(card).getByLabelText('الوحدة'), {
+      target: { value: 'كرتونة' },
+    });
+    fireEvent.change(within(card).getByLabelText('المعامل'), {
+      target: { value: '12' },
+    });
+    fireEvent.click(within(card).getByRole('button', { name: 'ضيف التحويل' }));
+    expect(
+      await within(card).findByText('1 كرتونة = 12 قطعة'),
+    ).toBeInTheDocument();
+    return { loads: () => loads };
+  }
+
+  it('refreshes the identity lock after the first conversion saves', async () => {
+    let resolveRefresh: (value: CatalogItem[]) => void = () => undefined;
+    const { loads } = await saveFirstBoxConversion(
+      () =>
+        new Promise((resolve) => {
+          resolveRefresh = resolve;
+        }),
+    );
+
+    await waitFor(() => {
+      expect(loads()).toBe(2);
+    });
+    expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
+    expect(screen.getByLabelText('النوع')).toBeDisabled();
+    expect(screen.queryByText(/متقفلين/)).not.toBeInTheDocument();
+
+    resolveRefresh([
+      item({
+        id: 'box',
+        name: 'علبة',
+        kind: 'packaging',
+        baseUnit: 'piece',
+        countFrequency: 'weekly',
+        identityLocked: true,
+      }),
+    ]);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
+    });
+    expect(screen.getByLabelText('النوع')).toBeDisabled();
+    expect(screen.getByLabelText('الوحدة الأساسية')).toBeDisabled();
+    expect(screen.getByText(/متقفلين/)).toBeInTheDocument();
+  });
+
+  it('stays locked when the refresh after a conversion save fails', async () => {
+    const { loads } = await saveFirstBoxConversion(() =>
+      Promise.reject(new Error('حصل خطأ. حاول تاني.')),
+    );
+
+    await waitFor(() => {
+      expect(loads()).toBe(2);
+    });
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'حصل خطأ. حاول تاني.',
+    );
+    expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
+    expect(screen.getByLabelText('النوع')).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'إعادة المحاولة' }),
+    ).toBeEnabled();
+  });
+
   it('locks the inactive filter while an inactive item conversion saves', async () => {
     vi.mocked(updateConversion).mockReset();
     await renderCatalog();

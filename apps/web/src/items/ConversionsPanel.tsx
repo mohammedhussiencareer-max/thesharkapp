@@ -408,6 +408,7 @@ export function ConversionsPanel({
   identityDirty = false,
   onBusyChange,
   onItemStale,
+  onConversionSaved,
 }: {
   item: CatalogItem;
   /** Set by the page while an item save is in flight. */
@@ -417,6 +418,8 @@ export function ConversionsPanel({
   onBusyChange?: (busy: boolean) => void;
   /** The snapshot base unit no longer matches the item the page rendered. */
   onItemStale?: (itemId: string) => void | Promise<void>;
+  /** A write landed, so the item's configuration status may have changed. */
+  onConversionSaved?: (itemId: string) => void | Promise<void>;
 }) {
   const requestRef = useRef(0);
   const aliveRef = useRef(false);
@@ -610,6 +613,7 @@ export function ConversionsPanel({
     try {
       await work();
       await load();
+      await onConversionSaved?.(item.id);
       return true;
     } catch (error) {
       setActionError(messageFrom(error));

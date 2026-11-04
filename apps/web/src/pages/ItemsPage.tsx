@@ -114,6 +114,17 @@ export function ItemsPage() {
     }
   }
 
+  // A landed conversion can configure the item. Stay locked until the catalog
+  // says so; a failed read leaves the lock and the retry button in place.
+  async function refreshAfterConversion() {
+    setNeedsReload(true);
+    try {
+      await reloadCatalog();
+    } catch (error) {
+      setLoadError(messageFrom(error));
+    }
+  }
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -344,6 +355,7 @@ export function ItemsPage() {
                 )
               }
               onConversionsBusyChange={setConversionsBusy}
+              onConversionSaved={refreshAfterConversion}
               onItemStale={(itemId) =>
                 reloadCatalog(itemId).catch((error: unknown) => {
                   setLoadError(messageFrom(error));

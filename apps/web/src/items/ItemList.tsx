@@ -18,6 +18,7 @@ function ItemCard({
   onToggleConversions,
   onConversionsBusy,
   onItemStale,
+  onConversionSaved,
 }: {
   item: CatalogItem;
   conversionsOpen: boolean;
@@ -28,6 +29,7 @@ function ItemCard({
   onToggleConversions: (itemId: string) => void;
   onConversionsBusy: (busy: boolean) => void;
   onItemStale?: (itemId: string) => void | Promise<void>;
+  onConversionSaved?: (itemId: string) => void | Promise<void>;
 }) {
   return (
     <article
@@ -94,6 +96,7 @@ function ItemCard({
           identityDirty={identityDirty}
           onBusyChange={onConversionsBusy}
           onItemStale={onItemStale}
+          onConversionSaved={onConversionSaved}
         />
       ) : null}
     </article>
@@ -119,6 +122,7 @@ export function ItemList({
   onToggleConversions,
   onConversionsBusyChange,
   onItemStale,
+  onConversionSaved,
 }: {
   items: readonly CatalogItem[];
   showInactive: boolean;
@@ -130,6 +134,7 @@ export function ItemList({
   onToggleConversions: (itemId: string) => void;
   onConversionsBusyChange?: (busy: boolean) => void;
   onItemStale?: (itemId: string) => void | Promise<void>;
+  onConversionSaved?: (itemId: string) => void | Promise<void>;
 }) {
   const [conversionsBusy, setConversionsBusyState] = useState(false);
   // The page also locks controls that would unmount an open panel (the inactive filter).
@@ -150,6 +155,7 @@ export function ItemList({
       onToggleConversions={onToggleConversions}
       onConversionsBusy={setConversionsBusy}
       onItemStale={onItemStale}
+      onConversionSaved={onConversionSaved}
     />
   );
 
@@ -178,6 +184,7 @@ export function ItemList({
                   onToggleConversions={onToggleConversions}
                   onConversionsBusy={setConversionsBusy}
                   onItemStale={onItemStale}
+                  onConversionSaved={onConversionSaved}
                 />
               ) : (
                 <p>تحت {block.parent.name} (موقوف)</p>
