@@ -320,8 +320,10 @@ run_full() {
   expect_denied "storage.buckets" 42501 "select 1 from storage.buckets limit 1"
   expect_denied "storage.objects" 42501 "select 1 from storage.objects limit 1"
   expect_denied "vault.secrets" '42501|3F000' "select 1 from vault.secrets limit 1"
-  expect_denied "cron.job" '42501|3F000' "select 1 from cron.job limit 1"
-  expect_denied "net.http_request_queue" '42501|3F000' "select 1 from net.http_request_queue limit 1"
+  # pg_cron and pg_net are absent here (the drift guard fails if either is
+  # installed), so a missing table also proves the reader cannot read it.
+  expect_denied "cron.job" '42501|3F000|42P01' "select 1 from cron.job limit 1"
+  expect_denied "net.http_request_queue" '42501|3F000|42P01' "select 1 from net.http_request_queue limit 1"
   expect_denied "migration name column" 42501 "select name from supabase_migrations.schema_migrations limit 1"
   expect_denied "pg_authid" 42501 "select rolpassword from pg_catalog.pg_authid limit 1"
   expect_denied "write under the read-only default" 25006 \
