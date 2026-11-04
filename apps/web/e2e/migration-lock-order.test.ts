@@ -27,7 +27,7 @@ describe('costing cutover migration lock order', () => {
   const lock =
     'select pg_catalog.pg_advisory_xact_lock(7342750000000000001::bigint);';
   const tables =
-    /^do (\$\w+\$) begin lock table ([^;]+) in share row exclusive mode; end; \1;/;
+    /^do (\$\w+\$) begin lock table ([^;]+) in share row exclusive mode nowait; end; \1;/;
 
   it('takes the ledger advisory lock as its first statement', () => {
     expect(code(sql).startsWith(lock)).toBe(true);

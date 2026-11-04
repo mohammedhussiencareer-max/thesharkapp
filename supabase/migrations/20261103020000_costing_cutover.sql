@@ -15,7 +15,10 @@ select
   pg_catalog.pg_advisory_xact_lock (7342750000000000001::bigint);
 
 -- A DO block, because the migration runner sends no explicit BEGIN and a
--- top-level LOCK TABLE needs one.
+-- top-level LOCK TABLE needs one. NOWAIT: a writer that already holds a row
+-- lock on one of these tables may be waiting for the advisory lock above, so
+-- waiting here could deadlock. The migration fails with 55P03 instead and
+-- rolls back whole; apply it again when no writer is active.
 do $lock_tables$
 begin
   lock table app.units,
@@ -23,7 +26,7 @@ begin
   app.item_unit_conversions,
   app.costing_changes,
   app.item_loss_versions,
-  app.item_conversion_versions in share row exclusive mode;
+  app.item_conversion_versions in share row exclusive mode nowait;
 end;
 $lock_tables$;
 
