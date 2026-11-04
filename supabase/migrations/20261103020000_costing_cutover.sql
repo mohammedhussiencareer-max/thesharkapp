@@ -3766,7 +3766,7 @@ $$;
 comment on function app.item_costing_schedule (uuid) is 'Owner read of the current loss and conversion schedules for one item. identity is base_unit|kind|parent_item_id|. Each token and empty_token is md5 of that identity plus that schedule. An empty schedule hashes the identity prefix alone.';
 
 -- The five-argument opening-price writer cannot name the approved identity.
--- Owners are told to call the overload. Non-owners still get 42501.
+-- A receipt stored before this cutover still replays. Anything else is refused.
 create or replace function app.set_item_opening_price (
   p_request_id uuid,
   p_item_id uuid,
@@ -3776,10 +3776,85 @@ create or replace function app.set_item_opening_price (
 ) returns jsonb language plpgsql security definer
 set
   search_path = '' as $$
+declare
+  v_cost numeric(20, 6);
+  v_reason text;
+  v_payload jsonb;
+  v_replay jsonb;
 begin
   if coalesce(app.is_owner(), false) is not true then
     raise exception 'insufficient_privilege'
       using errcode = '42501';
+  end if;
+
+  perform app.assert_ledger_write_allowed();
+
+  if p_request_id is null then
+    raise exception 'request_id is required'
+      using errcode = '22023';
+  end if;
+
+  if p_item_id is null then
+    raise exception 'item_id is required'
+      using errcode = '22023';
+  end if;
+
+  if p_unit_cost is null
+  or p_unit_cost in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+  or p_unit_cost < 0 then
+    raise exception 'unit_cost must be finite and greater than or equal to 0'
+      using errcode = '22023';
+  end if;
+
+  v_cost := pg_catalog.round(p_unit_cost, 6);
+
+  if v_cost < 0 then
+    raise exception 'unit_cost must be finite and greater than or equal to 0'
+      using errcode = '22023';
+  end if;
+
+  if p_zero_cost_reason is null
+  or btrim(p_zero_cost_reason) = '' then
+    v_reason := null;
+  else
+    v_reason := btrim(p_zero_cost_reason);
+  end if;
+
+  if v_reason is not null
+  and length(v_reason) > 500 then
+    raise exception 'zero_cost_reason must be at most 500 characters'
+      using errcode = '22023';
+  end if;
+
+  if v_cost = 0
+  and v_reason is null then
+    raise exception 'zero_cost_reason is required when unit_cost is 0'
+      using errcode = '22023';
+  end if;
+
+  if v_cost > 0
+  and v_reason is not null then
+    raise exception 'zero_cost_reason must be null when unit_cost is greater than 0'
+      using errcode = '22023';
+  end if;
+
+  v_payload := jsonb_build_object(
+    'fn',
+    'set_item_opening_price',
+    'item_id',
+    p_item_id,
+    'unit_cost',
+    v_cost,
+    'zero_cost_reason',
+    v_reason,
+    'expected_current_id',
+    p_expected_current_id
+  );
+
+  v_replay := app.costing_replay_result(p_request_id, v_payload);
+
+  if v_replay is not null then
+    return v_replay;
   end if;
 
   raise exception 'use app.set_item_opening_price with p_expected_identity'
@@ -3787,7 +3862,7 @@ begin
 end;
 $$;
 
-comment on function app.set_item_opening_price (uuid, uuid, numeric, text, uuid) is 'Retired. Keeps its signature and grants. Non-owners get 42501. Owners get 0A000 and must pass p_expected_identity.';
+comment on function app.set_item_opening_price (uuid, uuid, numeric, text, uuid) is 'Retired for new requests. Non-owners get 42501. Under the ledger lock, the foundation payload is rebuilt and a stored receipt is returned. Any other call gets 0A000 and must pass p_expected_identity.';
 
 create function app.set_item_opening_price (
   p_request_id uuid,

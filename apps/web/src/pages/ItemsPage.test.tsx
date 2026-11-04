@@ -1720,6 +1720,136 @@ describe('ItemsPage', () => {
     expect(retry?.[5]).toBe(scheduleIdentity);
   });
 
+  it('saves the next opening price with the identity from after a conflict', async () => {
+    let identity = scheduleIdentity;
+    vi.mocked(listCostingSchedule).mockImplementation(() =>
+      Promise.resolve({
+        lossToken: emptyScheduleToken,
+        identity,
+        lossVersions: [],
+        conversions: [],
+      }),
+    );
+    vi.mocked(setOpeningPrice).mockImplementation(
+      (_itemId, _price, _reason, _expectedId, _requestId, sentIdentity) => {
+        if (sentIdentity === scheduleIdentity) {
+          identity = 'liter|seafood||';
+          return Promise.reject(new CostingChangedError());
+        }
+        return Promise.resolve();
+      },
+    );
+    await renderCatalog();
+    vi.mocked(listItems).mockImplementation(() =>
+      Promise.resolve(
+        catalog.map((row) =>
+          row.id === 'shrimp' && identity.startsWith('liter')
+            ? { ...row, baseUnit: 'liter' }
+            : row,
+        ),
+      ),
+    );
+    fireEvent.click(
+      within(screen.getByRole('article', { name: 'جمبري' })).getByRole(
+        'button',
+        { name: 'تعديل' },
+      ),
+    );
+    await waitFor(() => {
+      expect(listCostingSchedule).toHaveBeenCalled();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const scheduleReads = vi.mocked(listCostingSchedule).mock.calls.length;
+    fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
+      target: { value: '100' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'البيانات اتغيرت — حدّث الصفحة وجرّب تاني',
+    );
+    await waitFor(() => {
+      expect(vi.mocked(listCostingSchedule).mock.calls.length).toBeGreaterThan(
+        scheduleReads,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('liter');
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ السعر' })).toBeEnabled();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    await waitFor(() => {
+      expect(setOpeningPrice).toHaveBeenCalledTimes(2);
+    });
+    const first = vi.mocked(setOpeningPrice).mock.calls[0];
+    const next = vi.mocked(setOpeningPrice).mock.calls[1];
+    expect(first?.[5]).toBe(scheduleIdentity);
+    expect(next?.[1]).toBe('100');
+    expect(next?.[4]).not.toBe(first?.[4]);
+    expect(next?.[5]).toBe('liter|seafood||');
+    expect(screen.queryByText(unknownSaveMessage)).not.toBeInTheDocument();
+  });
+
+  it('loads the new identity after a base-unit save before the next price', async () => {
+    let identity = scheduleIdentity;
+    vi.mocked(listCostingSchedule).mockImplementation(() =>
+      Promise.resolve({
+        lossToken: emptyScheduleToken,
+        identity,
+        lossVersions: [],
+        conversions: [],
+      }),
+    );
+    vi.mocked(updateItem).mockImplementation(() => {
+      identity = 'liter|seafood||';
+      return Promise.resolve();
+    });
+    await renderCatalog();
+    fireEvent.click(
+      within(screen.getByRole('article', { name: 'جمبري' })).getByRole(
+        'button',
+        { name: 'تعديل' },
+      ),
+    );
+    await waitFor(() => {
+      expect(listCostingSchedule).toHaveBeenCalled();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const scheduleReads = vi.mocked(listCostingSchedule).mock.calls.length;
+    fireEvent.change(screen.getByLabelText('الوحدة الأساسية'), {
+      target: { value: 'liter' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
+    await waitFor(() => {
+      expect(vi.mocked(listCostingSchedule).mock.calls.length).toBeGreaterThan(
+        scheduleReads,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
+      target: { value: '100' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    await waitFor(() => {
+      expect(setOpeningPrice).toHaveBeenCalledWith(
+        'shrimp',
+        '100',
+        null,
+        null,
+        expect.any(String),
+        'liter|seafood||',
+      );
+    });
+  });
+
   it('locks identity fields while a conversion save for the item is unresolved', async () => {
     vi.mocked(addConversion).mockRejectedValueOnce(new Error('تعذر الاتصال'));
     await renderCatalog();

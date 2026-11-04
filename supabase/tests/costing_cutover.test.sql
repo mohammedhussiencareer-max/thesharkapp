@@ -2290,6 +2290,137 @@ select
 
 reset role;
 
+-- A receipt the foundation 5-arg writer would have stored. The table owner
+-- seeds it; the owner role then retries the same arguments.
+insert into
+  app.costing_changes (
+    request_id,
+    kind,
+    actor_id,
+    reason,
+    payload,
+    result
+  )
+select
+  'd4000000-0000-4000-8000-000000000216',
+  'owner',
+  'b7e2c4a0-5f31-4d8e-9c6a-1a2b3c4d5e6f',
+  null,
+  jsonb_build_object(
+    'fn',
+    'set_item_opening_price',
+    'item_id',
+    si.id,
+    'unit_cost',
+    pg_catalog.round (100, 6)::numeric(20, 6),
+    'zero_cost_reason',
+    null,
+    'expected_current_id',
+    null::uuid
+  ),
+  '{"sentinel":"opening-price-replay"}'::jsonb
+from
+  app.stock_items si
+where
+  si.name = 'صنف سعر';
+
+set
+  local role authenticated;
+
+select
+  is (
+    app.set_item_opening_price (
+      'd4000000-0000-4000-8000-000000000216',
+      (
+        select
+          id
+        from
+          app.stock_items
+        where
+          name = 'صنف سعر'
+      ),
+      100,
+      null,
+      null
+    ),
+    '{"sentinel":"opening-price-replay"}'::jsonb,
+    'an identical 5-arg opening-price retry returns the pre-cutover receipt'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.costing_changes
+      where
+        request_id = 'd4000000-0000-4000-8000-000000000216'
+    ),
+    1::bigint,
+    'a replayed pre-cutover opening price writes no costing change'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.item_opening_prices p
+        join app.stock_items si on si.id = p.item_id
+      where
+        si.name = 'صنف سعر'
+    ),
+    0::bigint,
+    'a replayed pre-cutover opening price writes no price row'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_opening_price(
+      'd4000000-0000-4000-8000-000000000216',
+      (select id from app.stock_items where name = 'صنف سعر'),
+      90,
+      null,
+      null
+    )$$,
+    '22023'::char(5),
+    'request_id already used for a different change',
+    'a 5-arg retry with a different payload is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_opening_price(
+      'd4000000-0000-4000-8000-000000000217',
+      (select id from app.stock_items where name = 'صنف سعر'),
+      100,
+      null,
+      null
+    )$$,
+    '0A000'::char(5),
+    'use app.set_item_opening_price with p_expected_identity',
+    'a new 5-arg opening-price request is refused'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.item_opening_prices p
+        join app.stock_items si on si.id = p.item_id
+      where
+        si.name = 'صنف سعر'
+    ),
+    0::bigint,
+    'a refused 5-arg opening price still writes no price row'
+  );
+
+reset role;
+
 select
   set_config(
     'request.jwt.claims',

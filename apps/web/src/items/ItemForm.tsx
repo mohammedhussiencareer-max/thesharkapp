@@ -340,6 +340,9 @@ export function ItemForm({
       settleAction(subject);
     } catch (error) {
       settleAction(subject, error);
+      // The held price keeps the identity it was submitted with. A confirmed
+      // conflict retires that hold; the next fresh action reads this reload.
+      if (isConfirmedConfigurationChange(error)) await reloadLossSchedule();
     } finally {
       priceFlight.current = false;
       setActionEpoch((value) => value + 1);
@@ -388,9 +391,17 @@ export function ItemForm({
       setErrors(result.errors);
       return;
     }
-    void onSubmit({ kind: 'details', draft: result.draft }).catch(
-      () => undefined,
-    );
+    const identityChanged =
+      editing !== undefined &&
+      (result.draft.baseUnit !== editing.baseUnit ||
+        result.draft.kind !== editing.kind ||
+        result.draft.parentItemId !== editing.parentItemId);
+    void onSubmit({ kind: 'details', draft: result.draft })
+      .then((accepted) => {
+        if (accepted === true && identityChanged) return reloadLossSchedule();
+        return undefined;
+      })
+      .catch(() => undefined);
   }
 
   function retryLoss() {
