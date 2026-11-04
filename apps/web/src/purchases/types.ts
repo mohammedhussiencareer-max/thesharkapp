@@ -4,6 +4,8 @@ export type UnitOption = {
   unit: string;
   /** Exact `factor_to_base::text`. The base unit itself uses `"1"`. */
   factorToBase: string;
+  /** Arabic label. The option value stays `unit` (a unit code). */
+  label?: string;
 };
 
 export type StockChoice = {

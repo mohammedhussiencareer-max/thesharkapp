@@ -111,24 +111,6 @@ function record(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
-function rows(value: unknown): Record<string, unknown>[] {
-  if (value === null || value === undefined) return [];
-  if (!Array.isArray(value)) throw new Error(genericPurchaseError);
-  return value.map((row: unknown) => {
-    if (!row || typeof row !== 'object') throw new Error(genericPurchaseError);
-    return row as Record<string, unknown>;
-  });
-}
-
-function conversionsOf(value: unknown): UnitOption[] {
-  return rows(value)
-    .map((row) => {
-      if (typeof row.unit !== 'string') throw new Error(genericPurchaseError);
-      return { unit: row.unit, factorToBase: exactDecimal(row.factor_text) };
-    })
-    .sort((left, right) => left.unit.localeCompare(right.unit, 'ar'));
-}
-
 export async function listStockChoices(): Promise<StockChoice[]> {
   // One paged read so a balance (the sign that the item already has a movement)
   // is read with the same catalog row as its conversions. Paged by id, which
@@ -141,7 +123,7 @@ export async function listStockChoices(): Promise<StockChoice[]> {
       appDb()
         .from('stock_items')
         .select(
-          'id, name, kind, base_unit, parent_item_id, active, item_balances(item_id), item_unit_conversions(unit, factor_text:factor_to_base::text)',
+          'id, name, kind, base_unit, parent_item_id, active, item_balances(item_id)',
         )
         .order('id', { ascending: true })
         .range(from, to),
@@ -166,9 +148,53 @@ export async function listStockChoices(): Promise<StockChoice[]> {
       parentItemId: row.parent_item_id,
       active: row.active,
       hasMovements: record(row.item_balances) !== null,
-      conversions: conversionsOf(row.item_unit_conversions),
+      conversions: [],
     };
   });
+}
+
+/** Units usable at `atIso`, excluding the base row (the form adds factor 1). */
+export async function listUnitsAt(
+  itemIds: readonly string[],
+  atIso: string,
+): Promise<Record<string, UnitOption[]>> {
+  const grouped: Record<string, UnitOption[]> = {};
+  for (const id of itemIds) grouped[id] = [];
+  if (itemIds.length === 0) return grouped;
+  // One jsonb object keyed by item id, so the API row cap cannot cut a list.
+  const { data, error } = await appDb().rpc('item_units_at', {
+    p_item_ids: [...itemIds],
+    p_at: atIso,
+  });
+  throwIfError(error);
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    throw new Error(genericPurchaseError);
+  }
+  for (const [id, list] of Object.entries(grouped)) {
+    const units = data[id];
+    if (units === undefined) continue;
+    if (!Array.isArray(units)) throw new Error(genericPurchaseError);
+    for (const row of units) {
+      if (typeof row !== 'object' || row === null || Array.isArray(row)) {
+        throw new Error(genericPurchaseError);
+      }
+      if (row.source === 'base') continue;
+      if (typeof row.unit_code !== 'string') {
+        throw new Error(genericPurchaseError);
+      }
+      list.push({
+        unit: row.unit_code,
+        factorToBase: exactDecimal(row.factor_text),
+        label: typeof row.label_ar === 'string' ? row.label_ar : row.unit_code,
+      });
+    }
+  }
+  for (const list of Object.values(grouped)) {
+    list.sort((left, right) =>
+      (left.label ?? left.unit).localeCompare(right.label ?? right.unit, 'ar'),
+    );
+  }
+  return grouped;
 }
 
 function purchaseLine(row: Record<string, unknown>): {

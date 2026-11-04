@@ -16,15 +16,17 @@ import {
 import {
   listPurchases,
   listStockChoices,
+  listUnitsAt,
   recordPurchase,
 } from '@/purchases/api';
 import { PurchasesPage } from '@/pages/PurchasesPage';
-import type { Purchase, StockChoice } from '@/purchases/types';
+import type { Purchase, StockChoice, UnitOption } from '@/purchases/types';
 
 vi.mock('@/purchases/api', () => ({
   listStockChoices: vi.fn(),
   listPurchases: vi.fn(),
   recordPurchase: vi.fn(),
+  listUnitsAt: vi.fn(() => Promise.resolve({})),
 }));
 
 const oil: StockChoice = {
@@ -78,6 +80,8 @@ describe('PurchasesPage', () => {
     vi.mocked(listStockChoices).mockResolvedValue([oil]);
     vi.mocked(listPurchases).mockResolvedValue([]);
     vi.mocked(recordPurchase).mockResolvedValue(undefined);
+    vi.mocked(listUnitsAt).mockReset();
+    vi.mocked(listUnitsAt).mockResolvedValue({});
   });
 
   it('filters by a Cairo date range and ignores a stale read', async () => {
@@ -271,8 +275,26 @@ describe('PurchasesPage', () => {
   });
 
   it('asks for another review when the conversion changed and keeps the draft', async () => {
+    const lookedUpAt: string[] = [];
+    let releaseUnits: (rows: Record<string, UnitOption[]>) => void = () =>
+      undefined;
+    vi.mocked(listUnitsAt).mockImplementation((_ids, at) => {
+      lookedUpAt.push(at);
+      if (lookedUpAt.length === 1) {
+        return Promise.resolve({
+          oil: [{ unit: 'لتر', factorToBase: '0.92', label: 'لتر' }],
+        });
+      }
+      return new Promise((resolve) => {
+        releaseUnits = resolve;
+      });
+    });
     await renderPage();
-    const loads = vi.mocked(listStockChoices).mock.calls.length;
+    const purchasedAt = screen.getByLabelText('وقت الشراء');
+    const stamp = (purchasedAt as HTMLInputElement).value;
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'مراجعة' })).toBeEnabled();
+    });
     vi.mocked(recordPurchase).mockRejectedValueOnce(
       new ConversionChangedError(),
     );
@@ -283,14 +305,44 @@ describe('PurchasesPage', () => {
       conversionChangedMessage,
     );
     expect(
-      screen.getByText('المشتريات نهائية لحد ما نضيف التعديل'),
-    ).toBeInTheDocument();
-    await waitFor(() => {
-      expect(vi.mocked(listStockChoices).mock.calls.length).toBeGreaterThan(
-        loads,
-      );
-      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+      screen.queryByRole('heading', { name: 'مراجعة المشتريات' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText('وقت الشراء')).toHaveValue(stamp);
+    expect(screen.getByLabelText('الكمية')).toHaveValue('2');
+    expect(screen.getByLabelText('الوحدة')).toHaveValue('لتر');
+    expect(screen.getByRole('button', { name: 'مراجعة' })).toBeDisabled();
+    expect(lookedUpAt.length).toBeGreaterThanOrEqual(2);
+    expect(lookedUpAt[1]).toBe(lookedUpAt[0]);
+
+    await act(async () => {
+      releaseUnits({
+        oil: [{ unit: 'لتر', factorToBase: '1.1', label: 'لتر' }],
+      });
+      await Promise.resolve();
     });
-    expect(screen.queryByLabelText('الكمية')).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'مراجعة' })).toBeEnabled();
+    });
+    expect(screen.getByLabelText('وقت الشراء')).toHaveValue(stamp);
+    fireEvent.click(screen.getByRole('button', { name: 'مراجعة' }));
+    expect(
+      screen.getByRole('heading', { name: 'مراجعة المشتريات' }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordPurchase).toHaveBeenCalledTimes(2);
+    });
+    expect(
+      vi.mocked(recordPurchase).mock.calls[0]?.[0]?.lines[0]?.expectedFactor,
+    ).toBe('0.92');
+    expect(
+      vi.mocked(recordPurchase).mock.calls[1]?.[0]?.lines[0]?.expectedFactor,
+    ).toBe('1.1');
+    expect(vi.mocked(recordPurchase).mock.calls[1]?.[0]?.purchasedAt).toBe(
+      vi.mocked(recordPurchase).mock.calls[0]?.[0]?.purchasedAt,
+    );
+    expect(vi.mocked(recordPurchase).mock.calls[1]?.[0]?.requestId).toBe(
+      vi.mocked(recordPurchase).mock.calls[0]?.[0]?.requestId,
+    );
   });
 });

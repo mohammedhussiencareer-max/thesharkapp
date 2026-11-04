@@ -2,6 +2,7 @@ import type {
   BaseUnit,
   CatalogItem,
   CountFrequency,
+  ItemDraft,
   StockKind,
 } from '@/items/types';
 
@@ -10,10 +11,20 @@ export type ItemExpectation = {
   kind: StockKind;
   baseUnit: BaseUnit;
   countFrequency: CountFrequency;
-  lossPct: number | string;
   parentItemId: string | null;
   active: boolean;
 };
+
+export function expectationFromDraft(draft: ItemDraft): ItemExpectation {
+  return {
+    name: draft.name.trim(),
+    kind: draft.kind,
+    baseUnit: draft.baseUnit,
+    countFrequency: draft.countFrequency,
+    parentItemId: draft.parentItemId,
+    active: draft.active,
+  };
+}
 
 export function expectationFromItem(item: CatalogItem): ItemExpectation {
   return {
@@ -21,7 +32,6 @@ export function expectationFromItem(item: CatalogItem): ItemExpectation {
     kind: item.kind,
     baseUnit: item.baseUnit,
     countFrequency: item.countFrequency,
-    lossPct: item.storedLossPct,
     parentItemId: item.parentItemId,
     active: item.active,
   };

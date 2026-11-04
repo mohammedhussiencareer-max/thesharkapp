@@ -104,6 +104,9 @@ function baseQuantityOf(
   return { ok: true, text: formatDec(base), value: base };
 }
 
+export const unitUnavailableMessage =
+  'الوحدة دي مش متاحة في الوقت ده. اختار وحدة تانية.';
+
 export function unitChoices(item: StockChoice): UnitOption[] {
   return [
     { unit: item.baseUnit, factorToBase: '1' },
@@ -111,6 +114,22 @@ export function unitChoices(item: StockChoice): UnitOption[] {
       (conversion) => conversion.unit !== item.baseUnit,
     ),
   ];
+}
+
+export function unitIsAvailable(item: StockChoice, unit: string): boolean {
+  return unitChoices(item).some((choice) => choice.unit === unit);
+}
+
+/** Keeps a selected unit visible after it drops out of the dated list. */
+export function choicesIncluding(
+  item: StockChoice,
+  selected: string,
+): UnitOption[] {
+  const choices = unitChoices(item);
+  if (selected === '' || choices.some((choice) => choice.unit === selected)) {
+    return choices;
+  }
+  return [...choices, { unit: selected, factorToBase: '' }];
 }
 
 export function previewPurchaseLine(
@@ -374,4 +393,10 @@ export function validatePurchase(
 export function unitLabel(unit: string, baseUnit: BaseUnit): string {
   if (isBaseUnit(unit)) return unitLabels[unit];
   return unit === baseUnit ? unitLabels[baseUnit] : unit;
+}
+
+export function choiceLabel(choice: UnitOption, baseUnit: BaseUnit): string {
+  const label = choice.label?.trim() ?? '';
+  if (label.length > 0) return label;
+  return unitLabel(choice.unit, baseUnit);
 }

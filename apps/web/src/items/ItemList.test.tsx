@@ -10,6 +10,20 @@ vi.mock('@/items/api', () => ({
   addConversion: vi.fn(),
   updateConversion: vi.fn(),
   deleteConversion: vi.fn(),
+  currentShiftStart: vi.fn(() => Promise.resolve(null)),
+  listCostingSchedule: vi.fn(() =>
+    Promise.resolve({
+      lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      identity: 'kg|ingredient||',
+      lossVersions: [],
+      conversions: [],
+    }),
+  ),
+  costingImpact: vi.fn(() =>
+    Promise.resolve({ orders: 0, shifts: 0, movements: 0 }),
+  ),
+  listUnitOptions: vi.fn(() => Promise.resolve([])),
+  addCustomUnit: vi.fn((code: string) => Promise.resolve(code)),
 }));
 
 const item: CatalogItem = {
@@ -19,7 +33,6 @@ const item: CatalogItem = {
   baseUnit: 'kg',
   countFrequency: 'weekly',
   lossPct: 0,
-  storedLossPct: 0,
   parentItemId: null,
   active: true,
   onHandQty: 0,

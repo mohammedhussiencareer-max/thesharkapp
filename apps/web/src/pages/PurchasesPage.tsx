@@ -4,6 +4,7 @@ import { messageFrom } from '@/items/errors';
 import {
   listPurchases,
   listStockChoices,
+  listUnitsAt,
   recordPurchase,
 } from '@/purchases/api';
 import {
@@ -38,6 +39,7 @@ export function PurchasesPage() {
   const [serverError, setServerError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [formEpoch, setFormEpoch] = useState(0);
+  const [unitsNonce, setUnitsNonce] = useState(0);
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [filterError, setFilterError] = useState<string | null>(null);
@@ -169,7 +171,12 @@ export function PurchasesPage() {
     } catch (error) {
       if (!saved) {
         setServerError(messageFrom(error));
-        if (error instanceof ConversionChangedError) await reloadChoices();
+        if (error instanceof ConversionChangedError) {
+          // Same items and timestamp. The nonce is what makes the dated
+          // lookup run again; remounting the form would drop the draft.
+          setUnitsNonce((value) => value + 1);
+          await reloadChoices();
+        }
       } else {
         setNeedsReload(true);
         setLoadError(messageFrom(error));
@@ -263,6 +270,8 @@ export function PurchasesPage() {
               serverError={serverError}
               onClearServerError={() => setServerError(null)}
               onSubmit={(next) => void handleSubmit(next)}
+              resolveUnits={listUnitsAt}
+              reloadKey={unitsNonce}
             />
           )}
           <PurchaseList purchases={snapshot.purchases} />

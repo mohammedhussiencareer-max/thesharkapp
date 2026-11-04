@@ -697,6 +697,32 @@ isOneToOne: false
       referencedColumns: ["id"]
     }
                   ]
+                },"unit_aliases": {
+                  Row: {
+                    "alias": string,"created_change_id": number,"unit_code": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "alias": string,"created_change_id": number,"unit_code": string
+                  }
+                  Update: {
+                    "alias"?: string,"created_change_id"?: number,"unit_code"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "unit_aliases_created_change_id_fkey"
+      columns: ["created_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "unit_aliases_unit_code_fkey"
+      columns: ["unit_code"]
+isOneToOne: false
+      referencedRelation: "units"
+      referencedColumns: ["code"]
+    }
+                  ]
                 },"units": {
                   Row: {
                     "code": string,"dimension": string,"label_ar": string,"metric_scale": number | null
@@ -727,6 +753,14 @@ isOneToOne: false
       referencedRelation: "expense_categories"
       referencedColumns: ["id"]
     }
+                  ]
+                },"item_units_current": {
+                  Row: {
+                    "effective_from": string | null,"factor_text": string | null,"factor_to_base": number | null,"item_id": string | null,"label_ar": string | null,"source": string | null,"unit_code": string | null,"version_id": string | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    
                   ]
                 },"pos_shift_summaries": {
                   Row: {
@@ -775,7 +809,10 @@ isOneToOne: false
                 }
           }
           Functions: {
-            "add_expense_category":
+            "add_custom_unit":
+{ Args: { "p_code": string,"p_label_ar": string,"p_request_id": string }; Returns: string
+                           },
+"add_expense_category":
 { Args: { "p_kind": string,"p_name": string }; Returns: string
                            },
 "add_expense_entry":
@@ -811,8 +848,14 @@ isOneToOne: false
 "assert_recompute_range":
 { Args: { "p_allow_negative": boolean,"p_scale": number,"p_value": number }; Returns: number
                            },
+"backfill_legacy_costing":
+{ Args: { "p_at": string }; Returns: Json
+                           },
 "batch_is_forward":
 { Args: { "p_item_ids": (string)[],"p_occurred_at": (string)[] }; Returns: boolean
+                           },
+"costing_impact":
+{ Args: { "p_from": string,"p_item_id"?: string,"p_to": string }; Returns: Json
                            },
 "costing_replay_result":
 { Args: { "p_payload": Json,"p_request_id": string }; Returns: Json
@@ -822,6 +865,12 @@ isOneToOne: false
                            },
 "costing_timestamptz_text":
 { Args: { "p_at": string }; Returns: string
+                           },
+"create_stock_item":
+{ Args: { "p_active": boolean,"p_base_unit": string,"p_count_frequency": string,"p_kind": string,"p_loss_pct": number,"p_name": string,"p_parent_item_id": string,"p_request_id": string }; Returns: string
+                           },
+"current_shift_start":
+{ Args: Record<PropertyKey, never>; Returns: string
                            },
 "delete_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
@@ -864,6 +913,12 @@ isOneToOne: false
                            },
 "item_loss_at":
 { Args: { "p_at": string,"p_item_id": string }; Returns: number
+                           },
+"item_units_at":
+{ Args: { "p_at": string,"p_item_ids": (string)[] }; Returns: Json
+                           },
+"legacy_costing_snapshot_work":
+{ Args: { "p_at": string,"p_change_id": number }; Returns: Json
                            },
 "lock_and_validate_item_balance":
 { Args: { "p_item_id": string,"p_occurred_at": string }; Returns: {
@@ -946,6 +1001,9 @@ isOneToOne: false
 "resolve_shift_id":
 { Args: { "p_at": string }; Returns: string
                            },
+"resolve_unit_code":
+{ Args: { "p_unit": string }; Returns: string
+                           },
 "schedule_token":
 { Args: { "p_family": string,"p_item_id": string,"p_unit_code": string }; Returns: string
                            },
@@ -960,6 +1018,8 @@ isOneToOne: false
                            },
 "set_item_opening_price":
 { Args: { "p_expected_current_id": string,"p_item_id": string,"p_request_id": string,"p_unit_cost": number,"p_zero_cost_reason": string }; Returns: Json
+                           } |
+{ Args: { "p_expected_current_id": string,"p_expected_identity": string,"p_item_id": string,"p_request_id": string,"p_unit_cost": number,"p_zero_cost_reason": string }; Returns: Json
                            },
 "set_month_expense_complete":
 { Args: { "p_complete": boolean,"p_month": string }; Returns: undefined

@@ -18,7 +18,11 @@ alter table app.stock_movements enable trigger trg_stock_movements_no_truncate;
 
 delete from app.item_balances;
 
+alter table app.item_unit_conversions disable trigger trg_item_unit_conversions_frozen;
+
 delete from app.item_unit_conversions;
+
+alter table app.item_unit_conversions enable trigger trg_item_unit_conversions_frozen;
 
 delete from app.stock_items;
 
@@ -301,8 +305,8 @@ select
         and grantee = 'authenticated'
         and privilege_type in ('INSERT', 'SELECT', 'UPDATE', 'DELETE')
       order by 1$$,
-    $$values ('INSERT'::text), ('SELECT'::text)$$,
-    'authenticated table privileges on stock_items are INSERT and SELECT'
+    $$values ('SELECT'::text)$$,
+    'authenticated table privileges on stock_items are SELECT only'
   );
 
 -- 13
@@ -323,13 +327,12 @@ select
           'kind',
           'base_unit',
           'count_frequency',
-          'loss_pct',
           'parent_item_id',
           'active'
         )
     ),
-    7::bigint,
-    'authenticated can update the seven editable stock_items columns'
+    6::bigint,
+    'authenticated can update the six editable stock_items columns'
   );
 
 -- 14
@@ -361,8 +364,8 @@ select
         and grantee = 'authenticated'
         and privilege_type in ('INSERT', 'SELECT', 'UPDATE', 'DELETE')
       order by 1$$,
-    $$values ('DELETE'::text), ('INSERT'::text), ('SELECT'::text), ('UPDATE'::text)$$,
-    'authenticated can select, insert, update, and delete conversions'
+    $$values ('SELECT'::text)$$,
+    'authenticated can only select conversions'
   );
 
 -- 70
@@ -567,8 +570,60 @@ select
   );
 
 -- ============================================================================
--- Owner writes
+-- Owner writes. Direct insert is revoked, so the fixed ids are seeded as the
+-- table owner. The owner role then uses create_stock_item and dated writers.
 -- ============================================================================
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    parent_item_id
+  )
+values
+  (
+    '31000000-0000-4000-8000-000000000001',
+    'بوري مخلوط',
+    'fish_mixed',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    '31000000-0000-4000-8000-000000000002',
+    'بوري كبير',
+    'fish_size',
+    'kg',
+    'daily',
+    '31000000-0000-4000-8000-000000000001'
+  ),
+  (
+    '31000000-0000-4000-8000-000000000003',
+    'جمبري',
+    'seafood',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    '31000000-0000-4000-8000-000000000004',
+    'زيت',
+    'ingredient',
+    'kg',
+    'weekly',
+    null
+  ),
+  (
+    '31000000-0000-4000-8000-000000000005',
+    'صنف للجرد',
+    'ingredient',
+    'kg',
+    'weekly',
+    null
+  );
+
 select
   set_config(
     'request.jwt.claims',
@@ -586,16 +641,12 @@ set
 
 -- 16
 select
-  lives_ok (
-    $$insert into app.stock_items (id, name, kind, base_unit, count_frequency)
-      values (
-        '31000000-0000-4000-8000-000000000001',
-        'بوري مخلوط',
-        'fish_mixed',
-        'kg',
-        'daily'
-      )$$,
-    'owner can insert a fish_mixed item'
+  throws_ok (
+    $$insert into app.stock_items (name, kind, base_unit, count_frequency)
+      values ('صنف مباشر', 'ingredient', 'kg', 'weekly')$$,
+    '42501'::char(5),
+    'permission denied for table stock_items',
+    'owner cannot insert stock_items directly'
   );
 
 -- 17
@@ -603,11 +654,10 @@ select
   lives_ok (
     $$update app.stock_items
       set name = 'بوري مخلوط معدل',
-          loss_pct = 0.125,
           count_frequency = 'weekly',
           active = false
       where id = '31000000-0000-4000-8000-000000000001'$$,
-    'owner can update editable stock_items columns'
+    'owner can update editable stock_items columns without loss_pct'
   );
 
 -- 18
@@ -621,26 +671,27 @@ select
       'fish_mixed'::text,
       'kg'::text,
       'weekly'::text,
-      0.125::numeric,
+      0::numeric,
       null::uuid,
       false
     )$$,
-    'owner update stores the loss fraction and the other editable columns'
+    'owner update leaves the frozen loss_pct at its default'
   );
 
 -- 19
 select
   lives_ok (
-    $$insert into app.stock_items (id, name, kind, base_unit, count_frequency, parent_item_id)
-      values (
-        '31000000-0000-4000-8000-000000000002',
-        'بوري كبير',
-        'fish_size',
-        'kg',
-        'daily',
-        '31000000-0000-4000-8000-000000000001'
-      )$$,
-    'owner can insert a fish_size under a fish_mixed parent'
+    $$select app.create_stock_item(
+      '31000000-0000-4000-8000-000000000019',
+      'بوري وسط اختبار',
+      'fish_size',
+      'kg',
+      'daily',
+      '31000000-0000-4000-8000-000000000001',
+      null,
+      true
+    )$$,
+    'owner can create a fish_size through create_stock_item'
   );
 
 -- 20
@@ -660,58 +711,70 @@ select
 -- 21
 select
   lives_ok (
-    $$insert into app.stock_items (id, name, kind, base_unit, count_frequency)
-      values
-        ('31000000-0000-4000-8000-000000000003', 'جمبري', 'seafood', 'kg', 'daily'),
-        ('31000000-0000-4000-8000-000000000004', 'زيت', 'ingredient', 'kg', 'weekly'),
-        ('31000000-0000-4000-8000-000000000005', 'صنف للجرد', 'ingredient', 'kg', 'weekly')$$,
-    'owner can insert seafood and ingredient items'
+    $$select app.create_stock_item(
+      '31000000-0000-4000-8000-000000000021',
+      'جمبري اختبار',
+      'seafood',
+      'kg',
+      'daily',
+      null,
+      0,
+      true
+    )$$,
+    'owner can create seafood through create_stock_item'
   );
 
 -- 22
 select
-  lives_ok (
+  throws_ok (
     $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
       values ('31000000-0000-4000-8000-000000000004', 'piece', 2)$$,
-    'owner can insert a conversion'
+    '42501'::char(5),
+    'permission denied for table item_unit_conversions',
+    'owner cannot insert a legacy conversion'
   );
 
 -- 23
 select
-  lives_ok (
+  throws_ok (
     $$update app.item_unit_conversions
       set factor_to_base = 4
       where item_id = '31000000-0000-4000-8000-000000000004'
         and unit = 'piece'$$,
-    'owner can update a conversion factor'
+    '42501'::char(5),
+    'permission denied for table item_unit_conversions',
+    'owner cannot update a legacy conversion factor'
   );
 
 -- 24
 select
-  results_eq (
+  is_empty (
     $$select factor_to_base::numeric
       from app.item_unit_conversions
       where item_id = '31000000-0000-4000-8000-000000000004'
         and unit = 'piece'$$,
-    $$values (4::numeric)$$,
-    'owner conversion update stored the new factor'
+    'owner conversion update stored nothing on the frozen table'
   );
 
 -- 25
 select
-  lives_ok (
+  throws_ok (
     $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
       values ('31000000-0000-4000-8000-000000000004', 'كرتونة', 10)$$,
-    'owner can insert a second conversion'
+    '42501'::char(5),
+    'permission denied for table item_unit_conversions',
+    'owner cannot insert a second legacy conversion'
   );
 
 -- 26
 select
-  lives_ok (
+  throws_ok (
     $$delete from app.item_unit_conversions
       where item_id = '31000000-0000-4000-8000-000000000004'
         and unit = 'كرتونة'$$,
-    'owner can delete a conversion'
+    '42501'::char(5),
+    'permission denied for table item_unit_conversions',
+    'owner cannot delete a legacy conversion'
   );
 
 -- 27
@@ -726,24 +789,25 @@ select
 
 -- 75
 select
-  lives_ok (
+  throws_ok (
     $$select app.add_unit_conversion(
       '31000000-0000-4000-8000-000000000003',
       'bag',
       25,
       'kg'
     )$$,
-    'owner can add a conversion through add_unit_conversion'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'add_unit_conversion tells the owner to use the dated writer'
   );
 
 -- 76
 select
-  results_eq (
+  is_empty (
     $$select unit, factor_to_base::numeric
       from app.item_unit_conversions
       where item_id = '31000000-0000-4000-8000-000000000003'$$,
-    $$values ('bag'::text, 25::numeric)$$,
-    'add_unit_conversion stored bag = 25 against kg'
+    'add_unit_conversion stored nothing'
   );
 
 -- 77
@@ -755,9 +819,9 @@ select
       10,
       'liter'
     )$$,
-    '40001'::char(5),
-    'base unit changed',
-    'add_unit_conversion rejects a stale base unit'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'add_unit_conversion refuses before it can compare the base unit'
   );
 
 -- 78
@@ -771,8 +835,8 @@ select
       where
         item_id = '31000000-0000-4000-8000-000000000003'
     ),
-    1::bigint,
-    'stale base unit inserted nothing'
+    0::bigint,
+    'refused add_unit_conversion inserted nothing'
   );
 
 -- 79
@@ -784,14 +848,14 @@ select
       1,
       'kg'
     )$$,
-    '40001'::char(5),
-    'base unit changed',
-    'add_unit_conversion rejects a missing item'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'add_unit_conversion refuses a missing item before any lookup'
   );
 
 -- 92
 select
-  lives_ok (
+  throws_ok (
     $$select app.update_unit_conversion(
       '31000000-0000-4000-8000-000000000003',
       'bag',
@@ -799,18 +863,19 @@ select
       30,
       'kg'
     )$$,
-    'owner can update a conversion through update_unit_conversion'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'update_unit_conversion tells the owner to use the dated writer'
   );
 
 -- 93
 select
-  results_eq (
+  is_empty (
     $$select factor_to_base::numeric
       from app.item_unit_conversions
       where item_id = '31000000-0000-4000-8000-000000000003'
         and unit = 'bag'$$,
-    $$values (30::numeric)$$,
-    'update_unit_conversion stored bag = 30'
+    'update_unit_conversion stored nothing'
   );
 
 -- 94
@@ -823,20 +888,19 @@ select
       40,
       'liter'
     )$$,
-    '40001'::char(5),
-    'base unit changed',
-    'update_unit_conversion rejects a stale base unit'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'update_unit_conversion refuses before it can compare the base unit'
   );
 
 -- 95
 select
-  results_eq (
+  is_empty (
     $$select factor_to_base::numeric
       from app.item_unit_conversions
       where item_id = '31000000-0000-4000-8000-000000000003'
         and unit = 'bag'$$,
-    $$values (30::numeric)$$,
-    'stale base unit left the updated conversion unchanged'
+    'refused update left no legacy conversion'
   );
 
 -- 96
@@ -849,20 +913,19 @@ select
       40,
       'kg'
     )$$,
-    '40001'::char(5),
-    'conversion changed',
-    'update_unit_conversion rejects a stale factor'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'update_unit_conversion refuses before it can compare the factor'
   );
 
 -- 97
 select
-  results_eq (
+  is_empty (
     $$select factor_to_base::numeric
       from app.item_unit_conversions
       where item_id = '31000000-0000-4000-8000-000000000003'
         and unit = 'bag'$$,
-    $$values (30::numeric)$$,
-    'stale factor left the updated conversion unchanged'
+    'refused stale factor left no legacy conversion'
   );
 
 -- 98
@@ -874,9 +937,9 @@ select
       30,
       'liter'
     )$$,
-    '40001'::char(5),
-    'base unit changed',
-    'delete_unit_conversion rejects a stale base unit'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'delete_unit_conversion refuses before it can compare the base unit'
   );
 
 -- 99
@@ -891,8 +954,8 @@ select
         item_id = '31000000-0000-4000-8000-000000000003'
         and unit = 'bag'
     ),
-    1::bigint,
-    'stale base unit kept the conversion row'
+    0::bigint,
+    'refused delete left no legacy conversion'
   );
 
 -- 100
@@ -904,9 +967,9 @@ select
       99,
       'kg'
     )$$,
-    '40001'::char(5),
-    'conversion changed',
-    'delete_unit_conversion rejects a stale factor'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'delete_unit_conversion refuses before it can compare the factor'
   );
 
 -- 101
@@ -921,8 +984,8 @@ select
         item_id = '31000000-0000-4000-8000-000000000003'
         and unit = 'bag'
     ),
-    1::bigint,
-    'stale factor kept the conversion row'
+    0::bigint,
+    'refused stale factor left no legacy conversion'
   );
 
 -- ============================================================================
@@ -965,8 +1028,8 @@ select
     $$insert into app.stock_items (name, kind, base_unit, count_frequency)
       values ('صنف دخيل', 'ingredient', 'kg', 'weekly')$$,
     '42501'::char(5),
-    'new row violates row-level security policy for table "stock_items"',
-    'non-owner insert into stock_items is rejected by RLS'
+    'permission denied for table stock_items',
+    'non-owner insert into stock_items is denied'
   );
 
 -- 31
@@ -984,8 +1047,8 @@ select
     $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
       values ('31000000-0000-4000-8000-000000000004', 'علبة', 6)$$,
     '42501'::char(5),
-    'new row violates row-level security policy for table "item_unit_conversions"',
-    'non-owner insert into item_unit_conversions is rejected by RLS'
+    'permission denied for table item_unit_conversions',
+    'non-owner insert into item_unit_conversions is denied'
   );
 
 -- 80
@@ -997,9 +1060,9 @@ select
       6,
       'kg'
     )$$,
-    '42501'::char(5),
-    'new row violates row-level security policy for table "item_unit_conversions"',
-    'non-owner add_unit_conversion is rejected by RLS'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'non-owner add_unit_conversion is refused before RLS'
   );
 
 -- 102
@@ -1012,9 +1075,9 @@ select
       99,
       'kg'
     )$$,
-    '40001'::char(5),
-    'conversion changed',
-    'non-owner update_unit_conversion changes nothing'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'non-owner update_unit_conversion is refused'
   );
 
 -- 103
@@ -1026,28 +1089,32 @@ select
       30,
       'kg'
     )$$,
-    '40001'::char(5),
-    'conversion changed',
-    'non-owner delete_unit_conversion changes nothing'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'non-owner delete_unit_conversion is refused'
   );
 
 -- 33
 select
-  lives_ok (
+  throws_ok (
     $$update app.item_unit_conversions
       set factor_to_base = 99
       where item_id = '31000000-0000-4000-8000-000000000004'
         and unit = 'piece'$$,
-    'non-owner update of a conversion is not a permission error'
+    '42501'::char(5),
+    'permission denied for table item_unit_conversions',
+    'non-owner update of a conversion is denied'
   );
 
 -- 34
 select
-  lives_ok (
+  throws_ok (
     $$delete from app.item_unit_conversions
       where item_id = '31000000-0000-4000-8000-000000000004'
         and unit = 'piece'$$,
-    'non-owner delete of a conversion is not a permission error'
+    '42501'::char(5),
+    'permission denied for table item_unit_conversions',
+    'non-owner delete of a conversion is denied'
   );
 
 -- 35
@@ -1079,13 +1146,12 @@ select
 
 -- 37
 select
-  results_eq (
+  is_empty (
     $$select factor_to_base::numeric
       from app.item_unit_conversions
       where item_id = '31000000-0000-4000-8000-000000000004'
         and unit = 'piece'$$,
-    $$values (4::numeric)$$,
-    'non-owner update of a conversion affected zero rows'
+    'non-owner update left no legacy conversion'
   );
 
 -- 38
@@ -1100,19 +1166,18 @@ select
         item_id = '31000000-0000-4000-8000-000000000004'
         and unit = 'piece'
     ),
-    1::bigint,
-    'non-owner delete of a conversion affected zero rows'
+    0::bigint,
+    'non-owner delete left no legacy conversion'
   );
 
 -- 104
 select
-  results_eq (
+  is_empty (
     $$select factor_to_base::numeric
       from app.item_unit_conversions
       where item_id = '31000000-0000-4000-8000-000000000003'
         and unit = 'bag'$$,
-    $$values (30::numeric)$$,
-    'non-owner update and delete left bag = 30'
+    'non-owner update and delete left no legacy bag conversion'
   );
 
 -- ============================================================================
@@ -1260,14 +1325,16 @@ set
 
 -- 107
 select
-  lives_ok (
+  throws_ok (
     $$select app.delete_unit_conversion(
       '31000000-0000-4000-8000-000000000003',
       'bag',
       30,
       'kg'
     )$$,
-    'owner can delete a conversion through delete_unit_conversion'
+    '0A000'::char(5),
+    'use app.set_item_conversion',
+    'delete_unit_conversion tells the owner to use the dated writer'
   );
 
 -- 108
@@ -1319,20 +1386,36 @@ select
 -- 50
 select
   throws_ok (
-    $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
-      values ('31000000-0000-4000-8000-000000000004', 'kg', 1)$$,
-    '23514'::char(5),
-    'cannot store a conversion for the item base unit',
+    $$select app.set_item_conversion(
+      '31000000-0000-4000-8000-000000000050',
+      '31000000-0000-4000-8000-000000000004',
+      'kg',
+      1,
+      null,
+      null,
+      md5('kg|ingredient||'),
+      null
+    )$$,
+    '22023'::char(5),
+    'conversion unit must differ from the item base_unit',
     'conversion to the item base unit is rejected'
   );
 
 -- 51
 select
   throws_ok (
-    $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
-      values ('31000000-0000-4000-8000-000000000004', ' kg ', 1)$$,
-    '23514'::char(5),
-    'cannot store a conversion for the item base unit',
+    $$select app.set_item_conversion(
+      '31000000-0000-4000-8000-000000000051',
+      '31000000-0000-4000-8000-000000000004',
+      ' kg ',
+      1,
+      null,
+      null,
+      md5('kg|ingredient||'),
+      null
+    )$$,
+    '22023'::char(5),
+    'conversion unit must differ from the item base_unit',
     'conversion unit that trims to the base unit is rejected'
   );
 
@@ -1343,19 +1426,33 @@ select
       set unit = 'kg'
       where item_id = '31000000-0000-4000-8000-000000000004'
         and unit = 'piece'$$,
-    '23514'::char(5),
-    'cannot store a conversion for the item base unit',
-    'updating a conversion onto the base unit is rejected'
+    '42501'::char(5),
+    'permission denied for table item_unit_conversions',
+    'updating a legacy conversion onto the base unit is denied'
   );
 
 -- 53
 select
   throws_ok (
-    $$update app.stock_items
-      set base_unit = 'piece'
-      where id = '31000000-0000-4000-8000-000000000004'$$,
+    $fn$do $body$
+      begin
+        perform app.set_item_conversion(
+          '31000000-0000-4000-8000-000000000053',
+          '31000000-0000-4000-8000-000000000004',
+          'piece',
+          2,
+          null,
+          null,
+          md5('kg|ingredient||'),
+          null
+        );
+        update app.stock_items
+        set base_unit = 'piece'
+        where id = '31000000-0000-4000-8000-000000000004';
+      end
+      $body$;$fn$,
     '23514'::char(5),
-    'cannot change base_unit while the item has unit conversions',
+    'cannot change base_unit of an item that is configured or has movements',
     'base_unit change while a conversion exists is rejected'
   );
 
@@ -1377,8 +1474,25 @@ select
 -- 55
 select
   lives_ok (
-    $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
-      values ('31000000-0000-4000-8000-000000000005', 'bag', 25)$$,
+    $fn$do $body$
+      begin
+        perform app.add_custom_unit(
+          '31000000-0000-4000-8000-000000000055',
+          'bag',
+          'كيس'
+        );
+        perform app.set_item_conversion(
+          '31000000-0000-4000-8000-000000000056',
+          '31000000-0000-4000-8000-000000000005',
+          'bag',
+          25,
+          null,
+          null,
+          md5('kg|ingredient||'),
+          null
+        );
+      end
+      $body$;$fn$,
     'owner can add a bag conversion before changing base_unit'
   );
 
@@ -1389,7 +1503,7 @@ select
       set base_unit = 'liter'
       where id = '31000000-0000-4000-8000-000000000005'$$,
     '23514'::char(5),
-    'cannot change base_unit while the item has unit conversions',
+    'cannot change base_unit of an item that is configured or has movements',
     'kg item cannot change to liter while bag = 25 exists'
   );
 
@@ -1411,10 +1525,23 @@ select
 -- 58
 select
   lives_ok (
-    $$delete from app.item_unit_conversions
-      where item_id = '31000000-0000-4000-8000-000000000005'
-        and unit = 'bag'$$,
-    'owner can delete the bag conversion'
+    $$select app.set_item_conversion(
+      '31000000-0000-4000-8000-000000000058',
+      '31000000-0000-4000-8000-000000000005',
+      'bag',
+      null,
+      null,
+      null,
+      (
+        select conv ->> 'token'
+        from jsonb_array_elements(
+          app.item_costing_schedule('31000000-0000-4000-8000-000000000005') -> 'conversions'
+        ) conv
+        where conv ->> 'unit_code' = 'bag'
+      ),
+      null
+    )$$,
+    'owner can remove the bag conversion'
   );
 
 -- 59
@@ -1444,8 +1571,16 @@ select
 -- 61
 select
   throws_ok (
-    $$insert into app.stock_items (name, kind, base_unit, count_frequency)
-      values ('حجم يتيم', 'fish_size', 'kg', 'daily')$$,
+    $$select app.create_stock_item(
+      '31000000-0000-4000-8000-000000000061',
+      'حجم يتيم',
+      'fish_size',
+      'kg',
+      'daily',
+      null,
+      null,
+      true
+    )$$,
     '23514'::char(5),
     'fish_size item requires parent_item_id',
     'owner insert of fish_size without a parent is rejected'
@@ -1454,14 +1589,16 @@ select
 -- 62
 select
   throws_ok (
-    $$insert into app.stock_items (name, kind, base_unit, count_frequency, parent_item_id)
-      values (
-        'حجم غلط',
-        'fish_size',
-        'kg',
-        'daily',
-        '31000000-0000-4000-8000-000000000003'
-      )$$,
+    $$select app.create_stock_item(
+      '31000000-0000-4000-8000-000000000062',
+      'حجم غلط',
+      'fish_size',
+      'kg',
+      'daily',
+      '31000000-0000-4000-8000-000000000003',
+      null,
+      true
+    )$$,
     '23514'::char(5),
     'parent_item_id for fish_size must reference a fish_mixed item',
     'owner insert of fish_size under a non-fish_mixed parent is rejected'
@@ -1470,14 +1607,16 @@ select
 -- 63
 select
   throws_ok (
-    $$insert into app.stock_items (name, kind, base_unit, count_frequency, parent_item_id)
-      values (
-        'مكون بأب',
-        'ingredient',
-        'kg',
-        'weekly',
-        '31000000-0000-4000-8000-000000000001'
-      )$$,
+    $$select app.create_stock_item(
+      '31000000-0000-4000-8000-000000000063',
+      'مكون بأب',
+      'ingredient',
+      'kg',
+      'weekly',
+      '31000000-0000-4000-8000-000000000001',
+      null,
+      true
+    )$$,
     '23514'::char(5),
     'parent_item_id must be null for non-fish_size items',
     'owner insert of a non-fish_size item with a parent is rejected'
@@ -1497,8 +1636,16 @@ select
 -- 65
 select
   throws_ok (
-    $$insert into app.stock_items (name, kind, base_unit, count_frequency)
-      values ('بوري مخلوط معدل', 'ingredient', 'kg', 'weekly')$$,
+    $$select app.create_stock_item(
+      '31000000-0000-4000-8000-000000000065',
+      'بوري مخلوط معدل',
+      'ingredient',
+      'kg',
+      'weekly',
+      null,
+      null,
+      true
+    )$$,
     '23505'::char(5),
     'duplicate key value violates unique constraint "stock_items_name_key"',
     'owner duplicate item name is a unique violation'
@@ -1509,9 +1656,9 @@ select
   throws_ok (
     $$insert into app.item_unit_conversions (item_id, unit, factor_to_base)
       values ('31000000-0000-4000-8000-000000000004', 'piece', 8)$$,
-    '23505'::char(5),
-    'duplicate key value violates unique constraint "item_unit_conversions_pkey"',
-    'owner duplicate conversion unit is a unique violation'
+    '42501'::char(5),
+    'permission denied for table item_unit_conversions',
+    'owner duplicate legacy conversion is denied before the unique check'
   );
 
 -- ============================================================================

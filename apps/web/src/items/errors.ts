@@ -3,6 +3,17 @@ export const genericCatalogError = 'حصل خطأ. حاول تاني.';
 export const staleWriteMessage =
   'البيانات اتغيّرت من مكان تاني — اتعملها تحديث، راجعها واحفظ تاني';
 
+/** A dated loss or conversion lost the race with another schedule write. */
+export const costingChangedMessage = 'البيانات اتغيرت — حدّث الصفحة وجرّب تاني';
+
+/** The editor shows a kind, base unit or parent that is not saved yet. */
+export const saveDetailsFirstMessage =
+  'النوع أو الوحدة الأساسية أو الأب اتغيّروا ولسه ماتحفظوش — احفظ البيانات الأول';
+
+/** The costing schedule belongs to a different identity than the one shown. */
+export const identityOutOfDateMessage =
+  'نوع الصنف أو وحدته اتغيّروا من مكان تاني — بنحدّث البيانات، استنى لحظة وجرّب تاني';
+
 export class StaleWriteError extends Error {
   constructor() {
     super(staleWriteMessage);
@@ -10,7 +21,59 @@ export class StaleWriteError extends Error {
   }
 }
 
+export class CostingChangedError extends StaleWriteError {
+  /**
+   * Thrown only when a costing writer raises 40001 with the message
+   * `configuration changed` after the request-id replay lookup. That proves
+   * this request id stored nothing. A generic 40001 does not.
+   */
+  readonly code = '40001';
+
+  constructor() {
+    super();
+    this.name = 'CostingChangedError';
+    this.message = costingChangedMessage;
+  }
+}
+
+/**
+ * True only for the writers' post-replay conflict. The Arabic owner message
+ * is not enough: a generic serialization failure is also 40001.
+ */
+export function isConfirmedConfigurationChange(error: unknown): boolean {
+  let current: unknown = error;
+  const seen = new Set<object>();
+  for (let depth = 0; depth < 5; depth += 1) {
+    if (typeof current !== 'object' || current === null) return false;
+    if (seen.has(current)) return false;
+    seen.add(current);
+    if (current instanceof CostingChangedError) return true;
+    const record = current as {
+      code?: unknown;
+      message?: unknown;
+      cause?: unknown;
+    };
+    if (record.code === '40001' && record.message === 'configuration changed') {
+      return true;
+    }
+    current = record.cause;
+  }
+  return false;
+}
+
 const checkReasons: ReadonlyArray<readonly [string, string]> = [
+  [
+    'cannot change base_unit of an item that is configured or has movements',
+    'مينفعش تغيّر وحدة صنف اتحدد أو عليه حركات',
+  ],
+  [
+    'cannot change kind of an item that is configured or has movements',
+    'مينفعش تغيّر نوع صنف اتحدد أو عليه حركات',
+  ],
+  [
+    'cannot change parent_item_id of an item that is configured or has movements',
+    'مينفعش تغيّر أب صنف اتحدد أو عليه حركات',
+  ],
   [
     'cannot change base_unit of an item that has movements',
     'مينفعش تغيّر وحدة صنف عليه حركات',
@@ -65,8 +128,19 @@ export function mapCatalogError(error: unknown): string {
   if (typeof error !== 'object' || error === null) return genericCatalogError;
   const { code, text } = errorText(error);
 
+  if (code === '40001') return costingChangedMessage;
+  if (code === '42501') return 'المالك بس يقدر يعمل التغيير ده';
+
+  if (text.includes('zero_cost_reason') || text.includes('zero cost'))
+    return 'اكتب سبب إن السعر صفر';
+  if (text.includes('reason is required')) return 'اكتب سبب التغيير بأثر رجعي';
+  if (text.includes('unit already exists')) return 'الوحدة دي موجودة قبل كده';
+  if (text.includes('unknown unit')) return 'الوحدة دي مش معرّفة للصنف';
+  if (text.includes('is frozen'))
+    return 'القيمة القديمة متقفلة. عدّل الفاقد أو التحويل بتاريخ سريان';
+
   if (code === '23505') {
-    if (text.includes('item_unit_conversions')) {
+    if (text.includes('item_unit_conversions') || text.includes('units')) {
       return 'الوحدة دي موجودة قبل كده';
     }
     return 'الاسم ده موجود قبل كده';

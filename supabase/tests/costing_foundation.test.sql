@@ -311,8 +311,8 @@ set
 select
   is (
     app.item_costing_schedule ('e4010000-0000-4000-8000-000000000001') -> 'loss' ->> 'token',
-    md5(''),
-    'empty loss schedule token is md5 of the empty string'
+    md5('kg|ingredient||'),
+    'empty loss schedule token includes the item identity'
   );
 
 select
@@ -323,7 +323,7 @@ select
       0.10,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'تأسيس فاقد'
     )$$,
     'publish loss 0.10 from 2026-01-01'
@@ -357,7 +357,7 @@ select
       0.10,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'تأسيس فاقد'
     ),
     (
@@ -423,7 +423,7 @@ select
       0.30,
       '2026-07-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'سبب'
     )$$,
     '40001',
@@ -713,7 +713,7 @@ select
       12,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'كرتونة'
     )$$,
     'publish carton factor 12 from 2026-01-01'
@@ -738,7 +738,7 @@ select
       12,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'كرتونة'
     ),
     (
@@ -806,7 +806,7 @@ select
       13,
       '2026-07-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'سبب'
     )$$,
     '40001',
@@ -823,7 +823,7 @@ select
       0.002,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'جرام صريح'
     )$$,
     'publish an explicit g factor'
@@ -1020,7 +1020,7 @@ select
       0.05,
       '2000-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       null
     )$$,
     '22023',
@@ -1036,7 +1036,7 @@ select
       0.05,
       '2000-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       '   '
     )$$,
     '22023',
@@ -1052,7 +1052,7 @@ select
       0.05,
       '2000-01-01 00:00:00+00',
       '2000-02-01 00:00:00+00',
-      md5(''),
+      md5('kg|ingredient||'),
       '  سبب قديم  '
     )$$,
     'a far-past loss with a reason is stored'
@@ -1114,7 +1114,7 @@ select
       0.15,
       '2026-08-01 12:30:00+00',
       '2026-09-01 18:45:00.5+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'توقيت فاقد'
     )$$,
     'publish loss under UTC'
@@ -1129,7 +1129,7 @@ select
       6,
       '2026-08-01 12:30:00+00',
       '2026-09-01 18:45:00.5+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'توقيت تحويل'
     )$$,
     'publish conversion under UTC'
@@ -1174,7 +1174,7 @@ select
       0.15,
       '2026-08-01 12:30:00+00',
       '2026-09-01 18:45:00.5+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'توقيت فاقد'
     ),
     (
@@ -1211,7 +1211,7 @@ select
       6,
       '2026-08-01 12:30:00+00',
       '2026-09-01 18:45:00.5+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'توقيت تحويل'
     ),
     (
@@ -1251,7 +1251,7 @@ select
       0.11,
       '2026-01-01 00:00:00+00',
       '2026-02-01 00:00:00+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'مدى أول'
     )$$,
     'publish the first of three consecutive loss versions'
@@ -1670,7 +1670,7 @@ select
       12,
       '2026-01-01 00:00:00+00',
       '2026-03-01 00:00:00+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'قبل الفجوة'
     )$$,
     'publish the first carton version around a later gap'
@@ -1862,7 +1862,8 @@ select
       'e4010000-0000-4000-8000-000000000003',
       55.5,
       null,
-      null
+      null,
+      'kg|ingredient||'
     )$$,
     'set opening price 55.5'
   );
@@ -1889,7 +1890,8 @@ select
         'e4010000-0000-4000-8000-000000000003',
         60,
         null,
-        %L::uuid
+        %L::uuid,
+        'kg|ingredient||'
       )$$,
       (
         select
@@ -1911,7 +1913,8 @@ select
       'e4010000-0000-4000-8000-000000000003',
       70,
       null,
-      'e4010000-0000-4000-8000-000000000099'
+      'e4010000-0000-4000-8000-000000000099',
+      'kg|ingredient||'
     )$$,
     '40001',
     'configuration changed',
@@ -1927,7 +1930,8 @@ select
       null,
       (select id from app.item_opening_prices
         where item_id = 'e4010000-0000-4000-8000-000000000003'
-          and superseded_change_id is null)
+          and superseded_change_id is null),
+      'kg|ingredient||'
     )$$,
     '22023',
     'zero_cost_reason is required when unit_cost is 0',
@@ -1942,7 +1946,8 @@ select
         'e4010000-0000-4000-8000-000000000003',
         0,
         'تكلفة صفر مقصودة',
-        %L::uuid
+        %L::uuid,
+        'kg|ingredient||'
       )$$,
       (
         select
@@ -1980,7 +1985,8 @@ select
         'e4010000-0000-4000-8000-000000000003',
         0,
         'تكلفة صفر مقصودة',
-        %L::uuid
+        %L::uuid,
+        'kg|ingredient||'
       )$$,
       (
         select
@@ -2033,7 +2039,7 @@ select
       4,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'تغطية'
     )$$,
     'publish a conversion that will be removed entirely'
@@ -2074,7 +2080,7 @@ select
       0.10,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'تجميد'
     )$$,
     'configure the freeze item with a loss version'
@@ -2377,6 +2383,11 @@ select
       'app.set_item_opening_price(uuid,uuid,numeric,text,uuid)',
       'execute'
     )
+    and has_function_privilege(
+      'authenticated',
+      'app.set_item_opening_price(uuid,uuid,numeric,text,uuid,text)',
+      'execute'
+    )
     and not has_function_privilege(
       'service_role',
       'app.set_item_loss(uuid,uuid,numeric,timestamptz,timestamptz,text,text)',
@@ -2390,6 +2401,11 @@ select
     and not has_function_privilege(
       'service_role',
       'app.set_item_opening_price(uuid,uuid,numeric,text,uuid)',
+      'execute'
+    )
+    and not has_function_privilege(
+      'service_role',
+      'app.set_item_opening_price(uuid,uuid,numeric,text,uuid,text)',
       'execute'
     )
     and not has_function_privilege(
@@ -2418,8 +2434,18 @@ select
       'execute'
     )
     and not has_function_privilege(
+      'anon',
+      'app.set_item_opening_price(uuid,uuid,numeric,text,uuid,text)',
+      'execute'
+    )
+    and not has_function_privilege(
       'public',
       'app.set_item_opening_price(uuid,uuid,numeric,text,uuid)',
+      'execute'
+    )
+    and not has_function_privilege(
+      'public',
+      'app.set_item_opening_price(uuid,uuid,numeric,text,uuid,text)',
       'execute'
     ),
     true,
@@ -2626,7 +2652,7 @@ select
     $$select app.set_item_loss(
       'e4010000-0000-4000-8000-000000000191',
       'e4010000-0000-4000-8000-000000000001',
-      0.10, '2090-01-01 00:00:00+00', null, md5(''), null
+      0.10, '2090-01-01 00:00:00+00', null, md5('kg|ingredient||'), null
     )$$,
     '42501',
     'insufficient_privilege',
@@ -2638,7 +2664,7 @@ select
     $$select app.set_item_conversion(
       'e4010000-0000-4000-8000-000000000192',
       'e4010000-0000-4000-8000-000000000002',
-      'carton', 2, '2090-01-01 00:00:00+00', null, md5(''), null
+      'carton', 2, '2090-01-01 00:00:00+00', null, md5('kg|ingredient||'), null
     )$$,
     '42501',
     'insufficient_privilege',
@@ -2655,6 +2681,18 @@ select
     '42501',
     'insufficient_privilege',
     'non-owner cannot set an opening price'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_opening_price(
+      'e4010000-0000-4000-8000-000000000196',
+      'e4010000-0000-4000-8000-000000000003',
+      1, null, null, 'kg|ingredient||'
+    )$$,
+    '42501',
+    'insufficient_privilege',
+    'non-owner cannot set an opening price with an identity'
   );
 
 select
@@ -2727,7 +2765,7 @@ select
     $$select app.set_item_loss(
       'e4010000-0000-4000-8000-000000000194',
       'e4010000-0000-4000-8000-000000000001',
-      0.10, '2090-01-01 00:00:00+00', null, md5(''), null
+      0.10, '2090-01-01 00:00:00+00', null, md5('kg|ingredient||'), null
     )$$,
     '42501',
     null::text,
@@ -2757,6 +2795,18 @@ select
     '42501',
     null::text,
     'service_role cannot execute an opening-price writer'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_opening_price(
+      'e4010000-0000-4000-8000-000000000197',
+      'e4010000-0000-4000-8000-000000000003',
+      1, null, null, 'kg|ingredient||'
+    )$$,
+    '42501',
+    null::text,
+    'service_role cannot execute the identity opening-price writer'
   );
 
 select

@@ -58,10 +58,46 @@ describe('mapCatalogError', () => {
     ).toBe('التغيير ده مش مسموح');
   });
 
-  it('uses a generic retry message for anything else', () => {
+  it('maps owner-only, backdated, unknown, frozen, and zero-price errors', () => {
     expect(
-      mapCatalogError({ code: '42501', message: 'permission denied' }),
-    ).toBe('حصل خطأ. حاول تاني.');
+      mapCatalogError({ code: '42501', message: 'insufficient_privilege' }),
+    ).toBe('المالك بس يقدر يعمل التغيير ده');
+    expect(
+      mapCatalogError({ code: '40001', message: 'conversion changed' }),
+    ).toBe('البيانات اتغيرت — حدّث الصفحة وجرّب تاني');
+    expect(
+      mapCatalogError({
+        code: '22023',
+        message: 'reason is required for a backdated change',
+      }),
+    ).toBe('اكتب سبب التغيير بأثر رجعي');
+    expect(
+      mapCatalogError({ code: '22023', message: 'unit already exists' }),
+    ).toBe('الوحدة دي موجودة قبل كده');
+    expect(
+      mapCatalogError({
+        code: '22023',
+        message: 'unknown unit "bag" for item زيت',
+      }),
+    ).toBe('الوحدة دي مش معرّفة للصنف');
+    expect(
+      mapCatalogError({
+        code: '55000',
+        message: 'stock_items.loss_pct is frozen; use app.set_item_loss',
+      }),
+    ).toBe('القيمة القديمة متقفلة. عدّل الفاقد أو التحويل بتاريخ سريان');
+    expect(
+      mapCatalogError({
+        code: '22023',
+        message: 'zero_cost_reason is required when unit_cost is 0',
+      }),
+    ).toBe('اكتب سبب إن السعر صفر');
+  });
+
+  it('uses a generic retry message for anything else', () => {
+    expect(mapCatalogError({ code: 'XX000', message: 'nope' })).toBe(
+      'حصل خطأ. حاول تاني.',
+    );
     expect(mapCatalogError(null)).toBe('حصل خطأ. حاول تاني.');
   });
 });

@@ -13,19 +13,23 @@ function ItemCard({
   conversionsOpen,
   editsDisabled,
   conversionsLocked,
+  identityDirty,
   onEdit,
   onToggleConversions,
   onConversionsBusy,
   onItemStale,
+  onConversionSaved,
 }: {
   item: CatalogItem;
   conversionsOpen: boolean;
   editsDisabled: boolean;
   conversionsLocked: boolean;
+  identityDirty: boolean;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusy: (busy: boolean) => void;
   onItemStale?: (itemId: string) => void | Promise<void>;
+  onConversionSaved?: (itemId: string) => void | Promise<void>;
 }) {
   return (
     <article
@@ -41,9 +45,11 @@ function ItemCard({
       <ul className="flex flex-wrap gap-2 text-sm">
         <li>{unitLabels[item.baseUnit]}</li>
         <li>{frequencyLabels[item.countFrequency]}</li>
-        {item.lossPct > 0 ? (
+        {item.lossPct === null ? (
+          <li>فاقد مش متحدد</li>
+        ) : (
           <li>فاقد {formatLossPercent(item.lossPct)}</li>
-        ) : null}
+        )}
       </ul>
       <dl className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-3">
         <div>
@@ -87,8 +93,10 @@ function ItemCard({
         <ConversionsPanel
           item={item}
           locked={editsDisabled}
+          identityDirty={identityDirty}
           onBusyChange={onConversionsBusy}
           onItemStale={onItemStale}
+          onConversionSaved={onConversionSaved}
         />
       ) : null}
     </article>
@@ -109,19 +117,24 @@ export function ItemList({
   showInactive,
   openConversionsId,
   editsDisabled,
+  identityDirtyId = null,
   onEdit,
   onToggleConversions,
   onConversionsBusyChange,
   onItemStale,
+  onConversionSaved,
 }: {
   items: readonly CatalogItem[];
   showInactive: boolean;
   openConversionsId: string | null;
   editsDisabled: boolean;
+  /** The item whose open editor holds an unsaved kind, base unit or parent. */
+  identityDirtyId?: string | null;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusyChange?: (busy: boolean) => void;
   onItemStale?: (itemId: string) => void | Promise<void>;
+  onConversionSaved?: (itemId: string) => void | Promise<void>;
 }) {
   const [conversionsBusy, setConversionsBusyState] = useState(false);
   // The page also locks controls that would unmount an open panel (the inactive filter).
@@ -137,10 +150,12 @@ export function ItemList({
       conversionsOpen={openConversionsId === item.id}
       editsDisabled={editsDisabled}
       conversionsLocked={conversionsBusy || editsDisabled}
+      identityDirty={identityDirtyId === item.id}
       onEdit={onEdit}
       onToggleConversions={onToggleConversions}
       onConversionsBusy={setConversionsBusy}
       onItemStale={onItemStale}
+      onConversionSaved={onConversionSaved}
     />
   );
 
@@ -164,10 +179,12 @@ export function ItemList({
                   conversionsOpen={openConversionsId === block.parent.id}
                   editsDisabled={editsDisabled}
                   conversionsLocked={conversionsBusy || editsDisabled}
+                  identityDirty={identityDirtyId === block.parent.id}
                   onEdit={onEdit}
                   onToggleConversions={onToggleConversions}
                   onConversionsBusy={setConversionsBusy}
                   onItemStale={onItemStale}
+                  onConversionSaved={onConversionSaved}
                 />
               ) : (
                 <p>تحت {block.parent.name} (موقوف)</p>

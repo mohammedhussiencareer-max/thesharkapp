@@ -1,17 +1,28 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ConversionChangedError,
   conversionChangedMessage,
 } from '@/purchases/errors';
-import { listStockChoices, recordOpeningStock } from '@/purchases/api';
+import {
+  listStockChoices,
+  listUnitsAt,
+  recordOpeningStock,
+} from '@/purchases/api';
 import { OpeningPage } from '@/pages/OpeningPage';
-import type { StockChoice } from '@/purchases/types';
+import type { StockChoice, UnitOption } from '@/purchases/types';
 
 vi.mock('@/purchases/api', () => ({
   listStockChoices: vi.fn(),
   recordOpeningStock: vi.fn(),
+  listUnitsAt: vi.fn(() => Promise.resolve({})),
 }));
 
 function choice(
@@ -34,6 +45,8 @@ describe('OpeningPage', () => {
     vi.mocked(listStockChoices).mockReset();
     vi.mocked(recordOpeningStock).mockReset();
     vi.mocked(recordOpeningStock).mockResolvedValue(undefined);
+    vi.mocked(listUnitsAt).mockReset();
+    vi.mocked(listUnitsAt).mockResolvedValue({});
   });
 
   it('says every item already has an opening balance', async () => {
@@ -116,7 +129,27 @@ describe('OpeningPage', () => {
   });
 
   it('reloads choices when the conversion changed and keeps the entered row', async () => {
-    vi.mocked(listStockChoices).mockResolvedValue([oil]);
+    const literOil = choice({
+      id: 'oil',
+      name: 'زيت',
+      kind: 'ingredient',
+      conversions: [{ unit: 'لتر', factorToBase: '0.92' }],
+    });
+    vi.mocked(listStockChoices).mockResolvedValue([literOil]);
+    const lookedUpAt: string[] = [];
+    let releaseUnits: (rows: Record<string, UnitOption[]>) => void = () =>
+      undefined;
+    vi.mocked(listUnitsAt).mockImplementation((_ids, at) => {
+      lookedUpAt.push(at);
+      if (lookedUpAt.length === 1) {
+        return Promise.resolve({
+          oil: [{ unit: 'لتر', factorToBase: '0.92', label: 'لتر' }],
+        });
+      }
+      return new Promise((resolve) => {
+        releaseUnits = resolve;
+      });
+    });
     vi.mocked(recordOpeningStock).mockRejectedValueOnce(
       new ConversionChangedError(),
     );
@@ -126,8 +159,15 @@ describe('OpeningPage', () => {
       </MemoryRouter>,
     );
     expect(await screen.findByLabelText('كمية زيت')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    const stamp = screen.getByLabelText<HTMLInputElement>('وقت الرصيد').value;
     fireEvent.change(screen.getByLabelText('كمية زيت'), {
       target: { value: '4' },
+    });
+    fireEvent.change(screen.getByLabelText('وحدة زيت'), {
+      target: { value: 'لتر' },
     });
     fireEvent.change(screen.getByLabelText('تكلفة زيت'), {
       target: { value: '12.5' },
@@ -137,19 +177,34 @@ describe('OpeningPage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(
       conversionChangedMessage,
     );
+    expect(screen.getByLabelText('وقت الرصيد')).toHaveValue(stamp);
+    expect(screen.getByLabelText('كمية زيت')).toHaveValue('4');
+    expect(screen.getByLabelText('وحدة زيت')).toHaveValue('لتر');
+    expect(screen.getByLabelText('تكلفة زيت')).toHaveValue('12.5');
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+    expect(lookedUpAt.length).toBeGreaterThanOrEqual(2);
+    expect(lookedUpAt[1]).toBe(lookedUpAt[0]);
+
+    await act(async () => {
+      releaseUnits({
+        oil: [{ unit: 'لتر', factorToBase: '1.25', label: 'لتر' }],
+      });
+      await Promise.resolve();
+    });
     await waitFor(() => {
-      expect(listStockChoices).toHaveBeenCalledTimes(2);
       expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
     });
-    expect(screen.getByLabelText('كمية زيت')).toHaveValue('4');
-    expect(screen.getByLabelText('تكلفة زيت')).toHaveValue('12.5');
-    const first = vi.mocked(recordOpeningStock).mock.calls[0]?.[0]?.requestId;
+    expect(screen.getByLabelText('وقت الرصيد')).toHaveValue(stamp);
+    const first = vi.mocked(recordOpeningStock).mock.calls[0]?.[0];
+    expect(first?.lines[0]?.expectedFactor).toBe('0.92');
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
     await waitFor(() => {
       expect(recordOpeningStock).toHaveBeenCalledTimes(2);
     });
-    expect(vi.mocked(recordOpeningStock).mock.calls[1]?.[0]?.requestId).toBe(
-      first,
-    );
+    const second = vi.mocked(recordOpeningStock).mock.calls[1]?.[0];
+    expect(second?.lines[0]?.expectedFactor).toBe('1.25');
+    expect(second?.lines[0]?.unit).toBe('لتر');
+    expect(second?.occurredAt).toBe(first?.occurredAt);
+    expect(second?.requestId).toBe(first?.requestId);
   });
 });

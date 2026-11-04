@@ -30,7 +30,11 @@ alter table app.stock_movements enable trigger trg_stock_movements_no_truncate;
 
 delete from app.item_balances;
 
+alter table app.item_unit_conversions disable trigger trg_item_unit_conversions_frozen;
+
 delete from app.item_unit_conversions;
+
+alter table app.item_unit_conversions enable trigger trg_item_unit_conversions_frozen;
 
 delete from app.stock_items;
 
@@ -534,6 +538,8 @@ values
     'weekly'
   );
 
+alter table app.item_unit_conversions disable trigger trg_item_unit_conversions_frozen;
+
 insert into
   app.item_unit_conversions (item_id, unit, factor_to_base)
 values
@@ -550,6 +556,82 @@ values
   ('20000000-0000-4000-8000-00000000000b', 'كيس', 4),
   ('20000000-0000-4000-8000-00000000000e', 'علبة', 3),
   ('20000000-0000-4000-8000-00000000000f', 'علبة', 2);
+
+alter table app.item_unit_conversions enable trigger trg_item_unit_conversions_frozen;
+
+-- Dated factors the ledger readers actually use. لتر is the seeded alias of liter.
+insert into
+  app.units (code, label_ar, dimension, metric_scale)
+values
+  ('كرتونة', 'كرتونة', 'custom', null),
+  ('كيس', 'كيس', 'custom', null),
+  ('علبة', 'علبة', 'custom', null);
+
+insert into
+  app.costing_changes (
+    request_id,
+    kind,
+    actor_id,
+    reason,
+    payload,
+    result
+  )
+values
+  (
+    'c2000000-0000-4000-8000-000000000001',
+    'owner',
+    null,
+    null,
+    '{"fn":"test_purchases_seed"}'::jsonb,
+    '{"ok":true}'::jsonb
+  );
+
+insert into
+  app.item_conversion_versions (
+    effective_from,
+    created_change_id,
+    item_id,
+    unit_code,
+    factor_to_base
+  )
+select
+  '2000-01-01T00:00:00Z',
+  cc.id,
+  v.item_id,
+  v.unit_code,
+  v.factor
+from
+  app.costing_changes cc
+  cross join (
+    values
+      (
+        '20000000-0000-4000-8000-000000000001'::uuid,
+        'liter'::text,
+        0.92::numeric
+      ),
+      (
+        '20000000-0000-4000-8000-000000000006'::uuid,
+        'كرتونة'::text,
+        12::numeric
+      ),
+      (
+        '20000000-0000-4000-8000-00000000000b'::uuid,
+        'كيس'::text,
+        4::numeric
+      ),
+      (
+        '20000000-0000-4000-8000-00000000000e'::uuid,
+        'علبة'::text,
+        3::numeric
+      ),
+      (
+        '20000000-0000-4000-8000-00000000000f'::uuid,
+        'علبة'::text,
+        2::numeric
+      )
+  ) as v (item_id, unit_code, factor)
+where
+  cc.request_id = 'c2000000-0000-4000-8000-000000000001';
 
 select
   set_config(
@@ -1837,12 +1919,24 @@ select
   );
 
 select
-  app.update_unit_conversion (
+  app.set_item_conversion (
+    'c2000000-0000-4000-8000-000000000002',
     '20000000-0000-4000-8000-000000000006',
     'كرتونة',
-    12,
     24,
-    'kg'
+    '2000-01-01T00:00:00Z',
+    null,
+    (
+      select
+        conv ->> 'token'
+      from
+        jsonb_array_elements(
+          app.item_costing_schedule ('20000000-0000-4000-8000-000000000006') -> 'conversions'
+        ) conv
+      where
+        conv ->> 'unit_code' = 'كرتونة'
+    ),
+    'تغيير معامل الاختبار'
   );
 
 select
@@ -1904,12 +1998,24 @@ select
   );
 
 select
-  app.update_unit_conversion (
+  app.set_item_conversion (
+    'c2000000-0000-4000-8000-000000000003',
     '20000000-0000-4000-8000-00000000000b',
     'كيس',
-    4,
     8,
-    'kg'
+    '2000-01-01T00:00:00Z',
+    null,
+    (
+      select
+        conv ->> 'token'
+      from
+        jsonb_array_elements(
+          app.item_costing_schedule ('20000000-0000-4000-8000-00000000000b') -> 'conversions'
+        ) conv
+      where
+        conv ->> 'unit_code' = 'كيس'
+    ),
+    'تغيير معامل الاختبار'
   );
 
 select
@@ -2036,11 +2142,24 @@ select
   );
 
 select
-  app.delete_unit_conversion (
+  app.set_item_conversion (
+    'c2000000-0000-4000-8000-000000000004',
     '20000000-0000-4000-8000-00000000000e',
     'علبة',
-    3,
-    'kg'
+    null,
+    '2000-01-01T00:00:00Z',
+    null,
+    (
+      select
+        conv ->> 'token'
+      from
+        jsonb_array_elements(
+          app.item_costing_schedule ('20000000-0000-4000-8000-00000000000e') -> 'conversions'
+        ) conv
+      where
+        conv ->> 'unit_code' = 'علبة'
+    ),
+    'مسح التحويل في الاختبار'
   );
 
 select
@@ -2215,11 +2334,24 @@ select
   );
 
 select
-  app.delete_unit_conversion (
+  app.set_item_conversion (
+    'c2000000-0000-4000-8000-000000000005',
     '20000000-0000-4000-8000-00000000000f',
     'علبة',
-    2,
-    'kg'
+    null,
+    '2000-01-01T00:00:00Z',
+    null,
+    (
+      select
+        conv ->> 'token'
+      from
+        jsonb_array_elements(
+          app.item_costing_schedule ('20000000-0000-4000-8000-00000000000f') -> 'conversions'
+        ) conv
+      where
+        conv ->> 'unit_code' = 'علبة'
+    ),
+    'مسح التحويل في الاختبار'
   );
 
 select

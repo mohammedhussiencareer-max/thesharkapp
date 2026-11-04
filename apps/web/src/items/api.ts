@@ -1,10 +1,20 @@
 import {
+  CostingChangedError,
   genericCatalogError,
   mapCatalogError,
   StaleWriteError,
 } from '@/items/errors';
 import type { ItemExpectation } from '@/items/expectation';
+import {
+  beginAction,
+  createSubject,
+  settleAction,
+  unitSubject,
+} from '@/items/request-id';
+import type { Database } from '@/lib/database.types';
 import { exactDecimal } from '@/lib/decimal';
+import { readAllPages } from '@/lib/paged';
+import { isDefiniteRefusal } from '@/lib/write-outcome';
 import { supabase } from '@/lib/supabase';
 import {
   isBaseUnit,
@@ -12,8 +22,14 @@ import {
   isStockKind,
   type BaseUnit,
   type CatalogItem,
+  type CostingImpact,
+  type CostingSchedule,
+  type CostingVersion,
+  type DatedWrite,
   type ItemDraft,
+  type UnitCatalogOption,
   type UnitConversion,
+  type UnitSource,
 } from '@/items/types';
 
 export type { ItemExpectation };
@@ -23,33 +39,28 @@ function appDb() {
   return supabase.schema('app');
 }
 
-function isStaleWrite(error: {
+type PostgrestError = {
   code?: string;
   message?: string;
   details?: string | null;
   hint?: string | null;
-}): boolean {
-  const text = [error.message, error.details, error.hint]
-    .filter(
-      (part): part is string => typeof part === 'string' && part.length > 0,
-    )
-    .join('\n');
-  return (
-    error.code === '40001' ||
-    text.includes('base unit changed') ||
-    text.includes('conversion changed')
-  );
-}
+};
 
-function throwIfError(
-  error: {
-    code?: string;
-    message?: string;
-    details?: string | null;
-    hint?: string | null;
-  } | null,
-): void {
-  if (error) throw new Error(mapCatalogError(error));
+function throwIfError(error: PostgrestError | null): void {
+  if (!error) return;
+  // Only the writers' post-replay message proves this request stored nothing.
+  // A generic serialization_failure stays a plain 40001 and keeps its action.
+  if (error.code === '40001' && error.message === 'configuration changed') {
+    throw new CostingChangedError();
+  }
+  const mapped = new Error(mapCatalogError(error));
+  // The Arabic message is what the owner reads. The sqlstate stays on the
+  // error so a definite refusal retires its request id and an unknown
+  // outcome, including 23505, keeps it.
+  if (isDefiniteRefusal(error)) {
+    Object.assign(mapped, { code: error.code });
+  }
+  throw mapped;
 }
 
 function toNumber(value: unknown): number {
@@ -66,13 +77,21 @@ function numericColumn(value: string): number {
   return value as unknown as number;
 }
 
+function nullableNumeric(value: string | null): number {
+  if (value === null) return null as unknown as number;
+  return numericColumn(value);
+}
+
+function nullableText(value: string | null): string {
+  return value as unknown as string;
+}
+
 function itemPayload(draft: ItemDraft) {
   return {
     name: draft.name.trim(),
     kind: draft.kind,
     base_unit: draft.baseUnit,
     count_frequency: draft.countFrequency,
-    loss_pct: numericColumn(draft.lossPct),
     parent_item_id: draft.parentItemId,
     active: draft.active,
   };
@@ -83,7 +102,6 @@ function itemBalance(value: unknown): {
   avg_cost: unknown;
   on_hand_value: unknown;
 } | null {
-  // One-to-one embed: PostgREST returns the row object or null.
   if (value === null || value === undefined) return null;
   if (typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(genericCatalogError);
@@ -96,19 +114,40 @@ function itemBalance(value: unknown): {
   };
 }
 
+function rowsOf(value: unknown): Record<string, unknown>[] {
+  if (value === null || value === undefined) return [];
+  const list = Array.isArray(value) ? value : [value];
+  return list.map((row: unknown) => {
+    if (!row || typeof row !== 'object') throw new Error(genericCatalogError);
+    return row as Record<string, unknown>;
+  });
+}
+
+function instantMs(value: unknown): number {
+  if (typeof value !== 'string' || value.length === 0) return Number.NaN;
+  return Date.parse(value);
+}
+
+function coversNow(row: Record<string, unknown>, nowMs: number): boolean {
+  if (row.superseded_change_id != null) return false;
+  const from = instantMs(row.effective_from);
+  if (Number.isNaN(from) || from > nowMs) return false;
+  if (row.effective_to == null) return true;
+  const to = instantMs(row.effective_to);
+  return !Number.isNaN(to) && nowMs < to;
+}
+
 export async function listItems(): Promise<CatalogItem[]> {
-  // Items and their balances come from ONE request, so a balance is always
-  // shown in the base unit it was read with.
   const { data, error } = await appDb()
     .from('stock_items')
     .select(
-      'id, name, kind, base_unit, count_frequency, loss_pct, loss_pct_text:loss_pct::text, parent_item_id, active, item_balances(on_hand_qty, avg_cost, on_hand_value)',
+      'id, name, kind, base_unit, count_frequency, parent_item_id, active, item_balances(on_hand_qty, avg_cost, on_hand_value), item_loss_versions(loss_pct, loss_text:loss_pct::text, effective_from, effective_to, superseded_change_id), item_conversion_versions(id, superseded_change_id), item_opening_prices(id, price_text:unit_cost::text, superseded_change_id)',
     )
     .order('name');
   throwIfError(error);
+  const nowMs = Date.now();
 
   return (data ?? []).map((row) => {
-    const storedLossPct = exactDecimal(row.loss_pct_text, genericCatalogError);
     if (
       !isStockKind(row.kind) ||
       !isBaseUnit(row.base_unit) ||
@@ -117,14 +156,38 @@ export async function listItems(): Promise<CatalogItem[]> {
       throw new Error(genericCatalogError);
     }
     const balance = itemBalance(row.item_balances);
+    const loss = rowsOf(row.item_loss_versions).find((version) =>
+      coversNow(version, nowMs),
+    );
+    const lossFractionText = loss
+      ? exactDecimal(loss.loss_text, genericCatalogError)
+      : null;
+    const opening = rowsOf(row.item_opening_prices).find(
+      (price) => price.superseded_change_id == null,
+    );
+    const configured =
+      rowsOf(row.item_loss_versions).some(
+        (version) => version.superseded_change_id == null,
+      ) ||
+      rowsOf(row.item_conversion_versions).some(
+        (version) => version.superseded_change_id == null,
+      ) ||
+      opening !== undefined ||
+      balance !== null;
     return {
       id: row.id,
       name: row.name,
       kind: row.kind,
       baseUnit: row.base_unit,
       countFrequency: row.count_frequency,
-      lossPct: toNumber(row.loss_pct),
-      storedLossPct,
+      lossPct: lossFractionText === null ? null : toNumber(loss?.loss_pct),
+      lossFractionText,
+      identityLocked: configured,
+      openingPriceId:
+        opening && typeof opening.id === 'string' ? opening.id : null,
+      openingPriceText: opening
+        ? exactDecimal(opening.price_text, genericCatalogError)
+        : null,
       parentItemId: row.parent_item_id,
       active: row.active,
       onHandQty: balance ? toNumber(balance.on_hand_qty) : 0,
@@ -135,12 +198,28 @@ export async function listItems(): Promise<CatalogItem[]> {
 }
 
 export async function createItem(draft: ItemDraft): Promise<void> {
-  const { data, error } = await appDb()
-    .from('stock_items')
-    .insert(itemPayload(draft))
-    .select('id');
-  throwIfError(error);
-  if (!data || data.length === 0) throw new Error(genericCatalogError);
+  const subject = createSubject(draft);
+  const requestId = beginAction(subject, (id) => id);
+  try {
+    const { data, error } = await appDb().rpc('create_stock_item', {
+      p_request_id: requestId,
+      p_name: draft.name.trim(),
+      p_kind: draft.kind,
+      p_base_unit: draft.baseUnit,
+      p_count_frequency: draft.countFrequency,
+      p_parent_item_id: nullableText(draft.parentItemId),
+      p_loss_pct: nullableNumeric(draft.lossPct),
+      p_active: draft.active,
+    });
+    throwIfError(error);
+    if (typeof data !== 'string' || data.length === 0) {
+      throw new Error(genericCatalogError);
+    }
+    settleAction(subject);
+  } catch (error) {
+    settleAction(subject, error);
+    throw error;
+  }
 }
 
 export async function updateItem(
@@ -156,7 +235,6 @@ export async function updateItem(
     .eq('kind', expected.kind)
     .eq('base_unit', expected.baseUnit)
     .eq('count_frequency', expected.countFrequency)
-    .eq('loss_pct', expected.lossPct as number)
     .eq('active', expected.active);
   const filtered =
     expected.parentItemId === null
@@ -167,90 +245,308 @@ export async function updateItem(
   if (!data || data.length === 0) throw new StaleWriteError();
 }
 
+function isSource(value: unknown): value is UnitSource {
+  return value === 'base' || value === 'explicit' || value === 'implicit';
+}
+
+type UnitRow = Database['app']['Views']['item_units_current']['Row'];
+
 export type ConversionList = {
   baseUnit: BaseUnit;
   rows: UnitConversion[];
 };
 
-function conversionRows(value: unknown): UnitConversion[] {
-  if (!Array.isArray(value)) throw new Error(genericCatalogError);
-  return value.map((row: unknown) => {
-    if (!row || typeof row !== 'object') throw new Error(genericCatalogError);
-    const record = row as Record<string, unknown>;
-    if (typeof record.item_id !== 'string' || typeof record.unit !== 'string') {
-      throw new Error(genericCatalogError);
+export async function listConversions(itemId: string): Promise<ConversionList> {
+  // Paged by unit code, which is unique per item, so no list is cut at the API row cap.
+  const raw = await readAllPages<UnitRow>(
+    appDb()
+      .from('item_units_current')
+      .select(
+        'item_id, unit_code, label_ar, factor_to_base, factor_text, source, version_id, effective_from',
+      )
+      .eq('item_id', itemId)
+      .order('unit_code', { ascending: true }),
+    genericCatalogError,
+  );
+  if (raw.length === 0) {
+    const item = await appDb()
+      .from('stock_items')
+      .select('base_unit')
+      .eq('id', itemId)
+      .maybeSingle();
+    throwIfError(item.error);
+    if (!item.data || !isBaseUnit(item.data.base_unit)) {
+      throw new StaleWriteError();
     }
-    return {
-      itemId: record.item_id,
-      unit: record.unit,
-      factorToBase: toNumber(record.factor_to_base),
-      storedFactor: exactDecimal(record.factor_text, genericCatalogError),
-    };
-  });
+    return { baseUnit: item.data.base_unit, rows: [] };
+  }
+  const base = raw.find((row) => row.source === 'base');
+  const baseCode = base?.unit_code ?? '';
+  if (!isBaseUnit(baseCode)) {
+    throw new Error(genericCatalogError);
+  }
+  const rows = raw
+    .filter((row) => row.source !== 'base')
+    .map((row) => {
+      if (
+        row.item_id !== itemId ||
+        typeof row.unit_code !== 'string' ||
+        typeof row.label_ar !== 'string' ||
+        !isSource(row.source)
+      ) {
+        throw new Error(genericCatalogError);
+      }
+      return {
+        itemId,
+        unit: row.unit_code,
+        label: row.label_ar,
+        factorToBase: toNumber(row.factor_to_base),
+        storedFactor: exactDecimal(row.factor_text, genericCatalogError),
+        source: row.source,
+        effectiveFrom: row.effective_from,
+        versionId: row.version_id,
+      };
+    });
+  rows.sort((left, right) =>
+    (left.label ?? left.unit).localeCompare(right.label ?? right.unit, 'ar'),
+  );
+  return { baseUnit: baseCode, rows };
 }
 
-export async function listConversions(itemId: string): Promise<ConversionList> {
-  const { data, error } = await appDb()
-    .from('stock_items')
-    .select(
-      'base_unit, item_unit_conversions(item_id, unit, factor_to_base, factor_text:factor_to_base::text)',
-    )
-    .eq('id', itemId)
-    .maybeSingle();
+export async function listUnitOptions(): Promise<UnitCatalogOption[]> {
+  // Paged by code, which never changes; sorted by label afterwards.
+  const rows = await readAllPages<{ code: string; label_ar: string }>(
+    appDb()
+      .from('units')
+      .select('code, label_ar')
+      .order('code', { ascending: true }),
+    genericCatalogError,
+  );
+  return rows
+    .map((row) => ({ code: row.code, labelAr: row.label_ar }))
+    .sort((left, right) => left.labelAr.localeCompare(right.labelAr, 'ar'));
+}
+
+function versionOf(value: unknown, valueKey: string): CostingVersion {
+  if (!value || typeof value !== 'object') throw new Error(genericCatalogError);
+  const row = value as Record<string, unknown>;
+  if (typeof row.id !== 'string' || typeof row.effective_from !== 'string') {
+    throw new Error(genericCatalogError);
+  }
+  const payload = row[valueKey];
+  return {
+    id: row.id,
+    effectiveFrom: row.effective_from,
+    effectiveTo: typeof row.effective_to === 'string' ? row.effective_to : null,
+    valueText:
+      typeof payload === 'string'
+        ? payload
+        : typeof payload === 'number'
+          ? String(payload)
+          : exactDecimal(payload, genericCatalogError),
+  };
+}
+
+export async function listCostingSchedule(
+  itemId: string,
+): Promise<CostingSchedule> {
+  const { data, error } = await appDb().rpc('item_costing_schedule', {
+    p_item_id: itemId,
+  });
   throwIfError(error);
-  if (!data) throw new StaleWriteError();
-  if (!isBaseUnit(data.base_unit)) throw new Error(genericCatalogError);
-  const rows = conversionRows(data.item_unit_conversions);
-  rows.sort((left, right) => left.unit.localeCompare(right.unit));
-  return { baseUnit: data.base_unit, rows };
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error(genericCatalogError);
+  }
+  const record = data as Record<string, unknown>;
+  const loss = record.loss;
+  if (!loss || typeof loss !== 'object' || Array.isArray(loss)) {
+    throw new Error(genericCatalogError);
+  }
+  const lossRow = loss as Record<string, unknown>;
+  if (typeof lossRow.token !== 'string' || !Array.isArray(lossRow.versions)) {
+    throw new Error(genericCatalogError);
+  }
+  if (!Array.isArray(record.conversions)) throw new Error(genericCatalogError);
+  if (typeof record.empty_token !== 'string') {
+    throw new Error(genericCatalogError);
+  }
+  if (typeof record.identity !== 'string') {
+    throw new Error(genericCatalogError);
+  }
+  return {
+    lossToken: lossRow.token,
+    emptyToken: record.empty_token,
+    identity: record.identity,
+    lossVersions: lossRow.versions.map((version) =>
+      versionOf(version, 'loss_pct'),
+    ),
+    conversions: record.conversions.map((entry) => {
+      if (!entry || typeof entry !== 'object') {
+        throw new Error(genericCatalogError);
+      }
+      const row = entry as Record<string, unknown>;
+      if (
+        typeof row.unit_code !== 'string' ||
+        typeof row.token !== 'string' ||
+        !Array.isArray(row.versions)
+      ) {
+        throw new Error(genericCatalogError);
+      }
+      return {
+        unitCode: row.unit_code,
+        token: row.token,
+        versions: row.versions.map((version) =>
+          versionOf(version, 'factor_to_base'),
+        ),
+      };
+    }),
+  };
+}
+
+export async function currentShiftStart(): Promise<string | null> {
+  const { data, error } = await appDb().rpc('current_shift_start');
+  throwIfError(error);
+  return typeof data === 'string' && data.length > 0 ? data : null;
+}
+
+export async function costingImpact(
+  fromIso: string,
+  toIso: string | null,
+  itemId: string,
+): Promise<CostingImpact> {
+  const { data, error } = await appDb().rpc('costing_impact', {
+    p_from: fromIso,
+    p_to: nullableText(toIso),
+    p_item_id: itemId,
+  });
+  throwIfError(error);
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error(genericCatalogError);
+  }
+  const row = data as Record<string, unknown>;
+  return {
+    orders: toNumber(row.orders),
+    shifts: toNumber(row.shifts),
+    movements: row.movements == null ? null : toNumber(row.movements),
+  };
+}
+
+async function callDated(
+  call: () => PromiseLike<{ error: PostgrestError | null }>,
+): Promise<void> {
+  const { error } = await call();
+  throwIfError(error);
+}
+
+export async function setItemLoss(
+  itemId: string,
+  lossFraction: string,
+  timing: DatedWrite,
+): Promise<void> {
+  await callDated(() =>
+    appDb().rpc('set_item_loss', {
+      p_request_id: timing.requestId,
+      p_item_id: itemId,
+      p_loss_pct: numericColumn(lossFraction),
+      p_effective_from: nullableText(timing.effectiveFrom),
+      p_effective_to: nullableText(timing.effectiveTo),
+      p_expected_token: timing.token,
+      p_reason: nullableText(timing.reason),
+    }),
+  );
+}
+
+export async function setItemConversion(
+  itemId: string,
+  unitCode: string,
+  factor: string | null,
+  timing: DatedWrite,
+): Promise<void> {
+  await callDated(() =>
+    appDb().rpc('set_item_conversion', {
+      p_request_id: timing.requestId,
+      p_item_id: itemId,
+      p_unit_code: unitCode,
+      p_factor: nullableNumeric(factor),
+      p_effective_from: nullableText(timing.effectiveFrom),
+      p_effective_to: nullableText(timing.effectiveTo),
+      p_expected_token: timing.token,
+      p_reason: nullableText(timing.reason),
+    }),
+  );
+}
+
+export async function addCustomUnit(
+  code: string,
+  labelAr: string,
+  requestId?: string,
+): Promise<string> {
+  const subject = unitSubject(code, labelAr);
+  const id = requestId ?? beginAction(subject, (next) => next);
+  try {
+    const { data, error } = await appDb().rpc('add_custom_unit', {
+      p_request_id: id,
+      p_code: code.trim(),
+      p_label_ar: labelAr.trim(),
+    });
+    throwIfError(error);
+    if (typeof data !== 'string' || data.length === 0) {
+      throw new Error(genericCatalogError);
+    }
+    if (!requestId) settleAction(subject);
+    return data;
+  } catch (error) {
+    if (!requestId) settleAction(subject, error);
+    throw error;
+  }
+}
+
+export async function setOpeningPrice(
+  itemId: string,
+  price: string,
+  reason: string | null,
+  expectedId: string | null,
+  requestId: string,
+  expectedIdentity: string,
+): Promise<void> {
+  const { error } = await appDb().rpc('set_item_opening_price', {
+    p_request_id: requestId,
+    p_item_id: itemId,
+    p_unit_cost: numericColumn(price),
+    p_zero_cost_reason: nullableText(reason),
+    p_expected_current_id: nullableText(expectedId),
+    p_expected_identity: expectedIdentity,
+  });
+  throwIfError(error);
 }
 
 export async function addConversion(
   itemId: string,
   unit: string,
   factorToBase: string,
-  expectedBaseUnit: BaseUnit,
+  _expectedBaseUnit: BaseUnit,
+  timing: DatedWrite,
 ): Promise<void> {
-  const { error } = await appDb().rpc('add_unit_conversion', {
-    p_item_id: itemId,
-    p_unit: unit.trim(),
-    p_factor: numericColumn(factorToBase),
-    p_expected_base_unit: expectedBaseUnit,
-  });
-  if (error && isStaleWrite(error)) throw new StaleWriteError();
-  throwIfError(error);
+  await setItemConversion(itemId, unit.trim(), factorToBase, timing);
 }
 
 export async function updateConversion(
   itemId: string,
   unit: string,
   factorToBase: string,
-  expectedFactor: string,
-  expectedBaseUnit: BaseUnit,
+  _expectedFactor: string,
+  _expectedBaseUnit: BaseUnit,
+  timing: DatedWrite,
 ): Promise<void> {
-  const { error } = await appDb().rpc('update_unit_conversion', {
-    p_item_id: itemId,
-    p_unit: unit,
-    p_expected_factor: numericColumn(expectedFactor),
-    p_factor: numericColumn(factorToBase),
-    p_expected_base_unit: expectedBaseUnit,
-  });
-  if (error && isStaleWrite(error)) throw new StaleWriteError();
-  throwIfError(error);
+  await setItemConversion(itemId, unit, factorToBase, timing);
 }
 
 export async function deleteConversion(
   itemId: string,
   unit: string,
-  expectedFactor: string,
-  expectedBaseUnit: BaseUnit,
+  _expectedFactor: string,
+  _expectedBaseUnit: BaseUnit,
+  timing: DatedWrite,
 ): Promise<void> {
-  const { error } = await appDb().rpc('delete_unit_conversion', {
-    p_item_id: itemId,
-    p_unit: unit,
-    p_expected_factor: numericColumn(expectedFactor),
-    p_expected_base_unit: expectedBaseUnit,
-  });
-  if (error && isStaleWrite(error)) throw new StaleWriteError();
-  throwIfError(error);
+  await setItemConversion(itemId, unit, null, timing);
 }
