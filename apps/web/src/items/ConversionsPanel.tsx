@@ -441,7 +441,7 @@ export function ConversionsPanel({
     item.id,
     shiftStart,
     addEntry?.versions ?? noVersions,
-    addEntry?.token ?? emptyScheduleToken,
+    addEntry?.token ?? schedule?.emptyToken ?? emptyScheduleToken,
     addDisabled,
   );
 
@@ -800,7 +800,7 @@ export function ConversionsPanel({
             disabled={controlsDisabled}
             shiftStart={shiftStart}
             versions={entry?.versions ?? noVersions}
-            token={entry?.token ?? emptyScheduleToken}
+            token={entry?.token ?? schedule?.emptyToken ?? emptyScheduleToken}
             onReplay={replay}
           />
         );

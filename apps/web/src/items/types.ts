@@ -87,6 +87,11 @@ export type CostingVersion = {
 
 export type CostingSchedule = {
   lossToken: string;
+  /**
+   * Token of an empty schedule for this item. It binds base unit, kind, and
+   * parent. Absent only in tests that never load a schedule response.
+   */
+  emptyToken?: string;
   lossVersions: CostingVersion[];
   conversions: {
     unitCode: string;

@@ -28,9 +28,11 @@ import {
   beginAction,
   createSubject,
   hasAction,
+  hasItemConfigurationAction,
   lossSubject,
   priceSubject,
   settleAction,
+  subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
@@ -144,11 +146,17 @@ export function ItemForm({
   const [submitNow, setSubmitNow] = useState<number | null>(null);
   const [refreshingSchedule, setRefreshingSchedule] = useState(false);
   const [actionEpoch, setActionEpoch] = useState(0);
+  const [heldEpoch, setHeldEpoch] = useState(0);
   const [submittedDraft, setSubmittedDraft] = useState<ItemDraft | null>(null);
   const nowMs = submitNow ?? mountNow;
   const title = editingId ? 'تعديل الصنف' : 'صنف جديد';
   const editing = items.find((item) => item.id === editingId);
   const identityLocked = editing?.identityLocked === true;
+  const identityTick = heldEpoch;
+  const identityPending =
+    editingId === undefined || identityTick < 0
+      ? false
+      : hasItemConfigurationAction(editingId);
   const initialLoss = initial?.lossPercent ?? '';
   const lossDirty =
     editingId !== undefined && values.lossPercent.trim() !== initialLoss.trim();
@@ -178,6 +186,11 @@ export function ItemForm({
     .filter((item) => item.kind === 'fish_mixed')
     .slice()
     .sort((a, b) => a.name.localeCompare(b.name, 'ar'));
+
+  useEffect(
+    () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
+    [],
+  );
 
   useEffect(() => {
     if (!editingId) return;
@@ -265,6 +278,7 @@ export function ItemForm({
   }
 
   function onKind(event: ChangeEvent<HTMLSelectElement>) {
+    if (identityLocked || identityPending) return;
     const kind = event.target.value;
     if (!isStockKind(kind)) return;
     const defaults = defaultsForKind(kind);
@@ -554,10 +568,11 @@ export function ItemForm({
             النوع
             <select
               className={fieldClass}
-              disabled={detailsDisabled || identityLocked}
+              disabled={detailsDisabled || identityLocked || identityPending}
               value={values.kind}
               onChange={(event) => {
-                if (detailsDisabled) return;
+                if (detailsDisabled || identityLocked || identityPending)
+                  return;
                 onKind(event);
               }}
             >
@@ -576,10 +591,12 @@ export function ItemForm({
               السمك المخلوط
               <select
                 className={fieldClass}
-                disabled={detailsDisabled || identityLocked}
+                disabled={detailsDisabled || identityLocked || identityPending}
                 value={values.parentItemId}
                 onChange={(event) => {
-                  if (detailsDisabled) return;
+                  if (detailsDisabled || identityLocked || identityPending) {
+                    return;
+                  }
                   change({ parentItemId: event.target.value });
                 }}
               >
@@ -602,10 +619,11 @@ export function ItemForm({
             الوحدة الأساسية
             <select
               className={fieldClass}
-              disabled={detailsDisabled || identityLocked}
+              disabled={detailsDisabled || identityLocked || identityPending}
               value={values.baseUnit}
               onChange={(event) => {
-                if (detailsDisabled) return;
+                if (detailsDisabled || identityLocked || identityPending)
+                  return;
                 const baseUnit = event.target.value;
                 if (!isBaseUnit(baseUnit)) return;
                 change({ baseUnit });
@@ -619,7 +637,11 @@ export function ItemForm({
             </select>
           </label>
           {errors.baseUnit ? <p role="alert">{errors.baseUnit}</p> : null}
-          {identityLocked ? (
+          {identityPending ? (
+            <p className="text-sm text-neutral-600">
+              في حفظ للتكلفة لسه معلّق، فالنوع والوحدة الأساسية والأب متقفلين
+            </p>
+          ) : identityLocked ? (
             <p className="text-sm text-neutral-600">
               الصنف ده اتحدد أو عليه حركات، فالنوع والوحدة الأساسية والأب
               متقفلين

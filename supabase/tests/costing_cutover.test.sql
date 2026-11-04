@@ -580,7 +580,7 @@ select
     12,
     '2020-01-01T00:00:00Z',
     null,
-    md5(''),
+    md5('kg|ingredient||'),
     'بداية التحويل'
   );
 
@@ -1003,7 +1003,7 @@ select
     0.002,
     null,
     null,
-    md5(''),
+    md5('kg|ingredient||'),
     null
   );
 
@@ -1371,7 +1371,7 @@ select
     0.05,
     null,
     null,
-    md5(''),
+    md5('kg|ingredient||'),
     null
   );
 
@@ -1439,7 +1439,7 @@ select
     0.92,
     null,
     null,
-    md5(''),
+    md5('kg|ingredient||'),
     null
   );
 
@@ -1594,7 +1594,7 @@ select
     0.10,
     '2000-01-01T00:00:00Z',
     '2000-06-01T00:00:00Z',
-    md5(''),
+    md5('kg|ingredient||'),
     'تأسيس'
   );
 
@@ -1788,7 +1788,7 @@ select
     0.10,
     pg_catalog.date_trunc ('minute', pg_catalog.now ()),
     pg_catalog.date_trunc ('minute', pg_catalog.now ()) + interval '30 seconds',
-    md5(''),
+    md5('kg|ingredient||'),
     'فجوة دقيقة'
   );
 
@@ -2057,6 +2057,138 @@ select
     ),
     '{"sentinel":"conversion-replay"}'::jsonb,
     'replay of a now-bounded conversion returns the stored result after effective_to has passed'
+  );
+
+-- A conversion approved against kg must not land after the base unit becomes liter.
+select
+  app.create_stock_item (
+    'd4000000-0000-4000-8000-000000000210',
+    'صنف هوية',
+    'ingredient',
+    'kg',
+    'weekly',
+    null,
+    null,
+    true
+  );
+
+select
+  is (
+    app.item_costing_schedule (
+      (
+        select
+          id
+        from
+          app.stock_items
+        where
+          name = 'صنف هوية'
+      )
+    ) ->> 'empty_token',
+    md5('kg|ingredient||'),
+    'an empty schedule token is bound to base unit, kind, and parent'
+  );
+
+select
+  is (
+    app.item_costing_schedule (
+      (
+        select
+          id
+        from
+          app.stock_items
+        where
+          name = 'صنف هوية'
+      )
+    ) -> 'loss' ->> 'token',
+    md5('kg|ingredient||'),
+    'an empty loss token matches the identity-bound empty token'
+  );
+
+select
+  lives_ok (
+    $$update app.stock_items
+      set base_unit = 'liter'
+      where name = 'صنف هوية'$$,
+    'base unit can change while the item has no loss, conversion, or movement'
+  );
+
+select
+  is (
+    app.item_costing_schedule (
+      (
+        select
+          id
+        from
+          app.stock_items
+        where
+          name = 'صنف هوية'
+      )
+    ) -> 'loss' ->> 'token',
+    md5('liter|ingredient||'),
+    'the empty loss token follows the new base unit'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_conversion(
+      'd4000000-0000-4000-8000-000000000211',
+      (select id from app.stock_items where name = 'صنف هوية'),
+      'piece',
+      4,
+      null,
+      null,
+      md5('kg|ingredient||'),
+      null
+    )$$,
+    '40001'::char(5),
+    'configuration changed',
+    'retrying a conversion after the base unit changed is a conflict'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.item_conversion_versions v
+        join app.stock_items si on si.id = v.item_id
+      where
+        si.name = 'صنف هوية'
+    ),
+    0::bigint,
+    'a conflicting conversion retry inserts no conversion'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_loss(
+      'd4000000-0000-4000-8000-000000000212',
+      (select id from app.stock_items where name = 'صنف هوية'),
+      0.10,
+      null,
+      null,
+      md5('kg|ingredient||'),
+      null
+    )$$,
+    '40001'::char(5),
+    'configuration changed',
+    'retrying a loss after the base unit changed is a conflict'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.item_loss_versions v
+        join app.stock_items si on si.id = v.item_id
+      where
+        si.name = 'صنف هوية'
+    ),
+    0::bigint,
+    'a conflicting loss retry inserts no loss'
   );
 
 reset role;

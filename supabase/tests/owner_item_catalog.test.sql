@@ -1393,7 +1393,7 @@ select
       1,
       null,
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       null
     )$$,
     '22023'::char(5),
@@ -1411,7 +1411,7 @@ select
       1,
       null,
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       null
     )$$,
     '22023'::char(5),
@@ -1443,7 +1443,7 @@ select
           2,
           null,
           null,
-          md5(''),
+          md5('kg|ingredient||'),
           null
         );
         update app.stock_items
@@ -1488,7 +1488,7 @@ select
           25,
           null,
           null,
-          md5(''),
+          md5('kg|ingredient||'),
           null
         );
       end

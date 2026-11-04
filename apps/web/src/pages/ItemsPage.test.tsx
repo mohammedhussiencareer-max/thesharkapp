@@ -1571,6 +1571,124 @@ describe('ItemsPage', () => {
     );
   });
 
+  const identityHoldHint =
+    'في حفظ للتكلفة لسه معلّق، فالنوع والوحدة الأساسية والأب متقفلين';
+
+  async function editSize() {
+    fireEvent.click(
+      within(screen.getByRole('article', { name: 'بوري كبير' })).getByRole(
+        'button',
+        { name: 'تعديل' },
+      ),
+    );
+    await waitFor(() => {
+      expect(listCostingSchedule).toHaveBeenCalled();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+
+  it('locks identity fields while a loss save for the item is unresolved', async () => {
+    vi.mocked(setItemLoss)
+      .mockRejectedValueOnce(new Error('تعذر الاتصال'))
+      .mockRejectedValueOnce(new CostingChangedError());
+    await renderCatalog();
+    await editSize();
+
+    expect(screen.getByLabelText('النوع')).toBeEnabled();
+    expect(screen.getByLabelText('الوحدة الأساسية')).toBeEnabled();
+    expect(screen.getByLabelText('السمك المخلوط')).toBeEnabled();
+    expect(screen.queryByText(identityHoldHint)).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('نسبة الفاقد'), {
+      target: { value: '10' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('النوع')).toBeDisabled();
+    });
+    expect(screen.getByLabelText('الوحدة الأساسية')).toBeDisabled();
+    expect(screen.getByLabelText('السمك المخلوط')).toBeDisabled();
+    expect(screen.getByText(identityHoldHint)).toBeInTheDocument();
+    expect(screen.getByLabelText('الاسم')).toBeEnabled();
+    expect(screen.getByLabelText('الجرد')).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText('النوع'), {
+      target: { value: 'ingredient' },
+    });
+    fireEvent.change(screen.getByLabelText('الوحدة الأساسية'), {
+      target: { value: 'liter' },
+    });
+    fireEvent.change(screen.getByLabelText('السمك المخلوط'), {
+      target: { value: '' },
+    });
+    expect(screen.getByLabelText('النوع')).toHaveValue('fish_size');
+    expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('kg');
+    expect(screen.getByLabelText('السمك المخلوط')).toHaveValue('mixed');
+
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'البيانات اتغيرت — حدّث الصفحة وجرّب تاني',
+    );
+    await waitFor(() => {
+      expect(screen.getByLabelText('النوع')).toBeEnabled();
+    });
+    expect(screen.getByLabelText('الوحدة الأساسية')).toBeEnabled();
+    expect(screen.getByLabelText('السمك المخلوط')).toBeEnabled();
+    expect(screen.queryByText(identityHoldHint)).not.toBeInTheDocument();
+  });
+
+  it('locks identity fields while a conversion save for the item is unresolved', async () => {
+    vi.mocked(addConversion).mockRejectedValueOnce(new Error('تعذر الاتصال'));
+    await renderCatalog();
+    await editSize();
+
+    const size = screen.getByRole('article', { name: 'بوري كبير' });
+    fireEvent.click(within(size).getByRole('button', { name: 'التحويلات' }));
+    expect(
+      await within(size).findByRole('option', { name: 'قطعة' }),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        within(size).getByRole('button', { name: 'ضيف التحويل' }),
+      ).toBeEnabled();
+    });
+    fireEvent.change(within(size).getByLabelText('الوحدة'), {
+      target: { value: 'piece' },
+    });
+    fireEvent.change(within(size).getByLabelText('المعامل'), {
+      target: { value: '4' },
+    });
+    fireEvent.click(within(size).getByRole('button', { name: 'ضيف التحويل' }));
+
+    expect(
+      await within(size).findByText(unknownSaveMessage),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByLabelText('النوع')).toBeDisabled();
+    });
+    expect(screen.getByLabelText('الوحدة الأساسية')).toBeDisabled();
+    expect(screen.getByLabelText('السمك المخلوط')).toBeDisabled();
+    expect(screen.getByText(identityHoldHint)).toBeInTheDocument();
+    expect(screen.getByLabelText('الاسم')).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText('النوع'), {
+      target: { value: 'seafood' },
+    });
+    fireEvent.change(screen.getByLabelText('الوحدة الأساسية'), {
+      target: { value: 'piece' },
+    });
+    fireEvent.change(screen.getByLabelText('السمك المخلوط'), {
+      target: { value: 'mixed-off' },
+    });
+    expect(screen.getByLabelText('النوع')).toHaveValue('fish_size');
+    expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('kg');
+    expect(screen.getByLabelText('السمك المخلوط')).toHaveValue('mixed');
+  });
+
   it('applies a later return to an earlier loss with a fresh request id', async () => {
     await renderCatalog();
     fireEvent.click(

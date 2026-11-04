@@ -260,6 +260,7 @@ declare
   v_replay jsonb;
   v_token text;
   v_new_token text;
+  v_identity text;
   v_canonical_to timestamptz;
   v_result jsonb;
   v_change_id bigint;
@@ -372,7 +373,9 @@ begin
       using errcode = '22023';
   end if;
 
-  perform 1
+  select
+    si.base_unit || '|' || si.kind || '|' || coalesce(si.parent_item_id::text, '') || '|'
+  into v_identity
   from
     app.stock_items si
   where
@@ -511,7 +514,7 @@ begin
 
   select
     pg_catalog.md5(
-      coalesce(
+      v_identity || coalesce(
         string_agg(
           app.costing_schedule_line (s.id, s.effective_from, s.effective_to, s.payload),
           ','
@@ -624,6 +627,7 @@ declare
   v_factor numeric(18, 9);
   v_base_unit text;
   v_name text;
+  v_identity text;
   v_payload jsonb;
   v_replay jsonb;
   v_token text;
@@ -753,9 +757,11 @@ begin
 
   select
     si.base_unit,
-    si.name
+    si.name,
+    si.base_unit || '|' || si.kind || '|' || coalesce(si.parent_item_id::text, '') || '|'
   into v_base_unit,
-    v_name
+    v_name,
+    v_identity
   from
     app.stock_items si
   where
@@ -918,7 +924,7 @@ begin
 
   select
     pg_catalog.md5(
-      coalesce(
+      v_identity || coalesce(
         string_agg(
           app.costing_schedule_line (s.id, s.effective_from, s.effective_to, s.payload),
           ','
@@ -3513,3 +3519,246 @@ select
 -- One cutover instant. A later call returns this row and writes nothing.
 select
   app.backfill_legacy_costing (pg_catalog.now ());
+
+-- ============================================================================
+-- Schedule tokens bind the item identity. The hashed text is
+-- base_unit|kind|parent_item_id| followed by the ordered schedule lines.
+-- An empty schedule still hashes that prefix, so a retry approved against
+-- one base unit, kind, or parent cannot land on another. Signatures stay
+-- the same. item_costing_schedule inlines the line because it is security
+-- invoker and cannot call the helper.
+-- ============================================================================
+create or replace function app.schedule_token (p_family text, p_item_id uuid, p_unit_code text) returns text language plpgsql stable security definer
+set
+  search_path = '' as $$
+declare
+  v_identity text;
+  v_token text;
+begin
+  if p_family not in ('loss', 'conversion') then
+    raise exception 'unknown costing family %', p_family
+      using errcode = '22023';
+  end if;
+
+  if p_family = 'conversion'
+  and p_unit_code is null then
+    raise exception 'conversion schedule requires a unit'
+      using errcode = '22023';
+  end if;
+
+  select
+    si.base_unit || '|' || si.kind || '|' || coalesce(si.parent_item_id::text, '') || '|'
+  into v_identity
+  from
+    app.stock_items si
+  where
+    si.id = p_item_id;
+
+  if not found then
+    raise exception 'unknown stock_item id: %', p_item_id
+      using errcode = '22023';
+  end if;
+
+  select
+    pg_catalog.md5(
+      v_identity || coalesce(
+        string_agg(
+          app.costing_schedule_line (s.id, s.effective_from, s.effective_to, s.payload),
+          ','
+          order by
+            s.effective_from,
+            s.id
+        ),
+        ''
+      )
+    )
+  into v_token
+  from
+    (
+      select
+        v.id,
+        v.effective_from,
+        v.effective_to,
+        v.loss_pct::numeric as payload
+      from
+        app.item_loss_versions v
+      where
+        p_family = 'loss'
+        and v.item_id = p_item_id
+        and v.superseded_change_id is null
+      union all
+      select
+        v.id,
+        v.effective_from,
+        v.effective_to,
+        v.factor_to_base::numeric as payload
+      from
+        app.item_conversion_versions v
+      where
+        p_family = 'conversion'
+        and v.item_id = p_item_id
+        and v.unit_code = p_unit_code
+        and v.superseded_change_id is null
+    ) s;
+
+  return v_token;
+end;
+$$;
+
+comment on function app.schedule_token (text, uuid, text) is 'md5 of base_unit|kind|parent_item_id| plus the ordered schedule lines. An empty schedule still hashes that identity prefix. A missing item raises 22023.';
+
+create or replace function app.item_costing_schedule (p_item_id uuid) returns jsonb language plpgsql stable security invoker
+set
+  search_path = '' as $$
+declare
+  v_identity text;
+  v_empty_token text;
+  v_loss_token text;
+  v_loss_versions jsonb;
+  v_conversions jsonb;
+begin
+  if coalesce(app.is_owner(), false) is not true then
+    raise exception 'insufficient_privilege'
+      using errcode = '42501';
+  end if;
+
+  if p_item_id is null then
+    raise exception 'item_id is required'
+      using errcode = '22023';
+  end if;
+
+  select
+    si.base_unit || '|' || si.kind || '|' || coalesce(si.parent_item_id::text, '') || '|'
+  into v_identity
+  from
+    app.stock_items si
+  where
+    si.id = p_item_id;
+
+  if not found then
+    raise exception 'unknown stock_item id: %', p_item_id
+      using errcode = '22023';
+  end if;
+
+  v_empty_token := pg_catalog.md5(v_identity);
+
+  select
+    pg_catalog.md5(
+      v_identity || coalesce(
+        string_agg(
+          v.id::text || '|' || pg_catalog.to_char(v.effective_from at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '|' || coalesce(
+            pg_catalog.to_char(v.effective_to at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US'),
+            ''
+          ) || '|' || pg_catalog.trim_scale(v.loss_pct)::text,
+          ','
+          order by
+            v.effective_from,
+            v.id
+        ),
+        ''
+      )
+    )
+  into v_loss_token
+  from
+    app.item_loss_versions v
+  where
+    v.item_id = p_item_id
+    and v.superseded_change_id is null;
+
+  select
+    coalesce(
+      jsonb_agg(
+        jsonb_build_object(
+          'id',
+          v.id,
+          'effective_from',
+          v.effective_from,
+          'effective_to',
+          v.effective_to,
+          'loss_pct',
+          v.loss_pct
+        )
+        order by
+          v.effective_from,
+          v.id
+      ),
+      '[]'::jsonb
+    )
+  into v_loss_versions
+  from
+    app.item_loss_versions v
+  where
+    v.item_id = p_item_id
+    and v.superseded_change_id is null;
+
+  select
+    coalesce(
+      jsonb_agg(
+        s.entry
+        order by
+          s.unit_code
+      ),
+      '[]'::jsonb
+    )
+  into v_conversions
+  from
+    (
+      select
+        v.unit_code,
+        jsonb_build_object(
+          'unit_code',
+          v.unit_code,
+          'token',
+          pg_catalog.md5(
+            v_identity || coalesce(
+              string_agg(
+                v.id::text || '|' || pg_catalog.to_char(v.effective_from at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '|' || coalesce(
+                  pg_catalog.to_char(v.effective_to at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US'),
+                  ''
+                ) || '|' || pg_catalog.trim_scale(v.factor_to_base)::text,
+                ','
+                order by
+                  v.effective_from,
+                  v.id
+              ),
+              ''
+            )
+          ),
+          'versions',
+          jsonb_agg(
+            jsonb_build_object(
+              'id',
+              v.id,
+              'effective_from',
+              v.effective_from,
+              'effective_to',
+              v.effective_to,
+              'factor_to_base',
+              v.factor_to_base
+            )
+            order by
+              v.effective_from,
+              v.id
+          )
+        ) as entry
+      from
+        app.item_conversion_versions v
+      where
+        v.item_id = p_item_id
+        and v.superseded_change_id is null
+      group by
+        v.unit_code
+    ) s;
+
+  return jsonb_build_object(
+    'loss',
+    jsonb_build_object('token', v_loss_token, 'versions', v_loss_versions),
+    'conversions',
+    v_conversions,
+    'empty_token',
+    v_empty_token
+  );
+end;
+$$;
+
+comment on function app.item_costing_schedule (uuid) is 'Owner read of the current loss and conversion schedules for one item. Each token and empty_token is md5 of base_unit|kind|parent_item_id| plus that schedule. An empty schedule hashes the identity prefix alone.';

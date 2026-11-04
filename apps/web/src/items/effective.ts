@@ -1,6 +1,6 @@
 import type { DatedWrite } from '@/items/types';
 
-/** md5('') — the token of an empty loss or conversion schedule. */
+/** md5(''). Fallback when the schedule has not reported empty_token. */
 export const emptyScheduleToken = 'd41d8cd98f00b204e9800998ecf8427e';
 
 export type EffectiveMode = 'now' | 'shift' | 'custom';

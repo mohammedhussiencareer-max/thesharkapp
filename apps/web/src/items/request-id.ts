@@ -20,9 +20,25 @@ type Held = {
 
 const held = new Map<string, Held>();
 
+const heldListeners = new Set<() => void>();
+
+function emitHeldWrites(): void {
+  for (const listener of heldListeners) listener();
+}
+
+/** Re-render when a sibling section starts or settles a held action. */
+export function subscribeHeldWrites(listener: () => void): () => void {
+  heldListeners.add(listener);
+  return () => {
+    heldListeners.delete(listener);
+  };
+}
+
 /** Test isolation. Production callers never clear another subject's action. */
 export function resetHeldWrites(): void {
+  if (held.size === 0) return;
   held.clear();
+  emitHeldWrites();
 }
 
 export function lossSubject(itemId: string): string {
@@ -62,6 +78,28 @@ export function hasAction(subject: string): boolean {
   return held.has(subject);
 }
 
+const conversionPrefix = 'conversion:';
+
+/**
+ * True while a loss save or any conversion save for this item is in flight
+ * or still has an unknown outcome. Opening price and item creation do not
+ * count: they are not part of the schedule token.
+ */
+export function hasItemConfigurationAction(itemId: string): boolean {
+  if (held.has(lossSubject(itemId))) return true;
+  for (const key of held.keys()) {
+    if (!key.startsWith(conversionPrefix)) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(key.slice(conversionPrefix.length));
+    } catch {
+      continue;
+    }
+    if (Array.isArray(parsed) && parsed[0] === itemId) return true;
+  }
+  return false;
+}
+
 /** The payload whose outcome is still unknown. Null while a send is in flight. */
 export function unknownAction<T>(subject: string): T | null {
   const current = held.get(subject);
@@ -82,6 +120,7 @@ export function beginAction<T>(
   const requestId = crypto.randomUUID();
   const payload = create(requestId);
   held.set(subject, { requestId, payload, unknown: false });
+  emitHeldWrites();
   return payload;
 }
 
@@ -92,7 +131,7 @@ export function beginAction<T>(
  */
 export function settleAction(subject: string, error?: unknown): void {
   if (error === undefined) {
-    held.delete(subject);
+    if (held.delete(subject)) emitHeldWrites();
     return;
   }
   const current = held.get(subject);
@@ -103,7 +142,11 @@ export function settleAction(subject: string, error?: unknown): void {
     error instanceof StaleWriteError
   ) {
     held.delete(subject);
+    emitHeldWrites();
     return;
   }
-  current.unknown = true;
+  if (!current.unknown) {
+    current.unknown = true;
+    emitHeldWrites();
+  }
 }

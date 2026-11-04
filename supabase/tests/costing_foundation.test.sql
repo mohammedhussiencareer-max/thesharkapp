@@ -311,8 +311,8 @@ set
 select
   is (
     app.item_costing_schedule ('e4010000-0000-4000-8000-000000000001') -> 'loss' ->> 'token',
-    md5(''),
-    'empty loss schedule token is md5 of the empty string'
+    md5('kg|ingredient||'),
+    'empty loss schedule token includes the item identity'
   );
 
 select
@@ -323,7 +323,7 @@ select
       0.10,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'تأسيس فاقد'
     )$$,
     'publish loss 0.10 from 2026-01-01'
@@ -357,7 +357,7 @@ select
       0.10,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'تأسيس فاقد'
     ),
     (
@@ -423,7 +423,7 @@ select
       0.30,
       '2026-07-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'سبب'
     )$$,
     '40001',
@@ -713,7 +713,7 @@ select
       12,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'كرتونة'
     )$$,
     'publish carton factor 12 from 2026-01-01'
@@ -738,7 +738,7 @@ select
       12,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'كرتونة'
     ),
     (
@@ -806,7 +806,7 @@ select
       13,
       '2026-07-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'سبب'
     )$$,
     '40001',
@@ -823,7 +823,7 @@ select
       0.002,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'جرام صريح'
     )$$,
     'publish an explicit g factor'
@@ -1020,7 +1020,7 @@ select
       0.05,
       '2000-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       null
     )$$,
     '22023',
@@ -1036,7 +1036,7 @@ select
       0.05,
       '2000-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       '   '
     )$$,
     '22023',
@@ -1052,7 +1052,7 @@ select
       0.05,
       '2000-01-01 00:00:00+00',
       '2000-02-01 00:00:00+00',
-      md5(''),
+      md5('kg|ingredient||'),
       '  سبب قديم  '
     )$$,
     'a far-past loss with a reason is stored'
@@ -1114,7 +1114,7 @@ select
       0.15,
       '2026-08-01 12:30:00+00',
       '2026-09-01 18:45:00.5+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'توقيت فاقد'
     )$$,
     'publish loss under UTC'
@@ -1129,7 +1129,7 @@ select
       6,
       '2026-08-01 12:30:00+00',
       '2026-09-01 18:45:00.5+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'توقيت تحويل'
     )$$,
     'publish conversion under UTC'
@@ -1174,7 +1174,7 @@ select
       0.15,
       '2026-08-01 12:30:00+00',
       '2026-09-01 18:45:00.5+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'توقيت فاقد'
     ),
     (
@@ -1211,7 +1211,7 @@ select
       6,
       '2026-08-01 12:30:00+00',
       '2026-09-01 18:45:00.5+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'توقيت تحويل'
     ),
     (
@@ -1251,7 +1251,7 @@ select
       0.11,
       '2026-01-01 00:00:00+00',
       '2026-02-01 00:00:00+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'مدى أول'
     )$$,
     'publish the first of three consecutive loss versions'
@@ -1670,7 +1670,7 @@ select
       12,
       '2026-01-01 00:00:00+00',
       '2026-03-01 00:00:00+00',
-      md5(''),
+      md5('kg|ingredient||'),
       'قبل الفجوة'
     )$$,
     'publish the first carton version around a later gap'
@@ -2033,7 +2033,7 @@ select
       4,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'تغطية'
     )$$,
     'publish a conversion that will be removed entirely'
@@ -2074,7 +2074,7 @@ select
       0.10,
       '2026-01-01 00:00:00+00',
       null,
-      md5(''),
+      md5('kg|ingredient||'),
       'تجميد'
     )$$,
     'configure the freeze item with a loss version'
@@ -2626,7 +2626,7 @@ select
     $$select app.set_item_loss(
       'e4010000-0000-4000-8000-000000000191',
       'e4010000-0000-4000-8000-000000000001',
-      0.10, '2090-01-01 00:00:00+00', null, md5(''), null
+      0.10, '2090-01-01 00:00:00+00', null, md5('kg|ingredient||'), null
     )$$,
     '42501',
     'insufficient_privilege',
@@ -2638,7 +2638,7 @@ select
     $$select app.set_item_conversion(
       'e4010000-0000-4000-8000-000000000192',
       'e4010000-0000-4000-8000-000000000002',
-      'carton', 2, '2090-01-01 00:00:00+00', null, md5(''), null
+      'carton', 2, '2090-01-01 00:00:00+00', null, md5('kg|ingredient||'), null
     )$$,
     '42501',
     'insufficient_privilege',
@@ -2727,7 +2727,7 @@ select
     $$select app.set_item_loss(
       'e4010000-0000-4000-8000-000000000194',
       'e4010000-0000-4000-8000-000000000001',
-      0.10, '2090-01-01 00:00:00+00', null, md5(''), null
+      0.10, '2090-01-01 00:00:00+00', null, md5('kg|ingredient||'), null
     )$$,
     '42501',
     null::text,

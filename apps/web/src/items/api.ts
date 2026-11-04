@@ -357,8 +357,12 @@ export async function listCostingSchedule(
     throw new Error(genericCatalogError);
   }
   if (!Array.isArray(record.conversions)) throw new Error(genericCatalogError);
+  if (typeof record.empty_token !== 'string') {
+    throw new Error(genericCatalogError);
+  }
   return {
     lossToken: lossRow.token,
+    emptyToken: record.empty_token,
     lossVersions: lossRow.versions.map((version) =>
       versionOf(version, 'loss_pct'),
     ),
