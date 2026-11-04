@@ -11,7 +11,9 @@ begin
 end
 $$;
 
-alter role backup_reader login bypassrls nosuperuser nocreatedb nocreaterole noreplication noinherit;
+-- SUPERUSER and REPLICATION are left out: only a superuser may name them in
+-- ALTER ROLE, and the role is created without them. The dump checks both.
+alter role backup_reader login bypassrls nocreatedb nocreaterole noinherit;
 
 alter role backup_reader
 set
