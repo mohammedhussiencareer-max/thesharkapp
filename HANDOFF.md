@@ -37,7 +37,8 @@ Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner it
 
 ## Next
 
-- Hosted migration `costing_foundation` is applied (2026-11-03, fingerprints match). Pending hosted apply, after their PRs merge: `costing_cutover` (phase 4 PR 2) and `recipe_model` (phase 4 PR 3: recipes, dated recipe versions, immutable lines, `app.expand_recipe`, and the stock item identity freeze extended to items on current recipe lines; backend only, no screen yet).- Recipes (import + add/edit screen) and POS→recipe mapping; deduction engine (cancel/refund cost decisions, waste); daily profit report; weekly count; server-side sync (Edge Function); PWA; daily backup with a restore test.
+- Hosted migration `costing_foundation` is applied (2026-11-03, fingerprints match). Pending hosted apply, after their PRs merge: `costing_cutover` (phase 4 PR 2) and `recipe_model` (phase 4 PR 3: recipes, dated recipe versions, immutable lines, `app.expand_recipe`, and the stock item identity freeze extended to items on current recipe lines; backend only, no screen yet).
+- Recipes (import + add/edit screen) and POS→recipe mapping; deduction engine (cancel/refund cost decisions, waste); daily profit report; weekly count; server-side sync (Edge Function); PWA; daily backup with a restore test.
 
 ## Needs the owner
 

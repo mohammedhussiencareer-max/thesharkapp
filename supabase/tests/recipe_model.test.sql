@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (169);
+  plan (183);
 
 insert into
   auth.users (
@@ -73,6 +73,48 @@ values
     null,
     '{"fn":"test_fixture"}'::jsonb,
     '{"ok":true}'::jsonb
+  );
+
+-- An older "now" change whose end has since passed. The transaction clock
+-- cannot move, so the stored change is seeded with the payload the writer builds.
+insert into
+  app.costing_changes (
+    request_id,
+    kind,
+    actor_id,
+    reason,
+    payload,
+    result
+  )
+values
+  (
+    'f5000000-0000-4000-8000-0000000001f2',
+    'owner',
+    null,
+    null,
+    jsonb_build_object(
+      'fn',
+      'set_recipe_version',
+      'recipe_id',
+      'f5000000-0000-4000-8000-000000000047'::uuid,
+      'effective_from',
+      'now',
+      'effective_to',
+      app.costing_timestamptz_text ('2020-06-01 00:00:00+00'::timestamptz),
+      'batch_qty',
+      null::numeric,
+      'batch_unit',
+      null::text,
+      'lines',
+      app.recipe_lines_normalize (
+        '[{"stock_item_id":"f5000000-0000-4000-8000-000000000012","quantity":1,"unit":"kg"}]'::jsonb
+      ),
+      'expected_token',
+      md5('dish|'),
+      'reason',
+      null::text
+    ),
+    '{"seeded":"older now replay"}'::jsonb
   );
 
 insert into
@@ -480,6 +522,31 @@ from
         'f5000000-0000-4000-8000-000000000046',
         'طبق وحدة',
         'dish'
+      ),
+      (
+        'f5000000-0000-4000-8000-000000000047',
+        'طبق إعادة',
+        'dish'
+      ),
+      (
+        'f5000000-0000-4000-8000-000000000048',
+        'طبق لاحق',
+        'dish'
+      ),
+      (
+        'f5000000-0000-4000-8000-000000000049',
+        'ابن لاحق',
+        'batch'
+      ),
+      (
+        'f5000000-0000-4000-8000-00000000004a',
+        'طبق فجوة متداخلة',
+        'dish'
+      ),
+      (
+        'f5000000-0000-4000-8000-00000000004b',
+        'ابن فجوة متداخلة',
+        'batch'
       )
   ) as v (id, name, kind)
   cross join (
@@ -834,6 +901,51 @@ select
   );
 
 select
+  is (
+    app.set_recipe_version (
+      'f5000000-0000-4000-8000-0000000001f2',
+      'f5000000-0000-4000-8000-000000000047',
+      null,
+      '2020-06-01 00:00:00+00',
+      null,
+      null,
+      '[{"stock_item_id":"f5000000-0000-4000-8000-000000000012","quantity":1,"unit":"kg"}]'::jsonb,
+      null,
+      md5('dish|')
+    ),
+    '{"seeded":"older now replay"}'::jsonb,
+    'an older now change replays after its end has passed, before any now-dependent check'
+  );
+
+select
+  throws_ok (
+    $$select app.set_recipe_version(
+      'f5000000-0000-4000-8000-000000000114',
+      'f5000000-0000-4000-8000-000000000047',
+      null, '2020-06-01 00:00:00+00', null, null,
+      '[{"stock_item_id":"f5000000-0000-4000-8000-000000000012","quantity":1,"unit":"kg"}]'::jsonb,
+      null, md5('dish|')
+    )$$,
+    '22023',
+    'effective_to must be a finite timestamp after effective_from',
+    'the same arguments under a new request id fail the now-dependent end check'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.recipe_versions
+      where
+        recipe_id = 'f5000000-0000-4000-8000-000000000047'
+    ),
+    0::bigint,
+    'neither the replay nor the rejected request wrote a version'
+  );
+
+select
   throws_ok (
     $$select app.set_recipe_version(
       'f5000000-0000-4000-8000-00000000010b',
@@ -878,10 +990,43 @@ select
   );
 
 select
+  is (
+    app.recipe_schedule ('f5000000-0000-4000-8000-00000000003f') ->> 'token',
+    (
+      select
+        md5(
+          'dish|' || v.id::text || '|' || to_char(
+            v.effective_from at time zone 'UTC',
+            'YYYY-MM-DD HH24:MI:SS.US'
+          ) || '|||'
+        )
+      from
+        app.recipe_versions v
+      where
+        v.recipe_id = 'f5000000-0000-4000-8000-00000000003f'
+        and v.superseded_change_id is null
+    ),
+    'the token is the md5 of the kind prefix dish| and the version line'
+  );
+
+select
   isnt (
     app.recipe_schedule ('f5000000-0000-4000-8000-00000000003f') ->> 'token',
-    md5('dish|'),
-    'the token changes once a version exists'
+    (
+      select
+        md5(
+          v.id::text || '|' || to_char(
+            v.effective_from at time zone 'UTC',
+            'YYYY-MM-DD HH24:MI:SS.US'
+          ) || '|||'
+        )
+      from
+        app.recipe_versions v
+      where
+        v.recipe_id = 'f5000000-0000-4000-8000-00000000003f'
+        and v.superseded_change_id is null
+    ),
+    'the kind prefix is part of the populated token'
   );
 
 select
@@ -1581,6 +1726,80 @@ select
       null, md5('dish|')
     )$$,
     'a parent interval inside the child coverage is accepted'
+  );
+
+select
+  lives_ok (
+    $$select app.set_recipe_version(
+      'f5000000-0000-4000-8000-000000000153',
+      'f5000000-0000-4000-8000-000000000049',
+      '2030-01-01 00:00:00+00', null, 1, 'kg',
+      '[{"stock_item_id":"f5000000-0000-4000-8000-000000000012","quantity":1,"unit":"kg"}]'::jsonb,
+      null, md5('batch|')
+    )$$,
+    'the child of a late ancestor is published from 2030-01-01'
+  );
+
+select
+  lives_ok (
+    $$select app.set_recipe_version(
+      'f5000000-0000-4000-8000-000000000154',
+      'f5000000-0000-4000-8000-000000000048',
+      '2030-06-01 00:00:00+00', null, null, null,
+      '[{"child_recipe_id":"f5000000-0000-4000-8000-000000000049","quantity":1,"unit":"kg"}]'::jsonb,
+      null, md5('dish|')
+    )$$,
+    'the ancestor starts later, on 2030-06-01'
+  );
+
+select
+  throws_like (
+    $$select app.set_recipe_version(
+      'f5000000-0000-4000-8000-000000000155',
+      'f5000000-0000-4000-8000-000000000049',
+      '2030-05-01 00:00:00+00', '2030-09-01 00:00:00+00', null, null, null,
+      null,
+      (select app.recipe_schedule('f5000000-0000-4000-8000-000000000049') ->> 'token')
+    )$$,
+    '%recipe "طبق لاحق" would be invalid at 2030-06-01T00:00:00.000000Z: no_version_in_force in recipe "ابن لاحق"%',
+    'a gap that reaches an ancestor starting after the change start is rejected at that start'
+  );
+
+select
+  results_eq (
+    $$select effective_from, effective_to
+      from app.recipe_versions
+      where recipe_id = 'f5000000-0000-4000-8000-000000000049'
+        and superseded_change_id is null$$,
+    $$values ('2030-01-01 00:00:00+00'::timestamptz, null::timestamptz)$$,
+    'the rejected gap left the child schedule unchanged'
+  );
+
+select
+  lives_ok (
+    $$select app.set_recipe_version(
+      'f5000000-0000-4000-8000-000000000156',
+      'f5000000-0000-4000-8000-000000000049',
+      '2030-05-01 00:00:00+00', '2030-06-01 00:00:00+00', null, null, null,
+      null,
+      (select app.recipe_schedule('f5000000-0000-4000-8000-000000000049') ->> 'token')
+    )$$,
+    'a gap that ends exactly when the ancestor starts is accepted'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.recipe_versions
+      where
+        recipe_id = 'f5000000-0000-4000-8000-000000000049'
+        and superseded_change_id is null
+    ),
+    2::bigint,
+    'the accepted gap split the child into two current versions'
   );
 
 -- ============================================================================
@@ -2448,6 +2667,21 @@ select
   );
 
 select
+  is_empty (
+    $$select p.proname
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'app'
+        and (
+          p.proname like 'recipe\_%'
+          or p.proname like 'trg\_recipe%'
+          or p.proname in ('create_recipe', 'update_recipe', 'set_recipe_version', 'expand_recipe')
+        )
+        and coalesce(obj_description(p.oid, 'pg_proc'), '') = ''$$,
+    'every recipe function and trigger function carries a comment'
+  );
+
+select
   results_eq (
     $$select p.proname::text collate "default", p.prosecdef
       from pg_proc p
@@ -2822,6 +3056,121 @@ select
       ) x$$,
     $$values ('blocked'::text, 'depth_exceeded'::text, 'null'::jsonb)$$,
     'a ninth level found at run time blocks the expansion instead of truncating'
+  );
+
+insert into
+  app.recipe_versions (
+    id,
+    effective_from,
+    effective_to,
+    created_change_id,
+    recipe_id,
+    batch_qty,
+    batch_unit
+  )
+select
+  'f5000000-0000-4000-8000-000000000c03',
+  '2030-01-01 00:00:00+00',
+  '2030-03-01 00:00:00+00',
+  c.id,
+  'f5000000-0000-4000-8000-00000000004b',
+  1,
+  'kg'
+from
+  app.costing_changes c
+where
+  c.request_id = 'f5000000-0000-4000-8000-0000000001f1';
+
+insert into
+  app.recipe_lines (
+    version_id,
+    line_no,
+    stock_item_id,
+    quantity,
+    unit
+  )
+values
+  (
+    'f5000000-0000-4000-8000-000000000c03',
+    1,
+    'f5000000-0000-4000-8000-000000000012',
+    1,
+    'kg'
+  );
+
+insert into
+  app.recipe_versions (id, effective_from, created_change_id, recipe_id)
+select
+  'f5000000-0000-4000-8000-000000000c04',
+  '2030-01-01 00:00:00+00',
+  c.id,
+  'f5000000-0000-4000-8000-00000000004a'
+from
+  app.costing_changes c
+where
+  c.request_id = 'f5000000-0000-4000-8000-0000000001f1';
+
+insert into
+  app.recipe_lines (
+    version_id,
+    line_no,
+    child_recipe_id,
+    quantity,
+    unit
+  )
+values
+  (
+    'f5000000-0000-4000-8000-000000000c04',
+    1,
+    'f5000000-0000-4000-8000-00000000004b',
+    1,
+    'kg'
+  );
+
+select
+  is (
+    app.expand_recipe (
+      'f5000000-0000-4000-8000-00000000004a',
+      1,
+      'portion',
+      '2030-02-01 00:00:00+00'
+    ) ->> 'status',
+    'ready',
+    'the injected parent expands while its child has a version in force'
+  );
+
+select
+  results_eq (
+    $$select
+        r ->> 'status',
+        r -> 'issues' -> 0 ->> 'code',
+        r -> 'issues' -> 0 ->> 'recipe_id',
+        r -> 'requirements'
+      from (
+        select app.expand_recipe(
+          'f5000000-0000-4000-8000-00000000004a', 1, 'portion',
+          '2030-06-01 00:00:00+00'
+        ) as r
+      ) x$$,
+    $$values (
+      'blocked'::text,
+      'no_version_in_force'::text,
+      'f5000000-0000-4000-8000-00000000004b'::text,
+      'null'::jsonb
+    )$$,
+    'a child with no version at p_at blocks the expansion and names the child'
+  );
+
+select
+  is (
+    app.expand_recipe (
+      'f5000000-0000-4000-8000-00000000004a',
+      1,
+      'portion',
+      '2030-03-01 00:00:00+00'
+    ) -> 'issues' -> 0 ->> 'code',
+    'no_version_in_force',
+    'the child end is exclusive: asking at its end instant is blocked'
   );
 
 -- ============================================================================

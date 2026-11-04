@@ -136,6 +136,8 @@ begin
 end;
 $$;
 
+comment on function app.trg_recipes_guard () is 'Rejects every delete of a recipe and any change to id, kind or created_change_id. Only name and active may change. Internal.';
+
 create trigger trg_recipes_guard
 before update or delete on app.recipes for each row
 execute function app.trg_recipes_guard ();
@@ -173,6 +175,8 @@ begin
   return new;
 end;
 $$;
+
+comment on function app.trg_recipe_versions_batch_fields () is 'Before insert on a recipe version: a batch recipe needs batch_qty and batch_unit, any other kind must leave them null (23514). Internal.';
 
 create trigger trg_recipe_versions_batch_fields
 before insert on app.recipe_versions for each row
@@ -224,6 +228,8 @@ begin
 end;
 $$;
 
+comment on function app.trg_recipe_lines_target () is 'Before insert on a recipe line: a stock item target cannot be packaging or fish_mixed, and a child target must be a batch recipe (23514). Internal.';
+
 create trigger trg_recipe_lines_target
 before insert on app.recipe_lines for each row
 execute function app.trg_recipe_lines_target ();
@@ -236,6 +242,8 @@ begin
     using errcode = '55000';
 end;
 $$;
+
+comment on function app.trg_recipe_lines_immutable () is 'Rejects every update and delete of a recipe line (55000). A change is a new version with new lines. Internal.';
 
 create trigger trg_recipe_lines_immutable
 before update or delete on app.recipe_lines for each row
