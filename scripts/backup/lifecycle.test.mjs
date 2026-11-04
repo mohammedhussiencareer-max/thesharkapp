@@ -19,9 +19,19 @@ import test from 'node:test';
 const repoRoot = resolve(import.meta.dirname, '..', '..');
 const windows = process.platform === 'win32';
 const gitBash = 'C:\\Program Files\\Git\\bin\\bash.exe';
-const bash =
-  process.env.BACKUP_TEST_BASH ??
-  (windows && existsSync(gitBash) ? gitBash : 'bash');
+// Absolute on POSIX: spawn resolves a bare name through the child's own PATH,
+// and several tests give the child a PATH that does not contain bash.
+function resolveBash() {
+  if (process.env.BACKUP_TEST_BASH) return process.env.BACKUP_TEST_BASH;
+  if (windows) return existsSync(gitBash) ? gitBash : 'bash';
+  const found = (process.env.PATH ?? '')
+    .split(delimiter)
+    .filter(Boolean)
+    .map((dir) => join(dir, 'bash'))
+    .find((file) => existsSync(file));
+  return found ?? 'bash';
+}
+const bash = resolveBash();
 const posix = (path) => path.replaceAll('\\', '/');
 const msys = (path) =>
   windows
@@ -422,6 +432,9 @@ test('static: BACKUP_PG_BIN is applied before any PostgreSQL tool is required', 
 function shimDir(h) {
   const dir = join(h.base, 'shim');
   mkdirSync(dir);
+  // Every external command lib.sh, dump.sh, restore.sh and verify-archive.sh
+  // run before they need a PostgreSQL tool. Git Bash always keeps /usr/bin on
+  // PATH, a Linux bash does not, so the list must be complete.
   const tools = [
     'node',
     'tar',
@@ -432,13 +445,24 @@ function shimDir(h) {
     'cat',
     'grep',
     'rm',
+    'mkdir',
+    'head',
+    'cut',
+    'sort',
+    'awk',
+    'date',
   ];
   const found = spawnSync(bash, ['-c', `command -v ${tools.join(' ')}`], {
     encoding: 'utf8',
     env: process.env,
   });
+  assert.equal(found.error, undefined, 'bash did not start');
   const paths = found.stdout.trim().split('\n');
-  assert.equal(paths.length, tools.length);
+  assert.equal(
+    paths.length,
+    tools.length,
+    `tools missing from this machine; found: ${found.stdout}`,
+  );
   tools.forEach((tool, index) => {
     const file = join(dir, tool);
     writeFileSync(file, `#!/bin/sh\nexec "${paths[index]}" "$@"\n`);
@@ -473,14 +497,12 @@ test(
           ['-c', 'command -v psql pg_dump pg_restore'],
           { env: { ...process.env, PATH: env.PATH } },
         );
-        assert.notEqual(
-          leak.status,
-          0,
-          'a PostgreSQL tool is on the bare PATH',
-        );
+        assert.equal(leak.error, undefined, 'bash did not start');
+        assert.equal(leak.status, 1, 'a PostgreSQL tool is on the bare PATH');
 
         const found = h.run(script, args, env);
-        assert.equal(found.status, 1, script);
+        assert.equal(found.error, undefined, `${script}: bash did not start`);
+        assert.equal(found.status, 1, `${script}: ${found.stderr}`);
         assert.ok(
           !/TOOL_MISSING/.test(found.stderr),
           `${script}: ${found.stderr}`,
@@ -493,7 +515,8 @@ test(
           ...env,
           BACKUP_PG_BIN: msys(empty),
         });
-        assert.equal(missing.status, 1, script);
+        assert.equal(missing.error, undefined, `${script}: bash did not start`);
+        assert.equal(missing.status, 1, `${script}: ${missing.stderr}`);
         assert.match(
           missing.stderr,
           /\[TOOL_MISSING\]: (psql|pg_dump|pg_restore) /,

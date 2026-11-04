@@ -186,7 +186,7 @@ These could not be run in the sandbox where this was written; the first CI run o
 - `supabase start --workdir` with only `config.toml` really gives an empty database.
 - The platform extension and schema allowlists in `config.mjs` cover the hosted project (a false `DRIFT` on the first hosted run is expected to be fixed by adding an entry).
 - ACLs and default privileges are identical between the hosted origin and a local target; whether policies and RLS flags land in pre-data or post-data in `pg_dump`.
-- The synthetic seed's POS payload shape and the `set_item_opening_price` constraints.
+- The synthetic seed inside the round trip. It ran clean once on the local database after the costing cutover (`add_custom_unit`, `set_item_conversion`, `set_item_loss`, the six-argument `set_item_opening_price`, the POS payload shape); the seed must follow any later change to those RPCs.
 - The drift query's lists of platform-owned objects (`PLATFORM_OBJECT_OWNERS`, `PLATFORM_POSTGRES_OBJECTS` in `config.mjs`) against a live local and hosted stack; a false `DRIFT` names the object to add. The local stack must not install `pg_net` or `pg_cron`.
 - `psql` with `VERBOSITY=sqlstate` prints `ERROR:  <code>` as the denial checks and the failure messages expect.
 - Stack A runs `storage-api` (CI needs a real `storage.buckets`), and the background expense writer is accepted by `app.add_expense_entry`.

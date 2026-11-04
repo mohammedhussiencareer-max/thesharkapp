@@ -1,7 +1,8 @@
 -- Synthetic data for the backup round trip. Run once on a fresh local stack as
 -- the postgres role in a single transaction (psql -1) with -v owner=<uuid>.
--- The owner auth user must exist (create-user.sql). Everything goes through the
--- real RPCs, as in supabase/tests. No customer data, no POS documents.
+-- The owner auth user must exist (create-user.sql). Items are inserted with the
+-- default loss_pct 0 so their ids stay fixed; every other write goes through
+-- the real RPCs, as in supabase/tests. No customer data, no POS documents.
 insert into
   app.owner (user_id)
 values
@@ -31,12 +32,24 @@ values
   ('b4c00000-0000-4000-8000-000000000004', 'seed-lossy', 'seafood', 'kg', 'daily', 0, null),
   ('b4c00000-0000-4000-8000-000000000005', 'seed-priced', 'seafood', 'kg', 'daily', 0, null);
 
-insert into
-  app.item_unit_conversions (item_id, unit, factor_to_base)
-values
-  ('b4c00000-0000-4000-8000-000000000001', 'box', 10);
+-- Costing configuration first, on items that have no movements yet. Loss and
+-- conversions are dated versions guarded by a schedule token, and a custom
+-- unit must exist before a conversion can name it.
+select
+  app.add_custom_unit ('b4c00000-0000-4000-8000-000000000103', 'box', 'seed box');
 
--- Costing configuration first, on items that have no movements yet.
+select
+  app.set_item_conversion (
+    'b4c00000-0000-4000-8000-000000000104',
+    'b4c00000-0000-4000-8000-000000000001',
+    'box',
+    10,
+    '2026-01-01 00:00:00+00',
+    null,
+    app.schedule_token ('conversion', 'b4c00000-0000-4000-8000-000000000001', 'box'),
+    'seed conversion'
+  );
+
 select
   app.set_item_loss (
     'b4c00000-0000-4000-8000-000000000101',
@@ -44,7 +57,7 @@ select
     0.10,
     '2026-01-01 00:00:00+00',
     null,
-    md5(''),
+    app.schedule_token ('loss', 'b4c00000-0000-4000-8000-000000000004', null),
     'seed loss'
   );
 
@@ -54,7 +67,8 @@ select
     'b4c00000-0000-4000-8000-000000000005',
     55.5,
     null,
-    null
+    null,
+    'kg|seafood||'
   );
 
 -- Opening stock, a purchase, a sort and two sales, all moving forward in time.
