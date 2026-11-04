@@ -5,6 +5,7 @@ import {
   createItem,
   deleteConversion,
   listConversions,
+  listCostingSchedule,
   listItems,
   setItemLoss,
   setOpeningPrice,
@@ -601,14 +602,52 @@ describe('catalog api', () => {
   it('sets an opening price with the current id', async () => {
     const rpc = vi.fn().mockResolvedValue({ data: {}, error: null });
     mocks.schema.mockReturnValue({ rpc });
-    await setOpeningPrice('a', '0', 'افتتاح', 'price-1', 'req-price');
+    await setOpeningPrice(
+      'a',
+      '0',
+      'افتتاح',
+      'price-1',
+      'req-price',
+      'kg|ingredient||',
+    );
     expect(rpc).toHaveBeenCalledWith('set_item_opening_price', {
       p_request_id: 'req-price',
       p_item_id: 'a',
       p_unit_cost: '0',
       p_zero_cost_reason: 'افتتاح',
       p_expected_current_id: 'price-1',
+      p_expected_identity: 'kg|ingredient||',
     });
+  });
+
+  it('maps the schedule identity and rejects a response without one', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      data: {
+        loss: { token: 'loss-token', versions: [] },
+        conversions: [],
+        empty_token: 'empty-token',
+        identity: 'kg|ingredient||',
+      },
+      error: null,
+    });
+    mocks.schema.mockReturnValue({ rpc });
+    await expect(listCostingSchedule('a')).resolves.toMatchObject({
+      lossToken: 'loss-token',
+      emptyToken: 'empty-token',
+      identity: 'kg|ingredient||',
+    });
+
+    rpc.mockResolvedValue({
+      data: {
+        loss: { token: 'loss-token', versions: [] },
+        conversions: [],
+        empty_token: 'empty-token',
+      },
+      error: null,
+    });
+    await expect(listCostingSchedule('a')).rejects.toThrow(
+      'حصل خطأ. حاول تاني.',
+    );
   });
 
   it('adds a custom unit and maps a duplicate code', async () => {

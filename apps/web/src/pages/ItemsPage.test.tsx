@@ -46,6 +46,7 @@ vi.mock('@/items/api', () => ({
   listCostingSchedule: vi.fn(() =>
     Promise.resolve({
       lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      identity: 'kg|seafood||',
       lossVersions: [],
       conversions: [],
     }),
@@ -79,6 +80,8 @@ function item(
   };
   return row;
 }
+
+const scheduleIdentity = 'kg|seafood||';
 
 const catalog: CatalogItem[] = [
   item({
@@ -180,6 +183,7 @@ describe('ItemsPage', () => {
     vi.mocked(listCostingSchedule).mockReset();
     vi.mocked(listCostingSchedule).mockResolvedValue({
       lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      identity: scheduleIdentity,
       lossVersions: [],
       conversions: [],
     });
@@ -1212,6 +1216,7 @@ describe('ItemsPage', () => {
         'لسه من غير سعر',
         null,
         expect.any(String),
+        scheduleIdentity,
       );
     });
     expect(setItemLoss).toHaveBeenCalledTimes(1);
@@ -1327,6 +1332,12 @@ describe('ItemsPage', () => {
     await renderCatalog();
     const shrimp = screen.getByRole('article', { name: 'جمبري' });
     fireEvent.click(within(shrimp).getByRole('button', { name: 'تعديل' }));
+    await waitFor(() => {
+      expect(listCostingSchedule).toHaveBeenCalled();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
     fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
       target: { value: '15' },
     });
@@ -1376,6 +1387,7 @@ describe('ItemsPage', () => {
     vi.mocked(listCostingSchedule).mockImplementation(() =>
       Promise.resolve({
         lossToken,
+        identity: scheduleIdentity,
         lossVersions: [],
         conversions: [],
       }),
@@ -1444,6 +1456,7 @@ describe('ItemsPage', () => {
     vi.mocked(listCostingSchedule).mockImplementation(() =>
       Promise.resolve({
         lossToken,
+        identity: scheduleIdentity,
         lossVersions: [],
         conversions: [],
       }),
@@ -1459,6 +1472,12 @@ describe('ItemsPage', () => {
         { name: 'تعديل' },
       ),
     );
+    await waitFor(() => {
+      expect(listCostingSchedule).toHaveBeenCalled();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
     fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
       target: { value: '15' },
     });
@@ -1508,6 +1527,7 @@ describe('ItemsPage', () => {
     vi.mocked(listCostingSchedule).mockImplementation(() =>
       Promise.resolve({
         lossToken,
+        identity: scheduleIdentity,
         lossVersions: [],
         conversions: [],
       }),
@@ -1639,6 +1659,65 @@ describe('ItemsPage', () => {
     expect(screen.getByLabelText('الوحدة الأساسية')).toBeEnabled();
     expect(screen.getByLabelText('السمك المخلوط')).toBeEnabled();
     expect(screen.queryByText(identityHoldHint)).not.toBeInTheDocument();
+  });
+
+  it('locks identity fields while an opening-price save for the item is unresolved', async () => {
+    vi.mocked(setOpeningPrice)
+      .mockRejectedValueOnce(new Error('تعذر الاتصال'))
+      .mockRejectedValueOnce(new CostingChangedError());
+    await renderCatalog();
+    await editSize();
+
+    fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
+      target: { value: '100' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('النوع')).toBeDisabled();
+    });
+    expect(screen.getByLabelText('الوحدة الأساسية')).toBeDisabled();
+    expect(screen.getByLabelText('السمك المخلوط')).toBeDisabled();
+    expect(screen.getByText(identityHoldHint)).toBeInTheDocument();
+    expect(screen.getByLabelText('الاسم')).toBeEnabled();
+    expect(screen.getByLabelText('الجرد')).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText('النوع'), {
+      target: { value: 'ingredient' },
+    });
+    fireEvent.change(screen.getByLabelText('الوحدة الأساسية'), {
+      target: { value: 'liter' },
+    });
+    fireEvent.change(screen.getByLabelText('السمك المخلوط'), {
+      target: { value: '' },
+    });
+    expect(screen.getByLabelText('النوع')).toHaveValue('fish_size');
+    expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('kg');
+    expect(screen.getByLabelText('السمك المخلوط')).toHaveValue('mixed');
+    expect(setOpeningPrice).toHaveBeenCalledWith(
+      'size',
+      '100',
+      null,
+      null,
+      expect.any(String),
+      scheduleIdentity,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'البيانات اتغيرت — حدّث الصفحة وجرّب تاني',
+    );
+    await waitFor(() => {
+      expect(screen.getByLabelText('النوع')).toBeEnabled();
+    });
+    expect(screen.getByLabelText('الوحدة الأساسية')).toBeEnabled();
+    expect(screen.getByLabelText('السمك المخلوط')).toBeEnabled();
+    expect(screen.queryByText(identityHoldHint)).not.toBeInTheDocument();
+    const first = vi.mocked(setOpeningPrice).mock.calls[0];
+    const retry = vi.mocked(setOpeningPrice).mock.calls[1];
+    expect(retry?.[4]).toBe(first?.[4]);
+    expect(retry?.[5]).toBe(scheduleIdentity);
   });
 
   it('locks identity fields while a conversion save for the item is unresolved', async () => {

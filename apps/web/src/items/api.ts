@@ -5,10 +5,8 @@ import {
   StaleWriteError,
 } from '@/items/errors';
 import type { ItemExpectation } from '@/items/expectation';
-import { emptyScheduleToken } from '@/items/effective';
 import {
   beginAction,
-  conversionSubject,
   createSubject,
   settleAction,
   unitSubject,
@@ -360,9 +358,13 @@ export async function listCostingSchedule(
   if (typeof record.empty_token !== 'string') {
     throw new Error(genericCatalogError);
   }
+  if (typeof record.identity !== 'string') {
+    throw new Error(genericCatalogError);
+  }
   return {
     lossToken: lossRow.token,
     emptyToken: record.empty_token,
+    identity: record.identity,
     lossVersions: lossRow.versions.map((version) =>
       versionOf(version, 'loss_pct'),
     ),
@@ -493,6 +495,7 @@ export async function setOpeningPrice(
   reason: string | null,
   expectedId: string | null,
   requestId: string,
+  expectedIdentity: string,
 ): Promise<void> {
   const { error } = await appDb().rpc('set_item_opening_price', {
     p_request_id: requestId,
@@ -500,41 +503,9 @@ export async function setOpeningPrice(
     p_unit_cost: numericColumn(price),
     p_zero_cost_reason: nullableText(reason),
     p_expected_current_id: nullableText(expectedId),
+    p_expected_identity: expectedIdentity,
   });
   throwIfError(error);
-}
-
-function datedOrNow(
-  itemId: string,
-  unit: string,
-  timing: DatedWrite | undefined,
-): { owned: boolean; write: DatedWrite } {
-  if (timing) return { owned: false, write: timing };
-  const write = beginAction(conversionSubject(itemId, unit), (requestId) => ({
-    effectiveFrom: null,
-    effectiveTo: null,
-    token: emptyScheduleToken,
-    reason: null,
-    requestId,
-  }));
-  return { owned: true, write };
-}
-
-async function sendOwnedConversion(
-  itemId: string,
-  unit: string,
-  factor: string | null,
-  timing: DatedWrite | undefined,
-): Promise<void> {
-  const sent = datedOrNow(itemId, unit, timing);
-  const subject = conversionSubject(itemId, unit);
-  try {
-    await setItemConversion(itemId, unit, factor, sent.write);
-    if (sent.owned) settleAction(subject);
-  } catch (error) {
-    if (sent.owned) settleAction(subject, error);
-    throw error;
-  }
 }
 
 export async function addConversion(
@@ -542,9 +513,9 @@ export async function addConversion(
   unit: string,
   factorToBase: string,
   _expectedBaseUnit: BaseUnit,
-  timing?: DatedWrite,
+  timing: DatedWrite,
 ): Promise<void> {
-  await sendOwnedConversion(itemId, unit.trim(), factorToBase, timing);
+  await setItemConversion(itemId, unit.trim(), factorToBase, timing);
 }
 
 export async function updateConversion(
@@ -553,9 +524,9 @@ export async function updateConversion(
   factorToBase: string,
   _expectedFactor: string,
   _expectedBaseUnit: BaseUnit,
-  timing?: DatedWrite,
+  timing: DatedWrite,
 ): Promise<void> {
-  await sendOwnedConversion(itemId, unit, factorToBase, timing);
+  await setItemConversion(itemId, unit, factorToBase, timing);
 }
 
 export async function deleteConversion(
@@ -563,7 +534,7 @@ export async function deleteConversion(
   unit: string,
   _expectedFactor: string,
   _expectedBaseUnit: BaseUnit,
-  timing?: DatedWrite,
+  timing: DatedWrite,
 ): Promise<void> {
-  await sendOwnedConversion(itemId, unit, null, timing);
+  await setItemConversion(itemId, unit, null, timing);
 }

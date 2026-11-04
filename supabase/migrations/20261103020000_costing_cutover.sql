@@ -3755,10 +3755,232 @@ begin
     jsonb_build_object('token', v_loss_token, 'versions', v_loss_versions),
     'conversions',
     v_conversions,
+    'identity',
+    v_identity,
     'empty_token',
     v_empty_token
   );
 end;
 $$;
 
-comment on function app.item_costing_schedule (uuid) is 'Owner read of the current loss and conversion schedules for one item. Each token and empty_token is md5 of base_unit|kind|parent_item_id| plus that schedule. An empty schedule hashes the identity prefix alone.';
+comment on function app.item_costing_schedule (uuid) is 'Owner read of the current loss and conversion schedules for one item. identity is base_unit|kind|parent_item_id|. Each token and empty_token is md5 of that identity plus that schedule. An empty schedule hashes the identity prefix alone.';
+
+-- The five-argument opening-price writer cannot name the approved identity.
+-- Owners are told to call the overload. Non-owners still get 42501.
+create or replace function app.set_item_opening_price (
+  p_request_id uuid,
+  p_item_id uuid,
+  p_unit_cost numeric,
+  p_zero_cost_reason text,
+  p_expected_current_id uuid
+) returns jsonb language plpgsql security definer
+set
+  search_path = '' as $$
+begin
+  if coalesce(app.is_owner(), false) is not true then
+    raise exception 'insufficient_privilege'
+      using errcode = '42501';
+  end if;
+
+  raise exception 'use app.set_item_opening_price with p_expected_identity'
+    using errcode = '0A000';
+end;
+$$;
+
+comment on function app.set_item_opening_price (uuid, uuid, numeric, text, uuid) is 'Retired. Keeps its signature and grants. Non-owners get 42501. Owners get 0A000 and must pass p_expected_identity.';
+
+create function app.set_item_opening_price (
+  p_request_id uuid,
+  p_item_id uuid,
+  p_unit_cost numeric,
+  p_zero_cost_reason text,
+  p_expected_current_id uuid,
+  p_expected_identity text
+) returns jsonb language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_cost numeric(20, 6);
+  v_reason text;
+  v_base text;
+  v_identity text;
+  v_current_id uuid;
+  v_new_id uuid;
+  v_superseded uuid[] := '{}'::uuid[];
+  v_inserted uuid[] := '{}'::uuid[];
+  v_payload jsonb;
+  v_replay jsonb;
+  v_result jsonb;
+  v_change_id bigint;
+begin
+  if coalesce(app.is_owner(), false) is not true then
+    raise exception 'insufficient_privilege'
+      using errcode = '42501';
+  end if;
+
+  perform app.assert_ledger_write_allowed();
+
+  if p_request_id is null then
+    raise exception 'request_id is required'
+      using errcode = '22023';
+  end if;
+
+  if p_item_id is null then
+    raise exception 'item_id is required'
+      using errcode = '22023';
+  end if;
+
+  if p_unit_cost is null
+  or p_unit_cost in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+  or p_unit_cost < 0 then
+    raise exception 'unit_cost must be finite and greater than or equal to 0'
+      using errcode = '22023';
+  end if;
+
+  v_cost := pg_catalog.round(p_unit_cost, 6);
+
+  if v_cost < 0 then
+    raise exception 'unit_cost must be finite and greater than or equal to 0'
+      using errcode = '22023';
+  end if;
+
+  if p_zero_cost_reason is null
+  or btrim(p_zero_cost_reason) = '' then
+    v_reason := null;
+  else
+    v_reason := btrim(p_zero_cost_reason);
+  end if;
+
+  if v_reason is not null
+  and length(v_reason) > 500 then
+    raise exception 'zero_cost_reason must be at most 500 characters'
+      using errcode = '22023';
+  end if;
+
+  if v_cost = 0
+  and v_reason is null then
+    raise exception 'zero_cost_reason is required when unit_cost is 0'
+      using errcode = '22023';
+  end if;
+
+  if v_cost > 0
+  and v_reason is not null then
+    raise exception 'zero_cost_reason must be null when unit_cost is greater than 0'
+      using errcode = '22023';
+  end if;
+
+  v_payload := jsonb_build_object(
+    'fn',
+    'set_item_opening_price',
+    'item_id',
+    p_item_id,
+    'unit_cost',
+    v_cost,
+    'zero_cost_reason',
+    v_reason,
+    'expected_current_id',
+    p_expected_current_id,
+    'expected_identity',
+    p_expected_identity
+  );
+
+  v_replay := app.costing_replay_result(p_request_id, v_payload);
+
+  if v_replay is not null then
+    return v_replay;
+  end if;
+
+  select
+    si.base_unit,
+    si.base_unit || '|' || si.kind || '|' || coalesce(si.parent_item_id::text, '') || '|'
+  into v_base,
+  v_identity
+  from
+    app.stock_items si
+  where
+    si.id = p_item_id
+  for update;
+
+  if not found then
+    raise exception 'unknown stock_item id: %', p_item_id
+      using errcode = '22023';
+  end if;
+
+  if v_identity is distinct from p_expected_identity then
+    raise exception 'configuration changed'
+      using errcode = '40001';
+  end if;
+
+  select
+    p.id
+  into v_current_id
+  from
+    app.item_opening_prices p
+  where
+    p.item_id = p_item_id
+    and p.superseded_change_id is null
+  for update;
+
+  if v_current_id is distinct from p_expected_current_id then
+    raise exception 'configuration changed'
+      using errcode = '40001';
+  end if;
+
+  v_new_id := pg_catalog.gen_random_uuid();
+  v_inserted := pg_catalog.array_append(v_inserted, v_new_id);
+
+  if v_current_id is not null then
+    v_superseded := pg_catalog.array_append(v_superseded, v_current_id);
+  end if;
+
+  v_result := app.insert_owner_costing_change(
+    p_request_id,
+    null,
+    v_payload,
+    jsonb_build_object(
+      'superseded',
+      pg_catalog.to_jsonb(v_superseded),
+      'inserted',
+      pg_catalog.to_jsonb(v_inserted),
+      'current_id',
+      v_new_id
+    )
+  );
+  v_change_id := (v_result -> 'change_id')::bigint;
+
+  if v_current_id is not null then
+    update app.item_opening_prices
+    set
+      superseded_change_id = v_change_id
+    where
+      id = v_current_id;
+  end if;
+
+  insert into
+    app.item_opening_prices (id, item_id, base_unit, unit_cost, zero_cost_reason, approved_by, created_change_id)
+  values
+    (
+      v_new_id,
+      p_item_id,
+      v_base,
+      v_cost,
+      v_reason,
+      auth.uid (),
+      v_change_id
+    );
+
+  return v_result;
+end;
+$$;
+
+comment on function app.set_item_opening_price (uuid, uuid, numeric, text, uuid, text) is 'Sets the current opening unit cost for one base_unit|kind|parent_item_id| identity. Takes advisory lock 7342750000000000001, replays, then locks the item. A different identity or opening-price id raises 40001 configuration changed. Posts no movement.';
+
+revoke all on function app.set_item_opening_price (uuid, uuid, numeric, text, uuid, text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+grant
+execute on function app.set_item_opening_price (uuid, uuid, numeric, text, uuid, text) to authenticated;

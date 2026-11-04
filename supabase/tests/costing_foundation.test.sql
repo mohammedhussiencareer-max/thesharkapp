@@ -1862,7 +1862,8 @@ select
       'e4010000-0000-4000-8000-000000000003',
       55.5,
       null,
-      null
+      null,
+      'kg|ingredient||'
     )$$,
     'set opening price 55.5'
   );
@@ -1889,7 +1890,8 @@ select
         'e4010000-0000-4000-8000-000000000003',
         60,
         null,
-        %L::uuid
+        %L::uuid,
+        'kg|ingredient||'
       )$$,
       (
         select
@@ -1911,7 +1913,8 @@ select
       'e4010000-0000-4000-8000-000000000003',
       70,
       null,
-      'e4010000-0000-4000-8000-000000000099'
+      'e4010000-0000-4000-8000-000000000099',
+      'kg|ingredient||'
     )$$,
     '40001',
     'configuration changed',
@@ -1927,7 +1930,8 @@ select
       null,
       (select id from app.item_opening_prices
         where item_id = 'e4010000-0000-4000-8000-000000000003'
-          and superseded_change_id is null)
+          and superseded_change_id is null),
+      'kg|ingredient||'
     )$$,
     '22023',
     'zero_cost_reason is required when unit_cost is 0',
@@ -1942,7 +1946,8 @@ select
         'e4010000-0000-4000-8000-000000000003',
         0,
         'تكلفة صفر مقصودة',
-        %L::uuid
+        %L::uuid,
+        'kg|ingredient||'
       )$$,
       (
         select
@@ -1980,7 +1985,8 @@ select
         'e4010000-0000-4000-8000-000000000003',
         0,
         'تكلفة صفر مقصودة',
-        %L::uuid
+        %L::uuid,
+        'kg|ingredient||'
       )$$,
       (
         select
@@ -2377,6 +2383,11 @@ select
       'app.set_item_opening_price(uuid,uuid,numeric,text,uuid)',
       'execute'
     )
+    and has_function_privilege(
+      'authenticated',
+      'app.set_item_opening_price(uuid,uuid,numeric,text,uuid,text)',
+      'execute'
+    )
     and not has_function_privilege(
       'service_role',
       'app.set_item_loss(uuid,uuid,numeric,timestamptz,timestamptz,text,text)',
@@ -2390,6 +2401,11 @@ select
     and not has_function_privilege(
       'service_role',
       'app.set_item_opening_price(uuid,uuid,numeric,text,uuid)',
+      'execute'
+    )
+    and not has_function_privilege(
+      'service_role',
+      'app.set_item_opening_price(uuid,uuid,numeric,text,uuid,text)',
       'execute'
     )
     and not has_function_privilege(
@@ -2418,8 +2434,18 @@ select
       'execute'
     )
     and not has_function_privilege(
+      'anon',
+      'app.set_item_opening_price(uuid,uuid,numeric,text,uuid,text)',
+      'execute'
+    )
+    and not has_function_privilege(
       'public',
       'app.set_item_opening_price(uuid,uuid,numeric,text,uuid)',
+      'execute'
+    )
+    and not has_function_privilege(
+      'public',
+      'app.set_item_opening_price(uuid,uuid,numeric,text,uuid,text)',
       'execute'
     ),
     true,
@@ -2659,6 +2685,18 @@ select
 
 select
   throws_ok (
+    $$select app.set_item_opening_price(
+      'e4010000-0000-4000-8000-000000000196',
+      'e4010000-0000-4000-8000-000000000003',
+      1, null, null, 'kg|ingredient||'
+    )$$,
+    '42501',
+    'insufficient_privilege',
+    'non-owner cannot set an opening price with an identity'
+  );
+
+select
+  throws_ok (
     $$select app.item_costing_schedule('e4010000-0000-4000-8000-000000000001')$$,
     '42501',
     'insufficient_privilege',
@@ -2757,6 +2795,18 @@ select
     '42501',
     null::text,
     'service_role cannot execute an opening-price writer'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_opening_price(
+      'e4010000-0000-4000-8000-000000000197',
+      'e4010000-0000-4000-8000-000000000003',
+      1, null, null, 'kg|ingredient||'
+    )$$,
+    '42501',
+    null::text,
+    'service_role cannot execute the identity opening-price writer'
   );
 
 select

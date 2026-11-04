@@ -2191,6 +2191,103 @@ select
     'a conflicting loss retry inserts no loss'
   );
 
+-- An opening price approved against kg must not land after the base unit becomes liter.
+select
+  app.create_stock_item (
+    'd4000000-0000-4000-8000-000000000213',
+    'صنف سعر',
+    'ingredient',
+    'kg',
+    'weekly',
+    null,
+    null,
+    true
+  );
+
+select
+  is (
+    app.item_costing_schedule (
+      (
+        select
+          id
+        from
+          app.stock_items
+        where
+          name = 'صنف سعر'
+      )
+    ) ->> 'identity',
+    'kg|ingredient||',
+    'the schedule exposes the base unit, kind, and parent identity'
+  );
+
+select
+  lives_ok (
+    $$update app.stock_items
+      set base_unit = 'liter'
+      where name = 'صنف سعر'$$,
+    'base unit can change while the item has no opening price'
+  );
+
+select
+  is (
+    app.item_costing_schedule (
+      (
+        select
+          id
+        from
+          app.stock_items
+        where
+          name = 'صنف سعر'
+      )
+    ) ->> 'identity',
+    'liter|ingredient||',
+    'the schedule identity follows the new base unit'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_opening_price(
+      'd4000000-0000-4000-8000-000000000214',
+      (select id from app.stock_items where name = 'صنف سعر'),
+      100,
+      null,
+      null,
+      'kg|ingredient||'
+    )$$,
+    '40001'::char(5),
+    'configuration changed',
+    'retrying an opening price after the base unit changed is a conflict'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.item_opening_prices p
+        join app.stock_items si on si.id = p.item_id
+      where
+        si.name = 'صنف سعر'
+    ),
+    0::bigint,
+    'a conflicting opening-price retry inserts no price'
+  );
+
+select
+  throws_ok (
+    $$select app.set_item_opening_price(
+      'd4000000-0000-4000-8000-000000000215',
+      (select id from app.stock_items where name = 'صنف سعر'),
+      100,
+      null,
+      null
+    )$$,
+    '0A000'::char(5),
+    'use app.set_item_opening_price with p_expected_identity',
+    'the opening-price writer without an identity is retired'
+  );
+
 reset role;
 
 select

@@ -75,6 +75,7 @@ type PriceAction = {
   price: string;
   reason: string | null;
   expectedId: string | null;
+  identity: string;
   requestId: string;
 };
 
@@ -329,6 +330,7 @@ export function ItemForm({
         price: action.price,
         reason: action.reason,
         expectedId: action.expectedId,
+        identity: action.identity,
         requestId: action.requestId,
       });
       if (accepted !== true) {
@@ -520,11 +522,17 @@ export function ItemForm({
       setPriceError('اكتب سبب إن السعر صفر');
       return;
     }
+    const identity = schedule?.identity;
+    if (!identity) {
+      setPriceError('لسه بنحمّل بيانات السعر');
+      return;
+    }
     const reason = price === '0' ? priceReason.trim() : null;
     const action = beginAction(priceSubject(editingId), (requestId) => ({
       price,
       reason,
       expectedId: editing?.openingPriceId ?? null,
+      identity,
       requestId,
     }));
     void finishPrice(action);

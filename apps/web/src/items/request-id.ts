@@ -81,12 +81,13 @@ export function hasAction(subject: string): boolean {
 const conversionPrefix = 'conversion:';
 
 /**
- * True while a loss save or any conversion save for this item is in flight
- * or still has an unknown outcome. Opening price and item creation do not
- * count: they are not part of the schedule token.
+ * True while a loss, opening-price, or conversion save for this item is in
+ * flight or still has an unknown outcome. Item creation does not count.
  */
 export function hasItemConfigurationAction(itemId: string): boolean {
-  if (held.has(lossSubject(itemId))) return true;
+  if (held.has(lossSubject(itemId)) || held.has(priceSubject(itemId))) {
+    return true;
+  }
   for (const key of held.keys()) {
     if (!key.startsWith(conversionPrefix)) continue;
     let parsed: unknown;

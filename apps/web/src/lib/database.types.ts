@@ -1020,6 +1020,8 @@ isOneToOne: false
                            },
 "set_item_opening_price":
 { Args: { "p_expected_current_id": string,"p_item_id": string,"p_request_id": string,"p_unit_cost": number,"p_zero_cost_reason": string }; Returns: Json
+                           } |
+{ Args: { "p_expected_current_id": string,"p_expected_identity": string,"p_item_id": string,"p_request_id": string,"p_unit_cost": number,"p_zero_cost_reason": string }; Returns: Json
                            },
 "set_month_expense_complete":
 { Args: { "p_complete": boolean,"p_month": string }; Returns: undefined

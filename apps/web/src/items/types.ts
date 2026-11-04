@@ -92,6 +92,11 @@ export type CostingSchedule = {
    * parent. Absent only in tests that never load a schedule response.
    */
   emptyToken?: string;
+  /**
+   * `base_unit|kind|parent_item_id|` for this item. Absent only in tests that
+   * never load a schedule response.
+   */
+  identity?: string;
   lossVersions: CostingVersion[];
   conversions: {
     unitCode: string;
@@ -124,6 +129,7 @@ export type ItemSave =
       price: string;
       reason: string | null;
       expectedId: string | null;
+      identity: string;
       requestId: string;
     };
 
