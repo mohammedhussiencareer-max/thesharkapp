@@ -24,6 +24,7 @@ import {
   type EffectiveMode,
 } from '@/items/effective';
 import {
+  identityOutOfDateMessage,
   isConfirmedConfigurationChange,
   messageFrom,
   saveDetailsFirstMessage,
@@ -50,6 +51,7 @@ import {
   isBaseUnit,
   isCountFrequency,
   isStockKind,
+  itemIdentity,
   type CatalogItem,
   type CostingSchedule,
   type DatedWrite,
@@ -95,6 +97,7 @@ export function ItemForm({
   onCancel,
   detailsKey = 0,
   onIdentityDirtyChange,
+  onItemStale,
 }: {
   items: readonly CatalogItem[];
   editingId?: string;
@@ -110,6 +113,8 @@ export function ItemForm({
   detailsKey?: number;
   /** True while kind, base unit or parent differs from the saved item. */
   onIdentityDirtyChange?: (dirty: boolean) => void;
+  /** The costing schedule is for a different identity than the shown item. */
+  onItemStale?: (itemId: string) => void | Promise<void>;
 }) {
   const titleId = useId();
   const [values, setValues] = useState(initial ?? emptyItemForm);
@@ -131,6 +136,7 @@ export function ItemForm({
   const [mode, setMode] = useState<EffectiveMode>('now');
   const [customLocal, setCustomLocal] = useState('');
   const [lossReason, setLossReason] = useState('');
+  const [datedLoss, setDatedLoss] = useState(false);
   const [impact, setImpact] = useState<
     | { status: 'ready'; key: string; orders: number; shifts: number }
     | { status: 'error'; key: string }
@@ -144,6 +150,7 @@ export function ItemForm({
   const [priceError, setPriceError] = useState<string | null>(null);
   const timingTouched = useRef(false);
   const scheduleLoad = useRef(0);
+  const onItemStaleRef = useRef(onItemStale);
   const lossFlight = useRef(false);
   const priceFlight = useRef(false);
   const createFlight = useRef(false);
@@ -167,6 +174,13 @@ export function ItemForm({
     (values.kind !== editing.kind ||
       values.baseUnit !== editing.baseUnit ||
       values.parentItemId !== (editing.parentItemId ?? ''));
+  const editingIdentity = editing ? itemIdentity(editing) : '';
+  // The schedule and its tokens belong to the identity the database holds. A
+  // fresh write waits until that is the identity the owner is looking at.
+  const scheduleMismatch =
+    editing !== undefined &&
+    schedule !== null &&
+    schedule.identity !== editingIdentity;
   const identityTick = heldEpoch;
   const identityPending =
     editingId === undefined || identityTick < 0
@@ -213,6 +227,13 @@ export function ItemForm({
   }, [identityDirty, onIdentityDirtyChange]);
 
   useEffect(() => {
+    onItemStaleRef.current = onItemStale;
+  }, [onItemStale]);
+
+  // A new displayed identity re-reads the schedule. A schedule for another
+  // identity than the one this read was issued for means the shown item is
+  // behind: reload it, which re-runs this read.
+  useEffect(() => {
     if (!editingId) return;
     const request = ++scheduleLoad.current;
     let cancelled = false;
@@ -226,6 +247,9 @@ export function ItemForm({
         setShiftStart(shift);
         setSchedule(nextSchedule);
         if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
+        if (nextSchedule.identity !== editingIdentity) {
+          void onItemStaleRef.current?.(editingId);
+        }
       } catch (error) {
         if (!cancelled && request === scheduleLoad.current) {
           setExtraError(messageFrom(error));
@@ -235,15 +259,21 @@ export function ItemForm({
     return () => {
       cancelled = true;
     };
-  }, [editingId]);
+  }, [editingId, editingIdentity]);
 
-  async function reloadLossSchedule(): Promise<void> {
+  async function reloadLossSchedule(expectedIdentity?: string): Promise<void> {
     if (!editingId) return;
     const request = ++scheduleLoad.current;
     try {
       const next = await listCostingSchedule(editingId);
       if (request !== scheduleLoad.current) return;
       setSchedule(next);
+      if (
+        expectedIdentity !== undefined &&
+        next.identity !== expectedIdentity
+      ) {
+        void onItemStaleRef.current?.(editingId);
+      }
     } catch (error) {
       if (request === scheduleLoad.current) setExtraError(messageFrom(error));
     }
@@ -251,9 +281,11 @@ export function ItemForm({
 
   const lossCustomIso =
     mode === 'custom' ? cairoDateTimeLocalToIso(customLocal) : null;
+  const canDateLoss = editingId !== undefined && initialLoss.trim() !== '';
+  const lossTimingOpen = lossDirty || (canDateLoss && datedLoss);
   const lossBackdated =
     editingId !== undefined &&
-    lossDirty &&
+    lossTimingOpen &&
     needsBackdatedReason(mode, shiftStart, lossCustomIso, nowMs);
   const lossFrom = lossBackdated
     ? effectiveFromPayload(mode, shiftStart, lossCustomIso)
@@ -328,6 +360,7 @@ export function ItemForm({
         return;
       }
       settleAction(subject);
+      setDatedLoss(false);
       await reloadLossSchedule();
     } catch (error) {
       settleAction(subject, error);
@@ -417,7 +450,9 @@ export function ItemForm({
         result.draft.parentItemId !== editing.parentItemId);
     void onSubmit({ kind: 'details', draft: result.draft })
       .then((accepted) => {
-        if (accepted === true && identityChanged) return reloadLossSchedule();
+        if (accepted === true && identityChanged) {
+          return reloadLossSchedule(itemIdentity(result.draft));
+        }
         return undefined;
       })
       .catch(() => undefined);
@@ -444,6 +479,7 @@ export function ItemForm({
       submitting ||
       locked ||
       identityDirty ||
+      scheduleMismatch ||
       refreshingSchedule ||
       lossFlight.current ||
       hasAction(lossSubject(editingId))
@@ -465,7 +501,7 @@ export function ItemForm({
       setErrors({ lossPercent: lossError });
       return;
     }
-    if (!lossDirty) return;
+    if (!lossTimingOpen) return;
     if (!schedule) {
       setExtraError('لسه بنحمّل بيانات الفاقد');
       return;
@@ -483,6 +519,10 @@ export function ItemForm({
       lossCustomIso,
       now,
     );
+    if (!lossDirty && !backdatedNow) {
+      setExtraError('اختار وقت سريان قبل الوقت الحالي');
+      return;
+    }
     if (backdatedNow && lossReason.trim().length === 0) {
       setExtraError('اكتب سبب التغيير بأثر رجعي');
       return;
@@ -532,6 +572,7 @@ export function ItemForm({
       submitting ||
       locked ||
       identityDirty ||
+      scheduleMismatch ||
       priceFlight.current ||
       hasAction(priceSubject(editingId))
     ) {
@@ -692,6 +733,11 @@ export function ItemForm({
               {saveDetailsFirstMessage}
             </p>
           ) : null}
+          {scheduleMismatch ? (
+            <p className="text-sm text-neutral-600">
+              {identityOutOfDateMessage}
+            </p>
+          ) : null}
         </div>
         <div className="flex flex-col gap-1">
           <label className="flex flex-col gap-1">
@@ -739,7 +785,22 @@ export function ItemForm({
               : 'اكتبها نسبة مئوية من 0 لحد 99.999. سيبها فاضية لو لسه مش متحدد.'}
           </p>
           {errors.lossPercent ? <p role="alert">{errors.lossPercent}</p> : null}
-          {editingId && lossDirty ? (
+          {canDateLoss && !lossDirty ? (
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                disabled={lossDisabled}
+                checked={datedLoss}
+                onChange={(event) => {
+                  if (lossDisabled) return;
+                  setExtraError(null);
+                  setDatedLoss(event.target.checked);
+                }}
+              />
+              اعتمد النسبة الحالية من وقت سابق
+            </label>
+          ) : null}
+          {editingId && lossTimingOpen ? (
             <EffectiveTimeFields
               mode={mode}
               shiftStart={shiftStart}
@@ -859,7 +920,12 @@ export function ItemForm({
               <button
                 className={primaryButton}
                 type="button"
-                disabled={lossDisabled || refreshingSchedule || identityDirty}
+                disabled={
+                  lossDisabled ||
+                  refreshingSchedule ||
+                  identityDirty ||
+                  scheduleMismatch
+                }
                 onClick={saveLoss}
               >
                 حفظ الفاقد
@@ -867,7 +933,7 @@ export function ItemForm({
               <button
                 className={primaryButton}
                 type="button"
-                disabled={priceDisabled || identityDirty}
+                disabled={priceDisabled || identityDirty || scheduleMismatch}
                 onClick={savePrice}
               >
                 حفظ السعر

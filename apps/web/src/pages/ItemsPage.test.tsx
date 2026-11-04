@@ -30,11 +30,18 @@ import {
 } from '@/items/effective';
 import {
   CostingChangedError,
+  identityOutOfDateMessage,
   saveDetailsFirstMessage,
   StaleWriteError,
 } from '@/items/errors';
 import { resetHeldWrites, unknownSaveMessage } from '@/items/request-id';
-import type { BaseUnit, CatalogItem, UnitConversion } from '@/items/types';
+import {
+  itemIdentity,
+  type BaseUnit,
+  type CatalogItem,
+  type CostingSchedule,
+  type UnitConversion,
+} from '@/items/types';
 import { ItemsPage } from '@/pages/ItemsPage';
 
 vi.mock('@/items/api', () => ({
@@ -87,6 +94,7 @@ function item(
 }
 
 const scheduleIdentity = 'kg|seafood||';
+const sizeIdentity = 'kg|fish_size|mixed|';
 
 const catalog: CatalogItem[] = [
   item({
@@ -146,7 +154,20 @@ function listed(rows: UnitConversion[], baseUnit: BaseUnit) {
   return { baseUnit, rows };
 }
 
+let served: CatalogItem[] = catalog;
+
+function emptySchedule(itemId: string): CostingSchedule {
+  const row = served.find((candidate) => candidate.id === itemId);
+  return {
+    lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+    identity: row ? itemIdentity(row) : scheduleIdentity,
+    lossVersions: [],
+    conversions: [],
+  };
+}
+
 async function renderCatalog(items: CatalogItem[] = catalog) {
+  served = items;
   vi.mocked(listItems).mockResolvedValue(items);
   render(
     <MemoryRouter>
@@ -185,13 +206,11 @@ describe('ItemsPage', () => {
       shifts: 1,
       movements: 4,
     });
+    served = catalog;
     vi.mocked(listCostingSchedule).mockReset();
-    vi.mocked(listCostingSchedule).mockResolvedValue({
-      lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
-      identity: scheduleIdentity,
-      lossVersions: [],
-      conversions: [],
-    });
+    vi.mocked(listCostingSchedule).mockImplementation((itemId) =>
+      Promise.resolve(emptySchedule(itemId)),
+    );
   });
 
   afterEach(() => {
@@ -1018,6 +1037,7 @@ describe('ItemsPage', () => {
       baseUnit: 'kg',
       active: true,
     });
+    served = [oil];
     let loads = 0;
     vi.mocked(listItems).mockImplementation(() => {
       loads += 1;
@@ -1070,6 +1090,7 @@ describe('ItemsPage', () => {
       baseUnit: 'kg',
       active: true,
     });
+    served = [oil];
     let resolveStaleReload: (value: CatalogItem[]) => void = () => undefined;
     let loads = 0;
     vi.mocked(listItems).mockImplementation(() => {
@@ -1100,7 +1121,8 @@ describe('ItemsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
     expect(updateItem).not.toHaveBeenCalled();
 
-    resolveStaleReload([{ ...oil, baseUnit: 'liter' }]);
+    served = [{ ...oil, baseUnit: 'liter' }];
+    resolveStaleReload(served);
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
     });
@@ -1115,6 +1137,7 @@ describe('ItemsPage', () => {
       baseUnit: 'kg',
       active: true,
     });
+    served = [oil];
     let resolveSaveRead: (value: CatalogItem[]) => void = () => undefined;
     let loads = 0;
     vi.mocked(listItems).mockImplementation(() => {
@@ -1706,7 +1729,7 @@ describe('ItemsPage', () => {
       null,
       null,
       expect.any(String),
-      scheduleIdentity,
+      sizeIdentity,
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
@@ -1722,7 +1745,7 @@ describe('ItemsPage', () => {
     const first = vi.mocked(setOpeningPrice).mock.calls[0];
     const retry = vi.mocked(setOpeningPrice).mock.calls[1];
     expect(retry?.[4]).toBe(first?.[4]);
-    expect(retry?.[5]).toBe(scheduleIdentity);
+    expect(retry?.[5]).toBe(sizeIdentity);
   });
 
   it('saves the next opening price with the identity from after a conflict', async () => {
@@ -2178,5 +2201,257 @@ describe('ItemsPage', () => {
         reason: 'تصحيح',
       }),
     );
+  });
+
+  const priceLabel = 'السعر الافتتاحي المعتمد للوحدة';
+  const datedLossLabel = 'اعتمد النسبة الحالية من وقت سابق';
+
+  it('blocks fresh loss and price saves while the schedule identity differs from the one shown', async () => {
+    await renderCatalog();
+    vi.mocked(listCostingSchedule).mockImplementation(() =>
+      Promise.resolve({
+        lossToken: emptyScheduleToken,
+        identity: 'liter|seafood||',
+        lossVersions: [],
+        conversions: [],
+      }),
+    );
+    fireEvent.click(
+      within(screen.getByRole('article', { name: 'جمبري' })).getByRole(
+        'button',
+        { name: 'تعديل' },
+      ),
+    );
+    expect(
+      await screen.findByText(identityOutOfDateMessage),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(listItems).toHaveBeenCalledTimes(2);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
+    });
+    expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('kg');
+
+    fireEvent.change(screen.getByLabelText(priceLabel), {
+      target: { value: '100' },
+    });
+    fireEvent.change(screen.getByLabelText('نسبة الفاقد'), {
+      target: { value: '10' },
+    });
+    expect(screen.getByRole('button', { name: 'حفظ السعر' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'حفظ الفاقد' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    expect(setOpeningPrice).not.toHaveBeenCalled();
+    expect(setItemLoss).not.toHaveBeenCalled();
+  });
+
+  it('reloads the item shown and saves the price with the newer identity', async () => {
+    await renderCatalog();
+    const moved: CatalogItem[] = catalog.map((row) =>
+      row.id === 'shrimp' ? { ...row, baseUnit: 'liter' } : row,
+    );
+    let resolveReload: (rows: CatalogItem[]) => void = () => undefined;
+    vi.mocked(listItems).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveReload = resolve;
+        }),
+    );
+    served = moved;
+    await editShrimp();
+    expect(
+      await screen.findByText(identityOutOfDateMessage),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('kg');
+    expect(screen.getByRole('button', { name: 'حفظ السعر' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'حفظ الفاقد' })).toBeDisabled();
+    expect(setOpeningPrice).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveReload(moved);
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getByLabelText('الوحدة الأساسية')).toHaveValue('liter');
+    });
+    await waitFor(() => {
+      expect(listCostingSchedule).toHaveBeenCalledTimes(2);
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByText(identityOutOfDateMessage),
+      ).not.toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ السعر' })).toBeEnabled();
+    });
+
+    fireEvent.change(screen.getByLabelText(priceLabel), {
+      target: { value: '100' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    await waitFor(() => {
+      expect(setOpeningPrice).toHaveBeenCalledTimes(1);
+    });
+    expect(setOpeningPrice).toHaveBeenCalledWith(
+      'shrimp',
+      '100',
+      null,
+      null,
+      expect.any(String),
+      'liter|seafood||',
+    );
+  });
+
+  it('retries a held price with its own identity while a newer schedule is shown', async () => {
+    let identity = scheduleIdentity;
+    vi.mocked(listCostingSchedule).mockImplementation(() =>
+      Promise.resolve({
+        lossToken: emptyScheduleToken,
+        identity,
+        lossVersions: [],
+        conversions: [],
+      }),
+    );
+    await renderCatalog();
+    await editShrimp();
+    fireEvent.change(screen.getByLabelText(priceLabel), {
+      target: { value: '100' },
+    });
+    vi.mocked(setOpeningPrice).mockRejectedValueOnce(new Error('تعذر الاتصال'));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+
+    identity = 'liter|seafood||';
+    fireEvent.change(screen.getByLabelText('نسبة الفاقد'), {
+      target: { value: '10' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    expect(
+      await screen.findByText(identityOutOfDateMessage),
+    ).toBeInTheDocument();
+    expect(setItemLoss).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => {
+      expect(setOpeningPrice).toHaveBeenCalledTimes(2);
+    });
+    const first = vi.mocked(setOpeningPrice).mock.calls[0];
+    const retry = vi.mocked(setOpeningPrice).mock.calls[1];
+    expect(retry?.[4]).toBe(first?.[4]);
+    expect(first?.[5]).toBe(scheduleIdentity);
+    expect(retry?.[5]).toBe(scheduleIdentity);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
+    });
+    expect(screen.getByRole('button', { name: 'حفظ السعر' })).toBeDisabled();
+  });
+
+  it('approves the unchanged loss for an earlier interval with a reason and a reviewed impact', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-15T09:00:00.000Z'));
+    vi.mocked(listCostingSchedule).mockImplementation(() =>
+      Promise.resolve({
+        lossToken: 'loss-token',
+        identity: scheduleIdentity,
+        lossVersions: [
+          {
+            id: 'v1',
+            effectiveFrom: '2026-07-01T00:00:00.000Z',
+            effectiveTo: null,
+            valueText: '0.125',
+          },
+        ],
+        conversions: [],
+      }),
+    );
+    let resolveImpact: (value: {
+      orders: number;
+      shifts: number;
+      movements: number;
+    }) => void = () => undefined;
+    vi.mocked(costingImpact).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveImpact = resolve;
+        }),
+    );
+    await renderCatalog();
+    await editShrimp();
+    expect(screen.getByLabelText('نسبة الفاقد')).toHaveValue('12.5');
+    expect(screen.queryByLabelText('وقت السريان')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText(datedLossLabel));
+    fireEvent.change(screen.getByLabelText('وقت السريان'), {
+      target: { value: 'custom' },
+    });
+    fireEvent.change(screen.getByLabelText('الوقت'), {
+      target: { value: '2026-06-20T10:00' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    expect(screen.getByText('اكتب سبب التغيير بأثر رجعي')).toBeInTheDocument();
+    expect(setItemLoss).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('سبب التغيير'), {
+      target: { value: 'تصحيح' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    expect(screen.getByText(impactPendingMessage)).toBeInTheDocument();
+    expect(setItemLoss).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveImpact({ orders: 2, shifts: 1, movements: 4 });
+      await Promise.resolve();
+    });
+    expect(
+      await screen.findByText('ممكن يأثر على 2 طلب في 1 وردية (تقدير)'),
+    ).toBeInTheDocument();
+    expect(costingImpact).toHaveBeenCalledWith(
+      '2026-06-20T07:00:00.000Z',
+      '2026-07-01T00:00:00.000Z',
+      'shrimp',
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    await waitFor(() => {
+      expect(setItemLoss).toHaveBeenCalledTimes(1);
+    });
+    expect(setItemLoss).toHaveBeenCalledWith(
+      'shrimp',
+      '0.125',
+      expect.objectContaining({
+        effectiveFrom: '2026-06-20T07:00:00.000Z',
+        effectiveTo: '2026-07-01T00:00:00.000Z',
+        token: 'loss-token',
+        reason: 'تصحيح',
+      }),
+    );
+    expect(updateItem).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.queryByLabelText('سبب التغيير')).not.toBeInTheDocument();
+    });
+    expect(screen.getByLabelText(datedLossLabel)).not.toBeChecked();
+  });
+
+  it('does not publish an unchanged loss without an earlier effective time', async () => {
+    await renderCatalog();
+    await editShrimp();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    expect(setItemLoss).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByLabelText(datedLossLabel));
+    expect(screen.getByLabelText('وقت السريان')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    expect(
+      screen.getByText('اختار وقت سريان قبل الوقت الحالي'),
+    ).toBeInTheDocument();
+    expect(setItemLoss).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByLabelText(datedLossLabel));
+    expect(screen.queryByLabelText('وقت السريان')).not.toBeInTheDocument();
   });
 });

@@ -309,6 +309,11 @@ export function ItemsPage() {
               onClearServerError={() => setFormError(null)}
               detailsKey={formEpoch}
               onIdentityDirtyChange={setFormIdentityDirty}
+              onItemStale={(itemId) =>
+                reloadCatalog(itemId).catch((error: unknown) => {
+                  setLoadError(messageFrom(error));
+                })
+              }
               onSubmit={(action) => handleSubmit(action)}
               onCancel={() => {
                 if (busy) return;

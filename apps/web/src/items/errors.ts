@@ -10,6 +10,10 @@ export const costingChangedMessage = 'البيانات اتغيرت — حدّث
 export const saveDetailsFirstMessage =
   'النوع أو الوحدة الأساسية أو الأب اتغيّروا ولسه ماتحفظوش — احفظ البيانات الأول';
 
+/** The costing schedule belongs to a different identity than the one shown. */
+export const identityOutOfDateMessage =
+  'نوع الصنف أو وحدته اتغيّروا من مكان تاني — بنحدّث البيانات، استنى لحظة وجرّب تاني';
+
 export class StaleWriteError extends Error {
   constructor() {
     super(staleWriteMessage);

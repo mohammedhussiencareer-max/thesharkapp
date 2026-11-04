@@ -25,6 +25,7 @@ import {
 } from '@/items/effective';
 import {
   CostingChangedError,
+  identityOutOfDateMessage,
   saveDetailsFirstMessage,
   StaleWriteError,
 } from '@/items/errors';
@@ -40,6 +41,7 @@ vi.mock('@/items/api', () => ({
   listCostingSchedule: vi.fn(() =>
     Promise.resolve({
       lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      identity: 'kg|ingredient||',
       lossVersions: [],
       conversions: [],
     }),
@@ -113,6 +115,7 @@ describe('ConversionsPanel', () => {
     vi.mocked(listCostingSchedule).mockReset();
     vi.mocked(listCostingSchedule).mockResolvedValue({
       lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      identity: 'kg|ingredient||',
       lossVersions: [],
       conversions: [],
     });
@@ -476,6 +479,167 @@ describe('ConversionsPanel', () => {
     expect(addConversion).not.toHaveBeenCalled();
     expect(updateConversion).not.toHaveBeenCalled();
     expect(deleteConversion).not.toHaveBeenCalled();
+  });
+
+  it('blocks every conversion save while the schedule identity differs from the item shown', async () => {
+    const onItemStale = vi.fn();
+    const row = {
+      itemId: 'oil',
+      unit: 'كرتونة',
+      factorToBase: 12,
+      storedFactor: '12',
+    };
+    vi.mocked(listConversions)
+      .mockResolvedValueOnce(snapshot([row], 'kg'))
+      .mockResolvedValue(snapshot([row], 'liter'));
+    vi.mocked(listCostingSchedule).mockResolvedValue({
+      lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      identity: 'liter|ingredient||',
+      lossVersions: [],
+      conversions: [],
+    });
+
+    const view = render(
+      <ConversionsPanel item={item} onItemStale={onItemStale} />,
+    );
+    expect(await screen.findByText('1 كرتونة = 12 كيلو')).toBeInTheDocument();
+    expect(
+      await screen.findByRole('option', { name: 'كيس' }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText(identityOutOfDateMessage),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(onItemStale).toHaveBeenCalledWith('oil');
+    });
+
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كيس' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '2' },
+    });
+    fireEvent.change(screen.getByLabelText('معامل كرتونة'), {
+      target: { value: '13' },
+    });
+    expect(screen.getByRole('button', { name: 'ضيف التحويل' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'حفظ المعامل' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'احذف التحويل' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+    fireEvent.click(screen.getByRole('button', { name: 'احذف التحويل' }));
+    expect(addConversion).not.toHaveBeenCalled();
+    expect(updateConversion).not.toHaveBeenCalled();
+    expect(deleteConversion).not.toHaveBeenCalled();
+
+    const staleCalls = onItemStale.mock.calls.length;
+    view.rerender(
+      <ConversionsPanel
+        item={{ ...item, baseUnit: 'liter' }}
+        onItemStale={onItemStale}
+      />,
+    );
+    expect(await screen.findByText('1 كرتونة = 12 لتر')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        screen.queryByText(identityOutOfDateMessage),
+      ).not.toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ المعامل' })).toBeEnabled();
+    });
+    expect(screen.getByRole('button', { name: 'احذف التحويل' })).toBeEnabled();
+    expect(onItemStale).toHaveBeenCalledTimes(staleCalls);
+  });
+
+  it('approves the unchanged factor for an earlier interval with a reason and a reviewed impact', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-15T09:00:00.000Z'));
+    vi.mocked(listConversions).mockResolvedValue(
+      snapshot([
+        {
+          itemId: 'oil',
+          unit: 'كيس',
+          factorToBase: 2,
+          storedFactor: '2',
+          effectiveFrom: '2026-07-01T00:00:00.000Z',
+        },
+      ]),
+    );
+    vi.mocked(listCostingSchedule).mockResolvedValue({
+      lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      identity: 'kg|ingredient||',
+      lossVersions: [],
+      conversions: [
+        {
+          unitCode: 'كيس',
+          token: 'tok',
+          versions: [
+            {
+              id: 'v1',
+              effectiveFrom: '2026-07-01T00:00:00.000Z',
+              effectiveTo: null,
+              valueText: '2',
+            },
+          ],
+        },
+      ],
+    });
+    vi.mocked(costingImpact).mockResolvedValue({
+      orders: 3,
+      shifts: 1,
+      movements: 0,
+    });
+    vi.mocked(updateConversion).mockResolvedValue(undefined);
+    render(<ConversionsPanel item={item} />);
+    expect(await screen.findByText(/1 كيس = 2 كيلو/)).toBeInTheDocument();
+    const form = screen.getByRole('form', { name: 'تحويل كيس' });
+    await waitFor(() => {
+      expect(
+        within(form).getByRole('button', { name: 'حفظ المعامل' }),
+      ).toBeEnabled();
+    });
+
+    fireEvent.change(within(form).getByLabelText('وقت السريان'), {
+      target: { value: 'custom' },
+    });
+    fireEvent.change(within(form).getByLabelText('الوقت'), {
+      target: { value: '2026-06-20T10:00' },
+    });
+    fireEvent.click(within(form).getByRole('button', { name: 'حفظ المعامل' }));
+    expect(
+      within(form).getByText('اكتب سبب التغيير بأثر رجعي'),
+    ).toBeInTheDocument();
+    expect(updateConversion).not.toHaveBeenCalled();
+
+    fireEvent.change(within(form).getByLabelText('سبب التغيير'), {
+      target: { value: 'تصحيح' },
+    });
+    expect(
+      await within(form).findByText('ممكن يأثر على 3 طلب في 1 وردية (تقدير)'),
+    ).toBeInTheDocument();
+    fireEvent.click(within(form).getByRole('button', { name: 'حفظ المعامل' }));
+    await waitFor(() => {
+      expect(updateConversion).toHaveBeenCalledTimes(1);
+    });
+    expect(updateConversion).toHaveBeenCalledWith(
+      'oil',
+      'كيس',
+      '2',
+      '2',
+      'kg',
+      expect.objectContaining({
+        effectiveFrom: '2026-06-20T07:00:00.000Z',
+        effectiveTo: '2026-07-01T00:00:00.000Z',
+        reason: 'تصحيح',
+        token: 'tok',
+      }),
+    );
+    expect(costingImpact).toHaveBeenCalledWith(
+      '2026-06-20T07:00:00.000Z',
+      '2026-07-01T00:00:00.000Z',
+      'oil',
+    );
   });
 
   it('re-initializes the factor input when only the base unit changes', async () => {
@@ -963,6 +1127,7 @@ describe('ConversionsPanel', () => {
     vi.mocked(listCostingSchedule).mockImplementation(() =>
       Promise.resolve({
         lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+        identity: 'kg|ingredient||',
         lossVersions: [],
         conversions: [{ unitCode: 'كرتونة', token, versions: [] }],
       }),

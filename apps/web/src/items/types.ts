@@ -92,11 +92,8 @@ export type CostingSchedule = {
    * parent. Absent only in tests that never load a schedule response.
    */
   emptyToken?: string;
-  /**
-   * `base_unit|kind|parent_item_id|` for this item. Absent only in tests that
-   * never load a schedule response.
-   */
-  identity?: string;
+  /** `base_unit|kind|parent_item_id|` for this item. See `itemIdentity`. */
+  identity: string;
   lossVersions: CostingVersion[];
   conversions: {
     unitCode: string;
@@ -132,6 +129,13 @@ export type ItemSave =
       identity: string;
       requestId: string;
     };
+
+/** The schedule identity string the database computes for this item. */
+export function itemIdentity(
+  item: Pick<CatalogItem, 'baseUnit' | 'kind' | 'parentItemId'>,
+): string {
+  return `${item.baseUnit}|${item.kind}|${item.parentItemId ?? ''}|`;
+}
 
 export function isStockKind(value: string): value is StockKind {
   return (stockKinds as readonly string[]).includes(value);

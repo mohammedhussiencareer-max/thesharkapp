@@ -14,6 +14,7 @@ vi.mock('@/items/api', () => ({
   listCostingSchedule: vi.fn(() =>
     Promise.resolve({
       lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      identity: 'kg|ingredient||',
       lossVersions: [],
       conversions: [],
     }),

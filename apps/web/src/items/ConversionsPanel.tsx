@@ -31,6 +31,7 @@ import {
   type EffectiveMode,
 } from '@/items/effective';
 import {
+  identityOutOfDateMessage,
   messageFrom,
   saveDetailsFirstMessage,
   StaleWriteError,
@@ -45,14 +46,15 @@ import {
 import { UnknownSave } from '@/items/UnknownSave';
 import { formatStoredFactor } from '@/items/format';
 import { unitLabels } from '@/items/labels';
-import type {
-  BaseUnit,
-  CatalogItem,
-  CostingSchedule,
-  CostingVersion,
-  DatedWrite,
-  UnitCatalogOption,
-  UnitConversion,
+import {
+  itemIdentity,
+  type BaseUnit,
+  type CatalogItem,
+  type CostingSchedule,
+  type CostingVersion,
+  type DatedWrite,
+  type UnitCatalogOption,
+  type UnitConversion,
 } from '@/items/types';
 import { validateConversion } from '@/items/validation';
 import { formatCairo } from '@/lib/cairo';
@@ -420,12 +422,15 @@ export function ConversionsPanel({
   const aliveRef = useRef(false);
   const onItemStaleRef = useRef(onItemStale);
   const itemBaseUnitRef = useRef(item.baseUnit);
+  const identityKey = itemIdentity(item);
+  const itemIdentityRef = useRef(identityKey);
   const addFlight = useRef(false);
   const replayFlight = useRef(new Set<string>());
   useEffect(() => {
     onItemStaleRef.current = onItemStale;
     itemBaseUnitRef.current = item.baseUnit;
-  }, [item.baseUnit, onItemStale]);
+    itemIdentityRef.current = identityKey;
+  }, [identityKey, item.baseUnit, onItemStale]);
   const [rows, setRows] = useState<UnitConversion[] | null>(null);
   const [baseUnit, setBaseUnit] = useState<BaseUnit | null>(null);
   const [schedule, setSchedule] = useState<CostingSchedule | null>(null);
@@ -457,6 +462,11 @@ export function ConversionsPanel({
   const shiftStart = metaReady ? (meta?.shiftStart ?? null) : null;
   const unitOptions = metaReady ? (meta?.unitOptions ?? []) : [];
   const controlsDisabled = busy || locked || !metaReady || schedule === null;
+  // Fresh saves wait while the schedule is for another identity than the item
+  // shown. A held retry still replays unchanged.
+  const scheduleMismatch =
+    schedule !== null && schedule.identity !== identityKey;
+  const savesBlocked = identityDirty || scheduleMismatch;
   const addSubject =
     addCode.length === 0 ? '' : conversionSubject(item.id, addCode);
   const addHeld =
@@ -477,6 +487,7 @@ export function ConversionsPanel({
     async (
       itemId: string,
       next: ConversionList,
+      scheduleIdentity: string,
       requestId: number,
       cancelled: () => boolean,
     ) => {
@@ -485,7 +496,10 @@ export function ConversionsPanel({
       setRows(next.rows);
       setBaseUnit(next.baseUnit);
       setLoadError(null);
-      if (next.baseUnit !== itemBaseUnitRef.current) {
+      if (
+        next.baseUnit !== itemBaseUnitRef.current ||
+        scheduleIdentity !== itemIdentityRef.current
+      ) {
         await onItemStaleRef.current?.(itemId);
       }
     },
@@ -518,7 +532,13 @@ export function ConversionsPanel({
       ]);
       if (!aliveRef.current || requestId !== requestRef.current) return;
       setSchedule(nextSchedule);
-      await applySnapshot(item.id, next, requestId, () => false);
+      await applySnapshot(
+        item.id,
+        next,
+        nextSchedule.identity,
+        requestId,
+        () => false,
+      );
     } catch (error) {
       await failLoad(item.id, error, requestId, () => false);
     }
@@ -538,7 +558,13 @@ export function ConversionsPanel({
         if (!aliveRef.current || cancelled || requestId !== requestRef.current)
           return;
         setSchedule(nextSchedule);
-        await applySnapshot(item.id, next, requestId, () => cancelled);
+        await applySnapshot(
+          item.id,
+          next,
+          nextSchedule.identity,
+          requestId,
+          () => cancelled,
+        );
       } catch (error) {
         await failLoad(item.id, error, requestId, () => cancelled);
       }
@@ -548,7 +574,7 @@ export function ConversionsPanel({
       cancelled = true;
       aliveRef.current = false;
     };
-  }, [applySnapshot, failLoad, item.id]);
+  }, [applySnapshot, failLoad, identityKey, item.id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -713,7 +739,7 @@ export function ConversionsPanel({
 
   function onAdd(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!baseUnit || controlsDisabled || identityDirty || addFlight.current) {
+    if (!baseUnit || controlsDisabled || savesBlocked || addFlight.current) {
       return;
     }
     const code = unit === '__new__' ? customCode.trim() : unit.trim();
@@ -819,6 +845,9 @@ export function ConversionsPanel({
       {identityDirty ? (
         <p className="text-sm text-neutral-600">{saveDetailsFirstMessage}</p>
       ) : null}
+      {scheduleMismatch ? (
+        <p className="text-sm text-neutral-600">{identityOutOfDateMessage}</p>
+      ) : null}
       {rows.length === 0 && !shownError ? <p>مفيش تحويلات للصنف ده</p> : null}
       {rows.map((conversion) => {
         const entry = schedule?.conversions.find(
@@ -831,7 +860,7 @@ export function ConversionsPanel({
             baseLabel={baseLabel}
             baseUnit={baseUnit}
             disabled={controlsDisabled}
-            identityDirty={identityDirty}
+            identityDirty={savesBlocked}
             shiftStart={shiftStart}
             versions={entry?.versions ?? noVersions}
             token={entry?.token ?? schedule?.emptyToken ?? emptyScheduleToken}
@@ -947,7 +976,7 @@ export function ConversionsPanel({
         <button
           className={primaryButton}
           type="submit"
-          disabled={addDisabled || identityDirty}
+          disabled={addDisabled || savesBlocked}
         >
           ضيف التحويل
         </button>
