@@ -9,7 +9,7 @@ See [CLAUDE.md](CLAUDE.md) and [AI-WORKFLOW.md](AI-WORKFLOW.md). Design approved
 ## Hosted Supabase
 
 - Project `theshark`, ref `pltkoohfodvvmymlsycz`, region `eu-central-1`, free plan. URL and publishable key are in `apps/web/.env.production` (public values).
-- Migrations reach the hosted project through the Supabase MCP `apply_migration`, named after the file's suffix, only after the PR is merged. Applied: `baseline`, `owner_access`, `stock_ledger_core`, `owner_item_catalog`, `pos_sales` (2026-10-16) `pos_refunds_drawer`, `purchases_opening` and `expenses` (2026-10-21; hosted fingerprints match local, views included). `sorting` (2026-10-22). `counts` (2026-11-02), `backdated_recompute` (2026-11-03) and `costing_foundation` (2026-11-03) are applied with matching fingerprints. Advisors: `authenticated` may execute `is_owner`, `post_movements`, `post_sort`, `record_purchase`, `record_opening_stock`, the expense write RPCs, `record_sort`, `record_count` and the POS sync RPCs (intended: each checks the owner or service_role itself); `pos_sync_run_orders` has RLS with no policy (internal, no grants); leaked-password protection needs a paid plan.
+- Migrations reach the hosted project through the Supabase MCP `apply_migration`, named after the file's suffix, only after the PR is merged. Applied: `baseline`, `owner_access`, `stock_ledger_core`, `owner_item_catalog`, `pos_sales` (2026-10-16) `pos_refunds_drawer`, `purchases_opening` and `expenses` (2026-10-21; hosted fingerprints match local, views included). `sorting` (2026-10-22). `counts` (2026-11-02), `backdated_recompute` (2026-11-03), `costing_foundation` (2026-11-03) and `costing_cutover` (2026-11-04, hosted had no items yet) are applied with matching fingerprints. Advisors: `authenticated` may execute `is_owner`, `post_movements`, `post_sort`, `record_purchase`, `record_opening_stock`, the expense write RPCs, `record_sort`, `record_count` and the POS sync RPCs (intended: each checks the owner or service_role itself); `pos_sync_run_orders` has RLS with no policy (internal, no grants); leaked-password protection needs a paid plan.
 - Dashboard settings done by the owner: signups disabled, schema `app` exposed in the Data API. Recommended but optional: turn off "Automatically expose new tables".
 - Owner account linked in `app.owner`. Verified from outside: signup returns `signup_disabled`; anon gets `permission denied for schema app`.
 
@@ -37,7 +37,7 @@ Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner it
 
 ## Next
 
-- Hosted migration `costing_foundation` is applied (2026-11-03, fingerprints match). Pending hosted apply, after their PRs merge: `costing_cutover` (phase 4 PR 2) and `recipe_model` (phase 4 PR 3: recipes, dated recipe versions, immutable lines, `app.expand_recipe`, and the stock item identity freeze extended to items on current recipe lines; backend only, no screen yet).
+- Hosted migration `costing_foundation` is applied (2026-11-03, fingerprints match). `costing_cutover` (phase 4 PR 2) is applied (2026-11-04). Pending hosted apply after its PR merges: `recipe_model` (phase 4 PR 3: recipes, dated recipe versions, immutable lines, `app.expand_recipe`, and the stock item identity freeze extended to items on current recipe lines; backend only, no screen yet).
 - Recipes (import + add/edit screen) and POS→recipe mapping; deduction engine (cancel/refund cost decisions, waste); daily profit report; weekly count; server-side sync (Edge Function); PWA; daily backup with a restore test.
 
 ## Needs the owner
