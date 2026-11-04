@@ -13,6 +13,16 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$here/lib.sh"
 backup_init
 
+# A failed run must not leave a partial or unverified archive in the output directory.
+archive=""
+dump_done=0
+dump_cleanup() {
+  if [ "$dump_done" != 1 ] && [ -n "$archive" ] && [ "${BACKUP_KEEP_WORK:-0}" != 1 ]; then
+    rm -f "$archive" "$archive.sha256"
+  fi
+}
+exit_hook=dump_cleanup
+
 out_dir=${1:-}
 [ -n "$out_dir" ] || fail USAGE "usage: dump.sh <output-directory>"
 
@@ -63,6 +73,7 @@ step "verifying the new archive"
 verify_dir="$work_dir/verify"
 mkdir -p "$verify_dir"
 verify_archive "$archive" "$verify_dir"
+dump_done=1
 
 info "wrote $tag.tar.gz"
 printf '%s\n' "$archive"

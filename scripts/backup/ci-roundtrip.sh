@@ -101,14 +101,11 @@ make_empty_project() {
   ' "$repo_root/supabase/config.toml" >"$dir/supabase/config.toml"
 }
 
-rt_exit() {
-  local rc=$?
-  trap - EXIT
+# Installed only after the confirm check, so an unconfirmed run never stops the stack.
+stack_cleanup() {
   if [ "${BACKUP_ROUNDTRIP_KEEP_STACK:-0}" != 1 ]; then stack_stop; fi
-  (exit "$rc")
-  on_exit
 }
-trap rt_exit EXIT
+exit_hook=stack_cleanup
 
 sql() {
   psql -X -q -v ON_ERROR_STOP=1 -c "$1" >/dev/null

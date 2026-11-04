@@ -283,6 +283,9 @@ test('sanitizeStderr keeps only error lines and masks hosts and values', () => {
   assert.ok(!out.includes('1.2.3.4'));
   assert.ok(!out.includes('customer data'));
   assert.ok(!out.includes('Ahmed'));
-  assert.ok(!out.includes('DETAIL'));
+  assert.ok(!out.includes('abc'));
+  assert.ok(!out.includes('CONTEXT'));
+  assert.ok(!out.includes('select 1'));
+  assert.ok(out.includes('DETAIL:  Key (<redacted>)=(<redacted>) already'));
   assert.ok(out.includes('ERROR:  duplicate key'));
 });

@@ -29,9 +29,17 @@ step() {
   info "$1"
 }
 
+# A script may set exit_hook to a function; on_exit runs it (best effort)
+# before removing the work dir. It must honor BACKUP_KEEP_WORK itself.
+exit_hook=""
+
+# Runs on every exit path (EXIT, plus INT/TERM/HUP routed to exit). Errexit is
+# off so no failing command can skip the cleanup. BACKUP_KEEP_WORK=1 is the
+# only way to keep the work dir.
 on_exit() {
   local rc=$?
-  trap - EXIT
+  set +e
+  trap - EXIT INT TERM HUP
   if [ "$rc" -ne 0 ]; then
     if [ -z "$work_dir" ] || [ ! -e "$work_dir/reported" ]; then
       printf 'backup: error [FAILED]: step "%s" failed\n' "$current_step" >&3
@@ -39,6 +47,9 @@ on_exit() {
     if [ "${BACKUP_PRINT_STDERR:-0}" = 1 ] && [ -s "${BACKUP_STDERR_FILE:-/nonexistent}" ]; then
       node "$backup_dir/sanitize.mjs" "$BACKUP_STDERR_FILE" 2>&3 || true
     fi
+  fi
+  if [ -n "$exit_hook" ]; then
+    "$exit_hook" "$rc" || true
   fi
   if [ -n "$work_dir" ] && [ "${BACKUP_KEEP_WORK:-0}" != 1 ]; then
     rm -rf "$work_dir"
@@ -48,11 +59,14 @@ on_exit() {
 
 backup_init() {
   umask 077
+  trap on_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
   work_dir=$(mktemp -d "${TMPDIR:-/tmp}/backup.XXXXXX")
   BACKUP_STDERR_FILE="$work_dir/stderr.log"
   : >"$BACKUP_STDERR_FILE"
   export BACKUP_STDERR_FILE
-  trap on_exit EXIT
   exec 2>>"$BACKUP_STDERR_FILE"
 }
 
