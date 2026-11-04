@@ -91,9 +91,12 @@ stack_start() {
 make_empty_project() {
   local dir=$1
   mkdir -p "$dir/supabase"
+  # The API does not expose app yet: PostgREST fails its health check on a
+  # schema that does not exist, and the restore creates app later.
   awk '
-    /^\[/ { in_seed = ($0 == "[db.seed]") }
+    /^\[/ { in_seed = ($0 == "[db.seed]"); in_api = ($0 == "[api]") }
     in_seed && /^enabled[ ]*=/ { print "enabled = false"; next }
+    in_api && /^schemas[ ]*=/ { print "schemas = [\"public\", \"graphql_public\"]"; next }
     { print }
   ' "$repo_root/supabase/config.toml" >"$dir/supabase/config.toml"
 }
