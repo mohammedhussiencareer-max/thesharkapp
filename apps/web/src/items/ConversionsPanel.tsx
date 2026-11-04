@@ -30,7 +30,11 @@ import {
   nextVersionStart,
   type EffectiveMode,
 } from '@/items/effective';
-import { messageFrom, StaleWriteError } from '@/items/errors';
+import {
+  messageFrom,
+  saveDetailsFirstMessage,
+  StaleWriteError,
+} from '@/items/errors';
 import {
   beginAction,
   conversionSubject,
@@ -224,6 +228,7 @@ function ConversionRow({
   baseLabel,
   baseUnit,
   disabled,
+  identityDirty,
   shiftStart,
   versions,
   token,
@@ -233,6 +238,8 @@ function ConversionRow({
   baseLabel: string;
   baseUnit: BaseUnit;
   disabled: boolean;
+  /** Fresh saves wait; a held retry still replays unchanged. */
+  identityDirty: boolean;
   shiftStart: string | null;
   versions: readonly CostingVersion[];
   token: string;
@@ -275,7 +282,15 @@ function ConversionRow({
   }
 
   function begin(create: (write: DatedWrite) => ConversionAction) {
-    if (disabled || blocked || flight.current || hasAction(subject)) return;
+    if (
+      disabled ||
+      identityDirty ||
+      blocked ||
+      flight.current ||
+      hasAction(subject)
+    ) {
+      return;
+    }
     const built = timing.build();
     if (!built.ok) {
       setError(built.error);
@@ -290,7 +305,15 @@ function ConversionRow({
 
   function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (disabled || blocked || flight.current || hasAction(subject)) return;
+    if (
+      disabled ||
+      identityDirty ||
+      blocked ||
+      flight.current ||
+      hasAction(subject)
+    ) {
+      return;
+    }
     const parsed = validateConversion(conversion.unit, factor, baseUnit);
     if (!parsed.ok) {
       setError(parsed.error);
@@ -347,14 +370,14 @@ function ConversionRow({
             <button
               className={primaryButton}
               type="submit"
-              disabled={sectionDisabled}
+              disabled={sectionDisabled || identityDirty}
             >
               حفظ المعامل
             </button>
             <button
               className={secondaryButton}
               type="button"
-              disabled={sectionDisabled}
+              disabled={sectionDisabled || identityDirty}
               onClick={() =>
                 begin((write) => ({
                   kind: 'remove_conversion',
@@ -380,12 +403,15 @@ function ConversionRow({
 export function ConversionsPanel({
   item,
   locked = false,
+  identityDirty = false,
   onBusyChange,
   onItemStale,
 }: {
   item: CatalogItem;
   /** Set by the page while an item save is in flight. */
   locked?: boolean;
+  /** The open editor holds a kind, base unit or parent that is not saved. */
+  identityDirty?: boolean;
   onBusyChange?: (busy: boolean) => void;
   /** The snapshot base unit no longer matches the item the page rendered. */
   onItemStale?: (itemId: string) => void | Promise<void>;
@@ -409,6 +435,8 @@ export function ConversionsPanel({
     unitOptions: UnitCatalogOption[];
   } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [metaError, setMetaError] = useState<string | null>(null);
+  const [metaAttempt, setMetaAttempt] = useState(0);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionEpoch, setActionEpoch] = useState(0);
@@ -524,22 +552,28 @@ export function ConversionsPanel({
 
   useEffect(() => {
     let cancelled = false;
-    void Promise.all([currentShiftStart(), listUnitOptions()])
-      .then(([shift, options]) => {
+    void (async () => {
+      try {
+        const [shift, options] = await Promise.all([
+          currentShiftStart(),
+          listUnitOptions(),
+        ]);
         if (cancelled) return;
-        setMeta({
-          itemId: item.id,
-          shiftStart: shift,
-          unitOptions: options,
-        });
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) setLoadError(messageFrom(error));
-      });
+        setMeta({ itemId: item.id, shiftStart: shift, unitOptions: options });
+        setMetaError(null);
+      } catch (error) {
+        if (!cancelled) setMetaError(messageFrom(error));
+      }
+    })();
     return () => {
       cancelled = true;
     };
-  }, [item.id]);
+  }, [item.id, metaAttempt]);
+
+  function retryLoad() {
+    void load();
+    setMetaAttempt((attempt) => attempt + 1);
+  }
 
   async function run(work: () => Promise<void>): Promise<boolean> {
     if (busy || locked) return false;
@@ -679,7 +713,9 @@ export function ConversionsPanel({
 
   function onAdd(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!baseUnit || controlsDisabled || addFlight.current) return;
+    if (!baseUnit || controlsDisabled || identityDirty || addFlight.current) {
+      return;
+    }
     const code = unit === '__new__' ? customCode.trim() : unit.trim();
     const subject = conversionSubject(item.id, code);
     if (hasAction(subject)) return;
@@ -751,15 +787,13 @@ export function ConversionsPanel({
     send(action);
   }
 
-  if ((rows === null || baseUnit === null) && loadError) {
+  const shownError = loadError ?? metaError;
+
+  if ((rows === null || baseUnit === null) && shownError) {
     return (
       <div className="flex flex-col gap-2">
-        <p role="alert">{loadError}</p>
-        <button
-          className={secondaryButton}
-          type="button"
-          onClick={() => void load()}
-        >
+        <p role="alert">{shownError}</p>
+        <button className={secondaryButton} type="button" onClick={retryLoad}>
           إعادة المحاولة
         </button>
       </div>
@@ -774,19 +808,18 @@ export function ConversionsPanel({
 
   return (
     <div className="flex flex-col gap-3">
-      {loadError ? (
+      {shownError ? (
         <div className="flex flex-col gap-2">
-          <p role="alert">{loadError}</p>
-          <button
-            className={secondaryButton}
-            type="button"
-            onClick={() => void load()}
-          >
+          <p role="alert">{shownError}</p>
+          <button className={secondaryButton} type="button" onClick={retryLoad}>
             إعادة المحاولة
           </button>
         </div>
       ) : null}
-      {rows.length === 0 && !loadError ? <p>مفيش تحويلات للصنف ده</p> : null}
+      {identityDirty ? (
+        <p className="text-sm text-neutral-600">{saveDetailsFirstMessage}</p>
+      ) : null}
+      {rows.length === 0 && !shownError ? <p>مفيش تحويلات للصنف ده</p> : null}
       {rows.map((conversion) => {
         const entry = schedule?.conversions.find(
           (candidate) => candidate.unitCode === conversion.unit,
@@ -798,6 +831,7 @@ export function ConversionsPanel({
             baseLabel={baseLabel}
             baseUnit={baseUnit}
             disabled={controlsDisabled}
+            identityDirty={identityDirty}
             shiftStart={shiftStart}
             versions={entry?.versions ?? noVersions}
             token={entry?.token ?? schedule?.emptyToken ?? emptyScheduleToken}
@@ -910,7 +944,11 @@ export function ConversionsPanel({
         {addHeld ? (
           <UnknownSave disabled={busy || locked} onRetry={retryAdd} />
         ) : null}
-        <button className={primaryButton} type="submit" disabled={addDisabled}>
+        <button
+          className={primaryButton}
+          type="submit"
+          disabled={addDisabled || identityDirty}
+        >
           ضيف التحويل
         </button>
       </form>

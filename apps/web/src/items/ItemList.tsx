@@ -13,6 +13,7 @@ function ItemCard({
   conversionsOpen,
   editsDisabled,
   conversionsLocked,
+  identityDirty,
   onEdit,
   onToggleConversions,
   onConversionsBusy,
@@ -22,6 +23,7 @@ function ItemCard({
   conversionsOpen: boolean;
   editsDisabled: boolean;
   conversionsLocked: boolean;
+  identityDirty: boolean;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusy: (busy: boolean) => void;
@@ -89,6 +91,7 @@ function ItemCard({
         <ConversionsPanel
           item={item}
           locked={editsDisabled}
+          identityDirty={identityDirty}
           onBusyChange={onConversionsBusy}
           onItemStale={onItemStale}
         />
@@ -111,6 +114,7 @@ export function ItemList({
   showInactive,
   openConversionsId,
   editsDisabled,
+  identityDirtyId = null,
   onEdit,
   onToggleConversions,
   onConversionsBusyChange,
@@ -120,6 +124,8 @@ export function ItemList({
   showInactive: boolean;
   openConversionsId: string | null;
   editsDisabled: boolean;
+  /** The item whose open editor holds an unsaved kind, base unit or parent. */
+  identityDirtyId?: string | null;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusyChange?: (busy: boolean) => void;
@@ -139,6 +145,7 @@ export function ItemList({
       conversionsOpen={openConversionsId === item.id}
       editsDisabled={editsDisabled}
       conversionsLocked={conversionsBusy || editsDisabled}
+      identityDirty={identityDirtyId === item.id}
       onEdit={onEdit}
       onToggleConversions={onToggleConversions}
       onConversionsBusy={setConversionsBusy}
@@ -166,6 +173,7 @@ export function ItemList({
                   conversionsOpen={openConversionsId === block.parent.id}
                   editsDisabled={editsDisabled}
                   conversionsLocked={conversionsBusy || editsDisabled}
+                  identityDirty={identityDirtyId === block.parent.id}
                   onEdit={onEdit}
                   onToggleConversions={onToggleConversions}
                   onConversionsBusy={setConversionsBusy}

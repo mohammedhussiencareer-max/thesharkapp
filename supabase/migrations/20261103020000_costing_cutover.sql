@@ -6,6 +6,28 @@
 -- A movement before that instant, in a unit other than the base unit, needs
 -- an owner-approved interval that covers it. There is no GUC bypass.
 -- ============================================================================
+-- 0. Lock order. Every ledger and legacy conversion writer takes the ledger
+-- advisory lock first and its table locks after. This migration does the same:
+-- the advisory lock is the first statement, before any DDL, then the tables it
+-- changes are locked in one fixed order. Do not move any statement above them.
+-- ============================================================================
+select
+  pg_catalog.pg_advisory_xact_lock (7342750000000000001::bigint);
+
+-- A DO block, because the migration runner sends no explicit BEGIN and a
+-- top-level LOCK TABLE needs one.
+do $lock_tables$
+begin
+  lock table app.units,
+  app.stock_items,
+  app.item_unit_conversions,
+  app.costing_changes,
+  app.item_loss_versions,
+  app.item_conversion_versions in share row exclusive mode;
+end;
+$lock_tables$;
+
+-- ============================================================================
 -- A. Freeze the legacy columns. Insert of the default loss 0 still succeeds
 -- so new rows can be created; any other loss_pct write is rejected.
 -- ============================================================================
@@ -3165,18 +3187,11 @@ where
 
 comment on view app.item_units_current is 'Usable units of each active item at now(): the base unit, explicit current conversions, and implicit metric units that are not already explicit. Owner rows come from the underlying RLS policies.';
 
-create function app.item_units_at (p_item_ids uuid[], p_at timestamptz) returns table (
-  item_id uuid,
-  unit_code text,
-  label_ar text,
-  factor_to_base numeric,
-  factor_text text,
-  source text,
-  version_id uuid,
-  effective_from timestamptz
-) language plpgsql stable security invoker
+create function app.item_units_at (p_item_ids uuid[], p_at timestamptz) returns jsonb language plpgsql stable security invoker
 set
   search_path = '' as $$
+declare
+  v_result jsonb;
 begin
   if coalesce(app.is_owner (), false) is not true then
     raise exception 'insufficient_privilege'
@@ -3194,74 +3209,105 @@ begin
       using errcode = '22023';
   end if;
 
-  return query
   select
-    si.id,
-    si.base_unit,
-    bu.label_ar,
-    1::numeric,
-    '1'::text,
-    'base'::text,
-    null::uuid,
-    null::timestamptz
+    coalesce(
+      pg_catalog.jsonb_object_agg(g.item_id::text, g.units),
+      '{}'::jsonb
+    ) into v_result
   from
-    app.stock_items si
-    join app.units bu on bu.code = si.base_unit
-  where
-    si.id = any (p_item_ids)
-  union all
-  select
-    si.id,
-    v.unit_code,
-    u.label_ar,
-    v.factor_to_base,
-    pg_catalog.trim_scale(v.factor_to_base)::text,
-    'explicit'::text,
-    v.id,
-    v.effective_from
-  from
-    app.stock_items si
-    join app.item_conversion_versions v on v.item_id = si.id
-    and v.superseded_change_id is null
-    and v.valid_during @> p_at
-    join app.units u on u.code = v.unit_code
-  where
-    si.id = any (p_item_ids)
-  union all
-  select
-    si.id,
-    u.code,
-    u.label_ar,
-    u.metric_scale / bu.metric_scale,
-    pg_catalog.trim_scale(u.metric_scale / bu.metric_scale)::text,
-    'implicit'::text,
-    null::uuid,
-    null::timestamptz
-  from
-    app.stock_items si
-    join app.units bu on bu.code = si.base_unit
-    join app.units u on u.dimension = bu.dimension
-    and u.dimension in ('mass', 'volume')
-    and u.code <> bu.code
-    and u.metric_scale is not null
-    and bu.metric_scale is not null
-  where
-    si.id = any (p_item_ids)
-    and not exists (
+    (
       select
-        1
+        r.item_id,
+        pg_catalog.jsonb_agg(
+          pg_catalog.jsonb_build_object(
+            'unit_code',
+            r.unit_code,
+            'label_ar',
+            r.label_ar,
+            'factor_text',
+            r.factor_text,
+            'source',
+            r.source,
+            'version_id',
+            r.version_id,
+            'effective_from',
+            r.effective_from
+          )
+          order by
+            r.unit_code collate "C"
+        ) as units
       from
-        app.item_conversion_versions v
-      where
-        v.item_id = si.id
-        and v.unit_code = u.code
-        and v.superseded_change_id is null
-        and v.valid_during @> p_at
-    );
+        (
+          select
+            si.id as item_id,
+            si.base_unit as unit_code,
+            bu.label_ar,
+            '1'::text as factor_text,
+            'base'::text as source,
+            null::uuid as version_id,
+            null::timestamptz as effective_from
+          from
+            app.stock_items si
+            join app.units bu on bu.code = si.base_unit
+          where
+            si.id = any (p_item_ids)
+          union all
+          select
+            si.id,
+            v.unit_code,
+            u.label_ar,
+            pg_catalog.trim_scale(v.factor_to_base)::text,
+            'explicit'::text,
+            v.id,
+            v.effective_from
+          from
+            app.stock_items si
+            join app.item_conversion_versions v on v.item_id = si.id
+            and v.superseded_change_id is null
+            and v.valid_during @> p_at
+            join app.units u on u.code = v.unit_code
+          where
+            si.id = any (p_item_ids)
+          union all
+          select
+            si.id,
+            u.code,
+            u.label_ar,
+            pg_catalog.trim_scale(u.metric_scale / bu.metric_scale)::text,
+            'implicit'::text,
+            null::uuid,
+            null::timestamptz
+          from
+            app.stock_items si
+            join app.units bu on bu.code = si.base_unit
+            join app.units u on u.dimension = bu.dimension
+            and u.dimension in ('mass', 'volume')
+            and u.code <> bu.code
+            and u.metric_scale is not null
+            and bu.metric_scale is not null
+          where
+            si.id = any (p_item_ids)
+            and not exists (
+              select
+                1
+              from
+                app.item_conversion_versions v
+              where
+                v.item_id = si.id
+                and v.unit_code = u.code
+                and v.superseded_change_id is null
+                and v.valid_during @> p_at
+            )
+        ) r
+      group by
+        r.item_id
+    ) g;
+
+  return v_result;
 end;
 $$;
 
-comment on function app.item_units_at (uuid[], timestamptz) is 'Same columns as item_units_current, resolved at p_at for the requested items, including inactive items. Owner only.';
+comment on function app.item_units_at (uuid[], timestamptz) is 'The usable units of the requested items at p_at, including inactive items, as one jsonb object keyed by item id. Each value is an array ordered by unit_code of {unit_code, label_ar, factor_text, source, version_id, effective_from}, with the base row first-class (source base). A single value is not row-capped. Owner only.';
 
 create function app.current_shift_start () returns timestamptz language plpgsql stable security invoker
 set

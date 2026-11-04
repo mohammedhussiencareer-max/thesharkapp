@@ -23,7 +23,11 @@ import {
   nextVersionStart,
   type EffectiveMode,
 } from '@/items/effective';
-import { isConfirmedConfigurationChange, messageFrom } from '@/items/errors';
+import {
+  isConfirmedConfigurationChange,
+  messageFrom,
+  saveDetailsFirstMessage,
+} from '@/items/errors';
 import {
   beginAction,
   createSubject,
@@ -90,6 +94,7 @@ export function ItemForm({
   onSubmit,
   onCancel,
   detailsKey = 0,
+  onIdentityDirtyChange,
 }: {
   items: readonly CatalogItem[];
   editingId?: string;
@@ -103,6 +108,8 @@ export function ItemForm({
   onCancel: () => void;
   /** Bumped after a stale details reload. Resets details only. */
   detailsKey?: number;
+  /** True while kind, base unit or parent differs from the saved item. */
+  onIdentityDirtyChange?: (dirty: boolean) => void;
 }) {
   const titleId = useId();
   const [values, setValues] = useState(initial ?? emptyItemForm);
@@ -153,6 +160,13 @@ export function ItemForm({
   const title = editingId ? 'تعديل الصنف' : 'صنف جديد';
   const editing = items.find((item) => item.id === editingId);
   const identityLocked = editing?.identityLocked === true;
+  // A configuration write is approved for the saved identity. While the
+  // editor shows a different one, no fresh price, loss or conversion goes out.
+  const identityDirty =
+    editing !== undefined &&
+    (values.kind !== editing.kind ||
+      values.baseUnit !== editing.baseUnit ||
+      values.parentItemId !== (editing.parentItemId ?? ''));
   const identityTick = heldEpoch;
   const identityPending =
     editingId === undefined || identityTick < 0
@@ -192,6 +206,11 @@ export function ItemForm({
     () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
     [],
   );
+
+  useEffect(() => {
+    onIdentityDirtyChange?.(identityDirty);
+    return () => onIdentityDirtyChange?.(false);
+  }, [identityDirty, onIdentityDirtyChange]);
 
   useEffect(() => {
     if (!editingId) return;
@@ -424,6 +443,7 @@ export function ItemForm({
       !editingId ||
       submitting ||
       locked ||
+      identityDirty ||
       refreshingSchedule ||
       lossFlight.current ||
       hasAction(lossSubject(editingId))
@@ -511,6 +531,7 @@ export function ItemForm({
       !editingId ||
       submitting ||
       locked ||
+      identityDirty ||
       priceFlight.current ||
       hasAction(priceSubject(editingId))
     ) {
@@ -664,6 +685,11 @@ export function ItemForm({
             <p className="text-sm text-neutral-600">
               الصنف ده اتحدد أو عليه حركات، فالنوع والوحدة الأساسية والأب
               متقفلين
+            </p>
+          ) : null}
+          {identityDirty ? (
+            <p className="text-sm text-neutral-600">
+              {saveDetailsFirstMessage}
             </p>
           ) : null}
         </div>
@@ -833,7 +859,7 @@ export function ItemForm({
               <button
                 className={primaryButton}
                 type="button"
-                disabled={lossDisabled || refreshingSchedule}
+                disabled={lossDisabled || refreshingSchedule || identityDirty}
                 onClick={saveLoss}
               >
                 حفظ الفاقد
@@ -841,7 +867,7 @@ export function ItemForm({
               <button
                 className={primaryButton}
                 type="button"
-                disabled={priceDisabled}
+                disabled={priceDisabled || identityDirty}
                 onClick={savePrice}
               >
                 حفظ السعر

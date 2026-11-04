@@ -915,9 +915,7 @@ isOneToOne: false
 { Args: { "p_at": string,"p_item_id": string }; Returns: number
                            },
 "item_units_at":
-{ Args: { "p_at": string,"p_item_ids": (string)[] }; Returns: {
-              "effective_from": string,"factor_text": string,"factor_to_base": number,"item_id": string,"label_ar": string,"source": string,"unit_code": string,"version_id": string
-            }[]
+{ Args: { "p_at": string,"p_item_ids": (string)[] }; Returns: Json
                            },
 "legacy_costing_snapshot_work":
 { Args: { "p_at": string,"p_change_id": number }; Returns: Json

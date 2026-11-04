@@ -161,23 +161,33 @@ export async function listUnitsAt(
   const grouped: Record<string, UnitOption[]> = {};
   for (const id of itemIds) grouped[id] = [];
   if (itemIds.length === 0) return grouped;
+  // One jsonb object keyed by item id, so the API row cap cannot cut a list.
   const { data, error } = await appDb().rpc('item_units_at', {
     p_item_ids: [...itemIds],
     p_at: atIso,
   });
   throwIfError(error);
-  for (const row of data ?? []) {
-    if (!row || row.source === 'base') continue;
-    if (typeof row.item_id !== 'string' || typeof row.unit_code !== 'string') {
-      throw new Error(genericPurchaseError);
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    throw new Error(genericPurchaseError);
+  }
+  for (const [id, list] of Object.entries(grouped)) {
+    const units = data[id];
+    if (units === undefined) continue;
+    if (!Array.isArray(units)) throw new Error(genericPurchaseError);
+    for (const row of units) {
+      if (typeof row !== 'object' || row === null || Array.isArray(row)) {
+        throw new Error(genericPurchaseError);
+      }
+      if (row.source === 'base') continue;
+      if (typeof row.unit_code !== 'string') {
+        throw new Error(genericPurchaseError);
+      }
+      list.push({
+        unit: row.unit_code,
+        factorToBase: exactDecimal(row.factor_text),
+        label: typeof row.label_ar === 'string' ? row.label_ar : row.unit_code,
+      });
     }
-    const bucket = grouped[row.item_id] ?? [];
-    bucket.push({
-      unit: row.unit_code,
-      factorToBase: exactDecimal(row.factor_text),
-      label: typeof row.label_ar === 'string' ? row.label_ar : row.unit_code,
-    });
-    grouped[row.item_id] = bucket;
   }
   for (const list of Object.values(grouped)) {
     list.sort((left, right) =>

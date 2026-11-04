@@ -7,6 +7,7 @@ import {
   listConversions,
   listCostingSchedule,
   listItems,
+  listUnitOptions,
   setItemLoss,
   setOpeningPrice,
   updateConversion,
@@ -46,6 +47,7 @@ function query(result: { data: unknown; error: unknown }) {
     return chain;
   };
   chain.order = self;
+  chain.range = self;
   chain.delete = self;
   chain.eq = (column: string, value: unknown) => {
     captured.filters.push({ op: 'eq', column, value });
@@ -536,6 +538,64 @@ describe('catalog api', () => {
       'set_item_conversion',
       expect.objectContaining({ p_factor: '999999999.999999999' }),
     );
+  });
+
+  it('reads every unit of an item and every unit option past the 1000 row API cap', async () => {
+    const row = (code: string, source: string) => ({
+      item_id: 'oil',
+      unit_code: code,
+      label_ar: code,
+      factor_to_base: 2,
+      factor_text: '2',
+      source,
+      version_id: null,
+      effective_from: null,
+    });
+    const served = [
+      row('kg', 'base'),
+      ...Array.from({ length: 1499 }, (_, index) =>
+        row(`u${String(index).padStart(4, '0')}`, 'explicit'),
+      ),
+    ];
+    const units = Array.from({ length: 1200 }, (_, index) => ({
+      code: `c${String(index).padStart(4, '0')}`,
+      label_ar: `و${index}`,
+    }));
+    const pages: { table: string; from: number; to: number }[] = [];
+    mocks.schema.mockReturnValue({
+      from: (table: string) => {
+        const chain: Record<string, unknown> = {};
+        let window = { from: 0, to: 0 };
+        chain.select = () => chain;
+        chain.eq = () => chain;
+        chain.order = () => chain;
+        chain.range = (from: number, to: number) => {
+          pages.push({ table, from, to });
+          window = { from, to };
+          return chain;
+        };
+        chain.then = (resolve: (value: unknown) => unknown) => {
+          const all = table === 'units' ? units : served;
+          return Promise.resolve({
+            data: all.slice(window.from, window.to + 1),
+            error: null,
+          }).then(resolve);
+        };
+        return chain;
+      },
+    });
+
+    const snapshot = await listConversions('oil');
+    const options = await listUnitOptions();
+
+    expect(snapshot.rows).toHaveLength(1499);
+    expect(options).toHaveLength(1200);
+    expect(pages).toEqual([
+      { table: 'item_units_current', from: 0, to: 999 },
+      { table: 'item_units_current', from: 1000, to: 1999 },
+      { table: 'units', from: 0, to: 999 },
+      { table: 'units', from: 1000, to: 1999 },
+    ]);
   });
 
   it('throws StaleWriteError when the conversion snapshot item is missing', async () => {

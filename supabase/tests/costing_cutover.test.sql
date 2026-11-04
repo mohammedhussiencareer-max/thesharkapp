@@ -1055,26 +1055,222 @@ select
   is (
     (
       select
-        factor_text
+        e ->> 'factor_text'
       from
-        app.item_units_at (
-          array[
-            (
-              select
-                id
-              from
-                app.stock_items
-              where
-                name = 'صنف شراء'
-            )
-          ],
-          '2020-06-01T00:00:00Z'
-        )
+        jsonb_array_elements(
+          app.item_units_at (
+            array[
+              (
+                select
+                  id
+                from
+                  app.stock_items
+                where
+                  name = 'صنف شراء'
+              )
+            ],
+            '2020-06-01T00:00:00Z'
+          ) -> (
+            select
+              id::text
+            from
+              app.stock_items
+            where
+              name = 'صنف شراء'
+          )
+        ) e
       where
-        unit_code = 'علبة'
+        e ->> 'unit_code' = 'علبة'
     ),
     '12',
     'item_units_at resolves the factor that was in force at t1'
+  );
+
+select
+  results_eq (
+    $$select e ->> 'unit_code', e ->> 'source', e ->> 'factor_text'
+      from jsonb_array_elements(
+        app.item_units_at(
+          array[(select id from app.stock_items where name = 'صنف شراء')],
+          '2020-06-01T00:00:00Z'
+        ) -> (select id::text from app.stock_items where name = 'صنف شراء')
+      ) with ordinality as t (e, n)
+      order by n$$,
+    $$values
+      ('g'::text, 'implicit'::text, '0.001'::text),
+      ('kg'::text, 'base'::text, '1'::text),
+      ('علبة'::text, 'explicit'::text, '12'::text)$$,
+    'item_units_at returns one array per item, ordered by unit code'
+  );
+
+select
+  is (
+    (
+      select
+        array_agg(
+          k
+          order by
+            k
+        )
+      from
+        jsonb_object_keys(
+          app.item_units_at (
+            array[
+              (
+                select
+                  id
+                from
+                  app.stock_items
+                where
+                  name = 'صنف شراء'
+              ),
+              'd4000000-0000-4000-8000-0000000fffff'
+            ],
+            '2020-06-01T00:00:00Z'
+          )
+        ) k
+    ),
+    array[
+      (
+        select
+          id::text
+        from
+          app.stock_items
+        where
+          name = 'صنف شراء'
+      )
+    ],
+    'item_units_at is keyed by the requested items that exist'
+  );
+
+select
+  is (
+    app.item_units_at (array[]::uuid[], '2020-06-01T00:00:00Z'),
+    '{}'::jsonb,
+    'item_units_at of no items is an empty object'
+  );
+
+select
+  is (
+    jsonb_typeof(
+      app.item_units_at (
+        array[
+          (
+            select
+              id
+            from
+              app.stock_items
+            where
+              name = 'صنف شراء'
+          )
+        ],
+        '2020-06-01T00:00:00Z'
+      ) -> (
+        select
+          id::text
+        from
+          app.stock_items
+        where
+          name = 'صنف شراء'
+      ) -> 1 -> 'version_id'
+    ),
+    'null',
+    'the base row carries a null version id'
+  );
+
+reset role;
+
+insert into
+  app.stock_items (name, kind, base_unit, count_frequency, active)
+values
+  (
+    'صنف موقوف للوحدات',
+    'ingredient',
+    'liter',
+    'weekly',
+    false
+  );
+
+set
+  local role authenticated;
+
+select
+  results_eq (
+    $$select e ->> 'unit_code', e ->> 'source'
+      from jsonb_array_elements(
+        app.item_units_at(
+          array[(select id from app.stock_items where name = 'صنف موقوف للوحدات')],
+          '2020-06-01T00:00:00Z'
+        ) -> (select id::text from app.stock_items where name = 'صنف موقوف للوحدات')
+      ) with ordinality as t (e, n)
+      order by n$$,
+    $$values
+      ('liter'::text, 'base'::text),
+      ('ml'::text, 'implicit'::text)$$,
+    'item_units_at includes the units of an inactive item'
+  );
+
+reset role;
+
+insert into
+  app.stock_items (name, kind, base_unit, count_frequency)
+select
+  'صنف وحدات ' || n,
+  'ingredient',
+  'kg',
+  'weekly'
+from
+  generate_series(1, 1001) as n;
+
+set
+  local role authenticated;
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        jsonb_object_keys(
+          app.item_units_at (
+            (
+              select
+                array_agg(id)
+              from
+                app.stock_items
+              where
+                name like 'صنف وحدات %'
+            ),
+            '2020-06-01T00:00:00Z'
+          )
+        )
+    ),
+    1001::bigint,
+    'item_units_at returns every requested item above the 1000 row API cap'
+  );
+
+select
+  is (
+    (
+      select
+        sum(jsonb_array_length(value))
+      from
+        jsonb_each(
+          app.item_units_at (
+            (
+              select
+                array_agg(id)
+              from
+                app.stock_items
+              where
+                name like 'صنف وحدات %'
+            ),
+            '2020-06-01T00:00:00Z'
+          )
+        )
+    ),
+    2002::bigint,
+    'item_units_at returns every unit of those items, base and implicit, with none dropped'
   );
 
 reset role;
@@ -1481,24 +1677,33 @@ select
   ok (
     (
       select
-        factor_to_base = 0.92
+        (e ->> 'factor_text')::numeric = 0.92
       from
-        app.item_units_at (
-          array[
-            (
-              select
-                id
-              from
-                app.stock_items
-              where
-                name = 'صنف بلا فاقد'
-            )
-          ],
-          pg_catalog.date_trunc ('minute', pg_catalog.now ())
-        )
+        jsonb_array_elements(
+          app.item_units_at (
+            array[
+              (
+                select
+                  id
+                from
+                  app.stock_items
+                where
+                  name = 'صنف بلا فاقد'
+              )
+            ],
+            pg_catalog.date_trunc ('minute', pg_catalog.now ())
+          ) -> (
+            select
+              id::text
+            from
+              app.stock_items
+            where
+              name = 'صنف بلا فاقد'
+          )
+        ) e
       where
-        unit_code = 'liter'
-        and source = 'explicit'
+        e ->> 'unit_code' = 'liter'
+        and e ->> 'source' = 'explicit'
     ),
     'a conversion from now is in force at the start of the same minute'
   );

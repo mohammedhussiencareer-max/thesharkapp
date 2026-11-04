@@ -11,7 +11,9 @@ import {
   settleAction,
   unitSubject,
 } from '@/items/request-id';
+import type { Database } from '@/lib/database.types';
 import { exactDecimal } from '@/lib/decimal';
+import { readAllPages } from '@/lib/paged';
 import { isDefiniteRefusal } from '@/lib/write-outcome';
 import { supabase } from '@/lib/supabase';
 import {
@@ -247,20 +249,25 @@ function isSource(value: unknown): value is UnitSource {
   return value === 'base' || value === 'explicit' || value === 'implicit';
 }
 
+type UnitRow = Database['app']['Views']['item_units_current']['Row'];
+
 export type ConversionList = {
   baseUnit: BaseUnit;
   rows: UnitConversion[];
 };
 
 export async function listConversions(itemId: string): Promise<ConversionList> {
-  const { data, error } = await appDb()
-    .from('item_units_current')
-    .select(
-      'item_id, unit_code, label_ar, factor_to_base, factor_text, source, version_id, effective_from',
-    )
-    .eq('item_id', itemId);
-  throwIfError(error);
-  const raw = data ?? [];
+  // Paged by unit code, which is unique per item, so no list is cut at the API row cap.
+  const raw = await readAllPages<UnitRow>(
+    appDb()
+      .from('item_units_current')
+      .select(
+        'item_id, unit_code, label_ar, factor_to_base, factor_text, source, version_id, effective_from',
+      )
+      .eq('item_id', itemId)
+      .order('unit_code', { ascending: true }),
+    genericCatalogError,
+  );
   if (raw.length === 0) {
     const item = await appDb()
       .from('stock_items')
@@ -307,12 +314,17 @@ export async function listConversions(itemId: string): Promise<ConversionList> {
 }
 
 export async function listUnitOptions(): Promise<UnitCatalogOption[]> {
-  const { data, error } = await appDb()
-    .from('units')
-    .select('code, label_ar')
-    .order('label_ar');
-  throwIfError(error);
-  return (data ?? []).map((row) => ({ code: row.code, labelAr: row.label_ar }));
+  // Paged by code, which never changes; sorted by label afterwards.
+  const rows = await readAllPages<{ code: string; label_ar: string }>(
+    appDb()
+      .from('units')
+      .select('code, label_ar')
+      .order('code', { ascending: true }),
+    genericCatalogError,
+  );
+  return rows
+    .map((row) => ({ code: row.code, labelAr: row.label_ar }))
+    .sort((left, right) => left.labelAr.localeCompare(right.labelAr, 'ar'));
 }
 
 function versionOf(value: unknown, valueKey: string): CostingVersion {

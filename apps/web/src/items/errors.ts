@@ -6,6 +6,10 @@ export const staleWriteMessage =
 /** A dated loss or conversion lost the race with another schedule write. */
 export const costingChangedMessage = 'البيانات اتغيرت — حدّث الصفحة وجرّب تاني';
 
+/** The editor shows a kind, base unit or parent that is not saved yet. */
+export const saveDetailsFirstMessage =
+  'النوع أو الوحدة الأساسية أو الأب اتغيّروا ولسه ماتحفظوش — احفظ البيانات الأول';
+
 export class StaleWriteError extends Error {
   constructor() {
     super(staleWriteMessage);

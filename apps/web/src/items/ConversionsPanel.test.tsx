@@ -23,7 +23,11 @@ import {
   impactLoadingMessage,
   impactPendingMessage,
 } from '@/items/effective';
-import { CostingChangedError, StaleWriteError } from '@/items/errors';
+import {
+  CostingChangedError,
+  saveDetailsFirstMessage,
+  StaleWriteError,
+} from '@/items/errors';
 import { resetHeldWrites, unknownSaveMessage } from '@/items/request-id';
 import type { BaseUnit, CatalogItem, UnitConversion } from '@/items/types';
 
@@ -394,6 +398,84 @@ describe('ConversionsPanel', () => {
       screen.getByRole('button', { name: 'إعادة المحاولة' }),
     ).toBeInTheDocument();
     expect(screen.getByText('1 كرتونة = 12 كيلو')).toBeInTheDocument();
+  });
+
+  it.each([
+    ['unit options', () => vi.mocked(listUnitOptions)],
+    ['shift start', () => vi.mocked(currentShiftStart)],
+  ])(
+    'retries the %s load and enables the controls when it fails first',
+    async (_name, failing) => {
+      vi.mocked(listConversions).mockResolvedValue(
+        snapshot([
+          { itemId: 'oil', unit: 'كرتونة', factorToBase: 12, storedFactor: 12 },
+        ]),
+      );
+      failing().mockRejectedValueOnce(new Error('حصل خطأ. حاول تاني.'));
+
+      render(<ConversionsPanel item={item} />);
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'حصل خطأ. حاول تاني.',
+      );
+      expect(screen.getByText('1 كرتونة = 12 كيلو')).toBeInTheDocument();
+      expect(
+        screen.getByRole('button', { name: 'ضيف التحويل' }),
+      ).toBeDisabled();
+
+      fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+
+      await waitFor(() => {
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      });
+      expect(
+        await screen.findByRole('option', { name: 'كيس' }),
+      ).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText('الوحدة'), {
+        target: { value: 'كيس' },
+      });
+      fireEvent.change(screen.getByLabelText('المعامل'), {
+        target: { value: '2' },
+      });
+      expect(screen.getByRole('button', { name: 'ضيف التحويل' })).toBeEnabled();
+      expect(failing()).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('blocks every conversion save while the item identity is unsaved', async () => {
+    vi.mocked(listConversions).mockResolvedValue(
+      snapshot([
+        { itemId: 'oil', unit: 'كرتونة', factorToBase: 12, storedFactor: '12' },
+      ]),
+    );
+
+    render(<ConversionsPanel item={item} identityDirty />);
+
+    expect(await screen.findByText('1 كرتونة = 12 كيلو')).toBeInTheDocument();
+    expect(
+      await screen.findByRole('option', { name: 'كيس' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(saveDetailsFirstMessage)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كيس' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '2' },
+    });
+    fireEvent.change(screen.getByLabelText('معامل كرتونة'), {
+      target: { value: '13' },
+    });
+    expect(screen.getByRole('button', { name: 'ضيف التحويل' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'حفظ المعامل' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'احذف التحويل' })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+    fireEvent.click(screen.getByRole('button', { name: 'احذف التحويل' }));
+    expect(addConversion).not.toHaveBeenCalled();
+    expect(updateConversion).not.toHaveBeenCalled();
+    expect(deleteConversion).not.toHaveBeenCalled();
   });
 
   it('re-initializes the factor input when only the base unit changes', async () => {

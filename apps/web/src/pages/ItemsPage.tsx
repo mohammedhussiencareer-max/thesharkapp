@@ -56,6 +56,7 @@ export function ItemsPage() {
   const [conversionsBusy, setConversionsBusy] = useState(false);
   const [formMode, setFormMode] = useState<ItemEditor | null>(null);
   const [formEpoch, setFormEpoch] = useState(0);
+  const [formIdentityDirty, setFormIdentityDirty] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   // A save landed and fresh rows are not applied yet: stay locked until a read applies them.
@@ -307,6 +308,7 @@ export function ItemsPage() {
               serverError={formError}
               onClearServerError={() => setFormError(null)}
               detailsKey={formEpoch}
+              onIdentityDirtyChange={setFormIdentityDirty}
               onSubmit={(action) => handleSubmit(action)}
               onCancel={() => {
                 if (busy) return;
@@ -325,6 +327,11 @@ export function ItemsPage() {
               showInactive={showInactive}
               openConversionsId={openConversionsId}
               editsDisabled={busy}
+              identityDirtyId={
+                formIdentityDirty && formMode?.type === 'edit'
+                  ? formMode.id
+                  : null
+              }
               onEdit={openEdit}
               onToggleConversions={(itemId) =>
                 setOpenConversionsId((current) =>

@@ -13,6 +13,7 @@ import {
   costingImpact,
   createItem,
   currentShiftStart,
+  deleteConversion,
   listConversions,
   listCostingSchedule,
   listItems,
@@ -27,7 +28,11 @@ import {
   impactLoadingMessage,
   impactPendingMessage,
 } from '@/items/effective';
-import { CostingChangedError, StaleWriteError } from '@/items/errors';
+import {
+  CostingChangedError,
+  saveDetailsFirstMessage,
+  StaleWriteError,
+} from '@/items/errors';
 import { resetHeldWrites, unknownSaveMessage } from '@/items/request-id';
 import type { BaseUnit, CatalogItem, UnitConversion } from '@/items/types';
 import { ItemsPage } from '@/pages/ItemsPage';
@@ -1806,6 +1811,11 @@ describe('ItemsPage', () => {
     );
     vi.mocked(updateItem).mockImplementation(() => {
       identity = 'liter|seafood||';
+      vi.mocked(listItems).mockResolvedValue(
+        catalog.map((row) =>
+          row.id === 'shrimp' ? { ...row, baseUnit: 'liter' } : row,
+        ),
+      );
       return Promise.resolve();
     });
     await renderCatalog();
@@ -1847,6 +1857,176 @@ describe('ItemsPage', () => {
         expect.any(String),
         'liter|seafood||',
       );
+    });
+  });
+
+  async function editShrimp() {
+    fireEvent.click(
+      within(screen.getByRole('article', { name: 'جمبري' })).getByRole(
+        'button',
+        { name: 'تعديل' },
+      ),
+    );
+    await waitFor(() => {
+      expect(listCostingSchedule).toHaveBeenCalled();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+
+  it('blocks an opening price while the base unit shown is not the saved one', async () => {
+    await renderCatalog();
+    await editShrimp();
+    fireEvent.change(screen.getByLabelText('الوحدة الأساسية'), {
+      target: { value: 'liter' },
+    });
+    fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
+      target: { value: '100' },
+    });
+
+    expect(screen.getByText(saveDetailsFirstMessage)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'حفظ السعر' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    expect(setOpeningPrice).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('الوحدة الأساسية'), {
+      target: { value: 'kg' },
+    });
+    expect(screen.queryByText(saveDetailsFirstMessage)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    await waitFor(() => {
+      expect(setOpeningPrice).toHaveBeenCalledWith(
+        'shrimp',
+        '100',
+        null,
+        null,
+        expect.any(String),
+        scheduleIdentity,
+      );
+    });
+  });
+
+  it('blocks an opening price while the kind shown is not the saved one', async () => {
+    await renderCatalog();
+    await editShrimp();
+    fireEvent.change(screen.getByLabelText('النوع'), {
+      target: { value: 'ingredient' },
+    });
+    fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
+      target: { value: '100' },
+    });
+
+    expect(screen.getByText(saveDetailsFirstMessage)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    expect(setOpeningPrice).not.toHaveBeenCalled();
+  });
+
+  it('blocks an opening price while the parent shown is not the saved one', async () => {
+    await renderCatalog();
+    fireEvent.click(
+      within(screen.getByRole('article', { name: 'بوري كبير' })).getByRole(
+        'button',
+        { name: 'تعديل' },
+      ),
+    );
+    await waitFor(() => {
+      expect(listCostingSchedule).toHaveBeenCalled();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    fireEvent.change(screen.getByLabelText('السمك المخلوط'), {
+      target: { value: 'mixed-off' },
+    });
+    fireEvent.change(screen.getByLabelText('السعر الافتتاحي المعتمد للوحدة'), {
+      target: { value: '100' },
+    });
+
+    expect(screen.getByText(saveDetailsFirstMessage)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ السعر' }));
+    expect(setOpeningPrice).not.toHaveBeenCalled();
+  });
+
+  it('blocks a loss save while the base unit shown is not the saved one', async () => {
+    await renderCatalog();
+    await editShrimp();
+    fireEvent.change(screen.getByLabelText('الوحدة الأساسية'), {
+      target: { value: 'liter' },
+    });
+    fireEvent.change(screen.getByLabelText('نسبة الفاقد'), {
+      target: { value: '20' },
+    });
+
+    expect(screen.getByText(saveDetailsFirstMessage)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'حفظ الفاقد' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    expect(setItemLoss).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('الوحدة الأساسية'), {
+      target: { value: 'kg' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    await waitFor(() => {
+      expect(setItemLoss).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('blocks conversion saves while the base unit shown is not the saved one', async () => {
+    vi.mocked(updateConversion).mockClear();
+    vi.mocked(deleteConversion).mockClear();
+    vi.mocked(listConversions).mockResolvedValue(
+      listed(
+        [
+          {
+            itemId: 'shrimp',
+            unit: 'كيس',
+            factorToBase: 2,
+            storedFactor: '2',
+          },
+        ],
+        'kg',
+      ),
+    );
+    await renderCatalog();
+    await editShrimp();
+    const shrimp = screen.getByRole('article', { name: 'جمبري' });
+    fireEvent.click(within(shrimp).getByRole('button', { name: 'التحويلات' }));
+    expect(
+      await within(shrimp).findByText('1 كيس = 2 كيلو'),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        within(shrimp).getByRole('button', { name: 'ضيف التحويل' }),
+      ).toBeEnabled();
+    });
+
+    fireEvent.change(screen.getByLabelText('الوحدة الأساسية'), {
+      target: { value: 'liter' },
+    });
+    fireEvent.change(within(shrimp).getByLabelText('معامل كيس'), {
+      target: { value: '3' },
+    });
+
+    expect(
+      await within(shrimp).findByText(saveDetailsFirstMessage),
+    ).toBeInTheDocument();
+    for (const name of ['ضيف التحويل', 'حفظ المعامل', 'احذف التحويل']) {
+      const button = within(shrimp).getByRole('button', { name });
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+    }
+    expect(addConversion).not.toHaveBeenCalled();
+    expect(updateConversion).not.toHaveBeenCalled();
+    expect(deleteConversion).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('الوحدة الأساسية'), {
+      target: { value: 'kg' },
+    });
+    await waitFor(() => {
+      expect(
+        within(shrimp).getByRole('button', { name: 'حفظ المعامل' }),
+      ).toBeEnabled();
     });
   });
 
