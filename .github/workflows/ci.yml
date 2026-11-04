@@ -132,6 +132,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends postgresql-client-17
           /usr/lib/postgresql/17/bin/pg_dump --version
       - name: Backup round trip
+        # Synthetic data only, so sanitized psql errors may be printed here.
+        env:
+          BACKUP_PRINT_STDERR: '1'
         run: bash scripts/backup/ci-roundtrip.sh full
       - name: Stop Supabase
         if: always()
