@@ -462,11 +462,12 @@ export function ConversionsPanel({
   const shiftStart = metaReady ? (meta?.shiftStart ?? null) : null;
   const unitOptions = metaReady ? (meta?.unitOptions ?? []) : [];
   const controlsDisabled = busy || locked || !metaReady || schedule === null;
-  // Fresh saves wait while the schedule is for another identity than the item
-  // shown. A held retry still replays unchanged.
-  const scheduleMismatch =
-    schedule !== null && schedule.identity !== identityKey;
-  const savesBlocked = identityDirty || scheduleMismatch;
+  // Fresh saves wait until the cached rows, the schedule and the item shown
+  // agree on the identity. A held retry still replays unchanged.
+  const snapshotMismatch =
+    (baseUnit !== null && baseUnit !== item.baseUnit) ||
+    (schedule !== null && schedule.identity !== identityKey);
+  const savesBlocked = identityDirty || snapshotMismatch;
   const addSubject =
     addCode.length === 0 ? '' : conversionSubject(item.id, addCode);
   const addHeld =
@@ -845,7 +846,7 @@ export function ConversionsPanel({
       {identityDirty ? (
         <p className="text-sm text-neutral-600">{saveDetailsFirstMessage}</p>
       ) : null}
-      {scheduleMismatch ? (
+      {snapshotMismatch ? (
         <p className="text-sm text-neutral-600">{identityOutOfDateMessage}</p>
       ) : null}
       {rows.length === 0 && !shownError ? <p>مفيش تحويلات للصنف ده</p> : null}

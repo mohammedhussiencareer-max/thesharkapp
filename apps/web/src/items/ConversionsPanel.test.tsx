@@ -77,6 +77,8 @@ const item: CatalogItem = {
   onHandValue: 0,
 };
 
+const literItem: CatalogItem = { ...item, baseUnit: 'liter' };
+
 function sentTiming(index: number): {
   requestId: string;
   effectiveFrom: string | null;
@@ -289,6 +291,30 @@ describe('ConversionsPanel', () => {
     expect(onItemStale).toHaveBeenCalled();
   });
 
+  it('blocks conversion saves while the snapshot base unit differs from the item shown', async () => {
+    const onItemStale = vi.fn();
+    vi.mocked(listConversions).mockResolvedValue(
+      snapshot(
+        [{ itemId: 'oil', unit: 'كيس', factorToBase: 2, storedFactor: '2' }],
+        'liter',
+      ),
+    );
+
+    render(<ConversionsPanel item={item} onItemStale={onItemStale} />);
+    expect(await screen.findByText('1 كيس = 2 لتر')).toBeInTheDocument();
+    expect(
+      await screen.findByText(identityOutOfDateMessage),
+    ).toBeInTheDocument();
+    expect(onItemStale).toHaveBeenCalledWith('oil');
+    expect(screen.getByRole('button', { name: 'ضيف التحويل' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'حفظ المعامل' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'احذف التحويل' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+    fireEvent.click(screen.getByRole('button', { name: 'احذف التحويل' }));
+    expect(updateConversion).not.toHaveBeenCalled();
+    expect(deleteConversion).not.toHaveBeenCalled();
+  });
+
   it('sends update and delete with the snapshot base unit', async () => {
     vi.mocked(listConversions).mockResolvedValue(
       snapshot(
@@ -296,10 +322,16 @@ describe('ConversionsPanel', () => {
         'liter',
       ),
     );
+    vi.mocked(listCostingSchedule).mockResolvedValue({
+      lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
+      identity: 'liter|ingredient||',
+      lossVersions: [],
+      conversions: [],
+    });
     vi.mocked(updateConversion).mockResolvedValue(undefined);
     vi.mocked(deleteConversion).mockResolvedValue(undefined);
 
-    render(<ConversionsPanel item={item} />);
+    render(<ConversionsPanel item={literItem} />);
     expect(await screen.findByText('1 كيس = 2 لتر')).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText('معامل كيس'), {
@@ -489,9 +521,16 @@ describe('ConversionsPanel', () => {
       factorToBase: 12,
       storedFactor: '12',
     };
+    let resolveRefresh: (value: ReturnType<typeof snapshot>) => void = () =>
+      undefined;
     vi.mocked(listConversions)
       .mockResolvedValueOnce(snapshot([row], 'kg'))
-      .mockResolvedValue(snapshot([row], 'liter'));
+      .mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveRefresh = resolve;
+          }),
+      );
     vi.mocked(listCostingSchedule).mockResolvedValue({
       lossToken: 'd41d8cd98f00b204e9800998ecf8427e',
       identity: 'liter|ingredient||',
@@ -534,11 +573,24 @@ describe('ConversionsPanel', () => {
 
     const staleCalls = onItemStale.mock.calls.length;
     view.rerender(
-      <ConversionsPanel
-        item={{ ...item, baseUnit: 'liter' }}
-        onItemStale={onItemStale}
-      />,
+      <ConversionsPanel item={literItem} onItemStale={onItemStale} />,
     );
+    await waitFor(() => {
+      expect(listConversions).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.getByText('1 كرتونة = 12 كيلو')).toBeInTheDocument();
+    expect(screen.getByText(identityOutOfDateMessage)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'ضيف التحويل' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'حفظ المعامل' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'احذف التحويل' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المعامل' }));
+    fireEvent.click(screen.getByRole('button', { name: 'احذف التحويل' }));
+    expect(addConversion).not.toHaveBeenCalled();
+    expect(updateConversion).not.toHaveBeenCalled();
+    expect(deleteConversion).not.toHaveBeenCalled();
+
+    resolveRefresh(snapshot([row], 'liter'));
     expect(await screen.findByText('1 كرتونة = 12 لتر')).toBeInTheDocument();
     await waitFor(() => {
       expect(
@@ -550,6 +602,44 @@ describe('ConversionsPanel', () => {
     });
     expect(screen.getByRole('button', { name: 'احذف التحويل' })).toBeEnabled();
     expect(onItemStale).toHaveBeenCalledTimes(staleCalls);
+  });
+
+  it('replays a held conversion unchanged while the cached snapshot lags the item', async () => {
+    vi.mocked(listConversions)
+      .mockResolvedValueOnce(snapshot([], 'kg'))
+      .mockImplementation(() => new Promise(() => undefined));
+    vi.mocked(addConversion)
+      .mockRejectedValueOnce(new Error('تعذر الاتصال'))
+      .mockResolvedValue(undefined);
+    const view = render(<ConversionsPanel item={item} />);
+    expect(
+      await screen.findByRole('option', { name: 'كرتونة' }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('الوحدة'), {
+      target: { value: 'كرتونة' },
+    });
+    fireEvent.change(screen.getByLabelText('المعامل'), {
+      target: { value: '4' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'ضيف التحويل' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(addConversion).toHaveBeenCalledTimes(1);
+
+    view.rerender(<ConversionsPanel item={literItem} />);
+    expect(
+      await screen.findByText(identityOutOfDateMessage),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(listConversions).toHaveBeenCalledTimes(2);
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => {
+      expect(addConversion).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(addConversion).mock.calls[1]).toEqual(
+      vi.mocked(addConversion).mock.calls[0],
+    );
+    expect(vi.mocked(addConversion).mock.calls[1]?.[3]).toBe('kg');
   });
 
   it('approves the unchanged factor for an earlier interval with a reason and a reviewed impact', async () => {
