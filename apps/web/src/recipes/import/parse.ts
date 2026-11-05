@@ -79,6 +79,9 @@ const lossSheetName = 'جدول فاقد';
 const menuSheetName = 'المنيو';
 const blockWidth = 6;
 const netLookahead = 6;
+/** A block is read at most this far below its marker, whatever the sheet holds. */
+const maxBlockRows = 1000;
+const maxBlocks = 2000;
 
 const unitWords: Record<string, SourceUnit> = {
   g: 'g',
@@ -328,11 +331,12 @@ function parseRecipes(
   warnings: ParseWarning[],
 ): { blocks: ParsedBlock[]; regions: Region[] } {
   const markers = findMarkers(sheet);
+  if (markers.length > maxBlocks) throw new WorkbookReadError('too_large');
   const lastRow = lastRowOf(sheet);
   const blocks: ParsedBlock[] = [];
   const regions: Region[] = [];
   for (const marker of markers) {
-    let rowEnd = lastRow;
+    let rowEnd = Math.min(lastRow, marker.row + maxBlockRows);
     for (const other of markers) {
       if (other.col === marker.col && other.row > marker.row) {
         rowEnd = Math.min(rowEnd, other.row - 1);

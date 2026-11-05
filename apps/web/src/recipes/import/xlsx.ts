@@ -13,11 +13,18 @@ export type Sheet = {
 };
 
 export type WorkbookReadErrorCode =
-  'not_xlsx' | 'too_large' | 'unreadable' | 'no_recipes';
+  | 'not_xlsx'
+  | 'too_large'
+  | 'too_much_data'
+  | 'bad_cell'
+  | 'unreadable'
+  | 'no_recipes';
 
 export const workbookReadMessages: Record<WorkbookReadErrorCode, string> = {
   not_xlsx: 'الملف مش ملف إكسل بصيغة .xlsx',
   too_large: 'الملف كبير أكتر من اللازم',
+  too_much_data: 'الملف فيه ملفات كتير أو بيكبر أوي لما يتفتح، فمش هنفتحه',
+  bad_cell: 'الملف فيه خلية عنوانها غلط أو برا حدود الإكسل',
   unreadable: 'مش قادرين نقرا الملف ده',
   no_recipes: 'مفيش شيت الوصفات (الرسبي) في الملف',
 };
@@ -33,8 +40,18 @@ export class WorkbookReadError extends Error {
 }
 
 export const maxWorkbookBytes = 20 * 1024 * 1024;
-const maxEntryBytes = 64 * 1024 * 1024;
+/** Declared size of everything inflated: the workbook parts and each listed sheet. */
+const maxInflatedBytes = 64 * 1024 * 1024;
+const maxEntries = 1000;
 const maxSheets = 40;
+/** Excel's own grid: 1048576 rows and columns A to XFD. */
+const maxSheetRows = 1048576;
+const maxSheetCols = 16384;
+const coreParts = [
+  'xl/workbook.xml',
+  'xl/_rels/workbook.xml.rels',
+  'xl/sharedStrings.xml',
+];
 
 const relationshipsNs =
   'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
@@ -78,6 +95,15 @@ function columnIndex(letters: string): number {
   return index;
 }
 
+/** A1-style reference inside Excel's grid, or null. */
+function cellPosition(reference: string): { row: number; col: number } | null {
+  const match = /^([A-Z]{1,3})([1-9]\d{0,6})$/.exec(reference);
+  if (!match) return null;
+  const col = columnIndex(match[1] ?? '');
+  const row = Number(match[2]);
+  return col <= maxSheetCols && row <= maxSheetRows ? { row, col } : null;
+}
+
 function parseSheet(
   name: string,
   data: Uint8Array,
@@ -85,10 +111,11 @@ function parseSheet(
 ): Sheet {
   const rows = new Map<number, Map<number, Cell>>();
   for (const node of elements(parseXml(strFromU8(data)), 'c')) {
-    const address = /^([A-Z]+)(\d+)$/.exec(node.getAttribute('r') ?? '');
-    if (!address) continue;
-    const col = columnIndex(address[1] ?? '');
-    const row = Number(address[2]);
+    const reference = node.getAttribute('r');
+    if (reference === null) continue;
+    const position = cellPosition(reference);
+    if (!position) throw new WorkbookReadError('bad_cell');
+    const { row, col } = position;
     const type = node.getAttribute('t');
     const value = firstChild(node, 'v')?.textContent ?? null;
     const formulaNode = firstChild(node, 'f');
@@ -150,32 +177,70 @@ function sheetPaths(files: Record<string, Uint8Array>): {
   return found;
 }
 
+/** Declared sizes from the zip directory. Nothing is inflated here. */
+function listEntries(bytes: Uint8Array): Map<string, number> {
+  const sizes = new Map<string, number>();
+  let count = 0;
+  unzipSync(bytes, {
+    filter: (file) => {
+      count += 1;
+      if (count > maxEntries) throw new WorkbookReadError('too_much_data');
+      sizes.set(file.name, (sizes.get(file.name) ?? 0) + file.originalSize);
+      return false;
+    },
+  });
+  return sizes;
+}
+
+function declaredBytes(
+  sizes: ReadonlyMap<string, number>,
+  names: readonly string[],
+): number {
+  return names.reduce((sum, name) => sum + (sizes.get(name) ?? 0), 0);
+}
+
+function inflateParts(
+  bytes: Uint8Array,
+  names: readonly string[],
+): Record<string, Uint8Array> {
+  const wanted = new Set(names);
+  try {
+    return unzipSync(bytes, { filter: (file) => wanted.has(file.name) });
+  } catch {
+    throw new WorkbookReadError('not_xlsx');
+  }
+}
+
 /** Reads every sheet of an .xlsx file. Nothing leaves the browser. */
 export function readWorkbook(bytes: Uint8Array): Sheet[] {
   if (bytes.byteLength > maxWorkbookBytes) {
     throw new WorkbookReadError('too_large');
   }
-  let files: Record<string, Uint8Array>;
+  let sizes: Map<string, number>;
   try {
-    files = unzipSync(bytes, {
-      filter: (file) => {
-        const wanted =
-          file.name === 'xl/workbook.xml' ||
-          file.name === 'xl/_rels/workbook.xml.rels' ||
-          file.name === 'xl/sharedStrings.xml' ||
-          /^xl\/worksheets\/[^/]+\.xml$/.test(file.name);
-        if (wanted && file.originalSize > maxEntryBytes) {
-          throw new WorkbookReadError('too_large');
-        }
-        return wanted;
-      },
-    });
+    sizes = listEntries(bytes);
   } catch (failure) {
     if (failure instanceof WorkbookReadError) throw failure;
     throw new WorkbookReadError('not_xlsx');
   }
-  const strings = sharedStrings(files);
-  return sheetPaths(files).map(({ name, path }) => {
+  const coreBytes = declaredBytes(sizes, coreParts);
+  if (coreBytes > maxInflatedBytes)
+    throw new WorkbookReadError('too_much_data');
+  const core = inflateParts(bytes, coreParts);
+  const strings = sharedStrings(core);
+  const sheets = sheetPaths(core);
+  const sheetBytes = declaredBytes(
+    sizes,
+    sheets.map((sheet) => sheet.path),
+  );
+  if (coreBytes + sheetBytes > maxInflatedBytes) {
+    throw new WorkbookReadError('too_much_data');
+  }
+  const files = inflateParts(
+    bytes,
+    sheets.map((sheet) => sheet.path),
+  );
+  return sheets.map(({ name, path }) => {
     const data = files[path];
     if (!data) throw new WorkbookReadError('not_xlsx');
     return parseSheet(name, data, strings);
