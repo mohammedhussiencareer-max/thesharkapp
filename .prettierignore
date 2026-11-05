@@ -13,3 +13,10 @@ supabase/.temp
 supabase/.branches
 # Prettier realigns the roles table. This file is frozen for this task.
 AI-WORKFLOW.md
+# psql meta-commands (\ir, \if, \gset, \setenv) are not SQL; prettier-plugin-sql cannot parse them.
+scripts/backup/sql/drift.sql
+scripts/backup/sql/manifest.sql
+scripts/backup/sql/session.sql
+scripts/backup/sql/snapshot-session.sql
+scripts/backup/testdata/seed.sql
+scripts/backup/testdata/writer.sql

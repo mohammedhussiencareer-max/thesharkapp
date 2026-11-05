@@ -28,6 +28,7 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm backup:test
       - run: pnpm build
 
   db:
@@ -88,6 +89,7 @@ jobs:
       pull-requests: read
     outputs:
       desktop: ${{ steps.filter.outputs.desktop }}
+      backup: ${{ steps.filter.outputs.backup }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -102,6 +104,39 @@ jobs:
               - 'pnpm-workspace.yaml'
               - '.nvmrc'
               - '.github/workflows/ci.yml'
+            backup:
+              - 'supabase/**'
+              - 'scripts/backup/**'
+              - '.github/workflows/ci.yml'
+
+  backup-roundtrip:
+    needs: changes
+    if: needs.changes.outputs.backup == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.121.0
+      - name: Install PostgreSQL 17 client from PGDG
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          /usr/lib/postgresql/17/bin/pg_dump --version
+      - name: Backup round trip
+        # The script itself turns on sanitized diagnostics for this synthetic run only.
+        run: bash scripts/backup/ci-roundtrip.sh full
+      - name: Stop Supabase
+        if: always()
+        run: supabase stop --no-backup
 
   desktop:
     needs: changes
