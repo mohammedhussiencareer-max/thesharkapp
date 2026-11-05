@@ -2,10 +2,10 @@
 select to_regclass('supabase_migrations.schema_migrations') is not null as has_migrations \gset
 \if :has_migrations
 select coalesce(jsonb_agg(version order by version), '[]'::jsonb)::text as migrations from supabase_migrations.schema_migrations \gset
-select coalesce(jsonb_agg(jsonb_build_object('version', version, 'name', name, 'hash', md5(regexp_replace(coalesce(array_to_string(statements, ''), ''), '\s+', '', 'g'))) order by version), '[]'::jsonb)::text as migration_entries from supabase_migrations.schema_migrations \gset
+select coalesce(jsonb_agg(jsonb_build_object('version', version, 'name', name, 'statements', coalesce(to_jsonb(statements), '[]'::jsonb)) order by version), '[]'::jsonb)::text as migration_statements from supabase_migrations.schema_migrations \gset
 \else
 \set migrations '[]'
-\set migration_entries '[]'
+\set migration_statements '[]'
 \endif
 with auth_users as (
   select c.oid
@@ -287,7 +287,7 @@ select jsonb_build_object(
       where oid in (select o from acl_roles)
     ),
     'migrations', :'migrations'::jsonb,
-    'migrationEntries', :'migration_entries'::jsonb
+    'migrationStatements', :'migration_statements'::jsonb
   ),
   'tables', (
     select coalesce(jsonb_object_agg(tq.t, jsonb_build_object('rows', tq.n, 'hash', tq.h)), '{}'::jsonb)

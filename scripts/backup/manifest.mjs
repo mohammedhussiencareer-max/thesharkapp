@@ -15,6 +15,7 @@ import {
   repoRoot,
   runCli,
 } from './config.mjs';
+import { hashMigrationRows } from './migration-hash.mjs';
 import { runPsql } from './psql.mjs';
 
 const sqlDir = join(dirname(fileURLToPath(import.meta.url)), 'sql');
@@ -74,18 +75,22 @@ export function readDriftFacts({ psql = runPsql, snapshot } = {}) {
   return parseJson(output, 'DRIFT_QUERY_FAILED');
 }
 
-// Keep the md5 expression identical to the one in sql/manifest.sql. Whitespace
-// is ignored so the same SQL hashes the same whether the history stores it as
-// one statement (hosted apply_migration) or split by the CLI.
-export const MIGRATION_HASH_EXPR =
-  "md5(regexp_replace(coalesce(array_to_string(statements, ''), ''), '\\s+', '', 'g'))";
+// The queries return the raw statements and migration-hash.mjs normalises and
+// hashes them, so there is one implementation (see that file for the rules).
+// Keep this expression identical to the one in sql/manifest.sql.
+export const MIGRATION_ROWS_EXPR =
+  "coalesce(jsonb_agg(jsonb_build_object('version', version, 'name', name, 'statements', coalesce(to_jsonb(statements), '[]'::jsonb)) order by version), '[]'::jsonb)";
 
 export function readMigrationEntries({ psql = runPsql } = {}) {
   const output = psql({
-    sql: `select coalesce(jsonb_agg(jsonb_build_object('version', version, 'name', name, 'hash', ${MIGRATION_HASH_EXPR}) order by version), '[]'::jsonb)::text from supabase_migrations.schema_migrations;`,
+    sql: `select ${MIGRATION_ROWS_EXPR}::text from supabase_migrations.schema_migrations;`,
     code: 'MIGRATIONS_QUERY_FAILED',
   });
-  return parseJson(output, 'MIGRATIONS_QUERY_FAILED');
+  return hashMigrationRows(
+    parseJson(output, 'MIGRATIONS_QUERY_FAILED'),
+    'the migrations query',
+    'MIGRATIONS_QUERY_FAILED',
+  );
 }
 
 const MIGRATION_HASH = /^[0-9a-f]{32}$/;
@@ -257,11 +262,17 @@ export function buildManifest({
   } catch {
     pinnedMajor = null;
   }
+  const { migrationStatements, ...db } = parsed.db;
   return {
     format: 1,
     createdAt: now().toISOString(),
     metadata: {
-      ...parsed.db,
+      ...db,
+      migrationEntries: hashMigrationRows(
+        migrationStatements,
+        'the manifest query',
+        'MANIFEST_QUERY_FAILED',
+      ),
       ownerAuditColumns: [...OWNER_AUDIT_COLUMNS],
       appCommit: appCommit(env),
       pinnedMajor,

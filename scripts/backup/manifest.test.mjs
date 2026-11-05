@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import {
-  MIGRATION_HASH_EXPR,
+  MIGRATION_ROWS_EXPR,
   buildManifest,
   checkMigrationEntries,
   listRepoMigrations,
@@ -12,8 +12,10 @@ import {
   readMigrationEntries,
 } from './manifest.mjs';
 import { OWNER_FK_COLUMNS } from './config.mjs';
+import { hashStatements } from './migration-hash.mjs';
 
 const OWNER = '11111111-1111-4111-8111-111111111111';
+const INIT_STATEMENTS = ['create table a (id int)', 'insert into a values (1)'];
 
 const cleanFacts = {
   schemas: ['app', 'auth', 'extensions', 'ledger_scratch', 'public'],
@@ -38,8 +40,8 @@ function fakePsql({ facts = cleanFacts, owner = OWNER } = {}) {
         ownerUuid: owner,
         serverVersionNum: 170004,
         migrations: ['1'],
-        migrationEntries: [
-          { version: '1', name: 'init', hash: 'a'.repeat(32) },
+        migrationStatements: [
+          { version: '1', name: 'init', statements: INIT_STATEMENTS },
         ],
       },
       tables: { 'app.owner': { rows: 1, hash: 'h' } },
@@ -75,7 +77,7 @@ test('the SQL files only use variables the builder provides', () => {
     'platform_objects',
     'snapshot',
     'migrations',
-    'migration_entries',
+    'migration_statements',
     'tables_q',
     'has_migrations',
     'has_buckets',
@@ -115,8 +117,10 @@ test('the manifest merges metadata and runs drift first', () => {
   assert.equal(calls.length, 2);
   assert.match(calls[0].sql, /storage_buckets/);
   assert.deepEqual(manifest.metadata.migrationEntries, [
-    { version: '1', name: 'init', hash: 'a'.repeat(32) },
+    { version: '1', name: 'init', hash: hashStatements(INIT_STATEMENTS) },
   ]);
+  assert.equal('migrationStatements' in manifest.metadata, false);
+  assert.doesNotMatch(JSON.stringify(manifest), /create table/);
   for (const call of calls) {
     assert.equal(call.vars.snapshot, '00000004-0000002A-1');
     assert.ok(JSON.parse(call.vars.audit_cols).length > 0);
@@ -160,18 +164,69 @@ test('the manifest SQL serialises bigint values as decimal strings', () => {
   assert.doesNotMatch(sql, /'lastValue', last_value\)/);
 });
 
-test('migration hashes use one expression in the manifest SQL and the check', () => {
-  assert.ok(loadSql('manifest.sql').includes(MIGRATION_HASH_EXPR));
+test('the manifest SQL and the check read raw statements; hashing is done in Node', () => {
+  assert.ok(loadSql('manifest.sql').includes(MIGRATION_ROWS_EXPR));
+  assert.doesNotMatch(loadSql('manifest.sql'), /md5\(regexp_replace/);
   const calls = [];
   const entries = readMigrationEntries({
     psql: (call) => {
       calls.push(call);
-      return `${JSON.stringify([entry('1', 'init', 'a')])}\n`;
+      return `${JSON.stringify([
+        { version: '1', name: 'init', statements: INIT_STATEMENTS },
+        { version: '2', name: 'empty', statements: [] },
+      ])}\n`;
     },
   });
-  assert.deepEqual(entries, [entry('1', 'init', 'a')]);
-  assert.ok(calls[0].sql.includes(MIGRATION_HASH_EXPR));
-  assert.match(calls[0].sql, /'name', name/);
+  assert.deepEqual(entries, [
+    { version: '1', name: 'init', hash: hashStatements(INIT_STATEMENTS) },
+    { version: '2', name: 'empty', hash: hashStatements([]) },
+  ]);
+  assert.ok(calls[0].sql.includes(MIGRATION_ROWS_EXPR));
+  assert.doesNotMatch(calls[0].sql, /md5/);
+});
+
+test('one chunk and split statements of a migration give the same manifest entry', () => {
+  const build = (statements) =>
+    buildManifest(
+      options((call) =>
+        call.sql.includes('storage_buckets')
+          ? `${JSON.stringify(cleanFacts)}\n`
+          : `${JSON.stringify({
+              db: {
+                ownerUuid: OWNER,
+                migrationStatements: [
+                  { version: '1', name: 'init', statements },
+                ],
+              },
+              tables: {},
+              sequences: {},
+              fingerprint: {},
+            })}\n`,
+      ),
+    ).metadata.migrationEntries;
+  assert.deepEqual(
+    build(['create table a (id int);\ninsert into a values (1);']),
+    build(INIT_STATEMENTS),
+  );
+  assert.notDeepEqual(
+    build(['create table a (id int);\ninsert into a values (2);']),
+    build(INIT_STATEMENTS),
+  );
+});
+
+test('malformed migration rows are refused', () => {
+  for (const bad of [
+    null,
+    {},
+    [{ version: 1, name: 'x', statements: [] }],
+    [{ version: '1', name: 'x', statements: 'select 1' }],
+    [{ version: '1', name: 'x', statements: [1] }],
+  ]) {
+    assert.throws(
+      () => readMigrationEntries({ psql: () => `${JSON.stringify(bad)}\n` }),
+      (error) => error.code === 'MIGRATIONS_QUERY_FAILED',
+    );
+  }
 });
 
 function entry(version, name, fill) {

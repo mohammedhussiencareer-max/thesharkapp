@@ -259,6 +259,30 @@ check_migration_metadata() {
     fail MIGRATIONS_METADATA "migration versions and names in the manifest differ from supabase/migrations"
 }
 
+# The CLI stores each file split into statements; the repository holds the file
+# text. Their normalised hashes must agree, or the check would reject real history.
+check_migration_hashes() {
+  local differing
+  differing=$(node --input-type=module -e '
+    import fs from "node:fs";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+    const { hashStatements } = await import(pathToFileURL(process.argv[1]).href);
+    const entries = JSON.parse(fs.readFileSync(process.argv[2], "utf8")).metadata.migrationEntries;
+    const hashes = new Map(entries.map((e) => [e.name, e.hash]));
+    const bad = [];
+    for (const file of fs.readdirSync(process.argv[3]).filter((f) => f.endsWith(".sql"))) {
+      const name = file.slice(file.indexOf("_") + 1, -4);
+      const text = fs.readFileSync(path.join(process.argv[3], file), "utf8");
+      if (hashes.get(name) !== hashStatements([text])) bad.push(name);
+    }
+    process.stdout.write(bad.join(" "));
+  ' "$here/migration-hash.mjs" "$1" "$repo_root/supabase/migrations") ||
+    fail MIGRATIONS_METADATA "could not compare the manifest migration hashes with the repository files"
+  [ -z "$differing" ] ||
+    fail MIGRATIONS_METADATA "the manifest hash differs from the repository file for: $differing"
+}
+
 # mutate_manifest <in> <out> <hash | rename | versions | drop-last> : writes a changed copy;
 # drop-last also prints the name of the removed migration.
 mutate_manifest() {
@@ -343,6 +367,7 @@ run_full() {
   node_cli node "$here/compare.mjs" --strict-sequences \
     "$archives/admin-x/manifest.json" "$archives/reader-x/manifest.json" >/dev/null
   check_migration_metadata "$archives/admin-x/manifest.json"
+  check_migration_hashes "$archives/admin-x/manifest.json"
   info "the admin and backup_reader manifests are identical"
 
   step "stack A: migration history matches the manifest by name and statements"
