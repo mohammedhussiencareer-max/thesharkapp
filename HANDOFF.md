@@ -1,6 +1,6 @@
 # Handoff
 
-Updated: 2026-11-04.
+Updated: 2026-11-05.
 
 ## Rules
 
@@ -44,8 +44,8 @@ Merged: PR #8 (task 6, stock ledger core) → eb11b95; PR #12 (task 11, owner it
 
 ## Next
 
-- Hosted migration `costing_foundation` is applied (2026-11-03, fingerprints match). `costing_cutover` (phase 4 PR 2) is applied (2026-11-04). `recipe_model` (phase 4 PR 3) is applied (2026-11-05, fingerprints match). Pending hosted apply after its PR merges: `recipe_import` (phase 4 PR 5: `app.recipe_imports`, `app.recipe_import_bindings`, `app.commit_recipe_import`, costing change kind `import`; the browser-only workbook import at `/recipes/import`).
-- Recipes (import + add/edit screen) and POS→recipe mapping; deduction engine (cancel/refund cost decisions, waste); daily profit report; weekly count; server-side sync (Edge Function); PWA; daily backup with a restore test.
+- Hosted migration `costing_foundation` is applied (2026-11-03, fingerprints match). `costing_cutover` (phase 4 PR 2) is applied (2026-11-04). `recipe_model` (phase 4 PR 3) is applied (2026-11-05, fingerprints match). Pending hosted apply after its PR merges: `recipe_import` (phase 4 PR 5: `app.recipe_imports`, `app.recipe_import_bindings`, `app.commit_recipe_import`, costing change kind `import`; the browser-only workbook import at `/recipes/import`). Pending hosted apply after its PR merges: `pos_mapping` (phase 4 PR 6: `app.pos_map_subjects`, `app.pos_map_versions`, `app.resolve_line_requirements`, `app.pos_mapping_coverage`, `app.suggest_pos_mappings`, costing change kind `mapping`; the owner screen at `/mapping`).
+- Deduction engine (cancel/refund cost decisions, waste); daily profit report; weekly count; server-side sync (Edge Function); PWA; daily backup with a restore test. Packaging and per-order requirements are the next mapping PR.
 
 ## Needs the owner
 

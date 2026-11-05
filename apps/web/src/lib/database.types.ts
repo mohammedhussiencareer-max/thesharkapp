@@ -333,6 +333,76 @@ isOneToOne: true
       referencedColumns: ["id"]
     }
                   ]
+                },"pos_map_subjects": {
+                  Row: {
+                    "created_change_id": number,"id": string,"kind": string,"option_scope": string | null,"option_value": string | null,"pos_item_id": string | null,"size_key": Json | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_change_id": number,"id"?: string,"kind": string,"option_scope"?: string | null,"option_value"?: string | null,"pos_item_id"?: string | null,"size_key"?: Json | null
+                  }
+                  Update: {
+                    "created_change_id"?: number,"id"?: string,"kind"?: string,"option_scope"?: string | null,"option_value"?: string | null,"pos_item_id"?: string | null,"size_key"?: Json | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "pos_map_subjects_created_change_id_fkey"
+      columns: ["created_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"pos_map_versions": {
+                  Row: {
+                    "created_change_id": number,"effective_from": string,"effective_to": string | null,"exception_reason": string | null,"family": string,"id": string,"option_policy": string | null,"quantity_per_basis": number | null,"recipe_id": string | null,"stock_item_id": string | null,"subject_id": string,"superseded_change_id": number | null,"target_kind": string | null,"unit_code": string | null,"valid_during": unknown
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_change_id": number,"effective_from": string,"effective_to"?: string | null,"exception_reason"?: string | null,"family": string,"id"?: string,"option_policy"?: string | null,"quantity_per_basis"?: number | null,"recipe_id"?: string | null,"stock_item_id"?: string | null,"subject_id": string,"superseded_change_id"?: number | null,"target_kind"?: string | null,"unit_code"?: string | null,"valid_during"?: never
+                  }
+                  Update: {
+                    "created_change_id"?: number,"effective_from"?: string,"effective_to"?: string | null,"exception_reason"?: string | null,"family"?: string,"id"?: string,"option_policy"?: string | null,"quantity_per_basis"?: number | null,"recipe_id"?: string | null,"stock_item_id"?: string | null,"subject_id"?: string,"superseded_change_id"?: number | null,"target_kind"?: string | null,"unit_code"?: string | null,"valid_during"?: never
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "pos_map_versions_created_change_id_fkey"
+      columns: ["created_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "pos_map_versions_recipe_id_fkey"
+      columns: ["recipe_id"]
+isOneToOne: false
+      referencedRelation: "recipes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "pos_map_versions_stock_item_id_fkey"
+      columns: ["stock_item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "pos_map_versions_subject_id_fkey"
+      columns: ["subject_id"]
+isOneToOne: false
+      referencedRelation: "pos_map_subjects"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "pos_map_versions_superseded_change_id_fkey"
+      columns: ["superseded_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "pos_map_versions_unit_code_fkey"
+      columns: ["unit_code"]
+isOneToOne: false
+      referencedRelation: "units"
+      referencedColumns: ["code"]
+    }
+                  ]
                 },"pos_order_lines": {
                   Row: {
                     "item_id": string,"item_name": string | null,"line_id": string,"line_total": number,"options": NonNullable<Json>,"order_id": string,"price_per_kg": number | null,"quantity": number,"size_name": string | null,"unit_price": number | null,"weighted_qty": number | null,"weighted_unit": string | null
@@ -910,6 +980,22 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"pos_observed_bases": {
+                  Row: {
+                    "item_name": string | null,"last_ordered_at": string | null,"latest_line_id": string | null,"latest_order_id": string | null,"map_status": string | null,"pos_item_id": string | null,"sale_count": number | null,"size_key": Json | null,"size_key_text": string | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    
+                  ]
+                },"pos_observed_options": {
+                  Row: {
+                    "option_value": string | null,"pos_item_id": string | null,"seen_count": number | null,"size_key": Json | null,"size_key_text": string | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    
+                  ]
                 },"pos_shift_summaries": {
                   Row: {
                     "closed_at": string | null,"drawer_difference": number | null,"drawer_total": number | null,"gross_sales": number | null,"is_active": boolean | null,"net_sales": number | null,"opened_at": string | null,"orders_canceled": number | null,"orders_complete": number | null,"orders_missing": number | null,"orders_open": number | null,"refunds": number | null,"shift_id": string | null,"unknown_tx": number | null
@@ -1092,6 +1178,9 @@ isOneToOne: false
 "insert_import_costing_change":
 { Args: { "p_payload": Json,"p_reason": string,"p_request_id": string,"p_result": Json }; Returns: Json
                            },
+"insert_mapping_costing_change":
+{ Args: { "p_payload": Json,"p_reason": string,"p_request_id": string,"p_result": Json }; Returns: Json
+                           },
 "insert_owner_costing_change":
 { Args: { "p_payload": Json,"p_reason": string,"p_request_id": string,"p_result": Json }; Returns: Json
                            },
@@ -1131,11 +1220,74 @@ isOneToOne: false
 "note_period_revision":
 { Args: { "p_amount": number,"p_bucket": string,"p_cause": string,"p_item_id": string,"p_shift_id": string,"p_source_id": number }; Returns: undefined
                            },
+"pos_base_schedule":
+{ Args: { "p_pos_item_id": string,"p_size_key": Json }; Returns: Json
+                           },
+"pos_map_apply":
+{ Args: { "p_effective_from": string,"p_effective_to": string,"p_exception_reason": string,"p_expected_token": string,"p_family": string,"p_fn": string,"p_gap": boolean,"p_kind": string,"p_option_value": string,"p_policy": string,"p_pos_item_id": string,"p_quantity": number,"p_reason": string,"p_recipe_id": string,"p_request_id": string,"p_scope": string,"p_size_key": Json,"p_stock_item_id": string,"p_target": Json,"p_target_kind": string,"p_unit": string }; Returns: Json
+                           },
+"pos_map_assert_keys":
+{ Args: { "p_node": Json }; Returns: undefined
+                           },
+"pos_map_assert_recipe":
+{ Args: { "p_from": string,"p_label": string,"p_recipe_id": string,"p_to": string }; Returns: undefined
+                           },
+"pos_map_expand_target":
+{ Args: { "p_at": string,"p_quantity": number,"p_recipe_id": string,"p_scale_den": number,"p_scale_num": number,"p_stock_item_id": string,"p_target_kind": string,"p_unit": string,"p_weighted": boolean }; Returns: Json
+                           },
+"pos_map_identity":
+{ Args: { "p_kind": string,"p_option_value": string,"p_pos_item_id": string,"p_scope": string,"p_size_key": Json }; Returns: string
+                           },
+"pos_map_label":
+{ Args: { "p_kind": string,"p_option_value": string,"p_pos_item_id": string,"p_scope": string,"p_size_key": Json }; Returns: string
+                           },
+"pos_map_merge_req":
+{ Args: { "p_dst": Json,"p_src": Json }; Returns: Json
+                           },
+"pos_map_option_at":
+{ Args: { "p_at": string,"p_pos_item_id": string,"p_scale_den": number,"p_scale_num": number,"p_size_key": Json,"p_value": string,"p_weighted": boolean }; Returns: Json
+                           },
+"pos_map_schedule_line":
+{ Args: { "p_body": string,"p_effective_from": string,"p_effective_to": string,"p_family": string,"p_id": string }; Returns: string
+                           },
+"pos_map_subject_id":
+{ Args: { "p_kind": string,"p_option_value": string,"p_pos_item_id": string,"p_scope": string,"p_size_key": Json }; Returns: string
+                           },
+"pos_map_target_normalize":
+{ Args: { "p_allow_disposition": boolean,"p_target": Json }; Returns: Json
+                           },
+"pos_map_token":
+{ Args: { "p_kind": string,"p_option_value": string,"p_pos_item_id": string,"p_scope": string,"p_size_key": Json }; Returns: string
+                           },
+"pos_map_version_body":
+{ Args: { "p_exception_reason": string,"p_family": string,"p_policy": string,"p_quantity": number,"p_recipe_id": string,"p_stock_item_id": string,"p_target_kind": string,"p_unit": string }; Returns: string
+                           },
+"pos_map_with_subject":
+{ Args: { "p_kind": string,"p_option_value": string,"p_pos_item_id": string,"p_result": Json,"p_scope": string,"p_size_key": Json }; Returns: Json
+                           },
+"pos_mapping_coverage":
+{ Args: { "p_from": string,"p_to": string }; Returns: Json
+                           },
 "pos_money":
 { Args: { "p_value": number }; Returns: number
                            },
+"pos_name_key":
+{ Args: { "p_text": string }; Returns: string
+                           },
+"pos_option_schedule":
+{ Args: { "p_option_value": string,"p_pos_item_id": string,"p_scope": string,"p_size_key": Json }; Returns: Json
+                           },
 "pos_qty":
 { Args: { "p_value": number }; Returns: number
+                           },
+"pos_size_key":
+{ Args: { "p_size_name": string }; Returns: Json
+                           },
+"pos_size_key_normalize":
+{ Args: { "p_key": Json }; Returns: Json
+                           },
+"pos_text_id":
+{ Args: { "p_value": string,"p_what": string }; Returns: string
                            },
 "post_backdated_batch":
 { Args: { "p_batch_id": string,"p_pending": Json }; Returns: (number)[]
@@ -1223,6 +1375,12 @@ isOneToOne: false
 "replay_touch_deficit_flag":
 { Args: { "p_item_id": string }; Returns: undefined
                            },
+"resolve_line_requirements":
+{ Args: { "p_line_id": string,"p_order_id": string }; Returns: Json
+                           },
+"resolve_line_requirements_exact":
+{ Args: { "p_line_id": string,"p_order_id": string }; Returns: Json
+                           },
 "resolve_shift_id":
 { Args: { "p_at": string }; Returns: string
                            },
@@ -1249,6 +1407,18 @@ isOneToOne: false
 "set_month_expense_complete":
 { Args: { "p_complete": boolean,"p_month": string }; Returns: undefined
                            },
+"set_pos_base_mapping":
+{ Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_pos_item_id": string,"p_reason": string,"p_request_id": string,"p_size_key": Json,"p_target": Json }; Returns: Json
+                           },
+"set_pos_exception":
+{ Args: { "p_effective_from": string,"p_effective_to": string,"p_exception_reason": string,"p_expected_token": string,"p_pos_item_id": string,"p_reason": string,"p_request_id": string,"p_size_key": Json }; Returns: Json
+                           },
+"set_pos_option_mapping":
+{ Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_option_value": string,"p_pos_item_id": string,"p_reason": string,"p_request_id": string,"p_scope": string,"p_size_key": Json,"p_target": Json }; Returns: Json
+                           },
+"set_pos_option_policy":
+{ Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_policy": string,"p_pos_item_id": string,"p_reason": string,"p_request_id": string,"p_size_key": Json }; Returns: Json
+                           },
 "set_recipe_version":
 { Args: { "p_batch_qty": number,"p_batch_unit": string,"p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_lines": Json,"p_reason": string,"p_recipe_id": string,"p_request_id": string }; Returns: Json
                            },
@@ -1257,6 +1427,9 @@ isOneToOne: false
                            },
 "start_pos_sync_run":
 { Args: { "p_mode": string }; Returns: number
+                           },
+"suggest_pos_mappings":
+{ Args: { "p_name": string }; Returns: Json
                            },
 "text_has_long_digit_run":
 { Args: { "p_text": string }; Returns: boolean

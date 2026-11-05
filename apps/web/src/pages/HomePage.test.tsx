@@ -29,6 +29,10 @@ describe('HomePage', () => {
       'href',
       '/recipes',
     );
+    expect(screen.getByRole('link', { name: 'ربط الكاشير' })).toHaveAttribute(
+      'href',
+      '/mapping',
+    );
     expect(
       screen.getByRole('link', { name: 'الرصيد الافتتاحي' }),
     ).toHaveAttribute('href', '/opening');
