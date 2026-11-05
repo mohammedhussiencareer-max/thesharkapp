@@ -8,10 +8,29 @@ const publicationCodes: Record<string, string> = {
   unit_not_convertible: 'وحدة التحضيرة مش متوافقة مع وحدتها في الوصفة',
 };
 
-const invalidAtPublication = 'الوصفة هتبقى غير صالحة في الوقت ده';
+const invalidAtPublication = 'هتبقى غير صالحة في الوقت ده';
+const unnamedInvalidAtPublication = `الوصفة ${invalidAtPublication}`;
 
+/** `recipe "<parent>" would be invalid at <time>: <code>[ in recipe "<x>"][ for item "<y>"]` */
 const invalidAtPattern =
-  /would be invalid at [\s\S]*?: ([a-z_]+)(?: in recipe "|\s+for item "|\s*$)/;
+  /(?:recipe "([\s\S]+?)" )?would be invalid at [\s\S]*?: ([a-z_]+)(?: in recipe "|\s+for item "|\s*$)/;
+
+/** The name as plain, direction-isolated text: no control or bidi override characters. */
+function nameAsData(raw: string | undefined): string | null {
+  const clean = (raw ?? '')
+    .replace(/[\p{Cc}\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return clean.length === 0 ? null : `"\u2068${clean}\u2069"`;
+}
+
+function publicationMessage(parent: string | undefined, code: string): string {
+  const reason = publicationCodes[code];
+  const name = nameAsData(parent);
+  if (name === null) return reason ?? unnamedInvalidAtPublication;
+  const head = `الوصفة ${name} ${invalidAtPublication}`;
+  return reason === undefined ? head : `${head}: ${reason}`;
+}
 
 const reasons: ReadonlyArray<readonly [string, string]> = [
   ['reason is required', 'اكتب سبب التغيير بأثر رجعي'],
@@ -86,8 +105,8 @@ export function mapRecipeError(error: unknown): string {
   if (isDuplicateRecipeName(error)) return 'الاسم ده موجود قبل كده';
 
   if (text.includes('would be invalid at')) {
-    const detail = invalidAtPattern.exec(text)?.[1] ?? '';
-    return publicationCodes[detail] ?? invalidAtPublication;
+    const match = invalidAtPattern.exec(text);
+    return publicationMessage(match?.[1], match?.[2] ?? '');
   }
 
   for (const [needle, message] of reasons) {

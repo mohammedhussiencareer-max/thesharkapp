@@ -48,38 +48,92 @@ describe('mapRecipeError', () => {
     );
   });
 
+  // Migration format: recipe "%" would be invalid at %: % (code, then in recipe / for item)
+  const at = '2026-07-15T09:00:00.000000Z';
+  const refused = (message: string) => ({ code: '22023', message });
+  const marked = (name: string) => `"\u2068${name}\u2069"`;
+  const suffix = 'هتبقى غير صالحة في الوقت ده';
+
   it.each([
     ['cooking_marine', 'وصفة طريقة الطهي مينفعش فيها سمك ولا مأكولات بحرية'],
     ['cycle', 'الوصفة بتدخل في دايرة وبتستخدم نفسها'],
     ['depth_exceeded', 'التحضيرات متداخلة أكتر من اللازم'],
     ['no_version_in_force', 'في تحضيرة مالهاش نسخة سارية في الوقت ده'],
     ['unit_not_convertible', 'وحدة التحضيرة مش متوافقة مع وحدتها في الوصفة'],
-  ])('maps a refused publication with %s', (code, message) => {
+  ])(
+    'names the parent recipe when a publication fails with %s',
+    (code, why) => {
+      expect(
+        mapRecipeError(
+          refused(`recipe "صلصة الطماطم" would be invalid at ${at}: ${code}`),
+        ),
+      ).toBe(`الوصفة ${marked('صلصة الطماطم')} ${suffix}: ${why}`);
+    },
+  );
+
+  it.each([
+    [
+      'no_version_in_force in recipe "Tomato sauce"',
+      'في تحضيرة مالهاش نسخة سارية في الوقت ده',
+    ],
+    [
+      'cooking_marine for item "Shrimp"',
+      'وصفة طريقة الطهي مينفعش فيها سمك ولا مأكولات بحرية',
+    ],
+    [
+      'unit_not_convertible in recipe "Tomato sauce" for item "Olive oil"',
+      'وحدة التحضيرة مش متوافقة مع وحدتها في الوصفة',
+    ],
+  ])('keeps the parent name for the detail "%s"', (detail, why) => {
     expect(
-      mapRecipeError({
-        code: '23514',
-        message: `recipe would be invalid at 2026-07-15T09:00:00+00:00: ${code}`,
-      }),
-    ).toBe(message);
+      mapRecipeError(
+        refused(`recipe "Fried rice" would be invalid at ${at}: ${detail}`),
+      ),
+    ).toBe(`الوصفة ${marked('Fried rice')} ${suffix}: ${why}`);
   });
 
-  it('maps a publication refusal that names a recipe or item', () => {
+  it('names the parent for an unknown detail', () => {
     expect(
-      mapRecipeError({
-        code: '23514',
-        message:
-          'recipe would be invalid at 2026-07-15T09:00:00+00:00: cooking_marine for item "x"',
-      }),
-    ).toBe('وصفة طريقة الطهي مينفعش فيها سمك ولا مأكولات بحرية');
+      mapRecipeError(
+        refused(`recipe "Fried rice" would be invalid at ${at}: other`),
+      ),
+    ).toBe(`الوصفة ${marked('Fried rice')} ${suffix}`);
   });
 
-  it('uses a generic publication message for an unknown detail', () => {
+  it('shows the parent name as plain text, quotes and markup included', () => {
     expect(
-      mapRecipeError({
-        code: '23514',
-        message: 'recipe would be invalid at 2026-07-15T09:00:00+00:00: other',
-      }),
-    ).toBe('الوصفة هتبقى غير صالحة في الوقت ده');
+      mapRecipeError(
+        refused(
+          `recipe "<b>5" pan</b> & co" would be invalid at ${at}: cycle in recipe "x"`,
+        ),
+      ),
+    ).toBe(
+      `الوصفة ${marked('<b>5" pan</b> & co')} ${suffix}: الوصفة بتدخل في دايرة وبتستخدم نفسها`,
+    );
+  });
+
+  it('strips control and direction-override characters from the name', () => {
+    expect(
+      mapRecipeError(
+        refused(
+          `recipe "a\u202Eb\u2066c\nd\u0000e" would be invalid at ${at}: other`,
+        ),
+      ),
+    ).toBe(`الوصفة ${marked('a b c d e')} ${suffix}`);
+  });
+
+  it('falls back to the reason alone when no usable name is present', () => {
+    for (const message of [
+      `would be invalid at ${at}: cycle`,
+      `recipe "  " would be invalid at ${at}: cycle`,
+    ]) {
+      expect(mapRecipeError(refused(message))).toBe(
+        'الوصفة بتدخل في دايرة وبتستخدم نفسها',
+      );
+    }
+    expect(mapRecipeError(refused('recipe would be invalid at later'))).toBe(
+      `الوصفة ${suffix}`,
+    );
   });
 
   it('prefixes the row a line error names', () => {
