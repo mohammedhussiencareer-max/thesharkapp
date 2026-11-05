@@ -513,6 +513,58 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"recipe_import_bindings": {
+                  Row: {
+                    "created_at": string,"id": string,"import_id": string,"recipe_id": string | null,"source_name": string,"stock_item_id": string | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_at"?: string,"id"?: string,"import_id": string,"recipe_id"?: string | null,"source_name": string,"stock_item_id"?: string | null
+                  }
+                  Update: {
+                    "created_at"?: string,"id"?: string,"import_id"?: string,"recipe_id"?: string | null,"source_name"?: string,"stock_item_id"?: string | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "recipe_import_bindings_import_id_fkey"
+      columns: ["import_id"]
+isOneToOne: false
+      referencedRelation: "recipe_imports"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "recipe_import_bindings_recipe_id_fkey"
+      columns: ["recipe_id"]
+isOneToOne: false
+      referencedRelation: "recipes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "recipe_import_bindings_stock_item_id_fkey"
+      columns: ["stock_item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"recipe_imports": {
+                  Row: {
+                    "counts": NonNullable<Json>,"created_at": string,"created_change_id": number,"id": string,"request_id": string,"structural_hash": string,"summary": NonNullable<Json>
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "counts": NonNullable<Json>,"created_at"?: string,"created_change_id": number,"id"?: string,"request_id": string,"structural_hash": string,"summary": NonNullable<Json>
+                  }
+                  Update: {
+                    "counts"?: NonNullable<Json>,"created_at"?: string,"created_change_id"?: number,"id"?: string,"request_id"?: string,"structural_hash"?: string,"summary"?: NonNullable<Json>
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "recipe_imports_created_change_id_fkey"
+      columns: ["created_change_id"]
+isOneToOne: true
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"recipe_lines": {
                   Row: {
                     "child_recipe_id": string | null,"id": string,"line_no": number,"quantity": number,"stock_item_id": string | null,"unit": string,"version_id": string
@@ -950,6 +1002,9 @@ isOneToOne: false
 "batch_is_forward":
 { Args: { "p_item_ids": (string)[],"p_occurred_at": (string)[] }; Returns: boolean
                            },
+"commit_recipe_import":
+{ Args: { "p_payload": Json,"p_request_id": string }; Returns: Json
+                           },
 "costing_impact":
 { Args: { "p_from": string,"p_item_id"?: string,"p_to": string }; Returns: Json
                            },
@@ -998,8 +1053,44 @@ isOneToOne: false
 "finish_pos_sync_run":
 { Args: { "p_counts": Json,"p_error": string,"p_run_id": number,"p_status": string }; Returns: undefined
                            },
+"import_array":
+{ Args: { "p_key": string,"p_max": number,"p_node": Json }; Returns: Json
+                           },
+"import_assert_keys":
+{ Args: { "p_allowed": (string)[],"p_node": Json,"p_what": string }; Returns: undefined
+                           },
+"import_loss_canonical_to":
+{ Args: { "p_at": string,"p_item_id": string }; Returns: string
+                           },
+"import_normalize_payload":
+{ Args: { "p_payload": Json }; Returns: Json
+                           },
+"import_numeric":
+{ Args: { "p_key": string,"p_node": Json,"p_what": string }; Returns: number
+                           },
+"import_publish_order":
+{ Args: { "p_deps": Json }; Returns: (number)[]
+                           },
+"import_recipe_canonical_to":
+{ Args: { "p_at": string,"p_recipe_id": string }; Returns: string
+                           },
+"import_sub_request_id":
+{ Args: { "p_label": string,"p_request_id": string }; Returns: string
+                           },
+"import_text":
+{ Args: { "p_key": string,"p_max": number,"p_min": number,"p_node": Json,"p_required": boolean,"p_what": string }; Returns: string
+                           },
+"import_uuid":
+{ Args: { "p_key": string,"p_node": Json,"p_what": string }; Returns: string
+                           },
+"import_version_matches":
+{ Args: { "p_at": string,"p_batch_qty": number,"p_batch_unit": string,"p_lines": Json,"p_recipe_id": string }; Returns: boolean
+                           },
 "ingest_pos_batch":
 { Args: { "p_orders": Json,"p_run_id": number,"p_scope": Json,"p_shifts": Json }; Returns: Json
+                           },
+"insert_import_costing_change":
+{ Args: { "p_payload": Json,"p_reason": string,"p_request_id": string,"p_result": Json }; Returns: Json
                            },
 "insert_owner_costing_change":
 { Args: { "p_payload": Json,"p_reason": string,"p_request_id": string,"p_result": Json }; Returns: Json

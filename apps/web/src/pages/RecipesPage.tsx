@@ -125,6 +125,11 @@ export function RecipesPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الوصفات</h1>
+      <p>
+        <Link className="underline" to="/recipes/import">
+          استيراد الوصفات
+        </Link>
+      </p>
       {loading && recipes === null ? <p>جاري تحميل الوصفات…</p> : null}
       {recipes === null && !loading ? (
         <div className="flex flex-col gap-3">

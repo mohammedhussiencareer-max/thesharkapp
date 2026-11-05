@@ -10,6 +10,7 @@ import { ItemsPage } from '@/pages/ItemsPage';
 import { LoginPage } from '@/pages/LoginPage';
 import { OpeningPage } from '@/pages/OpeningPage';
 import { PurchasesPage } from '@/pages/PurchasesPage';
+import { RecipeImportPage } from '@/pages/RecipeImportPage';
 import { RecipePage } from '@/pages/RecipePage';
 import { RecipesPage } from '@/pages/RecipesPage';
 import { SalesPage } from '@/pages/SalesPage';
@@ -56,6 +57,14 @@ export function AppRoutes() {
         element={
           <RequireOwner>
             <RecipesPage />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/recipes/import"
+        element={
+          <RequireOwner>
+            <RecipeImportPage />
           </RequireOwner>
         }
       />
