@@ -200,6 +200,7 @@ describe('buildReview suggestions', () => {
           source: normalizeName(names.salt),
           recipeId: null,
           stockItemId: 'item-rice',
+          block: false,
         },
       ],
     });
@@ -209,7 +210,7 @@ describe('buildReview suggestions', () => {
     expect(salt.confirmed).toBe(false);
   });
 
-  it('defaults the unit to grams and a nested batch to its own unit', () => {
+  it('defaults the unit to grams', () => {
     const review = buildReview(parsed, importContext());
     expect(ingredientOf(review, names.salt).unit).toBe('g');
     expect(ingredientOf(review, names.fish).unit).toBe('g');
@@ -218,6 +219,47 @@ describe('buildReview suggestions', () => {
       batchQty: '2400',
       batchUnit: 'g',
     });
+  });
+
+  it('never reads workbook grams as the unit of a kg or liter batch', () => {
+    const batchIn = (id: string, name: string, unit: string) => ({
+      id,
+      name,
+      active: true,
+      versions: [
+        { effectiveFrom: '2020-01-01T00:00:00.000Z', effectiveTo: null, unit },
+      ],
+    });
+    const ctx = importContext({
+      batches: [
+        batchIn('batch-kg', names.fish, 'kg'),
+        batchIn('batch-liter', names.oil, 'liter'),
+      ],
+    });
+    const review = buildReview(parsed, ctx);
+    const fish = ingredientOf(review, names.fish);
+    expect(fish.target).toEqual({ type: 'recipe', recipeId: 'batch-kg' });
+    expect(fish.unit).toBe('g');
+    const oil = ingredientOf(review, names.oil);
+    expect(oil.target).toEqual({ type: 'recipe', recipeId: 'batch-liter' });
+    expect(oil.unit).toBe('ml');
+    const line = parsed.blocks
+      .flatMap((block) => block.lines)
+      .find((entry) => entry.norm === fish.norm);
+    expect(line?.qty).toBe('300');
+    expect(
+      issueCount(validateReview(confirmAll(review, ctx), parsed, ctx)),
+    ).toBe(0);
+  });
+
+  it('keeps grams for a file batch measured in kg or liter', () => {
+    const ctx = importContext();
+    let review = buildReview(parsed, ctx);
+    const id = blockOf(review, names.sauce).id;
+    review = patchBlock(review, ctx, id, { batchUnit: 'kg' });
+    expect(ingredientOf(review, names.sauce).unit).toBe('g');
+    review = patchBlock(review, ctx, id, { batchUnit: 'liter' });
+    expect(ingredientOf(review, names.sauce).unit).toBe('ml');
   });
 
   it('carries the loss ratio as a suggestion that starts unapproved', () => {
@@ -272,6 +314,66 @@ describe('review edits', () => {
       baseUnit: 'liter',
     });
     expect(ingredientOf(review, names.salt).unit).toBe('ml');
+  });
+
+  it('drops a typed opening price when the owner picks an existing item', () => {
+    const ctx = importContext();
+    const fish = normalizeName(names.fish);
+    let review = confirmAll(buildReview(parsed, ctx), ctx);
+    review = patchIngredient(review, ctx, fish, {
+      price: '0',
+      priceReason: 'هدية',
+    });
+    review = retargetIngredient(review, ctx, fish, {
+      type: 'item',
+      itemId: 'item-salt',
+    });
+    expect(ingredientOf(review, names.fish)).toMatchObject({
+      price: '',
+      priceReason: '',
+    });
+    const issues = validateReview(review, parsed, ctx);
+    expect(issues.ingredients.get(fish)).toBeUndefined();
+    expect(summarize(review, parsed).prices).toBe(0);
+  });
+
+  it('drops an approved loss when the owner picks a batch', () => {
+    const ctx = importContext({
+      batches: [
+        {
+          id: 'batch-old',
+          name: 'تحضيرة قديمة',
+          active: true,
+          versions: [
+            {
+              effectiveFrom: '2020-01-01T00:00:00.000Z',
+              effectiveTo: null,
+              unit: 'g',
+            },
+          ],
+        },
+      ],
+    });
+    const tomato = normalizeName(names.tomato);
+    let review = confirmAll(buildReview(parsed, ctx), ctx);
+    review = patchIngredient(review, ctx, tomato, { lossApproved: true });
+    expect(summarize(review, parsed).losses).toBe(1);
+    review = retargetIngredient(review, ctx, tomato, {
+      type: 'recipe',
+      recipeId: 'batch-old',
+    });
+    expect(ingredientOf(review, names.tomato).lossApproved).toBe(false);
+    expect(summarize(review, parsed).losses).toBe(0);
+    expect(validateReview(review, parsed, ctx).ingredients.get(tomato)).toBe(
+      undefined,
+    );
+
+    review = patchIngredient(review, ctx, tomato, { lossApproved: true });
+    review = retargetIngredient(review, ctx, tomato, {
+      type: 'block',
+      blockId: blockOf(review, names.sauce).id,
+    });
+    expect(ingredientOf(review, names.tomato).lossApproved).toBe(false);
   });
 
   it('confirms a re-picked recipe and takes its kind', () => {
@@ -422,6 +524,20 @@ describe('validateReview', () => {
     );
   });
 
+  it('checks the written unit only for recipes that are imported', () => {
+    const grams = manual([
+      [1, 'أول', ['ملح']],
+      [2, 'ثاني', ['ملح']],
+    ]);
+    grams.blocks[0]!.lines[0]!.unit = 'g';
+    grams.blocks[1]!.lines[0]!.unit = 'ml';
+    const ctx = importContext();
+    let review = confirmAll(buildReview(grams, ctx), ctx);
+    expect(issueCount(validateReview(review, grams, ctx))).toBeGreaterThan(0);
+    review = patchBlock(review, ctx, 2, { include: false });
+    expect(issueCount(validateReview(review, grams, ctx))).toBe(0);
+  });
+
   it('finds a cycle between two blocks', () => {
     const cyclic = manual([
       [1, 'أول', ['ثاني']],
@@ -528,19 +644,104 @@ describe('re-import helpers', () => {
         },
       ],
       bindings: [
-        { source: 'سمك قديم', recipeId: 'rec-old', stockItemId: null },
-        { source: 'وصفة موقوفة', recipeId: 'rec-stopped', stockItemId: null },
+        {
+          source: 'سمك قديم',
+          recipeId: 'rec-old',
+          stockItemId: null,
+          block: true,
+        },
+        {
+          source: 'وصفة موقوفة',
+          recipeId: 'rec-stopped',
+          stockItemId: null,
+          block: true,
+        },
         {
           source: normalizeName(names.dish),
           recipeId: 'rec-dish',
           stockItemId: null,
+          block: true,
         },
-        { source: 'ملح', recipeId: null, stockItemId: 'item-salt' },
+        {
+          source: 'ملح',
+          recipeId: null,
+          stockItemId: 'item-salt',
+          block: false,
+        },
       ],
     });
     expect(disappearedRecipes(parsed, ctx)).toEqual([
       { id: 'rec-old', name: 'سمك قديم' },
     ]);
+  });
+
+  it('warns about a renamed recipe from the source it was imported under', () => {
+    const ctx = importContext({
+      recipes: [
+        {
+          id: 'rec-renamed',
+          name: 'اسم جديد تماما',
+          kind: 'dish',
+          active: true,
+          inForce: true,
+        },
+      ],
+      bindings: [
+        {
+          source: normalizeName('اسم الملف القديم'),
+          recipeId: 'rec-renamed',
+          stockItemId: null,
+          block: true,
+        },
+      ],
+    });
+    expect(disappearedRecipes(parsed, ctx)).toEqual([
+      { id: 'rec-renamed', name: 'اسم جديد تماما' },
+    ]);
+  });
+
+  it('does not warn while any source of the recipe, or its current name, is in the file', () => {
+    const recipe = (id: string, name: string) => ({
+      id,
+      name,
+      kind: 'dish' as const,
+      active: true,
+      inForce: true,
+    });
+    const ctx = importContext({
+      recipes: [
+        recipe('rec-two', 'اسم تاني'),
+        recipe('rec-named', names.rice),
+        recipe('rec-batch', 'تحضيرة مرتبطة كمكوّن'),
+      ],
+      bindings: [
+        {
+          source: 'مصدر غايب',
+          recipeId: 'rec-two',
+          stockItemId: null,
+          block: true,
+        },
+        {
+          source: normalizeName(names.dish),
+          recipeId: 'rec-two',
+          stockItemId: null,
+          block: true,
+        },
+        {
+          source: 'مصدر غايب تاني',
+          recipeId: 'rec-named',
+          stockItemId: null,
+          block: true,
+        },
+        {
+          source: 'ملح',
+          recipeId: 'rec-batch',
+          stockItemId: null,
+          block: false,
+        },
+      ],
+    });
+    expect(disappearedRecipes(parsed, ctx)).toEqual([]);
   });
 
   it('knows a structure it has imported before', () => {

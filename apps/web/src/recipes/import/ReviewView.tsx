@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { kindLabels, unitLabels } from '@/items/labels';
 import { baseUnits, type BaseUnit } from '@/items/types';
+import { normalizeDecimal } from '@/items/validation';
 import { secondaryButton } from '@/lib/page-style';
 import { recipeKindLabels } from '@/recipes/labels';
 import {
@@ -22,7 +23,8 @@ import {
   type Review,
   type ReviewIssues,
 } from '@/recipes/import/model';
-import type { ParsedWorkbook } from '@/recipes/import/parse';
+import { collapseSpaces } from '@/recipes/import/normalize';
+import type { ParsedLine, ParsedWorkbook } from '@/recipes/import/parse';
 
 const fieldClass = 'w-full rounded border border-neutral-300 px-3 py-2';
 const rowClass = 'flex flex-col gap-2 rounded border border-neutral-200 p-3';
@@ -111,6 +113,15 @@ export function ReviewView({
     return 'صنف جديد';
   }
 
+  function lineText(line: ParsedLine): string {
+    const entry = review.ingredients.find((item) => item.norm === line.norm);
+    const quantity = normalizeDecimal(line.qty) ?? line.qty;
+    const code = line.unit ?? entry?.unit ?? '';
+    const unit = code === '' ? 'من غير وحدة' : unitName(code);
+    const target = entry ? ingredientTargetLabel(entry) : 'مش متحدد';
+    return `${entry?.name ?? collapseSpaces(line.name)}: ${quantity} ${unit} ← ${target}`;
+  }
+
   function recipeTargetLabel(block: BlockReview): string {
     if (block.target.mode === 'new') return 'وصفة جديدة';
     const { recipeId } = block.target;
@@ -155,6 +166,16 @@ export function ReviewView({
           <p className="text-sm text-neutral-600">
             في المنيو: {menuNames.join('، ')}
           </p>
+        ) : null}
+        {source.lines.length > 0 ? (
+          <ul
+            className="flex flex-col gap-1 text-sm"
+            aria-label={`تركيب ${source.name}`}
+          >
+            {source.lines.map((line, index) => (
+              <li key={`${line.norm}:${index}`}>{lineText(line)}</li>
+            ))}
+          </ul>
         ) : null}
         {block.include ? (
           <>

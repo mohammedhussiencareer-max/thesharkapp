@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (112);
+  plan (121);
 
 insert into
   auth.users (
@@ -227,8 +227,8 @@ select
               ],
               "bindings": [
                 {"source_name":"فلفل","item_key":"i1"},
-                {"source_name":"تتبيلة","recipe_key":"b1"},
-                {"source_name":"طبق","recipe_key":"d1"},
+                {"source_name":"تتبيلة","recipe_key":"b1","is_block":true},
+                {"source_name":"طبق","recipe_key":"d1","is_block":true},
                 {"source_name":"ملح","stock_item_id":"f6000000-0000-4000-8000-000000000012"}
               ]
             }$j$,
@@ -547,6 +547,24 @@ select
     '22023',
     'binding 2: duplicate source_name "فلفل"',
     'two bindings of one source name are refused'
+  );
+
+select
+  throws_ok (
+    $$select app.commit_recipe_import('f6000000-0000-4000-8000-0000000000f0',
+      jsonb_set(current_setting('t.base')::jsonb, '{bindings,1,is_block}', '"yes"'))$$,
+    '22023',
+    'binding 2: is_block must be true or false',
+    'a non-boolean block flag is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.commit_recipe_import('f6000000-0000-4000-8000-0000000000f0',
+      jsonb_set(current_setting('t.base')::jsonb, '{bindings,0,is_block}', 'true'))$$,
+    '22023',
+    'binding 1: is_block needs a recipe target',
+    'a block flag on an item binding is refused'
   );
 
 select
@@ -1008,15 +1026,16 @@ select
 select
   results_eq (
     $$select b.source_name::text collate "default",
-        (b.recipe_id is not null) as is_recipe
+        (b.recipe_id is not null) as is_recipe,
+        b.is_block
       from app.recipe_import_bindings b
       order by b.source_name$$,
     $$values
-      ('تتبيلة'::text, true),
-      ('طبق', true),
-      ('فلفل', false),
-      ('ملح', false)$$,
-    'the source names are bound to what they became'
+      ('تتبيلة'::text, true, true),
+      ('طبق', true, true),
+      ('فلفل', false, false),
+      ('ملح', false, false)$$,
+    'the source names are bound to what they became, and the block titles are flagged'
   );
 
 select
@@ -1274,9 +1293,18 @@ select
           'source_name',
           'طبق',
           'recipe_id',
-          current_setting('t.d1')
+          current_setting('t.d1'),
+          'is_block',
+          true
         ),
-        jsonb_build_object('source_name', 'تتبيلة', 'recipe_key', 'b1')
+        jsonb_build_object(
+          'source_name',
+          'تتبيلة',
+          'recipe_key',
+          'b1',
+          'is_block',
+          true
+        )
       )
     )::text,
     true
@@ -1385,6 +1413,185 @@ select
     ),
     250::numeric,
     'the new current version carries the new quantity'
+  );
+
+-- ============================================================================
+-- 9b. Coordinated updates: the graph is validated once, after every imported
+-- version exists, so a batch and its parents can change unit together.
+-- ============================================================================
+select
+  set_config(
+    't.coord',
+    jsonb_build_object(
+      'structural_hash',
+      repeat('e', 64),
+      'recipes',
+      jsonb_build_array(
+        jsonb_build_object(
+          'key',
+          'd1',
+          'recipe_id',
+          current_setting('t.d1'),
+          'expected_token',
+          app.recipe_schedule (current_setting('t.d1')::uuid) ->> 'token',
+          'kind',
+          'dish',
+          'lines',
+          jsonb_build_array(
+            jsonb_build_object(
+              'child_recipe_id',
+              current_setting('t.b1'),
+              'quantity',
+              300,
+              'unit',
+              'ml'
+            ),
+            jsonb_build_object(
+              'stock_item_id',
+              current_setting('t.i2'),
+              'quantity',
+              250,
+              'unit',
+              'g'
+            )
+          )
+        ),
+        jsonb_build_object(
+          'key',
+          'b1',
+          'recipe_id',
+          current_setting('t.b1'),
+          'expected_token',
+          app.recipe_schedule (current_setting('t.b1')::uuid) ->> 'token',
+          'kind',
+          'batch',
+          'batch_qty',
+          2400,
+          'batch_unit',
+          'ml',
+          'lines',
+          jsonb_build_array(
+            jsonb_build_object(
+              'stock_item_id',
+              current_setting('t.i1'),
+              'quantity',
+              100,
+              'unit',
+              'g'
+            ),
+            jsonb_build_object(
+              'stock_item_id',
+              'f6000000-0000-4000-8000-000000000012',
+              'quantity',
+              50,
+              'unit',
+              'g'
+            )
+          )
+        )
+      ),
+      'bindings',
+      jsonb_build_array(
+        jsonb_build_object(
+          'source_name',
+          'طبق',
+          'recipe_key',
+          'd1',
+          'is_block',
+          true
+        ),
+        jsonb_build_object(
+          'source_name',
+          'تتبيلة',
+          'recipe_key',
+          'b1',
+          'is_block',
+          true
+        )
+      )
+    )::text,
+    true
+  );
+
+select
+  throws_ok (
+    $$select app.commit_recipe_import('f6000000-0000-4000-8000-0000000000f0',
+      jsonb_set(current_setting('t.coord')::jsonb, '{recipes,0,lines,0,unit}', '"g"'))$$,
+    '22023',
+    null::text,
+    'a batch changing unit while its imported parent keeps the old unit fails the import'
+  );
+
+select
+  throws_ok (
+    $$select app.commit_recipe_import('f6000000-0000-4000-8000-0000000000f0',
+      jsonb_build_object('structural_hash', repeat('f', 64), 'recipes', jsonb_build_array(
+        jsonb_build_object('key', 'eb', 'recipe_id', current_setting('t.eb'),
+          'expected_token', (app.recipe_schedule(current_setting('t.eb')::uuid) ->> 'token'),
+          'kind', 'batch', 'batch_qty', 1000, 'batch_unit', 'ml',
+          'lines', '[{"stock_item_id":"f6000000-0000-4000-8000-000000000012","quantity":100,"unit":"g"}]'::jsonb)
+      )))$$,
+    '22023',
+    null::text,
+    'a batch changing unit under an existing parent outside the import fails the import'
+  );
+
+select
+  results_eq (
+    $$select r.name::text collate "default", v.batch_unit::text collate "default"
+      from app.recipe_versions v
+      join app.recipes r on r.id = v.recipe_id
+      where v.superseded_change_id is null
+        and r.name in ('تتبيلة استيراد', 'تحضيرة قائمة')
+      order by r.name$$,
+    $$values
+      ('تتبيلة استيراد'::text, 'g'::text),
+      ('تحضيرة قائمة', 'g')$$,
+    'the refused imports left the batch units unchanged'
+  );
+
+select
+  lives_ok (
+    $$select app.commit_recipe_import(
+      'f6000000-0000-4000-8000-000000000105', current_setting('t.coord')::jsonb
+    )$$,
+    'a batch and its parent change unit together in one import'
+  );
+
+select
+  is (
+    (
+      select
+        jsonb_agg(
+          e ->> 'status'
+          order by
+            e ->> 'key'
+        )
+      from
+        app.costing_changes c,
+        jsonb_array_elements(c.result -> 'recipes') e
+      where
+        c.request_id = 'f6000000-0000-4000-8000-000000000105'
+    ),
+    '["published","published"]'::jsonb,
+    'both recipes of the coordinated import are published'
+  );
+
+select
+  results_eq (
+    $$select 'batch'::text, v.batch_unit::text collate "default"
+      from app.recipe_versions v
+      where v.recipe_id = current_setting('t.b1')::uuid
+        and v.superseded_change_id is null
+      union all
+      select 'line', l.unit::text collate "default"
+      from app.recipe_lines l
+      join app.recipe_versions v on v.id = l.version_id
+      where v.recipe_id = current_setting('t.d1')::uuid
+        and v.superseded_change_id is null
+        and l.child_recipe_id = current_setting('t.b1')::uuid$$,
+    $$values ('batch'::text, 'ml'::text), ('line', 'ml')$$,
+    'the batch and the parent line now use the new unit'
   );
 
 -- ============================================================================
@@ -1571,7 +1778,10 @@ select
       join pg_namespace n on n.oid = p.pronamespace
       cross join (values ('anon'), ('authenticated'), ('service_role'), ('public')) as r(role)
       where n.nspname = 'app'
-        and (p.proname like 'import\_%' or p.proname = 'insert_import_costing_change')
+        and (
+          p.proname like 'import\_%'
+          or p.proname in ('insert_import_costing_change', 'recipe_publish_version')
+        )
         and has_function_privilege(r.role, p.oid, 'execute')$$,
     'no API role can execute an internal import helper'
   );
@@ -1584,7 +1794,11 @@ select
       where n.nspname = 'app'
         and (
           p.proname like 'import\_%'
-          or p.proname in ('insert_import_costing_change', 'commit_recipe_import')
+          or p.proname in (
+            'insert_import_costing_change',
+            'commit_recipe_import',
+            'recipe_publish_version'
+          )
         )
         and (
           not p.prosecdef and p.proname in ('commit_recipe_import', 'insert_import_costing_change')
@@ -1655,6 +1869,15 @@ select
     '23514',
     null::text,
     'a binding must name exactly one target'
+  );
+
+select
+  throws_ok (
+    $$insert into app.recipe_import_bindings (import_id, source_name, recipe_id, stock_item_id, is_block)
+      select id, 'x', null, 'f6000000-0000-4000-8000-000000000012', true from app.recipe_imports limit 1$$,
+    '23514',
+    null::text,
+    'a block binding must name a recipe'
   );
 
 select

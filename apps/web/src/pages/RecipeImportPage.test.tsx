@@ -18,6 +18,7 @@ import {
   type ImportAction,
 } from '@/recipes/import/api';
 import type { ImportContext } from '@/recipes/import/model';
+import { normalizeName } from '@/recipes/import/normalize';
 import { parseRecipeWorkbook } from '@/recipes/import/parse';
 import { structuralHash } from '@/recipes/import/payload';
 import { importContext } from '@/test/import-context';
@@ -184,7 +185,12 @@ describe('RecipeImportPage', () => {
           },
         ],
         bindings: [
-          { source: 'سمك قديم', recipeId: 'rec-old', stockItemId: null },
+          {
+            source: 'سمك قديم',
+            recipeId: 'rec-old',
+            stockItemId: null,
+            block: true,
+          },
         ],
       }),
     );
@@ -351,10 +357,213 @@ describe('RecipeImportPage', () => {
     expect(dish).not.toHaveProperty('name');
   });
 
+  it('shows every line of a recipe with its quantity, resolved unit and target', async () => {
+    await openReview();
+    const dishLines = within(
+      screen.getByRole('list', { name: `تركيب ${names.dish}` }),
+    );
+    expect(
+      dishLines.getByText(`${names.fish}: 300 جرام ← صنف جديد`),
+    ).toBeInTheDocument();
+    expect(
+      dishLines.getByText(`${names.salt}: 5 جرام ← ملح`),
+    ).toBeInTheDocument();
+    expect(
+      dishLines.getByText(
+        `${names.sauce}: 100 جرام ← ${names.sauce} (من الملف)`,
+      ),
+    ).toBeInTheDocument();
+    const riceLines = within(
+      screen.getByRole('list', { name: `تركيب ${names.rice}` }),
+    );
+    expect(
+      riceLines.getByText(`${names.riceRaw}: 200 جرام ← ارز خام`),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole('button', { name: `اختار غيره لـ ${names.salt}` }),
+    );
+    fireEvent.change(screen.getByLabelText(`الاختيار لـ ${names.salt}`), {
+      target: { value: 'item:item-rice' },
+    });
+    fireEvent.change(screen.getByLabelText(`وحدة الكميات ${names.salt}`), {
+      target: { value: 'kg' },
+    });
+    expect(
+      within(
+        screen.getByRole('list', { name: `تركيب ${names.dish}` }),
+      ).getByText(`${names.salt}: 5 كيلو ← ارز خام`),
+    ).toBeInTheDocument();
+    expect(
+      within(
+        screen.getByRole('list', { name: `تركيب ${names.rice}` }),
+      ).getByText(`${names.salt}: 4 كيلو ← ارز خام`),
+    ).toBeInTheDocument();
+  });
+
+  it('saves after a typed price or an approved loss is left behind by a new target', async () => {
+    vi.mocked(commitRecipeImport).mockResolvedValue(imported);
+    await openReview(
+      importContext({
+        batches: [
+          {
+            id: 'batch-old',
+            name: 'تحضيرة قديمة',
+            active: true,
+            versions: [
+              {
+                effectiveFrom: '2020-01-01T00:00:00.000Z',
+                effectiveTo: null,
+                unit: 'g',
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    confirmEverything();
+    fireEvent.change(screen.getByLabelText(/سعر افتتاحي اختياري لـ سمك بوري/), {
+      target: { value: '0' },
+    });
+    fireEvent.click(
+      within(ingredient(names.tomato)).getByLabelText(/اعتمد فاقد طماطم: 20%/),
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', { name: `اختار غيره لـ ${names.fish}` }),
+    );
+    fireEvent.change(screen.getByLabelText(`الاختيار لـ ${names.fish}`), {
+      target: { value: 'item:item-rice' },
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: `اختار غيره لـ ${names.tomato}` }),
+    );
+    fireEvent.change(screen.getByLabelText(`الاختيار لـ ${names.tomato}`), {
+      target: { value: 'recipe:batch-old' },
+    });
+    expect(
+      within(ingredient(names.tomato)).queryByLabelText(/اعتمد فاقد/),
+    ).toBeNull();
+
+    fireEvent.click(saveButton());
+    await screen.findByRole('region', { name: 'نتيجة الاستيراد' });
+    expect(sent().payload.manual_opening_prices).toEqual([]);
+    expect(sent().payload.losses).toEqual([]);
+  });
+
+  describe('a second import', () => {
+    const dishRecipe = {
+      id: 'rec-dish',
+      name: names.dish,
+      kind: 'dish' as const,
+      active: true,
+      inForce: true,
+    };
+
+    async function structure() {
+      return structuralHash(parseRecipeWorkbook(sampleWorkbook()));
+    }
+
+    it('reloads the bindings and catalog before the next upload', async () => {
+      vi.mocked(commitRecipeImport).mockResolvedValue(imported);
+      vi.mocked(fetchImportTokens).mockImplementation((need) =>
+        Promise.resolve({
+          recipes: new Map(need.recipeIds.map((id) => [id, `token-${id}`])),
+          losses: new Map(need.itemIds.map((id) => [id, `token-${id}`])),
+        }),
+      );
+      const refreshed = importContext({
+        recipes: [dishRecipe],
+        bindings: [
+          {
+            source: normalizeName(names.dish),
+            recipeId: 'rec-dish',
+            stockItemId: null,
+            block: true,
+          },
+        ],
+        knownHashes: [await structure()],
+      });
+      let release!: (value: ImportContext) => void;
+      vi.mocked(loadImportContext)
+        .mockResolvedValueOnce(importContext())
+        .mockImplementationOnce(
+          () =>
+            new Promise<ImportContext>((resolve) => {
+              release = resolve;
+            }),
+        )
+        .mockResolvedValue(refreshed);
+      renderPage();
+      await screen.findByLabelText('ملف الوصفات (xlsx)');
+      upload();
+      await screen.findByRole('region', { name: 'ملخص الملف' });
+      confirmEverything();
+      fireEvent.click(saveButton());
+      await screen.findByRole('region', { name: 'نتيجة الاستيراد' });
+
+      expect(sent().payload.recipes.every((entry) => entry.name)).toBe(true);
+      expect(loadImportContext).toHaveBeenCalledTimes(2);
+      expect(screen.getByLabelText('ملف الوصفات (xlsx)')).toBeDisabled();
+      expect(screen.getByText(/جاري تحديث بيانات الوصفات/)).toBeInTheDocument();
+
+      release(refreshed);
+      await waitFor(() =>
+        expect(screen.getByLabelText('ملف الوصفات (xlsx)')).toBeEnabled(),
+      );
+      expect(screen.queryByText(/جاري تحديث بيانات الوصفات/)).toBeNull();
+
+      upload();
+      await screen.findByRole('region', { name: 'ملخص الملف' });
+      expect(
+        screen.getByText(/بنفس شكل استيراد اتعمل قبل كده/),
+      ).toBeInTheDocument();
+      expect(
+        within(
+          screen.getByRole('listitem', { name: `وصفة ${names.dish}` }),
+        ).getByText(/مقترح من استيراد قبل كده/),
+      ).toBeInTheDocument();
+      confirmEverything();
+      fireEvent.click(saveButton());
+      await waitFor(() => expect(commitRecipeImport).toHaveBeenCalledTimes(2));
+
+      const dish = sent(1).payload.recipes.find(
+        (entry) => entry.recipe_id === 'rec-dish',
+      )!;
+      expect(dish.expected_token).toBe('token-rec-dish');
+      expect(dish).not.toHaveProperty('name');
+      expect(sent(1).requestId).not.toBe(sent(0).requestId);
+    });
+
+    it('keeps uploads off while the reload fails, until the owner reloads', async () => {
+      vi.mocked(commitRecipeImport).mockResolvedValue(imported);
+      vi.mocked(loadImportContext)
+        .mockResolvedValueOnce(importContext())
+        .mockRejectedValueOnce(new Error('تعذر التحميل'))
+        .mockResolvedValueOnce(importContext({ recipes: [dishRecipe] }));
+      renderPage();
+      await screen.findByLabelText('ملف الوصفات (xlsx)');
+      upload();
+      await screen.findByRole('region', { name: 'ملخص الملف' });
+      confirmEverything();
+      fireEvent.click(saveButton());
+      await screen.findByRole('region', { name: 'نتيجة الاستيراد' });
+
+      expect(await screen.findByText('تعذر التحميل')).toBeInTheDocument();
+      expect(screen.getByLabelText('ملف الوصفات (xlsx)')).toBeDisabled();
+      fireEvent.click(screen.getByRole('button', { name: 'حدّث البيانات' }));
+      await waitFor(() =>
+        expect(screen.getByLabelText('ملف الوصفات (xlsx)')).toBeEnabled(),
+      );
+      expect(loadImportContext).toHaveBeenCalledTimes(3);
+      expect(screen.queryByText('تعذر التحميل')).toBeNull();
+    });
+  });
+
   describe('effective time', () => {
     const shiftStart = new Date(Date.now() - 3 * 3_600_000).toISOString();
 
-    it('needs a reason and a ready impact for a backdated start', async () => {
+    it('needs a reason and a ready impact once the owner picks a backdated start', async () => {
       vi.mocked(commitRecipeImport).mockResolvedValue(imported);
       vi.mocked(costingImpact).mockResolvedValue({
         orders: 2,
@@ -364,7 +573,9 @@ describe('RecipeImportPage', () => {
       await openReview(importContext({ shiftStart }));
       confirmEverything();
 
-      expect(screen.getByLabelText('وقت السريان')).toHaveValue('shift');
+      fireEvent.change(screen.getByLabelText('وقت السريان'), {
+        target: { value: 'shift' },
+      });
       fireEvent.click(saveButton());
       expect(await screen.findByRole('alert')).toHaveTextContent(
         'اكتب سبب التغيير بأثر رجعي',
@@ -381,18 +592,22 @@ describe('RecipeImportPage', () => {
       expect(sent().payload.reason).toBe('سعر قديم');
     });
 
-    it('sends no start and no reason for now', async () => {
+    it('defaults to the server minute during an open shift and sends no start or reason', async () => {
       vi.mocked(commitRecipeImport).mockResolvedValue(imported);
       await openReview(importContext({ shiftStart }));
       confirmEverything();
-      fireEvent.change(screen.getByLabelText('وقت السريان'), {
-        target: { value: 'now' },
-      });
+      expect(screen.getByLabelText('وقت السريان')).toHaveValue('now');
       expect(screen.queryByLabelText('سبب التغيير')).toBeNull();
       fireEvent.click(saveButton());
       await screen.findByRole('region', { name: 'نتيجة الاستيراد' });
       expect(sent().payload.effective_from).toBeNull();
       expect(sent().payload.reason).toBeNull();
+      expect(costingImpact).not.toHaveBeenCalled();
+    });
+
+    it('defaults to now when no shift is open', async () => {
+      await openReview();
+      expect(screen.getByLabelText('وقت السريان')).toHaveValue('now');
     });
   });
 

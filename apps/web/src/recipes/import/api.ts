@@ -42,6 +42,7 @@ type BindingRow = {
   source_name: string;
   recipe_id: string | null;
   stock_item_id: string | null;
+  is_block: boolean;
   created_at: string;
 };
 
@@ -50,7 +51,9 @@ async function listBindings(): Promise<SourceBinding[]> {
   const rows = await readAllByKey<BindingRow>((afterId, size) => {
     const query = appDb()
       .from('recipe_import_bindings')
-      .select('id, source_name, recipe_id, stock_item_id, created_at');
+      .select(
+        'id, source_name, recipe_id, stock_item_id, is_block, created_at',
+      );
     return (afterId === null ? query : query.gt('id', afterId))
       .order('id')
       .limit(size);
@@ -70,6 +73,7 @@ async function listBindings(): Promise<SourceBinding[]> {
     source: row.source_name,
     recipeId: row.recipe_id,
     stockItemId: row.stock_item_id,
+    block: row.is_block,
   }));
 }
 

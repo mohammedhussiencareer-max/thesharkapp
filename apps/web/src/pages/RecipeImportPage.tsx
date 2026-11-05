@@ -99,7 +99,13 @@ type Loaded = {
   review: Review;
 };
 
-function Workspace({ ctx }: { ctx: ImportContext }) {
+function Workspace({
+  ctx,
+  reload,
+}: {
+  ctx: ImportContext;
+  reload: () => Promise<void>;
+}) {
   const subject = recipeImportSubject;
   const [heldEpoch, setHeldEpoch] = useState(0);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
@@ -107,13 +113,22 @@ function Workspace({ ctx }: { ctx: ImportContext }) {
   const [fileError, setFileError] = useState<string | null>(null);
   const [showIssues, setShowIssues] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [stale, setStale] = useState(false);
+  const [reloadError, setReloadError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ImportResult | null>(null);
   const [pickerKey, setPickerKey] = useState(0);
   const flight = useRef(false);
   const held = heldEpoch < 0 ? null : unknownAction<ImportAction>(subject);
-  const disabled = saving || reading || held !== null;
-  const timing = useDatedTiming(undefined, ctx.shiftStart, [], '', disabled);
+  const disabled = saving || reading || stale || held !== null;
+  const timing = useDatedTiming(
+    undefined,
+    ctx.shiftStart,
+    [],
+    '',
+    disabled,
+    'now',
+  );
 
   useEffect(
     () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
@@ -163,24 +178,39 @@ function Workspace({ ctx }: { ctx: ImportContext }) {
     }
   }
 
+  async function refresh() {
+    setReloadError(null);
+    try {
+      await reload();
+      setStale(false);
+    } catch (failure) {
+      setReloadError(messageFrom(failure) || genericCatalogError);
+    }
+  }
+
   async function run(action: ImportAction) {
     setSaving(true);
     setError(null);
+    let outcome: ImportResult;
     try {
-      const outcome = await commitRecipeImport(action);
+      outcome = await commitRecipeImport(action);
       settleAction(subject);
-      timing.refreshClock();
-      setResult(outcome);
-      setLoaded(null);
-      setShowIssues(false);
-      setPickerKey((value) => value + 1);
     } catch (failure) {
       settleAction(subject, failure);
       setError(messageFrom(failure));
-    } finally {
       flight.current = false;
       setSaving(false);
+      return;
     }
+    timing.refreshClock();
+    setResult(outcome);
+    setLoaded(null);
+    setShowIssues(false);
+    setPickerKey((value) => value + 1);
+    setStale(true);
+    flight.current = false;
+    setSaving(false);
+    await refresh();
   }
 
   async function onSave() {
@@ -266,6 +296,21 @@ function Workspace({ ctx }: { ctx: ImportContext }) {
             شوف الوصفات
           </Link>
         </section>
+      ) : null}
+      {stale && reloadError === null ? (
+        <p role="status">جاري تحديث بيانات الوصفات قبل استيراد جديد…</p>
+      ) : null}
+      {stale && reloadError !== null ? (
+        <div className="flex flex-col gap-2">
+          <p role="alert">{reloadError}</p>
+          <button
+            className={secondaryButton}
+            type="button"
+            onClick={() => void refresh()}
+          >
+            حدّث البيانات
+          </button>
+        </div>
       ) : null}
       <label className="flex flex-col gap-1">
         ملف الوصفات (xlsx)
@@ -422,6 +467,10 @@ export function RecipeImportPage() {
     setLoadId((value) => value + 1);
   }
 
+  async function reload() {
+    setCtx(await loadImportContext());
+  }
+
   return (
     <main className={pageShell}>
       <p>
@@ -439,7 +488,7 @@ export function RecipeImportPage() {
           </button>
         </div>
       ) : null}
-      {ctx !== null ? <Workspace ctx={ctx} /> : null}
+      {ctx !== null ? <Workspace ctx={ctx} reload={reload} /> : null}
     </main>
   );
 }

@@ -62,6 +62,7 @@ export type ImportPayload = {
     item_key?: string;
     recipe_id?: string;
     recipe_key?: string;
+    is_block?: boolean;
   }[];
 };
 
@@ -264,7 +265,11 @@ export function buildImportPayload(input: {
     const source = parsed.blocks.find((entry) => entry.id === block.id);
     if (!source || taken.has(source.norm)) continue;
     taken.add(source.norm);
-    bindings.push({ source_name: source.norm, recipe_key: `r${block.id}` });
+    bindings.push({
+      source_name: source.norm,
+      recipe_key: `r${block.id}`,
+      is_block: true,
+    });
   }
   for (const ingredient of ingredients) {
     if (taken.has(ingredient.norm)) continue;

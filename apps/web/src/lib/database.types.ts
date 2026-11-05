@@ -515,14 +515,14 @@ isOneToOne: false
                   ]
                 },"recipe_import_bindings": {
                   Row: {
-                    "created_at": string,"id": string,"import_id": string,"recipe_id": string | null,"source_name": string,"stock_item_id": string | null
+                    "created_at": string,"id": string,"import_id": string,"is_block": boolean,"recipe_id": string | null,"source_name": string,"stock_item_id": string | null
                   }
                   ComputedFields: never
                   Insert: {
-                    "created_at"?: string,"id"?: string,"import_id": string,"recipe_id"?: string | null,"source_name": string,"stock_item_id"?: string | null
+                    "created_at"?: string,"id"?: string,"import_id": string,"is_block"?: boolean,"recipe_id"?: string | null,"source_name": string,"stock_item_id"?: string | null
                   }
                   Update: {
-                    "created_at"?: string,"id"?: string,"import_id"?: string,"recipe_id"?: string | null,"source_name"?: string,"stock_item_id"?: string | null
+                    "created_at"?: string,"id"?: string,"import_id"?: string,"is_block"?: boolean,"recipe_id"?: string | null,"source_name"?: string,"stock_item_id"?: string | null
                   }
                   Relationships: [
                     {
@@ -1163,6 +1163,9 @@ isOneToOne: false
                            },
 "recipe_payload_assert_no_price_keys":
 { Args: { "p_depth": number,"p_node": Json }; Returns: undefined
+                           },
+"recipe_publish_version":
+{ Args: { "p_batch_qty": number,"p_batch_unit": string,"p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_lines": Json,"p_reason": string,"p_recipe_id": string,"p_request_id": string,"p_validate": boolean }; Returns: Json
                            },
 "recipe_schedule":
 { Args: { "p_recipe_id": string }; Returns: Json

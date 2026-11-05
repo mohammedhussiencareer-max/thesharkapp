@@ -22,6 +22,8 @@ export type SourceBinding = {
   source: string;
   recipeId: string | null;
   stockItemId: string | null;
+  /** True when the source name was a recipe block title, not an ingredient line. */
+  block: boolean;
 };
 
 export type ImportContext = {
@@ -159,13 +161,8 @@ export function ingredientChoices(
   );
 }
 
-function defaultUnit(
-  target: IngredientTarget,
-  choices: readonly UnitChoice[],
-): string {
-  if (target.type === 'block' || target.type === 'recipe') {
-    return choices[0]?.code ?? '';
-  }
+/** Workbook quantities are grams or millilitres, whatever the target is measured in. */
+function defaultUnit(choices: readonly UnitChoice[]): string {
   for (const code of ['g', 'ml']) {
     if (choices.some((choice) => choice.code === code)) return code;
   }
@@ -187,7 +184,7 @@ function settleUnit(
   if (choices.some((choice) => choice.code === ingredient.unit)) {
     return ingredient;
   }
-  return { ...ingredient, unit: defaultUnit(ingredient.target, choices) };
+  return { ...ingredient, unit: defaultUnit(choices) };
 }
 
 function unique<T>(list: readonly T[]): T | null {
@@ -369,6 +366,10 @@ export function retargetIngredient(
     confirmed: true,
     matched: 'none',
     unit: '',
+    ...(target.type === 'new' ? {} : { price: '', priceReason: '' }),
+    ...(target.type === 'item' || target.type === 'new'
+      ? {}
+      : { lossApproved: false }),
   });
 }
 
@@ -484,6 +485,7 @@ export function validateReview(
     ingredients: new Map(),
   };
   const included = review.blocks.filter((block) => block.include);
+  const includedIds = new Set(included.map((block) => block.id));
   if (included.length === 0) {
     issues.general.push('اختار وصفة واحدة على الأقل للاستيراد');
   }
@@ -635,6 +637,7 @@ export function validateReview(
       push(issues.ingredients, norm, 'اختار وحدة الكميات');
     }
     for (const block of parsed.blocks) {
+      if (!includedIds.has(block.id)) continue;
       for (const line of block.lines) {
         if (line.norm !== norm || line.unit === null) continue;
         if (!choices.some((choice) => choice.code === line.unit)) {
@@ -728,15 +731,25 @@ export function disappearedRecipes(
   ctx: ImportContext,
 ): { id: string; name: string }[] {
   const present = new Set(parsed.blocks.map((block) => block.norm));
+  const stillSourced = new Set(
+    ctx.bindings.flatMap((binding) =>
+      binding.block && binding.recipeId && present.has(binding.source)
+        ? [binding.recipeId]
+        : [],
+    ),
+  );
   const found: { id: string; name: string }[] = [];
   for (const binding of ctx.bindings) {
-    if (!binding.recipeId || present.has(binding.source)) continue;
+    if (!binding.block || !binding.recipeId || present.has(binding.source)) {
+      continue;
+    }
     const recipe = ctx.recipes.find((entry) => entry.id === binding.recipeId);
     if (
       recipe &&
       recipe.active &&
       recipe.kind !== 'cooking' &&
-      normalizeName(recipe.name) === binding.source &&
+      !stillSourced.has(recipe.id) &&
+      !present.has(normalizeName(recipe.name)) &&
       !found.some((entry) => entry.id === recipe.id)
     ) {
       found.push({ id: recipe.id, name: recipe.name });

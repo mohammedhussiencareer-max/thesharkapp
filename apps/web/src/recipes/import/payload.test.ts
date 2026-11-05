@@ -278,6 +278,7 @@ describe('buildImportPayload', () => {
     expect(payload.bindings).toContainEqual({
       source_name: norm(names.sauce),
       recipe_key: `r${blockId(names.sauce)}`,
+      is_block: true,
     });
     expect(payload.bindings).toContainEqual({
       source_name: norm(names.salt),
@@ -286,10 +287,25 @@ describe('buildImportPayload', () => {
     expect(
       payload.bindings.every(
         (binding) =>
-          Object.keys(binding).filter((key) => key !== 'source_name').length ===
-          1,
+          Object.keys(binding).filter(
+            (key) => key !== 'source_name' && key !== 'is_block',
+          ).length === 1,
       ),
     ).toBe(true);
+  });
+
+  it('marks exactly the recipe-title bindings as source blocks', () => {
+    const { payload } = setup(false);
+    const flagged = payload.bindings
+      .filter((binding) => binding.is_block === true)
+      .map((binding) => binding.source_name)
+      .sort();
+    expect(flagged).toEqual(
+      [names.dish, names.sauce, names.rice].map(norm).sort(),
+    );
+    expect(
+      payload.bindings.filter((binding) => 'is_block' in binding),
+    ).toHaveLength(flagged.length);
   });
 
   it('never carries a workbook price, a cell position or a formula', () => {
@@ -314,5 +330,45 @@ describe('buildImportPayload', () => {
     const first: ImportPayload = setup(true).payload;
     const second: ImportPayload = setup(true).payload;
     expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+  });
+
+  it('sends workbook grams as grams to a batch measured in kg', () => {
+    const ctx = importContext({
+      batches: [
+        {
+          id: 'batch-kg',
+          name: names.fish,
+          active: true,
+          versions: [
+            {
+              effectiveFrom: '2020-01-01T00:00:00.000Z',
+              effectiveTo: null,
+              unit: 'kg',
+            },
+          ],
+        },
+      ],
+    });
+    const review = confirmAll(buildReview(parsed, ctx), ctx);
+    expect(validateReview(review, parsed, ctx).general).toEqual([]);
+    const payload = buildImportPayload({
+      review,
+      parsed,
+      hash,
+      effectiveFrom: null,
+      reason: null,
+      tokens: {
+        recipes: new Map(),
+        losses: new Map(),
+      },
+    });
+    const dish = payload.recipes.find(
+      (recipe) => recipe.key === `r${blockId(names.dish)}`,
+    );
+    expect(dish?.lines).toContainEqual({
+      child_recipe_id: 'batch-kg',
+      quantity: '300',
+      unit: 'g',
+    });
   });
 });

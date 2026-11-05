@@ -2,7 +2,8 @@
 --
 -- The owner reviews a workbook in the browser, then sends ONE commit. The
 -- commit creates the approved new stock items and recipes, publishes recipe
--- versions through set_recipe_version, sets approved loss ratios through
+-- versions through the shared body of set_recipe_version and then validates
+-- the affected graph once, sets approved loss ratios through
 -- set_item_loss, applies owner-typed opening prices through
 -- set_item_opening_price, and records which source names were bound to what.
 -- Everything runs in one transaction under the ledger lock, so any refusal
@@ -38,16 +39,21 @@ create table app.recipe_import_bindings (
   source_name text not null,
   recipe_id uuid null references app.recipes (id) on delete restrict,
   stock_item_id uuid null references app.stock_items (id) on delete restrict,
+  is_block boolean not null default false,
   created_at timestamptz not null default clock_timestamp(),
   constraint recipe_import_bindings_source_name_chk check (
     source_name = btrim(source_name)
     and length(source_name) between 1 and 200
   ),
   constraint recipe_import_bindings_one_target_chk check ((recipe_id is null) <> (stock_item_id is null)),
+  constraint recipe_import_bindings_block_chk check (
+    not is_block
+    or recipe_id is not null
+  ),
   constraint recipe_import_bindings_import_source_key unique (import_id, source_name)
 );
 
-comment on table app.recipe_import_bindings is 'Which recipe or stock item a normalised workbook source name was bound to, per import. The latest row per source_name is the current binding. Append-only.';
+comment on table app.recipe_import_bindings is 'Which recipe or stock item a normalised workbook source name was bound to, per import. is_block marks a source name that was a recipe block title in the file, as opposed to an ingredient line, so a later file that no longer has the block can be told apart from one that never used the name. The latest row per source_name is the current binding. Append-only.';
 
 create index recipe_import_bindings_source_idx on app.recipe_import_bindings (source_name, created_at);
 
@@ -270,6 +276,7 @@ declare
   v_cid uuid;
   v_ikey text;
   v_rkey text;
+  v_is_block boolean;
   v_token text;
   v_text text;
   v_qty numeric;
@@ -816,7 +823,7 @@ begin
 
     perform app.import_assert_keys (
       v_elem,
-      array['source_name', 'stock_item_id', 'item_key', 'recipe_id', 'recipe_key'],
+      array['source_name', 'stock_item_id', 'item_key', 'recipe_id', 'recipe_key', 'is_block'],
       v_what
     );
 
@@ -828,6 +835,23 @@ begin
 
     if pg_catalog.num_nonnulls(v_sid, v_ikey, v_cid, v_rkey) <> 1 then
       raise exception '%: needs exactly one target', v_what
+        using errcode = '22023';
+    end if;
+
+    if pg_catalog.jsonb_typeof(v_elem -> 'is_block') is null
+    or pg_catalog.jsonb_typeof(v_elem -> 'is_block') = 'null' then
+      v_is_block := false;
+    elsif pg_catalog.jsonb_typeof(v_elem -> 'is_block') = 'boolean' then
+      v_is_block := (v_elem ->> 'is_block')::boolean;
+    else
+      raise exception '%: is_block must be true or false', v_what
+        using errcode = '22023';
+    end if;
+
+    if v_is_block
+    and v_cid is null
+    and v_rkey is null then
+      raise exception '%: is_block needs a recipe target', v_what
         using errcode = '22023';
     end if;
 
@@ -858,7 +882,9 @@ begin
         'recipe_id',
         v_cid,
         'recipe_key',
-        v_rkey
+        v_rkey,
+        'is_block',
+        v_is_block
       )
     );
   end loop;
@@ -1161,6 +1187,579 @@ end;
 $$;
 
 -- ============================================================================
+-- D2. One publication path. recipe_publish_version is the body of
+-- set_recipe_version with the closing publication check made optional, and
+-- set_recipe_version now calls it with the check on, so single edits behave
+-- exactly as before. The import publishes every recipe of a file without the
+-- check and then validates the whole affected graph once, because a
+-- coordinated change (a batch changing unit together with the lines of its
+-- parents) is invalid in every one-at-a-time order.
+-- ============================================================================
+create function app.recipe_publish_version (
+  p_request_id uuid,
+  p_recipe_id uuid,
+  p_effective_from timestamptz,
+  p_effective_to timestamptz,
+  p_batch_qty numeric,
+  p_batch_unit text,
+  p_lines jsonb,
+  p_reason text,
+  p_expected_token text,
+  p_validate boolean
+) returns jsonb language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_reason text;
+  v_from_is_now boolean;
+  v_effective_from timestamptz;
+  v_batch_qty numeric;
+  v_batch_unit text;
+  v_batch_code text;
+  v_lines jsonb;
+  v_kind text;
+  v_identity text;
+  v_payload jsonb;
+  v_replay jsonb;
+  v_token text;
+  v_new_token text;
+  v_canonical_to timestamptz;
+  v_result jsonb;
+  v_change_id bigint;
+  v_elem jsonb;
+  v_stock_id uuid;
+  v_child_id uuid;
+  v_code text;
+  v_target_kind text;
+  v_line_stock uuid[] := '{}'::uuid[];
+  v_line_child uuid[] := '{}'::uuid[];
+  v_line_qty numeric[] := '{}'::numeric[];
+  v_line_unit text[] := '{}'::text[];
+  v_superseded uuid[] := '{}'::uuid[];
+  v_new_ids uuid[] := '{}'::uuid[];
+  v_new_froms timestamptz[] := '{}'::timestamptz[];
+  v_new_tos timestamptz[] := '{}'::timestamptz[];
+  v_new_bqs numeric[] := '{}'::numeric[];
+  v_new_bus text[] := '{}'::text[];
+  v_new_srcs uuid[] := '{}'::uuid[];
+  v_row record;
+begin
+  if coalesce(app.is_owner(), false) is not true then
+    raise exception 'insufficient_privilege'
+      using errcode = '42501';
+  end if;
+
+  -- Ledger lock before the recipe row lock. Same key as every posting path.
+  perform app.assert_ledger_write_allowed();
+
+  if p_request_id is null then
+    raise exception 'request_id is required'
+      using errcode = '22023';
+  end if;
+
+  if p_recipe_id is null then
+    raise exception 'recipe_id is required'
+      using errcode = '22023';
+  end if;
+
+  if p_effective_from is null then
+    v_from_is_now := true;
+  elsif not pg_catalog.isfinite(p_effective_from) then
+    raise exception 'effective_from must be a finite timestamp'
+      using errcode = '22023';
+  else
+    v_from_is_now := false;
+  end if;
+
+  if p_effective_to is not null
+  and not pg_catalog.isfinite(p_effective_to) then
+    raise exception 'effective_to must be a finite timestamp after effective_from'
+      using errcode = '22023';
+  end if;
+
+  if p_reason is null
+  or btrim(p_reason) = '' then
+    v_reason := null;
+  else
+    v_reason := btrim(p_reason);
+  end if;
+
+  if v_reason is not null
+  and length(v_reason) > 500 then
+    raise exception 'reason must be at most 500 characters'
+      using errcode = '22023';
+  end if;
+
+  v_batch_qty := p_batch_qty;
+
+  if v_batch_qty is not null
+  and (
+    v_batch_qty in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+    or v_batch_qty <= 0
+  ) then
+    raise exception 'batch_qty must be finite and greater than 0'
+      using errcode = '22023';
+  end if;
+
+  v_batch_unit := nullif(btrim(p_batch_unit), '');
+
+  if v_batch_unit is not null
+  and length(v_batch_unit) > 40 then
+    raise exception 'batch_unit must be at most 40 characters'
+      using errcode = '22023';
+  end if;
+
+  if p_lines is null then
+    v_lines := null;
+
+    if v_batch_qty is not null
+    or v_batch_unit is not null then
+      raise exception 'batch_qty and batch_unit must be null when lines is null'
+        using errcode = '22023';
+    end if;
+  else
+    v_lines := app.recipe_lines_normalize(p_lines);
+  end if;
+
+  v_payload := jsonb_build_object(
+    'fn',
+    'set_recipe_version',
+    'recipe_id',
+    p_recipe_id,
+    'effective_from',
+    case
+      when v_from_is_now then 'now'
+      else app.costing_timestamptz_text (p_effective_from)
+    end,
+    'effective_to',
+    app.costing_timestamptz_text (p_effective_to),
+    'batch_qty',
+    pg_catalog.trim_scale(v_batch_qty),
+    'batch_unit',
+    v_batch_unit,
+    'lines',
+    v_lines,
+    'expected_token',
+    p_expected_token,
+    'reason',
+    v_reason
+  );
+
+  v_replay := app.costing_replay_result(p_request_id, v_payload);
+
+  if v_replay is not null then
+    return v_replay;
+  end if;
+
+  -- Null means the current minute, and only after replay so a retry
+  -- still matches the stored payload text "now".
+  if v_from_is_now then
+    v_effective_from := pg_catalog.date_trunc('minute', pg_catalog.now());
+  else
+    v_effective_from := p_effective_from;
+  end if;
+
+  if p_effective_to is not null
+  and p_effective_to <= v_effective_from then
+    raise exception 'effective_to must be a finite timestamp after effective_from'
+      using errcode = '22023';
+  end if;
+
+  select
+    r.kind,
+    r.kind || '|'
+  into v_kind,
+    v_identity
+  from
+    app.recipes r
+  where
+    r.id = p_recipe_id
+  for update;
+
+  if not found then
+    raise exception 'unknown recipe id: %', p_recipe_id
+      using errcode = '22023';
+  end if;
+
+  v_token := app.recipe_schedule_token(p_recipe_id);
+
+  if v_token is distinct from p_expected_token then
+    raise exception 'configuration changed'
+      using errcode = '40001';
+  end if;
+
+  -- The end is the covering version's own end, or the next start when the
+  -- resolved instant is in a gap. A client that computed the end from a
+  -- different instant must not fill a gap it did not see.
+  select
+    case
+      when exists (
+        select
+          1
+        from
+          app.recipe_versions v
+        where
+          v.recipe_id = p_recipe_id
+          and v.superseded_change_id is null
+          and v.effective_from <= v_effective_from
+          and (
+            v.effective_to is null
+            or v_effective_from < v.effective_to
+          )
+      ) then (
+        select
+          v.effective_to
+        from
+          app.recipe_versions v
+        where
+          v.recipe_id = p_recipe_id
+          and v.superseded_change_id is null
+          and v.effective_from <= v_effective_from
+          and (
+            v.effective_to is null
+            or v_effective_from < v.effective_to
+          )
+        order by
+          v.effective_from desc
+        limit
+          1
+      )
+      else (
+        select
+          min(v.effective_from)
+        from
+          app.recipe_versions v
+        where
+          v.recipe_id = p_recipe_id
+          and v.superseded_change_id is null
+          and v.effective_from > v_effective_from
+      )
+    end
+  into v_canonical_to;
+
+  if v_from_is_now
+  and v_canonical_to is not null
+  and (
+    p_effective_to is null
+    or p_effective_to > v_canonical_to
+  ) then
+    raise exception 'configuration changed'
+      using errcode = '40001';
+  end if;
+
+  -- Only a null effective_from is the server's current minute and needs no
+  -- reason. An explicit timestamp earlier than the actual clock does.
+  if not v_from_is_now
+  and v_effective_from < pg_catalog.now()
+  and v_reason is null then
+    raise exception 'reason is required for a backdated change'
+      using errcode = '22023';
+  end if;
+
+  if v_lines is not null then
+    if v_kind = 'batch' then
+      if v_batch_qty is null
+      or v_batch_unit is null then
+        raise exception 'a batch recipe version requires batch_qty and batch_unit'
+          using errcode = '22023';
+      end if;
+
+      v_batch_code := app.resolve_unit_code(v_batch_unit);
+
+      if v_batch_code is null then
+        raise exception 'unknown unit "%" for batch_unit', v_batch_unit
+          using errcode = '22023';
+      end if;
+    elsif v_batch_qty is not null
+    or v_batch_unit is not null then
+      raise exception 'batch_qty and batch_unit are only for batch recipes'
+        using errcode = '22023';
+    end if;
+
+    for v_i in 1..pg_catalog.jsonb_array_length(v_lines) loop
+      v_elem := v_lines -> (v_i - 1);
+      v_stock_id := (v_elem ->> 'stock_item_id')::uuid;
+      v_child_id := (v_elem ->> 'child_recipe_id')::uuid;
+      v_code := app.resolve_unit_code(v_elem ->> 'unit');
+
+      if v_code is null then
+        raise exception 'unknown unit "%" in line %', v_elem ->> 'unit', v_i
+          using errcode = '22023';
+      end if;
+
+      if v_stock_id is not null then
+        select
+          si.kind
+        into v_target_kind
+        from
+          app.stock_items si
+        where
+          si.id = v_stock_id;
+
+        if not found then
+          raise exception 'unknown stock_item id: % in line %', v_stock_id, v_i
+            using errcode = '22023';
+        end if;
+
+        if v_target_kind in ('packaging', 'fish_mixed') then
+          raise exception 'line %: a % item cannot be a recipe leaf', v_i, v_target_kind
+            using errcode = '22023';
+        end if;
+      else
+        select
+          r.kind
+        into v_target_kind
+        from
+          app.recipes r
+        where
+          r.id = v_child_id;
+
+        if not found then
+          raise exception 'unknown recipe id: % in line %', v_child_id, v_i
+            using errcode = '22023';
+        end if;
+
+        if v_target_kind <> 'batch' then
+          raise exception 'line %: only a batch recipe can be a child', v_i
+            using errcode = '22023';
+        end if;
+      end if;
+
+      v_line_stock := pg_catalog.array_append(v_line_stock, v_stock_id);
+      v_line_child := pg_catalog.array_append(v_line_child, v_child_id);
+      v_line_qty := pg_catalog.array_append(v_line_qty, (v_elem ->> 'quantity')::numeric);
+      v_line_unit := pg_catalog.array_append(v_line_unit, v_code);
+    end loop;
+  end if;
+
+  for v_row in
+    select
+      v.id,
+      v.effective_from,
+      v.effective_to,
+      v.batch_qty,
+      v.batch_unit
+    from
+      app.recipe_versions v
+    where
+      v.recipe_id = p_recipe_id
+      and v.superseded_change_id is null
+      and v.valid_during && pg_catalog.tstzrange(v_effective_from, p_effective_to, '[)')
+    order by
+      v.effective_from,
+      v.id
+    for update
+  loop
+    v_superseded := pg_catalog.array_append(v_superseded, v_row.id);
+
+    if v_row.effective_from < v_effective_from then
+      v_new_ids := pg_catalog.array_append(v_new_ids, pg_catalog.gen_random_uuid());
+      v_new_froms := pg_catalog.array_append(v_new_froms, v_row.effective_from);
+      v_new_tos := pg_catalog.array_append(v_new_tos, v_effective_from);
+      v_new_bqs := pg_catalog.array_append(v_new_bqs, v_row.batch_qty);
+      v_new_bus := pg_catalog.array_append(v_new_bus, v_row.batch_unit);
+      v_new_srcs := pg_catalog.array_append(v_new_srcs, v_row.id);
+    end if;
+
+    if p_effective_to is not null
+    and (
+      v_row.effective_to is null
+      or v_row.effective_to > p_effective_to
+    ) then
+      v_new_ids := pg_catalog.array_append(v_new_ids, pg_catalog.gen_random_uuid());
+      v_new_froms := pg_catalog.array_append(v_new_froms, p_effective_to);
+      v_new_tos := pg_catalog.array_append(v_new_tos, v_row.effective_to);
+      v_new_bqs := pg_catalog.array_append(v_new_bqs, v_row.batch_qty);
+      v_new_bus := pg_catalog.array_append(v_new_bus, v_row.batch_unit);
+      v_new_srcs := pg_catalog.array_append(v_new_srcs, v_row.id);
+    end if;
+  end loop;
+
+  -- Null lines remove coverage for the interval. Fragments outside it stay.
+  if v_lines is not null then
+    v_new_ids := pg_catalog.array_append(v_new_ids, pg_catalog.gen_random_uuid());
+    v_new_froms := pg_catalog.array_append(v_new_froms, v_effective_from);
+    v_new_tos := pg_catalog.array_append(v_new_tos, p_effective_to);
+    v_new_bqs := pg_catalog.array_append(v_new_bqs, v_batch_qty);
+    v_new_bus := pg_catalog.array_append(v_new_bus, v_batch_code);
+    v_new_srcs := pg_catalog.array_append(v_new_srcs, null::uuid);
+  end if;
+
+  select
+    pg_catalog.md5(
+      v_identity || coalesce(
+        string_agg(
+          app.recipe_schedule_line (s.id, s.effective_from, s.effective_to, s.batch_qty, s.batch_unit),
+          ','
+          order by
+            s.effective_from,
+            s.id
+        ),
+        ''
+      )
+    )
+  into v_new_token
+  from
+    (
+      select
+        v.id,
+        v.effective_from,
+        v.effective_to,
+        v.batch_qty,
+        v.batch_unit
+      from
+        app.recipe_versions v
+      where
+        v.recipe_id = p_recipe_id
+        and v.superseded_change_id is null
+        and not (v.id = any (v_superseded))
+      union all
+      select
+        v_new_ids[g.i],
+        v_new_froms[g.i],
+        v_new_tos[g.i],
+        v_new_bqs[g.i],
+        v_new_bus[g.i]
+      from
+        pg_catalog.generate_series(1, pg_catalog.cardinality(v_new_ids)) as g (i)
+    ) s;
+
+  v_result := app.insert_owner_costing_change(
+    p_request_id,
+    v_reason,
+    v_payload,
+    jsonb_build_object(
+      'superseded',
+      pg_catalog.to_jsonb(v_superseded),
+      'inserted',
+      pg_catalog.to_jsonb(v_new_ids),
+      'token',
+      v_new_token
+    )
+  );
+  v_change_id := (v_result -> 'change_id')::bigint;
+
+  if pg_catalog.cardinality(v_superseded) > 0 then
+    update app.recipe_versions
+    set
+      superseded_change_id = v_change_id
+    where
+      id = any (v_superseded);
+  end if;
+
+  if coalesce(pg_catalog.cardinality(v_new_ids), 0) > 0 then
+    for v_i in 1..pg_catalog.cardinality(v_new_ids) loop
+      insert into
+        app.recipe_versions (
+          id,
+          effective_from,
+          effective_to,
+          created_change_id,
+          recipe_id,
+          batch_qty,
+          batch_unit
+        )
+      values
+        (
+          v_new_ids[v_i],
+          v_new_froms[v_i],
+          v_new_tos[v_i],
+          v_change_id,
+          p_recipe_id,
+          v_new_bqs[v_i],
+          v_new_bus[v_i]
+        );
+
+      if v_new_srcs[v_i] is not null then
+        insert into
+          app.recipe_lines (version_id, line_no, stock_item_id, child_recipe_id, quantity, unit)
+        select
+          v_new_ids[v_i],
+          l.line_no,
+          l.stock_item_id,
+          l.child_recipe_id,
+          l.quantity,
+          l.unit
+        from
+          app.recipe_lines l
+        where
+          l.version_id = v_new_srcs[v_i]
+        order by
+          l.line_no;
+      else
+        for v_j in 1..pg_catalog.cardinality(v_line_unit) loop
+          insert into
+            app.recipe_lines (version_id, line_no, stock_item_id, child_recipe_id, quantity, unit)
+          values
+            (
+              v_new_ids[v_i],
+              v_j,
+              v_line_stock[v_j],
+              v_line_child[v_j],
+              v_line_qty[v_j],
+              v_line_unit[v_j]
+            );
+        end loop;
+      end if;
+    end loop;
+  end if;
+
+  if app.recipe_schedule_token(p_recipe_id) is distinct from v_new_token then
+    raise exception 'internal costing token mismatch'
+      using errcode = '55000';
+  end if;
+
+  if p_validate then
+    perform app.recipe_validate_publication(p_recipe_id, v_effective_from, p_effective_to);
+  end if;
+
+  return v_result;
+end;
+$$;
+
+comment on function app.recipe_publish_version (
+  uuid,
+  uuid,
+  timestamptz,
+  timestamptz,
+  numeric,
+  text,
+  jsonb,
+  text,
+  text,
+  boolean
+) is 'Shared body of set_recipe_version. When p_validate is false the closing recipe_validate_publication is skipped and the caller must validate every recipe it published, over the same interval, before the transaction ends. Takes advisory lock 7342750000000000001 before locking the recipe. Owner only. Internal.';
+
+create or replace function app.set_recipe_version (
+  p_request_id uuid,
+  p_recipe_id uuid,
+  p_effective_from timestamptz,
+  p_effective_to timestamptz,
+  p_batch_qty numeric,
+  p_batch_unit text,
+  p_lines jsonb,
+  p_reason text,
+  p_expected_token text
+) returns jsonb language plpgsql security definer
+set
+  search_path = '' as $$
+begin
+  return app.recipe_publish_version(
+    p_request_id,
+    p_recipe_id,
+    p_effective_from,
+    p_effective_to,
+    p_batch_qty,
+    p_batch_unit,
+    p_lines,
+    p_reason,
+    p_expected_token,
+    true
+  );
+end;
+$$;
+
+-- ============================================================================
 -- E. The commit. Owner only. Ledger lock, argument validation, replay, then
 -- state checks, then the writes in dependency order. The existing writers do
 -- the real work with sub request ids derived from the import request id, so
@@ -1213,6 +1812,8 @@ declare
   v_r_bqty numeric[] := '{}'::numeric[];
   v_r_bcode text[] := '{}'::text[];
   v_order integer[];
+  v_pub_ids uuid[] := '{}'::uuid[];
+  v_pub_tos timestamptz[] := '{}'::timestamptz[];
   v_recipes_out jsonb := '[]'::jsonb;
   v_losses_out jsonb := '[]'::jsonb;
   v_prices_out jsonb := '[]'::jsonb;
@@ -1513,7 +2114,8 @@ begin
     );
   end loop;
 
-  -- Publish children before parents. An unchanged existing recipe gets no version.
+  -- Publish every changed recipe without the per-recipe publication check, then
+  -- validate the affected graph once below. An unchanged existing recipe gets no version.
   foreach v_idx in array v_order loop
     v_elem := (v_payload -> 'recipes') -> (v_idx - 1);
     v_rid := v_r_id[v_idx];
@@ -1538,7 +2140,7 @@ begin
       v_change_id := null;
     else
       v_to := app.import_recipe_canonical_to (v_rid, v_effective_from);
-      v_sub := app.set_recipe_version (
+      v_sub := app.recipe_publish_version (
         app.import_sub_request_id (p_request_id, 'version:' || v_r_key[v_idx]),
         v_rid,
         v_from_arg,
@@ -1547,8 +2149,11 @@ begin
         v_r_bcode[v_idx],
         v_r_lines[v_idx],
         v_reason,
-        v_token
+        v_token,
+        false
       );
+      v_pub_ids := pg_catalog.array_append(v_pub_ids, v_rid);
+      v_pub_tos := pg_catalog.array_append(v_pub_tos, v_to);
       v_status := case
         when v_r_new[v_idx] then 'created'
         else 'published'
@@ -1569,6 +2174,12 @@ begin
         v_change_id
       )
     );
+  end loop;
+
+  -- Every imported version now exists, so each published recipe and its
+  -- ancestors are checked against the final graph. A failure rolls everything back.
+  for v_i in 1..coalesce(pg_catalog.cardinality(v_pub_ids), 0) loop
+    perform app.recipe_validate_publication (v_pub_ids[v_i], v_effective_from, v_pub_tos[v_i]);
   end loop;
 
   -- Owner-typed opening prices, with the same identity binding as the writer.
@@ -1719,16 +2330,22 @@ begin
     end if;
 
     insert into
-      app.recipe_import_bindings (import_id, source_name, recipe_id, stock_item_id)
+      app.recipe_import_bindings (import_id, source_name, recipe_id, stock_item_id, is_block)
     values
-      (v_import_id, v_elem ->> 'source_name', v_rid, v_sid);
+      (
+        v_import_id,
+        v_elem ->> 'source_name',
+        v_rid,
+        v_sid,
+        (v_elem ->> 'is_block')::boolean
+      );
   end loop;
 
   return v_result;
 end;
 $$;
 
-comment on function app.commit_recipe_import (uuid, jsonb) is 'Commits one reviewed workbook import atomically. Owner only. Takes advisory lock 7342750000000000001, validates the payload (price-like keys refused outside manual_opening_prices, unknown keys refused everywhere), replays by request_id, then creates the approved items and recipes, publishes versions children first through set_recipe_version, sets approved losses through set_item_loss, applies owner-typed opening prices, and records bindings. An unchanged recipe gets no version. Any refusal rolls everything back.';
+comment on function app.commit_recipe_import (uuid, jsonb) is 'Commits one reviewed workbook import atomically. Owner only. Takes advisory lock 7342750000000000001, validates the payload (price-like keys refused outside manual_opening_prices, unknown keys refused everywhere), replays by request_id, then creates the approved items and recipes, publishes every changed version through recipe_publish_version without the per-recipe check, validates the whole affected graph once after all versions exist, sets approved losses through set_item_loss, applies owner-typed opening prices, and records bindings. An unchanged recipe gets no version. Any refusal rolls everything back.';
 
 -- ============================================================================
 -- F. RLS and grants. The owner reads; nothing writes except the commit.
@@ -1878,6 +2495,24 @@ from
   service_role;
 
 revoke all on function app.import_publish_order (jsonb)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+revoke all on function app.recipe_publish_version (
+  uuid,
+  uuid,
+  timestamptz,
+  timestamptz,
+  numeric,
+  text,
+  jsonb,
+  text,
+  text,
+  boolean
+)
 from
   public,
   anon,
