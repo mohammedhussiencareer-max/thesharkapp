@@ -1,4 +1,11 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetHeldWrites, unknownSaveMessage } from '@/items/request-id';
@@ -8,11 +15,14 @@ import {
   loadCoverage,
   loadSubjectDetail,
   setBaseMapping,
+  setOptionMapping,
 } from '@/mapping/api';
+import { sourceChangedMessage } from '@/mapping/labels';
 import type {
   Coverage,
   MappingCatalog,
   ObservedBase,
+  ScheduleVersion,
   SubjectDetail,
 } from '@/mapping/types';
 import { MappingPage } from '@/pages/MappingPage';
@@ -47,7 +57,10 @@ function observed(
 
 const catalog: MappingCatalog = {
   recipes: [{ id: 'recipe-1', name: 'طبق تجريبي', kind: 'dish' }],
-  items: [{ id: 'item-1', name: 'ملح تجريبي', baseUnit: 'kg' }],
+  items: [
+    { id: 'item-1', name: 'ملح تجريبي', baseUnit: 'kg' },
+    { id: 'item-2', name: 'فلفل تجريبي', baseUnit: 'kg' },
+  ],
   units: [{ code: 'kg', label: 'كيلو' }],
   shiftStart: null,
 };
@@ -101,6 +114,7 @@ describe('MappingPage', () => {
     vi.mocked(loadCoverage).mockReset();
     vi.mocked(loadSubjectDetail).mockReset();
     vi.mocked(setBaseMapping).mockReset();
+    vi.mocked(setOptionMapping).mockReset();
     vi.mocked(loadBases).mockResolvedValue([
       observed('صنف جاهز', 'ready'),
       observed('صنف ناقص', 'incomplete'),
@@ -166,5 +180,189 @@ describe('MappingPage', () => {
     });
     expect(await screen.findByText('الربط اتحفظ')).toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/جنيه|EGP|ج\.م/);
+  });
+
+  function stockVersion(
+    id: string,
+    from: string,
+    to: string | null,
+    itemId: string,
+    quantity: string,
+  ): ScheduleVersion {
+    return {
+      id,
+      family: 'mapping',
+      effectiveFrom: from,
+      effectiveTo: to,
+      targetKind: 'stock',
+      recipeId: null,
+      stockItemId: itemId,
+      quantityPerBasis: quantity,
+      unitCode: 'kg',
+      exceptionReason: null,
+      optionPolicy: null,
+    };
+  }
+
+  const versionA = stockVersion(
+    'ver-a',
+    '2000-01-01T00:00:00.000Z',
+    '2090-01-01T00:00:00.000Z',
+    'item-1',
+    '1',
+  );
+  const versionB = stockVersion(
+    'ver-b',
+    '2090-01-01T00:00:00.000Z',
+    null,
+    'item-2',
+    '2',
+  );
+
+  function crossIntoLaterVersion(form: HTMLElement) {
+    fireEvent.change(within(form).getByLabelText('الكمية'), {
+      target: { value: '9' },
+    });
+    fireEvent.change(within(form).getByLabelText('وقت السريان'), {
+      target: { value: 'custom' },
+    });
+    fireEvent.change(within(form).getByLabelText('الوقت'), {
+      target: { value: '2090-06-01T12:00' },
+    });
+  }
+
+  it('resets base fields when the effective version changes', async () => {
+    vi.mocked(loadSubjectDetail).mockResolvedValue({
+      ...detail,
+      schedule: {
+        subjectId: 'sub-1',
+        token: 'token-1',
+        emptyToken: 'empty',
+        versions: [versionA, versionB],
+      },
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: /صنف ناقص/ }));
+    const form = await screen.findByRole('form', { name: 'ربط الصنف' });
+    crossIntoLaterVersion(form);
+    fireEvent.click(within(form).getByRole('button', { name: 'احفظ الربط' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      sourceChangedMessage,
+    );
+    expect(vi.mocked(setBaseMapping)).not.toHaveBeenCalled();
+    expect(within(form).getByLabelText('الكمية')).toHaveValue('2');
+    expect(within(form).getByLabelText('الصنف')).toHaveValue('item-2');
+    fireEvent.click(within(form).getByRole('button', { name: 'احفظ الربط' }));
+    await waitFor(() => {
+      expect(vi.mocked(setBaseMapping)).toHaveBeenCalledTimes(1);
+    });
+    expect(vi.mocked(setBaseMapping).mock.calls[0]?.[0]?.target).toEqual({
+      kind: 'stock',
+      stockItemId: 'item-2',
+      quantity: '2',
+      unit: 'kg',
+    });
+  });
+
+  it('resets option fields when the effective version changes', async () => {
+    vi.mocked(loadSubjectDetail).mockResolvedValue({
+      ...detail,
+      options: [
+        {
+          posItemId: 'صنف ناقص',
+          sizeKeyText: '["none"]',
+          optionValue: 'مشوي',
+          seenCount: 1,
+        },
+      ],
+      optionBindings: [
+        {
+          scope: 'global',
+          optionValue: 'مشوي',
+          schedule: {
+            subjectId: 'opt-1',
+            token: 'opt-token',
+            emptyToken: 'opt-empty',
+            versions: [versionA, versionB],
+          },
+        },
+      ],
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: /صنف ناقص/ }));
+    const form = await screen.findByRole('form', {
+      name: 'ربط الاختيار العام مشوي',
+    });
+    crossIntoLaterVersion(form);
+    fireEvent.click(
+      within(form).getByRole('button', { name: 'احفظ ربط الاختيار' }),
+    );
+    expect(within(form).getByRole('alert')).toHaveTextContent(
+      sourceChangedMessage,
+    );
+    expect(vi.mocked(setOptionMapping)).not.toHaveBeenCalled();
+    expect(within(form).getByLabelText('الكمية')).toHaveValue('2');
+    expect(within(form).getByLabelText('الصنف')).toHaveValue('item-2');
+    fireEvent.click(
+      within(form).getByRole('button', { name: 'احفظ ربط الاختيار' }),
+    );
+    await waitFor(() => {
+      expect(vi.mocked(setOptionMapping)).toHaveBeenCalledTimes(1);
+    });
+    expect(vi.mocked(setOptionMapping).mock.calls[0]?.[0]?.target).toEqual({
+      kind: 'stock',
+      stockItemId: 'item-2',
+      quantity: '2',
+      unit: 'kg',
+    });
+  });
+
+  it('discards a detail reload after another subject is selected', async () => {
+    const pending: Array<(value: SubjectDetail) => void> = [];
+    let opened = false;
+    const detailReady: SubjectDetail = {
+      ...detail,
+      resolution: {
+        status: 'ready',
+        issues: [],
+        requirements: [
+          { stockItemId: 'item-1', baseUnit: 'kg', quantity: '9.5' },
+        ],
+      },
+    };
+    vi.mocked(setBaseMapping).mockResolvedValue(undefined);
+    vi.mocked(loadSubjectDetail).mockImplementation((base) => {
+      if (base.posItemId === 'صنف جاهز') return Promise.resolve(detailReady);
+      if (!opened) {
+        opened = true;
+        return Promise.resolve(detail);
+      }
+      return new Promise((resolve) => {
+        pending.push(resolve);
+      });
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: /صنف ناقص/ }));
+    expect(
+      await screen.findByRole('form', { name: 'ربط الصنف' }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('الصنف'), {
+      target: { value: 'item-1' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'احفظ الربط' }));
+    await waitFor(() => {
+      expect(pending.length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getByRole('button', { name: /صنف جاهز/ }));
+    expect(await screen.findByText(/9\.5/)).toBeInTheDocument();
+    await act(async () => {
+      pending.splice(0).forEach((resolve) => resolve(detail));
+      await Promise.resolve();
+    });
+    expect(
+      screen.getByRole('heading', { level: 2, name: /صنف جاهز/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/9\.5/)).toBeInTheDocument();
+    expect(screen.queryByText('الصنف مش مربوط')).not.toBeInTheDocument();
   });
 });

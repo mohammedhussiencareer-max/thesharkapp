@@ -1233,7 +1233,7 @@ isOneToOne: false
 { Args: { "p_from": string,"p_label": string,"p_recipe_id": string,"p_to": string }; Returns: undefined
                            },
 "pos_map_expand_target":
-{ Args: { "p_at": string,"p_quantity": number,"p_recipe_id": string,"p_scale_den": number,"p_scale_num": number,"p_stock_item_id": string,"p_target_kind": string,"p_unit": string,"p_weighted": boolean }; Returns: Json
+{ Args: { "p_at": string,"p_quantity": number,"p_recipe_id": string,"p_role": string,"p_scale_den": number,"p_scale_num": number,"p_stock_item_id": string,"p_target_kind": string,"p_unit": string,"p_weighted": boolean }; Returns: Json
                            },
 "pos_map_identity":
 { Args: { "p_kind": string,"p_option_value": string,"p_pos_item_id": string,"p_scope": string,"p_size_key": Json }; Returns: string

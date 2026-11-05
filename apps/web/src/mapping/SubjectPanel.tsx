@@ -266,6 +266,26 @@ function TargetFields({
   );
 }
 
+function fieldsFromVersion(
+  version: ScheduleVersion | null | undefined,
+  allowed: readonly TargetMode[],
+  emptyMode: TargetMode,
+): {
+  mode: TargetMode;
+  recipeId: string;
+  stockItemId: string;
+  quantity: string;
+  unit: string;
+} {
+  return {
+    mode: allowed.find((entry) => entry === version?.targetKind) ?? emptyMode,
+    recipeId: version?.recipeId ?? '',
+    stockItemId: version?.stockItemId ?? '',
+    quantity: version?.quantityPerBasis ?? '1',
+    unit: version?.unitCode ?? '',
+  };
+}
+
 function targetFromDraft(
   mode: TargetMode,
   recipeId: string,
@@ -533,18 +553,13 @@ function BaseMappingForm({
   }
 
   if (seeded.key !== seedKey && !dirty) {
+    const next = fieldsFromVersion(covering, baseModes, 'stock');
     setSeeded({ key: seedKey, versionId: covering?.id ?? null });
-    setMode(
-      covering?.targetKind === 'recipe'
-        ? 'recipe'
-        : covering?.targetKind === 'stock'
-          ? 'stock'
-          : 'stock',
-    );
-    setRecipeId(covering?.recipeId ?? '');
-    setStockItemId(covering?.stockItemId ?? '');
-    setQuantity(covering?.quantityPerBasis ?? '1');
-    setUnit(covering?.unitCode ?? '');
+    setMode(next.mode);
+    setRecipeId(next.recipeId);
+    setStockItemId(next.stockItemId);
+    setQuantity(next.quantity);
+    setUnit(next.unit);
   }
 
   if (picked && appliedNonce !== picked.nonce) {
@@ -569,11 +584,17 @@ function BaseMappingForm({
       dated.instantMs ?? atMs,
     );
     if ((inForce?.id ?? null) !== seeded.versionId) {
+      const next = fieldsFromVersion(inForce, baseModes, 'stock');
+      setMode(next.mode);
+      setRecipeId(next.recipeId);
+      setStockItemId(next.stockItemId);
+      setQuantity(next.quantity);
+      setUnit(next.unit);
       setSeeded({
         key: `${inForce?.id ?? ''}|${detail.schedule.token}`,
         versionId: inForce?.id ?? null,
       });
-      setDirty(false);
+      setDirty((inForce?.id ?? null) !== (covering?.id ?? null));
       onError(sourceChangedMessage);
       return;
     }
@@ -1035,12 +1056,13 @@ function OptionMappingForm({
   );
 
   if (seeded.key !== seedKey && !dirty) {
+    const next = fieldsFromVersion(covering, optionModes, 'gap');
     setSeeded({ key: seedKey, versionId: covering?.id ?? null });
-    setMode(initialMode);
-    setRecipeId(covering?.recipeId ?? '');
-    setStockItemId(covering?.stockItemId ?? '');
-    setQuantity(covering?.quantityPerBasis ?? '1');
-    setUnit(covering?.unitCode ?? '');
+    setMode(next.mode);
+    setRecipeId(next.recipeId);
+    setStockItemId(next.stockItemId);
+    setQuantity(next.quantity);
+    setUnit(next.unit);
   }
 
   async function finish(write: OptionMappingWrite) {
@@ -1078,11 +1100,17 @@ function OptionMappingForm({
       dated.instantMs ?? atMs,
     );
     if ((inForce?.id ?? null) !== seeded.versionId) {
+      const next = fieldsFromVersion(inForce, optionModes, 'gap');
+      setMode(next.mode);
+      setRecipeId(next.recipeId);
+      setStockItemId(next.stockItemId);
+      setQuantity(next.quantity);
+      setUnit(next.unit);
       setSeeded({
         key: `${inForce?.id ?? ''}|${schedule.token}`,
         versionId: inForce?.id ?? null,
       });
-      setDirty(false);
+      setDirty((inForce?.id ?? null) !== (covering?.id ?? null));
       setError(sourceChangedMessage);
       return;
     }

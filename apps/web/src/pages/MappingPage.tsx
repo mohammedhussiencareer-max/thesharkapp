@@ -41,7 +41,10 @@ export function MappingPage() {
   const [catalog, setCatalog] = useState<MappingCatalog | null>(null);
   const [coverage, setCoverage] = useState<Coverage | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  const [detail, setDetail] = useState<SubjectDetail | null>(null);
+  const [detail, setDetail] = useState<{
+    key: string;
+    value: SubjectDetail;
+  } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -49,6 +52,8 @@ export function MappingPage() {
   const [loadId, setLoadId] = useState(0);
   const homeSeq = useRef(0);
   const detailSeq = useRef(0);
+  const reloadSeq = useRef(0);
+  const selectedKeyRef = useRef<string | null>(null);
   const rangeError = dateRangeError(fromDate, toDate);
 
   useEffect(() => {
@@ -88,16 +93,29 @@ export function MappingPage() {
   useEffect(() => {
     if (!selected) return;
     const seq = ++detailSeq.current;
+    const key = baseKey(selected);
     let cancelled = false;
     const current = selected;
     void (async () => {
       try {
         const next = await loadSubjectDetail(current);
-        if (cancelled || seq !== detailSeq.current) return;
-        setDetail(next);
+        if (
+          cancelled ||
+          seq !== detailSeq.current ||
+          selectedKeyRef.current !== key
+        ) {
+          return;
+        }
+        setDetail({ key, value: next });
         setDetailError(null);
       } catch (error) {
-        if (cancelled || seq !== detailSeq.current) return;
+        if (
+          cancelled ||
+          seq !== detailSeq.current ||
+          selectedKeyRef.current !== key
+        ) {
+          return;
+        }
         setDetail(null);
         setDetailError(messageFrom(error));
       }
@@ -108,6 +126,8 @@ export function MappingPage() {
   }, [selected]);
 
   async function reload() {
+    const seq = ++reloadSeq.current;
+    const keyAtStart = selectedKeyRef.current;
     const fromIso = cairoDateStartIso(fromDate);
     const toIso = cairoNextDateStartIso(toDate);
     if (!fromIso || !toIso || rangeError) {
@@ -117,10 +137,23 @@ export function MappingPage() {
       loadBases(),
       loadCoverage(fromIso, toIso),
     ]);
+    if (seq !== reloadSeq.current) return;
     setBases(nextBases);
     setCoverage(nextCoverage);
-    const current = nextBases.find((base) => baseKey(base) === selectedKey);
-    if (current) setDetail(await loadSubjectDetail(current));
+    if (keyAtStart === null || selectedKeyRef.current !== keyAtStart) return;
+    const current = nextBases.find((base) => baseKey(base) === keyAtStart);
+    if (!current) return;
+    const detailRequest = ++detailSeq.current;
+    const next = await loadSubjectDetail(current);
+    if (
+      seq !== reloadSeq.current ||
+      detailRequest !== detailSeq.current ||
+      selectedKeyRef.current !== keyAtStart
+    ) {
+      return;
+    }
+    setDetail({ key: keyAtStart, value: next });
+    setDetailError(null);
   }
 
   const shown = sortBases(bases ?? []).filter((base) =>
@@ -212,9 +245,12 @@ export function MappingPage() {
                 type="button"
                 aria-pressed={baseKey(base) === selectedKey}
                 onClick={() => {
+                  const key = baseKey(base);
+                  selectedKeyRef.current = key;
+                  detailSeq.current += 1;
                   setDetail(null);
                   setDetailError(null);
-                  setSelectedKey(baseKey(base));
+                  setSelectedKey(key);
                 }}
               >
                 {subjectTitle(base)} — {sizeLabel(base.sizeKey)} —{' '}
@@ -225,11 +261,15 @@ export function MappingPage() {
         </ul>
       ) : null}
       {detailError ? <p role="alert">{detailError}</p> : null}
-      {selected && !detail && !detailError ? <p>جاري تحميل الصنف…</p> : null}
-      {selected && detail && catalog ? (
+      {selected &&
+      !detailError &&
+      (!detail || detail.key !== baseKey(selected)) ? (
+        <p>جاري تحميل الصنف…</p>
+      ) : null}
+      {selected && detail && detail.key === baseKey(selected) && catalog ? (
         <SubjectPanel
           base={selected}
-          detail={detail}
+          detail={detail.value}
           catalog={catalog}
           onReload={reload}
         />

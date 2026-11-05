@@ -2,7 +2,7 @@
 begin;
 
 select
-  plan (154);
+  plan (173);
 
 insert into
   auth.users (
@@ -80,6 +80,12 @@ values
     '2030-08-01 08:00:00+00',
     false,
     '2030-08-01 08:00:00+00'
+  ),
+  (
+    'shift-map-sept',
+    '2030-09-01 08:00:00+00',
+    false,
+    '2030-09-01 08:00:00+00'
   );
 
 insert into
@@ -246,6 +252,21 @@ values
     0,
     0,
     '2030-07-01 12:00:00+00',
+    repeat('ab', 32),
+    false
+  ),
+  (
+    'order-map-zero',
+    'shift-map-sept',
+    'complete',
+    '2030-09-01 12:00:00+00',
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    '2030-09-01 12:00:00+00',
     repeat('ab', 32),
     false
   );
@@ -477,7 +498,7 @@ values
     1,
     null,
     null,
-    '[]'::jsonb,
+    '[{"value":"مشوي"}]'::jsonb,
     1
   ),
   (
@@ -485,6 +506,18 @@ values
     'line-wcook',
     'pos-wcook',
     'صنف تسوية وزن',
+    null,
+    1,
+    2,
+    'kg',
+    '[{"value":"مشوي"}]'::jsonb,
+    1
+  ),
+  (
+    'order-map-july',
+    'line-cookpub',
+    'pos-cookpub',
+    'صنف نشر طهي',
     null,
     1,
     2,
@@ -551,6 +584,18 @@ values
     'سلة',
     '[]'::jsonb,
     1
+  ),
+  (
+    'order-map-zero',
+    'line-zero',
+    'pos-zero',
+    'صنف كمية صفر',
+    null,
+    0,
+    null,
+    null,
+    '[]'::jsonb,
+    0
   );
 
 select
@@ -1746,7 +1791,7 @@ select
   );
 
 select
-  lives_ok (
+  throws_ok (
     $$select app.set_pos_base_mapping(
       'a4600000-0000-4000-8000-000000000433',
       'pos-cook', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
@@ -1754,29 +1799,13 @@ select
       (select app.pos_base_schedule('pos-cook', '["none"]'::jsonb) ->> 'token'),
       null
     )$$,
-    'a fixed line may be saved against a cooking recipe'
+    '22023',
+    'a base mapping cannot target a cooking recipe: pos-cook / ["none"]',
+    'a base mapping cannot target a cooking recipe'
   );
 
 select
-  lives_ok (
-    $$select app.set_pos_option_policy(
-      'a4600000-0000-4000-8000-000000000434',
-      'pos-cook', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
-      'none_expected',
-      (select app.pos_base_schedule('pos-cook', '["none"]'::jsonb) ->> 'token'),
-      null
-    )$$,
-    'the fixed cooking subject expects no options'
-  );
-
-select
-  ok (
-    app.resolve_line_requirements ('order-map-july', 'line-cook') -> 'issues' @> '[{"code":"target_kind_mismatch"}]'::jsonb,
-    'a cooking recipe on a fixed line does not match'
-  );
-
-select
-  lives_ok (
+  throws_ok (
     $$select app.set_pos_base_mapping(
       'a4600000-0000-4000-8000-000000000435',
       'pos-wcook', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
@@ -1784,19 +1813,76 @@ select
       (select app.pos_base_schedule('pos-wcook', '["none"]'::jsonb) ->> 'token'),
       null
     )$$,
-    'a weight line maps to the cooking recipe'
+    '22023',
+    'a base mapping cannot target a cooking recipe: pos-wcook / ["none"]',
+    'a weighted base cannot target a cooking recipe'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_base_mapping(
+      'a4600000-0000-4000-8000-0000000004e1',
+      'pos-wcook', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      jsonb_build_object(
+        'stock_item_id', (select id from app.stock_items where name = 'جمبري الربط'),
+        'quantity_per_basis', 1, 'unit', 'kg'
+      ),
+      (select app.pos_base_schedule('pos-wcook', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the weight line maps one kg of shrimp per kg'
   );
 
 select
   lives_ok (
     $$select app.set_pos_option_policy(
-      'a4600000-0000-4000-8000-000000000436',
+      'a4600000-0000-4000-8000-0000000004e2',
       'pos-wcook', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
-      'none_expected',
+      'exactly_one',
       (select app.pos_base_schedule('pos-wcook', '["none"]'::jsonb) ->> 'token'),
       null
     )$$,
-    'the weight cooking subject expects no options'
+    'the weight line expects one option'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_base_mapping(
+      'a4600000-0000-4000-8000-0000000004e3',
+      'pos-cook', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      jsonb_build_object(
+        'stock_item_id', (select id from app.stock_items where name = 'ملح الربط'),
+        'quantity_per_basis', 1, 'unit', 'kg'
+      ),
+      (select app.pos_base_schedule('pos-cook', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the fixed line maps to salt'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_option_policy(
+      'a4600000-0000-4000-8000-0000000004e4',
+      'pos-cook', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      'exactly_one',
+      (select app.pos_base_schedule('pos-cook', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the fixed line expects one option'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_option_mapping(
+      'a4600000-0000-4000-8000-0000000004e5',
+      'global', null, null, 'مشوي',
+      '2030-01-01 00:00:00+00', null,
+      jsonb_build_object('recipe_id', (select id from app.recipes where name = 'تسوية الربط')),
+      (select app.pos_option_schedule('global', null, null, 'مشوي') ->> 'token'),
+      null
+    )$$,
+    'a weight-line option maps to the cooking recipe'
   );
 
 select
@@ -1808,9 +1894,61 @@ select
         pg_catalog.jsonb_array_elements (
           app.resolve_line_requirements ('order-map-july', 'line-wcook') -> 'requirements'
         ) as e
+      where
+        e.value ->> 'stock_item_id' = (
+          select
+            id::text
+          from
+            app.stock_items
+          where
+            name = 'جمبري الربط'
+        )
     ),
     2::numeric,
-    'a cooking recipe scales per kg of the weight line'
+    'the weight line still requires the shrimp'
+  );
+
+select
+  is (
+    (
+      select
+        (e.value ->> 'quantity')::numeric
+      from
+        pg_catalog.jsonb_array_elements (
+          app.resolve_line_requirements ('order-map-july', 'line-wcook') -> 'requirements'
+        ) as e
+      where
+        e.value ->> 'stock_item_id' = (
+          select
+            id::text
+          from
+            app.stock_items
+          where
+            name = 'ملح الربط'
+        )
+    ),
+    2::numeric,
+    'a cooking option scales per kg of the weight line'
+  );
+
+select
+  ok (
+    app.resolve_line_requirements ('order-map-july', 'line-cook') -> 'issues' @> '[{"code":"target_kind_mismatch"}]'::jsonb,
+    'a cooking option on a fixed line does not match'
+  );
+
+select
+  is (
+    app.resolve_line_requirements ('order-map-july', 'line-cook') ->> 'status',
+    'incomplete',
+    'a cooking option on a fixed line is incomplete'
+  );
+
+select
+  is (
+    app.resolve_line_requirements ('order-map-july', 'line-cook') -> 'requirements',
+    'null'::jsonb,
+    'a cooking option on a fixed line has no requirements'
   );
 
 select
@@ -1915,6 +2053,104 @@ select
     app.resolve_line_requirements ('order-map-july', 'line-tiny') -> 'requirements',
     'null'::jsonb,
     'below precision does not return a zero quantity'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_base_mapping(
+      'a4600000-0000-4000-8000-000000000495',
+      'pos-digits', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      jsonb_build_object(
+        'stock_item_id', (select id from app.stock_items where name = 'ملح الربط'),
+        'quantity_per_basis', '0.0000004999999999999999999',
+        'unit', 'kg'
+      ),
+      (select app.pos_base_schedule('pos-digits', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'a long decimal quantity is mapped'
+  );
+
+select
+  is (
+    pg_catalog.jsonb_typeof (
+      app.pos_base_schedule ('pos-digits', '["none"]'::jsonb) -> 'versions' -> 0 -> 'quantity_per_basis'
+    ),
+    'string',
+    'a schedule quantity is text'
+  );
+
+select
+  is (
+    app.pos_base_schedule ('pos-digits', '["none"]'::jsonb) -> 'versions' -> 0 ->> 'quantity_per_basis',
+    '0.0000004999999999999999999',
+    'a schedule quantity keeps every decimal digit'
+  );
+
+select
+  is (
+    (
+      select
+        pg_catalog.trim_scale (v.quantity_per_basis)::text
+      from
+        app.pos_map_versions v
+        join app.pos_map_subjects s on s.id = v.subject_id
+      where
+        s.pos_item_id = 'pos-digits'
+        and v.family = 'mapping'
+        and v.superseded_change_id is null
+    ),
+    '0.0000004999999999999999999',
+    'the stored quantity matches the schedule text'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_base_mapping(
+      'a4600000-0000-4000-8000-0000000004d1',
+      'pos-zero', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      jsonb_build_object(
+        'stock_item_id', (select id from app.stock_items where name = 'ملح الربط'),
+        'quantity_per_basis', 1, 'unit', 'kg'
+      ),
+      (select app.pos_base_schedule('pos-zero', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'a zero-quantity line is mapped'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_option_policy(
+      'a4600000-0000-4000-8000-0000000004d2',
+      'pos-zero', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      'none_expected',
+      (select app.pos_base_schedule('pos-zero', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the zero-quantity line expects no options'
+  );
+
+select
+  is (
+    app.pos_mapping_coverage (
+      '2030-09-01 00:00:00+00',
+      '2030-09-02 00:00:00+00'
+    ) -> 'coverage',
+    'null'::jsonb,
+    'a window whose only line has quantity zero has null coverage'
+  );
+
+select
+  is (
+    (
+      app.pos_mapping_coverage (
+        '2030-09-01 00:00:00+00',
+        '2030-09-02 00:00:00+00'
+      ) ->> 'eligible_lines'
+    )::integer,
+    0,
+    'a zero-quantity line is not eligible'
   );
 
 select
@@ -2025,6 +2261,21 @@ select
     )$$,
     '%unknown key%',
     'an unknown target key is rejected'
+  );
+
+select
+  throws_ok (
+    $$select app.set_pos_option_mapping(
+      'a4600000-0000-4000-8000-000000000456',
+      'global', null, null, 'فارغ',
+      '2030-01-01 00:00:00+00', null,
+      '{"disposition":null}'::jsonb,
+      (select app.pos_option_schedule('global', null, null, 'فارغ') ->> 'token'),
+      null
+    )$$,
+    '22023',
+    'disposition must be unmapped or no_stock on an option mapping',
+    'a null option disposition is rejected'
   );
 
 select
@@ -2211,15 +2462,16 @@ select
 
 select
   throws_like (
-    $$select app.set_pos_base_mapping(
+    $$select app.set_pos_option_mapping(
       'a4600000-0000-4000-8000-000000000483',
-      'pos-marine', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      'global', null, null, 'مشوي مرفوض',
+      '2030-01-01 00:00:00+00', null,
       jsonb_build_object('recipe_id', (select id from app.recipes where name = 'تسوية مرفوضة')),
-      (select app.pos_base_schedule('pos-marine', '["none"]'::jsonb) ->> 'token'),
+      (select app.pos_option_schedule('global', null, null, 'مشوي مرفوض') ->> 'token'),
       null
     )$$,
-    '%pos-marine / ["none"]%cooking_marine%',
-    'a cooking recipe with a marine leaf is refused and names the subject'
+    '%option مشوي مرفوض%cooking_marine%',
+    'a cooking option with a marine leaf is refused and names the subject'
   );
 
 select
@@ -2293,6 +2545,108 @@ select
   );
 
 reset role;
+
+insert into
+  app.pos_map_subjects (kind, pos_item_id, size_key, created_change_id)
+values
+  (
+    'base',
+    'pos-cookpub',
+    '["none"]'::jsonb,
+    (
+      select
+        id
+      from
+        app.costing_changes
+      where
+        request_id = 'a4600000-0000-4000-8000-000000000302'
+    )
+  );
+
+insert into
+  app.pos_map_versions (
+    effective_from,
+    created_change_id,
+    subject_id,
+    family,
+    target_kind,
+    recipe_id
+  )
+values
+  (
+    '2030-01-01 00:00:00+00',
+    (
+      select
+        id
+      from
+        app.costing_changes
+      where
+        request_id = 'a4600000-0000-4000-8000-000000000302'
+    ),
+    (
+      select
+        id
+      from
+        app.pos_map_subjects
+      where
+        pos_item_id = 'pos-cookpub'
+    ),
+    'mapping',
+    'recipe',
+    (
+      select
+        id
+      from
+        app.recipes
+      where
+        name = 'تسوية الربط'
+    )
+  );
+
+select
+  ok (
+    app.resolve_line_requirements ('order-map-july', 'line-cookpub') -> 'issues' @> '[{"code":"target_kind_mismatch"}]'::jsonb,
+    'a weighted base stored against a cooking recipe does not match'
+  );
+
+set
+  local role authenticated;
+
+select
+  throws_like (
+    $$select app.set_recipe_version(
+      'a4600000-0000-4000-8000-000000000484',
+      (select id from app.recipes where name = 'تسوية الربط'),
+      '2030-02-01 00:00:00+00', null, null, null,
+      jsonb_build_array(jsonb_build_object(
+        'stock_item_id', (select id from app.stock_items where name = 'ملح الربط'),
+        'quantity', 1, 'unit', 'kg'
+      )),
+      null,
+      (select app.recipe_schedule((select id from app.recipes where name = 'تسوية الربط')) ->> 'token')
+    )$$,
+    '%pos-cookpub / ["none"]%',
+    'publishing a cooking recipe names a base mapping that targets it'
+  );
+
+reset role;
+
+select
+  throws_ok (
+    $$insert into app.pos_map_versions (
+      effective_from, created_change_id, superseded_change_id, subject_id, family, target_kind
+    ) values (
+      '2030-01-01 00:00:00+00',
+      (select id from app.costing_changes where request_id = 'a4600000-0000-4000-8000-000000000401'),
+      (select id from app.costing_changes where request_id = 'a4600000-0000-4000-8000-000000000401'),
+      (select id from app.pos_map_subjects where pos_item_id = 'pos-a' and kind = 'base'),
+      'mapping',
+      null
+    )$$,
+    '23514',
+    null,
+    'a mapping with a null target kind is rejected'
+  );
 
 select
   throws_ok (
@@ -2389,6 +2743,56 @@ select
     $$update app.stock_items set base_unit = 'piece', kind = 'packaging'
       where name = 'صنف التجميد معاد'$$,
     'after the mapping is superseded the identity can change'
+  );
+
+set
+  local role authenticated;
+
+select
+  is (
+    (
+      select
+        app.set_pos_base_mapping (
+          'a4600000-0000-4000-8000-000000000439',
+          'pos-ing',
+          '["none"]'::jsonb,
+          '2030-01-01 00:00:00+00',
+          null,
+          jsonb_build_object(
+            'stock_item_id',
+            (
+              select
+                (payload -> 'target' ->> 'stock_item_id')::uuid
+              from
+                app.costing_changes
+              where
+                request_id = 'a4600000-0000-4000-8000-000000000439'
+            ),
+            'quantity_per_basis',
+            1,
+            'unit',
+            'kg'
+          ),
+          (
+            select
+              payload ->> 'expected_token'
+            from
+              app.costing_changes
+            where
+              request_id = 'a4600000-0000-4000-8000-000000000439'
+          ),
+          null
+        ) - 'subject_id'
+    ),
+    (
+      select
+        result
+      from
+        app.costing_changes
+      where
+        request_id = 'a4600000-0000-4000-8000-000000000439'
+    ),
+    'retrying the direct mapping after the item became packaging returns the committed result'
   );
 
 select

@@ -5,6 +5,7 @@ import {
   genericCatalogError,
 } from '@/items/errors';
 import type { Json } from '@/lib/database.types';
+import { exactDecimalOrNull } from '@/lib/decimal';
 import { keysAfterFilter, readAllByKey, readAllByKeys } from '@/lib/paged';
 import { supabase } from '@/lib/supabase';
 import { isDefiniteRefusal, isPayloadRefusal } from '@/lib/write-outcome';
@@ -111,7 +112,7 @@ function ratioOf(value: unknown): number | null {
   return value;
 }
 
-/** A jsonb number arrives as a JS number. Write it back without an exponent. */
+/** Requirement quantities are already rounded to 6 places. */
 function plainDecimal(value: unknown): string {
   if (typeof value === 'string' && /^\d+(\.\d+)?$/.test(value.trim())) {
     return value.trim();
@@ -124,9 +125,20 @@ function plainDecimal(value: unknown): string {
   return value.toFixed(20).replace(/\.?0+$/, '');
 }
 
-function decimalOrNull(value: unknown): string | null {
-  if (value === null || value === undefined) return null;
-  return plainDecimal(value);
+export const historyVersionColumns =
+  'id, family, effective_from, effective_to, target_kind, recipe_id, stock_item_id, quantity_per_basis_text:quantity_per_basis::text, unit_code, exception_reason, option_policy, superseded_change_id';
+
+/** Mapping quantities stay exact decimal text. A JSON number is refused. */
+export function readMappingQuantity(value: unknown): string | null {
+  if (value === undefined) return null;
+  return exactDecimalOrNull(value, genericCatalogError);
+}
+
+function mappingQuantity(row: Record<string, unknown>): string | null {
+  if (Object.prototype.hasOwnProperty.call(row, 'quantity_per_basis_text')) {
+    return readMappingQuantity(row.quantity_per_basis_text);
+  }
+  return readMappingQuantity(row.quantity_per_basis);
 }
 
 export function sizeKeyOf(value: unknown): SizeKey {
@@ -165,7 +177,7 @@ function versionOf(value: unknown): ScheduleVersion {
     targetKind,
     recipeId: textOrNull(row.recipe_id),
     stockItemId: textOrNull(row.stock_item_id),
-    quantityPerBasis: decimalOrNull(row.quantity_per_basis),
+    quantityPerBasis: mappingQuantity(row),
     unitCode: textOrNull(row.unit_code),
     exceptionReason: textOrNull(row.exception_reason),
     optionPolicy: policy,
@@ -429,7 +441,7 @@ async function loadHistory(subjectId: string): Promise<HistoryRow[]> {
     target_kind: string | null;
     recipe_id: string | null;
     stock_item_id: string | null;
-    quantity_per_basis: number | string | null;
+    quantity_per_basis_text: string | null;
     unit_code: string | null;
     exception_reason: string | null;
     option_policy: string | null;
@@ -437,9 +449,7 @@ async function loadHistory(subjectId: string): Promise<HistoryRow[]> {
   }>((afterId, size) => {
     const query = appDb()
       .from('pos_map_versions')
-      .select(
-        'id, family, effective_from, effective_to, target_kind, recipe_id, stock_item_id, quantity_per_basis, unit_code, exception_reason, option_policy, superseded_change_id',
-      )
+      .select(historyVersionColumns)
       .eq('subject_id', subjectId);
     return (afterId === null ? query : query.gt('id', afterId))
       .order('id')

@@ -15,9 +15,11 @@
 --   in kg and never applies loss. A fixed line scales by quantity. A fixed
 --   direct target of kind seafood or fish_size applies net to raw with the
 --   item loss at the order instant.
--- * A cooking recipe on a fixed line is target_kind_mismatch. A dish on a
---   weight line is allowed and scales by kg. Batch, packaging and fish_mixed
---   are never targets.
+-- * A cooking recipe is only a target for an option on a weight line. A base
+--   mapping that names one is refused, and resolution reports
+--   target_kind_mismatch for a cooking base or a cooking option on a fixed
+--   line. A dish on a weight line is allowed and scales by kg. Batch,
+--   packaging and fish_mixed are never targets.
 -- * none_expected rejects any option on the line and does not consult option
 --   mappings. exactly_one needs one unambiguous value and no blank value.
 --   additive accepts any count. A missing policy blocks the line.
@@ -26,8 +28,10 @@
 -- * Exception and mapping intervals of one base subject cannot overlap.
 -- * Requirements stay exact until resolve_line_requirements rounds once to 6.
 --   Incomplete and exception results carry null requirements, never a zero cost.
--- * Coverage's covered count is ready plus exception. Free lines (zero total)
---   stay in the denominator. Canceled, open, missing and pre-start lines do not.
+-- * Coverage's covered count is ready plus exception. A line counts only when
+--   its quantity or weighted quantity is positive. Free lines (zero total,
+--   positive quantity) stay in the denominator. Canceled, open, missing and
+--   pre-start lines do not.
 -- ============================================================================
 -- A. costing_changes.kind gains 'mapping' and keeps the kinds already allowed.
 -- ============================================================================
@@ -215,7 +219,7 @@ create table app.pos_map_versions (
           and quantity_per_basis is null
           and unit_code is null
         )
-      )
+      ) is true
     )
     or (
       family = 'exception'
@@ -747,8 +751,6 @@ declare
   v_unit text;
   v_recipe uuid;
   v_item uuid;
-  v_kind text;
-  v_recipe_kind text;
 begin
   if p_target is null
   or pg_catalog.jsonb_typeof (p_target) = 'null' then
@@ -786,29 +788,13 @@ begin
           using errcode = '22023';
     end;
 
-    select
-      r.kind
-    into v_recipe_kind
-    from
-      app.recipes r
-    where
-      r.id = v_recipe;
-
-    if v_recipe_kind is null then
-      raise exception 'unknown recipe id: %', v_recipe
-        using errcode = '22023';
-    end if;
-
-    if v_recipe_kind = 'batch' then
-      raise exception 'a mapping cannot target a batch recipe'
-        using errcode = '22023';
-    end if;
-
+    -- Existence and kind are mutable. pos_map_apply checks them after replay.
     return pg_catalog.jsonb_build_object('recipe_id', v_recipe);
   end if;
 
   if v_keys = array['disposition']::text[] then
     if not p_allow_disposition
+    or pg_catalog.jsonb_typeof (p_target -> 'disposition') is distinct from 'string'
     or (p_target ->> 'disposition') not in ('unmapped', 'no_stock') then
       raise exception 'disposition must be unmapped or no_stock on an option mapping'
         using errcode = '22023';
@@ -862,32 +848,16 @@ begin
     end if;
 
     v_qty := pg_catalog.trim_scale (v_qty);
+    v_unit := btrim(p_target ->> 'unit');
 
-    select
-      si.kind
-    into v_kind
-    from
-      app.stock_items si
-    where
-      si.id = v_item;
-
-    if v_kind is null then
-      raise exception 'unknown stock_item id: %', v_item
+    if v_unit is null
+    or v_unit = '' then
+      raise exception 'unit is required'
         using errcode = '22023';
     end if;
 
-    if v_kind in ('packaging', 'fish_mixed') then
-      raise exception 'packaging and fish_mixed cannot be mapping targets'
-        using errcode = '22023';
-    end if;
-
-    v_unit := app.resolve_unit_code (p_target ->> 'unit');
-
-    if v_unit is null then
-      raise exception 'unknown unit "%"', p_target ->> 'unit'
-        using errcode = '22023';
-    end if;
-
+    -- The item kind and the unit code are mutable. pos_map_apply checks them
+    -- after replay so a retry still returns the committed row.
     return pg_catalog.jsonb_build_object(
       'quantity_per_basis',
       pg_catalog.to_jsonb (v_qty),
@@ -903,7 +873,7 @@ begin
 end;
 $$;
 
-comment on function app.pos_map_target_normalize (jsonb, boolean) is 'Canonical mapping target. A recipe id, a stock item with quantity and unit, or, on an option only, disposition unmapped or no_stock. Unknown and price-like keys raise 22023. Null is a gap. Internal.';
+comment on function app.pos_map_target_normalize (jsonb, boolean) is 'Canonical mapping target. A recipe id, a stock item with quantity and unit, or, on an option only, a non-null disposition unmapped or no_stock. Does not read recipes, stock items, or units; those checks run after replay. Unknown and price-like keys raise 22023. Null is a gap. Internal.';
 
 -- ============================================================================
 -- F. Publication. A mapping names its subject when a recipe under it breaks.
@@ -1072,6 +1042,7 @@ declare
   v_detail text;
   v_map record;
   v_label text;
+  v_recipe_kind text;
   v_slice_from timestamptz;
   v_slice_to timestamptz;
 begin
@@ -1206,6 +1177,24 @@ begin
       v_map.option_scope,
       v_map.option_value
     );
+
+    -- A cooking recipe is a weight-line option target. A base that already
+    -- names one blocks publication of that recipe and names the subject.
+    if v_map.kind = 'base' then
+      select
+        r.kind
+      into v_recipe_kind
+      from
+        app.recipes r
+      where
+        r.id = v_map.recipe_id;
+
+      if v_recipe_kind = 'cooking' then
+        raise exception 'a base mapping cannot target a cooking recipe: %', v_label
+          using errcode = '22023';
+      end if;
+    end if;
+
     perform app.pos_map_assert_recipe (v_map.recipe_id, v_slice_from, v_slice_to, v_label);
   end loop;
 
@@ -1362,6 +1351,9 @@ declare
   v_new_exc text[] := '{}'::text[];
   v_new_pol text[] := '{}'::text[];
   v_row record;
+  v_unit text;
+  v_recipe_kind text;
+  v_item_kind text;
 begin
   if coalesce(app.is_owner (), false) is not true then
     raise exception 'insufficient_privilege'
@@ -1501,6 +1493,68 @@ begin
   if v_token is distinct from p_expected_token then
     raise exception 'configuration changed'
       using errcode = '40001';
+  end if;
+
+  -- Replay already returned. Catalog kind and unit codes can change after a
+  -- committed request, so a retry must not be rejected by their current state.
+  v_unit := p_unit;
+
+  if not p_gap
+  and p_family = 'mapping' then
+    if p_target_kind = 'recipe' then
+      select
+        r.kind
+      into v_recipe_kind
+      from
+        app.recipes r
+      where
+        r.id = p_recipe_id;
+
+      if v_recipe_kind is null then
+        raise exception 'unknown recipe id: %', p_recipe_id
+          using errcode = '22023';
+      end if;
+
+      if v_recipe_kind = 'batch' then
+        raise exception 'a mapping cannot target a batch recipe'
+          using errcode = '22023';
+      end if;
+
+      if v_recipe_kind = 'cooking'
+      and p_kind is distinct from 'option' then
+        raise exception 'a base mapping cannot target a cooking recipe: %', v_label
+          using errcode = '22023';
+      end if;
+    elsif p_target_kind = 'stock' then
+      select
+        si.kind
+      into v_item_kind
+      from
+        app.stock_items si
+      where
+        si.id = p_stock_item_id;
+
+      if v_item_kind is null then
+        raise exception 'unknown stock_item id: %', p_stock_item_id
+          using errcode = '22023';
+      end if;
+
+      if v_item_kind in ('packaging', 'fish_mixed') then
+        raise exception 'packaging and fish_mixed cannot be mapping targets'
+          using errcode = '22023';
+      end if;
+
+      v_unit := app.resolve_unit_code (p_unit);
+
+      if v_unit is null then
+        raise exception 'unknown unit "%"', p_unit
+          using errcode = '22023';
+      end if;
+    elsif p_target_kind in ('unmapped', 'no_stock')
+    and p_kind is distinct from 'option' then
+      raise exception 'disposition must be unmapped or no_stock on an option mapping'
+        using errcode = '22023';
+    end if;
   end if;
 
   select
@@ -1655,7 +1709,7 @@ begin
     v_new_recipes := pg_catalog.array_append(v_new_recipes, p_recipe_id);
     v_new_items := pg_catalog.array_append(v_new_items, p_stock_item_id);
     v_new_qtys := pg_catalog.array_append(v_new_qtys, p_quantity);
-    v_new_units := pg_catalog.array_append(v_new_units, p_unit);
+    v_new_units := pg_catalog.array_append(v_new_units, v_unit);
     v_new_exc := pg_catalog.array_append(v_new_exc, p_exception_reason);
     v_new_pol := pg_catalog.array_append(v_new_pol, p_policy);
   end if;
@@ -1868,10 +1922,11 @@ comment on function app.pos_map_apply (
 ) is 'Replaces one family of a mapping subject on [effective_from, effective_to). Null effective_from is the current minute and is stored as now. An earlier instant needs a reason. Takes advisory lock 7342750000000000001 first. Owner only. Internal.';
 
 -- ============================================================================
--- H. Owner writers. Each one takes the ledger lock, normalises, then apply.
--- Replay stores the normalised payload, so a retry of the same arguments
--- returns the same result. subject_id is added for the caller; the sealed
--- audit row stays without it.
+-- H. Owner writers. Each one canonicalises the payload, then apply replays
+-- before it checks the current recipe or stock item. Replay stores the
+-- normalised payload, so a retry of the same arguments returns the same
+-- result. subject_id is added for the caller; the sealed audit row stays
+-- without it.
 -- ============================================================================
 create function app.pos_map_with_subject (
   p_result jsonb,
@@ -1979,7 +2034,7 @@ comment on function app.set_pos_base_mapping (
   jsonb,
   text,
   text
-) is 'Dates the base mapping of one POS item and size. Null target leaves a gap. The target is a dish or cooking recipe, or a stock item with quantity and unit. Takes advisory lock 7342750000000000001 first. Owner only.';
+) is 'Dates the base mapping of one POS item and size. Null target leaves a gap. The target is a dish recipe or a stock item with quantity and unit. A cooking recipe is refused. Takes advisory lock 7342750000000000001 first. Owner only.';
 
 create function app.set_pos_option_policy (
   p_request_id uuid,
@@ -2274,7 +2329,7 @@ begin
           'stock_item_id',
           v.stock_item_id,
           'quantity_per_basis',
-          v.quantity_per_basis,
+          pg_catalog.to_jsonb (pg_catalog.trim_scale (v.quantity_per_basis)::text),
           'unit_code',
           v.unit_code,
           'exception_reason',
@@ -2380,7 +2435,7 @@ begin
           'stock_item_id',
           v.stock_item_id,
           'quantity_per_basis',
-          v.quantity_per_basis,
+          pg_catalog.to_jsonb (pg_catalog.trim_scale (v.quantity_per_basis)::text),
           'unit_code',
           v.unit_code,
           'exception_reason',
@@ -2499,6 +2554,7 @@ create function app.pos_map_expand_target (
   p_unit text,
   p_at timestamptz,
   p_weighted boolean,
+  p_role text,
   p_scale_num numeric,
   p_scale_den numeric
 ) returns jsonb language plpgsql stable security definer
@@ -2546,7 +2602,10 @@ begin
     if v_recipe_kind = 'batch'
     or (
       v_recipe_kind = 'cooking'
-      and not p_weighted
+      and (
+        p_role is distinct from 'option'
+        or not p_weighted
+      )
     ) then
       v_issues := pg_catalog.jsonb_build_array(
         pg_catalog.jsonb_build_object(
@@ -2848,6 +2907,7 @@ begin
       v_unit,
       p_at,
       p_weighted,
+      'option',
       p_scale_num,
       p_scale_den
     );
@@ -3135,6 +3195,7 @@ begin
       v_map_unit,
       v_ordered,
       v_weighted_line,
+      'base',
       v_scale_num,
       v_scale_den
     );
@@ -3552,7 +3613,8 @@ $$;
 comment on function app.resolve_line_requirements (text, text) is 'Owner lookup of one POS line at its ordered_at. status is ready, incomplete, or exception. Requirements are raw stock quantities rounded once to 6 places, or null when the line is not ready. A positive total that rounds to 0 is below_precision and incomplete.';
 
 -- ============================================================================
--- K. Coverage. The period is the shifts that opened in it. Eligible lines are
+-- K. Coverage. The period is the shifts that opened in it. A line counts only
+-- when its quantity or weighted quantity is positive. Eligible lines are
 -- complete, not missing, and at or after the earliest opening. Exceptions
 -- count as covered. An empty eligible set has a null ratio.
 -- ============================================================================
@@ -3610,6 +3672,10 @@ begin
       where
         s.opened_at >= p_from
         and s.opened_at < p_to
+        and (
+          l.quantity > 0
+          or l.weighted_qty > 0
+        )
     ),
     marked as (
       select
@@ -3704,6 +3770,10 @@ begin
       where
         s.opened_at >= p_from
         and s.opened_at < p_to
+        and (
+          l.quantity > 0
+          or l.weighted_qty > 0
+        )
     ),
     marked as (
       select
@@ -3818,7 +3888,7 @@ begin
 end;
 $$;
 
-comment on function app.pos_mapping_coverage (timestamptz, timestamptz) is 'Owner coverage for shifts that opened in [p_from, p_to). Eligible lines are complete, not missing, and at or after the first opening. Covered lines are ready plus exception. The ratio is null when nothing is eligible. Canceled, open, missing and pre-start lines are causes, not part of the ratio.';
+comment on function app.pos_mapping_coverage (timestamptz, timestamptz) is 'Owner coverage for shifts that opened in [p_from, p_to). A line counts only when its quantity or weighted quantity is positive. Eligible lines are complete, not missing, and at or after the first opening. Covered lines are ready plus exception. The ratio is null when nothing is eligible. Canceled, open, missing and pre-start lines are causes, not part of the ratio.';
 
 -- ============================================================================
 -- L. Suggestions. Name folding matches the workbook import. Nothing is saved.
