@@ -1,4 +1,5 @@
 import {
+  ConfirmedRefusalError,
   isConfirmedConfigurationChange,
   StaleWriteError,
 } from '@/items/errors';
@@ -126,8 +127,8 @@ export function beginAction<T>(
 }
 
 /**
- * Success, a payload refusal, a known stale write, or a confirmed
- * `configuration changed` retires the action. 42501, a generic 40001, and a
+ * Success, a payload refusal, a confirmed refusal, a known stale write, or a
+ * confirmed `configuration changed` retires the action. 42501, a generic 40001, and a
  * lost response keep it and mark the outcome unknown.
  */
 export function settleAction(subject: string, error?: unknown): void {
@@ -140,6 +141,7 @@ export function settleAction(subject: string, error?: unknown): void {
   if (
     isConfirmedConfigurationChange(error) ||
     isPayloadRefusal(error) ||
+    error instanceof ConfirmedRefusalError ||
     error instanceof StaleWriteError
   ) {
     held.delete(subject);

@@ -32,13 +32,14 @@ export function effectiveFromPayload(
   return customIso;
 }
 
+/** "now" is the server's current minute; any other choice keeps its own seconds. */
 export function chosenInstantMs(
   mode: EffectiveMode,
   shiftStart: string | null,
   customIso: string | null,
   nowMs: number,
 ): number | null {
-  if (mode === 'now') return nowMs;
+  if (mode === 'now') return currentMinuteMs(nowMs);
   const iso = mode === 'shift' ? shiftStart : customIso;
   if (!iso) return null;
   const parsed = Date.parse(iso);

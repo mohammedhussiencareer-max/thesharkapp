@@ -100,6 +100,104 @@ function pageRows(result: unknown, errorMessage: string): unknown[] {
 }
 
 /**
+ * Read every row of a PostgREST list by key rather than by offset.
+ * `load(afterId, pageSize)` returns the next page's query: filtered, ordered by
+ * `id`, limited to `pageSize`, and narrowed with `.gt('id', afterId)` unless
+ * `afterId` is null. Each page starts after the last id read, so a row that
+ * changes or leaves the filter between pages cannot push another out of reach.
+ * A short page ends the read. A failed page or a full `maxPages` run throws
+ * `errorMessage` and does not return a partial list.
+ */
+export function readAllByKey<Row extends { id: string }>(
+  load: (afterId: string | null, pageSize: number) => unknown,
+  errorMessage: string,
+  options?: PageOptions,
+): Promise<Row[]> {
+  return readAllByKeys<Row, 'id'>(
+    ['id'],
+    (after, pageSize) => load(after?.id ?? null, pageSize),
+    errorMessage,
+    options,
+  );
+}
+
+/** PostgREST `or` filter for the rows that sort after `after` by `keys`, all ascending. */
+export function keysAfterFilter<K extends string>(
+  keys: readonly K[],
+  after: Readonly<Record<K, string>>,
+): string {
+  const quoted = (key: K) =>
+    `"${after[key].replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return keys
+    .map((key, index) => {
+      const later = `${key}.gt.${quoted(key)}`;
+      if (index === 0) return later;
+      const same = keys
+        .slice(0, index)
+        .map((earlier) => `${earlier}.eq.${quoted(earlier)}`);
+      return `and(${[...same, later].join(',')})`;
+    })
+    .join(',');
+}
+
+function cursorOf<K extends string>(
+  row: unknown,
+  keys: readonly K[],
+): Record<K, string> | null {
+  if (typeof row !== 'object' || row === null) return null;
+  const cursor: Partial<Record<K, string>> = {};
+  for (const key of keys) {
+    const value: unknown = (row as Record<string, unknown>)[key];
+    if (typeof value !== 'string') return null;
+    cursor[key] = value;
+  }
+  return cursor as Record<K, string>;
+}
+
+/**
+ * Like `readAllByKey`, for rows ordered by several text columns that together
+ * are unique and never change. `load(after, pageSize)` orders by `keys`, limits
+ * to `pageSize`, and narrows past `after` (null on the first page) with
+ * `keysAfterFilter` or `.gt`. A row with a missing or non-text key, or a page
+ * that does not move past the last one, throws `errorMessage`.
+ */
+export async function readAllByKeys<
+  Row extends object,
+  K extends keyof Row & string,
+>(
+  keys: readonly [K, ...K[]],
+  load: (after: Record<K, string> | null, pageSize: number) => unknown,
+  errorMessage: string,
+  options?: PageOptions,
+): Promise<Row[]> {
+  const { pageSize, maxPages } = paging(errorMessage, options);
+  const rows: Row[] = [];
+  let after: Record<K, string> | null = null;
+  for (let page = 0; page < maxPages; page += 1) {
+    let result: unknown;
+    try {
+      result = await Promise.resolve(load(after, pageSize));
+    } catch {
+      throw new Error(errorMessage);
+    }
+    const data = pageRows(result, errorMessage) as Row[];
+    if (data.length > pageSize) throw new Error(errorMessage);
+    rows.push(...data);
+    if (data.length < pageSize) return rows;
+    const next = cursorOf(data[data.length - 1], keys);
+    const previous = after;
+    if (
+      next === null ||
+      (previous !== null && keys.every((key) => next[key] === previous[key]))
+    ) {
+      throw new Error(errorMessage);
+    }
+    after = next;
+  }
+  throw new Error(errorMessage);
+}
+
+/**
  * Read every row of a PostgREST list.
  * Callers pass `.order()` on a unique key first, so later pages cannot skip
  * or repeat a row. A short page ends the read. A failed page or a full

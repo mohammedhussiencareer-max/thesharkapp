@@ -412,12 +412,12 @@ export async function currentShiftStart(): Promise<string | null> {
 export async function costingImpact(
   fromIso: string,
   toIso: string | null,
-  itemId: string,
+  itemId?: string,
 ): Promise<CostingImpact> {
   const { data, error } = await appDb().rpc('costing_impact', {
     p_from: fromIso,
     p_to: nullableText(toIso),
-    p_item_id: itemId,
+    ...(itemId === undefined ? {} : { p_item_id: itemId }),
   });
   throwIfError(error);
   if (!data || typeof data !== 'object' || Array.isArray(data)) {

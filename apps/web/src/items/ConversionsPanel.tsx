@@ -8,7 +8,6 @@ import {
 import {
   addConversion,
   addCustomUnit,
-  costingImpact,
   currentShiftStart,
   deleteConversion,
   listConversions,
@@ -17,19 +16,7 @@ import {
   updateConversion,
   type ConversionList,
 } from '@/items/api';
-import { EffectiveTimeFields } from '@/items/EffectiveTimeFields';
-import {
-  buildDatedWrite,
-  defaultEffectiveMode,
-  effectiveFromPayload,
-  emptyScheduleToken,
-  impactErrorMessage,
-  impactLine,
-  impactPendingMessage,
-  needsBackdatedReason,
-  nextVersionStart,
-  type EffectiveMode,
-} from '@/items/effective';
+import { emptyScheduleToken } from '@/items/effective';
 import {
   identityOutOfDateMessage,
   messageFrom,
@@ -44,6 +31,7 @@ import {
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatStoredFactor } from '@/items/format';
 import { unitLabels } from '@/items/labels';
 import {
@@ -58,7 +46,6 @@ import {
 } from '@/items/types';
 import { validateConversion } from '@/items/validation';
 import { formatCairo } from '@/lib/cairo';
-import { cairoDateTimeLocalToIso } from '@/purchases/time';
 
 const noVersions: readonly CostingVersion[] = [];
 
@@ -71,10 +58,6 @@ const secondaryButton =
 function storedFactorText(value: UnitConversion['storedFactor']): string {
   return typeof value === 'string' ? value : String(value);
 }
-
-type ImpactView =
-  | { status: 'ready'; key: string; text: string }
-  | { status: 'error'; key: string };
 
 /**
  * One outstanding conversion, stored in the module map. Replay uses this
@@ -118,111 +101,6 @@ function actionSubject(action: ConversionAction): string {
       ? action.inputCode
       : action.unit;
   return conversionSubject(action.itemId, unit);
-}
-
-function useDatedTiming(
-  itemId: string,
-  shiftStart: string | null,
-  versions: readonly CostingVersion[],
-  token: string,
-  disabled: boolean,
-) {
-  const [mountNow] = useState(() => Date.now());
-  const [evaluatedNow, setEvaluatedNow] = useState<number | null>(null);
-  const clockMs = evaluatedNow ?? mountNow;
-  const [chosenMode, setChosenMode] = useState<EffectiveMode | null>(null);
-  const mode = chosenMode ?? defaultEffectiveMode(shiftStart);
-  const [customLocal, setCustomLocal] = useState('');
-  const [reason, setReason] = useState('');
-  const [impactAttempt, setImpactAttempt] = useState(0);
-  const customIso =
-    mode === 'custom' ? cairoDateTimeLocalToIso(customLocal) : null;
-  const backdated = needsBackdatedReason(mode, shiftStart, customIso, clockMs);
-  const from = backdated
-    ? effectiveFromPayload(mode, shiftStart, customIso)
-    : null;
-  const to = from
-    ? nextVersionStart(versions, from, new Date(clockMs).toISOString())
-    : null;
-  const impactKey = from ? `${from}|${to ?? ''}` : '';
-  const [impact, setImpact] = useState<ImpactView | null>(null);
-  const shown = impact?.key === impactKey ? impact : null;
-
-  useEffect(() => {
-    if (!from || impactKey.length === 0) return;
-    let cancelled = false;
-    void costingImpact(from, to, itemId)
-      .then((next) => {
-        if (cancelled) return;
-        setImpact({
-          key: impactKey,
-          status: 'ready',
-          text: impactLine(next.orders, next.shifts),
-        });
-      })
-      .catch(() => {
-        if (!cancelled) setImpact({ key: impactKey, status: 'error' });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [from, impactAttempt, impactKey, itemId, to]);
-
-  function build():
-    { ok: true; write: DatedWrite } | { ok: false; error: string } {
-    const now = Date.now();
-    setEvaluatedNow(now);
-    const nowIso = new Date(now).toISOString();
-    const backdatedNow = needsBackdatedReason(mode, shiftStart, customIso, now);
-    if (backdatedNow && reason.trim().length === 0) {
-      return { ok: false, error: 'اكتب سبب التغيير بأثر رجعي' };
-    }
-    if (backdatedNow) {
-      const fromNow = effectiveFromPayload(mode, shiftStart, customIso);
-      const toNow = nextVersionStart(versions, fromNow, nowIso);
-      const key = `${fromNow ?? ''}|${toNow ?? ''}`;
-      if (shown?.status !== 'ready' || shown.key !== key) {
-        return {
-          ok: false,
-          error:
-            shown?.status === 'error' && shown.key === key
-              ? impactErrorMessage
-              : impactPendingMessage,
-        };
-      }
-    }
-    return buildDatedWrite({
-      mode,
-      shiftStart,
-      customIso,
-      versions,
-      nowIso,
-      token,
-      reason,
-      requestId: '00000000-0000-4000-8000-000000000000',
-    });
-  }
-
-  const fields = (
-    <EffectiveTimeFields
-      mode={mode}
-      shiftStart={shiftStart}
-      customLocal={customLocal}
-      reason={reason}
-      backdated={backdated}
-      impact={shown?.status === 'ready' ? shown.text : null}
-      impactStatus={
-        !backdated ? 'idle' : shown === null ? 'loading' : shown.status
-      }
-      disabled={disabled}
-      onMode={setChosenMode}
-      onCustomLocal={setCustomLocal}
-      onReason={setReason}
-      onRetryImpact={() => setImpactAttempt((value) => value + 1)}
-    />
-  );
-
-  return { fields, build };
 }
 
 function ConversionRow({
