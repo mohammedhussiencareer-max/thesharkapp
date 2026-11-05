@@ -26,7 +26,7 @@ const clean = {
   ],
   outOfScopeObjects: [],
   extensions: ['btree_gist', 'pg_graphql', 'pgcrypto', 'plpgsql', 'uuid-ossp'],
-  storageBuckets: -1,
+  storageBuckets: 0,
   ownerLikeColumns: [
     'app.owner.user_id',
     'app.stock_movements.created_by',
@@ -132,12 +132,20 @@ test('pg_cron and pg_net fail the guard with their own message', () => {
   }
 });
 
-test('storage buckets fail the guard only when they could be counted', () => {
+test('storage buckets fail the guard, and so does a count that is unavailable', () => {
   assert.deepEqual(evaluateDrift({ ...clean, storageBuckets: 0 }), []);
-  assert.deepEqual(evaluateDrift({ ...clean, storageBuckets: -1 }), []);
   const violations = evaluateDrift({ ...clean, storageBuckets: 1 });
   assert.equal(violations.length, 1);
   assert.match(violations[0], /storage holds 1 bucket/);
+  for (const unavailable of [-1, undefined, null, NaN, '0', 1.5]) {
+    const found = evaluateDrift({ ...clean, storageBuckets: unavailable });
+    assert.equal(found.length, 1, String(unavailable));
+    assert.match(found[0], /storage bucket count is unavailable/);
+  }
+  assert.equal(
+    codeOf(() => assertNoDrift({ ...clean, storageBuckets: -1 })),
+    'DRIFT',
+  );
 });
 
 test('owner foreign keys must be on the maintained allowlist', () => {
@@ -190,6 +198,8 @@ const safeRole = {
   replication: false,
   memberships: [],
   writable: [],
+  sequenceWrite: [],
+  storageAccess: [],
   schemaCreate: [],
   forbiddenUsage: [],
 };
@@ -209,8 +219,10 @@ test('each unsafe role attribute is rejected', () => {
     replication: true,
     memberships: ['pg_read_all_data'],
     writable: ['stock_items'],
+    sequenceWrite: ['app.stock_items_seq'],
+    storageAccess: ['objects'],
     schemaCreate: ['app'],
-    forbiddenUsage: ['storage'],
+    forbiddenUsage: ['vault'],
   };
   for (const [key, value] of Object.entries(cases)) {
     const violations = evaluateRole({ ...safeRole, [key]: value });
@@ -229,12 +241,47 @@ test('each unsafe role attribute is rejected', () => {
 test('every forbidden platform schema is named when the role can enter it', () => {
   assert.deepEqual(
     [...FORBIDDEN_USAGE_SCHEMAS],
-    ['auth', 'cron', 'net', 'storage', 'vault'],
+    ['auth', 'cron', 'net', 'vault'],
   );
   for (const schema of FORBIDDEN_USAGE_SCHEMAS) {
     const violations = evaluateRole({ ...safeRole, forbiddenUsage: [schema] });
     assert.equal(violations.length, 1, schema);
     assert.ok(violations[0].includes(schema), schema);
+  }
+});
+
+test('column writes, sequence use and extra storage access are named', () => {
+  const column = evaluateRole({ ...safeRole, writable: ['stock_items'] });
+  assert.match(column[0], /write to app tables or columns: stock_items/);
+  const sequence = evaluateRole({
+    ...safeRole,
+    sequenceWrite: ['app.a_seq', 'ledger_scratch.b_seq'],
+  });
+  assert.match(sequence[0], /sequences: app\.a_seq, ledger_scratch\.b_seq/);
+  const storage = evaluateRole({
+    ...safeRole,
+    storageAccess: ['buckets.name', 'objects'],
+  });
+  assert.match(
+    storage[0],
+    /storage beyond buckets\(id\): buckets\.name, objects/,
+  );
+});
+
+test('a role check that omits a fact fails closed', () => {
+  for (const key of [
+    'memberships',
+    'writable',
+    'sequenceWrite',
+    'storageAccess',
+    'schemaCreate',
+    'forbiddenUsage',
+  ]) {
+    const { [key]: omitted, ...rest } = safeRole;
+    assert.equal(omitted.length, 0);
+    const violations = evaluateRole(rest);
+    assert.equal(violations.length, 1, key);
+    assert.match(violations[0], new RegExp(`did not report ${key}`));
   }
 });
 

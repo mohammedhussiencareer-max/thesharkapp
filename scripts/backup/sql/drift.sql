@@ -1,17 +1,28 @@
 \ir session.sql
--- backup_reader cannot read storage.buckets (-1 = not checked). A role that can,
--- such as postgres in CI or the manual production check, gets the real count.
-select exists (
-  select 1
-  from pg_catalog.pg_class c
-  join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-  where n.nspname = 'storage' and c.relname = 'buckets' and c.relkind in ('r', 'p')
-    and has_schema_privilege(n.oid, 'usage') and has_table_privilege(c.oid, 'select')
-) as can_buckets \gset
+-- Counts storage buckets with the connecting role (backup_reader may read the
+-- id column only). A storage.buckets table that exists but cannot be read gives
+-- -1, which the guard treats as a failure; a database without the table cannot
+-- hold uploads, so it counts 0.
+select
+  exists (
+    select 1
+    from pg_catalog.pg_class c
+    join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'storage' and c.relname = 'buckets' and c.relkind in ('r', 'p')
+  ) as has_buckets,
+  exists (
+    select 1
+    from pg_catalog.pg_class c
+    join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'storage' and c.relname = 'buckets' and c.relkind in ('r', 'p')
+      and has_schema_privilege(n.oid, 'usage') and has_column_privilege(c.oid, 'id', 'select')
+  ) as can_buckets \gset
 \if :can_buckets
-select count(*)::text as storage_buckets from storage.buckets \gset
-\else
+select count(id)::text as storage_buckets from storage.buckets \gset
+\elif :has_buckets
 \set storage_buckets -1
+\else
+\set storage_buckets 0
 \endif
 with auth_users as (
   select c.oid

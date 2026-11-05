@@ -4,10 +4,12 @@ import { test } from 'node:test';
 import {
   MIGRATION_HASH_EXPR,
   buildManifest,
-  checkMigrationHashes,
+  checkMigrationEntries,
+  listRepoMigrations,
   loadSql,
+  pendingMigrations,
   readDriftFacts,
-  readMigrationHashes,
+  readMigrationEntries,
 } from './manifest.mjs';
 import { OWNER_FK_COLUMNS } from './config.mjs';
 
@@ -17,7 +19,7 @@ const cleanFacts = {
   schemas: ['app', 'auth', 'extensions', 'ledger_scratch', 'public'],
   outOfScopeObjects: [],
   extensions: ['btree_gist', 'plpgsql'],
-  storageBuckets: -1,
+  storageBuckets: 0,
   ownerLikeColumns: ['app.owner.user_id'],
   ownerFkMap: [...OWNER_FK_COLUMNS],
   otherAuthRefs: [],
@@ -36,7 +38,9 @@ function fakePsql({ facts = cleanFacts, owner = OWNER } = {}) {
         ownerUuid: owner,
         serverVersionNum: 170004,
         migrations: ['1'],
-        migrationHashes: { 1: 'a'.repeat(32) },
+        migrationEntries: [
+          { version: '1', name: 'init', hash: 'a'.repeat(32) },
+        ],
       },
       tables: { 'app.owner': { rows: 1, hash: 'h' } },
       sequences: {},
@@ -71,9 +75,10 @@ test('the SQL files only use variables the builder provides', () => {
     'platform_objects',
     'snapshot',
     'migrations',
-    'migration_hashes',
+    'migration_entries',
     'tables_q',
     'has_migrations',
+    'has_buckets',
     'can_buckets',
     'storage_buckets',
   ]);
@@ -109,7 +114,9 @@ test('the manifest merges metadata and runs drift first', () => {
   assert.deepEqual(Object.keys(manifest.tables), ['app.owner']);
   assert.equal(calls.length, 2);
   assert.match(calls[0].sql, /storage_buckets/);
-  assert.deepEqual(manifest.metadata.migrationHashes, { 1: 'a'.repeat(32) });
+  assert.deepEqual(manifest.metadata.migrationEntries, [
+    { version: '1', name: 'init', hash: 'a'.repeat(32) },
+  ]);
   for (const call of calls) {
     assert.equal(call.vars.snapshot, '00000004-0000002A-1');
     assert.ok(JSON.parse(call.vars.audit_cols).length > 0);
@@ -156,43 +163,173 @@ test('the manifest SQL serialises bigint values as decimal strings', () => {
 test('migration hashes use one expression in the manifest SQL and the check', () => {
   assert.ok(loadSql('manifest.sql').includes(MIGRATION_HASH_EXPR));
   const calls = [];
-  const hashes = readMigrationHashes({
+  const entries = readMigrationEntries({
     psql: (call) => {
       calls.push(call);
-      return `${JSON.stringify({ 1: 'a'.repeat(32) })}\n`;
+      return `${JSON.stringify([entry('1', 'init', 'a')])}\n`;
     },
   });
-  assert.deepEqual(hashes, { 1: 'a'.repeat(32) });
+  assert.deepEqual(entries, [entry('1', 'init', 'a')]);
   assert.ok(calls[0].sql.includes(MIGRATION_HASH_EXPR));
+  assert.match(calls[0].sql, /'name', name/);
 });
 
-test('a checkout whose migrations differ from the backup is named per version', () => {
-  const manifest = {
-    metadata: {
-      migrationHashes: { 1: 'aaa', 2: 'bbb', 3: 'ccc' },
-    },
-  };
-  assert.deepEqual(
-    checkMigrationHashes(manifest, { 1: 'aaa', 2: 'bbb', 3: 'ccc' }),
-    [],
-  );
-  assert.deepEqual(
-    checkMigrationHashes(manifest, { 1: 'aaa', 2: 'XXX', 4: 'ddd' }),
-    [
-      '2 has different statements',
-      '3 is not in this database',
-      '4 is not in the backup',
+function entry(version, name, fill) {
+  return { version, name, hash: fill.repeat(32) };
+}
+
+const backup = {
+  metadata: {
+    migrationEntries: [
+      entry('1', 'init', 'a'),
+      entry('2', 'costing', 'b'),
+      entry('3', 'reports', 'c'),
     ],
+  },
+};
+
+test('identical migrations under different version ids match by name and hash', () => {
+  const result = checkMigrationEntries(backup, [
+    entry('20261101000000', 'init', 'a'),
+    entry('20261102000000', 'costing', 'b'),
+    entry('20261103000000', 'reports', 'c'),
+  ]);
+  assert.deepEqual(result.differences, []);
+  assert.equal(result.versionChanges.length, 3);
+  assert.match(
+    result.versionChanges[0],
+    /init: backup version 1, this database 20261101000000/,
   );
+  assert.deepEqual(
+    result.matched.map((m) => m.version),
+    ['20261101000000', '20261102000000', '20261103000000'],
+  );
+  const same = checkMigrationEntries(backup, backup.metadata.migrationEntries);
+  assert.deepEqual(same.differences, []);
+  assert.deepEqual(same.versionChanges, []);
+});
+
+test('a changed, missing or extra migration is named, whatever its version id', () => {
+  const result = checkMigrationEntries(backup, [
+    entry('11', 'init', 'a'),
+    entry('12', 'costing', 'e'),
+    entry('14', 'extra', 'd'),
+  ]);
+  assert.deepEqual(result.differences, [
+    'costing has different statements',
+    'extra is not in the backup',
+    'reports is not in this database',
+  ]);
+  const sameVersionOtherName = checkMigrationEntries(backup, [
+    entry('1', 'init', 'a'),
+    entry('2', 'renamed', 'b'),
+    entry('3', 'reports', 'c'),
+  ]);
+  assert.deepEqual(sameVersionOtherName.differences, [
+    'costing is not in this database',
+    'renamed is not in the backup',
+  ]);
+});
+
+test('migrations applied in a different order are a difference', () => {
+  const result = checkMigrationEntries(backup, [
+    entry('12', 'init', 'a'),
+    entry('11', 'costing', 'b'),
+    entry('13', 'reports', 'c'),
+  ]);
+  assert.deepEqual(result.differences, [
+    'costing is applied in a different order',
+  ]);
+  const numeric = checkMigrationEntries(
+    {
+      metadata: {
+        migrationEntries: [entry('9', 'a', 'a'), entry('10', 'b', 'b')],
+      },
+    },
+    [entry('9', 'a', 'a'), entry('10', 'b', 'b')],
+  );
+  assert.deepEqual(numeric.differences, []);
+});
+
+test('manifests and databases without usable migration entries are rejected', () => {
   for (const bad of [
     {},
     { metadata: {} },
-    { metadata: { migrationHashes: [] } },
+    { metadata: { migrationHashes: { 1: 'a'.repeat(32) } } },
+    { metadata: { migrationEntries: {} } },
+    {
+      metadata: { migrationEntries: [{ version: '1', hash: 'a'.repeat(32) }] },
+    },
+    {
+      metadata: {
+        migrationEntries: [{ version: '1', name: null, hash: 'a'.repeat(32) }],
+      },
+    },
+    {
+      metadata: {
+        migrationEntries: [{ version: '1', name: 'x', hash: 'short' }],
+      },
+    },
+    {
+      metadata: {
+        migrationEntries: [entry('1', 'x', 'a'), entry('2', 'x', 'a')],
+      },
+    },
+    {
+      metadata: {
+        migrationEntries: [entry('1', 'x', 'a'), entry('1', 'y', 'a')],
+      },
+    },
   ]) {
-    assert.throws(() => checkMigrationHashes(bad, {}), {
+    assert.throws(() => checkMigrationEntries(bad, []), {
       code: 'MANIFEST_INVALID',
     });
   }
+  assert.throws(
+    () =>
+      checkMigrationEntries(backup, [
+        { version: '1', name: null, hash: 'a'.repeat(32) },
+      ]),
+    { code: 'MIGRATIONS_INVALID' },
+  );
+});
+
+test('pending migrations are the repository files whose names the backup lacks', () => {
+  const repo = [
+    { file: '1_init.sql', version: '1', name: 'init' },
+    { file: '2_costing.sql', version: '2', name: 'costing' },
+    { file: '4_new_thing.sql', version: '4', name: 'new_thing' },
+    { file: '5_newer.sql', version: '5', name: 'newer' },
+  ];
+  const manifest = {
+    metadata: {
+      migrationEntries: [
+        entry('900', 'init', 'a'),
+        entry('901', 'costing', 'b'),
+      ],
+    },
+  };
+  assert.deepEqual(
+    pendingMigrations(manifest, repo).map((m) => m.file),
+    ['4_new_thing.sql', '5_newer.sql'],
+  );
+  assert.deepEqual(pendingMigrations(manifest, repo.slice(0, 2)), []);
+  assert.throws(() => pendingMigrations(manifest, repo.slice(0, 1)), {
+    code: 'MIGRATIONS_DIFFER',
+    message: /costing/,
+  });
+});
+
+test('every migration file in the repository is listed by version and name', () => {
+  const files = listRepoMigrations();
+  assert.ok(files.length > 0);
+  for (const { file, version, name } of files) {
+    assert.equal(file, `${version}_${name}.sql`);
+  }
+  assert.deepEqual(
+    files.map((f) => f.version),
+    [...files.map((f) => f.version)].sort(),
+  );
 });
 
 test('drift stops the manifest before the main query', () => {

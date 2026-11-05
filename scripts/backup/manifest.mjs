@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertNoDrift } from './checks.mjs';
@@ -74,39 +74,140 @@ export function readDriftFacts({ psql = runPsql, snapshot } = {}) {
   return parseJson(output, 'DRIFT_QUERY_FAILED');
 }
 
-// Keep the md5 expression identical to the one in sql/manifest.sql.
+// Keep the md5 expression identical to the one in sql/manifest.sql. Whitespace
+// is ignored so the same SQL hashes the same whether the history stores it as
+// one statement (hosted apply_migration) or split by the CLI.
 export const MIGRATION_HASH_EXPR =
-  "md5(coalesce(array_to_string(statements, E'\\n'), ''))";
+  "md5(regexp_replace(coalesce(array_to_string(statements, ''), ''), '\\s+', '', 'g'))";
 
-export function readMigrationHashes({ psql = runPsql } = {}) {
+export function readMigrationEntries({ psql = runPsql } = {}) {
   const output = psql({
-    sql: `select coalesce(jsonb_object_agg(version, ${MIGRATION_HASH_EXPR}), '{}'::jsonb)::text from supabase_migrations.schema_migrations;`,
+    sql: `select coalesce(jsonb_agg(jsonb_build_object('version', version, 'name', name, 'hash', ${MIGRATION_HASH_EXPR}) order by version), '[]'::jsonb)::text from supabase_migrations.schema_migrations;`,
     code: 'MIGRATIONS_QUERY_FAILED',
   });
   return parseJson(output, 'MIGRATIONS_QUERY_FAILED');
 }
 
-export function checkMigrationHashes(manifest, actual) {
-  const expected = manifest?.metadata?.migrationHashes;
-  if (!expected || typeof expected !== 'object' || Array.isArray(expected)) {
-    throw new BackupError(
-      'MANIFEST_INVALID',
-      'the manifest has no migration hashes',
-    );
+const MIGRATION_HASH = /^[0-9a-f]{32}$/;
+const MIGRATION_FILE = /^(\d+)_(.+)\.sql$/;
+
+// Versions are timestamps without leading zeros: shorter is smaller.
+function compareVersions(a, b) {
+  if (a.length !== b.length) {
+    return a.length - b.length;
   }
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+// Migrations are matched by name: hosted versions come from apply_migration
+// timestamps and differ from the <version>_<name>.sql file names.
+function indexMigrations(entries, label, code) {
+  if (!Array.isArray(entries)) {
+    throw new BackupError(code, `${label} has no migration entries`);
+  }
+  const byName = new Map();
+  const versions = new Set();
+  for (const entry of entries) {
+    const { version, name, hash } = entry ?? {};
+    if (
+      typeof version !== 'string' ||
+      version === '' ||
+      typeof name !== 'string' ||
+      name === '' ||
+      !MIGRATION_HASH.test(String(hash))
+    ) {
+      throw new BackupError(
+        code,
+        `${label} holds a migration without a version, name and hash`,
+      );
+    }
+    if (byName.has(name) || versions.has(version)) {
+      throw new BackupError(
+        code,
+        `${label} lists a migration name or version twice`,
+      );
+    }
+    byName.set(name, { version, name, hash });
+    versions.add(version);
+  }
+  return byName;
+}
+
+// Compares the manifest's migrations with the connected database by name and
+// statement hash. A different version id for the same name and statements is
+// reported in versionChanges, not as a difference. matched pairs each backup
+// version with the version used here, in the order they were applied.
+export function checkMigrationEntries(manifest, actual) {
+  const expected = indexMigrations(
+    manifest?.metadata?.migrationEntries,
+    'the manifest',
+    'MANIFEST_INVALID',
+  );
+  const here = indexMigrations(actual, 'this database', 'MIGRATIONS_INVALID');
   const differences = [];
-  for (const version of [
-    ...new Set([...Object.keys(expected), ...Object.keys(actual)]),
+  const matched = [];
+  for (const name of [
+    ...new Set([...expected.keys(), ...here.keys()]),
   ].sort()) {
-    if (!(version in actual)) {
-      differences.push(`${version} is not in this database`);
-    } else if (!(version in expected)) {
-      differences.push(`${version} is not in the backup`);
-    } else if (expected[version] !== actual[version]) {
-      differences.push(`${version} has different statements`);
+    const backup = expected.get(name);
+    const local = here.get(name);
+    if (!local) {
+      differences.push(`${name} is not in this database`);
+    } else if (!backup) {
+      differences.push(`${name} is not in the backup`);
+    } else if (backup.hash !== local.hash) {
+      differences.push(`${name} has different statements`);
+    } else {
+      matched.push({
+        name,
+        backupVersion: backup.version,
+        version: local.version,
+      });
     }
   }
-  return differences;
+  matched.sort((a, b) => compareVersions(a.backupVersion, b.backupVersion));
+  for (let i = 1; i < matched.length; i += 1) {
+    if (compareVersions(matched[i].version, matched[i - 1].version) <= 0) {
+      differences.push(`${matched[i].name} is applied in a different order`);
+    }
+  }
+  const versionChanges = matched
+    .filter((m) => m.version !== m.backupVersion)
+    .map(
+      (m) =>
+        `${m.name}: backup version ${m.backupVersion}, this database ${m.version}`,
+    );
+  return { differences, versionChanges, matched };
+}
+
+export function listRepoMigrations(
+  dir = join(repoRoot, 'supabase', 'migrations'),
+) {
+  return readdirSync(dir)
+    .map((file) => ({ file, found: MIGRATION_FILE.exec(file) }))
+    .filter((entry) => entry.found)
+    .map(({ file, found }) => ({ file, version: found[1], name: found[2] }))
+    .sort((a, b) => compareVersions(a.version, b.version));
+}
+
+// Repository migrations the backup does not have, by name, in apply order.
+// A backup migration missing from the repository means the checkout is older
+// than the backup, so it is an error rather than an empty list.
+export function pendingMigrations(manifest, repoMigrations) {
+  const recorded = indexMigrations(
+    manifest?.metadata?.migrationEntries,
+    'the manifest',
+    'MANIFEST_INVALID',
+  );
+  const repoNames = new Set(repoMigrations.map((m) => m.name));
+  const unknown = [...recorded.keys()].filter((name) => !repoNames.has(name));
+  if (unknown.length > 0) {
+    throw new BackupError(
+      'MIGRATIONS_DIFFER',
+      `the backup holds migrations this checkout does not have: ${unknown.slice(0, 20).join(', ')}`,
+    );
+  }
+  return repoMigrations.filter((m) => !recorded.has(m.name));
 }
 
 function toolVersion(command) {
@@ -177,6 +278,14 @@ export function buildManifest({
   };
 }
 
+function readJsonFile(path) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    throw new BackupError('MANIFEST_INVALID', 'the manifest is not valid JSON');
+  }
+}
+
 function option(args, name) {
   const index = args.indexOf(name);
   return index === -1 ? undefined : args[index + 1];
@@ -210,27 +319,68 @@ if (isMain(import.meta.url)) {
       return 'drift guard: no application objects outside the backup scope';
     }
     if (command === 'migrations-check') {
-      if (!rest[0]) {
+      if (!rest[0] || rest[0].startsWith('--')) {
         throw new BackupError(
           'USAGE',
-          'usage: manifest.mjs migrations-check <manifest.json>',
+          'usage: manifest.mjs migrations-check <manifest.json> [--repair-versions]',
         );
       }
-      const manifest = JSON.parse(readFileSync(rest[0], 'utf8'));
-      const differences = checkMigrationHashes(manifest, readMigrationHashes());
+      const { differences, versionChanges, matched } = checkMigrationEntries(
+        readJsonFile(rest[0]),
+        readMigrationEntries(),
+      );
       if (differences.length > 0) {
         throw new BackupError(
           'MIGRATIONS_DIFFER',
           `${differences.length} migration(s) differ: ${differences.slice(0, 20).join('; ')}`,
         );
       }
-      return `migration history matches the backup (${
-        Object.keys(manifest.metadata.migrationHashes).length
-      } versions)`;
+      if (rest.includes('--repair-versions')) {
+        return matched.map((m) => m.version).join(' ');
+      }
+      const lines = [
+        `migration history matches the backup (${matched.length} migrations, matched by name and statements)`,
+      ];
+      if (versionChanges.length > 0) {
+        lines.push(
+          `${versionChanges.length} migration(s) have a different version id than the backup (informational):`,
+          ...versionChanges.map((change) => `  ${change}`),
+        );
+      }
+      return lines.join('\n');
+    }
+    if (command === 'migrations-export') {
+      if (!rest[0] || rest[0].startsWith('--')) {
+        throw new BackupError(
+          'USAGE',
+          'usage: manifest.mjs migrations-export <out.json>',
+        );
+      }
+      const migrationEntries = readMigrationEntries();
+      writeFileSync(
+        rest[0],
+        `${JSON.stringify({ metadata: { migrationEntries } }, null, 2)}\n`,
+        { mode: 0o600 },
+      );
+      return `exported ${migrationEntries.length} migrations`;
+    }
+    if (command === 'migrations-pending') {
+      if (!rest[0] || rest[0].startsWith('--')) {
+        throw new BackupError(
+          'USAGE',
+          'usage: manifest.mjs migrations-pending <manifest.json> [migrations dir]',
+        );
+      }
+      return pendingMigrations(
+        readJsonFile(rest[0]),
+        rest[1] ? listRepoMigrations(rest[1]) : listRepoMigrations(),
+      )
+        .map((m) => m.file)
+        .join('\n');
     }
     throw new BackupError(
       'USAGE',
-      'usage: manifest.mjs build <out.json> | drift | migrations-check <manifest.json>',
+      'usage: manifest.mjs build <out.json> | drift | migrations-check <manifest.json> | migrations-export <out.json> | migrations-pending <manifest.json>',
     );
   });
 }

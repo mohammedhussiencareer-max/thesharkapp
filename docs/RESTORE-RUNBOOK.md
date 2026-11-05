@@ -86,28 +86,30 @@ psql -c "drop schema if exists app, ledger_scratch cascade"
 tar -xzf <النسخة>.tar.gz manifest.json
 ```
 
-2. تأكد إن الكود عندك هو نفس الكود اللي اتعملت بيه النسخة. الأمر `migration repair` بيكتب أرقام الإصدارات بس، فلازم تتأكد الأول إن ملفات الـ migrations مطابقة. محتاج Docker شغال:
+2. تأكد إن الكود عندك هو نفس الكود اللي اتعملت بيه النسخة. الأمر `migration repair` بيكتب أرقام الإصدارات بس، فلازم تتأكد الأول إن ملفات الـ migrations مطابقة. المقارنة بالاسم وبصمة الـ SQL، مش برقم الإصدار: الـ migrations اللي اتطبقت على المشروع بأداة Supabase MCP (`apply_migration`) رقم إصدارها بيبقى وقت التطبيق على السيرفر، ومختلف عن رقم الملف في الريبو (`<الإصدار>_<الاسم>.sql`). الاسم هو نفسه على الجهتين. محتاج Docker شغال:
 
 ```
 git checkout "$(node -p "require('./manifest.json').metadata.appCommit")"
+git switch -c "restore-$(date +%Y%m%d)"
 supabase start
 supabase db reset
 PGHOST=127.0.0.1 PGPORT=55422 PGUSER=postgres PGPASSWORD=postgres PGDATABASE=postgres PGSSLMODE=disable node scripts/backup/manifest.mjs migrations-check manifest.json
 ```
 
 - لازم يطلع السطر: `migration history matches the backup`.
-- لو طلع إن إصدارات مختلفة، متكملش. الكود ده مش اللي عمل النسخة. وقف واسأل.
+- لو طلع اختلاف في أرقام الإصدارات بس، ده طبيعي وبيتكتب كمعلومة. مفيش مشكلة.
+- لو طلع إن migration اسمها مختلف أو ناقصة أو زيادة، أو الـ SQL بتاعها اتغير، متكملش. الكود ده مش اللي عمل النسخة. وقف واسأل.
 
-3. اربط المشروع وعلّم الإصدارات إنها اتطبقت:
+3. اربط المشروع وعلّم الـ migrations إنها اتطبقت. الخيار `--repair-versions` بيطبع أرقام الإصدارات من ملفات الريبو (بيربط كل إصدار قديم بالملف اللي ليه نفس الاسم)، وده اللي لازم يتسجل:
 
 ```
 supabase link --project-ref <project ref>
-supabase migration repair --status applied $(node -p "require('./manifest.json').metadata.migrations.join(' ')")
+supabase migration repair --status applied $(PGHOST=127.0.0.1 PGPORT=55422 PGUSER=postgres PGPASSWORD=postgres PGDATABASE=postgres PGSSLMODE=disable node scripts/backup/manifest.mjs migrations-check manifest.json --repair-versions)
 supabase migration list
 ```
 
 4. لازم القايمة تبين إن المحلي والبعيد زي بعض.
-5. ارجع للفرع الأساسي: `git checkout main`.
+5. افضل على الفرع ده (`restore-...`). ده الكود اللي بيطابق الـ schema المستعادة. متعملش `git checkout main` دلوقتي، والخطوة 9 بتشرح ليه.
 
 ## 8. أنشئ مستخدم النسخ الاحتياطي من جديد
 
@@ -125,13 +127,22 @@ psql "host=<host> port=5432 dbname=postgres user=postgres.<project ref> sslmode=
 
 التطبيق المثبّت على الكمبيوتر بيحفظ عنوان المشروع والمفتاح جواه وقت البناء، وكمان بيمنع الاتصال بأي مشروع غير القديم. تعديل `.env.production` لوحده مش هيغيّر حاجة في التطبيق المثبّت. لازم تبني التطبيق من جديد وتثبّته.
 
+الاستعادة بترجّع الـ schema زي ما كانت وقت النسخة بالظبط، ومبتوصلهاش لآخر migration. التطبيق بينادي دوال في الداتابيز وشكلها بيتغير مع الـ migrations. مثلاً التطبيق الحالي بيبعت `p_expected_identity` للدالة `app.set_item_opening_price`، والدالة القديمة (خمس معاملات) مبتقبلهوش. لو بنيت آخر `main` على schema أقدم، التطبيق هيفشل في النداءات دي.
+
+- **الأصل: ابني على الفرع `restore-...` اللي عملته في الخطوة 7** (الكود بتاع `appCommit` في النسخة). الخطوات 1 لـ 7 تحت بتتعمل على الفرع ده.
+- **لو عايز تنقل لآخر `main`، ده خطوة منفصلة ولازم تتعمل الأول وبالترتيب ده:**
+  1. `git checkout main`، وهات الـ migrations اللي في `main` وناقصة من النسخة، بالاسم وبالترتيب: `node scripts/backup/manifest.mjs migrations-pending manifest.json`. لو النسخة فيها migration مش موجودة في `main` الأمر هيفشل: وقف واسأل.
+  2. طبّق كل ملف من القايمة بالترتيب على المشروع المستعاد بنفس الطريقة اللي بتتطبق بيها الـ migrations عادةً (`HANDOFF.md`: `apply_migration` من Supabase MCP، والاسم هو اللي بعد رقم الإصدار في اسم الملف).
+  3. اتأكد: اعمل `supabase db reset` على `main` محلياً، وصدّر الـ migrations بـ `node scripts/backup/manifest.mjs migrations-export main-migrations.json` (بمتغيرات الاتصال المحلية زي الخطوة 7)، وقارنها بالمشروع المستعاد: `node scripts/backup/manifest.mjs migrations-check main-migrations.json` بمتغيرات اتصال المشروع المستعاد. لازم يطلع `migration history matches the backup`. أي اختلاف معناه migration اتنسيت أو اتطبقت غلط: متبنيش، وقف واسأل.
+  4. كرر تعديلات الخطوات تحت على `main` وابني منه.
+
 1. حدّث `apps/web/.env.production` بالـ URL والمفتاح الجديدين (`VITE_SUPABASE_URL` و`VITE_SUPABASE_ANON_KEY`).
 2. حدّث `apps/desktop/src-tauri/tauri.conf.json`: في `app.security.csp` وتحت `connect-src` بدّل عنوان المشروع القديم بالجديد: `'self' https://<project ref الجديد>.supabase.co`. متلمسش `devCsp`.
 3. ابني ملف التثبيت بالأمر `pnpm desktop:build`، وشغّل ملف الـ setup الجديد على كمبيوتر المالك. بيتثبّت فوق القديم.
 4. اتأكد إن التطبيق بيكلم المشروع الجديد: افتح التطبيق، سجل دخول بحساب المالك، وقارن كمية مخزون واحدة بالنسخة. لو الشاشة فاضية أو الدخول فشل بخطأ شبكة، يبقى العنوان أو الـ CSP لسه القديم. متكتبش بيانات جديدة قبل ما ده يشتغل.
 5. شوف المخزون، وجرّب شراء، وشوف شهر المصروفات.
 6. لو حاجة مش مظبوطة، متكتبش بيانات جديدة. وقف واسأل.
-7. اعمل commit لتعديل `tauri.conf.json` عشان البناء الجاي يفضل على المشروع الجديد.
+7. اعمل commit لتعديل `.env.production` و`tauri.conf.json` على الفرع `restore-...`. لو عايزهم على `main` انقل نفس التعديلين هناك بس بعد ما تطبّق migrations الـ `main` على المشروع المستعاد وتتأكد منها، ومتدمجش فرع `restore-...` في `main`.
 
 ## تمرين الاستعادة (مرة واحدة قبل ما تعتمد على النسخ)
 

@@ -37,9 +37,14 @@ export function evaluateDrift(facts) {
       violations.push(`extension ${extension} is not in the allowlist`);
     }
   }
-  if (Number(facts.storageBuckets) > 0) {
+  const buckets = facts.storageBuckets;
+  if (!Number.isSafeInteger(buckets) || buckets < 0) {
     violations.push(
-      `storage holds ${facts.storageBuckets} bucket(s); objects are outside the backup`,
+      'the storage bucket count is unavailable; backup_reader must be able to read storage.buckets(id) (run scripts/backup/provision-backup-reader.sql)',
+    );
+  } else if (buckets > 0) {
+    violations.push(
+      `storage holds ${buckets} bucket(s); objects are outside the backup`,
     );
   }
   const fkAllowed = new Set(OWNER_COLUMNS);
@@ -105,12 +110,34 @@ export function evaluateRole(facts) {
       violations.push(`role has ${label}`);
     }
   }
+  for (const key of [
+    'memberships',
+    'writable',
+    'sequenceWrite',
+    'storageAccess',
+    'schemaCreate',
+    'forbiddenUsage',
+  ]) {
+    if (!Array.isArray(facts[key])) {
+      violations.push(`the role check did not report ${key}`);
+    }
+  }
   if (list(facts.memberships).length > 0) {
     violations.push('role is a member of other roles');
   }
   if (list(facts.writable).length > 0) {
     violations.push(
-      `role can write to app tables: ${list(facts.writable).join(', ')}`,
+      `role can write to app tables or columns: ${list(facts.writable).join(', ')}`,
+    );
+  }
+  if (list(facts.sequenceWrite).length > 0) {
+    violations.push(
+      `role can use or update sequences: ${list(facts.sequenceWrite).join(', ')}`,
+    );
+  }
+  if (list(facts.storageAccess).length > 0) {
+    violations.push(
+      `role can access storage beyond buckets(id): ${list(facts.storageAccess).join(', ')}`,
     );
   }
   if (list(facts.schemaCreate).length > 0) {

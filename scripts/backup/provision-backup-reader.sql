@@ -70,17 +70,36 @@ grant
 select
   on sequences to backup_reader;
 
--- Migration versions and a hash of their statements are saved as metadata
--- (the version and statements columns only; the hash is computed, not stored).
+-- Migration versions, names and a hash of their statements are saved as
+-- metadata (the version, name and statements columns only; the hash is
+-- computed, not stored).
 do $$
 begin
   if to_regclass('supabase_migrations.schema_migrations') is not null then
     grant usage on schema supabase_migrations to backup_reader;
-    grant select (version, statements) on supabase_migrations.schema_migrations to backup_reader;
+    grant select (version, name, statements) on supabase_migrations.schema_migrations to backup_reader;
   end if;
 end
 $$;
 
--- Nothing else: backup_reader gets no access to the auth, storage, vault, cron
--- or net schemas. The drift guard cannot read storage.buckets with this role;
--- see docs/BACKUP.md for the manual check.
+-- The drift guard counts storage buckets as backup_reader: Storage objects are
+-- outside the backup, and an upload needs a bucket. Only the bucket id column
+-- is readable (no object rows, no bucket settings). Schema usage is required
+-- for that; the role check allows nothing else in storage. If the grant does
+-- not take effect the script fails here instead of leaving a role whose
+-- backups can never pass the drift guard.
+do $$
+begin
+  if to_regclass('storage.buckets') is not null then
+    grant usage on schema storage to backup_reader;
+    grant select (id) on storage.buckets to backup_reader;
+    if not has_schema_privilege('backup_reader', 'storage', 'usage')
+       or not has_column_privilege('backup_reader', 'storage.buckets', 'id', 'select') then
+      raise exception 'could not grant backup_reader read access to storage.buckets(id); run this script as the schema owner or a role with grant option';
+    end if;
+  end if;
+end
+$$;
+
+-- Nothing else: backup_reader gets no access to the auth, vault, cron or net
+-- schemas, and nothing in storage beyond the bucket id column.

@@ -216,6 +216,14 @@ expect_denied() {
   info "denied ok: $label"
 }
 
+# expect_reader_zero <label> <sql> : backup_reader must read exactly 0.
+expect_reader_zero() {
+  local label=$1 out
+  out=$(reader_psql -c "$2") || fail DENIAL_CONTROL "$label: the query failed"
+  [ "$out" = 0 ] || fail DENIAL_PASSED "$label: expected 0"
+  info "none ok: $label"
+}
+
 # expect_reader_count <label> <sql> : backup_reader must read a positive number.
 expect_reader_count() {
   local label=$1 out
@@ -234,16 +242,55 @@ extract_manifest() {
 check_migration_metadata() {
   node -e '
     const fs = require("node:fs");
-    const recorded = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.migrations;
+    const metadata = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata;
     const files = fs.readdirSync(process.argv[2])
       .filter((name) => name.endsWith(".sql"))
-      .map((name) => name.split("_")[0])
-      .sort();
-    if (recorded.length === 0 || JSON.stringify(recorded) !== JSON.stringify(files)) {
+      .sort()
+      .map((name) => [name.split("_")[0], name.slice(name.indexOf("_") + 1, -4)]);
+    const recorded = (metadata.migrationEntries ?? []).map((e) => [e.version, e.name]);
+    if (
+      metadata.migrations.length === 0 ||
+      JSON.stringify(metadata.migrations) !== JSON.stringify(files.map((f) => f[0])) ||
+      JSON.stringify(recorded) !== JSON.stringify(files)
+    ) {
       process.exit(1);
     }
   ' "$1" "$repo_root/supabase/migrations" ||
-    fail MIGRATIONS_METADATA "migration versions in the manifest differ from supabase/migrations"
+    fail MIGRATIONS_METADATA "migration versions and names in the manifest differ from supabase/migrations"
+}
+
+# mutate_manifest <in> <out> <hash | rename | versions | drop-last> : writes a changed copy;
+# drop-last also prints the name of the removed migration.
+mutate_manifest() {
+  node -e '
+    const fs = require("node:fs");
+    const [src, dst, mode] = process.argv.slice(1);
+    const manifest = JSON.parse(fs.readFileSync(src, "utf8"));
+    const entries = manifest.metadata.migrationEntries;
+    if (entries.length === 0) process.exit(1);
+    if (mode === "hash") entries[0].hash = "0".repeat(32);
+    else if (mode === "rename") entries[0].name += "_renamed";
+    else if (mode === "versions") for (const e of entries) e.version = "9" + e.version;
+    else if (mode === "drop-last") process.stdout.write(entries.pop().name);
+    else process.exit(1);
+    fs.writeFileSync(dst, JSON.stringify(manifest));
+  ' "$1" "$2" "$3"
+}
+
+# expect_unsafe_grant <label> <needle> <grant sql> <revoke sql> [<proof sql>]
+# After the grant the reader dump must fail the role check and print the needle.
+# The optional proof must succeed as backup_reader, so the grant is known to be live.
+expect_unsafe_grant() {
+  local label=$1 needle=$2 grant_sql=$3 revoke_sql=$4 proof=${5-}
+  sql "$grant_sql"
+  if [ -n "$proof" ]; then
+    reader_psql -c "$proof" >/dev/null 2>"$work_dir/proof.err" ||
+      fail DENIAL_CONTROL "$label: the grant did not give backup_reader the privilege"
+  fi
+  expect_fail "role check rejects $label" "$needle" \
+    env PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
+    "$here/dump.sh" "$neg_dir/out"
+  sql "$revoke_sql"
 }
 
 # restore_archive <archive> <preserve | remap uuid>
@@ -298,33 +345,65 @@ run_full() {
   check_migration_metadata "$archives/admin-x/manifest.json"
   info "the admin and backup_reader manifests are identical"
 
-  step "stack A: migration history matches the manifest"
-  node_cli node "$here/manifest.mjs" migrations-check "$archives/admin-x/manifest.json" >/dev/null
-  node -e '
-    const fs = require("node:fs");
-    const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    const versions = Object.keys(m.metadata.migrationHashes);
-    if (versions.length === 0) process.exit(1);
-    m.metadata.migrationHashes[versions[0]] = "0".repeat(32);
-    fs.writeFileSync(process.argv[2], JSON.stringify(m));
-  ' "$archives/admin-x/manifest.json" "$work_dir/mutated-hashes.json" ||
-    fail MIGRATIONS_METADATA "the manifest holds no migration hashes"
+  step "stack A: migration history matches the manifest by name and statements"
+  local admin_manifest="$archives/admin-x/manifest.json"
+  local repair_versions pending removed version_report
+  node_cli node "$here/manifest.mjs" migrations-check "$admin_manifest" >/dev/null
+  mutate_manifest "$admin_manifest" "$work_dir/mutated-hashes.json" hash ||
+    fail MIGRATIONS_METADATA "the manifest holds no migration entries"
   expect_fail "migration statements changed" "has different statements" \
     node "$here/manifest.mjs" migrations-check "$work_dir/mutated-hashes.json"
+  mutate_manifest "$admin_manifest" "$work_dir/mutated-name.json" rename
+  expect_fail "migration name changed" "is not in this database" \
+    node "$here/manifest.mjs" migrations-check "$work_dir/mutated-name.json"
+  mutate_manifest "$admin_manifest" "$work_dir/other-versions.json" versions
+  version_report=$(node_cli node "$here/manifest.mjs" migrations-check "$work_dir/other-versions.json")
+  case "$version_report" in
+    *"different version id than the backup (informational)"*) ;;
+    *) fail MIGRATIONS_METADATA "different version ids were not reported as informational" ;;
+  esac
+  repair_versions=$(node_cli node "$here/manifest.mjs" migrations-check "$work_dir/other-versions.json" --repair-versions)
+  node -e '
+    const fs = require("node:fs");
+    const versions = fs.readdirSync(process.argv[1])
+      .filter((name) => name.endsWith(".sql"))
+      .map((name) => name.split("_")[0])
+      .sort();
+    process.exit(process.argv[2] === versions.join(" ") ? 0 : 1);
+  ' "$repo_root/supabase/migrations" "$repair_versions" ||
+    fail MIGRATIONS_METADATA "the repair versions are not the repository migration versions"
+  info "the same migrations under other version ids match; repair uses the repository versions"
+  pending=$(node_cli node "$here/manifest.mjs" migrations-pending "$admin_manifest")
+  [ -z "$pending" ] || fail MIGRATIONS_METADATA "a backup of the current schema reports pending migrations"
+  removed=$(mutate_manifest "$admin_manifest" "$work_dir/missing-last.json" drop-last)
+  pending=$(node_cli node "$here/manifest.mjs" migrations-pending "$work_dir/missing-last.json")
+  case "$pending" in
+    *_"$removed".sql) ;;
+    *) fail MIGRATIONS_METADATA "the migration missing from the manifest was not reported as pending" ;;
+  esac
 
   step "stack A: backup_reader is refused outside its grant"
   expect_reader_count "app tables" "select count(*) from app.stock_items"
-  expect_reader_count "migration versions and statements" \
-    "select least(count(version), count(statements)) from supabase_migrations.schema_migrations"
+  expect_reader_count "migration versions, names and statements" \
+    "select least(count(version), count(name), count(statements)) from supabase_migrations.schema_migrations"
+  expect_reader_zero "migration columns beyond version, name and statements" \
+    "select count(*) from pg_catalog.pg_attribute a where a.attrelid = 'supabase_migrations.schema_migrations'::regclass and a.attnum > 0 and not a.attisdropped and a.attname not in ('version', 'name', 'statements') and has_column_privilege(a.attrelid, a.attnum, 'select')"
   expect_denied "auth.users" 42501 "select 1 from auth.users limit 1"
-  expect_denied "storage.buckets" 42501 "select 1 from storage.buckets limit 1"
+  reader_psql -c "select count(id) from storage.buckets" >/dev/null ||
+    fail DENIAL_CONTROL "storage.buckets(id): backup_reader could not read it"
+  info "allowed ok: storage.buckets(id)"
+  expect_denied "storage.buckets other columns" 42501 "select name from storage.buckets limit 1"
+  expect_denied "storage.buckets all columns" 42501 "select * from storage.buckets limit 1"
+  expect_denied "storage.buckets insert" 42501 \
+    "begin read write; insert into storage.buckets (id, name) values ('ci-reader-bucket', 'ci-reader-bucket'); rollback"
+  expect_denied "storage.buckets delete" 42501 \
+    "begin read write; delete from storage.buckets where false; rollback"
   expect_denied "storage.objects" 42501 "select 1 from storage.objects limit 1"
   expect_denied "vault.secrets" '42501|3F000' "select 1 from vault.secrets limit 1"
   # pg_cron and pg_net are absent here (the drift guard fails if either is
   # installed), so a missing table also proves the reader cannot read it.
   expect_denied "cron.job" '42501|3F000|42P01' "select 1 from cron.job limit 1"
   expect_denied "net.http_request_queue" '42501|3F000|42P01' "select 1 from net.http_request_queue limit 1"
-  expect_denied "migration name column" 42501 "select name from supabase_migrations.schema_migrations limit 1"
   expect_denied "pg_authid" 42501 "select rolpassword from pg_catalog.pg_authid limit 1"
   expect_denied "write under the read-only default" 25006 \
     "update app.stock_items set name = name where false"
@@ -339,6 +418,35 @@ run_full() {
   expect_denied "create role" 42501 "begin read write; create role rogue_reader_role; rollback"
   expect_denied "call an app RPC" 42501 \
     "begin read write; select app.add_expense_entry(p_category_id => gen_random_uuid(), p_request_id => gen_random_uuid()); rollback"
+
+  step "stack A: the role check rejects column, sequence and storage grants"
+  expect_unsafe_grant "an UPDATE column grant" "tables or columns: stock_items" \
+    "grant update (name) on app.stock_items to backup_reader" \
+    "revoke update (name) on app.stock_items from backup_reader" \
+    "begin read write; update app.stock_items set name = name where false; rollback"
+  expect_unsafe_grant "an INSERT column grant" "tables or columns: stock_items" \
+    "grant insert (name) on app.stock_items to backup_reader" \
+    "revoke insert (name) on app.stock_items from backup_reader"
+  expect_unsafe_grant "a REFERENCES column grant" "tables or columns: stock_items" \
+    "grant references (id) on app.stock_items to backup_reader" \
+    "revoke references (id) on app.stock_items from backup_reader"
+  expect_unsafe_grant "a table DELETE grant" "tables or columns: stock_items" \
+    "grant delete on app.stock_items to backup_reader" \
+    "revoke delete on app.stock_items from backup_reader"
+  expect_unsafe_grant "sequence USAGE" "sequences: app.stock_movements_id_seq" \
+    "grant usage on sequence app.stock_movements_id_seq to backup_reader" \
+    "revoke usage on sequence app.stock_movements_id_seq from backup_reader"
+  expect_unsafe_grant "sequence UPDATE" "sequences: app.stock_movements_id_seq" \
+    "grant update on sequence app.stock_movements_id_seq to backup_reader" \
+    "revoke update on sequence app.stock_movements_id_seq from backup_reader"
+  expect_unsafe_grant "another storage.buckets column" "beyond buckets(id): buckets.name" \
+    "grant select (name) on storage.buckets to backup_reader" \
+    "revoke select (name) on storage.buckets from backup_reader"
+  expect_unsafe_grant "storage.objects" "beyond buckets(id): objects" \
+    "grant select on storage.objects to backup_reader" \
+    "revoke select on storage.objects from backup_reader"
+  expect_reader_zero "write privileges left on app tables or sequences" \
+    "select count(*) from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname in ('app', 'ledger_scratch') and ((c.relkind in ('r', 'p') and has_any_column_privilege(c.oid, 'insert,update,references')) or (c.relkind = 'S' and (has_sequence_privilege(c.oid, 'usage') or has_sequence_privilege(c.oid, 'update'))))"
 
   step "stack A: dump as backup_reader while a writer inserts expenses"
   start_writer
@@ -386,11 +494,19 @@ run_full() {
   expect_fail "rogue public table" "[DRIFT]" "$here/dump.sh" "$neg_dir/out"
   sql 'drop table public.rogue_scope_test'
   sql "insert into storage.buckets (id, name) values ('ci-rogue-bucket', 'ci-rogue-bucket')"
-  expect_fail "storage bucket present" "storage holds 1 bucket" "$here/dump.sh" "$neg_dir/out"
+  expect_fail "storage bucket present (admin role)" "storage holds 1 bucket" "$here/dump.sh" "$neg_dir/out"
+  expect_fail "storage bucket present (backup_reader)" "storage holds 1 bucket" \
+    env PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
+    "$here/dump.sh" "$neg_dir/out"
   sql "set storage.allow_delete_query = 'true'; delete from storage.buckets where id = 'ci-rogue-bucket'"
   local buckets
   buckets=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c 'select count(*) from storage.buckets')
   [ "$buckets" = 0 ] || fail NEGATIVE_LEFT_DATA "the test bucket could not be removed from storage.buckets"
+  sql "revoke select (id) on storage.buckets from backup_reader"
+  expect_fail "storage bucket count unavailable to backup_reader" "storage bucket count is unavailable" \
+    env PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
+    "$here/dump.sh" "$neg_dir/out"
+  sql "grant select (id) on storage.buckets to backup_reader"
 
   step "stack B: empty project"
   make_empty_project "$work_dir/stack-b"

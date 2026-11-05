@@ -17,6 +17,8 @@ const safeRole = {
   replication: false,
   memberships: [],
   writable: [],
+  sequenceWrite: [],
+  storageAccess: [],
   schemaCreate: [],
   forbiddenUsage: [],
 };
@@ -32,7 +34,6 @@ test('the role check asks about the forbidden platform schemas', () => {
     'auth',
     'cron',
     'net',
-    'storage',
     'vault',
   ]);
   assert.throws(

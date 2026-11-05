@@ -70,14 +70,10 @@ export const OWNER_COLUMNS = [...OWNER_FK_COLUMNS, ...OWNER_AUDIT_COLUMNS];
 // The application uses neither: their jobs and queues live outside the dump.
 export const FORBIDDEN_EXTENSIONS = ['pg_cron', 'pg_net'];
 
-// Schemas backup_reader must not be able to enter.
-export const FORBIDDEN_USAGE_SCHEMAS = [
-  'auth',
-  'cron',
-  'net',
-  'storage',
-  'vault',
-];
+// Schemas backup_reader must not be able to enter. storage is not listed: the
+// drift guard reads storage.buckets(id), so the role has usage on it, and the
+// role check's storageAccess fact allows nothing else there.
+export const FORBIDDEN_USAGE_SCHEMAS = ['auth', 'cron', 'net', 'vault'];
 
 export const PLATFORM_EXTENSIONS = [
   'pg_graphql',

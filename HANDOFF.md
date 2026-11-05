@@ -29,6 +29,7 @@ See [CLAUDE.md](CLAUDE.md) and [AI-WORKFLOW.md](AI-WORKFLOW.md). Design approved
 
 - Design: private repo `thesharkapp-backups` runs the daily schedule (02:17 UTC); this repo holds the code in `scripts/backup/` (dump, manifest, restore, compare, retention, drift guard, `ci-roundtrip.sh`). How it works: [docs/BACKUP.md](docs/BACKUP.md). Disaster steps in Egyptian Arabic: [docs/RESTORE-RUNBOOK.md](docs/RESTORE-RUNBOOK.md).
 - Owner decisions 2026-11-04: read-only `backup_reader` role (owner sets the password with psql `\password`), 3 repo secrets in the private repo, no encryption, one restore drill into a temporary second free project, restore may load rows directly into an empty database (CLAUDE.md exception).
+- Recovery rules: migrations are verified by name and statement hash (hosted MCP versions differ from the repo's file versions); the app is rebuilt at the manifest's `appCommit`, and moving to `main` needs the pending migrations applied and verified first. Details in docs/BACKUP.md.
 - CI job `backup-roundtrip` runs the full dump and restore on two local stacks with negative cases. Still to do by the owner/orchestrator: create the private repo and its workflows, run `provision-backup-reader.sql` on the hosted project, and do the real-run checks listed in docs/BACKUP.md ("Open checks").
 
 ## Open PRs
