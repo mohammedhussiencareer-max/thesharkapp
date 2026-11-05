@@ -26,6 +26,12 @@ export function HomePage({
       </Link>
       <Link
         className="inline-flex w-fit rounded bg-neutral-900 px-3 py-2 text-white"
+        to="/recipes"
+      >
+        الوصفات
+      </Link>
+      <Link
+        className="inline-flex w-fit rounded bg-neutral-900 px-3 py-2 text-white"
         to="/opening"
       >
         الرصيد الافتتاحي

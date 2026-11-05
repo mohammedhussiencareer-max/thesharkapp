@@ -100,6 +100,43 @@ function pageRows(result: unknown, errorMessage: string): unknown[] {
 }
 
 /**
+ * Read every row of a PostgREST list by key rather than by offset.
+ * `load(afterId, pageSize)` returns the next page's query: filtered, ordered by
+ * `id`, limited to `pageSize`, and narrowed with `.gt('id', afterId)` unless
+ * `afterId` is null. Each page starts after the last id read, so a row that
+ * changes or leaves the filter between pages cannot push another out of reach.
+ * A short page ends the read. A failed page or a full `maxPages` run throws
+ * `errorMessage` and does not return a partial list.
+ */
+export async function readAllByKey<Row extends { id: string }>(
+  load: (afterId: string | null, pageSize: number) => unknown,
+  errorMessage: string,
+  options?: PageOptions,
+): Promise<Row[]> {
+  const { pageSize, maxPages } = paging(errorMessage, options);
+  const rows: Row[] = [];
+  let afterId: string | null = null;
+  for (let page = 0; page < maxPages; page += 1) {
+    let result: unknown;
+    try {
+      result = await Promise.resolve(load(afterId, pageSize));
+    } catch {
+      throw new Error(errorMessage);
+    }
+    const data = pageRows(result, errorMessage) as Row[];
+    if (data.length > pageSize) throw new Error(errorMessage);
+    rows.push(...data);
+    if (data.length < pageSize) return rows;
+    const lastId: unknown = data[data.length - 1]?.id;
+    if (typeof lastId !== 'string' || lastId === afterId) {
+      throw new Error(errorMessage);
+    }
+    afterId = lastId;
+  }
+  throw new Error(errorMessage);
+}
+
+/**
  * Read every row of a PostgREST list.
  * Callers pass `.order()` on a unique key first, so later pages cannot skip
  * or repeat a row. A short page ends the read. A failed page or a full

@@ -77,7 +77,7 @@ export function itemToFormValues(item: CatalogItem): ItemFormValues {
  * No exponent notation. Leading integer zeros and trailing fraction zeros
  * are removed so the text is the exact value we can write.
  */
-function normalizeDecimal(raw: string): string | null {
+export function normalizeDecimal(raw: string): string | null {
   let text = raw.trim().replace(',', '.');
   if (text.startsWith('+')) text = text.slice(1).trim();
   if (!/^\d+(\.\d+)?$/.test(text)) return null;

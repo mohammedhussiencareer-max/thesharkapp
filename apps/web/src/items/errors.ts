@@ -21,6 +21,14 @@ export class StaleWriteError extends Error {
   }
 }
 
+/** The server refused this payload and its request id stored nothing. */
+export class ConfirmedRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConfirmedRefusalError';
+  }
+}
+
 export class CostingChangedError extends StaleWriteError {
   /**
    * Thrown only when a costing writer raises 40001 with the message
