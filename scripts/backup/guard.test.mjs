@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { READER_EXECUTE_ALLOWLIST } from './config.mjs';
 import {
   checkRole,
   checkTargetEmpty,
@@ -18,10 +19,40 @@ const safeRole = {
   memberships: [],
   writable: [],
   sequenceWrite: [],
+  executable: [],
   storageAccess: [],
   schemaCreate: [],
   forbiddenUsage: [],
 };
+
+test('the role check allows no function execution and says so to the query', () => {
+  const calls = [];
+  checkRole((call) => {
+    calls.push(call);
+    return `${JSON.stringify(safeRole)}\n`;
+  });
+  assert.deepEqual(JSON.parse(calls[0].vars.allowed_functions), []);
+  assert.deepEqual(READER_EXECUTE_ALLOWLIST, []);
+  const sql = calls[0].sql;
+  assert.match(sql, /'executable'/);
+  assert.match(sql, /has_function_privilege\(r\.oid, p\.oid, 'EXECUTE'\)/);
+  assert.match(sql, /n\.nspname in \('app', 'ledger_scratch'\)/);
+  assert.match(sql, /n\.nspname = 'public'\s+and p\.prosecdef/);
+  assert.match(sql, /:'allowed_functions'::jsonb/);
+  assert.throws(
+    () =>
+      checkRole(() =>
+        JSON.stringify({
+          ...safeRole,
+          executable: ['app.rename_expense_category(p_id uuid, p_name text)'],
+        }),
+      ),
+    {
+      code: 'ROLE_UNSAFE',
+      message: /execute application functions: app\.rename_expense_category/,
+    },
+  );
+});
 
 test('the role check asks about the forbidden platform schemas', () => {
   const calls = [];

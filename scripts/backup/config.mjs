@@ -75,6 +75,13 @@ export const FORBIDDEN_EXTENSIONS = ['pg_cron', 'pg_net'];
 // role check's storageAccess fact allows nothing else there.
 export const FORBIDDEN_USAGE_SCHEMAS = ['auth', 'cron', 'net', 'vault'];
 
+// Functions backup_reader may execute, as schema.name(identity arguments), as
+// the role check reports them. Empty on purpose: pg_dump reads tables and the
+// catalog only, and every app RPC is SECURITY DEFINER with an authorization
+// helper that trusts request.jwt.claims, which any session can set. Add an entry
+// only after reviewing that the function cannot write.
+export const READER_EXECUTE_ALLOWLIST = [];
+
 export const PLATFORM_EXTENSIONS = [
   'pg_graphql',
   'pg_stat_statements',

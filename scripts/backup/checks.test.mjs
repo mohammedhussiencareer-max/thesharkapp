@@ -199,6 +199,7 @@ const safeRole = {
   memberships: [],
   writable: [],
   sequenceWrite: [],
+  executable: [],
   storageAccess: [],
   schemaCreate: [],
   forbiddenUsage: [],
@@ -220,6 +221,7 @@ test('each unsafe role attribute is rejected', () => {
     memberships: ['pg_read_all_data'],
     writable: ['stock_items'],
     sequenceWrite: ['app.stock_items_seq'],
+    executable: ['app.rename_expense_category(p_id uuid, p_name text)'],
     storageAccess: ['objects'],
     schemaCreate: ['app'],
     forbiddenUsage: ['vault'],
@@ -268,11 +270,37 @@ test('column writes, sequence use and extra storage access are named', () => {
   );
 });
 
+test('an executable application function is named and the list is capped', () => {
+  const one = evaluateRole({
+    ...safeRole,
+    executable: ['app.rename_expense_category(p_id uuid, p_name text)'],
+  });
+  assert.equal(one.length, 1);
+  assert.match(
+    one[0],
+    /execute application functions: app\.rename_expense_category\(p_id uuid, p_name text\)$/,
+  );
+  const many = evaluateRole({
+    ...safeRole,
+    executable: Array.from({ length: 25 }, (_, i) => `app.f${i}()`),
+  });
+  assert.equal(many.length, 1);
+  assert.match(many[0], /app\.f9\(\) \(and 15 more\)$/);
+  assert.doesNotMatch(many[0], /app\.f10\(\)/);
+  assert.equal(
+    codeOf(() =>
+      assertRoleSafe({ ...safeRole, executable: ['public.definer()'] }),
+    ),
+    'ROLE_UNSAFE',
+  );
+});
+
 test('a role check that omits a fact fails closed', () => {
   for (const key of [
     'memberships',
     'writable',
     'sequenceWrite',
+    'executable',
     'storageAccess',
     'schemaCreate',
     'forbiddenUsage',

@@ -444,7 +444,7 @@ run_full() {
   expect_denied "call an app RPC" 42501 \
     "begin read write; select app.add_expense_entry(p_category_id => gen_random_uuid(), p_request_id => gen_random_uuid()); rollback"
 
-  step "stack A: the role check rejects column, sequence and storage grants"
+  step "stack A: the role check rejects column, sequence, storage and function grants"
   expect_unsafe_grant "an UPDATE column grant" "tables or columns: stock_items" \
     "grant update (name) on app.stock_items to backup_reader" \
     "revoke update (name) on app.stock_items from backup_reader" \
@@ -470,6 +470,29 @@ run_full() {
   expect_unsafe_grant "storage.objects" "beyond buckets(id): objects" \
     "grant select on storage.objects to backup_reader" \
     "revoke select on storage.objects from backup_reader"
+  # The proof renames a category as backup_reader (read-write transaction, a
+  # service_role claim set by the session) and rolls back. It must be refused
+  # without EXECUTE and must succeed once EXECUTE is granted, so each grant
+  # below is shown to open a real write path before the role check must refuse it.
+  rpc_write_proof=$(cat "$here/testdata/reader-rpc-write.sql")
+  expect_denied "renaming a category without EXECUTE" 42501 "$rpc_write_proof"
+  expect_unsafe_grant "EXECUTE on an app writer granted directly" \
+    "functions: app.rename_expense_category(" \
+    "grant execute on function app.rename_expense_category (uuid, text) to backup_reader" \
+    "revoke execute on function app.rename_expense_category (uuid, text) from backup_reader" \
+    "$rpc_write_proof"
+  expect_unsafe_grant "EXECUTE on an app writer granted through PUBLIC" \
+    "functions: app.rename_expense_category(" \
+    "grant execute on function app.rename_expense_category (uuid, text) to public" \
+    "revoke execute on function app.rename_expense_category (uuid, text) from public" \
+    "$rpc_write_proof"
+  expect_denied "renaming a category after the revokes" 42501 "$rpc_write_proof"
+  expect_unsafe_grant "a SECURITY DEFINER function in public" \
+    "functions: public.rogue_reader_definer(" \
+    "create function public.rogue_reader_definer () returns int language sql security definer set search_path = '' as 'select 1'" \
+    "drop function public.rogue_reader_definer ()"
+  expect_reader_zero "execute privileges left on app functions" \
+    "select count(*) from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where (n.nspname in ('app', 'ledger_scratch') or (n.nspname = 'public' and p.prosecdef)) and has_function_privilege(p.oid, 'execute')"
   expect_reader_zero "write privileges left on app tables or sequences" \
     "select count(*) from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname in ('app', 'ledger_scratch') and ((c.relkind in ('r', 'p') and has_any_column_privilege(c.oid, 'insert,update,references')) or (c.relkind = 'S' and (has_sequence_privilege(c.oid, 'usage') or has_sequence_privilege(c.oid, 'update'))))"
 

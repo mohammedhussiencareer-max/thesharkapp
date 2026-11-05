@@ -80,6 +80,42 @@ select
           or has_sequence_privilege(r.oid, c.oid, 'UPDATE')
         )
     ),
+    'executable',
+    (
+      select
+        coalesce(
+          jsonb_agg(
+            f.ref
+            order by
+              f.ref
+          ),
+          '[]'::jsonb
+        )
+      from
+        (
+          select
+            (
+              n.nspname::text || '.' || p.proname::text || '(' || pg_catalog.pg_get_function_identity_arguments (p.oid) || ')'
+            ) as ref
+          from
+            pg_catalog.pg_proc p
+            join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+          where
+            (
+              n.nspname in ('app', 'ledger_scratch')
+              or (
+                n.nspname = 'public'
+                and p.prosecdef
+              )
+            )
+            and has_function_privilege(r.oid, p.oid, 'EXECUTE')
+        ) f
+      where
+        f.ref not in (
+          select
+            jsonb_array_elements_text(:'allowed_functions'::jsonb)
+        )
+    ),
     'storageAccess',
     (
       select

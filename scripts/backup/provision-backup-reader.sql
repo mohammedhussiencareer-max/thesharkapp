@@ -70,6 +70,33 @@ grant
 select
   on sequences to backup_reader;
 
+-- No function execution: the app's RPCs are SECURITY DEFINER and their
+-- authorization helper trusts request.jwt.claims, which any session can set, so
+-- EXECUTE would let this role write. These revokes remove direct grants only;
+-- a grant to PUBLIC cannot be removed from one role, and the role check before
+-- every dump refuses the role while it can execute any app function.
+revoke
+execute on all routines in schema app
+from
+  backup_reader;
+
+revoke
+execute on all routines in schema ledger_scratch
+from
+  backup_reader;
+
+alter default privileges for role postgres in schema app
+revoke
+execute on functions
+from
+  backup_reader;
+
+alter default privileges for role postgres in schema ledger_scratch
+revoke
+execute on functions
+from
+  backup_reader;
+
 -- Migration versions, names and a hash of their statements are saved as
 -- metadata (the version, name and statements columns only; the hash is
 -- computed, not stored).

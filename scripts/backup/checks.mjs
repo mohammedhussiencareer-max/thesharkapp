@@ -114,6 +114,7 @@ export function evaluateRole(facts) {
     'memberships',
     'writable',
     'sequenceWrite',
+    'executable',
     'storageAccess',
     'schemaCreate',
     'forbiddenUsage',
@@ -133,6 +134,13 @@ export function evaluateRole(facts) {
   if (list(facts.sequenceWrite).length > 0) {
     violations.push(
       `role can use or update sequences: ${list(facts.sequenceWrite).join(', ')}`,
+    );
+  }
+  if (list(facts.executable).length > 0) {
+    const names = list(facts.executable);
+    const more = names.length > 10 ? ` (and ${names.length - 10} more)` : '';
+    violations.push(
+      `role can execute application functions: ${names.slice(0, 10).join(', ')}${more}`,
     );
   }
   if (list(facts.storageAccess).length > 0) {
