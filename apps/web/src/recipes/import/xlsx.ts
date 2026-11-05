@@ -1,4 +1,4 @@
-import { strFromU8, unzipSync } from 'fflate';
+import { Inflate, strFromU8 } from 'fflate';
 
 export type Cell = {
   text: string | null;
@@ -40,9 +40,11 @@ export class WorkbookReadError extends Error {
 }
 
 export const maxWorkbookBytes = 20 * 1024 * 1024;
-/** Declared size of everything inflated: the workbook parts and each listed sheet. */
+/** Actual bytes of everything extracted: the workbook parts and each listed sheet. */
 const maxInflatedBytes = 64 * 1024 * 1024;
 const maxEntries = 1000;
+/** Input fed to the inflater per step; deflate expands at most about 1000 to 1. */
+const inflateStepBytes = 4096;
 const maxSheets = 40;
 /** Excel's own grid: 1048576 rows and columns A to XFD. */
 const maxSheetRows = 1048576;
@@ -83,8 +85,8 @@ function richText(node: Element): string {
     .join('');
 }
 
-function sharedStrings(files: Record<string, Uint8Array>): string[] {
-  const data = files['xl/sharedStrings.xml'];
+function sharedStrings(files: ReadonlyMap<string, Uint8Array>): string[] {
+  const data = files.get('xl/sharedStrings.xml');
   if (!data) return [];
   return elements(parseXml(strFromU8(data)), 'si').map(richText);
 }
@@ -147,12 +149,12 @@ function parseSheet(
   return { name, rows };
 }
 
-function sheetPaths(files: Record<string, Uint8Array>): {
+function sheetPaths(files: ReadonlyMap<string, Uint8Array>): {
   name: string;
   path: string;
 }[] {
-  const book = files['xl/workbook.xml'];
-  const rels = files['xl/_rels/workbook.xml.rels'];
+  const book = files.get('xl/workbook.xml');
+  const rels = files.get('xl/_rels/workbook.xml.rels');
   if (!book || !rels) throw new WorkbookReadError('not_xlsx');
   const targets = new Map<string, string>();
   for (const rel of elements(parseXml(strFromU8(rels)), 'Relationship')) {
@@ -177,36 +179,129 @@ function sheetPaths(files: Record<string, Uint8Array>): {
   return found;
 }
 
-/** Declared sizes from the zip directory. Nothing is inflated here. */
-function listEntries(bytes: Uint8Array): Map<string, number> {
-  const sizes = new Map<string, number>();
-  let count = 0;
-  unzipSync(bytes, {
-    filter: (file) => {
-      count += 1;
-      if (count > maxEntries) throw new WorkbookReadError('too_much_data');
-      sizes.set(file.name, (sizes.get(file.name) ?? 0) + file.originalSize);
-      return false;
-    },
+type ZipEntry = {
+  name: string;
+  flags: number;
+  method: number;
+  /** Bytes stored in the file, from the zip directory. */
+  compressed: number;
+  /** Bytes the entry must expand to, from the zip directory. */
+  size: number;
+  /** Where the local header starts. */
+  offset: number;
+  /** Where the entry data starts, after the local header. */
+  start: number;
+};
+
+const zip64Marker = 0xffffffff;
+
+/** Zip directory with every entry's data range checked to sit inside the file and not overlap another. */
+function readDirectory(bytes: Uint8Array): Map<string, ZipEntry> {
+  const length = bytes.byteLength;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, length);
+  let end = -1;
+  for (let at = length - 22; at >= Math.max(0, length - 22 - 0xffff); at -= 1) {
+    if (view.getUint32(at, true) === 0x06054b50) {
+      end = at;
+      break;
+    }
+  }
+  if (end < 0) throw new WorkbookReadError('not_xlsx');
+  const count = view.getUint16(end + 10, true);
+  const directory = view.getUint32(end + 16, true);
+  if (count > maxEntries) throw new WorkbookReadError('too_much_data');
+  if (directory === zip64Marker) throw new WorkbookReadError('unreadable');
+  const entries = new Map<string, ZipEntry>();
+  let at = directory;
+  for (let index = 0; index < count; index += 1) {
+    if (at + 46 > length || view.getUint32(at, true) !== 0x02014b50) {
+      throw new WorkbookReadError('not_xlsx');
+    }
+    const nameLength = view.getUint16(at + 28, true);
+    const next =
+      at +
+      46 +
+      nameLength +
+      view.getUint16(at + 30, true) +
+      view.getUint16(at + 32, true);
+    if (next > length) throw new WorkbookReadError('not_xlsx');
+    const compressed = view.getUint32(at + 20, true);
+    const size = view.getUint32(at + 24, true);
+    const offset = view.getUint32(at + 42, true);
+    if (
+      compressed === zip64Marker ||
+      size === zip64Marker ||
+      offset === zip64Marker
+    ) {
+      throw new WorkbookReadError('unreadable');
+    }
+    const name = strFromU8(bytes.subarray(at + 46, at + 46 + nameLength));
+    if (entries.has(name)) throw new WorkbookReadError('not_xlsx');
+    if (offset + 30 > length || view.getUint32(offset, true) !== 0x04034b50) {
+      throw new WorkbookReadError('not_xlsx');
+    }
+    const start =
+      offset +
+      30 +
+      view.getUint16(offset + 26, true) +
+      view.getUint16(offset + 28, true);
+    if (start + compressed > length) throw new WorkbookReadError('not_xlsx');
+    entries.set(name, {
+      name,
+      flags: view.getUint16(at + 8, true),
+      method: view.getUint16(at + 10, true),
+      compressed,
+      size,
+      offset,
+      start,
+    });
+    at = next;
+  }
+  const byOffset = [...entries.values()].sort((a, b) => a.offset - b.offset);
+  for (let index = 1; index < byOffset.length; index += 1) {
+    const before = byOffset[index - 1];
+    const entry = byOffset[index];
+    if (!before || !entry) continue;
+    if (entry.offset < before.start + before.compressed) {
+      throw new WorkbookReadError('not_xlsx');
+    }
+  }
+  return entries;
+}
+
+/** The entry's bytes, which must match its declared size exactly. */
+function extract(bytes: Uint8Array, entry: ZipEntry): Uint8Array {
+  if (entry.flags & 1) throw new WorkbookReadError('not_xlsx');
+  const data = bytes.subarray(entry.start, entry.start + entry.compressed);
+  if (entry.method === 0) {
+    if (entry.compressed !== entry.size) {
+      throw new WorkbookReadError('not_xlsx');
+    }
+    return data;
+  }
+  if (entry.method !== 8) throw new WorkbookReadError('not_xlsx');
+  const out = new Uint8Array(entry.size);
+  let written = 0;
+  const stream = new Inflate((chunk) => {
+    if (written + chunk.length > out.length) {
+      throw new WorkbookReadError('not_xlsx');
+    }
+    out.set(chunk, written);
+    written += chunk.length;
   });
-  return sizes;
+  for (let at = 0; at < data.length; at += inflateStepBytes) {
+    const next = Math.min(at + inflateStepBytes, data.length);
+    stream.push(data.subarray(at, next), next === data.length);
+  }
+  if (written !== out.length) throw new WorkbookReadError('not_xlsx');
+  return out;
 }
 
-function declaredBytes(
-  sizes: ReadonlyMap<string, number>,
-  names: readonly string[],
-): number {
-  return names.reduce((sum, name) => sum + (sizes.get(name) ?? 0), 0);
-}
-
-function inflateParts(
-  bytes: Uint8Array,
-  names: readonly string[],
-): Record<string, Uint8Array> {
-  const wanted = new Set(names);
+function damaged<T>(read: () => T): T {
   try {
-    return unzipSync(bytes, { filter: (file) => wanted.has(file.name) });
-  } catch {
+    return read();
+  } catch (failure) {
+    if (failure instanceof WorkbookReadError) throw failure;
     throw new WorkbookReadError('not_xlsx');
   }
 }
@@ -216,34 +311,40 @@ export function readWorkbook(bytes: Uint8Array): Sheet[] {
   if (bytes.byteLength > maxWorkbookBytes) {
     throw new WorkbookReadError('too_large');
   }
-  let sizes: Map<string, number>;
-  try {
-    sizes = listEntries(bytes);
-  } catch (failure) {
-    if (failure instanceof WorkbookReadError) throw failure;
-    throw new WorkbookReadError('not_xlsx');
-  }
-  const coreBytes = declaredBytes(sizes, coreParts);
-  if (coreBytes > maxInflatedBytes)
-    throw new WorkbookReadError('too_much_data');
-  const core = inflateParts(bytes, coreParts);
+  const entries = damaged(() => readDirectory(bytes));
+  let used = 0;
+  const take = (names: readonly string[]): Map<string, Uint8Array> => {
+    const wanted = [...new Set(names)].flatMap((name) => {
+      const entry = entries.get(name);
+      return entry ? [entry] : [];
+    });
+    const declared = wanted.reduce((sum, entry) => sum + entry.size, 0);
+    if (used + declared > maxInflatedBytes) {
+      throw new WorkbookReadError('too_much_data');
+    }
+    const files = new Map<string, Uint8Array>();
+    for (const entry of wanted) {
+      const data = damaged(() => extract(bytes, entry));
+      used += data.length;
+      if (used > maxInflatedBytes) throw new WorkbookReadError('too_much_data');
+      files.set(entry.name, data);
+    }
+    return files;
+  };
+  const core = take(coreParts);
   const strings = sharedStrings(core);
   const sheets = sheetPaths(core);
-  const sheetBytes = declaredBytes(
-    sizes,
-    sheets.map((sheet) => sheet.path),
-  );
-  if (coreBytes + sheetBytes > maxInflatedBytes) {
-    throw new WorkbookReadError('too_much_data');
-  }
-  const files = inflateParts(
-    bytes,
-    sheets.map((sheet) => sheet.path),
-  );
+  const files = take(sheets.map((sheet) => sheet.path));
+  const parsed = new Map<string, Sheet>();
   return sheets.map(({ name, path }) => {
-    const data = files[path];
+    const data = files.get(path);
     if (!data) throw new WorkbookReadError('not_xlsx');
-    return parseSheet(name, data, strings);
+    let sheet = parsed.get(path);
+    if (!sheet) {
+      sheet = parseSheet(name, data, strings);
+      parsed.set(path, sheet);
+    }
+    return { name, rows: sheet.rows };
   });
 }
 

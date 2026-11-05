@@ -1,12 +1,28 @@
-import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
+import {
+  deflateSync,
+  strFromU8,
+  strToU8,
+  unzipSync,
+  zipSync,
+  type FlateStreamHandler,
+} from 'fflate';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseRecipeWorkbook } from '@/recipes/import/parse';
-import { readWorkbook } from '@/recipes/import/xlsx';
+import { maxWorkbookBytes, readWorkbook } from '@/recipes/import/xlsx';
+import { sampleWorkbook } from '@/test/sample-workbook';
 import { buildWorkbook, type BuilderCell } from '@/test/workbook-builder';
+
+const counter = vi.hoisted(() => ({ inflates: 0 }));
 
 vi.mock('fflate', async () => {
   const actual = await vi.importActual<typeof import('fflate')>('fflate');
-  return { ...actual, unzipSync: vi.fn(actual.unzipSync) };
+  class CountingInflate extends actual.Inflate {
+    constructor(handler: FlateStreamHandler) {
+      super(handler);
+      counter.inflates += 1;
+    }
+  }
+  return { ...actual, Inflate: CountingInflate };
 });
 
 const sheetPath = 'xl/worksheets/sheet1.xml';
@@ -17,22 +33,8 @@ const coreParts = [
 ];
 const mebibyte = 1024 * 1024;
 
-let inflated: string[] = [];
-let actualUnzip: typeof unzipSync;
-
-beforeEach(async () => {
-  const actual = await vi.importActual<typeof import('fflate')>('fflate');
-  actualUnzip = actual.unzipSync;
-  vi.mocked(unzipSync).mockImplementation((data, options) =>
-    actual.unzipSync(data, {
-      ...options,
-      filter: (file) => {
-        const keep = options?.filter ? options.filter(file) : true;
-        if (keep) inflated.push(file.name);
-        return keep;
-      },
-    }),
-  );
+beforeEach(() => {
+  counter.inflates = 0;
 });
 
 const blockRows: BuilderCell[][] = [
@@ -46,11 +48,21 @@ function baseWorkbook(): Uint8Array {
   return buildWorkbook([{ name: 'الرسبي', rows: blockRows }]);
 }
 
+function concat(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let at = 0;
+  for (const part of parts) {
+    out.set(part, at);
+    at += part.length;
+  }
+  return out;
+}
+
 function rewrite(
   bytes: Uint8Array,
   change: (files: Record<string, Uint8Array>) => void,
 ): Uint8Array {
-  const files = actualUnzip(bytes);
+  const files = unzipSync(bytes);
   change(files);
   return zipSync(files, { level: 1 });
 }
@@ -82,22 +94,137 @@ function declareSize(
   return copy;
 }
 
+type RawEntry = {
+  name: string;
+  data: Uint8Array;
+  method?: 0 | 8;
+  size?: number;
+  sharesDataOf?: string;
+  localExtra?: number;
+  descriptor?: boolean;
+};
+
+/** A zip written by hand, so sizes and offsets can disagree with the data. */
+function rawZip(entries: RawEntry[]): Uint8Array {
+  const body: Uint8Array[] = [];
+  const directory: Uint8Array[] = [];
+  const offsets = new Map<string, number>();
+  let position = 0;
+  const add = (part: Uint8Array): void => {
+    body.push(part);
+    position += part.length;
+  };
+  for (const entry of entries) {
+    const name = strToU8(entry.name);
+    const method = entry.method ?? 0;
+    const size = entry.size ?? entry.data.length;
+    const flags = entry.descriptor ? 8 : 0;
+    if (!entry.sharesDataOf) {
+      offsets.set(entry.name, position);
+      const extra = entry.localExtra ?? 0;
+      const header = new Uint8Array(30 + name.length + extra);
+      const local = new DataView(header.buffer);
+      local.setUint32(0, 0x04034b50, true);
+      local.setUint16(4, 20, true);
+      local.setUint16(6, flags, true);
+      local.setUint16(8, method, true);
+      if (!entry.descriptor) {
+        local.setUint32(18, entry.data.length, true);
+        local.setUint32(22, size, true);
+      }
+      local.setUint16(26, name.length, true);
+      local.setUint16(28, extra, true);
+      header.set(name, 30);
+      add(header);
+      add(entry.data);
+      if (entry.descriptor) {
+        const tail = new Uint8Array(16);
+        const after = new DataView(tail.buffer);
+        after.setUint32(0, 0x08074b50, true);
+        after.setUint32(8, entry.data.length, true);
+        after.setUint32(12, size, true);
+        add(tail);
+      }
+    }
+    const record = new Uint8Array(46 + name.length);
+    const central = new DataView(record.buffer);
+    central.setUint32(0, 0x02014b50, true);
+    central.setUint16(4, 20, true);
+    central.setUint16(6, 20, true);
+    central.setUint16(8, flags, true);
+    central.setUint16(10, method, true);
+    central.setUint32(20, entry.data.length, true);
+    central.setUint32(24, size, true);
+    central.setUint16(28, name.length, true);
+    central.setUint32(
+      42,
+      offsets.get(entry.sharesDataOf ?? entry.name) ?? 0,
+      true,
+    );
+    record.set(name, 46);
+    directory.push(record);
+  }
+  const listing = concat(directory);
+  const end = new Uint8Array(22);
+  const tail = new DataView(end.buffer);
+  tail.setUint32(0, 0x06054b50, true);
+  tail.setUint16(8, entries.length, true);
+  tail.setUint16(10, entries.length, true);
+  tail.setUint32(12, listing.length, true);
+  tail.setUint32(16, position, true);
+  return concat([...body, listing, end]);
+}
+
+function storedCore(files: Record<string, Uint8Array>): RawEntry[] {
+  return coreParts.map((name) => ({ name, data: files[name]! }));
+}
+
+/** Stored sheets 2..n point at the data of sheet 1, which is padded to `padding` bytes. */
+function sharedSheets(
+  sheets: number,
+  padding: number,
+  declared?: number,
+): Uint8Array {
+  const files = unzipSync(
+    buildWorkbook(
+      Array.from({ length: sheets }, (_, index) => ({
+        name: `شيت ${index + 1}`,
+        rows: blockRows,
+      })),
+    ),
+  );
+  const first = concat([files[sheetPath]!, new Uint8Array(padding).fill(32)]);
+  const entries = [...storedCore(files), { name: sheetPath, data: first }];
+  for (let index = 2; index <= sheets; index += 1) {
+    entries.push({
+      name: `xl/worksheets/sheet${index}.xml`,
+      data: first,
+      sharesDataOf: sheetPath,
+      size: declared,
+    });
+  }
+  return rawZip(entries);
+}
+
 function refused(bytes: Uint8Array, code: string): void {
-  inflated = [];
+  counter.inflates = 0;
   expect(() => readWorkbook(bytes)).toThrowError(
     expect.objectContaining({ code }),
   );
 }
 
 describe('readWorkbook archive limits', () => {
-  it('inflates only the workbook parts and the sheets it lists', () => {
-    const bytes = rewrite(baseWorkbook(), (files) => {
-      files['xl/worksheets/sheet9.xml'] = strToU8('<unlisted/>');
-      files['xl/media/image1.png'] = new Uint8Array(2048);
-    });
-    inflated = [];
+  it('reads only the workbook parts and the sheets it lists', () => {
+    const bytes = declareSize(
+      rewrite(baseWorkbook(), (files) => {
+        files['xl/worksheets/sheet9.xml'] = strToU8('<unlisted/>');
+        files['xl/media/image1.png'] = new Uint8Array(2048);
+      }),
+      'xl/worksheets/sheet9.xml',
+      80 * mebibyte,
+    );
     expect(readWorkbook(bytes)).toHaveLength(1);
-    expect([...inflated].sort()).toEqual([...coreParts, sheetPath].sort());
+    expect(counter.inflates).toBeLessThanOrEqual(coreParts.length + 1);
   });
 
   it('refuses an archive with too many entries without inflating any', () => {
@@ -108,7 +235,7 @@ describe('readWorkbook archive limits', () => {
       }
     });
     refused(bytes, 'too_much_data');
-    expect(inflated).toEqual([]);
+    expect(counter.inflates).toBe(0);
   });
 
   it('refuses sheets that together inflate past the limit before inflating one', () => {
@@ -124,13 +251,125 @@ describe('readWorkbook archive limits', () => {
     });
     expect(bytes.byteLength).toBeLessThan(mebibyte);
     refused(bytes, 'too_much_data');
-    expect(inflated.filter((name) => name.includes('worksheets'))).toEqual([]);
+    expect(counter.inflates).toBeLessThanOrEqual(coreParts.length);
   });
 
-  it('goes by the sizes in the zip directory, not by the data', () => {
+  it('refuses a declared size past the limit before inflating the sheet', () => {
     const bytes = declareSize(baseWorkbook(), sheetPath, 80 * mebibyte);
     refused(bytes, 'too_much_data');
-    expect(inflated.filter((name) => name.includes('worksheets'))).toEqual([]);
+    expect(counter.inflates).toBeLessThanOrEqual(coreParts.length);
+  });
+
+  it('refuses a file over the size cap', () => {
+    refused(new Uint8Array(maxWorkbookBytes + 1), 'too_large');
+    expect(counter.inflates).toBe(0);
+  });
+});
+
+describe('sizes that disagree with the data', () => {
+  const realSize = unzipSync(baseWorkbook())[sheetPath]!.length;
+
+  it.each([
+    [5, mebibyte],
+    [40, 18 * mebibyte],
+  ])(
+    'refuses %i stored sheets that share data and under-declare their size',
+    (sheets, padding) => {
+      refused(sharedSheets(sheets, padding, 1), 'not_xlsx');
+    },
+  );
+
+  it('refuses stored sheets that share data even when the sizes add up', () => {
+    refused(sharedSheets(5, mebibyte), 'not_xlsx');
+  });
+
+  it.each([5, -1])(
+    'refuses a stored sheet whose size is off by %i from its data',
+    (change) => {
+      const files = unzipSync(baseWorkbook());
+      const data = files[sheetPath]!;
+      const bytes = rawZip([
+        ...storedCore(files),
+        { name: sheetPath, data, size: data.length + change },
+      ]);
+      refused(bytes, 'not_xlsx');
+    },
+  );
+
+  it.each([10, realSize - 1])(
+    'refuses a deflated sheet that declares %i bytes instead of truncating it',
+    (declared) => {
+      refused(declareSize(baseWorkbook(), sheetPath, declared), 'not_xlsx');
+    },
+  );
+
+  it('refuses a deflated sheet that declares more than it holds', () => {
+    refused(declareSize(baseWorkbook(), sheetPath, realSize + 1), 'not_xlsx');
+  });
+
+  it('stops a small deflated bomb that declares a tiny size', () => {
+    const bytes = declareSize(
+      rewrite(baseWorkbook(), (files) => {
+        files[sheetPath] = concat([
+          files[sheetPath]!,
+          new Uint8Array(8 * mebibyte).fill(32),
+        ]);
+      }),
+      sheetPath,
+      100,
+    );
+    expect(bytes.byteLength).toBeLessThan(mebibyte);
+    refused(bytes, 'not_xlsx');
+  });
+
+  it('refuses two entries whose data overlap', () => {
+    const files = unzipSync(baseWorkbook());
+    const bytes = rawZip([
+      ...storedCore(files),
+      { name: sheetPath, data: files[sheetPath]! },
+      {
+        name: 'xl/worksheets/sheet2.xml',
+        data: files[sheetPath]!,
+        sharesDataOf: sheetPath,
+      },
+    ]);
+    refused(bytes, 'not_xlsx');
+  });
+
+  it('refuses a truncated file and a repeated entry name', () => {
+    refused(baseWorkbook().slice(0, 100), 'not_xlsx');
+    const files = unzipSync(baseWorkbook());
+    refused(
+      rawZip([
+        ...storedCore(files),
+        { name: sheetPath, data: files[sheetPath]! },
+        { name: sheetPath, data: files[sheetPath]! },
+      ]),
+      'not_xlsx',
+    );
+  });
+});
+
+describe('real-world workbooks', () => {
+  it('reads the sample workbook', () => {
+    const bytes = sampleWorkbook();
+    expect(readWorkbook(bytes).length).toBeGreaterThan(0);
+    expect(parseRecipeWorkbook(bytes).blocks.length).toBeGreaterThan(0);
+  });
+
+  it('reads deflated entries with data descriptors and local extra fields', () => {
+    const files = unzipSync(baseWorkbook());
+    const bytes = rawZip(
+      [...coreParts, sheetPath].map((name) => ({
+        name,
+        data: deflateSync(files[name]!),
+        method: 8 as const,
+        size: files[name]!.length,
+        descriptor: true,
+        localExtra: 12,
+      })),
+    );
+    expect(readWorkbook(bytes)).toEqual(readWorkbook(baseWorkbook()));
   });
 });
 
