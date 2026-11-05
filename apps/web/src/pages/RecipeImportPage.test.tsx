@@ -184,13 +184,8 @@ describe('RecipeImportPage', () => {
             inForce: true,
           },
         ],
-        bindings: [
-          {
-            source: 'سمك قديم',
-            recipeId: 'rec-old',
-            stockItemId: null,
-            block: true,
-          },
+        blockBindings: [
+          { source: 'سمك قديم', recipeId: 'rec-old', stockItemId: null },
         ],
       }),
     );
@@ -472,16 +467,15 @@ describe('RecipeImportPage', () => {
           losses: new Map(need.itemIds.map((id) => [id, `token-${id}`])),
         }),
       );
+      const dishBinding = {
+        source: normalizeName(names.dish),
+        recipeId: 'rec-dish',
+        stockItemId: null,
+      };
       const refreshed = importContext({
         recipes: [dishRecipe],
-        bindings: [
-          {
-            source: normalizeName(names.dish),
-            recipeId: 'rec-dish',
-            stockItemId: null,
-            block: true,
-          },
-        ],
+        bindings: [dishBinding],
+        blockBindings: [dishBinding],
         knownHashes: [await structure()],
       });
       let release!: (value: ImportContext) => void;

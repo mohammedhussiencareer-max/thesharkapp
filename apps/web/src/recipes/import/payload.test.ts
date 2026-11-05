@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { reduceBindings, type BindingRow } from '@/recipes/import/bindings';
 import {
   buildReview,
+  disappearedRecipes,
   patchBlock,
   patchIngredient,
   validateReview,
@@ -370,5 +372,183 @@ describe('buildImportPayload', () => {
       quantity: '300',
       unit: 'g',
     });
+  });
+
+  it('sends the parent line in the unit of the batch version it is published with', () => {
+    const sauceSource = norm(names.sauce);
+    const bound = { source: sauceSource, recipeId: 'rec-sauce' };
+    const ctx = importContext({
+      recipes: [
+        {
+          id: 'rec-sauce',
+          name: names.sauce,
+          kind: 'batch',
+          active: true,
+          inForce: true,
+        },
+      ],
+      batches: [
+        {
+          id: 'rec-sauce',
+          name: names.sauce,
+          active: true,
+          versions: [
+            {
+              effectiveFrom: '2020-01-01T00:00:00.000Z',
+              effectiveTo: null,
+              unit: 'g',
+            },
+          ],
+        },
+      ],
+      bindings: [{ ...bound, stockItemId: null }],
+      blockBindings: [{ ...bound, stockItemId: null }],
+    });
+    let review = buildReview(parsed, ctx);
+    review = patchBlock(review, ctx, blockId(names.sauce), { batchUnit: 'ml' });
+    review = confirmAll(review, ctx);
+    expect(validateReview(review, parsed, ctx).general).toEqual([]);
+    const payload = buildImportPayload({
+      review,
+      parsed,
+      hash,
+      effectiveFrom: null,
+      reason: null,
+      tokens: {
+        recipes: new Map([['rec-sauce', 'token-sauce']]),
+        losses: new Map(),
+      },
+    });
+    const dish = payload.recipes.find(
+      (recipe) => recipe.key === `r${blockId(names.dish)}`,
+    );
+    expect(dish?.lines).toContainEqual({
+      child_recipe_id: 'rec-sauce',
+      quantity: '100',
+      unit: 'ml',
+    });
+    expect(
+      payload.recipes.find((recipe) => recipe.recipe_id === 'rec-sauce'),
+    ).toMatchObject({ kind: 'batch', batch_unit: 'ml' });
+  });
+});
+
+describe('block provenance across three imports', () => {
+  const ids: Record<string, string> = {
+    [`r${blockId(names.dish)}`]: 'rec-dish',
+    [`r${blockId(names.rice)}`]: 'rec-rice',
+    [`r${blockId(names.sauce)}`]: 'rec-sauce',
+  };
+  const recipes: ImportContext['recipes'] = [
+    {
+      id: 'rec-dish',
+      name: names.dish,
+      kind: 'dish',
+      active: true,
+      inForce: true,
+    },
+    {
+      id: 'rec-rice',
+      name: names.rice,
+      kind: 'dish',
+      active: true,
+      inForce: true,
+    },
+    {
+      id: 'rec-sauce',
+      name: names.sauce,
+      kind: 'batch',
+      active: true,
+      inForce: true,
+    },
+  ];
+  const batches: ImportContext['batches'] = [
+    {
+      id: 'rec-sauce',
+      name: names.sauce,
+      active: true,
+      versions: [
+        {
+          effectiveFrom: '2020-01-01T00:00:00.000Z',
+          effectiveTo: null,
+          unit: 'g',
+        },
+      ],
+    },
+  ];
+
+  function rowsOf(payload: ImportPayload, created: string): BindingRow[] {
+    return payload.bindings.map((binding, index) => ({
+      id: `${created}-${String(index).padStart(3, '0')}`,
+      source_name: binding.source_name,
+      recipe_id:
+        binding.recipe_id ??
+        (binding.recipe_key ? (ids[binding.recipe_key] ?? null) : null),
+      stock_item_id: binding.stock_item_id ?? null,
+      is_block: binding.is_block ?? false,
+      created_at: created,
+    }));
+  }
+
+  function importOnce(
+    ctx: ImportContext,
+    tokens: string[],
+    leaveOut: string[] = [],
+  ): ImportPayload {
+    let review = confirmAll(buildReview(parsed, ctx), ctx);
+    for (const name of leaveOut) {
+      review = patchBlock(review, ctx, blockId(name), { include: false });
+    }
+    expect(validateReview(review, parsed, ctx).general).toEqual([]);
+    return buildImportPayload({
+      review,
+      parsed,
+      hash,
+      effectiveFrom: null,
+      reason: null,
+      tokens: {
+        recipes: new Map(tokens.map((id) => [id, `token-${id}`])),
+        losses: new Map(),
+      },
+    });
+  }
+
+  it('still reports a block that a later import only referenced as an ingredient', () => {
+    const first = importOnce(importContext(), []);
+    const rows1 = rowsOf(first, '2026-11-01T10:00:00.000Z');
+    expect(
+      rows1.filter((row) => row.is_block).map((row) => row.recipe_id),
+    ).toEqual(expect.arrayContaining(['rec-dish', 'rec-sauce']));
+
+    const ctx2 = importContext({ recipes, batches, ...reduceBindings(rows1) });
+    expect(disappearedRecipes(parsed, ctx2)).toEqual([]);
+    const second = importOnce(ctx2, ['rec-dish', 'rec-rice'], [names.sauce]);
+    const sauceBinding = second.bindings.find(
+      (binding) => binding.source_name === norm(names.sauce),
+    );
+    expect(sauceBinding).toEqual({
+      source_name: norm(names.sauce),
+      recipe_id: 'rec-sauce',
+    });
+    const rows2 = rowsOf(second, '2026-11-02T10:00:00.000Z');
+    expect(
+      rows2.find((row) => row.source_name === norm(names.sauce)),
+    ).toMatchObject({ recipe_id: 'rec-sauce', is_block: false });
+
+    const gone = {
+      ...parsed,
+      blocks: parsed.blocks.filter((block) => block.name !== names.sauce),
+    };
+    const ctx3 = importContext({
+      recipes,
+      batches,
+      ...reduceBindings([...rows2, ...rows1]),
+    });
+    expect(
+      ctx3.bindings.find((binding) => binding.source === norm(names.sauce)),
+    ).toMatchObject({ recipeId: 'rec-sauce' });
+    expect(disappearedRecipes(gone, ctx3)).toEqual([
+      { id: 'rec-sauce', name: names.sauce },
+    ]);
   });
 });

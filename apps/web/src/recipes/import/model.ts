@@ -15,16 +15,11 @@ import type {
   StockOption,
   UnitMeta,
 } from '@/recipes/types';
+import type { SourceBinding } from '@/recipes/import/bindings';
 import { collapseSpaces, normalizeName } from '@/recipes/import/normalize';
 import type { ParsedWorkbook } from '@/recipes/import/parse';
 
-export type SourceBinding = {
-  source: string;
-  recipeId: string | null;
-  stockItemId: string | null;
-  /** True when the source name was a recipe block title, not an ingredient line. */
-  block: boolean;
-};
+export type { SourceBinding };
 
 export type ImportContext = {
   stock: StockOption[];
@@ -35,6 +30,8 @@ export type ImportContext = {
   shiftStart: string | null;
   /** The latest binding per normalised source name. */
   bindings: SourceBinding[];
+  /** The latest binding per source name that was ever a recipe block title. */
+  blockBindings: SourceBinding[];
   knownHashes: string[];
 };
 
@@ -136,6 +133,18 @@ function choicesByTarget(
   }
   if (target.type === 'new') return metricChoices(newItem.baseUnit, ctx.units);
   if (target.type === 'recipe') {
+    const updated = blocks.find(
+      (block) =>
+        block.include &&
+        block.kind === 'batch' &&
+        block.target.mode === 'existing' &&
+        block.target.recipeId === target.recipeId,
+    );
+    if (updated) {
+      return updated.batchUnit
+        ? metricChoices(updated.batchUnit, ctx.units)
+        : [];
+    }
     return childUnitChoices(
       ctx.batches.find((batch) => batch.id === target.recipeId),
       Date.now(),
@@ -732,17 +741,13 @@ export function disappearedRecipes(
 ): { id: string; name: string }[] {
   const present = new Set(parsed.blocks.map((block) => block.norm));
   const stillSourced = new Set(
-    ctx.bindings.flatMap((binding) =>
-      binding.block && binding.recipeId && present.has(binding.source)
-        ? [binding.recipeId]
-        : [],
+    ctx.blockBindings.flatMap((binding) =>
+      binding.recipeId && present.has(binding.source) ? [binding.recipeId] : [],
     ),
   );
   const found: { id: string; name: string }[] = [];
-  for (const binding of ctx.bindings) {
-    if (!binding.block || !binding.recipeId || present.has(binding.source)) {
-      continue;
-    }
+  for (const binding of ctx.blockBindings) {
+    if (!binding.recipeId || present.has(binding.source)) continue;
     const recipe = ctx.recipes.find((entry) => entry.id === binding.recipeId);
     if (
       recipe &&

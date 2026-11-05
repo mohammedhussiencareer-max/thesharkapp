@@ -12,7 +12,8 @@ import {
   listUnitsMeta,
 } from '@/recipes/api';
 import { mapRecipeError } from '@/recipes/errors';
-import type { ImportContext, SourceBinding } from '@/recipes/import/model';
+import { reduceBindings, type BindingRow } from '@/recipes/import/bindings';
+import type { ImportContext } from '@/recipes/import/model';
 import type { ImportPayload, ImportTokens } from '@/recipes/import/payload';
 
 function appDb() {
@@ -37,17 +38,7 @@ function throwIfError(error: PostgrestError | null): void {
   throw mapped;
 }
 
-type BindingRow = {
-  id: string;
-  source_name: string;
-  recipe_id: string | null;
-  stock_item_id: string | null;
-  is_block: boolean;
-  created_at: string;
-};
-
-/** The latest row per source name is the current binding. */
-async function listBindings(): Promise<SourceBinding[]> {
+async function listBindings(): Promise<ReturnType<typeof reduceBindings>> {
   const rows = await readAllByKey<BindingRow>((afterId, size) => {
     const query = appDb()
       .from('recipe_import_bindings')
@@ -58,23 +49,7 @@ async function listBindings(): Promise<SourceBinding[]> {
       .order('id')
       .limit(size);
   }, genericCatalogError);
-  const latest = new Map<string, BindingRow>();
-  for (const row of rows) {
-    const known = latest.get(row.source_name);
-    if (
-      !known ||
-      Date.parse(row.created_at) > Date.parse(known.created_at) ||
-      (row.created_at === known.created_at && row.id > known.id)
-    ) {
-      latest.set(row.source_name, row);
-    }
-  }
-  return [...latest.values()].map((row) => ({
-    source: row.source_name,
-    recipeId: row.recipe_id,
-    stockItemId: row.stock_item_id,
-    block: row.is_block,
-  }));
+  return reduceBindings(rows);
 }
 
 async function listKnownHashes(): Promise<string[]> {
@@ -100,7 +75,7 @@ export async function loadImportContext(): Promise<ImportContext> {
     itemUnits,
     units,
     shiftStart,
-    bindings,
+    { bindings, blockBindings },
     hashes,
   ] = await Promise.all([
     listStockOptions(),
@@ -120,6 +95,7 @@ export async function loadImportContext(): Promise<ImportContext> {
     units,
     shiftStart,
     bindings,
+    blockBindings,
     knownHashes: hashes,
   };
 }

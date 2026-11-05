@@ -5,6 +5,7 @@ import {
   confirmSuggestions,
   disappearedRecipes,
   guessKinds,
+  ingredientChoices,
   isKnownStructure,
   issueCount,
   patchBlock,
@@ -200,7 +201,6 @@ describe('buildReview suggestions', () => {
           source: normalizeName(names.salt),
           recipeId: null,
           stockItemId: 'item-rice',
-          block: false,
         },
       ],
     });
@@ -260,6 +260,74 @@ describe('buildReview suggestions', () => {
     expect(ingredientOf(review, names.sauce).unit).toBe('g');
     review = patchBlock(review, ctx, id, { batchUnit: 'liter' });
     expect(ingredientOf(review, names.sauce).unit).toBe('ml');
+  });
+
+  describe('a batch that is updated by this import', () => {
+    const sauceSource = normalizeName(names.sauce);
+    const boundBatch = {
+      id: 'rec-sauce',
+      name: names.sauce,
+      active: true,
+      versions: [
+        {
+          effectiveFrom: '2020-01-01T00:00:00.000Z',
+          effectiveTo: null,
+          unit: 'g',
+        },
+      ],
+    };
+    const ctx = importContext({
+      recipes: [
+        {
+          id: 'rec-sauce',
+          name: names.sauce,
+          kind: 'batch',
+          active: true,
+          inForce: true,
+        },
+      ],
+      batches: [boundBatch],
+      bindings: [
+        { source: sauceSource, recipeId: 'rec-sauce', stockItemId: null },
+      ],
+      blockBindings: [
+        { source: sauceSource, recipeId: 'rec-sauce', stockItemId: null },
+      ],
+    });
+    const codes = (review: Review, name: string) =>
+      ingredientChoices(ingredientOf(review, name), review, ctx)
+        .map((choice) => choice.code)
+        .sort();
+
+    it('offers the unit of the incoming batch, not the persisted one', () => {
+      let review = buildReview(parsed, ctx);
+      const id = blockOf(review, names.sauce).id;
+      expect(blockOf(review, names.sauce).target).toEqual({
+        mode: 'existing',
+        recipeId: 'rec-sauce',
+      });
+      expect(ingredientOf(review, names.sauce).target).toEqual({
+        type: 'recipe',
+        recipeId: 'rec-sauce',
+      });
+      expect(codes(review, names.sauce)).toEqual(['g', 'kg']);
+
+      review = patchBlock(review, ctx, id, { batchUnit: 'ml' });
+      expect(ingredientOf(review, names.sauce).unit).toBe('ml');
+      expect(codes(review, names.sauce)).toEqual(['liter', 'ml']);
+      expect(
+        issueCount(validateReview(confirmAll(review, ctx), parsed, ctx)),
+      ).toBe(0);
+    });
+
+    it('falls back to the persisted unit while the update is left out', () => {
+      let review = buildReview(parsed, ctx);
+      const id = blockOf(review, names.sauce).id;
+      review = patchBlock(review, ctx, id, { batchUnit: 'ml' });
+      review = patchBlock(review, ctx, id, { include: false });
+      expect(ingredientOf(review, names.sauce).unit).toBe('g');
+      expect(codes(review, names.sauce)).toEqual(['g', 'kg']);
+    });
   });
 
   it('carries the loss ratio as a suggestion that starts unapproved', () => {
@@ -643,30 +711,14 @@ describe('re-import helpers', () => {
           inForce: true,
         },
       ],
-      bindings: [
-        {
-          source: 'سمك قديم',
-          recipeId: 'rec-old',
-          stockItemId: null,
-          block: true,
-        },
-        {
-          source: 'وصفة موقوفة',
-          recipeId: 'rec-stopped',
-          stockItemId: null,
-          block: true,
-        },
+      bindings: [{ source: 'ملح', recipeId: null, stockItemId: 'item-salt' }],
+      blockBindings: [
+        { source: 'سمك قديم', recipeId: 'rec-old', stockItemId: null },
+        { source: 'وصفة موقوفة', recipeId: 'rec-stopped', stockItemId: null },
         {
           source: normalizeName(names.dish),
           recipeId: 'rec-dish',
           stockItemId: null,
-          block: true,
-        },
-        {
-          source: 'ملح',
-          recipeId: null,
-          stockItemId: 'item-salt',
-          block: false,
         },
       ],
     });
@@ -686,12 +738,11 @@ describe('re-import helpers', () => {
           inForce: true,
         },
       ],
-      bindings: [
+      blockBindings: [
         {
           source: normalizeName('اسم الملف القديم'),
           recipeId: 'rec-renamed',
           stockItemId: null,
-          block: true,
         },
       ],
     });
@@ -714,31 +765,15 @@ describe('re-import helpers', () => {
         recipe('rec-named', names.rice),
         recipe('rec-batch', 'تحضيرة مرتبطة كمكوّن'),
       ],
-      bindings: [
-        {
-          source: 'مصدر غايب',
-          recipeId: 'rec-two',
-          stockItemId: null,
-          block: true,
-        },
+      bindings: [{ source: 'ملح', recipeId: 'rec-batch', stockItemId: null }],
+      blockBindings: [
+        { source: 'مصدر غايب', recipeId: 'rec-two', stockItemId: null },
         {
           source: normalizeName(names.dish),
           recipeId: 'rec-two',
           stockItemId: null,
-          block: true,
         },
-        {
-          source: 'مصدر غايب تاني',
-          recipeId: 'rec-named',
-          stockItemId: null,
-          block: true,
-        },
-        {
-          source: 'ملح',
-          recipeId: 'rec-batch',
-          stockItemId: null,
-          block: false,
-        },
+        { source: 'مصدر غايب تاني', recipeId: 'rec-named', stockItemId: null },
       ],
     });
     expect(disappearedRecipes(parsed, ctx)).toEqual([]);

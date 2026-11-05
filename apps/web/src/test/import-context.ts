@@ -56,6 +56,7 @@ export function importContext(
     units: unitMeta,
     shiftStart: null,
     bindings: [],
+    blockBindings: [],
     knownHashes: [],
     ...overrides,
   };
