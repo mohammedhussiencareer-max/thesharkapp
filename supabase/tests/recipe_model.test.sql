@@ -1,7 +1,7 @@
 begin;
 
 select
-  plan (183);
+  plan (191);
 
 insert into
   auth.users (
@@ -547,6 +547,46 @@ from
         'f5000000-0000-4000-8000-00000000004b',
         'ابن فجوة متداخلة',
         'batch'
+      ),
+      (
+        'f5000000-0000-4000-8000-00000000004c',
+        'دفعة ثلاثة كيلو',
+        'batch'
+      ),
+      (
+        'f5000000-0000-4000-8000-00000000004d',
+        'طبق عُشر الدفعة',
+        'dish'
+      ),
+      (
+        'f5000000-0000-4000-8000-00000000004e',
+        'دفعة ثلاثة كيلو دقيقة',
+        'batch'
+      ),
+      (
+        'f5000000-0000-4000-8000-00000000004f',
+        'طبق عُشر دفعة دقيقة',
+        'dish'
+      ),
+      (
+        'f5000000-0000-4000-8000-000000000050',
+        'دفعة تحتوي دفعة',
+        'batch'
+      ),
+      (
+        'f5000000-0000-4000-8000-000000000051',
+        'طبق دفعة داخل دفعة',
+        'dish'
+      ),
+      (
+        'f5000000-0000-4000-8000-000000000052',
+        'دفعة سبعة كيلو',
+        'batch'
+      ),
+      (
+        'f5000000-0000-4000-8000-000000000053',
+        'طبق مقامين',
+        'dish'
       )
   ) as v (id, name, kind)
   cross join (
@@ -1921,6 +1961,58 @@ select
     'an inactive stock item and a fish_size item are allowed as leaves'
   );
 
+-- Batches of 3 kg and 7 kg whose ratios are not finite decimals, so any
+-- quotient taken before the final rounding changes a quantity.
+select
+  lives_ok (
+    $t$do $b$
+    begin
+      perform app.set_recipe_version(gen_random_uuid(),
+        'f5000000-0000-4000-8000-00000000004c'::uuid,
+        '2030-01-01 00:00:00+00', null, 3, 'kg',
+        '[{"stock_item_id":"f5000000-0000-4000-8000-000000000012","quantity":0.300015,"unit":"kg"}]'::jsonb,
+        null, md5('batch|'));
+      perform app.set_recipe_version(gen_random_uuid(),
+        'f5000000-0000-4000-8000-00000000004d'::uuid,
+        '2030-01-01 00:00:00+00', null, null, null,
+        '[{"child_recipe_id":"f5000000-0000-4000-8000-00000000004c","quantity":0.1,"unit":"kg"}]'::jsonb,
+        null, md5('dish|'));
+      perform app.set_recipe_version(gen_random_uuid(),
+        'f5000000-0000-4000-8000-00000000004e'::uuid,
+        '2030-01-01 00:00:00+00', null, 3, 'kg',
+        '[{"stock_item_id":"f5000000-0000-4000-8000-000000000012","quantity":0.000015,"unit":"kg"}]'::jsonb,
+        null, md5('batch|'));
+      perform app.set_recipe_version(gen_random_uuid(),
+        'f5000000-0000-4000-8000-00000000004f'::uuid,
+        '2030-01-01 00:00:00+00', null, null, null,
+        '[{"child_recipe_id":"f5000000-0000-4000-8000-00000000004e","quantity":0.1,"unit":"kg"}]'::jsonb,
+        null, md5('dish|'));
+      perform app.set_recipe_version(gen_random_uuid(),
+        'f5000000-0000-4000-8000-000000000050'::uuid,
+        '2030-01-01 00:00:00+00', null, 3, 'kg',
+        '[{"child_recipe_id":"f5000000-0000-4000-8000-00000000004c","quantity":1,"unit":"kg"}]'::jsonb,
+        null, md5('batch|'));
+      perform app.set_recipe_version(gen_random_uuid(),
+        'f5000000-0000-4000-8000-000000000051'::uuid,
+        '2030-01-01 00:00:00+00', null, null, null,
+        '[{"child_recipe_id":"f5000000-0000-4000-8000-000000000050","quantity":0.3,"unit":"kg"}]'::jsonb,
+        null, md5('dish|'));
+      perform app.set_recipe_version(gen_random_uuid(),
+        'f5000000-0000-4000-8000-000000000052'::uuid,
+        '2030-01-01 00:00:00+00', null, 7, 'kg',
+        '[{"stock_item_id":"f5000000-0000-4000-8000-000000000012","quantity":0.7,"unit":"kg"}]'::jsonb,
+        null, md5('batch|'));
+      perform app.set_recipe_version(gen_random_uuid(),
+        'f5000000-0000-4000-8000-000000000053'::uuid,
+        '2030-01-01 00:00:00+00', null, null, null,
+        '[{"child_recipe_id":"f5000000-0000-4000-8000-00000000004c","quantity":0.1,"unit":"kg"},
+          {"child_recipe_id":"f5000000-0000-4000-8000-000000000052","quantity":1,"unit":"kg"}]'::jsonb,
+        null, md5('dish|'));
+    end
+    $b$;$t$,
+    'the exact-fraction fixtures are published'
+  );
+
 -- ============================================================================
 -- 6. Supersede and fragments
 -- ============================================================================
@@ -2352,6 +2444,112 @@ select
     'two paths to one item are summed before the single rounding'
   );
 
+-- Exact fractions: a quotient taken mid-walk (0.1 / 3 = 0.0333...) would drop
+-- below the half-piaster line these quantities sit exactly on.
+select
+  results_eq (
+    $$select
+        r ->> 'status',
+        r -> 'requirements'
+      from (
+        select app.expand_recipe(
+          'f5000000-0000-4000-8000-00000000004d', 1, 'portion',
+          '2030-06-01 00:00:00+00'
+        ) as r
+      ) x$$,
+    $$values (
+      'ready'::text,
+      '[{"stock_item_id":"f5000000-0000-4000-8000-000000000012","base_unit":"kg","quantity":0.010001}]'::jsonb
+    )$$,
+    '0.1 kg of a 3 kg batch holding 0.300015 kg needs 0.010001 kg, not 0.010000'
+  );
+
+select
+  results_eq (
+    $$select
+        r ->> 'status',
+        r -> 'requirements' -> 0 ->> 'quantity',
+        jsonb_array_length(r -> 'issues')
+      from (
+        select app.expand_recipe(
+          'f5000000-0000-4000-8000-00000000004f', 1, 'portion',
+          '2030-06-01 00:00:00+00'
+        ) as r
+      ) x$$,
+    $$values ('ready'::text, '0.000001'::text, 0)$$,
+    '0.1 kg of a 3 kg batch holding 0.000015 kg is ready with 0.000001 kg, not below_precision'
+  );
+
+select
+  is (
+    app.expand_recipe (
+      'f5000000-0000-4000-8000-000000000051',
+      1,
+      'portion',
+      '2030-06-01 00:00:00+00'
+    ) -> 'requirements' -> 0 ->> 'quantity',
+    '0.010001',
+    'two batch levels in a row (1/3 of 0.3/3) keep the exact fraction'
+  );
+
+select
+  results_eq (
+    $$select
+        r ->> 'status',
+        r -> 'requirements'
+      from (
+        select app.expand_recipe(
+          'f5000000-0000-4000-8000-00000000004c', 0.1, 'kg',
+          '2030-06-01 00:00:00+00'
+        ) as r
+      ) x$$,
+    $$values (
+      'ready'::text,
+      '[{"stock_item_id":"f5000000-0000-4000-8000-000000000012","base_unit":"kg","quantity":0.010001}]'::jsonb
+    )$$,
+    'a root batch asked for 0.1 kg of 3 kg needs 0.010001 kg of the 0.300015 kg item'
+  );
+
+select
+  results_eq (
+    $$select
+        r ->> 'status',
+        r -> 'requirements' -> 0 ->> 'quantity',
+        jsonb_array_length(r -> 'issues')
+      from (
+        select app.expand_recipe(
+          'f5000000-0000-4000-8000-00000000004e', 0.1, 'kg',
+          '2030-06-01 00:00:00+00'
+        ) as r
+      ) x$$,
+    $$values ('ready'::text, '0.000001'::text, 0)$$,
+    'a root batch asked for 0.1 kg of 3 kg holding 0.000015 kg is ready with 0.000001 kg'
+  );
+
+select
+  is (
+    app.expand_recipe (
+      'f5000000-0000-4000-8000-00000000004c',
+      100,
+      'g',
+      '2030-06-01 00:00:00+00'
+    ) -> 'requirements' -> 0 ->> 'quantity',
+    '0.010001',
+    'a root batch asked in grams keeps the unit ratio and the batch quantity undivided'
+  );
+
+select
+  is (
+    app.expand_recipe (
+      'f5000000-0000-4000-8000-000000000053',
+      1,
+      'portion',
+      '2030-06-01 00:00:00+00'
+    ) -> 'requirements',
+    '[{"stock_item_id":"f5000000-0000-4000-8000-000000000012","base_unit":"kg","quantity":0.110001}]'::jsonb,
+    'paths with different denominators (3 and 7) sum exactly before the one rounding'
+  );
+
 select
   is (
     app.expand_recipe (
@@ -2638,7 +2836,7 @@ select
       cross join (values ('anon'), ('authenticated'), ('service_role'), ('public')) as r(role)
       where n.nspname = 'app'
         and p.proname in (
-          'recipe_schedule_line', 'recipe_schedule_token', 'recipe_unit_factor',
+          'recipe_schedule_line', 'recipe_schedule_token', 'recipe_unit_ratio',
           'recipe_payload_assert_no_price_keys', 'recipe_lines_normalize',
           'recipe_walk', 'recipe_expand_exact', 'recipe_validate_publication',
           'trg_recipes_guard', 'trg_recipe_versions_batch_fields',

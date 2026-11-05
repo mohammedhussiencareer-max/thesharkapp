@@ -330,31 +330,35 @@ $$;
 
 comment on function app.recipe_schedule_token (uuid) is 'md5 of kind| plus the ordered non-superseded version lines of one recipe. An empty schedule hashes the identity prefix alone. A missing recipe raises 22023. Internal.';
 
--- Factor from one unit to another: 1 for the same code, from.metric_scale /
--- to.metric_scale inside one mass or volume dimension, null for anything else.
-create function app.recipe_unit_factor (p_from_unit text, p_to_unit text) returns numeric language sql stable security definer
+-- Factor from one unit to another as an undivided fraction: 1/1 for the same
+-- code, from.metric_scale / to.metric_scale inside one mass or volume
+-- dimension, no row for anything else. The walk multiplies the two parts
+-- separately so no division happens before the final rounding.
+create function app.recipe_unit_ratio (p_from_unit text, p_to_unit text) returns table (ratio_num numeric, ratio_den numeric) language sql stable security definer
 set
   search_path = '' as $$
   select
-    case
-      when p_from_unit = p_to_unit then 1::numeric
-      else (
-        select
-          f.metric_scale / t.metric_scale
-        from
-          app.units f
-          join app.units t on t.code = p_to_unit
-          and t.dimension = f.dimension
-        where
-          f.code = p_from_unit
-          and f.dimension in ('mass', 'volume')
-          and f.metric_scale is not null
-          and t.metric_scale is not null
-      )
-    end;
+    1::numeric,
+    1::numeric
+  where
+    p_from_unit = p_to_unit
+  union all
+  select
+    f.metric_scale,
+    t.metric_scale
+  from
+    app.units f
+    join app.units t on t.code = p_to_unit
+    and t.dimension = f.dimension
+  where
+    f.code = p_from_unit
+    and f.code <> t.code
+    and f.dimension in ('mass', 'volume')
+    and f.metric_scale is not null
+    and t.metric_scale is not null;
 $$;
 
-comment on function app.recipe_unit_factor (text, text) is 'Implicit factor between two unit codes: 1 for the same code, the metric_scale ratio inside mass or volume, otherwise null. Internal.';
+comment on function app.recipe_unit_ratio (text, text) is 'Implicit factor between two unit codes as numerator and denominator: 1/1 for the same code, from.metric_scale / to.metric_scale inside mass or volume, no row otherwise. Never divides. Internal.';
 
 -- ============================================================================
 -- D. Strict payload allowlist. Price-like keys are refused at any depth, then
@@ -563,13 +567,17 @@ comment on function app.recipe_lines_normalize (jsonb) is 'Strict allowlist for 
 -- reports loss_not_set / unit_not_convertible; p_validate = true checks the
 -- publication rules only (cooking recipes never reach a marine leaf).
 -- Cycles, depth above 8, a child with no version in force, and a batch line
--- in an unusable unit are issues in both modes. Nothing is truncated or rounded.
+-- in an unusable unit are issues in both modes. Nothing is truncated or rounded,
+-- and nothing is divided: scales and leaf amounts are exact fractions (numeric
+-- products), because a numeric quotient has a finite scale and a quotient taken
+-- mid-walk would change the quantity the final rounding sees.
 -- ============================================================================
 create function app.recipe_walk (
   p_recipe_id uuid,
   p_at timestamptz,
   p_scale numeric,
-  p_validate boolean
+  p_validate boolean,
+  p_scale_den numeric default 1
 ) returns jsonb language plpgsql stable security definer
 set
   search_path = '' as $$
@@ -583,13 +591,15 @@ declare
   v_leaves jsonb := '[]'::jsonb;
   s_recipe uuid[] := '{}'::uuid[];
   s_version uuid[] := '{}'::uuid[];
-  s_scale numeric[] := '{}'::numeric[];
+  s_num numeric[] := '{}'::numeric[];
+  s_den numeric[] := '{}'::numeric[];
   s_path jsonb[] := '{}'::jsonb[];
   s_depth integer[] := '{}'::integer[];
   v_n integer;
   v_recipe uuid;
   v_version uuid;
-  v_scale numeric;
+  v_num numeric;
+  v_den numeric;
   v_path jsonb;
   v_depth integer;
   v_line record;
@@ -598,7 +608,8 @@ declare
   v_child_version uuid;
   v_child_qty numeric;
   v_child_unit text;
-  v_unit_factor numeric;
+  v_ratio_num numeric;
+  v_ratio_den numeric;
   v_loss numeric;
   v_factor numeric;
   v_bad boolean;
@@ -648,7 +659,8 @@ begin
 
   s_recipe := pg_catalog.array_append(s_recipe, p_recipe_id);
   s_version := pg_catalog.array_append(s_version, v_root_version);
-  s_scale := pg_catalog.array_append(s_scale, p_scale);
+  s_num := pg_catalog.array_append(s_num, p_scale);
+  s_den := pg_catalog.array_append(s_den, p_scale_den);
   s_path := pg_catalog.array_append(s_path, pg_catalog.jsonb_build_array(p_recipe_id));
   s_depth := pg_catalog.array_append(s_depth, 0);
 
@@ -656,12 +668,14 @@ begin
     v_n := pg_catalog.cardinality(s_recipe);
     v_recipe := s_recipe[v_n];
     v_version := s_version[v_n];
-    v_scale := s_scale[v_n];
+    v_num := s_num[v_n];
+    v_den := s_den[v_n];
     v_path := s_path[v_n];
     v_depth := s_depth[v_n];
     s_recipe := s_recipe[1:v_n - 1];
     s_version := s_version[1:v_n - 1];
-    s_scale := s_scale[1:v_n - 1];
+    s_num := s_num[1:v_n - 1];
+    s_den := s_den[1:v_n - 1];
     s_path := s_path[1:v_n - 1];
     s_depth := s_depth[1:v_n - 1];
     v_versions := pg_catalog.array_append(v_versions, v_version);
@@ -763,8 +777,10 @@ begin
                 v_line.id,
                 'path',
                 v_path,
-                'quantity',
-                v_scale * v_line.quantity * v_factor / (1 - v_loss)
+                'numerator',
+                v_num * v_line.quantity * v_factor,
+                'denominator',
+                v_den * (1 - v_loss)
               )
             );
           end if;
@@ -818,9 +834,15 @@ begin
             )
           );
         else
-          v_unit_factor := app.recipe_unit_factor (v_line.unit, v_child_unit);
+          select
+            r.ratio_num,
+            r.ratio_den
+          into v_ratio_num,
+            v_ratio_den
+          from
+            app.recipe_unit_ratio (v_line.unit, v_child_unit) r;
 
-          if v_unit_factor is null then
+          if not found then
             v_issues := v_issues || pg_catalog.jsonb_build_array(
               pg_catalog.jsonb_build_object(
                 'code',
@@ -836,7 +858,8 @@ begin
           else
             s_recipe := pg_catalog.array_append(s_recipe, v_line.child_recipe_id);
             s_version := pg_catalog.array_append(s_version, v_child_version);
-            s_scale := pg_catalog.array_append(s_scale, v_scale * v_line.quantity * v_unit_factor / v_child_qty);
+            s_num := pg_catalog.array_append(s_num, v_num * v_line.quantity * v_ratio_num);
+            s_den := pg_catalog.array_append(s_den, v_den * v_ratio_den * v_child_qty);
             s_path := pg_catalog.array_append(s_path, v_path || pg_catalog.to_jsonb(v_line.child_recipe_id));
             s_depth := pg_catalog.array_append(s_depth, v_depth + 1);
           end if;
@@ -869,14 +892,16 @@ begin
 end;
 $$;
 
-comment on function app.recipe_walk (uuid, timestamptz, numeric, boolean) is 'Walks one recipe at one instant. Each leaf is scale x net quantity x item factor / (1 - loss), unrounded. Issues carry code, recipe_id, optional stock_item_id and unit, and the recipe path. p_validate = true skips costing and adds cooking_marine. A cycle, depth above 8, a missing child version or an unusable batch unit is an issue, never truncation. Internal.';
+comment on function app.recipe_walk (uuid, timestamptz, numeric, boolean, numeric) is 'Walks one recipe at one instant. The root scale is the fraction p_scale / p_scale_den. Each leaf is the exact fraction numerator / denominator with numerator = scale numerator x net quantity x item factor and denominator = scale denominator x (1 - loss); a child scale multiplies by the line quantity and the unit ratio over the child batch quantity. Nothing is divided or rounded. Issues carry code, recipe_id, optional stock_item_id and unit, and the recipe path. p_validate = true skips costing and adds cooking_marine. A cycle, depth above 8, a missing child version or an unusable batch unit is an issue, never truncation. Internal.';
 
--- Unrounded per-stock-item aggregates and provenance. p_scale is the number of
--- portions (dish), kg of scale weight (cooking) or batches (batch) of output.
+-- Exact per-stock-item aggregates and provenance. The scale is the fraction
+-- p_scale / p_scale_den of portions (dish), kg of scale weight (cooking) or
+-- batches (batch) of output.
 create function app.recipe_expand_exact (
   p_recipe_id uuid,
   p_at timestamptz,
-  p_scale numeric
+  p_scale numeric,
+  p_scale_den numeric default 1
 ) returns jsonb language plpgsql stable security definer
 set
   search_path = '' as $$
@@ -885,6 +910,11 @@ declare
   v_requirements jsonb := null;
   v_paths jsonb;
   v_status text;
+  v_row record;
+  v_item text;
+  v_unit text;
+  v_num numeric;
+  v_den numeric;
 begin
   if p_at is null
   or not pg_catalog.isfinite(p_at) then
@@ -894,12 +924,15 @@ begin
 
   if p_scale is null
   or p_scale in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
-  or p_scale <= 0 then
+  or p_scale <= 0
+  or p_scale_den is null
+  or p_scale_den in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+  or p_scale_den <= 0 then
     raise exception 'scale must be finite and greater than 0'
       using errcode = '22023';
   end if;
 
-  v_walk := app.recipe_walk (p_recipe_id, p_at, p_scale, false);
+  v_walk := app.recipe_walk (p_recipe_id, p_at, p_scale, false, p_scale_den);
 
   select
     coalesce(
@@ -925,36 +958,67 @@ begin
 
   if pg_catalog.jsonb_array_length(v_walk -> 'issues') = 0 then
     v_status := 'ready';
+    v_requirements := '[]'::jsonb;
 
+    -- Leaves with the same denominator add their numerators. Different
+    -- denominators combine by cross-multiplication, so the sum stays exact.
+    for v_row in
     select
-      coalesce(
-        pg_catalog.jsonb_agg(
-          pg_catalog.jsonb_build_object(
-            'stock_item_id',
-            a.stock_item_id,
-            'base_unit',
-            a.base_unit,
-            'quantity',
-            a.quantity
-          )
-          order by
-            a.stock_item_id
-        ),
-        '[]'::jsonb
-      )
-    into v_requirements
+      e.value ->> 'stock_item_id' as stock_item_id,
+      e.value ->> 'base_unit' as base_unit,
+      (e.value ->> 'denominator')::numeric as denominator,
+      sum((e.value ->> 'numerator')::numeric) as numerator
     from
-      (
-        select
-          e.value ->> 'stock_item_id' as stock_item_id,
-          e.value ->> 'base_unit' as base_unit,
-          sum((e.value ->> 'quantity')::numeric) as quantity
-        from
-          pg_catalog.jsonb_array_elements(v_walk -> 'leaves') as e
-        group by
-          e.value ->> 'stock_item_id',
-          e.value ->> 'base_unit'
-      ) a;
+      pg_catalog.jsonb_array_elements(v_walk -> 'leaves') as e
+    group by
+      e.value ->> 'stock_item_id',
+      e.value ->> 'base_unit',
+      (e.value ->> 'denominator')::numeric
+    order by
+      e.value ->> 'stock_item_id',
+      (e.value ->> 'denominator')::numeric
+    loop
+      if v_item is not null
+      and v_row.stock_item_id = v_item then
+        v_num := v_num * v_row.denominator + v_row.numerator * v_den;
+        v_den := v_den * v_row.denominator;
+      else
+        if v_item is not null then
+          v_requirements := v_requirements || pg_catalog.jsonb_build_array(
+            pg_catalog.jsonb_build_object(
+              'stock_item_id',
+              v_item,
+              'base_unit',
+              v_unit,
+              'numerator',
+              v_num,
+              'denominator',
+              v_den
+            )
+          );
+        end if;
+
+        v_item := v_row.stock_item_id;
+        v_unit := v_row.base_unit;
+        v_num := v_row.numerator;
+        v_den := v_row.denominator;
+      end if;
+    end loop;
+
+    if v_item is not null then
+      v_requirements := v_requirements || pg_catalog.jsonb_build_array(
+        pg_catalog.jsonb_build_object(
+          'stock_item_id',
+          v_item,
+          'base_unit',
+          v_unit,
+          'numerator',
+          v_num,
+          'denominator',
+          v_den
+        )
+      );
+    end if;
   else
     v_status := 'blocked';
   end if;
@@ -981,7 +1045,7 @@ begin
 end;
 $$;
 
-comment on function app.recipe_expand_exact (uuid, timestamptz, numeric) is 'Expands one recipe at p_at into unrounded per-stock-item requirements in the item base unit, plus issues and provenance. requirements is null when blocked, never an empty list. Callers round once, after aggregation. Internal.';
+comment on function app.recipe_expand_exact (uuid, timestamptz, numeric, numeric) is 'Expands one recipe at p_at into exact per-stock-item requirements in the item base unit, plus issues and provenance. Each requirement is stock_item_id, base_unit and the exact sum of its paths as a fraction (numerator, denominator, both positive); no division or rounding has happened, so the caller divides and rounds once. requirements is null when blocked, never an empty list. Internal.';
 
 -- ============================================================================
 -- F. Publication validation (B2). After a change is written, every affected
@@ -2027,8 +2091,10 @@ declare
   v_kind text;
   v_unit text;
   v_code text;
-  v_scale numeric;
-  v_factor numeric;
+  v_scale_num numeric;
+  v_scale_den numeric;
+  v_ratio_num numeric;
+  v_ratio_den numeric;
   v_batch_qty numeric;
   v_batch_unit text;
   v_exact jsonb;
@@ -2072,17 +2138,25 @@ begin
   end if;
 
   v_unit := nullif(btrim(p_output_unit), '');
-  v_scale := null;
+  v_scale_num := null;
 
   if v_kind = 'dish' then
     if v_unit = 'portion' then
-      v_scale := p_output_qty;
+      v_scale_num := p_output_qty;
+      v_scale_den := 1;
     end if;
   elsif v_kind = 'cooking' then
-    v_factor := app.recipe_unit_factor(app.resolve_unit_code(v_unit), 'kg');
+    select
+      r.ratio_num,
+      r.ratio_den
+    into v_ratio_num,
+      v_ratio_den
+    from
+      app.recipe_unit_ratio(app.resolve_unit_code(v_unit), 'kg') r;
 
-    if v_factor is not null then
-      v_scale := p_output_qty * v_factor;
+    if found then
+      v_scale_num := p_output_qty * v_ratio_num;
+      v_scale_den := v_ratio_den;
     end if;
   else
     select
@@ -2099,18 +2173,27 @@ begin
 
     if not found then
       -- The walk reports the missing version.
-      v_scale := 1;
+      v_scale_num := 1;
+      v_scale_den := 1;
     else
       v_code := app.resolve_unit_code(v_unit);
-      v_factor := app.recipe_unit_factor(v_code, v_batch_unit);
 
-      if v_factor is not null then
-        v_scale := p_output_qty * v_factor / v_batch_qty;
+      select
+        r.ratio_num,
+        r.ratio_den
+      into v_ratio_num,
+        v_ratio_den
+      from
+        app.recipe_unit_ratio(v_code, v_batch_unit) r;
+
+      if found then
+        v_scale_num := p_output_qty * v_ratio_num;
+        v_scale_den := v_ratio_den * v_batch_qty;
       end if;
     end if;
   end if;
 
-  if v_scale is null then
+  if v_scale_num is null then
     return jsonb_build_object(
       'status',
       'blocked',
@@ -2145,13 +2228,15 @@ begin
     );
   end if;
 
-  v_exact := app.recipe_expand_exact(p_recipe_id, p_at, v_scale);
+  v_exact := app.recipe_expand_exact(p_recipe_id, p_at, v_scale_num, v_scale_den);
 
   if v_exact ->> 'status' <> 'ready' then
     return v_exact;
   end if;
 
-  -- The only rounding: once per stock item, after every path is summed.
+  -- The only division and rounding: once per stock item, on the exact sum of
+  -- every path. round(n / d * 1e6) is div(2 * n * 1e6 + d, 2 * d), an integer
+  -- division, so no quotient is rounded twice. Halves round up.
   select
     jsonb_agg(
       jsonb_build_object(
@@ -2160,7 +2245,10 @@ begin
         'base_unit',
         e.value ->> 'base_unit',
         'quantity',
-        pg_catalog.round((e.value ->> 'quantity')::numeric, 6)
+        pg_catalog.div(
+          2 * (e.value ->> 'numerator')::numeric * 1000000 + (e.value ->> 'denominator')::numeric,
+          2 * (e.value ->> 'denominator')::numeric
+        ) * 0.000001
       )
       order by
         e.value ->> 'stock_item_id'
@@ -2191,8 +2279,11 @@ begin
   from
     jsonb_array_elements(v_exact -> 'requirements') as e
   where
-    (e.value ->> 'quantity')::numeric > 0
-    and pg_catalog.round((e.value ->> 'quantity')::numeric, 6) = 0;
+    (e.value ->> 'numerator')::numeric > 0
+    and pg_catalog.div(
+      2 * (e.value ->> 'numerator')::numeric * 1000000 + (e.value ->> 'denominator')::numeric,
+      2 * (e.value ->> 'denominator')::numeric
+    ) = 0;
 
   if jsonb_array_length(v_below) > 0 then
     return jsonb_build_object(
@@ -2211,7 +2302,7 @@ begin
 end;
 $$;
 
-comment on function app.expand_recipe (uuid, numeric, text, timestamptz) is 'Editor preview. Expands a recipe at p_at for an output quantity: p_output_unit is portion for a dish, a mass unit for cooking (scaled to kg), and the batch unit or a same-dimension metric unit for a batch. Sums every path per stock item, rounds once to 6 places, and blocks when a positive total rounds to 0. requirements is null when blocked. Owner only.';
+comment on function app.expand_recipe (uuid, numeric, text, timestamptz) is 'Editor preview. Expands a recipe at p_at for an output quantity: p_output_unit is portion for a dish, a mass unit for cooking (scaled to kg), and the batch unit or a same-dimension metric unit for a batch. Sums every path per stock item as an exact fraction, divides and rounds once to 6 places, and blocks when a positive total rounds to 0. requirements is null when blocked. Owner only.';
 
 -- ============================================================================
 -- I. Stock item identity freeze. A current recipe line now freezes base_unit,
@@ -2437,7 +2528,7 @@ from
   authenticated,
   service_role;
 
-revoke all on function app.recipe_unit_factor (text, text)
+revoke all on function app.recipe_unit_ratio (text, text)
 from
   public,
   anon,
@@ -2458,14 +2549,14 @@ from
   authenticated,
   service_role;
 
-revoke all on function app.recipe_walk (uuid, timestamptz, numeric, boolean)
+revoke all on function app.recipe_walk (uuid, timestamptz, numeric, boolean, numeric)
 from
   public,
   anon,
   authenticated,
   service_role;
 
-revoke all on function app.recipe_expand_exact (uuid, timestamptz, numeric)
+revoke all on function app.recipe_expand_exact (uuid, timestamptz, numeric, numeric)
 from
   public,
   anon,

@@ -1065,7 +1065,7 @@ isOneToOne: false
 { Args: { "p_cause_batch": string,"p_item_ids": (string)[] }; Returns: undefined
                            },
 "recipe_expand_exact":
-{ Args: { "p_at": string,"p_recipe_id": string,"p_scale": number }; Returns: Json
+{ Args: { "p_at": string,"p_recipe_id": string,"p_scale": number,"p_scale_den"?: number }; Returns: Json
                            },
 "recipe_lines_normalize":
 { Args: { "p_lines": Json }; Returns: Json
@@ -1082,14 +1082,16 @@ isOneToOne: false
 "recipe_schedule_token":
 { Args: { "p_recipe_id": string }; Returns: string
                            },
-"recipe_unit_factor":
-{ Args: { "p_from_unit": string,"p_to_unit": string }; Returns: number
+"recipe_unit_ratio":
+{ Args: { "p_from_unit": string,"p_to_unit": string }; Returns: {
+              "ratio_den": number,"ratio_num": number
+            }[]
                            },
 "recipe_validate_publication":
 { Args: { "p_from": string,"p_recipe_id": string,"p_to": string }; Returns: undefined
                            },
 "recipe_walk":
-{ Args: { "p_at": string,"p_recipe_id": string,"p_scale": number,"p_validate": boolean }; Returns: Json
+{ Args: { "p_at": string,"p_recipe_id": string,"p_scale": number,"p_scale_den"?: number,"p_validate": boolean }; Returns: Json
                            },
 "recompute_item_set":
 { Args: { "p_item_ids": (string)[] }; Returns: (string)[]
