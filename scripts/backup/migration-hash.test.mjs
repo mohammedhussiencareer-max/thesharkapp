@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { test } from 'node:test';
 import {
+  RAW_PREFIX,
   hashMigrationRows,
   hashStatements,
   normalizeSql,
@@ -162,22 +163,140 @@ test('comments act as whitespace between tokens and never split or hide', () => 
   ]);
 });
 
-test('unterminated constructs end at the end of the text without throwing', () => {
+const raw = (text) => [RAW_PREFIX + text];
+
+test('a continued E string keeps the first segment escape mode', () => {
+  const text = "SELECT E'prefix'\n'it\\'s  fine';";
+  assert.deepEqual(normalizeSql(text), ["SELECT E'prefix'\n'it\\'s  fine'"]);
+  differ([text], ["SELECT E'prefix'\n'it\\'s fine';"], 'a space inside');
+  differ([text], ["SELECT E'prefix'\n'it\\'s   fine';"], 'a space added');
+  differ([text], ["SELECT E'prefix'\n'it\\'s  fina';"], 'a letter');
+  differ(
+    [text],
+    ["SELECT E'prefix'\n'it\\'t  fine';"],
+    'a letter after the escape',
+  );
+  // The escaped quote does not end the segment, so the semicolon is content.
+  assert.deepEqual(normalizeSql("select e'a'\n'b\\'; c'; select 2"), [
+    "select e'a'\n'b\\'; c'",
+    'select 2',
+  ]);
+  differ(
+    ["select e'a'\n'b\\'; c'"],
+    ["select e'a'\n'b\\';  c'"],
+    'a semicolon inside a continued segment',
+  );
+  // Every later segment stays in E mode: \' does not end the third segment.
+  assert.deepEqual(normalizeSql("select E'a'\n'b'\n'c\\'; d'; select 2"), [
+    "select E'a'\n'b'\n'c\\'; d'",
+    'select 2',
+  ]);
+  differ(
+    ["select E'a'\n'b\\\\'\n'c  d'"],
+    ["select E'a'\n'b\\\\'\n'c d'"],
+    'three segments',
+  );
+});
+
+test('one chunk and split forms of a continued string match', () => {
+  const body = "select E'prefix'\n  'it\\'s  fine'\n  'more' as c";
+  const split = ["select E'prefix'\n'it\\'s  fine'\n'more' as c", 'select 2'];
+  same([`${body};\nselect 2;`], split, 'chunk');
+  same([`${body}`, 'select 2'], split, 'statement per element');
+  same([`${body};`, 'select 2;'], split, 'with semicolons');
+  same(
+    ["select E'prefix'\r\n\r\n\t'it\\'s  fine'\r\n'more' as c;select 2"],
+    split,
+    'CRLF and blank lines in the gap',
+  );
+  assert.deepEqual(normalizeStatements(normalizeSql(`${body};`)), [
+    "select E'prefix'\n'it\\'s  fine'\n'more' as c",
+  ]);
+});
+
+test('a continued plain string stays byte-exact and ends at a quote', () => {
+  assert.deepEqual(normalizeSql("select 'a  b'\n  'c  d';"), [
+    "select 'a  b'\n'c  d'",
+  ]);
+  differ(["select 'a  b'\n'c  d'"], ["select 'a  b'\n'c d'"], 'second segment');
+  differ(["select 'a  b'\n'c  d'"], ["select 'a b'\n'c  d'"], 'first segment');
+  differ(["select 'a'\n'b'"], ["select 'ab'"], 'continuation is not a merge');
+  // A plain segment has no backslash escape, so \' ends it.
+  assert.deepEqual(normalizeSql("select 'a'\n'it\\'; select 2"), [
+    "select 'a'\n'it\\'",
+    'select 2',
+  ]);
+  differ(
+    ["select 'a'\n'x\\'; select 'y  z'"],
+    ["select 'a'\n'x\\'; select 'y z'"],
+    'text after a plain backslash quote',
+  );
+  // A doubled quote at a segment edge is an escape, not a continuation.
+  assert.deepEqual(normalizeSql("select 'a'''\n'b'"), ["select 'a'''\n'b'"]);
+});
+
+test('the gap between continued segments is normalised, comments included', () => {
+  const expected = ["select 'a'\n'b'"];
+  for (const gap of [
+    '\n',
+    '\r\n',
+    '  \n\n  ',
+    ' \t\f\n',
+    ' -- note\n',
+    '\n-- note\n',
+    '\n\t-- note\r\n  ',
+    ' -- a\n-- b\n',
+    '\n\u000b',
+  ]) {
+    assert.deepEqual(normalizeSql(`select 'a'${gap}'b'`), expected, gap);
+  }
+  same(["select 'a'\n'b' from t"], ["select 'a' \n\n 'b'  from t"], 'tail');
+});
+
+test('constructs that cannot be lexed with confidence keep their raw text', () => {
   for (const text of [
     "select 'open; select 2",
     'select "open; select 2',
     'select $$open; select 2',
     'select /* open; select 2',
     "select E'open\\",
-    'select 1 --',
+    "select E'open'\n'also open",
+    "select 'a' 'b'",
+    "select 'a'  /* c */ 'b'",
+    "select 'a'\n/* c */ 'b'",
+    "select 'a' -- c\n-- d\n/* e */ 'b'",
+    "select 'a' E'b'",
+    "select 'a'\nE'b'",
+    "select 'a'\u000b\n'b'",
+    'select 1; set standard_conforming_strings = off; select 2',
+    "select 'a\u0000b'",
   ]) {
-    assert.ok(normalizeSql(text).length >= 1, text);
+    assert.deepEqual(normalizeSql(text), raw(text), JSON.stringify(text));
   }
-  assert.deepEqual(normalizeSql("select 'open; select 2"), [
-    "select 'open; select 2",
+  // Raw text is compared exactly: no chunk/split equivalence, no whitespace folding.
+  differ(["select 'a'  'b'"], ["select 'a' 'b'"], 'whitespace is kept');
+  differ(
+    ['select 1; set Standard_Conforming_Strings = off'],
+    ['select 1', 'set Standard_Conforming_Strings = off'],
+    'chunk vs split is not reconciled',
+  );
+  assert.notDeepEqual(
+    normalizeSql("select 'a' 'b'"),
+    normalizeSql("select 'ab'"),
+  );
+  // A comment or an open construct in one element does not touch the others.
+  assert.deepEqual(normalizeStatements(["select 'open", 'select  1']), [
+    ...raw("select 'open"),
+    'select 1',
   ]);
+});
+
+test('empty and comment-only text produce no statements', () => {
   assert.deepEqual(normalizeSql(''), []);
   assert.deepEqual(normalizeSql(' ;\n-- only a comment'), []);
+  assert.deepEqual(normalizeSql('select 1 --'), ['select 1']);
+  assert.deepEqual(normalizeSql("select 'a' --"), ["select 'a'"]);
+  assert.deepEqual(normalizeSql("select 'a'\n-- c"), ["select 'a'"]);
 });
 
 test('null elements and an empty history hash like empty statements', () => {
@@ -224,6 +343,10 @@ test('every repository migration hashes the same as one chunk and as split state
     const text = readFileSync(new URL(file, migrationsDir), 'utf8');
     const statements = normalizeSql(text);
     assert.ok(statements.length > 0, file);
+    assert.ok(
+      statements.every((s) => !s.startsWith(RAW_PREFIX)),
+      `${file}: lexed with confidence`,
+    );
     // What the CLI stores: one element per statement, outer semicolon removed.
     same([text], statements, `${file}: one chunk vs split`);
     same(
