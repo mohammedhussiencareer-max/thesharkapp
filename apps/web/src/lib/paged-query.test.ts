@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   postgrestMaxPages,
+  keysAfterFilter,
   postgrestPageSize,
   readAllByKey,
+  readAllByKeys,
   readAllPages,
 } from '@/lib/paged';
 
@@ -183,6 +185,121 @@ describe('readAllByKey', () => {
     ]);
     await expect(
       readAllByKey(keyless.load, pageError, { pageSize: 2 }),
+    ).rejects.toThrow(pageError);
+  });
+});
+
+describe('keysAfterFilter', () => {
+  it('filters one key with a plain greater-than', () => {
+    expect(keysAfterFilter(['code'], { code: 'kg' })).toBe('code.gt."kg"');
+  });
+
+  it('continues inside an equal first key for a composite key', () => {
+    expect(
+      keysAfterFilter(['item_id', 'unit_code'], {
+        item_id: 'i1',
+        unit_code: 'kg',
+      }),
+    ).toBe('item_id.gt."i1",and(item_id.eq."i1",unit_code.gt."kg")');
+  });
+
+  it('nests every earlier key for three keys', () => {
+    expect(keysAfterFilter(['a', 'b', 'c'], { a: '1', b: '2', c: '3' })).toBe(
+      'a.gt."1",and(a.eq."1",b.gt."2"),and(a.eq."1",b.eq."2",c.gt."3")',
+    );
+  });
+
+  it('quotes commas, parentheses, quotes and backslashes', () => {
+    expect(keysAfterFilter(['code'], { code: 'a,"b)\\' })).toBe(
+      'code.gt."a,\\"b)\\\\"',
+    );
+  });
+});
+
+describe('readAllByKeys', () => {
+  type Pair = { item_id: string; unit_code: string };
+  const keys = ['item_id', 'unit_code'] as const;
+
+  function pairPage(start: number, length: number): Pair[] {
+    return Array.from({ length }, (_, offset) => ({
+      item_id: `i${String(Math.floor((start + offset) / 2)).padStart(4, '0')}`,
+      unit_code: (start + offset) % 2 === 0 ? 'a' : 'b',
+    }));
+  }
+
+  function keyedPairs(pages: { data: unknown }[]) {
+    const asked: (Pair | null)[] = [];
+    const load = (after: Pair | null) => {
+      asked.push(after);
+      return Promise.resolve({
+        data: pages[asked.length - 1]?.data ?? [],
+        error: null,
+      });
+    };
+    return { load, asked };
+  }
+
+  it('starts each page after the whole key of the last row', async () => {
+    const { load, asked } = keyedPairs([
+      { data: pairPage(0, 4) },
+      { data: pairPage(4, 1) },
+    ]);
+
+    const rows = await readAllByKeys<Pair, 'item_id' | 'unit_code'>(
+      keys,
+      load,
+      pageError,
+      { pageSize: 4 },
+    );
+
+    expect(rows).toHaveLength(5);
+    expect(asked).toEqual([null, { item_id: 'i0001', unit_code: 'b' }]);
+  });
+
+  it('fails closed when a page ends on a row without a text key', async () => {
+    const { load } = keyedPairs([
+      { data: [{ item_id: 'i1', unit_code: 'a' }, { item_id: 'i1' }] },
+    ]);
+
+    await expect(
+      readAllByKeys<Pair, 'item_id' | 'unit_code'>(keys, load, pageError, {
+        pageSize: 2,
+      }),
+    ).rejects.toThrow(pageError);
+  });
+
+  it('fails closed when the server ignores the key and repeats a page', async () => {
+    const { load } = keyedPairs([
+      { data: pairPage(0, 2) },
+      { data: pairPage(0, 2) },
+    ]);
+
+    await expect(
+      readAllByKeys<Pair, 'item_id' | 'unit_code'>(keys, load, pageError, {
+        pageSize: 2,
+      }),
+    ).rejects.toThrow(pageError);
+  });
+
+  it('fails closed at the page cap and when a page fails', async () => {
+    const full = keyedPairs([
+      { data: pairPage(0, 2) },
+      { data: pairPage(2, 2) },
+    ]);
+    await expect(
+      readAllByKeys<Pair, 'item_id' | 'unit_code'>(keys, full.load, pageError, {
+        pageSize: 2,
+        maxPages: 2,
+      }),
+    ).rejects.toThrow(pageError);
+    expect(full.asked).toHaveLength(2);
+
+    await expect(
+      readAllByKeys<Pair, 'item_id' | 'unit_code'>(
+        keys,
+        () => Promise.reject(new Error('boom')),
+        pageError,
+      ),
     ).rejects.toThrow(pageError);
   });
 });

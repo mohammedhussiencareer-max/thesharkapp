@@ -177,6 +177,87 @@ const currentVersion: Row = {
   superseded_change_id: null,
 };
 
+/**
+ * A table read by key: each request is filtered to the rows after the key it
+ * was given (`gt` for one column, `or` for a composite key), sorted by `keys`
+ * and cut to the limit, from the data as it is at that moment.
+ */
+function keyedTable(
+  data: Row[],
+  keys: string[],
+  beforeRequest?: (request: number) => void,
+) {
+  const seen: {
+    requests: number;
+    afters: Record<string, string>[];
+    or: string[];
+  } = { requests: 0, afters: [], or: [] };
+  function isAfter(row: Row, cursor: Record<string, string>): boolean {
+    for (const key of keys) {
+      const value = String(row[key]);
+      if (value !== cursor[key]) return value > (cursor[key] ?? '');
+    }
+    return false;
+  }
+  function byKeys(left: Row, right: Row): number {
+    for (const key of keys) {
+      const a = String(left[key]);
+      const b = String(right[key]);
+      if (a !== b) return a < b ? -1 : 1;
+    }
+    return 0;
+  }
+  function fresh() {
+    let cursor: Record<string, string> | null = null;
+    let limit = Infinity;
+    const chain: Record<string, unknown> = {};
+    chain.select = () => chain;
+    chain.order = () => chain;
+    chain.gt = (column: string, value: string) => {
+      cursor = { [column]: value };
+      seen.afters.push(cursor);
+      return chain;
+    };
+    chain.or = (filter: string) => {
+      seen.or.push(filter);
+      const quoted = [...filter.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((match) =>
+        (match[1] ?? '').replace(/\\(.)/g, '$1'),
+      );
+      cursor = Object.fromEntries(
+        keys.map((key, index) => [
+          key,
+          quoted.slice(-keys.length)[index] ?? '',
+        ]),
+      );
+      seen.afters.push(cursor);
+      return chain;
+    };
+    chain.limit = (count: number) => {
+      limit = count;
+      return chain;
+    };
+    chain.then = (
+      resolve: (value: unknown) => unknown,
+      reject?: (reason: unknown) => unknown,
+    ) => {
+      seen.requests += 1;
+      beforeRequest?.(seen.requests);
+      const rows = data
+        .filter((row) => cursor === null || isAfter(row, cursor))
+        .sort(byKeys)
+        .slice(0, limit);
+      return Promise.resolve({ data: rows, error: null }).then(resolve, reject);
+    };
+    return chain;
+  }
+  return {
+    get chain() {
+      return fresh();
+    },
+    seen,
+  };
+}
+
 const write: RecipeWrite = {
   requestId: 'req-1',
   effectiveFrom: null,
@@ -917,7 +998,38 @@ describe('recipe api', () => {
     ]);
   });
 
-  it('lists units with their dimension and metric scale', async () => {
+  it('does not skip an item unit when an earlier item leaves the view between pages', async () => {
+    const awkward = 'a,"b)\\';
+    const data: Row[] = [
+      ...Array.from({ length: 999 }, (_, index) => ({
+        item_id: `i${String(index).padStart(4, '0')}`,
+        unit_code: 'kg',
+        label_ar: 'كيلو',
+      })),
+      { item_id: 'i0999', unit_code: awkward, label_ar: 'غريبة' },
+      { item_id: 'i0999', unit_code: 'kg', label_ar: 'كيلو' },
+      { item_id: 'i1000', unit_code: 'kg', label_ar: 'كيلو' },
+    ];
+    const view = keyedTable(data, ['item_id', 'unit_code'], (request) => {
+      if (request === 2) data.splice(0, 1);
+    });
+    mocks.schema.mockReturnValue({ from: () => view.chain });
+    const list = await listItemUnits();
+    expect(view.seen.requests).toBe(2);
+    expect(list).toHaveLength(1002);
+    expect(list.slice(-2)).toEqual([
+      { itemId: 'i0999', unit: 'kg', label: 'كيلو' },
+      { itemId: 'i1000', unit: 'kg', label: 'كيلو' },
+    ]);
+    expect(view.seen.afters).toEqual([
+      { item_id: 'i0999', unit_code: awkward },
+    ]);
+    expect(view.seen.or).toEqual([
+      'item_id.gt."i0999",and(item_id.eq."i0999",unit_code.gt."a,\\"b)\\\\")',
+    ]);
+  });
+
+  it('lists units with their dimension and metric scale, sorted by label', async () => {
     const units = query({
       data: [
         { code: 'kg', label_ar: 'كيلو', dimension: 'mass', metric_scale: 1000 },
@@ -932,9 +1044,26 @@ describe('recipe api', () => {
     });
     mocks.schema.mockReturnValue({ from: () => units.chain });
     await expect(listUnitsMeta()).resolves.toEqual([
-      { code: 'kg', labelAr: 'كيلو', dimension: 'mass', metricScale: 1000 },
       { code: 'piece', labelAr: 'قطعة', dimension: 'count', metricScale: null },
+      { code: 'kg', labelAr: 'كيلو', dimension: 'mass', metricScale: 1000 },
     ]);
+  });
+
+  it('reads every unit past the first thousand by code, then sorts by label', async () => {
+    const data: Row[] = Array.from({ length: 1001 }, (_, index) => ({
+      code: `u${String(index).padStart(4, '0')}`,
+      label_ar: `وحدة ${String(1000 - index).padStart(4, '0')}`,
+      dimension: 'custom',
+      metric_scale: null,
+    }));
+    const units = keyedTable(data, ['code']);
+    mocks.schema.mockReturnValue({ from: () => units.chain });
+    const list = await listUnitsMeta();
+    expect(list).toHaveLength(1001);
+    expect(list[0]?.code).toBe('u1000');
+    expect(list[1000]?.code).toBe('u0000');
+    expect(units.seen.requests).toBe(2);
+    expect(units.seen.afters).toEqual([{ code: 'u0999' }]);
   });
 
   it('lists batch recipes with their dated batch units', async () => {

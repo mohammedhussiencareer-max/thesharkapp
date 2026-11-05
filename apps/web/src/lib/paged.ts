@@ -108,18 +108,75 @@ function pageRows(result: unknown, errorMessage: string): unknown[] {
  * A short page ends the read. A failed page or a full `maxPages` run throws
  * `errorMessage` and does not return a partial list.
  */
-export async function readAllByKey<Row extends { id: string }>(
+export function readAllByKey<Row extends { id: string }>(
   load: (afterId: string | null, pageSize: number) => unknown,
+  errorMessage: string,
+  options?: PageOptions,
+): Promise<Row[]> {
+  return readAllByKeys<Row, 'id'>(
+    ['id'],
+    (after, pageSize) => load(after?.id ?? null, pageSize),
+    errorMessage,
+    options,
+  );
+}
+
+/** PostgREST `or` filter for the rows that sort after `after` by `keys`, all ascending. */
+export function keysAfterFilter<K extends string>(
+  keys: readonly K[],
+  after: Readonly<Record<K, string>>,
+): string {
+  const quoted = (key: K) =>
+    `"${after[key].replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return keys
+    .map((key, index) => {
+      const later = `${key}.gt.${quoted(key)}`;
+      if (index === 0) return later;
+      const same = keys
+        .slice(0, index)
+        .map((earlier) => `${earlier}.eq.${quoted(earlier)}`);
+      return `and(${[...same, later].join(',')})`;
+    })
+    .join(',');
+}
+
+function cursorOf<K extends string>(
+  row: unknown,
+  keys: readonly K[],
+): Record<K, string> | null {
+  if (typeof row !== 'object' || row === null) return null;
+  const cursor: Partial<Record<K, string>> = {};
+  for (const key of keys) {
+    const value: unknown = (row as Record<string, unknown>)[key];
+    if (typeof value !== 'string') return null;
+    cursor[key] = value;
+  }
+  return cursor as Record<K, string>;
+}
+
+/**
+ * Like `readAllByKey`, for rows ordered by several text columns that together
+ * are unique and never change. `load(after, pageSize)` orders by `keys`, limits
+ * to `pageSize`, and narrows past `after` (null on the first page) with
+ * `keysAfterFilter` or `.gt`. A row with a missing or non-text key, or a page
+ * that does not move past the last one, throws `errorMessage`.
+ */
+export async function readAllByKeys<
+  Row extends object,
+  K extends keyof Row & string,
+>(
+  keys: readonly [K, ...K[]],
+  load: (after: Record<K, string> | null, pageSize: number) => unknown,
   errorMessage: string,
   options?: PageOptions,
 ): Promise<Row[]> {
   const { pageSize, maxPages } = paging(errorMessage, options);
   const rows: Row[] = [];
-  let afterId: string | null = null;
+  let after: Record<K, string> | null = null;
   for (let page = 0; page < maxPages; page += 1) {
     let result: unknown;
     try {
-      result = await Promise.resolve(load(afterId, pageSize));
+      result = await Promise.resolve(load(after, pageSize));
     } catch {
       throw new Error(errorMessage);
     }
@@ -127,11 +184,15 @@ export async function readAllByKey<Row extends { id: string }>(
     if (data.length > pageSize) throw new Error(errorMessage);
     rows.push(...data);
     if (data.length < pageSize) return rows;
-    const lastId: unknown = data[data.length - 1]?.id;
-    if (typeof lastId !== 'string' || lastId === afterId) {
+    const next = cursorOf(data[data.length - 1], keys);
+    const previous = after;
+    if (
+      next === null ||
+      (previous !== null && keys.every((key) => next[key] === previous[key]))
+    ) {
       throw new Error(errorMessage);
     }
-    afterId = lastId;
+    after = next;
   }
   throw new Error(errorMessage);
 }

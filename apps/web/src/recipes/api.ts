@@ -5,7 +5,12 @@ import {
 } from '@/items/errors';
 import { beginAction, settleAction } from '@/items/request-id';
 import { isStockKind } from '@/items/types';
-import { readAllByKey, readAllPages } from '@/lib/paged';
+import {
+  keysAfterFilter,
+  readAllByKey,
+  readAllByKeys,
+  readAllPages,
+} from '@/lib/paged';
 import { supabase } from '@/lib/supabase';
 import { isDefiniteRefusal } from '@/lib/write-outcome';
 import { isDuplicateRecipeName, mapRecipeError } from '@/recipes/errors';
@@ -434,16 +439,25 @@ export async function listStockOptions(): Promise<StockOption[]> {
 }
 
 export async function listItemUnits(): Promise<ItemUnit[]> {
-  const list = await readAllPages<{
-    item_id: string | null;
-    unit_code: string | null;
-    label_ar: string | null;
-  }>(
-    appDb()
-      .from('item_units_current')
-      .select('item_id, unit_code, label_ar')
-      .order('item_id')
-      .order('unit_code'),
+  const keys = ['item_id', 'unit_code'] as const;
+  const list = await readAllByKeys<
+    {
+      item_id: string | null;
+      unit_code: string | null;
+      label_ar: string | null;
+    },
+    'item_id' | 'unit_code'
+  >(
+    keys,
+    (after, size) => {
+      const query = appDb()
+        .from('item_units_current')
+        .select('item_id, unit_code, label_ar');
+      return (after === null ? query : query.or(keysAfterFilter(keys, after)))
+        .order('item_id')
+        .order('unit_code')
+        .limit(size);
+    },
     genericCatalogError,
   );
   return list.flatMap((row) =>
@@ -460,17 +474,34 @@ export async function listItemUnits(): Promise<ItemUnit[]> {
 }
 
 export async function listUnitsMeta(): Promise<UnitMeta[]> {
-  const { data, error } = await appDb()
-    .from('units')
-    .select('code, label_ar, dimension, metric_scale')
-    .order('label_ar');
-  throwIfError(error);
-  return (data ?? []).map((row) => ({
-    code: row.code,
-    labelAr: row.label_ar,
-    dimension: row.dimension,
-    metricScale: row.metric_scale,
-  }));
+  const rows = await readAllByKeys<
+    {
+      code: string;
+      label_ar: string;
+      dimension: string;
+      metric_scale: number | null;
+    },
+    'code'
+  >(
+    ['code'],
+    (after, size) => {
+      const query = appDb()
+        .from('units')
+        .select('code, label_ar, dimension, metric_scale');
+      return (after === null ? query : query.gt('code', after.code))
+        .order('code')
+        .limit(size);
+    },
+    genericCatalogError,
+  );
+  return rows
+    .map((row) => ({
+      code: row.code,
+      labelAr: row.label_ar,
+      dimension: row.dimension,
+      metricScale: row.metric_scale,
+    }))
+    .sort((left, right) => left.labelAr.localeCompare(right.labelAr, 'ar'));
 }
 
 export async function listBatchOptions(): Promise<BatchOption[]> {
