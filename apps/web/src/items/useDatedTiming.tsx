@@ -32,12 +32,13 @@ export function useDatedTiming(
   versions: readonly SchedulePoint[],
   token: string,
   disabled: boolean,
+  defaultMode?: EffectiveMode,
 ) {
   const [mountNow] = useState(() => Date.now());
   const [evaluatedNow, setEvaluatedNow] = useState<number | null>(null);
   const clockMs = evaluatedNow ?? mountNow;
   const [chosenMode, setChosenMode] = useState<EffectiveMode | null>(null);
-  const mode = chosenMode ?? defaultEffectiveMode(shiftStart);
+  const mode = chosenMode ?? defaultMode ?? defaultEffectiveMode(shiftStart);
   const [customLocal, setCustomLocal] = useState('');
   const [reason, setReason] = useState('');
   const [impactAttempt, setImpactAttempt] = useState(0);

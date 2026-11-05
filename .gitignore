@@ -11,6 +11,9 @@ coverage/
 !/apps/web/.env.production
 *.pem
 *.key
+*.xlsx
+*.xls
+*.xlsm
 *service-account*.json
 .secrets/
 supabase/.branches/

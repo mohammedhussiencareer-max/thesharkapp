@@ -9,6 +9,9 @@ export function recipeUpdateSubject(recipeId: string): string {
   return `recipe-update:${recipeId}`;
 }
 
+/** One workbook import at a time, whatever the file. */
+export const recipeImportSubject = 'recipe-import';
+
 /** One version save per recipe, whatever its interval. */
 export function recipeVersionSubject(recipeId: string): string {
   return `recipe-version:${recipeId}`;
