@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import { cairoDateIso, formatCairo } from '@/lib/cairo';
@@ -50,44 +50,58 @@ export function MappingPage() {
   const [loading, setLoading] = useState(true);
   const [onlyIncomplete, setOnlyIncomplete] = useState(false);
   const [loadId, setLoadId] = useState(0);
-  // Home loads and save reloads both write the subject list and coverage.
-  // One generation makes a late reload drop its result after a newer period.
+  // Refs, not the render that started a save. A late onReload still reads the
+  // period that is on screen when the response arrives.
+  const fromDateRef = useRef(fromDate);
+  const toDateRef = useRef(toDate);
+  // One generation for every write of bases, catalog, coverage, and load state.
   const listSeq = useRef(0);
   const detailSeq = useRef(0);
   const selectedKeyRef = useRef<string | null>(null);
   const rangeError = dateRangeError(fromDate, toDate);
 
-  useEffect(() => {
-    const seq = ++listSeq.current;
-    let cancelled = false;
-    void (async () => {
-      try {
-        const fromIso = cairoDateStartIso(fromDate);
-        const toIso = cairoNextDateStartIso(toDate);
-        if (!fromIso || !toIso || dateRangeError(fromDate, toDate)) {
-          throw new Error('فترة التغطية مش مظبوطة');
-        }
-        const [nextBases, nextCatalog, nextCoverage] = await Promise.all([
-          loadBases(),
-          loadCatalog(),
-          loadCoverage(fromIso, toIso),
-        ]);
-        if (cancelled || seq !== listSeq.current) return;
-        setBases(nextBases);
-        setCatalog(nextCatalog);
-        setCoverage(nextCoverage);
-        setLoadError(null);
-      } catch (error) {
-        if (cancelled || seq !== listSeq.current) return;
-        setLoadError(messageFrom(error));
-      } finally {
-        if (!cancelled && seq === listSeq.current) setLoading(false);
+  const loadHome = useCallback(async (gen: number) => {
+    const from = fromDateRef.current;
+    const to = toDateRef.current;
+    try {
+      const fromIso = cairoDateStartIso(from);
+      const toIso = cairoNextDateStartIso(to);
+      const range = dateRangeError(from, to);
+      if (!fromIso || !toIso || range) {
+        throw new Error(range ?? 'فترة التغطية مش مظبوطة');
       }
-    })();
+      const [nextBases, nextCatalog, nextCoverage] = await Promise.all([
+        loadBases(),
+        loadCatalog(),
+        loadCoverage(fromIso, toIso),
+      ]);
+      if (gen !== listSeq.current) return null;
+      setBases(nextBases);
+      setCatalog(nextCatalog);
+      setCoverage(nextCoverage);
+      setLoadError(null);
+      return nextBases;
+    } catch (error) {
+      if (gen !== listSeq.current) return null;
+      setLoadError(messageFrom(error));
+      throw error;
+    } finally {
+      if (gen === listSeq.current) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fromDateRef.current = fromDate;
+    toDateRef.current = toDate;
+  }, [fromDate, toDate]);
+
+  useEffect(() => {
+    const gen = ++listSeq.current;
+    void loadHome(gen).catch(() => undefined);
     return () => {
-      cancelled = true;
+      if (listSeq.current === gen) listSeq.current += 1;
     };
-  }, [fromDate, loadId, toDate]);
+  }, [fromDate, loadHome, loadId, toDate]);
 
   const selected = bases?.find((base) => baseKey(base) === selectedKey) ?? null;
 
@@ -128,26 +142,16 @@ export function MappingPage() {
 
   async function reload() {
     const keyAtStart = selectedKeyRef.current;
-    const fromIso = cairoDateStartIso(fromDate);
-    const toIso = cairoNextDateStartIso(toDate);
-    if (!fromIso || !toIso || rangeError) {
-      throw new Error(rangeError ?? 'فترة التغطية مش مظبوطة');
-    }
-    const seq = ++listSeq.current;
-    const [nextBases, nextCoverage] = await Promise.all([
-      loadBases(),
-      loadCoverage(fromIso, toIso),
-    ]);
-    if (seq !== listSeq.current) return;
-    setBases(nextBases);
-    setCoverage(nextCoverage);
+    const gen = ++listSeq.current;
+    const nextBases = await loadHome(gen);
+    if (!nextBases || gen !== listSeq.current) return;
     if (keyAtStart === null || selectedKeyRef.current !== keyAtStart) return;
     const current = nextBases.find((base) => baseKey(base) === keyAtStart);
     if (!current) return;
     const detailRequest = ++detailSeq.current;
     const next = await loadSubjectDetail(current);
     if (
-      seq !== listSeq.current ||
+      gen !== listSeq.current ||
       detailRequest !== detailSeq.current ||
       selectedKeyRef.current !== keyAtStart
     ) {

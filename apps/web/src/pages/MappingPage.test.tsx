@@ -459,6 +459,127 @@ describe('MappingPage', () => {
     expect(screen.getByLabelText('إلى تاريخ')).toHaveValue(nextDay);
   });
 
+  it('reloads the period that is current when a delayed save finishes', async () => {
+    const periodA = coverage({
+      eligibleLines: 2,
+      coveredLines: 1,
+      readyLines: 1,
+      coverage: 0.5,
+    });
+    const periodB = coverage({
+      eligibleLines: 8,
+      coveredLines: 7,
+      readyLines: 7,
+      coverage: 0.875,
+    });
+    let periodATo: string | null = null;
+    vi.mocked(loadCoverage).mockImplementation((_from, to) => {
+      if (periodATo === null) periodATo = to;
+      return Promise.resolve(to === periodATo ? periodA : periodB);
+    });
+    let releaseSave: () => void = () => {};
+    const saveGate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    vi.mocked(setBaseMapping).mockImplementation(() => saveGate);
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: /صنف ناقص/ }));
+    expect(
+      await screen.findByRole('form', { name: 'ربط الصنف' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('المغطى 1 من 2')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('الصنف'), {
+      target: { value: 'item-1' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'احفظ الربط' }));
+    await waitFor(() => {
+      expect(vi.mocked(setBaseMapping)).toHaveBeenCalledTimes(1);
+    });
+    const toInput = screen.getByLabelText('إلى تاريخ');
+    const nextDay = nextIsoDate((toInput as HTMLInputElement).value);
+    fireEvent.change(toInput, { target: { value: nextDay } });
+    expect(await screen.findByText('المغطى 7 من 8')).toBeInTheDocument();
+    expect(toInput).toHaveValue(nextDay);
+    await act(async () => {
+      releaseSave();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText('الربط اتحفظ')).toBeInTheDocument();
+    expect(screen.getByText('المغطى 7 من 8')).toBeInTheDocument();
+    expect(screen.queryByText('المغطى 1 من 2')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('إلى تاريخ')).toHaveValue(nextDay);
+  });
+
+  it('shows the catalog from a save reload that preempts a home refresh', async () => {
+    const releaseHome: Array<() => void> = [];
+    const homeGate = new Promise<void>((resolve) => {
+      releaseHome.push(resolve);
+    });
+    let catalogCalls = 0;
+    const staleCatalog: MappingCatalog = {
+      ...catalog,
+      items: [
+        ...catalog.items,
+        { id: 'item-stale', name: 'صنف التحديث القديم', baseUnit: 'kg' },
+      ],
+      shiftStart: null,
+    };
+    const winningCatalog: MappingCatalog = {
+      ...catalog,
+      items: [
+        ...catalog.items,
+        { id: 'item-win', name: 'صنف الحفظ الجديد', baseUnit: 'kg' },
+      ],
+      shiftStart: '2099-01-01T00:00:00.000Z',
+    };
+    vi.mocked(loadCatalog).mockImplementation(() => {
+      catalogCalls += 1;
+      if (catalogCalls === 1) return Promise.resolve(catalog);
+      if (catalogCalls === 2) return homeGate.then(() => staleCatalog);
+      return Promise.resolve(winningCatalog);
+    });
+    vi.mocked(setBaseMapping).mockResolvedValue(undefined);
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: /صنف ناقص/ }));
+    const form = await screen.findByRole('form', { name: 'ربط الصنف' });
+    expect(within(form).getByLabelText('وقت السريان')).not.toHaveTextContent(
+      'بداية الوردية',
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'تحديث' }));
+    await waitFor(() => {
+      expect(catalogCalls).toBe(2);
+    });
+    fireEvent.change(within(form).getByLabelText('الصنف'), {
+      target: { value: 'item-1' },
+    });
+    fireEvent.click(within(form).getByRole('button', { name: 'احفظ الربط' }));
+    expect(await screen.findByText('الربط اتحفظ')).toBeInTheDocument();
+    const savedForm = screen.getByRole('form', { name: 'ربط الصنف' });
+    expect(within(savedForm).getByLabelText('الصنف')).toHaveTextContent(
+      'صنف الحفظ الجديد',
+    );
+    expect(within(savedForm).getByLabelText('وقت السريان')).toHaveTextContent(
+      'بداية الوردية',
+    );
+    expect(within(savedForm).getByLabelText('الصنف')).not.toHaveTextContent(
+      'صنف التحديث القديم',
+    );
+    await act(async () => {
+      releaseHome.splice(0).forEach((release) => release());
+      await Promise.resolve();
+    });
+    const settled = screen.getByRole('form', { name: 'ربط الصنف' });
+    expect(within(settled).getByLabelText('الصنف')).toHaveTextContent(
+      'صنف الحفظ الجديد',
+    );
+    expect(within(settled).getByLabelText('الصنف')).not.toHaveTextContent(
+      'صنف التحديث القديم',
+    );
+    expect(within(settled).getByLabelText('وقت السريان')).toHaveTextContent(
+      'بداية الوردية',
+    );
+  });
+
   it('keeps the open subject when its row is clicked again', async () => {
     renderPage();
     const row = await screen.findByRole('button', { name: /صنف ناقص/ });
