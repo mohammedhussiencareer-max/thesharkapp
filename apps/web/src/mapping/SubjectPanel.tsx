@@ -372,12 +372,20 @@ export function SubjectPanel({
     setSaving(true);
     setError(null);
     setNotice(null);
+    const requestId = action.write.requestId;
     try {
-      if (action.kind === 'mapping') await setBaseMapping(action.write);
-      else if (action.kind === 'policy') await setOptionPolicy(action.write);
-      else await setException(action.write);
-      settleAction(subject);
-      setResetEpoch((value) => value + 1);
+      try {
+        if (action.kind === 'mapping') await setBaseMapping(action.write);
+        else if (action.kind === 'policy') await setOptionPolicy(action.write);
+        else await setException(action.write);
+        settleAction(subject, requestId);
+        setResetEpoch((value) => value + 1);
+      } catch (failure) {
+        settleAction(subject, requestId, failure);
+        setError(messageFrom(failure));
+        if (!hasAction(subject)) await onReload();
+        return;
+      }
       await onReload();
       setNotice(
         action.kind === 'mapping'
@@ -387,9 +395,7 @@ export function SubjectPanel({
             : savedExceptionMessage,
       );
     } catch (failure) {
-      settleAction(subject, failure);
       setError(messageFrom(failure));
-      if (!hasAction(subject)) await onReload();
     } finally {
       flight.current = false;
       setSaving(false);
@@ -1072,15 +1078,20 @@ function OptionMappingForm({
     setError(null);
     setNotice(null);
     try {
-      await setOptionMapping(write);
-      settleAction(subject);
-      setDirty(false);
+      try {
+        await setOptionMapping(write);
+        settleAction(subject, write.requestId);
+        setDirty(false);
+      } catch (failure) {
+        settleAction(subject, write.requestId, failure);
+        setError(messageFrom(failure));
+        if (!hasAction(subject)) await onReload();
+        return;
+      }
       await onReload();
       setNotice(savedOptionMessage);
     } catch (failure) {
-      settleAction(subject, failure);
       setError(messageFrom(failure));
-      if (!hasAction(subject)) await onReload();
     } finally {
       flight.current = false;
       setSaving(false);

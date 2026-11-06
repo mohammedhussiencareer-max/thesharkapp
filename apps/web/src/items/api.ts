@@ -215,9 +215,9 @@ export async function createItem(draft: ItemDraft): Promise<void> {
     if (typeof data !== 'string' || data.length === 0) {
       throw new Error(genericCatalogError);
     }
-    settleAction(subject);
+    settleAction(subject, requestId);
   } catch (error) {
-    settleAction(subject, error);
+    settleAction(subject, requestId, error);
     throw error;
   }
 }
@@ -493,10 +493,10 @@ export async function addCustomUnit(
     if (typeof data !== 'string' || data.length === 0) {
       throw new Error(genericCatalogError);
     }
-    if (!requestId) settleAction(subject);
+    if (!requestId) settleAction(subject, id);
     return data;
   } catch (error) {
-    if (!requestId) settleAction(subject, error);
+    if (!requestId) settleAction(subject, id, error);
     throw error;
   }
 }

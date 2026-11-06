@@ -356,14 +356,16 @@ export function ItemForm({
       // A refused send never reached the database. A retry whose page is
       // busy still has an unknown outcome and must keep its payload.
       if (accepted !== true) {
-        if (unknownAction<LossAction>(subject) === null) settleAction(subject);
+        if (unknownAction<LossAction>(subject) === null) {
+          settleAction(subject, action.write.requestId);
+        }
         return;
       }
-      settleAction(subject);
+      settleAction(subject, action.write.requestId);
       setDatedLoss(false);
       await reloadLossSchedule();
     } catch (error) {
-      settleAction(subject, error);
+      settleAction(subject, action.write.requestId, error);
       if (isConfirmedConfigurationChange(error)) await reloadLossSchedule();
     } finally {
       lossFlight.current = false;
@@ -386,12 +388,14 @@ export function ItemForm({
         requestId: action.requestId,
       });
       if (accepted !== true) {
-        if (unknownAction<PriceAction>(subject) === null) settleAction(subject);
+        if (unknownAction<PriceAction>(subject) === null) {
+          settleAction(subject, action.requestId);
+        }
         return;
       }
-      settleAction(subject);
+      settleAction(subject, action.requestId);
     } catch (error) {
-      settleAction(subject, error);
+      settleAction(subject, action.requestId, error);
       // The held price keeps the identity it was submitted with. A confirmed
       // conflict retires that hold; the next fresh action reads this reload.
       if (isConfirmedConfigurationChange(error)) await reloadLossSchedule();
