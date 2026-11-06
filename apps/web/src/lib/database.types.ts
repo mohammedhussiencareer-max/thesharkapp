@@ -1309,6 +1309,8 @@ isOneToOne: false
                            },
 "recipe_expand_exact":
 { Args: { "p_at": string,"p_recipe_id": string,"p_scale": number,"p_scale_den"?: number }; Returns: Json
+                           } |
+{ Args: { "p_apply_loss": boolean,"p_at": string,"p_recipe_id": string,"p_scale": number,"p_scale_den": number }; Returns: Json
                            },
 "recipe_lines_normalize":
 { Args: { "p_lines": Json }; Returns: Json
@@ -1338,6 +1340,8 @@ isOneToOne: false
                            },
 "recipe_walk":
 { Args: { "p_at": string,"p_recipe_id": string,"p_scale": number,"p_scale_den"?: number,"p_validate": boolean }; Returns: Json
+                           } |
+{ Args: { "p_apply_loss": boolean,"p_at": string,"p_recipe_id": string,"p_scale": number,"p_scale_den": number,"p_validate": boolean }; Returns: Json
                            },
 "recompute_item_set":
 { Args: { "p_item_ids": (string)[] }; Returns: (string)[]

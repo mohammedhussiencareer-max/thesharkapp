@@ -12,7 +12,10 @@
 --   complete, not-missing lines of shifts that opened in the window, at or
 --   after that instant. No opening means nothing is eligible.
 -- * A weight line (weighted_qty present) scales the base target by the weight
---   in kg and never applies loss. A fixed line scales by quantity. A fixed
+--   in kg and never applies loss. A weight-line base recipe target omits leaf
+--   loss the same way: the weighed quantity is already raw, and a missing loss
+--   does not block it. A fixed line scales by quantity and still applies leaf
+--   loss. A cooking option on a weight line still applies recipe loss. A fixed
 --   direct target of kind seafood or fish_size applies net to raw with the
 --   item loss at the order instant.
 -- * A cooking recipe is only a target for an option on a weight line. A base
@@ -2546,6 +2549,583 @@ begin
 end;
 $$;
 
+-- Exact expansion with a loss switch. The bodies below are the applied
+-- walk and expansion, with leaf loss gated by p_apply_loss. The previous
+-- signatures delegate with p_apply_loss true, so every existing caller,
+-- including the editor preview, stays on the loss-on path.
+create function app.recipe_walk (
+  p_recipe_id uuid,
+  p_at timestamptz,
+  p_scale numeric,
+  p_validate boolean,
+  p_scale_den numeric,
+  p_apply_loss boolean
+) returns jsonb language plpgsql stable security definer
+set
+  search_path = '' as $$
+declare
+  c_max_depth constant integer := 8;
+  v_root_kind text;
+  v_root_version uuid;
+  v_versions uuid[] := '{}'::uuid[];
+  v_versions_json jsonb;
+  v_issues jsonb := '[]'::jsonb;
+  v_leaves jsonb := '[]'::jsonb;
+  s_recipe uuid[] := '{}'::uuid[];
+  s_version uuid[] := '{}'::uuid[];
+  s_num numeric[] := '{}'::numeric[];
+  s_den numeric[] := '{}'::numeric[];
+  s_path jsonb[] := '{}'::jsonb[];
+  s_depth integer[] := '{}'::integer[];
+  v_n integer;
+  v_recipe uuid;
+  v_version uuid;
+  v_num numeric;
+  v_den numeric;
+  v_path jsonb;
+  v_depth integer;
+  v_line record;
+  v_item_kind text;
+  v_item_base text;
+  v_child_version uuid;
+  v_child_qty numeric;
+  v_child_unit text;
+  v_ratio_num numeric;
+  v_ratio_den numeric;
+  v_loss numeric;
+  v_factor numeric;
+  v_bad boolean;
+begin
+  select
+    r.kind
+  into v_root_kind
+  from
+    app.recipes r
+  where
+    r.id = p_recipe_id;
+
+  if not found then
+    raise exception 'unknown recipe id: %', p_recipe_id
+      using errcode = '22023';
+  end if;
+
+  select
+    v.id
+  into v_root_version
+  from
+    app.recipe_versions v
+  where
+    v.recipe_id = p_recipe_id
+    and v.superseded_change_id is null
+    and v.valid_during @> p_at;
+
+  if not found then
+    return pg_catalog.jsonb_build_object(
+      'leaves',
+      '[]'::jsonb,
+      'issues',
+      pg_catalog.jsonb_build_array(
+        pg_catalog.jsonb_build_object(
+          'code',
+          'no_version_in_force',
+          'recipe_id',
+          p_recipe_id,
+          'path',
+          pg_catalog.jsonb_build_array(p_recipe_id)
+        )
+      ),
+      'versions',
+      '[]'::jsonb
+    );
+  end if;
+
+  s_recipe := pg_catalog.array_append(s_recipe, p_recipe_id);
+  s_version := pg_catalog.array_append(s_version, v_root_version);
+  s_num := pg_catalog.array_append(s_num, p_scale);
+  s_den := pg_catalog.array_append(s_den, p_scale_den);
+  s_path := pg_catalog.array_append(s_path, pg_catalog.jsonb_build_array(p_recipe_id));
+  s_depth := pg_catalog.array_append(s_depth, 0);
+
+  while pg_catalog.cardinality(s_recipe) > 0 loop
+    v_n := pg_catalog.cardinality(s_recipe);
+    v_recipe := s_recipe[v_n];
+    v_version := s_version[v_n];
+    v_num := s_num[v_n];
+    v_den := s_den[v_n];
+    v_path := s_path[v_n];
+    v_depth := s_depth[v_n];
+    s_recipe := s_recipe[1:v_n - 1];
+    s_version := s_version[1:v_n - 1];
+    s_num := s_num[1:v_n - 1];
+    s_den := s_den[1:v_n - 1];
+    s_path := s_path[1:v_n - 1];
+    s_depth := s_depth[1:v_n - 1];
+    v_versions := pg_catalog.array_append(v_versions, v_version);
+
+    for v_line in
+    select
+      l.id,
+      l.stock_item_id,
+      l.child_recipe_id,
+      l.quantity,
+      l.unit
+    from
+      app.recipe_lines l
+    where
+      l.version_id = v_version
+    order by
+      l.line_no
+    loop
+      if v_line.stock_item_id is not null then
+        select
+          si.kind,
+          si.base_unit
+        into v_item_kind,
+          v_item_base
+        from
+          app.stock_items si
+        where
+          si.id = v_line.stock_item_id;
+
+        if p_validate then
+          if v_root_kind = 'cooking'
+          and v_item_kind in ('seafood', 'fish_size', 'fish_mixed') then
+            v_issues := v_issues || pg_catalog.jsonb_build_array(
+              pg_catalog.jsonb_build_object(
+                'code',
+                'cooking_marine',
+                'recipe_id',
+                v_recipe,
+                'stock_item_id',
+                v_line.stock_item_id,
+                'path',
+                v_path
+              )
+            );
+          end if;
+        else
+          v_bad := false;
+
+          if p_apply_loss then
+            v_loss := app.item_loss_at (v_line.stock_item_id, p_at);
+
+            if v_loss is null then
+              v_bad := true;
+              v_issues := v_issues || pg_catalog.jsonb_build_array(
+                pg_catalog.jsonb_build_object(
+                  'code',
+                  'loss_not_set',
+                  'recipe_id',
+                  v_recipe,
+                  'stock_item_id',
+                  v_line.stock_item_id,
+                  'path',
+                  v_path
+                )
+              );
+            end if;
+          end if;
+
+          begin
+            v_factor := app.item_factor_at (v_line.stock_item_id, v_line.unit, p_at);
+          exception
+            when sqlstate '22023' then
+              v_factor := null;
+          end;
+
+          if v_factor is null then
+            v_bad := true;
+            v_issues := v_issues || pg_catalog.jsonb_build_array(
+              pg_catalog.jsonb_build_object(
+                'code',
+                'unit_not_convertible',
+                'recipe_id',
+                v_recipe,
+                'stock_item_id',
+                v_line.stock_item_id,
+                'unit',
+                v_line.unit,
+                'path',
+                v_path
+              )
+            );
+          end if;
+
+          if not v_bad then
+            v_leaves := v_leaves || pg_catalog.jsonb_build_array(
+              pg_catalog.jsonb_build_object(
+                'stock_item_id',
+                v_line.stock_item_id,
+                'base_unit',
+                v_item_base,
+                'line_id',
+                v_line.id,
+                'path',
+                v_path,
+                'numerator',
+                v_num * v_line.quantity * v_factor,
+                'denominator',
+                case
+                  when p_apply_loss then v_den * (1 - v_loss)
+                  else v_den
+                end
+              )
+            );
+          end if;
+        end if;
+      elsif v_path @> pg_catalog.to_jsonb(v_line.child_recipe_id) then
+        v_issues := v_issues || pg_catalog.jsonb_build_array(
+          pg_catalog.jsonb_build_object(
+            'code',
+            'cycle',
+            'recipe_id',
+            v_line.child_recipe_id,
+            'path',
+            v_path || pg_catalog.to_jsonb(v_line.child_recipe_id)
+          )
+        );
+      elsif v_depth + 1 > c_max_depth then
+        v_issues := v_issues || pg_catalog.jsonb_build_array(
+          pg_catalog.jsonb_build_object(
+            'code',
+            'depth_exceeded',
+            'recipe_id',
+            v_line.child_recipe_id,
+            'path',
+            v_path || pg_catalog.to_jsonb(v_line.child_recipe_id)
+          )
+        );
+      else
+        select
+          cv.id,
+          cv.batch_qty,
+          cv.batch_unit
+        into v_child_version,
+          v_child_qty,
+          v_child_unit
+        from
+          app.recipe_versions cv
+        where
+          cv.recipe_id = v_line.child_recipe_id
+          and cv.superseded_change_id is null
+          and cv.valid_during @> p_at;
+
+        if not found then
+          v_issues := v_issues || pg_catalog.jsonb_build_array(
+            pg_catalog.jsonb_build_object(
+              'code',
+              'no_version_in_force',
+              'recipe_id',
+              v_line.child_recipe_id,
+              'path',
+              v_path || pg_catalog.to_jsonb(v_line.child_recipe_id)
+            )
+          );
+        else
+          select
+            r.ratio_num,
+            r.ratio_den
+          into v_ratio_num,
+            v_ratio_den
+          from
+            app.recipe_unit_ratio (v_line.unit, v_child_unit) r;
+
+          if not found then
+            v_issues := v_issues || pg_catalog.jsonb_build_array(
+              pg_catalog.jsonb_build_object(
+                'code',
+                'unit_not_convertible',
+                'recipe_id',
+                v_line.child_recipe_id,
+                'unit',
+                v_line.unit,
+                'path',
+                v_path || pg_catalog.to_jsonb(v_line.child_recipe_id)
+              )
+            );
+          else
+            s_recipe := pg_catalog.array_append(s_recipe, v_line.child_recipe_id);
+            s_version := pg_catalog.array_append(s_version, v_child_version);
+            s_num := pg_catalog.array_append(s_num, v_num * v_line.quantity * v_ratio_num);
+            s_den := pg_catalog.array_append(s_den, v_den * v_ratio_den * v_child_qty);
+            s_path := pg_catalog.array_append(s_path, v_path || pg_catalog.to_jsonb(v_line.child_recipe_id));
+            s_depth := pg_catalog.array_append(s_depth, v_depth + 1);
+          end if;
+        end if;
+      end if;
+    end loop;
+  end loop;
+
+  select
+    coalesce(
+      pg_catalog.jsonb_agg(
+        distinct u.v
+        order by
+          u.v
+      ),
+      '[]'::jsonb
+    )
+  into v_versions_json
+  from
+    pg_catalog.unnest(v_versions) as u (v);
+
+  return pg_catalog.jsonb_build_object(
+    'leaves',
+    v_leaves,
+    'issues',
+    v_issues,
+    'versions',
+    v_versions_json
+  );
+end;
+$$;
+
+comment on function app.recipe_walk (
+  uuid,
+  timestamptz,
+  numeric,
+  boolean,
+  numeric,
+  boolean
+) is 'Walks one recipe at one instant. p_apply_loss true matches the five-argument walk: each leaf denominator is the scale denominator times (1 - loss), and a missing loss is loss_not_set. p_apply_loss false keeps the scale denominator and does not read loss. p_validate true skips costing and adds cooking_marine. Nothing is divided or rounded. Internal.';
+
+create or replace function app.recipe_walk (
+  p_recipe_id uuid,
+  p_at timestamptz,
+  p_scale numeric,
+  p_validate boolean,
+  p_scale_den numeric default 1
+) returns jsonb language plpgsql stable security definer
+set
+  search_path = '' as $$
+begin
+  return app.recipe_walk (
+    p_recipe_id => p_recipe_id,
+    p_at => p_at,
+    p_scale => p_scale,
+    p_validate => p_validate,
+    p_scale_den => p_scale_den,
+    p_apply_loss => true
+  );
+end;
+$$;
+
+comment on function app.recipe_walk (uuid, timestamptz, numeric, boolean, numeric) is 'Walks one recipe at one instant. The root scale is the fraction p_scale / p_scale_den. Each leaf is the exact fraction numerator / denominator with numerator = scale numerator x net quantity x item factor and denominator = scale denominator x (1 - loss); a child scale multiplies by the line quantity and the unit ratio over the child batch quantity. Nothing is divided or rounded. Issues carry code, recipe_id, optional stock_item_id and unit, and the recipe path. p_validate = true skips costing and adds cooking_marine. A cycle, depth above 8, a missing child version or an unusable batch unit is an issue, never truncation. Internal.';
+
+create function app.recipe_expand_exact (
+  p_recipe_id uuid,
+  p_at timestamptz,
+  p_scale numeric,
+  p_scale_den numeric,
+  p_apply_loss boolean
+) returns jsonb language plpgsql stable security definer
+set
+  search_path = '' as $$
+declare
+  v_walk jsonb;
+  v_requirements jsonb := null;
+  v_paths jsonb;
+  v_status text;
+  v_row record;
+  v_item text;
+  v_unit text;
+  v_num numeric;
+  v_den numeric;
+begin
+  if p_at is null
+  or not pg_catalog.isfinite(p_at) then
+    raise exception 'p_at must be a finite timestamp'
+      using errcode = '22023';
+  end if;
+
+  if p_scale is null
+  or p_scale in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+  or p_scale <= 0
+  or p_scale_den is null
+  or p_scale_den in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+  or p_scale_den <= 0 then
+    raise exception 'scale must be finite and greater than 0'
+      using errcode = '22023';
+  end if;
+
+  v_walk := app.recipe_walk (
+    p_recipe_id,
+    p_at,
+    p_scale,
+    false,
+    p_scale_den,
+    p_apply_loss
+  );
+
+  select
+    coalesce(
+      pg_catalog.jsonb_agg(
+        pg_catalog.jsonb_build_object(
+          'stock_item_id',
+          e.value ->> 'stock_item_id',
+          'line_id',
+          e.value ->> 'line_id',
+          'path',
+          e.value -> 'path'
+        )
+        order by
+          e.value ->> 'stock_item_id',
+          e.value ->> 'line_id',
+          (e.value -> 'path')::text
+      ),
+      '[]'::jsonb
+    )
+  into v_paths
+  from
+    pg_catalog.jsonb_array_elements(v_walk -> 'leaves') as e;
+
+  if pg_catalog.jsonb_array_length(v_walk -> 'issues') = 0 then
+    v_status := 'ready';
+    v_requirements := '[]'::jsonb;
+
+    -- Leaves with the same denominator add their numerators. Different
+    -- denominators combine by cross-multiplication, so the sum stays exact.
+    for v_row in
+    select
+      e.value ->> 'stock_item_id' as stock_item_id,
+      e.value ->> 'base_unit' as base_unit,
+      (e.value ->> 'denominator')::numeric as denominator,
+      sum((e.value ->> 'numerator')::numeric) as numerator
+    from
+      pg_catalog.jsonb_array_elements(v_walk -> 'leaves') as e
+    group by
+      e.value ->> 'stock_item_id',
+      e.value ->> 'base_unit',
+      (e.value ->> 'denominator')::numeric
+    order by
+      e.value ->> 'stock_item_id',
+      (e.value ->> 'denominator')::numeric
+    loop
+      if v_item is not null
+      and v_row.stock_item_id = v_item then
+        v_num := v_num * v_row.denominator + v_row.numerator * v_den;
+        v_den := v_den * v_row.denominator;
+      else
+        if v_item is not null then
+          v_requirements := v_requirements || pg_catalog.jsonb_build_array(
+            pg_catalog.jsonb_build_object(
+              'stock_item_id',
+              v_item,
+              'base_unit',
+              v_unit,
+              'numerator',
+              v_num,
+              'denominator',
+              v_den
+            )
+          );
+        end if;
+
+        v_item := v_row.stock_item_id;
+        v_unit := v_row.base_unit;
+        v_num := v_row.numerator;
+        v_den := v_row.denominator;
+      end if;
+    end loop;
+
+    if v_item is not null then
+      v_requirements := v_requirements || pg_catalog.jsonb_build_array(
+        pg_catalog.jsonb_build_object(
+          'stock_item_id',
+          v_item,
+          'base_unit',
+          v_unit,
+          'numerator',
+          v_num,
+          'denominator',
+          v_den
+        )
+      );
+    end if;
+  else
+    v_status := 'blocked';
+  end if;
+
+  return pg_catalog.jsonb_build_object(
+    'status',
+    v_status,
+    'requirements',
+    v_requirements,
+    'issues',
+    v_walk -> 'issues',
+    'provenance',
+    pg_catalog.jsonb_build_object(
+      'at',
+      app.costing_timestamptz_text (p_at),
+      'algorithm_version',
+      1,
+      'versions',
+      v_walk -> 'versions',
+      'paths',
+      v_paths
+    )
+  );
+end;
+$$;
+
+comment on function app.recipe_expand_exact (uuid, timestamptz, numeric, numeric, boolean) is 'Expands one recipe at p_at into exact per-stock-item requirements. p_apply_loss true matches the four-argument expansion. p_apply_loss false omits leaf loss and does not report loss_not_set. requirements is null when blocked, never an empty list. Internal.';
+
+create or replace function app.recipe_expand_exact (
+  p_recipe_id uuid,
+  p_at timestamptz,
+  p_scale numeric,
+  p_scale_den numeric default 1
+) returns jsonb language plpgsql stable security definer
+set
+  search_path = '' as $$
+begin
+  return app.recipe_expand_exact (
+    p_recipe_id => p_recipe_id,
+    p_at => p_at,
+    p_scale => p_scale,
+    p_scale_den => p_scale_den,
+    p_apply_loss => true
+  );
+end;
+$$;
+
+comment on function app.recipe_expand_exact (uuid, timestamptz, numeric, numeric) is 'Expands one recipe at p_at into exact per-stock-item requirements in the item base unit, plus issues and provenance. Each requirement is stock_item_id, base_unit and the exact sum of its paths as a fraction (numerator, denominator, both positive); no division or rounding has happened, so the caller divides and rounds once. requirements is null when blocked, never an empty list. Internal.';
+
+revoke all on function app.recipe_walk (
+  uuid,
+  timestamptz,
+  numeric,
+  boolean,
+  numeric,
+  boolean
+)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+revoke all on function app.recipe_walk (uuid, timestamptz, numeric, boolean, numeric)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+revoke all on function app.recipe_expand_exact (uuid, timestamptz, numeric, numeric, boolean)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+revoke all on function app.recipe_expand_exact (uuid, timestamptz, numeric, numeric)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 create function app.pos_map_expand_target (
   p_target_kind text,
   p_recipe_id uuid,
@@ -2636,7 +3216,16 @@ begin
         );
       end if;
     else
-      v_exact := app.recipe_expand_exact (p_recipe_id, p_at, p_scale_num, p_scale_den);
+      -- A weighed base quantity is already raw. Fixed lines and options,
+      -- including a cooking recipe on a weight line, still apply leaf loss.
+      v_exact := app.recipe_expand_exact (
+        p_recipe_id,
+        p_at,
+        p_scale_num,
+        p_scale_den,
+        (not p_weighted)
+        or p_role is distinct from 'base'
+      );
       v_versions := coalesce(v_exact -> 'provenance' -> 'versions', '[]'::jsonb);
 
       if v_exact ->> 'status' is distinct from 'ready' then

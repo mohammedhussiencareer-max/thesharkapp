@@ -2,7 +2,7 @@
 begin;
 
 select
-  plan (173);
+  plan (185);
 
 insert into
   auth.users (
@@ -596,6 +596,42 @@ values
     null,
     '[]'::jsonb,
     0
+  ),
+  (
+    'order-map-july',
+    'line-wbase',
+    'pos-wbase',
+    'صنف وزن وصفة',
+    null,
+    1,
+    0.9,
+    'kg',
+    '[]'::jsonb,
+    1
+  ),
+  (
+    'order-map-july',
+    'line-wnoloss',
+    'pos-wnoloss',
+    'صنف وزن بلا فاقد',
+    null,
+    1,
+    0.9,
+    'kg',
+    '[]'::jsonb,
+    1
+  ),
+  (
+    'order-map-july',
+    'line-fbase',
+    'pos-fbase',
+    'صنف ثابت وصفة',
+    null,
+    1,
+    null,
+    null,
+    '[]'::jsonb,
+    1
   );
 
 select
@@ -797,6 +833,30 @@ select
       (select app.recipe_schedule((select id from app.recipes where name = 'طبق بلا فاقد')) ->> 'token')
     )$$,
     'publication does not require loss'
+  );
+
+select
+  lives_ok (
+    $$select app.create_recipe(
+      'a4600000-0000-4000-8000-000000000209', 'طبق الوزن', 'dish'
+    )$$,
+    'a per-kg dish of seafood'
+  );
+
+select
+  lives_ok (
+    $$select app.set_recipe_version(
+      'a4600000-0000-4000-8000-000000000309',
+      (select id from app.recipes where name = 'طبق الوزن'),
+      '2030-01-01 00:00:00+00', null, null, null,
+      jsonb_build_array(jsonb_build_object(
+        'stock_item_id', (select id from app.stock_items where name = 'جمبري الربط'),
+        'quantity', 1, 'unit', 'kg'
+      )),
+      null,
+      (select app.recipe_schedule((select id from app.recipes where name = 'طبق الوزن')) ->> 'token')
+    )$$,
+    'the per-kg dish contains 1 kg of seafood with 10 percent loss'
   );
 
 reset role;
@@ -1364,6 +1424,134 @@ select
     ),
     2::numeric,
     'a weight line does not apply loss'
+  );
+
+-- A weighed base quantity is already raw. The same dish on a fixed line, and
+-- the editor preview, still divide the marine leaf by (1 - loss).
+select
+  lives_ok (
+    $$select app.set_pos_base_mapping(
+      'a4600000-0000-4000-8000-0000000004f1',
+      'pos-wbase', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      jsonb_build_object('recipe_id', (select id from app.recipes where name = 'طبق الوزن')),
+      (select app.pos_base_schedule('pos-wbase', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'a weight line maps to the per-kg seafood dish'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_option_policy(
+      'a4600000-0000-4000-8000-0000000004f2',
+      'pos-wbase', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      'none_expected',
+      (select app.pos_base_schedule('pos-wbase', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the weight-line seafood dish expects no options'
+  );
+
+select
+  is (
+    (
+      select
+        e.value ->> 'quantity'
+      from
+        pg_catalog.jsonb_array_elements (
+          app.resolve_line_requirements ('order-map-july', 'line-wbase') -> 'requirements'
+        ) as e
+    ),
+    '0.900000',
+    '0.9 kg of a per-kg dish with 10 percent loss requires 0.900000 kg'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_base_mapping(
+      'a4600000-0000-4000-8000-0000000004f3',
+      'pos-wnoloss', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      jsonb_build_object('recipe_id', (select id from app.recipes where name = 'طبق بلا فاقد')),
+      (select app.pos_base_schedule('pos-wnoloss', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'a weight line maps to a dish whose leaf has no loss'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_option_policy(
+      'a4600000-0000-4000-8000-0000000004f4',
+      'pos-wnoloss', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      'none_expected',
+      (select app.pos_base_schedule('pos-wnoloss', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the weight line with no loss expects no options'
+  );
+
+select
+  is (
+    app.resolve_line_requirements ('order-map-july', 'line-wnoloss') ->> 'status',
+    'ready',
+    'a weight-line base recipe with no loss configured resolves ready'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_base_mapping(
+      'a4600000-0000-4000-8000-0000000004f5',
+      'pos-fbase', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      jsonb_build_object('recipe_id', (select id from app.recipes where name = 'طبق الوزن')),
+      (select app.pos_base_schedule('pos-fbase', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'a fixed line maps to the same per-kg seafood dish'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_option_policy(
+      'a4600000-0000-4000-8000-0000000004f6',
+      'pos-fbase', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      'none_expected',
+      (select app.pos_base_schedule('pos-fbase', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the fixed seafood dish expects no options'
+  );
+
+select
+  is (
+    (
+      select
+        e.value ->> 'quantity'
+      from
+        pg_catalog.jsonb_array_elements (
+          app.resolve_line_requirements ('order-map-july', 'line-fbase') -> 'requirements'
+        ) as e
+    ),
+    '1.111111',
+    'a fixed line of the same dish still applies 10 percent loss'
+  );
+
+select
+  is (
+    app.expand_recipe (
+      (
+        select
+          id
+        from
+          app.recipes
+        where
+          name = 'طبق الوزن'
+      ),
+      1,
+      'portion',
+      '2030-07-01 12:00:00+00'
+    ) -> 'requirements' -> 0 ->> 'quantity',
+    '1.111111',
+    'the editor preview of the same dish still applies loss'
   );
 
 select
