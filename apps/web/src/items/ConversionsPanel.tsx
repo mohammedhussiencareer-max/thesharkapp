@@ -591,10 +591,12 @@ export function ConversionsPanel({
       const accepted = await run(async () => {
         try {
           await perform(action);
-          settleAction(subject);
+          settleAction(subject, action.write.requestId);
           clearSubmittedAdd(action);
         } catch (error) {
-          if (hasAction(subject)) settleAction(subject, error);
+          if (hasAction(subject)) {
+            settleAction(subject, action.write.requestId, error);
+          }
           throw error;
         }
       });
@@ -602,7 +604,7 @@ export function ConversionsPanel({
         accepted === false &&
         unknownAction<ConversionAction>(subject) === null
       ) {
-        settleAction(subject);
+        settleAction(subject, action.write.requestId);
       }
     } catch {
       // run already settled this action and showed the error.

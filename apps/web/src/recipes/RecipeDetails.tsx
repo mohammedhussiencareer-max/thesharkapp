@@ -70,7 +70,7 @@ export function RecipeDetails({
     setNotice(null);
     try {
       await updateRecipe(action.recipeId, action.update);
-      settleAction(subject);
+      settleAction(subject, action.update.requestId);
       const fresh = await onReload();
       adopt(
         fresh ?? {
@@ -81,7 +81,7 @@ export function RecipeDetails({
       );
       setNotice('الوصفة اتحفظت');
     } catch (failure) {
-      settleAction(subject, failure);
+      settleAction(subject, action.update.requestId, failure);
       if (failure instanceof StaleWriteError) {
         const fresh = await onReload();
         if (fresh) adopt(fresh);

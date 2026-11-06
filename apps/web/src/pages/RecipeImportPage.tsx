@@ -194,9 +194,9 @@ function Workspace({
     let outcome: ImportResult;
     try {
       outcome = await commitRecipeImport(action);
-      settleAction(subject);
+      settleAction(subject, action.requestId);
     } catch (failure) {
-      settleAction(subject, failure);
+      settleAction(subject, action.requestId, failure);
       setError(messageFrom(failure));
       flight.current = false;
       setSaving(false);

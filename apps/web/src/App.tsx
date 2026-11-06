@@ -6,6 +6,7 @@ import { supabase } from '@/lib/supabase';
 import { ExpensesPage } from '@/pages/ExpensesPage';
 import { CountsPage } from '@/pages/CountsPage';
 import { HomePage } from '@/pages/HomePage';
+import { MappingPage } from '@/pages/MappingPage';
 import { ItemsPage } from '@/pages/ItemsPage';
 import { LoginPage } from '@/pages/LoginPage';
 import { OpeningPage } from '@/pages/OpeningPage';
@@ -57,6 +58,14 @@ export function AppRoutes() {
         element={
           <RequireOwner>
             <RecipesPage />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/mapping"
+        element={
+          <RequireOwner>
+            <MappingPage />
           </RequireOwner>
         }
       />

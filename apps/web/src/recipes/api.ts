@@ -205,10 +205,10 @@ export async function createRecipe(
     if (typeof recipeId !== 'string' || recipeId.length === 0) {
       throw new Error(genericCatalogError);
     }
-    settleAction(subject);
+    settleAction(subject, requestId);
     return recipeId;
   } catch (failure) {
-    settleAction(subject, failure);
+    settleAction(subject, requestId, failure);
     throw failure;
   }
 }

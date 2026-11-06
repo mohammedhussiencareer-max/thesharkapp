@@ -130,14 +130,21 @@ export function beginAction<T>(
  * Success, a payload refusal, a confirmed refusal, a known stale write, or a
  * confirmed `configuration changed` retires the action. 42501, a generic 40001, and a
  * lost response keep it and mark the outcome unknown.
+ * The request id must be the one currently held. A late completion of an older
+ * write does nothing, so it cannot retire the newer action.
  */
-export function settleAction(subject: string, error?: unknown): void {
+export function settleAction(
+  subject: string,
+  requestId: string,
+  error?: unknown,
+): void {
+  const current = held.get(subject);
+  if (!current || current.requestId !== requestId) return;
   if (error === undefined) {
-    if (held.delete(subject)) emitHeldWrites();
+    held.delete(subject);
+    emitHeldWrites();
     return;
   }
-  const current = held.get(subject);
-  if (!current) return;
   if (
     isConfirmedConfigurationChange(error) ||
     isPayloadRefusal(error) ||

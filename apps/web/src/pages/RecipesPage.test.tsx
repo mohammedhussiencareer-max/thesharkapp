@@ -244,9 +244,9 @@ describe('RecipesPage', () => {
     vi.mocked(createRecipe)
       .mockImplementationOnce((name, kind) => {
         const subject = recipeCreateSubject(name, kind);
-        beginAction(subject, (id) => id);
+        const requestId = beginAction(subject, (id) => id);
         const failure = new Error('تعذر الاتصال');
-        settleAction(subject, failure);
+        settleAction(subject, requestId, failure);
         return Promise.reject(failure);
       })
       .mockResolvedValueOnce('new-id');

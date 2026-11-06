@@ -107,7 +107,7 @@ export function VersionEditor({
     setNotice(null);
     try {
       await setRecipeVersion(action.recipeId, action.write);
-      settleAction(subject);
+      settleAction(subject, action.write.requestId);
       setDirty(false);
       setConfirmStop(false);
       timing.refreshClock();
@@ -118,7 +118,7 @@ export function VersionEditor({
       );
       await onReload();
     } catch (failure) {
-      settleAction(subject, failure);
+      settleAction(subject, action.write.requestId, failure);
       setError(messageFrom(failure));
       if (!hasAction(subject)) await onReload();
     } finally {
