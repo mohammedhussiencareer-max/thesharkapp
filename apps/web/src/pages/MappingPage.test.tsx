@@ -365,4 +365,114 @@ describe('MappingPage', () => {
     expect(screen.getByText(/9\.5/)).toBeInTheDocument();
     expect(screen.queryByText('الصنف مش مربوط')).not.toBeInTheDocument();
   });
+
+  function nextIsoDate(iso: string): string {
+    const [year, month, day] = iso.split('-').map(Number);
+    const next = new Date(
+      Date.UTC(year ?? 0, (month ?? 1) - 1, (day ?? 1) + 1),
+    );
+    const y = next.getUTCFullYear();
+    const m = String(next.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(next.getUTCDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+
+  it('keeps a newer coverage period when a save reload resolves late', async () => {
+    const releaseReload: Array<() => void> = [];
+    const reloadGate = new Promise<void>((resolve) => {
+      releaseReload.push(resolve);
+    });
+    let basesCalls = 0;
+    let coverageCalls = 0;
+    const initialBases = [
+      observed('صنف جاهز', 'ready'),
+      observed('صنف ناقص', 'incomplete'),
+    ];
+    const newerBases = [
+      ...initialBases,
+      observed('صنف الفترة الجديدة', 'incomplete'),
+    ];
+    const staleBases = [
+      ...initialBases,
+      observed('صنف الفترة القديمة', 'ready'),
+    ];
+    const newerCoverage = coverage({
+      eligibleLines: 8,
+      coveredLines: 7,
+      readyLines: 7,
+      coverage: 0.875,
+    });
+    const staleCoverage = coverage({
+      eligibleLines: 9,
+      coveredLines: 1,
+      readyLines: 1,
+      coverage: 1 / 9,
+    });
+    vi.mocked(loadBases).mockImplementation(() => {
+      basesCalls += 1;
+      if (basesCalls === 1) return Promise.resolve(initialBases);
+      if (basesCalls === 2) return reloadGate.then(() => staleBases);
+      return Promise.resolve(newerBases);
+    });
+    vi.mocked(loadCoverage).mockImplementation(() => {
+      coverageCalls += 1;
+      if (coverageCalls === 1) return Promise.resolve(coverage());
+      if (coverageCalls === 2) return reloadGate.then(() => staleCoverage);
+      return Promise.resolve(newerCoverage);
+    });
+    vi.mocked(setBaseMapping).mockResolvedValue(undefined);
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: /صنف ناقص/ }));
+    expect(
+      await screen.findByRole('form', { name: 'ربط الصنف' }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('الصنف'), {
+      target: { value: 'item-1' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'احفظ الربط' }));
+    await waitFor(() => {
+      expect(basesCalls).toBe(2);
+      expect(coverageCalls).toBe(2);
+    });
+    const toInput = screen.getByLabelText('إلى تاريخ');
+    const nextDay = nextIsoDate((toInput as HTMLInputElement).value);
+    fireEvent.change(toInput, { target: { value: nextDay } });
+    expect(await screen.findByText('المغطى 7 من 8')).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /صنف الفترة الجديدة/ }),
+    ).toBeInTheDocument();
+    expect(toInput).toHaveValue(nextDay);
+    await act(async () => {
+      releaseReload.splice(0).forEach((release) => release());
+      await Promise.resolve();
+    });
+    expect(screen.getByText('المغطى 7 من 8')).toBeInTheDocument();
+    expect(screen.queryByText('المغطى 1 من 9')).not.toBeInTheDocument();
+    expect(screen.getByText(/جاهز 7/)).toBeInTheDocument();
+    expect(screen.queryByText(/جاهز 1،/)).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /صنف الفترة الجديدة/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /صنف الفترة القديمة/ }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText('إلى تاريخ')).toHaveValue(nextDay);
+  });
+
+  it('keeps the open subject when its row is clicked again', async () => {
+    renderPage();
+    const row = await screen.findByRole('button', { name: /صنف ناقص/ });
+    fireEvent.click(row);
+    expect(
+      await screen.findByRole('form', { name: 'ربط الصنف' }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('جاري تحميل الصنف…')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /صنف ناقص/ }));
+    expect(screen.getByRole('form', { name: 'ربط الصنف' })).toBeInTheDocument();
+    expect(screen.queryByText('جاري تحميل الصنف…')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /صنف ناقص/ })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+  });
 });

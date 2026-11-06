@@ -50,14 +50,15 @@ export function MappingPage() {
   const [loading, setLoading] = useState(true);
   const [onlyIncomplete, setOnlyIncomplete] = useState(false);
   const [loadId, setLoadId] = useState(0);
-  const homeSeq = useRef(0);
+  // Home loads and save reloads both write the subject list and coverage.
+  // One generation makes a late reload drop its result after a newer period.
+  const listSeq = useRef(0);
   const detailSeq = useRef(0);
-  const reloadSeq = useRef(0);
   const selectedKeyRef = useRef<string | null>(null);
   const rangeError = dateRangeError(fromDate, toDate);
 
   useEffect(() => {
-    const seq = ++homeSeq.current;
+    const seq = ++listSeq.current;
     let cancelled = false;
     void (async () => {
       try {
@@ -71,16 +72,16 @@ export function MappingPage() {
           loadCatalog(),
           loadCoverage(fromIso, toIso),
         ]);
-        if (cancelled || seq !== homeSeq.current) return;
+        if (cancelled || seq !== listSeq.current) return;
         setBases(nextBases);
         setCatalog(nextCatalog);
         setCoverage(nextCoverage);
         setLoadError(null);
       } catch (error) {
-        if (cancelled || seq !== homeSeq.current) return;
+        if (cancelled || seq !== listSeq.current) return;
         setLoadError(messageFrom(error));
       } finally {
-        if (!cancelled && seq === homeSeq.current) setLoading(false);
+        if (!cancelled && seq === listSeq.current) setLoading(false);
       }
     })();
     return () => {
@@ -126,18 +127,18 @@ export function MappingPage() {
   }, [selected]);
 
   async function reload() {
-    const seq = ++reloadSeq.current;
     const keyAtStart = selectedKeyRef.current;
     const fromIso = cairoDateStartIso(fromDate);
     const toIso = cairoNextDateStartIso(toDate);
     if (!fromIso || !toIso || rangeError) {
       throw new Error(rangeError ?? 'فترة التغطية مش مظبوطة');
     }
+    const seq = ++listSeq.current;
     const [nextBases, nextCoverage] = await Promise.all([
       loadBases(),
       loadCoverage(fromIso, toIso),
     ]);
-    if (seq !== reloadSeq.current) return;
+    if (seq !== listSeq.current) return;
     setBases(nextBases);
     setCoverage(nextCoverage);
     if (keyAtStart === null || selectedKeyRef.current !== keyAtStart) return;
@@ -146,7 +147,7 @@ export function MappingPage() {
     const detailRequest = ++detailSeq.current;
     const next = await loadSubjectDetail(current);
     if (
-      seq !== reloadSeq.current ||
+      seq !== listSeq.current ||
       detailRequest !== detailSeq.current ||
       selectedKeyRef.current !== keyAtStart
     ) {
@@ -246,6 +247,9 @@ export function MappingPage() {
                 aria-pressed={baseKey(base) === selectedKey}
                 onClick={() => {
                   const key = baseKey(base);
+                  // Same key does not change `selected`, so the detail effect
+                  // would not replace the panel this click clears.
+                  if (key === selectedKeyRef.current) return;
                   selectedKeyRef.current = key;
                   detailSeq.current += 1;
                   setDetail(null);
