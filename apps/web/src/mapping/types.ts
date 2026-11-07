@@ -1,3 +1,5 @@
+import type { PackagingDetail } from '@/packaging/types';
+
 export const mapStatuses = ['ready', 'incomplete', 'exception'] as const;
 
 export type MapStatus = (typeof mapStatuses)[number];
@@ -102,6 +104,30 @@ export type CoverageCauses = {
   beforeStockStart: number;
 };
 
+export type OrderCoverage = {
+  eligible: number;
+  ready: number;
+  incomplete: number;
+  coverage: number | null;
+  causes: {
+    line: number;
+    packagingUnreviewed: number;
+    blocked: number;
+  };
+  excluded: CoverageCauses;
+};
+
+export type OrderTypeCoverage = {
+  key: string;
+  label: string | null;
+  seen: number;
+  eligible: number;
+  covered: number;
+  unreviewed: number;
+  blocked: number;
+  coverage: number | null;
+};
+
 export type Coverage = {
   stockStart: string | null;
   eligibleLines: number;
@@ -111,6 +137,8 @@ export type Coverage = {
   exceptionLines: number;
   coverage: number | null;
   causes: CoverageCauses;
+  orders: OrderCoverage;
+  orderTypes: OrderTypeCoverage[];
 };
 
 export type Suggestion = {
@@ -148,6 +176,7 @@ export type LineResolution = {
 export type MappingCatalog = {
   recipes: { id: string; name: string; kind: 'dish' | 'cooking' }[];
   items: { id: string; name: string; baseUnit: string }[];
+  packagingItems: { id: string; name: string; baseUnit: string }[];
   units: { code: string; label: string }[];
   shiftStart: string | null;
 };
@@ -166,6 +195,7 @@ export type SubjectDetail = {
   history: HistoryRow[];
   optionHistory: { subjectId: string; rows: HistoryRow[] }[];
   resolution: LineResolution;
+  packaging: PackagingDetail;
 };
 
 export function isMapStatus(value: string): value is MapStatus {

@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { coverageText, quantityError, sortBases } from '@/mapping/format';
+import {
+  coverageText,
+  orderCoverageText,
+  quantityError,
+  sortBases,
+} from '@/mapping/format';
 import type { Coverage, ObservedBase } from '@/mapping/types';
 
 function base(
@@ -30,6 +35,15 @@ function coverage(partial: Partial<Coverage>): Coverage {
     exceptionLines: 0,
     coverage: null,
     causes: { canceled: 0, open: 0, missing: 0, beforeStockStart: 0 },
+    orders: {
+      eligible: 0,
+      ready: 0,
+      incomplete: 0,
+      coverage: null,
+      causes: { line: 0, packagingUnreviewed: 0, blocked: 0 },
+      excluded: { canceled: 0, open: 0, missing: 0, beforeStockStart: 0 },
+    },
+    orderTypes: [],
     ...partial,
   };
 }
@@ -59,6 +73,24 @@ describe('mapping list order and coverage', () => {
         }),
       ),
     ).toBe('3 من 4');
+  });
+
+  it('shows an em dash when no order is eligible', () => {
+    expect(orderCoverageText(coverage({}))).toBe('—');
+    expect(
+      orderCoverageText(
+        coverage({
+          orders: {
+            eligible: 4,
+            ready: 1,
+            incomplete: 3,
+            coverage: 0.25,
+            causes: { line: 1, packagingUnreviewed: 1, blocked: 1 },
+            excluded: { canceled: 0, open: 0, missing: 0, beforeStockStart: 0 },
+          },
+        }),
+      ),
+    ).toBe('1 من 4');
   });
 
   it('rejects a zero quantity and keeps a precise positive decimal', () => {

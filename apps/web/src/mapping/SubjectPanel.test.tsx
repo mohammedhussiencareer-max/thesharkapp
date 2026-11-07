@@ -43,6 +43,7 @@ const catalog: MappingCatalog = {
     { id: 'item-1', name: 'ملح تجريبي', baseUnit: 'kg' },
     { id: 'item-2', name: 'فلفل تجريبي', baseUnit: 'kg' },
   ],
+  packagingItems: [],
   units: [{ code: 'kg', label: 'كيلو' }],
   shiftStart: null,
 };
@@ -63,6 +64,15 @@ const detail: SubjectDetail = {
     status: 'incomplete',
     issues: [{ code: 'unmapped_base', expandIssue: null }],
     requirements: [],
+  },
+  packaging: {
+    schedule: {
+      subjectId: null,
+      token: 'pack-token',
+      emptyToken: 'pack-token',
+      versions: [],
+    },
+    history: [],
   },
 };
 

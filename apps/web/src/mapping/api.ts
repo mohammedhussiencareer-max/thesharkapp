@@ -17,6 +17,8 @@ import {
   isTargetKind,
   type BaseMappingWrite,
   type Coverage,
+  type OrderCoverage,
+  type OrderTypeCoverage,
   type ExceptionWrite,
   type HistoryRow,
   type LineResolution,
@@ -33,6 +35,8 @@ import {
   type SubjectSchedule,
   type Suggestion,
 } from '@/mapping/types';
+import { canonicalOrderTypeKey } from '@/packaging/format';
+import { loadBasePackaging } from '@/packaging/api';
 import { listRecipes, listStockOptions, listUnitsMeta } from '@/recipes/api';
 
 function appDb() {
@@ -321,6 +325,56 @@ export async function loadCoverage(
       missing: countOf(causes.missing),
       beforeStockStart: countOf(causes.before_stock_start),
     },
+    orders: orderCoverageOf(row.orders),
+    orderTypes: rows(row.order_types).map(orderTypeCoverageOf),
+  };
+}
+
+function excludedOf(value: unknown): Coverage['causes'] {
+  const row = record(value);
+  return {
+    canceled: countOf(row.canceled),
+    open: countOf(row.open),
+    missing: countOf(row.missing),
+    beforeStockStart: countOf(row.before_stock_start),
+  };
+}
+
+function orderCoverageOf(value: unknown): OrderCoverage {
+  const row = record(value);
+  const causes = record(row.causes);
+  return {
+    eligible: countOf(row.eligible),
+    ready: countOf(row.ready),
+    incomplete: countOf(row.incomplete),
+    coverage: ratioOf(row.coverage),
+    causes: {
+      line: countOf(causes.line),
+      packagingUnreviewed: countOf(causes.packaging_unreviewed),
+      blocked: countOf(causes.blocked),
+    },
+    excluded: excludedOf(row.excluded),
+  };
+}
+
+function orderTypeCoverageOf(
+  value: Record<string, unknown>,
+): OrderTypeCoverage {
+  const key = canonicalOrderTypeKey(value.order_type_key);
+  if (!key) throw new Error(genericCatalogError);
+  const label = value.label;
+  if (label !== null && typeof label !== 'string') {
+    throw new Error(genericCatalogError);
+  }
+  return {
+    key,
+    label,
+    seen: countOf(value.seen),
+    eligible: countOf(value.eligible),
+    covered: countOf(value.covered),
+    unreviewed: countOf(value.unreviewed),
+    blocked: countOf(value.blocked),
+    coverage: ratioOf(value.coverage),
   };
 }
 
@@ -339,6 +393,13 @@ export async function loadCatalog(): Promise<MappingCatalog> {
     ),
     items: items
       .filter((item) => item.kind !== 'packaging' && item.kind !== 'fish_mixed')
+      .map((item) => ({
+        id: item.id,
+        name: item.name,
+        baseUnit: item.baseUnit,
+      })),
+    packagingItems: items
+      .filter((item) => item.kind === 'packaging')
       .map((item) => ({
         id: item.id,
         name: item.name,
@@ -470,12 +531,14 @@ async function loadHistory(subjectId: string): Promise<HistoryRow[]> {
 export async function loadSubjectDetail(
   base: ObservedBase,
 ): Promise<SubjectDetail> {
-  const [schedule, options, suggestions, resolution] = await Promise.all([
-    loadBaseSchedule(base),
-    loadOptions(base),
-    loadSuggestions(base.itemName),
-    loadResolution(base),
-  ]);
+  const [schedule, options, suggestions, resolution, packaging] =
+    await Promise.all([
+      loadBaseSchedule(base),
+      loadOptions(base),
+      loadSuggestions(base.itemName),
+      loadResolution(base),
+      loadBasePackaging(base.posItemId, base.sizeKey),
+    ]);
   const optionBindings: OptionBinding[] = [];
   for (const option of options) {
     if (option.optionValue.trim().length === 0) continue;
@@ -520,6 +583,7 @@ export async function loadSubjectDetail(
     history,
     optionHistory,
     resolution,
+    packaging,
   };
 }
 

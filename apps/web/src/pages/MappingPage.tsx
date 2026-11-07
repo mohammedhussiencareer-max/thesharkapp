@@ -11,6 +11,7 @@ import {
 } from '@/mapping/api';
 import {
   coverageText,
+  orderCoverageText,
   sizeLabel,
   sortBases,
   subjectTitle,
@@ -171,6 +172,10 @@ export function MappingPage() {
         <Link className="underline" to="/">
           الرئيسية
         </Link>
+        {' — '}
+        <Link className="underline" to="/packaging">
+          التغليف
+        </Link>
       </p>
       <h1 className="text-2xl font-semibold">ربط الكاشير</h1>
       <section className="flex flex-col gap-2" aria-label="التغطية">
@@ -200,6 +205,12 @@ export function MappingPage() {
         {coverage ? (
           <>
             <p>المغطى {coverageText(coverage)}</p>
+            <p>تغطية الطلبات {orderCoverageText(coverage)}</p>
+            <p>
+              سطر {coverage.orders.causes.line}، تغليف مش متراجع{' '}
+              {coverage.orders.causes.packagingUnreviewed}، موقوف{' '}
+              {coverage.orders.causes.blocked}
+            </p>
             <p>
               جاهز {coverage.readyLines}، ناقص {coverage.incompleteLines}،
               استثناء {coverage.exceptionLines}

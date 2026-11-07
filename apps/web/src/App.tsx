@@ -7,6 +7,7 @@ import { ExpensesPage } from '@/pages/ExpensesPage';
 import { CountsPage } from '@/pages/CountsPage';
 import { HomePage } from '@/pages/HomePage';
 import { MappingPage } from '@/pages/MappingPage';
+import { PackagingPage } from '@/pages/PackagingPage';
 import { ItemsPage } from '@/pages/ItemsPage';
 import { LoginPage } from '@/pages/LoginPage';
 import { OpeningPage } from '@/pages/OpeningPage';
@@ -66,6 +67,14 @@ export function AppRoutes() {
         element={
           <RequireOwner>
             <MappingPage />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/packaging"
+        element={
+          <RequireOwner>
+            <PackagingPage />
           </RequireOwner>
         }
       />

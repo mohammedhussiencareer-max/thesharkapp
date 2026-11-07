@@ -307,6 +307,90 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"packaging_lines": {
+                  Row: {
+                    "capacity_kg": number | null,"id": string,"line_no": number,"quantity": number,"stock_item_id": string,"unit_code": string,"version_id": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "capacity_kg"?: number | null,"id"?: string,"line_no": number,"quantity": number,"stock_item_id": string,"unit_code": string,"version_id": string
+                  }
+                  Update: {
+                    "capacity_kg"?: number | null,"id"?: string,"line_no"?: number,"quantity"?: number,"stock_item_id"?: string,"unit_code"?: string,"version_id"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "packaging_lines_stock_item_id_fkey"
+      columns: ["stock_item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "packaging_lines_unit_code_fkey"
+      columns: ["unit_code"]
+isOneToOne: false
+      referencedRelation: "units"
+      referencedColumns: ["code"]
+    },{
+      foreignKeyName: "packaging_lines_version_id_fkey"
+      columns: ["version_id"]
+isOneToOne: false
+      referencedRelation: "packaging_versions"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"packaging_subjects": {
+                  Row: {
+                    "created_change_id": number,"id": string,"kind": string,"order_type_key": Json | null,"pos_item_id": string | null,"size_key": Json | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_change_id": number,"id"?: string,"kind": string,"order_type_key"?: Json | null,"pos_item_id"?: string | null,"size_key"?: Json | null
+                  }
+                  Update: {
+                    "created_change_id"?: number,"id"?: string,"kind"?: string,"order_type_key"?: Json | null,"pos_item_id"?: string | null,"size_key"?: Json | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "packaging_subjects_created_change_id_fkey"
+      columns: ["created_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"packaging_versions": {
+                  Row: {
+                    "created_change_id": number,"decision": string,"effective_from": string,"effective_to": string | null,"id": string,"subject_id": string,"superseded_change_id": number | null,"valid_during": unknown
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_change_id": number,"decision": string,"effective_from": string,"effective_to"?: string | null,"id"?: string,"subject_id": string,"superseded_change_id"?: number | null,"valid_during"?: never
+                  }
+                  Update: {
+                    "created_change_id"?: number,"decision"?: string,"effective_from"?: string,"effective_to"?: string | null,"id"?: string,"subject_id"?: string,"superseded_change_id"?: number | null,"valid_during"?: never
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "packaging_versions_created_change_id_fkey"
+      columns: ["created_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "packaging_versions_subject_id_fkey"
+      columns: ["subject_id"]
+isOneToOne: false
+      referencedRelation: "packaging_subjects"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "packaging_versions_superseded_change_id_fkey"
+      columns: ["superseded_change_id"]
+isOneToOne: false
+      referencedRelation: "costing_changes"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"period_revisions": {
                   Row: {
                     "amount": number,"bucket": string,"cause_batch_id": string,"created_at": string,"id": number,"item_id": string,"shift_id": string | null,"source_movement_id": number
@@ -980,6 +1064,46 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"packaging_line_rows": {
+                  Row: {
+                    "capacity_kg": number | null,"id": string | null,"line_no": number | null,"quantity": number | null,"stock_item_id": string | null,"subject_id": string | null,"unit_code": string | null,"version_id": string | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    {
+      foreignKeyName: "packaging_lines_stock_item_id_fkey"
+      columns: ["stock_item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "packaging_lines_unit_code_fkey"
+      columns: ["unit_code"]
+isOneToOne: false
+      referencedRelation: "units"
+      referencedColumns: ["code"]
+    },{
+      foreignKeyName: "packaging_lines_version_id_fkey"
+      columns: ["version_id"]
+isOneToOne: false
+      referencedRelation: "packaging_versions"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "packaging_versions_subject_id_fkey"
+      columns: ["subject_id"]
+isOneToOne: false
+      referencedRelation: "packaging_subjects"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"packaging_observed_order_types": {
+                  Row: {
+                    "last_ordered_at": string | null,"order_count": number | null,"order_type_key": Json | null,"order_type_key_text": string | null,"order_type_label": string | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    
+                  ]
                 },"pos_observed_bases": {
                   Row: {
                     "item_name": string | null,"last_ordered_at": string | null,"latest_line_id": string | null,"latest_order_id": string | null,"map_status": string | null,"pos_item_id": string | null,"sale_count": number | null,"size_key": Json | null,"size_key_text": string | null
@@ -1220,6 +1344,66 @@ isOneToOne: false
 "note_period_revision":
 { Args: { "p_amount": number,"p_bucket": string,"p_cause": string,"p_item_id": string,"p_shift_id": string,"p_source_id": number }; Returns: undefined
                            },
+"packaging_apply":
+{ Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_fn": string,"p_kind": string,"p_order_type": string,"p_order_type_key": Json,"p_policy": Json,"p_pos_item_id": string,"p_reason": string,"p_request_id": string,"p_size_key": Json }; Returns: Json
+                           },
+"packaging_assert_keys":
+{ Args: { "p_node": Json }; Returns: undefined
+                           },
+"packaging_base_schedule":
+{ Args: { "p_pos_item_id": string,"p_size_key": Json }; Returns: Json
+                           },
+"packaging_body":
+{ Args: { "p_decision": string,"p_lines": Json }; Returns: string
+                           },
+"packaging_distinct_ids":
+{ Args: { "p_ids": Json }; Returns: Json
+                           },
+"packaging_expand":
+{ Args: { "p_at": string,"p_kind": string,"p_line_id": string,"p_order_type_key": Json,"p_pos_item_id": string,"p_scale_den": number,"p_scale_num": number,"p_scale_ok": boolean,"p_size_key": Json,"p_weighted": boolean }; Returns: Json
+                           },
+"packaging_identity":
+{ Args: { "p_kind": string,"p_order_type_key": Json,"p_pos_item_id": string,"p_size_key": Json }; Returns: string
+                           },
+"packaging_kg_scale":
+{ Args: { "p_qty": number,"p_unit": string }; Returns: Json
+                           },
+"packaging_line_recipe_paths":
+{ Args: { "p_line_id": string,"p_order_id": string }; Returns: Json
+                           },
+"packaging_normalize_policy":
+{ Args: { "p_allow_capacity": boolean,"p_policy": Json }; Returns: Json
+                           },
+"packaging_order_type_key":
+{ Args: { "p_order_type": string }; Returns: Json
+                           },
+"packaging_order_type_schedule":
+{ Args: { "p_order_type": string }; Returns: Json
+                           },
+"packaging_positive_numeric":
+{ Args: { "p_value": Json,"p_what": string }; Returns: number
+                           },
+"packaging_schedule_line":
+{ Args: { "p_body": string,"p_effective_from": string,"p_effective_to": string,"p_id": string }; Returns: string
+                           },
+"packaging_subject_id":
+{ Args: { "p_kind": string,"p_order_type_key": Json,"p_pos_item_id": string,"p_size_key": Json }; Returns: string
+                           },
+"packaging_target_recipe_paths":
+{ Args: { "p_at": string,"p_line_id": string,"p_mapping_version_id": string,"p_option_value": string,"p_pos_item_id": string,"p_recipe_id": string,"p_role": string,"p_scale_den": number,"p_scale_num": number,"p_size_key": Json,"p_target_kind": string,"p_weighted": boolean }; Returns: Json
+                           },
+"packaging_token":
+{ Args: { "p_kind": string,"p_order_type_key": Json,"p_pos_item_id": string,"p_size_key": Json }; Returns: string
+                           },
+"packaging_version_lines_json":
+{ Args: { "p_version_id": string }; Returns: Json
+                           },
+"packaging_versions_json":
+{ Args: { "p_subject": string }; Returns: Json
+                           },
+"packaging_with_subject":
+{ Args: { "p_kind": string,"p_order_type_key": Json,"p_pos_item_id": string,"p_result": Json,"p_size_key": Json }; Returns: Json
+                           },
 "pos_base_schedule":
 { Args: { "p_pos_item_id": string,"p_size_key": Json }; Returns: Json
                            },
@@ -1385,6 +1569,12 @@ isOneToOne: false
 "resolve_line_requirements_exact":
 { Args: { "p_line_id": string,"p_order_id": string }; Returns: Json
                            },
+"resolve_order_requirements":
+{ Args: { "p_expected_order_version": number,"p_order_id": string }; Returns: Json
+                           },
+"resolve_order_requirements_exact":
+{ Args: { "p_expected_order_version": number,"p_order_id": string }; Returns: Json
+                           },
 "resolve_shift_id":
 { Args: { "p_at": string }; Returns: string
                            },
@@ -1393,6 +1583,9 @@ isOneToOne: false
                            },
 "schedule_token":
 { Args: { "p_family": string,"p_item_id": string,"p_unit_code": string }; Returns: string
+                           },
+"set_base_packaging":
+{ Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_policy": Json,"p_pos_item_id": string,"p_reason": string,"p_request_id": string,"p_size_key": Json }; Returns: Json
                            },
 "set_expense_category_active":
 { Args: { "p_active": boolean,"p_id": string }; Returns: undefined
@@ -1410,6 +1603,9 @@ isOneToOne: false
                            },
 "set_month_expense_complete":
 { Args: { "p_complete": boolean,"p_month": string }; Returns: undefined
+                           },
+"set_order_type_packaging":
+{ Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_order_type": string,"p_policy": Json,"p_reason": string,"p_request_id": string }; Returns: Json
                            },
 "set_pos_base_mapping":
 { Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_pos_item_id": string,"p_reason": string,"p_request_id": string,"p_size_key": Json,"p_target": Json }; Returns: Json
