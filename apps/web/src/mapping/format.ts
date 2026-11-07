@@ -39,6 +39,14 @@ export function coverageText(coverage: Coverage): string {
   return `${coverage.coveredLines} من ${coverage.eligibleLines}`;
 }
 
+/** Order coverage uses ready orders over eligible orders. */
+export function orderCoverageText(coverage: Coverage): string {
+  if (coverage.orders.coverage === null || coverage.orders.eligible === 0) {
+    return '—';
+  }
+  return `${coverage.orders.ready} من ${coverage.orders.eligible}`;
+}
+
 export function familyPoints(
   versions: readonly ScheduleVersion[],
   family: ScheduleVersion['family'],

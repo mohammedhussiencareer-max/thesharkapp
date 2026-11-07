@@ -39,6 +39,8 @@ import {
   targetModeLabels,
 } from '@/mapping/labels';
 import { baseSubject, optionSubject } from '@/mapping/subjects';
+import { PackagingEditor } from '@/packaging/PackagingEditor';
+import { basePackagingSubject } from '@/packaging/subjects';
 import type {
   BaseMappingWrite,
   DatedWrite,
@@ -487,6 +489,19 @@ export function SubjectPanel({
         onFinish={(action) => void finish(action)}
       />
       <HistoryList rows={detail.history} catalog={catalog} />
+      <PackagingEditor
+        subjectKey={basePackagingSubject(base.posItemId, base.sizeKeyText)}
+        kind="base"
+        posItemId={base.posItemId}
+        sizeKey={base.sizeKey}
+        schedule={detail.packaging.schedule}
+        history={detail.packaging.history}
+        items={catalog.packagingItems}
+        units={catalog.units}
+        shiftStart={catalog.shiftStart}
+        allowCapacity
+        onReload={onReload}
+      />
       <section className="flex flex-col gap-3">
         <h3 className="font-semibold">اختيارات ظهرت على السطور</h3>
         {detail.options.length === 0 ? <p>مفيش اختيارات</p> : null}

@@ -61,6 +61,7 @@ const catalog: MappingCatalog = {
     { id: 'item-1', name: 'ملح تجريبي', baseUnit: 'kg' },
     { id: 'item-2', name: 'فلفل تجريبي', baseUnit: 'kg' },
   ],
+  packagingItems: [],
   units: [{ code: 'kg', label: 'كيلو' }],
   shiftStart: null,
 };
@@ -82,6 +83,15 @@ const detail: SubjectDetail = {
     issues: [{ code: 'unmapped_base', expandIssue: null }],
     requirements: [],
   },
+  packaging: {
+    schedule: {
+      subjectId: null,
+      token: 'pack-token',
+      emptyToken: 'pack-token',
+      versions: [],
+    },
+    history: [],
+  },
 };
 
 function coverage(partial: Partial<Coverage> = {}): Coverage {
@@ -94,6 +104,15 @@ function coverage(partial: Partial<Coverage> = {}): Coverage {
     exceptionLines: 0,
     coverage: null,
     causes: { canceled: 1, open: 0, missing: 0, beforeStockStart: 0 },
+    orders: {
+      eligible: 0,
+      ready: 0,
+      incomplete: 0,
+      coverage: null,
+      causes: { line: 0, packagingUnreviewed: 0, blocked: 0 },
+      excluded: { canceled: 0, open: 0, missing: 0, beforeStockStart: 0 },
+    },
+    orderTypes: [],
     ...partial,
   };
 }
@@ -131,6 +150,11 @@ describe('MappingPage', () => {
     expect(rows[0]).toHaveTextContent('ناقص');
     expect(rows[1]).toHaveTextContent('جاهز');
     expect(screen.getByText('المغطى —')).toBeInTheDocument();
+    expect(screen.getByText('تغطية الطلبات —')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'التغليف' })).toHaveAttribute(
+      'href',
+      '/packaging',
+    );
     expect(screen.getByText(/ملغي 1/)).toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/جنيه|EGP|ج\.م/);
   });
