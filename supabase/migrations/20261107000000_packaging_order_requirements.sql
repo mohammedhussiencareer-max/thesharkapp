@@ -1601,6 +1601,7 @@ declare
   v_num numeric;
   v_den numeric;
   v_containers numeric;
+  v_step numeric;
   v_state text;
 begin
   v_role := case
@@ -1822,9 +1823,20 @@ begin
         v_den := 1;
       elsif p_weighted
       and v_line.capacity_kg is not null then
-        v_containers := pg_catalog.ceil(
-          (p_scale_num / p_scale_den) / v_line.capacity_kg
-        );
+        -- ceil(kg / capacity) from the exact fraction. Numeric division
+        -- rounds the quotient, so 3 / 2.99999999999999999 becomes 1.
+        v_step := p_scale_den * v_line.capacity_kg;
+
+        if p_scale_num > 0
+        and v_step > 0
+        and p_scale_num not in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+        and v_step not in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) then
+          v_containers := pg_catalog.div (p_scale_num, v_step);
+
+          if p_scale_num - v_containers * v_step > 0 then
+            v_containers := v_containers + 1;
+          end if;
+        end if;
 
         if v_containers > 0 then
           v_num := v_containers * v_line.quantity * v_factor;
@@ -1922,6 +1934,418 @@ set
         pg_catalog.jsonb_array_elements (coalesce(p_ids, '[]'::jsonb)) as e
     ) d;
 $$;
+
+-- Paths already produced by recipe_expand_exact, annotated with the order
+-- line. The recipe id chain is the walk path; the leaf stock item is appended
+-- so a dish that uses a batch shows dish, batch and stock. A batch or a
+-- cooking recipe in a role the line lookup rejects contributes nothing,
+-- matching pos_map_expand_target.
+create function app.packaging_target_recipe_paths (
+  p_target_kind text,
+  p_recipe_id uuid,
+  p_at timestamptz,
+  p_weighted boolean,
+  p_role text,
+  p_scale_num numeric,
+  p_scale_den numeric,
+  p_line_id text,
+  p_pos_item_id text,
+  p_size_key jsonb,
+  p_option_value text,
+  p_mapping_version_id uuid
+) returns jsonb language plpgsql stable security definer
+set
+  search_path = '' as $$
+declare
+  v_kind text;
+  v_exact jsonb;
+  v_paths jsonb;
+begin
+  if p_target_kind is distinct from 'recipe'
+  or p_recipe_id is null
+  or p_scale_num is null
+  or p_scale_den is null
+  or p_scale_num <= 0
+  or p_scale_den <= 0 then
+    return '[]'::jsonb;
+  end if;
+
+  select
+    r.kind
+  into v_kind
+  from
+    app.recipes r
+  where
+    r.id = p_recipe_id;
+
+  if v_kind is null
+  or v_kind = 'batch'
+  or (
+    v_kind = 'cooking'
+    and (
+      p_role is distinct from 'option'
+      or not p_weighted
+    )
+  ) then
+    return '[]'::jsonb;
+  end if;
+
+  v_exact := app.recipe_expand_exact (
+    p_recipe_id,
+    p_at,
+    p_scale_num,
+    p_scale_den,
+    (not p_weighted)
+    or p_role is distinct from 'base'
+  );
+
+  select
+    coalesce(
+      pg_catalog.jsonb_agg(
+        pg_catalog.jsonb_strip_nulls (
+          pg_catalog.jsonb_build_object(
+            'source',
+            'recipe',
+            'line_id',
+            p_line_id,
+            'role',
+            p_role,
+            'pos_item_id',
+            p_pos_item_id,
+            'size_key',
+            p_size_key,
+            'option_value',
+            p_option_value,
+            'mapping_version_id',
+            p_mapping_version_id,
+            'recipe_line_id',
+            e.value ->> 'line_id',
+            'stock_item_id',
+            e.value ->> 'stock_item_id',
+            'path',
+            (e.value -> 'path') || pg_catalog.jsonb_build_array(e.value ->> 'stock_item_id')
+          )
+        )
+        order by
+          e.ordinality
+      ),
+      '[]'::jsonb
+    )
+  into v_paths
+  from
+    pg_catalog.jsonb_array_elements (
+      coalesce(v_exact -> 'provenance' -> 'paths', '[]'::jsonb)
+    ) with ordinality as e (value, ordinality);
+
+  return v_paths;
+end;
+$$;
+
+comment on function app.packaging_target_recipe_paths (
+  text,
+  uuid,
+  timestamptz,
+  boolean,
+  text,
+  numeric,
+  numeric,
+  text,
+  text,
+  jsonb,
+  text,
+  uuid
+) is 'Recipe expansion paths for one mapping target, from recipe_expand_exact. Each path is the recipe chain plus the leaf stock item, with the order line, role and option value. Internal.';
+
+-- Same expand gates as the line lookup: an exception or an unusable weight
+-- stops the line, none_expected ignores options, and a repeated option value
+-- is ambiguous. Item-scoped option mappings win over the global one.
+create function app.packaging_line_recipe_paths (p_order_id text, p_line_id text) returns jsonb language plpgsql stable security definer
+set
+  search_path = '' as $$
+declare
+  v_item text;
+  v_ordered timestamptz;
+  v_qty numeric;
+  v_weighted numeric;
+  v_weighted_unit text;
+  v_options jsonb;
+  v_key jsonb;
+  v_map_id uuid;
+  v_map_kind text;
+  v_map_recipe uuid;
+  v_exc_id uuid;
+  v_policy text;
+  v_weighted_line boolean;
+  v_scale_num numeric;
+  v_scale_den numeric;
+  v_unit_code text;
+  v_ratio_num numeric;
+  v_ratio_den numeric;
+  v_stop boolean := false;
+  v_paths jsonb := '[]'::jsonb;
+  v_elem jsonb;
+  v_values text[] := '{}'::text[];
+  v_opt record;
+  v_opt_id uuid;
+  v_opt_kind text;
+  v_opt_recipe uuid;
+begin
+  select
+    l.item_id,
+    o.ordered_at,
+    l.quantity,
+    l.weighted_qty,
+    l.weighted_unit,
+    l.options
+  into v_item,
+    v_ordered,
+    v_qty,
+    v_weighted,
+    v_weighted_unit,
+    v_options
+  from
+    app.pos_order_lines l
+    join app.pos_orders o on o.id = l.order_id
+  where
+    l.order_id = p_order_id
+    and l.line_id = p_line_id;
+
+  if not found then
+    return '[]'::jsonb;
+  end if;
+
+  v_key := app.pos_size_key (
+    (
+      select
+        l.size_name
+      from
+        app.pos_order_lines l
+      where
+        l.order_id = p_order_id
+        and l.line_id = p_line_id
+    )
+  );
+
+  select
+    v.id,
+    v.target_kind,
+    v.recipe_id
+  into v_map_id,
+    v_map_kind,
+    v_map_recipe
+  from
+    app.pos_map_versions v
+    join app.pos_map_subjects s on s.id = v.subject_id
+  where
+    s.kind = 'base'
+    and s.pos_item_id = v_item
+    and s.size_key = v_key
+    and v.family = 'mapping'
+    and v.superseded_change_id is null
+    and v.valid_during @> v_ordered
+  limit
+    1;
+
+  select
+    v.id
+  into v_exc_id
+  from
+    app.pos_map_versions v
+    join app.pos_map_subjects s on s.id = v.subject_id
+  where
+    s.kind = 'base'
+    and s.pos_item_id = v_item
+    and s.size_key = v_key
+    and v.family = 'exception'
+    and v.superseded_change_id is null
+    and v.valid_during @> v_ordered
+  limit
+    1;
+
+  select
+    v.option_policy
+  into v_policy
+  from
+    app.pos_map_versions v
+    join app.pos_map_subjects s on s.id = v.subject_id
+  where
+    s.kind = 'base'
+    and s.pos_item_id = v_item
+    and s.size_key = v_key
+    and v.family = 'option_policy'
+    and v.superseded_change_id is null
+    and v.valid_during @> v_ordered
+  limit
+    1;
+
+  if v_exc_id is not null then
+    return '[]'::jsonb;
+  end if;
+
+  v_weighted_line := v_weighted is not null;
+
+  if v_weighted_line then
+    v_unit_code := app.resolve_unit_code (v_weighted_unit);
+
+    if v_unit_code is null then
+      v_scale_num := null;
+    else
+      select
+        r.ratio_num,
+        r.ratio_den
+      into v_ratio_num,
+        v_ratio_den
+      from
+        app.recipe_unit_ratio (v_unit_code, 'kg') r;
+
+      if not found then
+        v_scale_num := null;
+      else
+        v_scale_num := v_weighted * v_ratio_num;
+        v_scale_den := v_ratio_den;
+      end if;
+    end if;
+
+    if v_scale_num is null then
+      v_stop := true;
+    end if;
+  else
+    v_scale_num := v_qty;
+    v_scale_den := 1;
+  end if;
+
+  if v_stop then
+    return '[]'::jsonb;
+  end if;
+
+  if v_map_id is not null then
+    v_paths := v_paths || app.packaging_target_recipe_paths (
+      v_map_kind,
+      v_map_recipe,
+      v_ordered,
+      v_weighted_line,
+      'base',
+      v_scale_num,
+      v_scale_den,
+      p_line_id,
+      v_item,
+      v_key,
+      null,
+      v_map_id
+    );
+  end if;
+
+  if v_policy = 'none_expected' then
+    return v_paths;
+  end if;
+
+  for v_elem in
+  select
+    e.value
+  from
+    pg_catalog.jsonb_array_elements (coalesce(v_options, '[]'::jsonb)) as e
+  loop
+    if pg_catalog.jsonb_typeof (v_elem) = 'object'
+    and nullif(btrim(v_elem ->> 'value'), '') is not null then
+      v_values := pg_catalog.array_append(v_values, btrim(v_elem ->> 'value'));
+    end if;
+  end loop;
+
+  for v_opt in
+  select
+    u.val,
+    count(*) as n
+  from
+    pg_catalog.unnest (v_values) with ordinality as u (val, ord)
+  group by
+    u.val
+  order by
+    min(u.ord)
+  loop
+    if v_opt.n > 1 then
+      continue;
+    end if;
+
+    v_opt_id := null;
+    v_opt_kind := null;
+    v_opt_recipe := null;
+
+    select
+      v.id,
+      v.target_kind,
+      v.recipe_id
+    into v_opt_id,
+      v_opt_kind,
+      v_opt_recipe
+    from
+      app.pos_map_versions v
+      join app.pos_map_subjects s on s.id = v.subject_id
+    where
+      s.kind = 'option'
+      and s.option_scope = 'item'
+      and s.pos_item_id = v_item
+      and s.size_key = v_key
+      and s.option_value = v_opt.val
+      and v.family = 'mapping'
+      and v.superseded_change_id is null
+      and v.valid_during @> v_ordered
+    limit
+      1;
+
+    if not found then
+      select
+        v.id,
+        v.target_kind,
+        v.recipe_id
+      into v_opt_id,
+        v_opt_kind,
+        v_opt_recipe
+      from
+        app.pos_map_versions v
+        join app.pos_map_subjects s on s.id = v.subject_id
+      where
+        s.kind = 'option'
+        and s.option_scope = 'global'
+        and s.option_value = v_opt.val
+        and s.pos_item_id is null
+        and s.size_key is null
+        and v.family = 'mapping'
+        and v.superseded_change_id is null
+        and v.valid_during @> v_ordered
+      limit
+        1;
+
+      if not found
+      or v_opt_kind = 'unmapped' then
+        continue;
+      end if;
+    end if;
+
+    if v_opt_kind in ('unmapped', 'no_stock') then
+      continue;
+    end if;
+
+    v_paths := v_paths || app.packaging_target_recipe_paths (
+      v_opt_kind,
+      v_opt_recipe,
+      v_ordered,
+      v_weighted_line,
+      'option',
+      v_scale_num,
+      v_scale_den,
+      p_line_id,
+      v_item,
+      v_key,
+      v_opt.val,
+      v_opt_id
+    );
+  end loop;
+
+  return v_paths;
+end;
+$$;
+
+comment on function app.packaging_line_recipe_paths (text, text) is 'Recipe expansion paths for one order line at its ordered_at. Base and option contributions carry the order line id, role and, for an option, the option value. Internal.';
 
 create function app.resolve_order_requirements_exact (p_order_id text, p_expected_order_version integer) returns jsonb language plpgsql stable security definer
 set
@@ -2108,6 +2532,7 @@ begin
       ),
       '[]'::jsonb
     );
+    v_paths := v_paths || app.packaging_line_recipe_paths (p_order_id, v_line.line_id);
 
     if v_exact ->> 'status' = 'exception' then
       v_lines := v_lines || pg_catalog.jsonb_build_array(
@@ -3180,6 +3605,8 @@ begin
         'packaging_base_schedule',
         'packaging_kg_scale',
         'packaging_expand',
+        'packaging_target_recipe_paths',
+        'packaging_line_recipe_paths',
         'packaging_distinct_ids',
         'resolve_order_requirements_exact',
         'resolve_order_requirements'
@@ -3194,8 +3621,12 @@ begin
 end;
 $$;
 
+-- PR 6 grants service_role SELECT on its security-invoker views. This view
+-- calls packaging_order_type_key, so the same role needs EXECUTE on that
+-- pure helper or a populated read fails.
 grant
-execute on function app.packaging_order_type_key (text) to authenticated;
+execute on function app.packaging_order_type_key (text) to authenticated,
+service_role;
 
 grant
 execute on function app.set_order_type_packaging (

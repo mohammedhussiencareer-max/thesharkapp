@@ -2,7 +2,7 @@
 begin;
 
 select
-  plan (172);
+  plan (190);
 
 insert into
   auth.users (
@@ -334,6 +334,30 @@ from
         'hall',
         '2030-07-01 19:55:00+00'::timestamptz,
         true
+      ),
+      (
+        'order-pack-exact',
+        'shift-pack-july',
+        'complete',
+        'delivery',
+        '2030-07-01 20:10:00+00'::timestamptz,
+        false
+      ),
+      (
+        'order-pack-tight',
+        'shift-pack-july',
+        'complete',
+        'tight',
+        '2030-07-01 20:20:00+00'::timestamptz,
+        false
+      ),
+      (
+        'order-pack-nest',
+        'shift-pack-july',
+        'complete',
+        'nest',
+        '2030-07-01 20:30:00+00'::timestamptz,
+        false
       )
   ) as o (
     id,
@@ -637,6 +661,39 @@ values
     'line-cap',
     'pos-cap',
     'سعة',
+    1,
+    null,
+    null,
+    '[]'::jsonb,
+    0
+  ),
+  (
+    'order-pack-exact',
+    'line-exact',
+    'pos-weight',
+    'وزن',
+    1,
+    2.0,
+    'kg',
+    '[]'::jsonb,
+    0
+  ),
+  (
+    'order-pack-tight',
+    'line-tight',
+    'pos-tight',
+    'حد',
+    1,
+    3,
+    'kg',
+    '[]'::jsonb,
+    0
+  ),
+  (
+    'order-pack-nest',
+    'line-nest',
+    'pos-nest',
+    'طبق',
     1,
     null,
     null,
@@ -1072,6 +1129,287 @@ select
     ),
     '3',
     'the expansion path records the container count as text'
+  );
+
+select
+  is (
+    (
+      select
+        e.value ->> 'quantity'
+      from
+        pg_catalog.jsonb_array_elements (
+          app.resolve_order_requirements ('order-pack-exact', null) -> 'requirements'
+        ) as e
+      where
+        e.value ->> 'base_unit' = 'piece'
+    ),
+    '2',
+    'an exact multiple of the capacity is that many boxes'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_base_mapping(
+      'a4700000-0000-4000-8000-000000000921',
+      'pos-tight', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      jsonb_build_object(
+        'stock_item_id', (select id from app.stock_items where name = 'ملح التغليف'),
+        'quantity_per_basis', '1', 'unit', 'kg'
+      ),
+      (select app.pos_base_schedule('pos-tight', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the tight-capacity item maps to salt'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_option_policy(
+      'a4700000-0000-4000-8000-000000000922',
+      'pos-tight', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      'none_expected',
+      (select app.pos_base_schedule('pos-tight', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the tight-capacity item expects no options'
+  );
+
+select
+  lives_ok (
+    $$select app.set_order_type_packaging(
+      'a4700000-0000-4000-8000-000000000923',
+      'tight', '2030-01-01 00:00:00+00', null,
+      '{"none": true}'::jsonb,
+      (select app.packaging_order_type_schedule('tight') ->> 'token'),
+      null
+    )$$,
+    'the tight order type has no packaging'
+  );
+
+select
+  lives_ok (
+    $$select app.set_base_packaging(
+      'a4700000-0000-4000-8000-000000000924',
+      'pos-tight', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      jsonb_build_object('lines', jsonb_build_array(jsonb_build_object(
+        'stock_item_id', (select id from app.stock_items where name = 'علبة التغليف'),
+        'quantity', '1', 'unit', 'piece', 'capacity_kg', '2.99999999999999999'
+      ))),
+      (select app.packaging_base_schedule('pos-tight', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the tight capacity is just under 3 kilograms'
+  );
+
+select
+  is (
+    (
+      select
+        e.value ->> 'quantity'
+      from
+        pg_catalog.jsonb_array_elements (
+          app.resolve_order_requirements ('order-pack-tight', null) -> 'requirements'
+        ) as e
+      where
+        e.value ->> 'base_unit' = 'piece'
+    ),
+    '2',
+    '3 kilograms in a box of 2.99999999999999999 kilograms is 2 boxes'
+  );
+
+select
+  lives_ok (
+    $$select app.create_recipe(
+      'a4700000-0000-4000-8000-000000000931', 'خلطة التغليف', 'batch'
+    )$$,
+    'a batch recipe used inside a dish'
+  );
+
+select
+  lives_ok (
+    $$select app.create_recipe(
+      'a4700000-0000-4000-8000-000000000932', 'طبق التغليف', 'dish'
+    )$$,
+    'a dish that uses the batch'
+  );
+
+select
+  lives_ok (
+    $$select app.set_recipe_version(
+      'a4700000-0000-4000-8000-000000000933',
+      (select id from app.recipes where name = 'خلطة التغليف'),
+      '2030-01-01 00:00:00+00', null, 1, 'kg',
+      jsonb_build_array(jsonb_build_object(
+        'stock_item_id', (select id from app.stock_items where name = 'ملح التغليف'),
+        'quantity', '1', 'unit', 'kg'
+      )),
+      null,
+      (select app.recipe_schedule((select id from app.recipes where name = 'خلطة التغليف')) ->> 'token')
+    )$$,
+    'the batch is one kilogram of salt'
+  );
+
+select
+  lives_ok (
+    $$select app.set_recipe_version(
+      'a4700000-0000-4000-8000-000000000934',
+      (select id from app.recipes where name = 'طبق التغليف'),
+      '2030-01-01 00:00:00+00', null, null, null,
+      jsonb_build_array(jsonb_build_object(
+        'child_recipe_id', (select id from app.recipes where name = 'خلطة التغليف'),
+        'quantity', '1', 'unit', 'kg'
+      )),
+      null,
+      (select app.recipe_schedule((select id from app.recipes where name = 'طبق التغليف')) ->> 'token')
+    )$$,
+    'the dish uses one batch'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_base_mapping(
+      'a4700000-0000-4000-8000-000000000935',
+      'pos-nest', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      jsonb_build_object(
+        'recipe_id', (select id from app.recipes where name = 'طبق التغليف')
+      ),
+      (select app.pos_base_schedule('pos-nest', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the nested item maps to the dish'
+  );
+
+select
+  lives_ok (
+    $$select app.set_pos_option_policy(
+      'a4700000-0000-4000-8000-000000000936',
+      'pos-nest', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      'none_expected',
+      (select app.pos_base_schedule('pos-nest', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the nested item expects no options'
+  );
+
+select
+  lives_ok (
+    $$select app.set_order_type_packaging(
+      'a4700000-0000-4000-8000-000000000937',
+      'nest', '2030-01-01 00:00:00+00', null,
+      '{"none": true}'::jsonb,
+      (select app.packaging_order_type_schedule('nest') ->> 'token'),
+      null
+    )$$,
+    'the nested order type has no packaging'
+  );
+
+select
+  lives_ok (
+    $$select app.set_base_packaging(
+      'a4700000-0000-4000-8000-000000000938',
+      'pos-nest', '["none"]'::jsonb, '2030-01-01 00:00:00+00', null,
+      '{"none": true}'::jsonb,
+      (select app.packaging_base_schedule('pos-nest', '["none"]'::jsonb) ->> 'token'),
+      null
+    )$$,
+    'the nested item has no packaging'
+  );
+
+select
+  is (
+    app.resolve_order_requirements ('order-pack-nest', null) ->> 'status',
+    'ready',
+    'a dish of a batch is ready'
+  );
+
+select
+  is (
+    (
+      select
+        bool_or(
+          e.value -> 'path' = pg_catalog.jsonb_build_array (
+            (
+              select
+                id::text
+              from
+                app.recipes
+              where
+                name = 'طبق التغليف'
+            ),
+            (
+              select
+                id::text
+              from
+                app.recipes
+              where
+                name = 'خلطة التغليف'
+            ),
+            (
+              select
+                id::text
+              from
+                app.stock_items
+              where
+                name = 'ملح التغليف'
+            )
+          )
+          and e.value ->> 'source' = 'recipe'
+          and e.value ->> 'role' = 'base'
+          and e.value ->> 'line_id' = 'line-nest'
+          and e.value ->> 'stock_item_id' = (
+            select
+              id::text
+            from
+              app.stock_items
+            where
+              name = 'ملح التغليف'
+          )
+        )
+      from
+        pg_catalog.jsonb_array_elements (
+          app.resolve_order_requirements ('order-pack-nest', null) -> 'provenance' -> 'paths'
+        ) as e
+    ),
+    true,
+    'the expansion path is the dish, the batch and the stock item'
+  );
+
+select
+  is (
+    (
+      select
+        doc -> 'provenance' -> 'recipe_versions' @> pg_catalog.jsonb_build_array (
+          pg_catalog.to_jsonb (dish.id),
+          pg_catalog.to_jsonb (batch.id)
+        )
+      from
+        (
+          select
+            app.resolve_order_requirements ('order-pack-nest', null) as doc
+        ) resolved
+        cross join (
+          select
+            v.id
+          from
+            app.recipe_versions v
+            join app.recipes r on r.id = v.recipe_id
+          where
+            r.name = 'طبق التغليف'
+            and v.superseded_change_id is null
+        ) dish
+        cross join (
+          select
+            v.id
+          from
+            app.recipe_versions v
+            join app.recipes r on r.id = v.recipe_id
+          where
+            r.name = 'خلطة التغليف'
+            and v.superseded_change_id is null
+        ) batch
+    ),
+    true,
+    'the order provenance lists both recipe versions'
   );
 
 select
@@ -2790,6 +3128,20 @@ select
     '42501',
     null::text,
     'anon cannot read observed order types'
+  );
+
+set
+  local role service_role;
+
+select
+  ok (
+    (
+      select
+        count(*)
+      from
+        app.packaging_observed_order_types
+    ) > 0,
+    'service_role can read observed order types that have rows'
   );
 
 select

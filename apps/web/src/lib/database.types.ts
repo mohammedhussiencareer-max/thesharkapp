@@ -1368,6 +1368,9 @@ isOneToOne: false
 "packaging_kg_scale":
 { Args: { "p_qty": number,"p_unit": string }; Returns: Json
                            },
+"packaging_line_recipe_paths":
+{ Args: { "p_line_id": string,"p_order_id": string }; Returns: Json
+                           },
 "packaging_normalize_policy":
 { Args: { "p_allow_capacity": boolean,"p_policy": Json }; Returns: Json
                            },
@@ -1385,6 +1388,9 @@ isOneToOne: false
                            },
 "packaging_subject_id":
 { Args: { "p_kind": string,"p_order_type_key": Json,"p_pos_item_id": string,"p_size_key": Json }; Returns: string
+                           },
+"packaging_target_recipe_paths":
+{ Args: { "p_at": string,"p_line_id": string,"p_mapping_version_id": string,"p_option_value": string,"p_pos_item_id": string,"p_recipe_id": string,"p_role": string,"p_scale_den": number,"p_scale_num": number,"p_size_key": Json,"p_target_kind": string,"p_weighted": boolean }; Returns: Json
                            },
 "packaging_token":
 { Args: { "p_kind": string,"p_order_type_key": Json,"p_pos_item_id": string,"p_size_key": Json }; Returns: string

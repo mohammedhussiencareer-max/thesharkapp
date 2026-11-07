@@ -187,7 +187,14 @@ function unreviewedCount(text: string | null): number {
  * summary has to match the coverage response for that day before we read it.
  */
 async function showDay(page: Page, day: string): Promise<void> {
-  await page.getByLabel('إلى تاريخ').fill(day);
+  const to = page.getByLabel('إلى تاريخ');
+  const from = page.getByLabel('من تاريخ');
+  // A re-render during fill can drop the end date and leave start after end,
+  // which never requests coverage. Confirm the end date before moving the start.
+  await expect(async () => {
+    if ((await to.inputValue()) !== day) await to.fill(day);
+    await expect(to).toHaveValue(day);
+  }).toPass({ timeout: 20_000 });
   const loaded = page.waitForResponse(
     (response) => {
       if (!response.url().includes('pos_mapping_coverage') || !response.ok()) {
@@ -206,7 +213,10 @@ async function showDay(page: Page, day: string): Promise<void> {
     },
     { timeout: 20_000 },
   );
-  await page.getByLabel('من تاريخ').fill(day);
+  await expect(async () => {
+    if ((await from.inputValue()) !== day) await from.fill(day);
+    await expect(from).toHaveValue(day);
+  }).toPass({ timeout: 20_000 });
   const response = await loaded;
   const payload = (await response.json()) as {
     orders?: { ready?: number; eligible?: number; coverage?: number | null };

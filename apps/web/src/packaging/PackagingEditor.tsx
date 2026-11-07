@@ -13,6 +13,7 @@ import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatCairo } from '@/lib/cairo';
 import { primaryButton } from '@/lib/page-style';
 import { coverAt, quantityError } from '@/mapping/format';
+import { sourceChangedMessage } from '@/mapping/labels';
 import { setBasePackaging, setOrderTypePackaging } from '@/packaging/api';
 import type {
   BasePackagingWrite,
@@ -122,16 +123,40 @@ function PackagingForm({
   const [mountNow] = useState(() => currentMinuteMs(Date.now()));
   const atMs = timing.instantMs ?? mountNow;
   const covering = coverAt(schedule.versions, atMs);
+  const seedKey = `${covering?.id ?? ''}|${schedule.token}`;
+  const [seeded, setSeeded] = useState({
+    key: seedKey,
+    versionId: covering?.id ?? null,
+  });
+  const [dirty, setDirty] = useState(false);
   const [mode, setMode] = useState<PackagingMode>(covering?.decision ?? 'gap');
   const [lines, setLines] = useState<DraftLine[]>(() =>
     draftsFrom(covering, units),
   );
+
+  if (seeded.key !== seedKey && !dirty) {
+    setSeeded({ key: seedKey, versionId: covering?.id ?? null });
+    setMode(covering?.decision ?? 'gap');
+    setLines(draftsFrom(covering, units));
+  }
 
   function submit(event: FormEvent) {
     event.preventDefault();
     const built = timing.build();
     if (!built.ok) {
       onError(built.error);
+      return;
+    }
+    const inForce = coverAt(schedule.versions, built.instantMs ?? atMs);
+    if ((inForce?.id ?? null) !== seeded.versionId) {
+      setMode(inForce?.decision ?? 'gap');
+      setLines(draftsFrom(inForce, units));
+      setSeeded({
+        key: `${inForce?.id ?? ''}|${schedule.token}`,
+        versionId: inForce?.id ?? null,
+      });
+      setDirty((inForce?.id ?? null) !== (covering?.id ?? null));
+      onError(sourceChangedMessage);
       return;
     }
     let policy: PackagingPolicy | null = null;
@@ -209,6 +234,7 @@ function PackagingForm({
           onChange={(event) => {
             const next = event.target.value;
             if (next === 'lines' || next === 'none' || next === 'gap') {
+              setDirty(true);
               setMode(next);
             }
           }}
@@ -229,6 +255,7 @@ function PackagingForm({
                   value={line.stockItemId}
                   onChange={(event) => {
                     const stockItemId = event.target.value;
+                    setDirty(true);
                     setLines((current) =>
                       current.map((entry, entryIndex) =>
                         entryIndex === index
@@ -255,6 +282,7 @@ function PackagingForm({
                   value={line.quantity}
                   onChange={(event) => {
                     const quantity = event.target.value;
+                    setDirty(true);
                     setLines((current) =>
                       current.map((entry, entryIndex) =>
                         entryIndex === index ? { ...entry, quantity } : entry,
@@ -271,6 +299,7 @@ function PackagingForm({
                   value={line.unit}
                   onChange={(event) => {
                     const unit = event.target.value;
+                    setDirty(true);
                     setLines((current) =>
                       current.map((entry, entryIndex) =>
                         entryIndex === index ? { ...entry, unit } : entry,
@@ -295,6 +324,7 @@ function PackagingForm({
                     value={line.capacity}
                     onChange={(event) => {
                       const capacity = event.target.value;
+                      setDirty(true);
                       setLines((current) =>
                         current.map((entry, entryIndex) =>
                           entryIndex === index ? { ...entry, capacity } : entry,
@@ -309,11 +339,12 @@ function PackagingForm({
                   className="w-fit underline"
                   type="button"
                   disabled={disabled}
-                  onClick={() =>
+                  onClick={() => {
+                    setDirty(true);
                     setLines((current) =>
                       current.filter((entry) => entry.key !== line.key),
-                    )
-                  }
+                    );
+                  }}
                 >
                   شيل السطر
                 </button>
@@ -326,7 +357,10 @@ function PackagingForm({
           className="w-fit underline"
           type="button"
           disabled={disabled}
-          onClick={() => setLines((current) => [...current, blankLine(units)])}
+          onClick={() => {
+            setDirty(true);
+            setLines((current) => [...current, blankLine(units)]);
+          }}
         >
           ضيف سطر
         </button>
