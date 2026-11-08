@@ -2,7 +2,8 @@
 -- Items e5100000-…-0001 cents, 0002 covered sale, 0003 waste, 0004 uncovered,
 -- 0005 reallocation, 0006 seed, 0007 missing basis, 0008 approved zero,
 -- 0009 known average, 000a same-instant order, 000b count compensation,
--- 000c legacy silent zero.
+-- 000c legacy silent zero, 000d cover order, 000e reclass,
+-- 000f overflow, 0010 negative unit, 0011 sort shape.
 begin;
 
 select
@@ -172,6 +173,51 @@ values
     'daily',
     0,
     null
+  ),
+  (
+    'e5100000-0000-4000-8000-00000000000d',
+    'p51-cover',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e5100000-0000-4000-8000-00000000000e',
+    'p51-reclass',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e5100000-0000-4000-8000-00000000000f',
+    'p51-overflow',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e5100000-0000-4000-8000-000000000010',
+    'p51-neg-unit',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e5100000-0000-4000-8000-000000000011',
+    'p51-sort-shape',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
   );
 
 insert into
@@ -180,6 +226,12 @@ values
   (
     'shift-p51',
     '2026-01-01T00:00:00Z',
+    true,
+    '2026-01-01T00:00:00Z'
+  ),
+  (
+    'shift-p51-reclass',
+    '2027-01-01T00:00:00Z',
     true,
     '2026-01-01T00:00:00Z'
   );
@@ -1722,6 +1774,365 @@ select
     '22023',
     'disallowed movement_type in post_movements: count_compensation',
     'post_movements rejects count_compensation'
+  );
+
+-- Two same-instant seed shortages. The earlier event_position is inserted
+-- second, so it has the newer id. A later purchase of 1 must cover that one.
+select
+  lives_ok (
+    $$select app.set_item_opening_price(
+      'e5100000-0000-4000-8000-0000000000d1',
+      'e5100000-0000-4000-8000-00000000000d',
+      40,
+      null,
+      null,
+      'kg|seafood||'
+    )$$,
+    'cover-order item gets an opening price of 40'
+  );
+
+select
+  lives_ok (
+    $$select app.post_engine_outflows(jsonb_build_array(
+      jsonb_build_object(
+        'item_id', 'e5100000-0000-4000-8000-00000000000d',
+        'movement_type', 'sale',
+        'occurred_at', '2026-11-08T10:00:00Z',
+        'quantity', 1,
+        'event_position', 20
+      ),
+      jsonb_build_object(
+        'item_id', 'e5100000-0000-4000-8000-00000000000d',
+        'movement_type', 'sale',
+        'occurred_at', '2026-11-08T10:00:00Z',
+        'quantity', 1,
+        'event_position', 10
+      )
+    ))$$,
+    'two same-instant shortages are posted with the earlier position on the newer id'
+  );
+
+select
+  ok (
+    (
+      select
+        max(sm.id) filter (
+          where
+            sm.event_position = 10
+        ) > max(sm.id) filter (
+          where
+            sm.event_position = 20
+        )
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'e5100000-0000-4000-8000-00000000000d'
+        and sm.movement_type = 'sale'
+    ),
+    'the earlier shortage has the newer id'
+  );
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'e5100000-0000-4000-8000-00000000000d',
+      'movement_type', 'purchase',
+      'occurred_at', '2026-11-08T12:00:00Z',
+      'quantity', 1,
+      'unit_cost', 100
+    )))$$,
+    'one purchased unit covers the first logical shortage'
+  );
+
+select
+  results_eq (
+    $$select sm.event_position, ca.total_cost
+      from app.stock_movements ca
+      join app.stock_movements sm on sm.id = ca.adjusts_movement_id
+      where ca.item_id = 'e5100000-0000-4000-8000-00000000000d'
+        and ca.movement_type = 'cost_adjustment'$$,
+    $$values (10::bigint, -60::numeric(14, 2))$$,
+    'the forward purchase covers event 10, the newer id, at seed 40'
+  );
+
+select
+  is (
+    (
+      select
+        pd.qty_uncovered
+      from
+        app.provisional_deficits pd
+        join app.stock_movements sm on sm.id = pd.movement_id
+      where
+        sm.item_id = 'e5100000-0000-4000-8000-00000000000d'
+        and sm.event_position = 20
+    ),
+    1::numeric,
+    'the later event stays uncovered'
+  );
+
+select
+  lives_ok (
+    $$select app.rebuild_derived_balances(
+      array['e5100000-0000-4000-8000-00000000000d']::uuid[],
+      'e5100000-0000-4000-8000-0000000000d2'
+    )$$,
+    'replaying the two shortages keeps the same cover'
+  );
+
+select
+  results_eq (
+    $$select sm.event_position, ca.total_cost
+      from app.stock_movements ca
+      join app.stock_movements sm on sm.id = ca.adjusts_movement_id
+      where ca.item_id = 'e5100000-0000-4000-8000-00000000000d'
+        and ca.movement_type = 'cost_adjustment'$$,
+    $$values (10::bigint, -60::numeric(14, 2))$$,
+    'replay covers the same earlier event and does not move the adjustment'
+  );
+
+-- Retire a -100 sale and repost it as -100 waste. Stock and profit_delta stay
+-- where the sale left them; the new cogs and waste revisions are opposite.
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'e5100000-0000-4000-8000-00000000000e',
+      'movement_type', 'purchase',
+      'occurred_at', '2026-11-08T08:00:00Z',
+      'quantity', 1,
+      'unit_cost', 100
+    )))$$,
+    'reclass item purchases 1 kg at 100'
+  );
+
+select
+  lives_ok (
+    $$select app.post_engine_outflows(jsonb_build_array(jsonb_build_object(
+      'item_id', 'e5100000-0000-4000-8000-00000000000e',
+      'movement_type', 'sale',
+      'occurred_at', '2026-11-08T10:00:00Z',
+      'quantity', 1,
+      'shift_id', 'shift-p51-reclass'
+    )))$$,
+    'the engine sale is posted and noted'
+  );
+
+select
+  results_eq (
+    $$select
+        ib.on_hand_qty,
+        ib.on_hand_value,
+        pr.bucket,
+        pr.amount,
+        (
+          select f.profit_delta
+          from app.shift_report_flags f
+          where f.shift_id = 'shift-p51-reclass'
+        ),
+        (
+          select count(*)
+          from app.period_revisions noted
+          where noted.source_movement_id = sale.id
+        )
+      from app.item_balances ib
+      join app.stock_movements sale
+        on sale.item_id = ib.item_id
+        and sale.movement_type = 'sale'
+      join app.period_revisions pr on pr.source_movement_id = sale.id
+      where ib.item_id = 'e5100000-0000-4000-8000-00000000000e'$$,
+    $$values (
+      0::numeric(20, 6),
+      0::numeric(14, 2),
+      'cogs',
+      -100::numeric(14, 2),
+      -100::numeric(14, 2),
+      1::bigint
+    )$$,
+    'the engine sale is noted once in cogs and clears the stock'
+  );
+
+select
+  lives_ok (
+    $$select app.retire_movements(
+      array[(
+        select id from app.stock_movements
+        where item_id = 'e5100000-0000-4000-8000-00000000000e'
+          and movement_type = 'sale'
+      )],
+      'e5100000-0000-4000-8000-0000000000e1'
+    )$$,
+    'the sale is retired'
+  );
+
+select
+  lives_ok (
+    $$select app.post_engine_outflows(jsonb_build_array(jsonb_build_object(
+      'item_id', 'e5100000-0000-4000-8000-00000000000e',
+      'movement_type', 'waste',
+      'occurred_at', '2026-11-08T11:00:00Z',
+      'quantity', 1,
+      'shift_id', 'shift-p51-reclass'
+    )))$$,
+    'the same quantity is reposted as waste'
+  );
+
+select
+  results_eq (
+    $$select
+        ib.on_hand_qty,
+        ib.on_hand_value,
+        (
+          select coalesce(sum(pr.amount), 0)
+          from app.period_revisions pr
+          where pr.item_id = ib.item_id
+            and pr.bucket = 'cogs'
+        ),
+        (
+          select coalesce(sum(pr.amount), 0)
+          from app.period_revisions pr
+          where pr.item_id = ib.item_id
+            and pr.bucket = 'waste'
+        ),
+        (
+          select f.profit_delta
+          from app.shift_report_flags f
+          where f.shift_id = 'shift-p51-reclass'
+        ),
+        (
+          select count(*)
+          from app.stock_movements sm
+          where sm.item_id = ib.item_id
+            and sm.movement_type = 'cost_adjustment'
+        )
+      from app.item_balances ib
+      where ib.item_id = 'e5100000-0000-4000-8000-00000000000e'$$,
+    $$values (
+      0::numeric(20, 6),
+      0::numeric(14, 2),
+      0::numeric,
+      -100::numeric,
+      -100::numeric(14, 2),
+      0::bigint
+    )$$,
+    'reclass leaves stock and profit_delta unchanged, with cogs and waste opposite'
+  );
+
+select
+  results_eq (
+    $$select pr.bucket, pr.amount
+      from app.period_revisions pr
+      join app.stock_movements sm on sm.id = pr.source_movement_id
+      where pr.item_id = 'e5100000-0000-4000-8000-00000000000e'
+        and sm.movement_type in ('sale_reversal', 'waste')
+      order by sm.movement_type::text$$,
+    $$values ('cogs', 100::numeric(14, 2)), ('waste', -100::numeric(14, 2))$$,
+    'retirement adds 100 cogs and the waste repost adds -100 waste'
+  );
+
+-- Real replay failures, not the helper in isolation.
+select
+  lives_ok (
+    $$select app.set_item_opening_price(
+      'e5100000-0000-4000-8000-0000000000f0',
+      'e5100000-0000-4000-8000-00000000000f',
+      1000000,
+      null,
+      null,
+      'kg|seafood||'
+    )$$,
+    'overflow item gets an opening price of 1000000'
+  );
+
+select
+  is (
+    pg_temp.caught (
+      $$select app.post_engine_outflows(jsonb_build_array(jsonb_build_object(
+        'item_id', 'e5100000-0000-4000-8000-00000000000f',
+        'movement_type', 'sale',
+        'occurred_at', '2026-11-08T10:00:00Z',
+        'quantity', 1000000
+      )))$$
+    ),
+    '22023|recompute result is out of range|critical',
+    'a shortage whose seed value overflows numeric(14,2) is detail critical'
+  );
+
+select
+  is_empty (
+    $$select sm.id::text from app.stock_movements sm
+      where sm.item_id = 'e5100000-0000-4000-8000-00000000000f'
+      union all
+      select seed.item_id::text from app.item_provisional_seeds seed
+      where seed.item_id = 'e5100000-0000-4000-8000-00000000000f'$$,
+    'the overflow rolls back the movement and the seed'
+  );
+
+select
+  is (
+    pg_temp.caught (
+      $$insert into app.stock_movements (
+          batch_id, item_id, movement_type, occurred_at, quantity, unit_cost, total_cost
+        ) values (
+          'e5100000-0000-4000-8000-000000000101',
+          'e5100000-0000-4000-8000-000000000010',
+          'purchase',
+          '2026-11-08T08:00:00Z',
+          1, -1, -1
+        );
+        select app.rebuild_derived_balances(
+          array['e5100000-0000-4000-8000-000000000010']::uuid[],
+          'e5100000-0000-4000-8000-000000000102'
+        )$$
+    ),
+    '22023|recompute result is out of range|critical',
+    'replaying a negative unit cost is detail critical'
+  );
+
+select
+  is (
+    pg_temp.caught (
+      $$insert into app.stock_movements (
+          batch_id, item_id, movement_type, occurred_at, quantity, unit_cost, total_cost
+        ) values (
+          'e5100000-0000-4000-8000-000000000111',
+          'e5100000-0000-4000-8000-000000000011',
+          'sort_in',
+          '2026-11-08T08:00:00Z',
+          1, 1, 1
+        );
+        select app.rebuild_derived_balances(
+          array['e5100000-0000-4000-8000-000000000011']::uuid[],
+          'e5100000-0000-4000-8000-000000000112'
+        )$$
+    ),
+    '22023|recompute result is out of range|critical',
+    'a sort batch without its sort_out is detail critical'
+  );
+
+select
+  is (
+    pg_temp.caught (
+      $$select app.replay_component(
+        array['e5100000-0000-4000-8000-000000000011']::uuid[],
+        jsonb_build_array(jsonb_build_object(
+          'line_key', 1,
+          'batch_id', 'e5100000-0000-4000-8000-000000000113',
+          'item_id', 'e5100000-0000-4000-8000-000000000011',
+          'movement_type', 'sale',
+          'occurred_at', '2026-11-08T10:00:00Z',
+          'quantity', 0,
+          'unit_cost', 1,
+          'total_cost', 0,
+          'is_input_total', false,
+          'source_type', 'engine',
+          'engine_valued', false
+        )),
+        'e5100000-0000-4000-8000-000000000114',
+        false
+      )$$
+    ),
+    '22023|recompute result is out of range|critical',
+    'a zero-quantity replay row is detail critical'
   );
 
 select

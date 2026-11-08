@@ -18,6 +18,27 @@
 -- engine post. app.replay_component is the only replay seam the new posters
 -- call; PR 2 replaces that function with anchor-aware replay.
 -- ============================================================================
+-- 0. Lock order. Same as the costing cutover: the ledger advisory lock is the
+-- first statement, before any DDL, then the tables this migration changes are
+-- locked in one fixed order. An owner base_unit update holds a stock_items
+-- row lock and then waits for this advisory lock. Taking the table lock with
+-- NOWAIT fails with 55P03 instead of waiting into that deadlock.
+-- ============================================================================
+select
+  pg_catalog.pg_advisory_xact_lock (7342750000000000001::bigint);
+
+do $lock_tables$
+begin
+  lock table app.stock_items,
+  app.stock_movements,
+  app.units,
+  ledger_scratch.recompute_bal,
+  ledger_scratch.recompute_def,
+  ledger_scratch.recompute_row in share row exclusive mode nowait;
+end;
+$lock_tables$;
+
+-- ============================================================================
 -- 1. Movement link, stable position, engine valuation flag
 -- ============================================================================
 alter table app.stock_movements
@@ -276,9 +297,54 @@ begin
 end;
 $$;
 
-comment on function app.raise_recompute_failure (text) is 'Raises the historical recompute message. detail recompute_limit is the 100000-row cap. detail critical is a ledger invariant failure.';
+comment on function app.raise_recompute_failure (text) is 'Raises the historical recompute message. detail recompute_limit is the 100000-row cap. detail critical is a ledger invariant failure or a replay value outside the stored numeric range.';
 
 revoke all on function app.raise_recompute_failure (text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+-- Range checks keep the historical message and carry detail critical.
+create or replace function app.assert_recompute_range (
+  p_value numeric,
+  p_scale integer,
+  p_allow_negative boolean
+) returns numeric language plpgsql volatile security definer
+set
+  search_path = '' as $$
+declare
+  v_max numeric;
+begin
+  if p_value is null
+  or p_value = 'NaN'::numeric
+  or p_value = 'Infinity'::numeric
+  or p_value = '-Infinity'::numeric
+  or (
+    not p_allow_negative
+    and p_value < 0
+  ) then
+    perform app.raise_recompute_failure ('critical');
+  end if;
+
+  if p_scale = 2 then
+    v_max := 999999999999.99;
+  else
+    v_max := 99999999999999.999999;
+  end if;
+
+  if p_value > v_max or p_value < -v_max then
+    perform app.raise_recompute_failure ('critical');
+  end if;
+
+  return p_value;
+end;
+$$;
+
+comment on function app.assert_recompute_range (numeric, integer, boolean) is 'Rejects null, non-finite, disallowed negative, and out-of-scale replay values. The refusal is recompute result is out of range with detail critical.';
+
+revoke all on function app.assert_recompute_range (numeric, integer, boolean)
 from
   public,
   anon,
@@ -405,6 +471,279 @@ add column event_position bigint not null default 0,
 add column piece_position integer not null default 0,
 add column engine_valued boolean not null default false;
 
+alter table ledger_scratch.recompute_def
+add column ord_class integer not null default 0,
+add column event_position bigint not null default 0,
+add column piece_position integer not null default 0;
+
+-- Forward covers use the same logical order as replay.
+create or replace function app.apply_inflow_movement (
+  p_batch_id uuid,
+  p_item_id uuid,
+  p_movement_type app.movement_type,
+  p_occurred_at timestamptz,
+  p_in_qty numeric(20, 6),
+  p_in_unit_cost numeric(20, 6),
+  p_shift_id text,
+  p_source_type text,
+  p_source_id text,
+  p_note text,
+  p_in_total_cost numeric(14, 2) default null
+) returns void language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_bal app.item_balances;
+  v_inflow_unit_cost numeric(20, 6);
+  v_inflow_total_cost numeric(14, 2);
+  v_delta_value numeric(14, 2);
+  v_remaining_qty numeric(20, 6);
+  v_remaining_inflow_value numeric(14, 2);
+  v_covered_qty numeric(20, 6);
+  v_covered_inflow_value numeric(14, 2);
+  v_covered_prov_value numeric(14, 2);
+  v_adj_unit_cost numeric(20, 6);
+  v_adj_total_cost numeric(14, 2);
+  v_prior_pos_qty numeric(20, 6);
+  v_on_hand_value_after_cover numeric(14, 2);
+  v_new_avg_cost numeric(20, 6);
+  v_has_deficit boolean;
+  r_def record;
+begin
+  if p_in_qty is null
+  or p_in_qty in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+  or p_in_qty <= 0 then
+    raise exception 'inflow quantity must be a finite number > 0'
+      using errcode = '22023';
+  end if;
+
+  v_bal := app.lock_and_validate_item_balance (p_item_id, p_occurred_at);
+
+  if p_movement_type = 'count_adjustment' then
+    v_inflow_unit_cost := v_bal.avg_cost;
+  else
+    v_inflow_unit_cost := p_in_unit_cost;
+  end if;
+
+  if v_inflow_unit_cost is null
+  or v_inflow_unit_cost in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+  or v_inflow_unit_cost < 0 then
+    raise exception 'inflow unit_cost must be a finite number >= 0'
+      using errcode = '22023';
+  end if;
+
+  if p_in_total_cost is not null then
+    if p_in_total_cost in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+    or p_in_total_cost < 0 then
+      raise exception 'inflow total_cost must be a finite number >= 0'
+        using errcode = '22023';
+    end if;
+    v_inflow_total_cost := p_in_total_cost;
+  else
+    v_inflow_total_cost := pg_catalog.round(p_in_qty * v_inflow_unit_cost, 2);
+  end if;
+
+  insert into
+    app.stock_movements (
+      batch_id,
+      item_id,
+      movement_type,
+      occurred_at,
+      quantity,
+      unit_cost,
+      total_cost,
+      is_provisional,
+      shift_id,
+      source_type,
+      source_id,
+      note
+    )
+  values
+    (
+      p_batch_id,
+      p_item_id,
+      p_movement_type,
+      p_occurred_at,
+      p_in_qty,
+      v_inflow_unit_cost,
+      v_inflow_total_cost,
+      false,
+      p_shift_id,
+      p_source_type,
+      p_source_id,
+      p_note
+    );
+
+  v_delta_value := v_inflow_total_cost;
+  v_remaining_qty := p_in_qty;
+  v_remaining_inflow_value := v_inflow_total_cost;
+
+  -- Cover uncovered deficits in logical order: occurred_at, ordinary before count, event position, piece, id.
+  for r_def in
+    select
+      pd.movement_id,
+      pd.qty_uncovered,
+      pd.value_uncovered,
+      pd.provisional_unit_cost,
+      sm.shift_id as prov_shift_id
+    from
+      app.provisional_deficits pd
+      join app.stock_movements sm on sm.id = pd.movement_id
+    where
+      pd.item_id = p_item_id
+      and pd.qty_uncovered > 0
+    order by
+      sm.occurred_at asc,
+      case
+        when sm.movement_type = 'count_adjustment'
+        and exists (
+          select
+            1
+          from
+            app.stock_count_lines scl
+          where
+            scl.movement_id = sm.id
+        ) then 1
+        else 0
+      end asc,
+      coalesce(sm.event_position, sm.id) asc,
+      coalesce(sm.piece_position, 0) asc,
+      sm.id asc
+    for update of pd
+  loop
+    exit when v_remaining_qty <= 0;
+
+    v_covered_qty := least(v_remaining_qty, r_def.qty_uncovered);
+
+    if v_covered_qty = v_remaining_qty then
+      v_covered_inflow_value := v_remaining_inflow_value;
+    else
+      v_covered_inflow_value := pg_catalog.round(
+        v_remaining_inflow_value * v_covered_qty / v_remaining_qty,
+        2
+      );
+    end if;
+
+    -- Conserve the original provisional value. A cover of the whole remainder
+    -- takes value_uncovered exactly; a partial cover takes its quantity share,
+    -- rounded to the piaster. provisional_unit_cost stays for unit_cost only.
+    if v_covered_qty = r_def.qty_uncovered then
+      v_covered_prov_value := r_def.value_uncovered;
+    else
+      v_covered_prov_value := pg_catalog.round(
+        r_def.value_uncovered * v_covered_qty / r_def.qty_uncovered,
+        2
+      );
+    end if;
+
+    v_adj_unit_cost := v_inflow_unit_cost - r_def.provisional_unit_cost;
+    v_adj_total_cost := -(v_covered_inflow_value - v_covered_prov_value);
+
+    insert into
+      app.stock_movements (
+        batch_id,
+        item_id,
+        movement_type,
+        occurred_at,
+        quantity,
+        unit_cost,
+        total_cost,
+        is_provisional,
+        adjusts_movement_id,
+        shift_id,
+        source_type,
+        source_id,
+        note
+      )
+    values
+      (
+        p_batch_id,
+        p_item_id,
+        'cost_adjustment',
+        p_occurred_at,
+        0,
+        v_adj_unit_cost,
+        v_adj_total_cost,
+        false,
+        r_def.movement_id,
+        r_def.prov_shift_id,
+        p_source_type,
+        p_source_id,
+        p_note
+      );
+
+    update app.provisional_deficits
+    set
+      qty_uncovered = qty_uncovered - v_covered_qty,
+      value_uncovered = value_uncovered - v_covered_prov_value
+    where
+      movement_id = r_def.movement_id;
+
+    v_remaining_qty := v_remaining_qty - v_covered_qty;
+    v_remaining_inflow_value := v_remaining_inflow_value - v_covered_inflow_value;
+    v_delta_value := v_delta_value + v_adj_total_cost;
+  end loop;
+
+  v_prior_pos_qty := greatest(v_bal.on_hand_qty, 0::numeric(20, 6));
+  v_on_hand_value_after_cover := case
+    when v_bal.on_hand_qty > 0 then greatest(v_bal.on_hand_value, 0::numeric(14, 2))
+    else 0::numeric(14, 2)
+  end;
+
+  if v_prior_pos_qty + v_remaining_qty > 0 then
+    v_new_avg_cost := pg_catalog.round(
+      (v_on_hand_value_after_cover + v_remaining_inflow_value) / (v_prior_pos_qty + v_remaining_qty),
+      6
+    );
+  elsif p_movement_type in ('purchase', 'sort_in')
+  or (
+    p_movement_type = 'opening'
+    and v_inflow_unit_cost > 0
+  ) then
+    v_new_avg_cost := v_inflow_unit_cost;
+  else
+    v_new_avg_cost := v_bal.avg_cost;
+  end if;
+
+  select
+    exists (
+      select
+        1
+      from
+        app.provisional_deficits pd
+      where
+        pd.item_id = p_item_id
+        and pd.qty_uncovered > 0
+    )
+  into v_has_deficit;
+
+  -- Put any piaster rounding remainder on on_hand_value so ledger sum == on_hand_value at all times.
+  update app.item_balances
+  set
+    on_hand_qty = v_bal.on_hand_qty + p_in_qty,
+    on_hand_value = v_bal.on_hand_value + v_delta_value,
+    avg_cost = v_new_avg_cost,
+    last_occurred_at = p_occurred_at,
+    has_uncovered_deficit = v_has_deficit
+  where
+    item_id = p_item_id;
+end;
+$$;
+
+comment on function app.apply_inflow_movement (
+  uuid,
+  uuid,
+  app.movement_type,
+  timestamptz,
+  numeric,
+  numeric,
+  text,
+  text,
+  text,
+  text,
+  numeric
+) is 'Posts one inflow and covers provisional deficits in logical event order. Same body as stock_ledger_core except that cover order.';
+
 create or replace function app.replay_outflow (
   p_movement_id bigint,
   p_item_id uuid,
@@ -436,6 +775,9 @@ declare
   v_base numeric(14, 2);
   v_piece integer := 0;
   v_syn bigint;
+  v_ord integer;
+  v_event bigint;
+  v_row_piece integer;
 begin
   select
     b.on_hand_qty,
@@ -453,8 +795,15 @@ begin
     b.item_id = p_item_id;
 
   select
-    coalesce(q.engine_valued, false)
-  into v_engine
+    coalesce(q.engine_valued, false),
+    coalesce(q.ord_class, 0),
+    q.event_position,
+    coalesce(q.piece_position, 0)
+  into
+    v_engine,
+    v_ord,
+    v_event,
+    v_row_piece
   from
     ledger_scratch.recompute_row q
   where
@@ -462,6 +811,9 @@ begin
 
   v_known := coalesce(v_known, false);
   v_engine := coalesce(v_engine, false);
+  v_ord := coalesce(v_ord, 0);
+  v_event := coalesce(v_event, p_movement_id);
+  v_row_piece := coalesce(v_row_piece, 0);
   v_unit := app.assert_recompute_range (v_avg, 6, false);
   v_prov_unit := v_unit;
 
@@ -589,7 +941,10 @@ begin
           qty_uncovered,
           provisional_unit_cost,
           value_uncovered,
-          occurred_at
+          occurred_at,
+          ord_class,
+          event_position,
+          piece_position
         )
       values
         (
@@ -598,7 +953,10 @@ begin
           v_prov_qty,
           v_prov_unit,
           abs(v_prov_cost),
-          p_occurred_at
+          p_occurred_at,
+          v_ord,
+          v_event,
+          v_piece
         );
     end if;
   else
@@ -629,7 +987,10 @@ begin
           qty_uncovered,
           provisional_unit_cost,
           value_uncovered,
-          occurred_at
+          occurred_at,
+          ord_class,
+          event_position,
+          piece_position
         )
       values
         (
@@ -638,7 +999,10 @@ begin
           v_prov_qty,
           v_prov_unit,
           abs(v_prov_cost),
-          p_occurred_at
+          p_occurred_at,
+          v_ord,
+          v_event,
+          v_row_piece
         );
     end if;
   end if;
@@ -732,6 +1096,9 @@ begin
       and d.qty_uncovered > 0
     order by
       d.occurred_at asc,
+      d.ord_class asc,
+      d.event_position asc,
+      d.piece_position asc,
       d.movement_id asc
   loop
     exit when v_remaining_qty <= 0;
@@ -1128,8 +1495,7 @@ begin
         and q.movement_type in ('sort_out', 'sort_in', 'sort_loss');
 
       if v_out_n <> 1 or v_loss_n > 1 then
-        raise exception 'recompute result is out of range'
-          using errcode = '22023';
+        perform app.raise_recompute_failure ('critical');
       end if;
 
       select
@@ -1378,8 +1744,7 @@ begin
         r.note
       );
     else
-      raise exception 'recompute result is out of range'
-        using errcode = '22023';
+      perform app.raise_recompute_failure ('critical');
     end if;
   end loop;
 
@@ -1585,8 +1950,7 @@ begin
   end if;
 exception
   when numeric_value_out_of_range then
-    raise exception 'recompute result is out of range'
-      using errcode = '22023';
+    perform app.raise_recompute_failure ('critical');
 end;
 $$;
 
@@ -1920,6 +2284,7 @@ declare
   v_items uuid[] := '{}'::uuid[];
   v_pending jsonb := '[]'::jsonb;
   v_line jsonb;
+  v_posted record;
 begin
   perform app.assert_ledger_lock_held ();
 
@@ -2041,47 +2406,65 @@ begin
 
   perform app.replay_component (v_items, v_pending, v_batch, false);
 
-  insert into
-    app.stock_movements (
-      batch_id,
+  for v_posted in
+    insert into
+      app.stock_movements (
+        batch_id,
+        item_id,
+        movement_type,
+        occurred_at,
+        quantity,
+        unit_cost,
+        total_cost,
+        is_provisional,
+        shift_id,
+        source_type,
+        source_id,
+        note,
+        engine_valued,
+        event_position,
+        piece_position
+      )
+    select
+      v_batch,
+      piece.item_id,
+      piece.movement_type,
+      piece.occurred_at,
+      piece.quantity,
+      piece.unit_cost,
+      piece.total_cost,
+      piece.is_provisional,
+      piece.shift_id,
+      piece.source_type,
+      piece.source_id,
+      piece.note,
+      true,
+      pending_row.event_position,
+      piece.piece_no
+    from
+      ledger_scratch.recompute_piece piece
+      join ledger_scratch.recompute_row pending_row on pending_row.line_key = piece.line_key
+      and pending_row.is_pending
+    order by
+      piece.line_key,
+      piece.piece_no
+    returning
+      id,
       item_id,
       movement_type,
-      occurred_at,
-      quantity,
-      unit_cost,
-      total_cost,
-      is_provisional,
-      shift_id,
-      source_type,
-      source_id,
-      note,
-      engine_valued,
-      event_position,
-      piece_position
-    )
-  select
-    v_batch,
-    piece.item_id,
-    piece.movement_type,
-    piece.occurred_at,
-    piece.quantity,
-    piece.unit_cost,
-    piece.total_cost,
-    piece.is_provisional,
-    piece.shift_id,
-    piece.source_type,
-    piece.source_id,
-    piece.note,
-    true,
-    pending_row.event_position,
-    piece.piece_no
-  from
-    ledger_scratch.recompute_piece piece
-    join ledger_scratch.recompute_row pending_row on pending_row.line_key = piece.line_key
-    and pending_row.is_pending
-  order by
-    piece.line_key,
-    piece.piece_no;
+      total_cost
+  loop
+    -- One revision for the posted piece. The confirming replay notes only a
+    -- later valuation adjustment, whose source id is the adjustment row.
+    perform app.note_period_revision (
+      v_posted.id,
+      app.shift_for_target (v_posted.id),
+      app.profit_bucket (v_posted.movement_type),
+      v_posted.total_cost,
+      v_posted.item_id,
+      v_batch
+    );
+  end loop;
 
   perform app.replay_component (v_items, '[]'::jsonb, v_batch, true);
 
@@ -2089,7 +2472,7 @@ begin
 end;
 $$;
 
-comment on function app.post_engine_outflows (jsonb) is 'Posts sale or waste lines with the engine provisional cost basis, valued by replay so a following replay inserts no adjustment. Caller holds the ledger lock. Private. Public post_movements does not call this.';
+comment on function app.post_engine_outflows (jsonb) is 'Posts sale or waste lines with the engine provisional cost basis, valued by replay so a following replay inserts no adjustment. Notes each inserted piece once. Caller holds the ledger lock. Private. Public post_movements does not call this.';
 
 revoke all on function app.post_engine_outflows (jsonb)
 from
