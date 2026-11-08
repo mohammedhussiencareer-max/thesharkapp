@@ -3,7 +3,7 @@
 -- 0005 reallocation, 0006 seed, 0007 missing basis, 0008 approved zero,
 -- 0009 known average, 000a same-instant order, 000b count compensation,
 -- 000c legacy silent zero, 000d cover order, 000e reclass,
--- 000f overflow, 0010 negative unit, 0011 sort shape.
+-- 000f overflow, 0010 negative unit, 0011 sort shape, 0012 before opening.
 begin;
 
 select
@@ -213,6 +213,15 @@ values
   (
     'e5100000-0000-4000-8000-000000000011',
     'p51-sort-shape',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'e5100000-0000-4000-8000-000000000012',
+    'p51-before-open',
     'seafood',
     'kg',
     'daily',
@@ -2256,6 +2265,65 @@ select
     ),
     '22023|recompute result is out of range|critical',
     'a zero-quantity replay row is detail critical'
+  );
+
+-- Opening stock on 2 Nov and an approved fallback price. A sale on 1 Nov is
+-- before that opening, so the engine refuses it before replay.
+select
+  lives_ok (
+    $$select app.set_item_opening_price(
+      'e5100000-0000-4000-8000-000000000121',
+      'e5100000-0000-4000-8000-000000000012',
+      40,
+      null,
+      null,
+      'kg|seafood||'
+    )$$,
+    'before-opening item gets an approved fallback price of 40'
+  );
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'e5100000-0000-4000-8000-000000000012',
+      'movement_type', 'opening',
+      'occurred_at', '2026-11-02T08:00:00Z',
+      'quantity', 1,
+      'unit_cost', 40
+    )))$$,
+    'before-opening item has opening stock on 2 Nov'
+  );
+
+select
+  is (
+    pg_temp.caught (
+      $$select app.post_engine_outflows(jsonb_build_array(jsonb_build_object(
+        'item_id', 'e5100000-0000-4000-8000-000000000012',
+        'movement_type', 'sale',
+        'occurred_at', '2026-11-01T10:00:00Z',
+        'quantity', 1
+      )))$$
+    ),
+    'P0001|movement is before opening stock|p51-before-open',
+    'an engine sale before opening stock is refused with the item name'
+  );
+
+select
+  results_eq (
+    $$select sm.movement_type::text, sm.occurred_at
+      from app.stock_movements sm
+      where sm.item_id = 'e5100000-0000-4000-8000-000000000012'
+      order by sm.id$$,
+    $$values ('opening'::text, '2026-11-02T08:00:00Z'::timestamptz)$$,
+    'the refused sale leaves only the opening movement'
+  );
+
+select
+  is_empty (
+    $$select seed.item_id
+      from app.item_provisional_seeds seed
+      where seed.item_id = 'e5100000-0000-4000-8000-000000000012'$$,
+    'the refused sale leaves no provisional seed'
   );
 
 select

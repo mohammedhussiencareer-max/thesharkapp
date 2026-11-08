@@ -2296,6 +2296,8 @@ declare
   v_event bigint;
   v_n integer := 0;
   v_items uuid[] := '{}'::uuid[];
+  v_times timestamptz[] := '{}'::timestamptz[];
+  v_types text[] := '{}'::text[];
   v_pending jsonb := '[]'::jsonb;
   v_line jsonb;
   v_posted record;
@@ -2378,6 +2380,8 @@ begin
 
     v_n := v_n + 1;
     v_items := v_items || v_item;
+    v_times := v_times || v_at;
+    v_types := v_types || v_type;
     v_line := pg_catalog.jsonb_build_object(
       'line_key',
       v_n,
@@ -2417,6 +2421,10 @@ begin
 
     v_pending := v_pending || pg_catalog.jsonb_build_array(v_line);
   end loop;
+
+  -- Same helper and error text as post_backdated_batch, before either replay.
+  -- A later opening must not cover a line dated before it.
+  perform app.assert_not_before_opening (v_items, v_times, v_types);
 
   perform app.replay_component (v_items, v_pending, v_batch, false);
 
