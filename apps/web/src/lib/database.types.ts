@@ -199,6 +199,32 @@ isOneToOne: false
       referencedColumns: ["id"]
     }
                   ]
+                },"item_provisional_seeds": {
+                  Row: {
+                    "base_unit": string,"created_at": string,"item_id": string,"opening_price_id": string,"unit_cost": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "base_unit": string,"created_at"?: string,"item_id": string,"opening_price_id": string,"unit_cost": number
+                  }
+                  Update: {
+                    "base_unit"?: string,"created_at"?: string,"item_id"?: string,"opening_price_id"?: string,"unit_cost"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "item_provisional_seeds_base_unit_fkey"
+      columns: ["base_unit"]
+isOneToOne: false
+      referencedRelation: "units"
+      referencedColumns: ["code"]
+    },{
+      foreignKeyName: "item_provisional_seeds_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: true
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"item_unit_conversions": {
                   Row: {
                     "factor_to_base": number,"item_id": string,"unit": string
@@ -975,14 +1001,14 @@ isOneToOne: false
                   ]
                 },"stock_movements": {
                   Row: {
-                    "adjusts_movement_id": number | null,"batch_id": string,"created_at": string,"created_by": string | null,"id": number,"is_provisional": boolean,"item_id": string,"movement_type": Database["app"]['Enums']["movement_type"],"note": string | null,"occurred_at": string,"quantity": number,"shift_id": string | null,"source_id": string | null,"source_type": string | null,"total_cost": number,"unit_cost": number
+                    "adjusts_movement_id": number | null,"batch_id": string,"created_at": string,"created_by": string | null,"engine_valued": boolean | null,"event_position": number | null,"id": number,"is_provisional": boolean,"item_id": string,"movement_type": Database["app"]['Enums']["movement_type"],"note": string | null,"occurred_at": string,"piece_position": number | null,"quantity": number,"reverses_movement_id": number | null,"shift_id": string | null,"source_id": string | null,"source_type": string | null,"total_cost": number,"unit_cost": number
                   }
                   ComputedFields: never
                   Insert: {
-                    "adjusts_movement_id"?: number | null,"batch_id": string,"created_at"?: string,"created_by"?: string | null,"id"?: never,"is_provisional"?: boolean,"item_id": string,"movement_type": Database["app"]['Enums']["movement_type"],"note"?: string | null,"occurred_at": string,"quantity": number,"shift_id"?: string | null,"source_id"?: string | null,"source_type"?: string | null,"total_cost": number,"unit_cost": number
+                    "adjusts_movement_id"?: number | null,"batch_id": string,"created_at"?: string,"created_by"?: string | null,"engine_valued"?: boolean | null,"event_position"?: number | null,"id"?: never,"is_provisional"?: boolean,"item_id": string,"movement_type": Database["app"]['Enums']["movement_type"],"note"?: string | null,"occurred_at": string,"piece_position"?: number | null,"quantity": number,"reverses_movement_id"?: number | null,"shift_id"?: string | null,"source_id"?: string | null,"source_type"?: string | null,"total_cost": number,"unit_cost": number
                   }
                   Update: {
-                    "adjusts_movement_id"?: number | null,"batch_id"?: string,"created_at"?: string,"created_by"?: string | null,"id"?: never,"is_provisional"?: boolean,"item_id"?: string,"movement_type"?: Database["app"]['Enums']["movement_type"],"note"?: string | null,"occurred_at"?: string,"quantity"?: number,"shift_id"?: string | null,"source_id"?: string | null,"source_type"?: string | null,"total_cost"?: number,"unit_cost"?: number
+                    "adjusts_movement_id"?: number | null,"batch_id"?: string,"created_at"?: string,"created_by"?: string | null,"engine_valued"?: boolean | null,"event_position"?: number | null,"id"?: never,"is_provisional"?: boolean,"item_id"?: string,"movement_type"?: Database["app"]['Enums']["movement_type"],"note"?: string | null,"occurred_at"?: string,"piece_position"?: number | null,"quantity"?: number,"reverses_movement_id"?: number | null,"shift_id"?: string | null,"source_id"?: string | null,"source_type"?: string | null,"total_cost"?: number,"unit_cost"?: number
                   }
                   Relationships: [
                     {
@@ -996,6 +1022,12 @@ isOneToOne: false
       columns: ["item_id"]
 isOneToOne: false
       referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "stock_movements_reverses_movement_id_fkey"
+      columns: ["reverses_movement_id"]
+isOneToOne: false
+      referencedRelation: "stock_movements"
       referencedColumns: ["id"]
     }
                   ]
@@ -1191,6 +1223,9 @@ isOneToOne: false
 "assert_expense_write_allowed":
 { Args: Record<PropertyKey, never>; Returns: undefined
                            },
+"assert_ledger_lock_held":
+{ Args: Record<PropertyKey, never>; Returns: undefined
+                           },
 "assert_ledger_write_allowed":
 { Args: Record<PropertyKey, never>; Returns: undefined
                            },
@@ -1238,6 +1273,9 @@ isOneToOne: false
                            },
 "delete_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
+                           },
+"ensure_provisional_seed":
+{ Args: { "p_item_id": string }; Returns: number
                            },
 "expand_recipe":
 { Args: { "p_at": string,"p_output_qty": number,"p_output_unit": string,"p_recipe_id": string }; Returns: Json
@@ -1476,6 +1514,9 @@ isOneToOne: false
 "post_backdated_batch":
 { Args: { "p_batch_id": string,"p_pending": Json }; Returns: (number)[]
                            },
+"post_engine_outflows":
+{ Args: { "p_lines": Json }; Returns: string
+                           },
 "post_movements":
 { Args: { "p_movements": Json }; Returns: string
                            },
@@ -1487,6 +1528,9 @@ isOneToOne: false
                            },
 "profit_bucket":
 { Args: { "p_type": Database["app"]['Enums']["movement_type"] }; Returns: string
+                           },
+"raise_recompute_failure":
+{ Args: { "p_reason": string }; Returns: undefined
                            },
 "rebuild_derived_balances":
 { Args: { "p_cause_batch": string,"p_item_ids": (string)[] }; Returns: undefined
@@ -1548,6 +1592,9 @@ isOneToOne: false
 "replace_pos_order_lines":
 { Args: { "p_lines": Json,"p_order_id": string }; Returns: undefined
                            },
+"replay_component":
+{ Args: { "p_cause": string,"p_item_ids": (string)[],"p_pending": Json,"p_write": boolean }; Returns: undefined
+                           },
 "replay_execute":
 { Args: { "p_cause": string,"p_item_ids": (string)[],"p_pending": Json,"p_write": boolean }; Returns: undefined
                            },
@@ -1580,6 +1627,9 @@ isOneToOne: false
                            },
 "resolve_unit_code":
 { Args: { "p_unit": string }; Returns: string
+                           },
+"retire_movements":
+{ Args: { "p_cause": string,"p_movement_ids": (number)[] }; Returns: (number)[]
                            },
 "schedule_token":
 { Args: { "p_family": string,"p_item_id": string,"p_unit_code": string }; Returns: string
@@ -1645,7 +1695,7 @@ isOneToOne: false
                            }
           }
           Enums: {
-            "movement_type": "opening"|"purchase"|"sort_out"|"sort_in"|"sort_loss"|"sale"|"sale_reversal"|"waste"|"count_adjustment"|"cost_adjustment"
+            "movement_type": "opening"|"purchase"|"sort_out"|"sort_in"|"sort_loss"|"sale"|"sale_reversal"|"waste"|"count_adjustment"|"cost_adjustment"|"waste_reversal"|"count_compensation"
           }
           CompositeTypes: {
             [_ in never]: never
@@ -1777,7 +1827,7 @@ export type CompositeTypes<
 export const Constants = {
   "app": {
           Enums: {
-            "movement_type": ["opening", "purchase", "sort_out", "sort_in", "sort_loss", "sale", "sale_reversal", "waste", "count_adjustment", "cost_adjustment"]
+            "movement_type": ["opening", "purchase", "sort_out", "sort_in", "sort_loss", "sale", "sale_reversal", "waste", "count_adjustment", "cost_adjustment", "waste_reversal", "count_compensation"]
           }
         },"public": {
           Enums: {
