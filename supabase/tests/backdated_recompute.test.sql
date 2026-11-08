@@ -1827,7 +1827,8 @@ select
     'in-batch sales: a second rebuild inserts nothing'
   );
 
--- 12. A registered count still blocks a back-dated instant at or before it.
+-- 12. A registered count is an anchor. A movement at that instant is replayed
+-- before the anchor and compensated, and the observation stays.
 select
   app.post_movements (
     jsonb_build_array(
@@ -1947,35 +1948,25 @@ where
   );
 
 select
-  ok (
-    pg_temp.expect_refusal (
-      $sql$select app.post_movements(jsonb_build_array(jsonb_build_object(
-        'item_id', 'e2700000-0000-4000-8000-000000000018',
-        'movement_type', 'sale',
-        'occurred_at', '2026-11-03T10:00:00Z',
-        'quantity', 1
-      )))$sql$,
-      'P0001',
-      'back-dated movement not supported yet',
-      '27a-count-item'
-    ),
-    'a movement at a registered count is still refused'
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'e2700000-0000-4000-8000-000000000018',
+      'movement_type', 'sale',
+      'occurred_at', '2026-11-03T10:00:00Z',
+      'quantity', 1
+    )))$$,
+    'a movement at a registered count is compensated and the observation stays'
   );
 
 select
-  ok (
-    pg_temp.expect_refusal (
-      $sql$select app.post_movements(jsonb_build_array(jsonb_build_object(
-        'item_id', 'e2700000-0000-4000-8000-000000000019',
-        'movement_type', 'sale',
-        'occurred_at', '2026-11-03T10:00:00Z',
-        'quantity', 1
-      )))$sql$,
-      'P0001',
-      'back-dated movement not supported yet',
-      '27a-zero-count'
-    ),
-    'a movement at a zero-delta count is still refused'
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'e2700000-0000-4000-8000-000000000019',
+      'movement_type', 'sale',
+      'occurred_at', '2026-11-03T10:00:00Z',
+      'quantity', 1
+    )))$$,
+    'a movement at a zero-delta count is compensated and the observation stays'
   );
 
 select
@@ -3335,8 +3326,8 @@ select
         n.nspname = 'ledger_scratch'
         and c.relkind = 'r'
     ),
-    7::bigint,
-    'ledger_scratch has the seven replay tables'
+    8::bigint,
+    'ledger_scratch has the eight replay tables'
   );
 
 select

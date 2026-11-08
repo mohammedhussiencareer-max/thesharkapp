@@ -167,7 +167,7 @@ export async function listCounts(): Promise<CountRecord[]> {
       appDb()
         .from('stock_count_history')
         .select(
-          'id, counted_at, frequency, created_at, note, item_count, shortage_value_text:shortage_value::text, surplus_value_text:surplus_value::text, has_surplus',
+          'id, counted_at, frequency, created_at, note, item_count, shortage_value_text:shortage_value::text, surplus_value_text:surplus_value::text, has_surplus, revised_difference_text:revised_difference::text, compensator_sum_text:compensator_sum::text, has_compensator',
         )
         .order('created_at', { ascending: true })
         .order('id', { ascending: true })
@@ -197,7 +197,8 @@ export async function listCounts(): Promise<CountRecord[]> {
       (row.frequency !== 'daily' && row.frequency !== 'weekly') ||
       typeof row.item_count !== 'number' ||
       !Number.isInteger(row.item_count) ||
-      typeof row.has_surplus !== 'boolean'
+      typeof row.has_surplus !== 'boolean' ||
+      typeof row.has_compensator !== 'boolean'
     ) {
       throw new Error(genericCountError);
     }
@@ -215,6 +216,9 @@ export async function listCounts(): Promise<CountRecord[]> {
       shortageValue: exactDecimal(row.shortage_value_text),
       surplusValue: exactDecimal(row.surplus_value_text),
       hasSurplus: row.has_surplus,
+      revisedDifference: exactDecimal(row.revised_difference_text),
+      compensatorSum: exactDecimal(row.compensator_sum_text),
+      hasCompensator: row.has_compensator,
     };
   });
 }

@@ -63,4 +63,9 @@ export type CountRecord = {
   shortageValue: string;
   surplusValue: string;
   hasSurplus: boolean;
+  /** Latest required value minus the frozen line value, as decimal text. */
+  revisedDifference: string;
+  /** Signed sum of count_compensation values, as decimal text. */
+  compensatorSum: string;
+  hasCompensator: boolean;
 };

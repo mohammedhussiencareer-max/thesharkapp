@@ -907,6 +907,70 @@ isOneToOne: false
       referencedColumns: ["id"]
     }
                   ]
+                },"stock_count_anchors": {
+                  Row: {
+                    "actual_qty": number,"base_unit": string,"count_id": string,"counted_at": string,"item_id": string,"line_no": number,"shift_id": string | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "actual_qty": number,"base_unit": string,"count_id": string,"counted_at": string,"item_id": string,"line_no": number,"shift_id"?: string | null
+                  }
+                  Update: {
+                    "actual_qty"?: number,"base_unit"?: string,"count_id"?: string,"counted_at"?: string,"item_id"?: string,"line_no"?: number,"shift_id"?: string | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "stock_count_anchors_count_id_line_no_fkey"
+      columns: ["count_id","line_no"]
+isOneToOne: true
+      referencedRelation: "stock_count_line_current"
+      referencedColumns: ["count_id","line_no"]
+    },{
+      foreignKeyName: "stock_count_anchors_count_id_line_no_fkey"
+      columns: ["count_id","line_no"]
+isOneToOne: true
+      referencedRelation: "stock_count_lines"
+      referencedColumns: ["count_id","line_no"]
+    },{
+      foreignKeyName: "stock_count_anchors_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"stock_count_derivations": {
+                  Row: {
+                    "cause_batch_id": string,"count_id": string,"created_at": string,"expected_qty": number,"id": number,"line_no": number,"predecessor_id": number | null,"required_qty": number,"required_value": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "cause_batch_id": string,"count_id": string,"created_at"?: string,"expected_qty": number,"id"?: never,"line_no": number,"predecessor_id"?: number | null,"required_qty": number,"required_value": number
+                  }
+                  Update: {
+                    "cause_batch_id"?: string,"count_id"?: string,"created_at"?: string,"expected_qty"?: number,"id"?: never,"line_no"?: number,"predecessor_id"?: number | null,"required_qty"?: number,"required_value"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "stock_count_derivations_count_id_line_no_fkey"
+      columns: ["count_id","line_no"]
+isOneToOne: false
+      referencedRelation: "stock_count_line_current"
+      referencedColumns: ["count_id","line_no"]
+    },{
+      foreignKeyName: "stock_count_derivations_count_id_line_no_fkey"
+      columns: ["count_id","line_no"]
+isOneToOne: false
+      referencedRelation: "stock_count_lines"
+      referencedColumns: ["count_id","line_no"]
+    },{
+      foreignKeyName: "stock_count_derivations_predecessor_id_fkey"
+      columns: ["predecessor_id"]
+isOneToOne: false
+      referencedRelation: "stock_count_derivations"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"stock_count_lines": {
                   Row: {
                     "count_id": string,"counted_qty": number,"delta_qty": number,"delta_value": number,"expected_base_unit": string,"expected_qty": number,"item_id": string,"line_no": number,"movement_id": number | null
@@ -941,6 +1005,38 @@ isOneToOne: false
       foreignKeyName: "stock_count_lines_movement_id_fkey"
       columns: ["movement_id"]
 isOneToOne: false
+      referencedRelation: "stock_movements"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"stock_count_postings": {
+                  Row: {
+                    "count_id": string,"created_at": string,"line_no": number,"movement_id": number,"posting_role": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "count_id": string,"created_at"?: string,"line_no": number,"movement_id": number,"posting_role": string
+                  }
+                  Update: {
+                    "count_id"?: string,"created_at"?: string,"line_no"?: number,"movement_id"?: number,"posting_role"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "stock_count_postings_count_id_line_no_fkey"
+      columns: ["count_id","line_no"]
+isOneToOne: false
+      referencedRelation: "stock_count_line_current"
+      referencedColumns: ["count_id","line_no"]
+    },{
+      foreignKeyName: "stock_count_postings_count_id_line_no_fkey"
+      columns: ["count_id","line_no"]
+isOneToOne: false
+      referencedRelation: "stock_count_lines"
+      referencedColumns: ["count_id","line_no"]
+    },{
+      foreignKeyName: "stock_count_postings_movement_id_fkey"
+      columns: ["movement_id"]
+isOneToOne: true
       referencedRelation: "stock_movements"
       referencedColumns: ["id"]
     }
@@ -1176,11 +1272,37 @@ isOneToOne: false
                   ]
                 },"stock_count_history": {
                   Row: {
-                    "counted_at": string | null,"created_at": string | null,"frequency": string | null,"has_surplus": boolean | null,"id": string | null,"item_count": number | null,"note": string | null,"shortage_value": number | null,"surplus_value": number | null
+                    "compensator_sum": number | null,"counted_at": string | null,"created_at": string | null,"frequency": string | null,"has_compensator": boolean | null,"has_surplus": boolean | null,"id": string | null,"item_count": number | null,"note": string | null,"revised_difference": number | null,"shortage_value": number | null,"surplus_value": number | null
                   }
                   ComputedFields: never
                   Relationships: [
                     
+                  ]
+                },"stock_count_line_current": {
+                  Row: {
+                    "compensator_qty": number | null,"compensator_value": number | null,"count_id": string | null,"counted_at": string | null,"counted_qty": number | null,"has_compensator": boolean | null,"item_id": string | null,"latest_expected_qty": number | null,"latest_required_qty": number | null,"latest_required_value": number | null,"line_no": number | null,"original_delta_qty": number | null,"original_delta_value": number | null,"original_expected_qty": number | null,"revised_difference": number | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    {
+      foreignKeyName: "stock_count_lines_count_id_fkey"
+      columns: ["count_id"]
+isOneToOne: false
+      referencedRelation: "stock_count_history"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "stock_count_lines_count_id_fkey"
+      columns: ["count_id"]
+isOneToOne: false
+      referencedRelation: "stock_counts"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "stock_count_lines_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
                   ]
                 },"stock_count_pending": {
                   Row: {
@@ -1592,6 +1714,9 @@ isOneToOne: false
 "replace_pos_order_lines":
 { Args: { "p_lines": Json,"p_order_id": string }; Returns: undefined
                            },
+"replay_apply_anchor":
+{ Args: { "p_anchor_ord": number }; Returns: undefined
+                           },
 "replay_component":
 { Args: { "p_cause": string,"p_item_ids": (string)[],"p_pending": Json,"p_write": boolean }; Returns: undefined
                            },
@@ -1671,6 +1796,9 @@ isOneToOne: false
                            },
 "set_recipe_version":
 { Args: { "p_batch_qty": number,"p_batch_unit": string,"p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_lines": Json,"p_reason": string,"p_recipe_id": string,"p_request_id": string }; Returns: Json
+                           },
+"settle_count_anchors":
+{ Args: { "p_cause": string,"p_item_ids": (string)[] }; Returns: undefined
                            },
 "shift_for_target":
 { Args: { "p_movement_id": number }; Returns: string
