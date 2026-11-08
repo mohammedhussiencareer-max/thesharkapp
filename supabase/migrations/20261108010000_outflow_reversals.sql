@@ -509,6 +509,8 @@ declare
   v_new_avg_cost numeric(20, 6);
   v_has_deficit boolean;
   r_def record;
+  v_adj_id bigint;
+  v_target_shift text;
 begin
   if p_in_qty is null
   or p_in_qty in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
@@ -585,7 +587,7 @@ begin
       pd.qty_uncovered,
       pd.value_uncovered,
       pd.provisional_unit_cost,
-      sm.shift_id as prov_shift_id
+      sm.movement_type as prov_type
     from
       app.provisional_deficits pd
       join app.stock_movements sm on sm.id = pd.movement_id
@@ -638,6 +640,7 @@ begin
 
     v_adj_unit_cost := v_inflow_unit_cost - r_def.provisional_unit_cost;
     v_adj_total_cost := -(v_covered_inflow_value - v_covered_prov_value);
+    v_target_shift := app.shift_for_target (r_def.movement_id);
 
     insert into
       app.stock_movements (
@@ -666,11 +669,22 @@ begin
         v_adj_total_cost,
         false,
         r_def.movement_id,
-        r_def.prov_shift_id,
+        v_target_shift,
         p_source_type,
         p_source_id,
         p_note
-      );
+      )
+    returning
+      id into v_adj_id;
+
+    perform app.note_period_revision (
+      v_adj_id,
+      v_target_shift,
+      app.profit_bucket (r_def.prov_type),
+      v_adj_total_cost,
+      p_item_id,
+      p_batch_id
+    );
 
     update app.provisional_deficits
     set
@@ -742,7 +756,7 @@ comment on function app.apply_inflow_movement (
   text,
   text,
   numeric
-) is 'Posts one inflow and covers provisional deficits in logical event order. Same body as stock_ledger_core except that cover order.';
+) is 'Posts one inflow and covers provisional deficits in logical event order. Same body as the backdated recompute definition except that cover order.';
 
 create or replace function app.replay_outflow (
   p_movement_id bigint,

@@ -1832,6 +1832,20 @@ select
     'the earlier shortage has the newer id'
   );
 
+create temp table cover_profit_before as
+select
+  coalesce(
+    (
+      select
+        f.profit_delta
+      from
+        app.shift_report_flags f
+      where
+        f.shift_id = 'shift-p51'
+    ),
+    0::numeric(14, 2)
+  ) as profit_delta;
+
 select
   lives_ok (
     $$select app.post_movements(jsonb_build_array(jsonb_build_object(
@@ -1853,6 +1867,68 @@ select
         and ca.movement_type = 'cost_adjustment'$$,
     $$values (10::bigint, -60::numeric(14, 2))$$,
     'the forward purchase covers event 10, the newer id, at seed 40'
+  );
+
+select
+  ok (
+    (
+      select
+        sm.shift_id is null
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'e5100000-0000-4000-8000-00000000000d'
+        and sm.movement_type = 'sale'
+        and sm.event_position = 10
+    ),
+    'the covered shortage keeps a null shift column'
+  );
+
+select
+  results_eq (
+    $$select ma.shift_id, ca.shift_id, pr.bucket, pr.amount, pr.shift_id,
+        (
+          select count(*)
+          from app.period_revisions noted
+          where noted.source_movement_id = ca.id
+        )
+      from app.stock_movements sale
+      join app.movement_attributions ma on ma.movement_id = sale.id
+      join app.stock_movements ca
+        on ca.adjusts_movement_id = sale.id
+        and ca.movement_type = 'cost_adjustment'
+      join app.period_revisions pr on pr.source_movement_id = ca.id
+      where sale.item_id = 'e5100000-0000-4000-8000-00000000000d'
+        and sale.movement_type = 'sale'
+        and sale.event_position = 10$$,
+    $$values (
+      'shift-p51'::text,
+      'shift-p51'::text,
+      'cogs',
+      -60::numeric(14, 2),
+      'shift-p51'::text,
+      1::bigint
+    )$$,
+    'the forward cover uses the pinned shift and notes one cogs revision of -60'
+  );
+
+select
+  is (
+    (
+      select
+        f.profit_delta
+      from
+        app.shift_report_flags f
+      where
+        f.shift_id = 'shift-p51'
+    ),
+    (
+      select
+        profit_delta - 60::numeric(14, 2)
+      from
+        cover_profit_before
+    ),
+    'the forward cover lowers the shift profit flag by 60'
   );
 
 select
@@ -1889,6 +1965,53 @@ select
         and ca.movement_type = 'cost_adjustment'$$,
     $$values (10::bigint, -60::numeric(14, 2))$$,
     'replay covers the same earlier event and does not move the adjustment'
+  );
+
+select
+  results_eq (
+    $$select ma.shift_id, ca.shift_id, pr.bucket, pr.amount, pr.shift_id,
+        (
+          select count(*)
+          from app.period_revisions noted
+          where noted.source_movement_id = ca.id
+        )
+      from app.stock_movements sale
+      join app.movement_attributions ma on ma.movement_id = sale.id
+      join app.stock_movements ca
+        on ca.adjusts_movement_id = sale.id
+        and ca.movement_type = 'cost_adjustment'
+      join app.period_revisions pr on pr.source_movement_id = ca.id
+      where sale.item_id = 'e5100000-0000-4000-8000-00000000000d'
+        and sale.movement_type = 'sale'
+        and sale.event_position = 10$$,
+    $$values (
+      'shift-p51'::text,
+      'shift-p51'::text,
+      'cogs',
+      -60::numeric(14, 2),
+      'shift-p51'::text,
+      1::bigint
+    )$$,
+    'replay leaves the pinned cover revision in place and does not add another'
+  );
+
+select
+  is (
+    (
+      select
+        f.profit_delta
+      from
+        app.shift_report_flags f
+      where
+        f.shift_id = 'shift-p51'
+    ),
+    (
+      select
+        profit_delta - 60::numeric(14, 2)
+      from
+        cover_profit_before
+    ),
+    'replay does not change the shift profit flag after the forward cover'
   );
 
 -- Retire a -100 sale and repost it as -100 waste. Stock and profit_delta stay
