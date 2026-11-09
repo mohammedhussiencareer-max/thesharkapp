@@ -1185,8 +1185,19 @@ begin
         from
           app.pos_shifts shift
         where
-          shift.opened_at >= v_from
-          and shift.id <> all (v_presented)
+          shift.id <> all (v_presented)
+          and (
+            shift.opened_at >= v_from
+            or exists (
+              select
+                1
+              from
+                app.pos_orders o
+              where
+                o.shift_id = shift.id
+                and o.ordered_at >= v_from
+            )
+          )
       )
       when v_applied then false
       else pg_catalog.cardinality(v_presented) > 0

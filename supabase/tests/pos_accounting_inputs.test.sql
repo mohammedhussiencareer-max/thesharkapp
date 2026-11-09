@@ -2811,6 +2811,98 @@ select
     'the second backfill adds no cost input'
   );
 
+-- A shift opened before a from cutoff can own orders inside it, so a run that
+-- never presented it has not read that shift's transactions.
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+values
+  (
+    'shift-span-cutoff',
+    '2031-01-01T08:00:00Z',
+    '2031-01-01T18:00:00Z',
+    false,
+    '2031-01-01T18:00:00Z'
+  );
+
+insert into
+  app.pos_orders (
+    id,
+    shift_id,
+    status,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    version
+  )
+values
+  (
+    'order-span-cutoff',
+    'shift-span-cutoff',
+    'complete',
+    '2031-01-01T12:00:00Z',
+    10,
+    0,
+    0,
+    0,
+    0,
+    10,
+    '2031-01-01T12:00:00Z',
+    repeat('a', 64),
+    1
+  );
+
+insert into
+  input_runs (k, n)
+values
+  (
+    'spancut',
+    pg_temp.finished_run (
+      'window35',
+      (
+        select
+          array_agg(shift.id)
+        from
+          app.pos_shifts shift
+        where
+          shift.id <> 'shift-span-cutoff'
+      ),
+      jsonb_build_object('from', '2031-01-01T10:00:00Z'::timestamptz)
+    )
+  );
+
+select
+  is (
+    (
+      select
+        cov.transactions_covered
+      from
+        app.pos_sync_coverage cov
+      where
+        cov.run_id = (
+          select
+            n
+          from
+            input_runs
+          where
+            k = 'spancut'
+        )
+    ),
+    false,
+    'an omitted shift that spans a from cutoff is not transaction coverage'
+  );
+
 select
   *
 from
