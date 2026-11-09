@@ -441,10 +441,16 @@ describe('drainAccountingWork', () => {
       );
     });
 
-    it('is repeated a bounded number of times and then left busy', async () => {
+    // 7750 ms of growing pauses, then 13 pauses of 4000 ms reach 59750 ms.
+    const fullBudgetPauses = [
+      ...RECORDER_BACKOFF_MS,
+      ...Array.from({ length: 13 }, () => 4_000),
+    ];
+
+    it('keeps repeating at the capped pause until the budget is spent, then is left busy', async () => {
       const { db, runs, reports } = fakeDb(
         [lost],
-        Array.from({ length: 20 }, () => 'busy' as const),
+        Array.from({ length: 30 }, () => 'busy' as const),
       );
       const pace = pauses();
       const outcome = await drainAccountingWork(db, {
@@ -453,11 +459,42 @@ describe('drainAccountingWork', () => {
       });
       expect(outcome.stop).toBe('call_failed');
       expect(outcome.report).toBe('busy');
-      expect(pace.slept).toEqual([...RECORDER_BACKOFF_MS]);
-      expect(reports).toHaveLength(RECORDER_BACKOFF_MS.length + 1);
+      expect(pace.slept).toEqual(fullBudgetPauses);
+      expect(reports).toHaveLength(fullBudgetPauses.length + 1);
       expect(new Set(reports.map((r) => r.attemptId))).toEqual(
         new Set([runs[0]?.attemptId]),
       );
+    });
+
+    it('is recorded when contention outlasts the growing pauses', async () => {
+      const { db, reports } = fakeDb(
+        [lost],
+        [...Array.from({ length: 8 }, () => 'busy' as const), 'recorded'],
+      );
+      const pace = pauses();
+      const outcome = await drainAccountingWork(db, {
+        newAttemptId: ids(),
+        ...pace,
+      });
+      expect(outcome.report).toBe('recorded');
+      expect(pace.slept).toEqual([...RECORDER_BACKOFF_MS, 4_000, 4_000, 4_000]);
+      expect(reports).toHaveLength(9);
+    });
+
+    it('stays bounded by its own pauses if the clock stalls', async () => {
+      const { db, reports } = fakeDb(
+        [lost],
+        Array.from({ length: 30 }, () => 'busy' as const),
+      );
+      const pace = pauses();
+      const outcome = await drainAccountingWork(db, {
+        newAttemptId: ids(),
+        clock: () => 0,
+        sleep: pace.sleep,
+      });
+      expect(outcome.report).toBe('busy');
+      expect(pace.slept).toEqual(fullBudgetPauses);
+      expect(reports).toHaveLength(fullBudgetPauses.length + 1);
     });
 
     it('stops repeating when the budget cannot cover the next pause, and later drains stay correct', async () => {

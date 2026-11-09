@@ -15,6 +15,7 @@ export const DRAIN_BUDGET_MS = 60_000;
 export const DRAIN_BATCH_LIMIT = 1;
 const MAX_CONSECUTIVE_STALE = 3;
 // Waits before each repeat of a failure report the ledger lock turned away.
+// The last wait repeats for as long as the budget can cover it.
 export const RECORDER_BACKOFF_MS: readonly number[] = [
   250, 500, 1_000, 2_000, 4_000,
 ];
@@ -174,12 +175,18 @@ async function failedCall(
       binding.orderId,
       binding.workGeneration,
     );
-    for (const pause of RECORDER_BACKOFF_MS) {
-      const { clock, started, budgetMs, sleep } = pacing;
-      if (report !== 'busy' || clock() - started + pause > budgetMs) {
+    const { clock, started, budgetMs, sleep } = pacing;
+    let waited = 0;
+    for (let repeat = 0; report === 'busy'; repeat += 1) {
+      const pause = RECORDER_BACKOFF_MS[
+        Math.min(repeat, RECORDER_BACKOFF_MS.length - 1)
+      ] as number;
+      // The sum of the pauses bounds the loop even if the clock stalls.
+      if (Math.max(clock() - started, waited) + pause > budgetMs) {
         break;
       }
       await sleep(pause);
+      waited += pause;
       report = await db.recordAccountingCallFailure(
         attemptId,
         binding.orderId,
