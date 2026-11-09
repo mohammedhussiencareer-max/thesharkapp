@@ -235,6 +235,93 @@ create function pg_temp.refund_tx (p_amount numeric) returns jsonb language sql 
     );
 $$;
 
+create function pg_temp.count_c1 () returns jsonb language sql as $$
+  select
+    app.record_count (
+      jsonb_build_object(
+        'request_id',
+        'a5300000-0000-4000-8000-0000000000c1',
+        'frequency',
+        'daily',
+        'counted_at',
+        '2026-11-01T20:00:00Z',
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'a5300000-0000-4000-8000-000000000011',
+            'counted_qty',
+            '0',
+            'expected_base_unit',
+            'kg'
+          )
+        )
+      )
+    );
+$$;
+
+-- Order scope listing every shift opened at or before the count of c1.
+create function pg_temp.relevant_shift_scope () returns jsonb language sql as $$
+  select
+    jsonb_build_object(
+      'shift_ids',
+      coalesce(
+        jsonb_agg(
+          shift.id
+          order by
+            shift.id
+        ),
+        '[]'::jsonb
+      )
+    )
+  from
+    app.pos_shifts shift
+  where
+    shift.opened_at <= '2026-11-01T20:00:00Z'::timestamptz;
+$$;
+
+-- One ok run that presents only the named mirror shifts (no transactions) and
+-- applies p_scope, then moves its clock past the count's prepared_at.
+create function pg_temp.finished_run (p_mode text, p_present text[], p_scope jsonb) returns bigint language plpgsql as $$
+declare
+  v_run bigint;
+begin
+  v_run := app.start_pos_sync_run (p_mode);
+
+  perform app.ingest_pos_batch (
+    v_run,
+    coalesce(
+      (
+        select
+          jsonb_agg(
+            pg_temp.shift_doc (
+              shift.id,
+              shift.opened_at,
+              shift.closed_at,
+              shift.pos_update_time,
+              '[]'::jsonb
+            )
+            order by
+              shift.id
+          )
+        from
+          app.pos_shifts shift
+        where
+          shift.id = any (p_present)
+      ),
+      '[]'::jsonb
+    ),
+    '[]'::jsonb,
+    p_scope
+  );
+
+  perform app.finish_pos_sync_run (v_run, 'ok', null, null);
+  perform pg_temp.bump_run_after_prepare (v_run);
+
+  return v_run;
+end;
+$$;
+
 -- ============================================================================
 -- Catalog, privileges, append-only truncate before any rows.
 -- ============================================================================
@@ -1948,6 +2035,374 @@ select
         request_id = 'a5300000-0000-4000-8000-0000000000c1'
     $$,
     'a count with a missing covering scope posts nothing'
+  );
+
+-- ---------------------------------------------------------------------------
+-- The order scope matches, but the transaction subcollections were not read
+-- for every shift opened by the count. The count stays waiting.
+-- ---------------------------------------------------------------------------
+insert into
+  input_runs (k, n)
+values
+  (
+    'noread',
+    pg_temp.finished_run (
+      'recent',
+      '{}'::text[],
+      pg_temp.relevant_shift_scope ()
+    )
+  );
+
+select
+  ok (
+    (
+      select
+        cov.orders_scope_applied
+        and cov.scope_kind = 'shift_ids'
+        and not cov.legacy_direct
+        and cov.scope_shift_ids = (
+          select
+            array_agg(
+              shift.id
+              order by
+                shift.id
+            )
+          from
+            app.pos_shifts shift
+          where
+            shift.opened_at <= '2026-11-01T20:00:00Z'::timestamptz
+        )
+        and cov.presented_shift_ids = '{}'::text[]
+        and not cov.transactions_covered
+      from
+        app.pos_sync_coverage cov
+      where
+        cov.run_id = (
+          select
+            n
+          from
+            input_runs
+          where
+            k = 'noread'
+        )
+    ),
+    'a shift_ids scope listing every relevant shift but presenting none is not transaction coverage'
+  );
+
+select
+  is (
+    pg_temp.count_c1 (),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a count stays waiting when the scope matches but no shift transactions were read'
+  );
+
+select
+  is_empty (
+    $$
+      select
+        id
+      from
+        app.stock_counts
+      where
+        request_id = 'a5300000-0000-4000-8000-0000000000c1'
+    $$,
+    'a count refused for missing transaction reads posts nothing'
+  );
+
+insert into
+  input_runs (k, n)
+values
+  (
+    'fullnone',
+    pg_temp.finished_run (
+      'full',
+      '{}'::text[],
+      jsonb_build_object('all', true)
+    )
+  ),
+  (
+    'fullpart',
+    pg_temp.finished_run (
+      'full',
+      array['shift-main', 'shift-miss'],
+      jsonb_build_object('all', true)
+    )
+  );
+
+select
+  is (
+    (
+      select
+        transactions_covered
+      from
+        app.pos_sync_coverage
+      where
+        run_id = (
+          select
+            n
+          from
+            input_runs
+          where
+            k = 'fullnone'
+        )
+    ),
+    false,
+    'an all scope that presented no shift is not transaction coverage'
+  );
+
+select
+  is (
+    (
+      select
+        transactions_covered
+      from
+        app.pos_sync_coverage
+      where
+        run_id = (
+          select
+            n
+          from
+            input_runs
+          where
+            k = 'fullpart'
+        )
+    ),
+    false,
+    'an all scope that presented only some shifts is not transaction coverage'
+  );
+
+select
+  is (
+    pg_temp.count_c1 (),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a count stays waiting when an all scope presented only some shifts'
+  );
+
+insert into
+  input_runs (k, n)
+values
+  (
+    'fromnone',
+    pg_temp.finished_run (
+      'window35',
+      '{}'::text[],
+      jsonb_build_object('from', '2000-01-01T00:00:00Z'::timestamptz)
+    )
+  );
+
+select
+  is (
+    (
+      select
+        transactions_covered
+      from
+        app.pos_sync_coverage
+      where
+        run_id = (
+          select
+            n
+          from
+            input_runs
+          where
+            k = 'fromnone'
+        )
+    ),
+    false,
+    'a from scope that presented no shift is not transaction coverage'
+  );
+
+select
+  is (
+    pg_temp.count_c1 (),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a count stays waiting when a from scope presented no shift'
+  );
+
+insert into
+  input_runs (k, n)
+values
+  (
+    'fullall',
+    pg_temp.finished_run (
+      'full',
+      (
+        select
+          array_agg(shift.id)
+        from
+          app.pos_shifts shift
+      ),
+      jsonb_build_object('all', true)
+    )
+  ),
+  (
+    'fromall',
+    pg_temp.finished_run (
+      'window35',
+      (
+        select
+          array_agg(shift.id)
+        from
+          app.pos_shifts shift
+      ),
+      jsonb_build_object('from', '2000-01-01T00:00:00Z'::timestamptz)
+    )
+  );
+
+select
+  is (
+    (
+      select
+        array_agg(
+          cov.transactions_covered
+          order by
+            cov.run_id
+        )
+      from
+        app.pos_sync_coverage cov
+      where
+        cov.run_id in (
+          select
+            n
+          from
+            input_runs
+          where
+            k in ('fullall', 'fromall')
+        )
+    ),
+    array[true, true],
+    'all and from scopes that presented every shift are transaction coverage'
+  );
+
+-- ---------------------------------------------------------------------------
+-- Migration transition. A sync that applied its scope before scope_kind
+-- existed finishes after the migration with applied true and kind null. Every
+-- shift is presented, so only the unknown scope can keep the count waiting.
+-- ---------------------------------------------------------------------------
+reset role;
+
+with
+  inserted as (
+    insert into
+      app.pos_sync_runs (mode, scope_applied, presented_shift_ids)
+    values
+      (
+        'recent',
+        true,
+        (
+          select
+            array_agg(
+              shift.id
+              order by
+                shift.id
+            )
+          from
+            app.pos_shifts shift
+        )
+      )
+    returning
+      id
+  )
+insert into
+  input_runs (k, n)
+select
+  'preapplied',
+  id
+from
+  inserted;
+
+select
+  set_config(
+    'request.jwt.claims',
+    jsonb_build_object(
+      'sub',
+      'a5300001-0000-4000-8000-000000000301',
+      'role',
+      'authenticated'
+    )::text,
+    true
+  );
+
+set
+  local role authenticated;
+
+select
+  app.finish_pos_sync_run (
+    (
+      select
+        n
+      from
+        input_runs
+      where
+        k = 'preapplied'
+    ),
+    'ok',
+    null,
+    null
+  );
+
+select
+  pg_temp.bump_run_after_prepare (
+    (
+      select
+        n
+      from
+        input_runs
+      where
+        k = 'preapplied'
+    )
+  );
+
+select
+  ok (
+    (
+      select
+        cov.orders_scope_applied
+        and cov.scope_kind is null
+        and not cov.legacy_direct
+        and not cov.transactions_covered
+        and cov.presented_shift_ids = (
+          select
+            array_agg(
+              shift.id
+              order by
+                shift.id
+            )
+          from
+            app.pos_shifts shift
+        )
+      from
+        app.pos_sync_coverage cov
+      where
+        cov.run_id = (
+          select
+            n
+          from
+            input_runs
+          where
+            k = 'preapplied'
+        )
+    ),
+    'a run that applied its scope before scope_kind existed finishes with an unknown scope'
+  );
+
+select
+  is (
+    pg_temp.count_c1 (),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a count stays waiting when the newest ok run applied an unknown scope'
+  );
+
+select
+  is_empty (
+    $$
+      select
+        id
+      from
+        app.stock_counts
+      where
+        request_id = 'a5300000-0000-4000-8000-0000000000c1'
+    $$,
+    'a count refused for an unknown scope posts nothing'
   );
 
 insert into

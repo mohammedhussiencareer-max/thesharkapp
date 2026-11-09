@@ -19,24 +19,31 @@
 --                                        base 20261016040000_pos_sales.sql
 --   app.record_count(jsonb)              base 20261022010000_counts.sql
 -- ============================================================================
--- 0. Lock order. The ledger advisory lock is first, then the POS tables this
--- migration alters or backfills, NOWAIT, in a fixed order.
+-- 0. Lock order. The ledger advisory lock is first, then pos_sync_runs in
+-- ACCESS EXCLUSIVE mode NOWAIT, then the other POS tables this migration
+-- backfills, NOWAIT, in a fixed order.
 --
--- Ingest at runtime does not take this advisory lock. Its order stays
--- sync-run row, then shifts and transactions, then orders, then input
--- appends. A running sync can therefore hold those row locks while this
--- migration already holds the ledger lock. NOWAIT fails that migration with
--- 55P03 instead of keeping the ledger lock until the sync commits. That wait
--- would not deadlock (sync never asks for the ledger lock) but it would
--- block every poster for the whole sync.
+-- Ingest at runtime does not take the advisory lock. Its first statement is
+-- a FOR UPDATE on its pos_sync_runs row, which holds ROW SHARE on the table
+-- until commit, and it writes that row again later. A weaker lock here
+-- (SHARE ROW EXCLUSIVE admits ROW SHARE) would let this migration lock first
+-- and then wait in ALTER TABLE for that ingest while the ingest's later
+-- write waits for this migration: a deadlock, resolved after
+-- deadlock_timeout, while the ledger lock is held. ACCESS EXCLUSIVE NOWAIT
+-- conflicts with that ROW SHARE, so a running sync fails the migration at
+-- once with 55P03. Once held, no sync statement can start, and every sync
+-- transaction reaches pos_sync_runs before any other POS table, so the
+-- remaining NOWAIT locks cannot wait on a sync either. The advisory lock
+-- stays first because record_count takes it before it reads pos_sync_runs.
 -- ============================================================================
 select
   pg_catalog.pg_advisory_xact_lock (7342750000000000001::bigint);
 
 do $lock_tables$
 begin
-  lock table app.pos_sync_runs,
-  app.pos_sync_run_orders,
+  lock table app.pos_sync_runs in access exclusive mode nowait;
+
+  lock table app.pos_sync_run_orders,
   app.pos_shifts,
   app.pos_shift_transactions,
   app.pos_orders,
@@ -68,7 +75,7 @@ add constraint pos_sync_runs_scope_shifts_chk check (
   or pg_catalog.cardinality (scope_shift_ids) = 0
 );
 
-comment on column app.pos_sync_runs.scope_kind is 'Order-read scope applied by this run: shift_ids, from, or all. Null until p_scope is applied. Not a proof of coverage by itself; finish copies it into pos_sync_coverage only when the run ends ok.';
+comment on column app.pos_sync_runs.scope_kind is 'Order-read scope applied by this run: shift_ids, from, or all. Null until p_scope is applied, and null on a run that applied its scope before this column existed (scope unknown, never treated as covering). Not a proof of coverage by itself; finish copies it into pos_sync_coverage only when the run ends ok.';
 
 comment on column app.pos_sync_runs.scope_from is 'Lower bound of a from scope. Null unless scope_kind is from.';
 
@@ -242,7 +249,7 @@ comment on column app.pos_sync_coverage.orders_scope_applied is 'True when this 
 
 comment on column app.pos_sync_coverage.presented_shift_ids is 'Shifts whose transaction subcollections this run replaced, sorted and distinct.';
 
-comment on column app.pos_sync_coverage.transactions_covered is 'True when a shift_ids scope lists only presented shifts, or when another applied scope completed. False when the order scope listed a shift whose subcollection was not replaced, and false on legacy_direct rows.';
+comment on column app.pos_sync_coverage.transactions_covered is 'True when every shift the applied scope names was presented, so its transaction subcollection was replaced: the listed shifts for shift_ids, every mirror shift for all, every mirror shift opened at or after scope_from for from. False when any of them was not presented, when the scope is unknown (applied before this column existed), and on legacy_direct rows. Computed at finish; record_count recomputes it from presented_shift_ids for the shifts opened at or before the count.';
 
 comment on column app.pos_sync_coverage.legacy_direct is 'True when the ok run was inserted already finished, not closed by finish_pos_sync_run. record_count then keeps the previous time check and does not apply the scope geometry.';
 
@@ -896,7 +903,7 @@ set
     );
 $$;
 
-comment on function app.pos_sync_scope_covers_count (boolean, text, timestamptz, text[], timestamptz) is 'True when an applied order scope covers every shift opened at or before the count. all covers them. shift_ids must list each of them. from must be at or before the earliest such opened_at. No such shift is covered by any applied scope. Internal.';
+comment on function app.pos_sync_scope_covers_count (boolean, text, timestamptz, text[], timestamptz) is 'True when an applied order scope covers every shift opened at or before the count. all covers them. shift_ids must list each of them. from must be at or before the earliest such opened_at. No such shift is covered by any applied scope. Null or false for an unknown kind: callers must test is not true. Internal.';
 
 revoke all on function app.pos_sync_scope_covers_count (boolean, text, timestamptz, text[], timestamptz)
 from
@@ -1164,7 +1171,24 @@ begin
     v_scope_shifts := coalesce(v_scope_shifts, '{}'::text[]);
     v_transactions := case
       when v_kind = 'shift_ids' then v_scope_shifts <@ v_presented
-      when v_applied then true
+      when v_kind = 'all' then not exists (
+        select
+          1
+        from
+          app.pos_shifts shift
+        where
+          shift.id <> all (v_presented)
+      )
+      when v_kind = 'from' then not exists (
+        select
+          1
+        from
+          app.pos_shifts shift
+        where
+          shift.opened_at >= v_from
+          and shift.id <> all (v_presented)
+      )
+      when v_applied then false
       else pg_catalog.cardinality(v_presented) > 0
     end;
 
@@ -1213,7 +1237,7 @@ begin
 end;
 $$;
 
-comment on function app.finish_pos_sync_run (bigint, text, jsonb, text) is 'Closes a POS sync run and drops the temporary seen-order ids. error is truncated to 500 characters. Status ok appends pos_sync_coverage from the scope and presented shifts accumulated by ingest. Status failed appends nothing. scope_applied is not required. Does not post stock and does not take the ledger posting lock.';
+comment on function app.finish_pos_sync_run (bigint, text, jsonb, text) is 'Closes a POS sync run and drops the temporary seen-order ids. error is truncated to 500 characters. Status ok appends pos_sync_coverage from the scope and presented shifts accumulated by ingest; transactions_covered is true only when every shift the scope names was presented. Status failed appends nothing. scope_applied is not required. Does not post stock and does not take the ledger posting lock.';
 
 revoke all on function app.finish_pos_sync_run (bigint, text, jsonb, text)
 from
@@ -2200,6 +2224,7 @@ declare
   v_cov_kind text;
   v_cov_from timestamptz;
   v_cov_shifts text[];
+  v_cov_presented text[];
   v_cov_legacy boolean;
   v_close_recorded timestamptz;
   v_has_prior_shift boolean := false;
@@ -2620,17 +2645,24 @@ begin
   -- The time check above is unchanged. Coverage then proves that this same
   -- newest ok run actually completed a read of the shifts opened by the count.
   -- legacy_direct is a finished ok row that was not closed by finish_pos_sync_run.
+  -- Otherwise the run needs an applied order scope covering every shift opened
+  -- at or before the count, and its transaction subcollection must have been
+  -- replaced for each of those shifts. An unknown scope (null kind: applied
+  -- before scope_kind existed) makes the helper return null, which is not
+  -- covered.
   select
     cov.orders_scope_applied,
     cov.scope_kind,
     cov.scope_from,
     cov.scope_shift_ids,
+    cov.presented_shift_ids,
     cov.legacy_direct
   into
     v_cov_applied,
     v_cov_kind,
     v_cov_from,
     v_cov_shifts,
+    v_cov_presented,
     v_cov_legacy
   from
     app.pos_sync_coverage cov
@@ -2641,12 +2673,21 @@ begin
   or v_cov_legacy is not true then
     if not found
     or v_cov_applied is not true
-    or not app.pos_sync_scope_covers_count (
+    or app.pos_sync_scope_covers_count (
       v_cov_applied,
       v_cov_kind,
       v_cov_from,
       v_cov_shifts,
       v_counted_at
+    ) is not true
+    or exists (
+      select
+        1
+      from
+        app.pos_shifts shift
+      where
+        shift.opened_at <= v_counted_at
+        and shift.id <> all (coalesce(v_cov_presented, '{}'::text[]))
     ) then
       return pg_catalog.jsonb_build_object('status', 'waiting_for_sync');
     end if;
@@ -2866,7 +2907,7 @@ begin
 end;
 $$;
 
-comment on function app.record_count (jsonb) is 'Prepares, then posts, one stock count. Takes advisory lock 7342750000000000001 first, validates the payload, and replays request_id against stock_counts before any catalog, shift, sync, or balance read. The same normalized payload returns {"status":"posted","count_id":...} and does not post again. counted_qty is stored as numeric(20, 6) text, not a JSON number, and both the prepare replay and the posted replay compare that same text and the trimmed expected_base_unit. A missing or blank expected_base_unit raises 22023 expected_base_unit is required. The first submit and the post both raise 22023 item base unit changed when that unit differs from stock_items.base_unit. A different payload raises 22023 request_id already used for a different count. The first submit stores stock_count_requests with prepared_at = clock_timestamp() and returns {"status":"waiting_for_sync"} without raising, after the shift and item guards. The owner submits only after the physical count, so prepared_at is after the count. A later call with the same payload waits until the newest ok pos_sync_runs row, by id, has finished_at not null, started_at > prepared_at, and started_at > the latest close_recorded_at among shifts with opened_at <= counted_at. Those times are all the database clock. started_at is not compared with counted_at. Sale and shift times are POS-clock and are compared with counted_at only to place movements before or after the count. When that run exists, every guard runs again on the fresh mirror, then non-zero deltas post as one count_adjustment batch (actual minus locked on-hand). After the post, last_occurred_at moves to counted_at plus one microsecond so a later movement at or before the count is back-dated. A sale still missing is refused by that watermark until a later recompute. The same newest ok run must also have app.pos_sync_coverage. A legacy_direct row keeps the time check above. Any other row returns {"status":"waiting_for_sync"} unless that run applied an order scope covering every shift with opened_at <= counted_at: all, shift_ids containing each such shift, or from at or before the earliest such opened_at. finish_pos_sync_run does not require scope_applied. A failed finish writes no coverage row.';
+comment on function app.record_count (jsonb) is 'Prepares, then posts, one stock count. Takes advisory lock 7342750000000000001 first, validates the payload, and replays request_id against stock_counts before any catalog, shift, sync, or balance read. The same normalized payload returns {"status":"posted","count_id":...} and does not post again. counted_qty is stored as numeric(20, 6) text, not a JSON number, and both the prepare replay and the posted replay compare that same text and the trimmed expected_base_unit. A missing or blank expected_base_unit raises 22023 expected_base_unit is required. The first submit and the post both raise 22023 item base unit changed when that unit differs from stock_items.base_unit. A different payload raises 22023 request_id already used for a different count. The first submit stores stock_count_requests with prepared_at = clock_timestamp() and returns {"status":"waiting_for_sync"} without raising, after the shift and item guards. The owner submits only after the physical count, so prepared_at is after the count. A later call with the same payload waits until the newest ok pos_sync_runs row, by id, has finished_at not null, started_at > prepared_at, and started_at > the latest close_recorded_at among shifts with opened_at <= counted_at. Those times are all the database clock. started_at is not compared with counted_at. Sale and shift times are POS-clock and are compared with counted_at only to place movements before or after the count. When that run exists, every guard runs again on the fresh mirror, then non-zero deltas post as one count_adjustment batch (actual minus locked on-hand). After the post, last_occurred_at moves to counted_at plus one microsecond so a later movement at or before the count is back-dated. A sale still missing is refused by that watermark until a later recompute. The same newest ok run must also have app.pos_sync_coverage. A legacy_direct row keeps the time check above. Any other row returns {"status":"waiting_for_sync"} unless that run applied a known order scope covering every shift with opened_at <= counted_at (all, shift_ids containing each such shift, or from at or before the earliest such opened_at; an unknown scope never covers) and its presented_shift_ids contain each such shift, so every one had its transaction subcollection replaced. finish_pos_sync_run does not require scope_applied. A failed finish writes no coverage row.';
 
 revoke all on function app.record_count (jsonb)
 from
