@@ -2738,10 +2738,75 @@ values
     '2026-12-01T12:30:00Z'
   );
 
+-- A finished run from before this migration has no coverage row. The insert
+-- trigger exists only after the migration, so it is off for this one row.
+alter table app.pos_sync_runs disable trigger trg_pos_sync_runs_legacy_coverage;
+
+with
+  run as (
+    insert into
+      app.pos_sync_runs (
+        mode,
+        status,
+        started_at,
+        finished_at,
+        scope_applied
+      )
+    values
+      (
+        'recent',
+        'ok',
+        '2026-11-01T22:00:00Z',
+        '2026-11-01T22:01:00Z',
+        true
+      )
+    returning
+      id
+  )
+insert into
+  input_runs (k, n)
+select
+  'predates',
+  run.id
+from
+  run;
+
+alter table app.pos_sync_runs enable trigger trg_pos_sync_runs_legacy_coverage;
+
 select
   lives_ok (
     'select app.backfill_pos_accounting_inputs()',
     'backfill copies the current mirror'
+  );
+
+select
+  ok (
+    (
+      select
+        cov.orders_scope_applied
+        and cov.scope_kind is null
+        and not cov.legacy_direct
+        and not cov.transactions_covered
+        and app.pos_sync_scope_covers_count (
+          cov.orders_scope_applied,
+          cov.scope_kind,
+          cov.scope_from,
+          cov.scope_shift_ids,
+          '2026-11-01T22:30:00Z'::timestamptz
+        ) is not true
+      from
+        app.pos_sync_coverage cov
+      where
+        cov.run_id = (
+          select
+            n
+          from
+            input_runs
+          where
+            k = 'predates'
+        )
+    ),
+    'a run from before the migration is copied with an unknown scope that covers no count'
   );
 
 select

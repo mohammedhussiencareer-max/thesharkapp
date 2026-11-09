@@ -243,7 +243,7 @@ create table app.pos_sync_coverage (
   )
 );
 
-comment on table app.pos_sync_coverage is 'One row per successful POS sync finish: the order scope that finish actually had, the shifts whose transaction subcollections were replaced, and the run start and finish times. A failed finish writes nothing. legacy_direct marks an ok run that was inserted already finished, including runs copied at migration time, so the older time-only count check still applies to those rows.';
+comment on table app.pos_sync_coverage is 'One row per successful POS sync finish: the order scope that finish actually had, the shifts whose transaction subcollections were replaced, and the run start and finish times. A failed finish writes nothing. legacy_direct marks an ok run that was inserted already finished, not closed by finish_pos_sync_run, so the older time-only count check still applies to those rows. Runs that predate this table are copied with an unknown scope and do not cover a count.';
 
 comment on column app.pos_sync_coverage.orders_scope_applied is 'True when this run applied p_scope. finish_pos_sync_run does not require it; a true ok finish with this flag false does not cover a count.';
 
@@ -984,8 +984,8 @@ begin
     perform app.append_pos_cost_input (v_order_id, null, 'backfill');
   end loop;
 
-  -- Finished ok runs that predate coverage. legacy_direct keeps the old
-  -- count time check until a newer run is closed by finish_pos_sync_run.
+  -- Finished ok runs that predate coverage have an unknown scope, so they do
+  -- not cover a count; a new run closed by finish_pos_sync_run has to.
   insert into
     app.pos_sync_coverage (
       run_id,
@@ -1003,13 +1003,13 @@ begin
     run.id,
     run.started_at,
     run.finished_at,
-    true,
-    'all',
+    run.scope_applied,
+    null,
     null,
     '{}'::text[],
     '{}'::text[],
     false,
-    true
+    false
   from
     app.pos_sync_runs run
   where
@@ -1028,7 +1028,7 @@ begin
 end;
 $$;
 
-comment on function app.backfill_pos_accounting_inputs () is 'Copies the current mirror into one backfill snapshot and one backfill cost input per order, and one present backfill refund revision per current transaction that has none yet. Finished ok runs with no coverage row get a legacy_direct all-scope row. A second call appends nothing. Internal.';
+comment on function app.backfill_pos_accounting_inputs () is 'Copies the current mirror into one backfill snapshot and one backfill cost input per order, and one present backfill refund revision per current transaction that has none yet. Finished ok runs with no coverage row get an unknown-scope row that covers no count. A second call appends nothing. Internal.';
 
 revoke all on function app.backfill_pos_accounting_inputs ()
 from

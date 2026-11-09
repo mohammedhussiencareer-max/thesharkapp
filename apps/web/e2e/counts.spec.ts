@@ -219,9 +219,17 @@ test('owner counts a daily item short and sees the shortage', async ({
   await page.getByRole('button', { name: 'حفظ', exact: true }).click();
   await expect(page.getByText(waitingForSyncMessage)).toBeVisible(visible);
 
-  await coverCountTime(supabaseUrl);
-
-  await page.getByRole('button', { name: 'سجّل الجرد' }).click();
+  // A parallel spec can finish a narrower sync between the covering read and
+  // the submit, so the read and the submit are retried together.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await coverCountTime(supabaseUrl);
+    const response = page.waitForResponse((candidate) =>
+      candidate.url().includes('/rpc/record_count'),
+    );
+    await page.getByRole('button', { name: 'سجّل الجرد' }).click();
+    const body = (await (await response).json()) as { status?: string };
+    if (body.status !== 'waiting_for_sync') break;
+  }
   await expect(page.getByRole('status')).toHaveText('اتسجل الجرد', visible);
   const saved = page.getByRole('article', { name: stamp, exact: true });
   await expect(saved).toBeVisible(visible);
