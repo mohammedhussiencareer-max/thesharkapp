@@ -372,6 +372,34 @@ select
     null
   );
 
+-- Reasoned waste: a record in a custom unit and its correction. The documents
+-- carry an owner foreign key (actor), a saved conversion version and a chain.
+select
+  app.record_waste (
+    'b4c00000-0000-4000-8000-000000000411',
+    jsonb_build_object(
+      'occurred_at', '2026-08-09T10:00:00Z',
+      'reason_code', 'spoilage',
+      'lines', jsonb_build_array(
+        jsonb_build_object('item_id', 'b4c00000-0000-4000-8000-000000000001', 'quantity', '0.2', 'unit', 'box')
+      )
+    )
+  );
+
+select
+  app.record_waste (
+    'b4c00000-0000-4000-8000-000000000412',
+    jsonb_build_object(
+      'predecessor_id', (select id::text from app.waste_documents where request_id = 'b4c00000-0000-4000-8000-000000000411'),
+      'occurred_at', '2026-08-09T10:00:00Z',
+      'reason_code', 'other',
+      'explanation', 'seed correction',
+      'lines', jsonb_build_array(
+        jsonb_build_object('item_id', 'b4c00000-0000-4000-8000-000000000001', 'quantity', '0.3', 'unit', 'box')
+      )
+    )
+  );
+
 insert into
   app.accounting_work_attempts (
     order_id,

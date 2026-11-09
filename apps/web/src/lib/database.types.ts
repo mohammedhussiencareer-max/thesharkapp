@@ -1573,6 +1573,158 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"waste_documents": {
+                  Row: {
+                    "actor": string,"batch_id": string | null,"created_at": string,"event_position": number,"explanation": string | null,"id": number,"is_void": boolean,"occurred_at": string,"predecessor_id": number | null,"reason_code": string,"request_id": string,"retire_batch_id": string | null,"shift_id": string | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "actor": string,"batch_id"?: string | null,"created_at"?: string,"event_position": number,"explanation"?: string | null,"id"?: never,"is_void"?: boolean,"occurred_at": string,"predecessor_id"?: number | null,"reason_code": string,"request_id": string,"retire_batch_id"?: string | null,"shift_id"?: string | null
+                  }
+                  Update: {
+                    "actor"?: string,"batch_id"?: string | null,"created_at"?: string,"event_position"?: number,"explanation"?: string | null,"id"?: never,"is_void"?: boolean,"occurred_at"?: string,"predecessor_id"?: number | null,"reason_code"?: string,"request_id"?: string,"retire_batch_id"?: string | null,"shift_id"?: string | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "waste_documents_predecessor_id_fkey"
+      columns: ["predecessor_id"]
+isOneToOne: true
+      referencedRelation: "waste_documents"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "waste_documents_predecessor_id_fkey"
+      columns: ["predecessor_id"]
+isOneToOne: true
+      referencedRelation: "waste_history"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "waste_documents_predecessor_id_fkey"
+      columns: ["predecessor_id"]
+isOneToOne: true
+      referencedRelation: "waste_history"
+      referencedColumns: ["successor_id"]
+    }
+                  ]
+                },"waste_line_movements": {
+                  Row: {
+                    "document_id": number,"line_id": number,"movement_id": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "document_id": number,"line_id": number,"movement_id": number
+                  }
+                  Update: {
+                    "document_id"?: number,"line_id"?: number,"movement_id"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "waste_line_movements_document_id_fkey"
+      columns: ["document_id"]
+isOneToOne: false
+      referencedRelation: "waste_documents"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "waste_line_movements_document_id_fkey"
+      columns: ["document_id"]
+isOneToOne: false
+      referencedRelation: "waste_history"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "waste_line_movements_document_id_fkey"
+      columns: ["document_id"]
+isOneToOne: false
+      referencedRelation: "waste_history"
+      referencedColumns: ["successor_id"]
+    },{
+      foreignKeyName: "waste_line_movements_line_id_fkey"
+      columns: ["line_id"]
+isOneToOne: false
+      referencedRelation: "waste_lines"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "waste_line_movements_movement_id_fkey"
+      columns: ["movement_id"]
+isOneToOne: true
+      referencedRelation: "stock_movements"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"waste_lines": {
+                  Row: {
+                    "base_quantity": number,"base_unit": string,"conversion_version_id": string | null,"document_id": number,"factor": number,"factor_source": string,"id": number,"input_quantity": number,"input_unit": string,"item_id": string,"line_no": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "base_quantity": number,"base_unit": string,"conversion_version_id"?: string | null,"document_id": number,"factor": number,"factor_source": string,"id"?: never,"input_quantity": number,"input_unit": string,"item_id": string,"line_no": number
+                  }
+                  Update: {
+                    "base_quantity"?: number,"base_unit"?: string,"conversion_version_id"?: string | null,"document_id"?: number,"factor"?: number,"factor_source"?: string,"id"?: never,"input_quantity"?: number,"input_unit"?: string,"item_id"?: string,"line_no"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "waste_lines_document_id_fkey"
+      columns: ["document_id"]
+isOneToOne: false
+      referencedRelation: "waste_documents"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "waste_lines_document_id_fkey"
+      columns: ["document_id"]
+isOneToOne: false
+      referencedRelation: "waste_history"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "waste_lines_document_id_fkey"
+      columns: ["document_id"]
+isOneToOne: false
+      referencedRelation: "waste_history"
+      referencedColumns: ["successor_id"]
+    },{
+      foreignKeyName: "waste_lines_input_unit_fkey"
+      columns: ["input_unit"]
+isOneToOne: false
+      referencedRelation: "units"
+      referencedColumns: ["code"]
+    },{
+      foreignKeyName: "waste_lines_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"waste_requests": {
+                  Row: {
+                    "created_at": string,"document_id": number,"payload_hash": string,"request_id": string,"result": NonNullable<Json>
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_at"?: string,"document_id": number,"payload_hash": string,"request_id": string,"result": NonNullable<Json>
+                  }
+                  Update: {
+                    "created_at"?: string,"document_id"?: number,"payload_hash"?: string,"request_id"?: string,"result"?: NonNullable<Json>
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "waste_requests_document_id_fkey"
+      columns: ["document_id"]
+isOneToOne: false
+      referencedRelation: "waste_documents"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "waste_requests_document_id_fkey"
+      columns: ["document_id"]
+isOneToOne: false
+      referencedRelation: "waste_history"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "waste_requests_document_id_fkey"
+      columns: ["document_id"]
+isOneToOne: false
+      referencedRelation: "waste_history"
+      referencedColumns: ["successor_id"]
+    }
+                  ]
                 }
           }
           Views: {
@@ -1739,6 +1891,32 @@ isOneToOne: false
                   ComputedFields: never
                   Relationships: [
                     
+                  ]
+                },"waste_history": {
+                  Row: {
+                    "created_at": string | null,"explanation": string | null,"id": number | null,"is_current": boolean | null,"is_void": boolean | null,"kind": string | null,"lines": Json | null,"occurred_at": string | null,"predecessor_id": number | null,"reason_code": string | null,"request_id": string | null,"shift_id": string | null,"successor_id": number | null,"value": string | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    {
+      foreignKeyName: "waste_documents_predecessor_id_fkey"
+      columns: ["predecessor_id"]
+isOneToOne: true
+      referencedRelation: "waste_documents"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "waste_documents_predecessor_id_fkey"
+      columns: ["predecessor_id"]
+isOneToOne: true
+      referencedRelation: "waste_history"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "waste_documents_predecessor_id_fkey"
+      columns: ["predecessor_id"]
+isOneToOne: true
+      referencedRelation: "waste_history"
+      referencedColumns: ["successor_id"]
+    }
                   ]
                 }
           }
@@ -2224,6 +2402,9 @@ isOneToOne: false
                            },
 "record_sort":
 { Args: { "p_sort": Json }; Returns: string
+                           },
+"record_waste":
+{ Args: { "p_document": Json,"p_request_id": string }; Returns: Json
                            },
 "rename_expense_category":
 { Args: { "p_id": string,"p_name": string }; Returns: undefined
