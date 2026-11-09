@@ -2291,22 +2291,35 @@ select
   app.append_pos_cost_input ('o-refund', null, 'sync');
 
 select
-  is (
-    (pg_temp.work () ->> 'disposition_pending')::integer,
-    3,
-    'canceled, missing and refunded orders are disposition_pending'
+  results_eq (
+    $$select (w ->> 'applied')::integer, (w ->> 'unchanged')::integer, (w ->> 'disposition_pending')::integer
+      from (select pg_temp.work () as w) x$$,
+    $$values (2, 1, 0)$$,
+    'a canceled and a missing order default to made and post prepared waste; a partly refunded order stays a sale'
   );
 
 select
   results_eq (
-    $$select h.order_id, (h.causes -> 0 ->> 'code'), (h.causes -> 0 ->> 'reason')
+    $$select h.order_id, h.disposition
       from app.order_cost_state h
       where h.order_id in ('o-cancel', 'o-miss', 'o-refund') order by 1$$,
     $$values
-      ('o-cancel', 'disposition_pending', 'canceled'),
-      ('o-miss', 'disposition_pending', 'missing'),
-      ('o-refund', 'disposition_pending', 'refund')$$,
-    'each head names why the decision is pending'
+      ('o-cancel', 'prepared_waste'),
+      ('o-miss', 'prepared_waste'),
+      ('o-refund', 'sale')$$,
+    'each head carries the default decision''s disposition'
+  );
+
+select
+  results_eq (
+    $$select e.order_id, e.class, e.decision, e.source, e.owner_reviewed
+      from app.order_disposition_events e
+      where e.order_id in ('o-cancel', 'o-miss', 'o-refund') order by 1$$,
+    $$values
+      ('o-cancel', 'canceled', 'made', 'system_default', false),
+      ('o-miss', 'missing', 'made', 'system_default', false),
+      ('o-refund', 'partial_refund', 'made', 'system_default', false)$$,
+    'each episode starts with one unreviewed system default'
   );
 
 select
@@ -2314,9 +2327,10 @@ select
     $$select h.order_id
       from app.order_cost_state h
       join pending_before b on b.order_id = h.order_id
-      where h.owner_application_id is distinct from b.owner_application_id
-         or (select count(*) from app.order_cost_applications a where a.order_id = h.order_id) <> b.receipts$$,
-    'the current application and the receipts stay as they were'
+      where h.order_id = 'o-refund'
+        and (h.owner_application_id is distinct from b.owner_application_id
+         or (select count(*) from app.order_cost_applications a where a.order_id = h.order_id) <> b.receipts + 1)$$,
+    'the partly refunded order keeps its sale application and gains an evaluation receipt'
   );
 
 select
@@ -2326,7 +2340,7 @@ select
       'a5400000-0000-4000-8000-000000000001'
     ),
     -1::numeric,
-    'the canceled order keeps its sale until PR 5 decides'
+    'the canceled order''s stock effect is the prepared waste, not the sale and the waste together'
   );
 
 select
@@ -2339,20 +2353,21 @@ select
       where
         order_id = 'o-cancel'
     ),
-    'disposition_pending',
-    'the work state records disposition_pending'
+    'applied',
+    'the work state records the applied default'
   );
 
 select
   results_eq (
-    $$select c.order_id, c.outcome, c.application_id is null
+    $$select c.order_id, c.outcome, c.application_id is not null
       from app.accounting_work_completions c
-      where c.order_id in ('o-cancel', 'o-miss', 'o-refund') and c.outcome = 'disposition_pending'
+      where c.order_id in ('o-cancel', 'o-miss', 'o-refund')
+        and c.work_generation = (select max(c2.work_generation) from app.accounting_work_completions c2 where c2.order_id = c.order_id)
       order by 1$$,
-    $$values ('o-cancel', 'disposition_pending', true),
-             ('o-miss', 'disposition_pending', true),
-             ('o-refund', 'disposition_pending', true)$$,
-    'each disposition_pending call left completion evidence although it wrote no receipt'
+    $$values ('o-cancel', 'applied', true),
+             ('o-miss', 'applied', true),
+             ('o-refund', 'unchanged', true)$$,
+    'each default call left completion evidence with its receipt'
   );
 
 select
@@ -2365,13 +2380,23 @@ select
           app.accounting_work_completions c
         where
           c.order_id = 'o-cancel'
-          and c.outcome = 'disposition_pending'
+        order by
+          c.work_generation desc
+        limit
+          1
       ),
       'o-cancel',
-      1
+      (
+        select
+          max(c.work_generation)
+        from
+          app.accounting_work_completions c
+        where
+          c.order_id = 'o-cancel'
+      )
     ) ->> 'status',
     'committed',
-    'a late failure report for the disposition_pending call is answered committed'
+    'a late failure report for the default call is answered committed'
   );
 
 -- ---------------------------------------------------------------------------
@@ -3823,8 +3848,8 @@ select
   is_empty (
     $$select l.movement_id from app.order_cost_movement_links l
       join app.stock_movements m on m.id = l.movement_id
-      where m.source_type <> 'engine' or m.movement_type <> 'sale'$$,
-    'links point only at engine sale movements'
+      where m.source_type <> 'engine' or m.movement_type not in ('sale', 'waste')$$,
+    'links point only at engine sale and prepared-waste movements'
   );
 
 -- ---------------------------------------------------------------------------
