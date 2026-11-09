@@ -2405,6 +2405,92 @@ select
     'a count refused for an unknown scope posts nothing'
   );
 
+-- An order before the count whose shift was never mirrored keeps the count
+-- waiting even though every mirrored shift was presented.
+reset role;
+
+insert into
+  app.pos_orders (
+    id,
+    shift_id,
+    status,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    version
+  )
+values
+  (
+    'order-count-no-parent',
+    'shift-count-never-mirrored',
+    'complete',
+    '2026-11-01T10:00:00Z',
+    10,
+    0,
+    0,
+    0,
+    0,
+    10,
+    '2026-11-01T10:00:00Z',
+    repeat('c', 64),
+    1
+  );
+
+set
+  local role authenticated;
+
+insert into
+  input_runs (k, n)
+values
+  (
+    'count-noparent',
+    pg_temp.finished_run (
+      'full',
+      (
+        select
+          array_agg(shift.id)
+        from
+          app.pos_shifts shift
+      ),
+      jsonb_build_object('all', true)
+    )
+  );
+
+select
+  is (
+    pg_temp.count_c1 (),
+    jsonb_build_object('status', 'waiting_for_sync'),
+    'a count waits for an earlier order whose shift was never mirrored'
+  );
+
+select
+  is_empty (
+    $$
+      select
+        id
+      from
+        app.stock_counts
+      where
+        request_id = 'a5300000-0000-4000-8000-0000000000c1'
+    $$,
+    'a count refused for a never-mirrored shift posts nothing'
+  );
+
+reset role;
+
+delete from app.pos_orders
+where
+  id = 'order-count-no-parent';
+
+set
+  local role authenticated;
+
 insert into
   input_runs (k, n)
 values

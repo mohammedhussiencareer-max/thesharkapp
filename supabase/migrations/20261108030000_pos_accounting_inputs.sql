@@ -2712,10 +2712,24 @@ begin
       select
         1
       from
-        app.pos_shifts shift
+        (
+          select
+            shift.id
+          from
+            app.pos_shifts shift
+          where
+            shift.opened_at <= v_counted_at
+          union
+          select
+            o.shift_id
+          from
+            app.pos_orders o
+          where
+            o.ordered_at <= v_counted_at
+            and o.shift_id is not null
+        ) as required (id)
       where
-        shift.opened_at <= v_counted_at
-        and shift.id <> all (coalesce(v_cov_presented, '{}'::text[]))
+        required.id <> all (coalesce(v_cov_presented, '{}'::text[]))
     ) then
       return pg_catalog.jsonb_build_object('status', 'waiting_for_sync');
     end if;
