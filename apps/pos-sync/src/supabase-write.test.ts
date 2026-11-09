@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { localServiceRoleKey } from './local-supabase.ts';
-import { createSupabaseDb } from './supabase-write.ts';
+import {
+  createSupabaseDb,
+  isUnknownOutcome,
+  SupabaseRpcError,
+} from './supabase-write.ts';
 import type { IngestCounts } from './types.ts';
 
 const counts: IngestCounts = {
@@ -153,5 +157,301 @@ describe('createSupabaseDb', () => {
     await expect(ingest.ingest(4, [], [], null)).rejects.toThrow(
       /^Supabase RPC failed: HTTP 409$/,
     );
+  });
+});
+
+const ATTEMPT = 'b4c00000-0000-4000-8000-000000000501';
+
+const processedBody = {
+  status: 'processed',
+  processed: 3,
+  applied: 2,
+  unchanged: 1,
+  incomplete: 0,
+  none: 0,
+  blocked: 0,
+  disposition_pending: 0,
+  failed: 0,
+  remaining: 4,
+  head: { order_id: 'order-test-9', work_generation: 2 },
+  critical: null,
+};
+
+function accountingDb(respond: (url: string, init: RequestInit) => Response) {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const db = createSupabaseDb(
+    'http://127.0.0.1:55421',
+    localServiceRoleKey,
+    async (url, init) => {
+      calls.push({ url, init });
+      return respond(url, init);
+    },
+  );
+  return { db, calls };
+}
+
+function sentBody(call: { init: RequestInit } | undefined): unknown {
+  const body = call?.init.body;
+  if (typeof body !== 'string') {
+    throw new Error('request body is not a string');
+  }
+  return JSON.parse(body) as unknown;
+}
+
+describe('accounting RPCs', () => {
+  it('calls the app profile with the caller attempt id and a timeout', async () => {
+    const { db, calls } = accountingDb((url) =>
+      new URL(url).pathname.endsWith('/run_accounting_work')
+        ? new Response(JSON.stringify(processedBody), { status: 200 })
+        : new Response(JSON.stringify({ status: 'recorded' }), { status: 200 }),
+    );
+    await expect(db.runAccountingWork(ATTEMPT, 5)).resolves.toEqual({
+      status: 'processed',
+      counts: {
+        processed: 3,
+        applied: 2,
+        unchanged: 1,
+        incomplete: 0,
+        none: 0,
+        blocked: 0,
+        disposition_pending: 0,
+        failed: 0,
+        remaining: 4,
+      },
+      head: { orderId: 'order-test-9', workGeneration: 2 },
+      critical: null,
+    });
+    await expect(db.recordAccountingCallFailure(ATTEMPT, 2)).resolves.toBe(
+      'recorded',
+    );
+    await expect(db.recordAccountingCallFailure(ATTEMPT, null)).resolves.toBe(
+      'recorded',
+    );
+    expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
+      '/rest/v1/rpc/run_accounting_work',
+      '/rest/v1/rpc/record_accounting_call_failure',
+      '/rest/v1/rpc/record_accounting_call_failure',
+    ]);
+    expect(sentBody(calls[0])).toEqual({
+      p_attempt_id: ATTEMPT,
+      p_limit: 5,
+    });
+    expect(sentBody(calls[1])).toEqual({
+      p_attempt_id: ATTEMPT,
+      p_work_generation: 2,
+    });
+    expect(sentBody(calls[2])).toEqual({
+      p_attempt_id: ATTEMPT,
+      p_work_generation: null,
+    });
+    for (const call of calls) {
+      const headers = new Headers(call.init.headers);
+      expect(call.init.redirect).toBe('error');
+      expect(call.init.signal).toBeInstanceOf(AbortSignal);
+      expect(headers.get('Content-Profile')).toBe('app');
+      expect(headers.get('Accept-Profile')).toBe('app');
+      expect(headers.get('apikey')).toBe(localServiceRoleKey);
+    }
+  });
+
+  it('accepts the idle statuses without counts', async () => {
+    for (const status of ['empty', 'busy', 'sync_running', 'not_activated']) {
+      const { db } = accountingDb(
+        () =>
+          new Response(
+            JSON.stringify(
+              status === 'empty'
+                ? {
+                    ...processedBody,
+                    status,
+                    processed: 0,
+                    remaining: 0,
+                    head: null,
+                  }
+                : { status },
+            ),
+            { status: 200 },
+          ),
+      );
+      const run = await db.runAccountingWork(ATTEMPT, 5);
+      expect(run.status).toBe(status);
+      expect(run.critical).toBeNull();
+    }
+  });
+
+  it('returns the critical order only with the critical status', async () => {
+    const critical = { order_id: 'order-test-7', work_generation: 3 };
+    const { db } = accountingDb(
+      () =>
+        new Response(
+          JSON.stringify({ ...processedBody, status: 'critical', critical }),
+          { status: 200 },
+        ),
+    );
+    const run = await db.runAccountingWork(ATTEMPT, 5);
+    expect(run.status).toBe('critical');
+    expect(run.critical).toEqual({
+      orderId: 'order-test-7',
+      workGeneration: 3,
+    });
+
+    const mismatched = [
+      { ...processedBody, status: 'critical' },
+      { ...processedBody, critical },
+    ];
+    for (const body of mismatched) {
+      const { db: other } = accountingDb(
+        () => new Response(JSON.stringify(body), { status: 200 }),
+      );
+      await expect(other.runAccountingWork(ATTEMPT, 5)).rejects.toThrow(
+        /^Supabase RPC failed: unexpected response$/,
+      );
+    }
+  });
+
+  it('rejects malformed worker and recorder responses', async () => {
+    const workerBodies: unknown[] = [
+      null,
+      [],
+      'processed',
+      { status: 'weird' },
+      { ...processedBody, processed: -1 },
+      { ...processedBody, applied: 1.5 },
+      { ...processedBody, remaining: '4' },
+      { ...processedBody, failed: undefined },
+      { ...processedBody, head: { order_id: 'bad id!', work_generation: 1 } },
+      { ...processedBody, head: { order_id: 'order-1', work_generation: 0 } },
+    ];
+    for (const body of workerBodies) {
+      const { db } = accountingDb(
+        () => new Response(JSON.stringify(body), { status: 200 }),
+      );
+      await expect(db.runAccountingWork(ATTEMPT, 5)).rejects.toThrow(
+        /^Supabase RPC failed: unexpected response$/,
+      );
+    }
+    for (const body of [null, {}, { status: 'ok' }, 'recorded']) {
+      const { db } = accountingDb(
+        () => new Response(JSON.stringify(body), { status: 200 }),
+      );
+      await expect(db.recordAccountingCallFailure(ATTEMPT, 1)).rejects.toThrow(
+        /^Supabase RPC failed: unexpected response$/,
+      );
+    }
+    const { db: notJson } = accountingDb(
+      () => new Response('<html>', { status: 200 }),
+    );
+    await expect(notJson.runAccountingWork(ATTEMPT, 5)).rejects.toThrow(
+      /^Supabase RPC failed: unexpected response$/,
+    );
+  });
+
+  it('hides error bodies and classifies unknown outcomes', async () => {
+    const secret = 'pii-customer-name ya29.SECRET-DB';
+    const cases: Array<{ status: number; body: string; unknown: boolean }> = [
+      { status: 500, body: secret, unknown: true },
+      { status: 502, body: '', unknown: true },
+      {
+        status: 500,
+        body: JSON.stringify({ code: '57014', message: secret }),
+        unknown: true,
+      },
+      {
+        status: 400,
+        body: JSON.stringify({ code: '57014', message: secret }),
+        unknown: true,
+      },
+      {
+        status: 400,
+        body: JSON.stringify({ code: '22023', message: secret }),
+        unknown: false,
+      },
+      { status: 401, body: secret, unknown: false },
+      { status: 404, body: secret, unknown: false },
+    ];
+    for (const item of cases) {
+      const { db } = accountingDb(
+        () => new Response(item.body, { status: item.status }),
+      );
+      const error = await db.runAccountingWork(ATTEMPT, 5).then(
+        () => null,
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(SupabaseRpcError);
+      expect((error as Error).message).toBe(
+        `Supabase RPC failed: HTTP ${item.status}`,
+      );
+      expect(isUnknownOutcome(error)).toBe(item.unknown);
+    }
+  });
+
+  it('treats a lost reply, a timeout and an unreadable body as unknown', async () => {
+    const lost = createSupabaseDb(
+      'http://127.0.0.1:55421',
+      localServiceRoleKey,
+      async () => {
+        throw new TypeError('socket hang up ya29.SECRET');
+      },
+    );
+    const lostError = await lost.runAccountingWork(ATTEMPT, 5).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect((lostError as Error).message).toBe('Supabase RPC failed: network');
+    expect(isUnknownOutcome(lostError)).toBe(true);
+
+    const timeout = createSupabaseDb(
+      'http://127.0.0.1:55421',
+      localServiceRoleKey,
+      async () => {
+        throw new DOMException('timed out', 'TimeoutError');
+      },
+    );
+    const timeoutError = await timeout
+      .recordAccountingCallFailure(ATTEMPT, 1)
+      .then(
+        () => null,
+        (caught: unknown) => caught,
+      );
+    expect((timeoutError as Error).message).toBe(
+      'Supabase RPC failed: network',
+    );
+    expect(isUnknownOutcome(timeoutError)).toBe(true);
+    expect(isUnknownOutcome(new Error('plain'))).toBe(false);
+
+    const unreadable = createSupabaseDb(
+      'http://127.0.0.1:55421',
+      localServiceRoleKey,
+      async () =>
+        ({
+          ok: true,
+          status: 200,
+          async text() {
+            throw new Error('reset');
+          },
+        }) as unknown as Response,
+    );
+    const unreadableError = await unreadable.runAccountingWork(ATTEMPT, 5).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect((unreadableError as Error).message).toBe(
+      'Supabase RPC failed: unexpected response',
+    );
+    expect(isUnknownOutcome(unreadableError)).toBe(true);
+  });
+
+  it('keeps the RPC allowlist closed to retry and other functions', async () => {
+    const { db, calls } = accountingDb(
+      () => new Response('{}', { status: 200 }),
+    );
+    expect(Object.keys(db).sort()).toEqual([
+      'finishRun',
+      'ingest',
+      'recordAccountingCallFailure',
+      'runAccountingWork',
+      'startRun',
+    ]);
+    expect(calls).toEqual([]);
   });
 });

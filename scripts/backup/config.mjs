@@ -24,6 +24,7 @@ export const SCOPE_SCHEMAS = [DUMP_SCHEMA, STRUCTURE_ONLY_SCHEMA];
 // references auth.users; never remove one while old archives may exist.
 export const OWNER_FK_COLUMNS = [
   'app.costing_changes.actor_id',
+  'app.inventory_activation.approved_by',
   'app.item_opening_prices.approved_by',
   'app.owner.user_id',
 ];

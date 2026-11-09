@@ -1,9 +1,18 @@
+import {
+  drainAccountingWork,
+  formatDrain,
+  type DrainOptions,
+} from './accounting-drain.ts';
 import { compareId } from './hash.ts';
 import { assertLocalSupabaseUrl } from './local-guard.ts';
 import type { PosSnapshot } from './read-pos.ts';
 import { safeErrorMessage } from './safe-error.ts';
 import { planIngestCalls } from './scope.ts';
-import { createSupabaseDb, type PosDb } from './supabase-write.ts';
+import {
+  createSupabaseDb,
+  type AccountingDb,
+  type PosDb,
+} from './supabase-write.ts';
 import type { SyncMode } from './types.ts';
 
 export type PosReader = {
@@ -53,13 +62,26 @@ export async function runPosSync(input: {
   now?: Date;
   logger?: SyncLogger;
   fetchImpl?: (url: string, init: RequestInit) => Promise<Response>;
+  accountingDb?: AccountingDb;
+  accountingOptions?: Partial<DrainOptions>;
 }): Promise<SyncResult> {
   assertLocalSupabaseUrl(input.supabaseUrl);
-  const db =
-    input.db ??
-    createSupabaseDb(input.supabaseUrl, input.serviceRoleKey, input.fetchImpl);
+  let db: PosDb;
+  let accountingDb = input.accountingDb;
+  if (input.db === undefined) {
+    const created = createSupabaseDb(
+      input.supabaseUrl,
+      input.serviceRoleKey,
+      input.fetchImpl,
+    );
+    db = created;
+    accountingDb ??= created;
+  } else {
+    db = input.db;
+  }
   const counts = emptyCounts();
   let runId: number | undefined;
+  let result: SyncResult;
   try {
     runId = await db.startRun(input.mode);
     const read = await input.reader.read(input.mode, input.now ?? new Date());
@@ -95,7 +117,7 @@ export async function runPosSync(input: {
       counts.transactions += chunk.transactions;
     }
     await db.finishRun(runId, 'ok', { ...counts }, null);
-    return {
+    result = {
       mode: input.mode,
       shiftIds: shifts.map((shift) => shift.id),
       counts: { ...counts },
@@ -113,5 +135,28 @@ export async function runPosSync(input: {
       });
     }
     throw new Error(reported, { cause: error });
+  }
+  if (accountingDb !== undefined) {
+    await drainAfterSync(accountingDb, input.logger, input.accountingOptions);
+  }
+  return result;
+}
+
+// The sync run is already finished as ok. Nothing here may change its result,
+// mark it failed, or throw.
+async function drainAfterSync(
+  accountingDb: AccountingDb,
+  logger: SyncLogger | undefined,
+  options: Partial<DrainOptions> | undefined,
+): Promise<void> {
+  try {
+    const outcome = await drainAccountingWork(accountingDb, options);
+    logger?.(formatDrain(outcome));
+  } catch (error) {
+    try {
+      logger?.(`accounting drain failed: ${safeErrorMessage(error)}`);
+    } catch {
+      return;
+    }
   }
 }

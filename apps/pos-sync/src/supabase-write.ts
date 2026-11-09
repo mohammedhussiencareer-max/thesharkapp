@@ -14,11 +14,84 @@ const RPC_NAMES = new Set([
   'start_pos_sync_run',
   'ingest_pos_batch',
   'finish_pos_sync_run',
+  'run_accounting_work',
+  'record_accounting_call_failure',
 ]);
+
+const ACCOUNTING_CALL_TIMEOUT_MS = 20_000;
 
 function localFetch(input: string, init: RequestInit): Promise<Response> {
   return fetch(input, init);
 }
+
+export type RpcFailureKind = 'network' | 'http' | 'response';
+
+export class SupabaseRpcError extends Error {
+  readonly kind: RpcFailureKind;
+  readonly status: number | null;
+  readonly sqlstate: string | null;
+
+  constructor(
+    message: string,
+    kind: RpcFailureKind,
+    status: number | null = null,
+    sqlstate: string | null = null,
+  ) {
+    super(message);
+    this.name = 'SupabaseRpcError';
+    this.kind = kind;
+    this.status = status;
+    this.sqlstate = sqlstate;
+  }
+}
+
+// True when the call may have reached the database and its outcome is not
+// known: no reply, a server error, a statement timeout, or a reply that cannot
+// be read. A refusal (4xx other than a timeout) means the call did not run.
+export function isUnknownOutcome(error: unknown): boolean {
+  if (!(error instanceof SupabaseRpcError)) {
+    return false;
+  }
+  if (error.sqlstate === '57014') {
+    return true;
+  }
+  if (error.kind === 'network' || error.kind === 'response') {
+    return true;
+  }
+  return error.status !== null && error.status >= 500;
+}
+
+export type AccountingStatus =
+  | 'processed'
+  | 'empty'
+  | 'busy'
+  | 'sync_running'
+  | 'not_activated'
+  | 'critical';
+
+export type AccountingCounts = {
+  processed: number;
+  applied: number;
+  unchanged: number;
+  incomplete: number;
+  none: number;
+  blocked: number;
+  disposition_pending: number;
+  failed: number;
+  remaining: number;
+};
+
+export type AccountingOrderRef = { orderId: string; workGeneration: number };
+
+export type AccountingRun = {
+  status: AccountingStatus;
+  counts: AccountingCounts;
+  head: AccountingOrderRef | null;
+  critical: AccountingOrderRef | null;
+};
+
+export type FailureReport =
+  'recorded' | 'committed' | 'duplicate' | 'no_work' | 'stale' | 'busy';
 
 export type PosDb = {
   startRun(mode: SyncMode): Promise<number>;
@@ -36,19 +109,31 @@ export type PosDb = {
   ): Promise<void>;
 };
 
+export type AccountingDb = {
+  runAccountingWork(attemptId: string, limit: number): Promise<AccountingRun>;
+  recordAccountingCallFailure(
+    attemptId: string,
+    workGeneration: number | null,
+  ): Promise<FailureReport>;
+};
+
 export function createSupabaseDb(
   supabaseUrl: string,
   serviceRoleKey: string,
   fetchImpl: FetchLike = localFetch,
-): PosDb {
+): PosDb & AccountingDb {
   assertLocalSupabaseUrl(supabaseUrl);
   if (serviceRoleKey.trim().length === 0) {
     throw new Error('Supabase service role key is required');
   }
 
-  async function rpc(name: string, body: unknown): Promise<unknown> {
+  async function rpc(
+    name: string,
+    body: unknown,
+    timeoutMs: number | null = null,
+  ): Promise<unknown> {
     if (!RPC_NAMES.has(name)) {
-      throw new Error('Supabase RPC failed: unexpected response');
+      throw unexpectedResponse();
     }
     const url = rpcUrl(supabaseUrl, name);
     let response: Response;
@@ -65,9 +150,12 @@ export function createSupabaseDb(
           'Accept-Profile': 'app',
         },
         body: JSON.stringify(body),
+        ...(timeoutMs === null
+          ? {}
+          : { signal: AbortSignal.timeout(timeoutMs) }),
       });
     } catch {
-      throw new Error('Supabase RPC failed: network');
+      throw new SupabaseRpcError('Supabase RPC failed: network', 'network');
     }
     if (!response.ok) {
       let text: string;
@@ -79,7 +167,12 @@ export function createSupabaseDb(
       if (name === 'start_pos_sync_run' && isAnotherPosSyncRunning(text)) {
         throw new Error('another POS sync is running');
       }
-      throw new Error(`Supabase RPC failed: HTTP ${response.status}`);
+      throw new SupabaseRpcError(
+        `Supabase RPC failed: HTTP ${response.status}`,
+        'http',
+        response.status,
+        errorSqlstate(text),
+      );
     }
     const text = await readBody(response);
     if (text.trim().length === 0) {
@@ -88,7 +181,7 @@ export function createSupabaseDb(
     try {
       return JSON.parse(text) as unknown;
     } catch {
-      throw new Error('Supabase RPC failed: unexpected response');
+      throw unexpectedResponse();
     }
   }
 
@@ -114,14 +207,39 @@ export function createSupabaseDb(
         p_error: error,
       });
     },
+    async runAccountingWork(attemptId, limit) {
+      return parseAccountingRun(
+        await rpc(
+          'run_accounting_work',
+          { p_attempt_id: attemptId, p_limit: limit },
+          ACCOUNTING_CALL_TIMEOUT_MS,
+        ),
+      );
+    },
+    async recordAccountingCallFailure(attemptId, workGeneration) {
+      return parseFailureReport(
+        await rpc(
+          'record_accounting_call_failure',
+          { p_attempt_id: attemptId, p_work_generation: workGeneration },
+          ACCOUNTING_CALL_TIMEOUT_MS,
+        ),
+      );
+    },
   };
+}
+
+function unexpectedResponse(): SupabaseRpcError {
+  return new SupabaseRpcError(
+    'Supabase RPC failed: unexpected response',
+    'response',
+  );
 }
 
 async function readBody(response: Response): Promise<string> {
   try {
     return await response.text();
   } catch {
-    throw new Error('Supabase RPC failed: unexpected response');
+    throw unexpectedResponse();
   }
 }
 
@@ -152,16 +270,35 @@ function isAnotherPosSyncRunning(body: string): boolean {
   );
 }
 
+// Only the five-character SQLSTATE is kept. The message, details and hint of a
+// database error are never read.
+function errorSqlstate(body: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body) as unknown;
+  } catch {
+    return null;
+  }
+  if (
+    isRecord(parsed) &&
+    typeof parsed.code === 'string' &&
+    /^[0-9A-Z]{5}$/.test(parsed.code)
+  ) {
+    return parsed.code;
+  }
+  return null;
+}
+
 function parseRunId(value: unknown): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
-    throw new Error('Supabase RPC failed: unexpected response');
+    throw unexpectedResponse();
   }
   return value;
 }
 
 function parseCounts(value: unknown): IngestCounts {
   if (!isRecord(value)) {
-    throw new Error('Supabase RPC failed: unexpected response');
+    throw unexpectedResponse();
   }
   return {
     inserted: countField(value.inserted),
@@ -177,7 +314,111 @@ function parseCounts(value: unknown): IngestCounts {
 
 function countField(value: unknown): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
-    throw new Error('Supabase RPC failed: unexpected response');
+    throw unexpectedResponse();
   }
   return value;
+}
+
+const ACCOUNTING_STATUSES = new Set<string>([
+  'processed',
+  'empty',
+  'busy',
+  'sync_running',
+  'not_activated',
+  'critical',
+]);
+
+const IDLE_STATUSES = new Set<string>([
+  'busy',
+  'sync_running',
+  'not_activated',
+]);
+
+const FAILURE_REPORTS = new Set<string>([
+  'recorded',
+  'committed',
+  'duplicate',
+  'no_work',
+  'stale',
+  'busy',
+]);
+
+const ORDER_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+function parseAccountingRun(value: unknown): AccountingRun {
+  if (
+    !isRecord(value) ||
+    typeof value.status !== 'string' ||
+    !ACCOUNTING_STATUSES.has(value.status)
+  ) {
+    throw unexpectedResponse();
+  }
+  const status = value.status as AccountingStatus;
+  if (IDLE_STATUSES.has(status)) {
+    return {
+      status,
+      counts: zeroAccountingCounts(),
+      head: null,
+      critical: null,
+    };
+  }
+  const counts: AccountingCounts = {
+    processed: countField(value.processed),
+    applied: countField(value.applied),
+    unchanged: countField(value.unchanged),
+    incomplete: countField(value.incomplete),
+    none: countField(value.none),
+    blocked: countField(value.blocked),
+    disposition_pending: countField(value.disposition_pending),
+    failed: countField(value.failed),
+    remaining: countField(value.remaining),
+  };
+  const head = parseOrderRef(value.head);
+  const critical = parseOrderRef(value.critical);
+  if ((status === 'critical') !== (critical !== null)) {
+    throw unexpectedResponse();
+  }
+  return { status, counts, head, critical };
+}
+
+function parseOrderRef(value: unknown): AccountingOrderRef | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (
+    !isRecord(value) ||
+    typeof value.order_id !== 'string' ||
+    !ORDER_ID_PATTERN.test(value.order_id) ||
+    typeof value.work_generation !== 'number' ||
+    !Number.isInteger(value.work_generation) ||
+    value.work_generation < 1
+  ) {
+    throw unexpectedResponse();
+  }
+  return { orderId: value.order_id, workGeneration: value.work_generation };
+}
+
+function parseFailureReport(value: unknown): FailureReport {
+  if (
+    !isRecord(value) ||
+    typeof value.status !== 'string' ||
+    !FAILURE_REPORTS.has(value.status)
+  ) {
+    throw unexpectedResponse();
+  }
+  return value.status as FailureReport;
+}
+
+export function zeroAccountingCounts(): AccountingCounts {
+  return {
+    processed: 0,
+    applied: 0,
+    unchanged: 0,
+    incomplete: 0,
+    none: 0,
+    blocked: 0,
+    disposition_pending: 0,
+    failed: 0,
+    remaining: 0,
+  };
 }
