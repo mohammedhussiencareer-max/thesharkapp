@@ -250,7 +250,6 @@ create table app.accounting_work_state (
   last_reason text null,
   blocked_item_ids uuid[] not null default '{}'::uuid[],
   last_error_code text null,
-  last_attempt_id uuid null,
   updated_at timestamptz not null default pg_catalog.clock_timestamp ()
 );
 
@@ -273,10 +272,11 @@ create table app.accounting_work_attempts (
     reason in ('error', 'recompute_limit', 'critical', 'escaped')
   ),
   recorded_at timestamptz not null default pg_catalog.clock_timestamp (),
-  primary key (order_id, work_generation, attempt_id)
+  primary key (order_id, work_generation, attempt_id),
+  constraint accounting_work_attempts_attempt_key unique (attempt_id)
 );
 
-comment on table app.accounting_work_attempts is 'Append-only failed attempts, keyed by (order, work generation, attempt id). attempt_id is chosen by the caller before the worker call, so a retried failure report is a no-op. Only the SQLSTATE and a coarse reason are kept: no message, no names.';
+comment on table app.accounting_work_attempts is 'Append-only failed attempts, keyed by (order, work generation, attempt id); an attempt id is charged to at most one order, once. attempt_id is chosen by the caller before the worker call, so a repeated failure or a retried failure report is a no-op. Only the SQLSTATE and a coarse reason are kept: no message, no names.';
 
 -- ============================================================================
 -- 4. Applications (immutable receipts), movement links, derived head.
@@ -368,11 +368,59 @@ create table app.order_cost_state (
     or signature ~ '^[0-9a-f]{32}$'
   ),
   causes jsonb not null default '[]'::jsonb,
+  event_position bigint null,
   evaluated_at timestamptz null,
   updated_at timestamptz not null default pg_catalog.clock_timestamp ()
 );
 
 comment on table app.order_cost_state is 'Derived per-order head, written only by the coordinator under the ledger lock. latest_application_id is the newest receipt, owner_application_id the application that owns the live movements. causes lists why the current cost is unknown, stale or waiting (missing_cost_basis, disposition_pending, incomplete requirements, open order).';
+
+comment on column app.order_cost_state.event_position is 'The order''s stable position among same-instant stock events. Taken once, when the order first posts a sale, and never changed or cleared, so a sale that is retired (incomplete, canceled) and posted again keeps its place and does not jump behind events that arrived in between.';
+
+create function app.trg_order_cost_state_event_position_guard () returns trigger language plpgsql
+set
+  search_path = '' as $$
+begin
+  if old.event_position is not null
+  and new.event_position is distinct from old.event_position then
+    raise exception 'order event position is immutable'
+      using errcode = '55000';
+  end if;
+
+  return new;
+end;
+$$;
+
+revoke all on function app.trg_order_cost_state_event_position_guard ()
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create trigger trg_order_cost_state_event_position_guard
+before update on app.order_cost_state for each row
+execute function app.trg_order_cost_state_event_position_guard ();
+
+create table app.accounting_work_completions (
+  attempt_id uuid primary key,
+  order_id text not null check (length(pg_catalog.btrim (order_id)) > 0),
+  work_generation integer not null check (work_generation >= 1),
+  outcome text not null check (
+    outcome in (
+      'applied',
+      'unchanged',
+      'incomplete',
+      'none',
+      'blocked',
+      'disposition_pending'
+    )
+  ),
+  application_id bigint null references app.order_cost_applications (id) on delete restrict,
+  completed_at timestamptz not null default pg_catalog.clock_timestamp ()
+);
+
+comment on table app.accounting_work_completions is 'Append-only evidence that a worker call committed its order, keyed by the call''s attempt id. Written in the same transaction as the order''s result for every outcome, including blocked and disposition_pending, which leave no application receipt. A late failure report for an attempt that has a row here is answered committed and charges nothing. application_id is the receipt, when there is one.';
 
 -- ============================================================================
 -- 5. Append-only guards for the immutable tables.
@@ -391,6 +439,14 @@ execute function app.prevent_append_only_mutation ();
 
 create trigger trg_accounting_work_attempts_no_truncate
 before truncate on app.accounting_work_attempts for each statement
+execute function app.prevent_append_only_mutation ();
+
+create trigger trg_accounting_work_completions_no_update_delete
+before update or delete on app.accounting_work_completions for each row
+execute function app.prevent_append_only_mutation ();
+
+create trigger trg_accounting_work_completions_no_truncate
+before truncate on app.accounting_work_completions for each statement
 execute function app.prevent_append_only_mutation ();
 
 create trigger trg_order_cost_applications_no_update_delete
@@ -423,6 +479,8 @@ alter table app.accounting_work_events enable row level security;
 alter table app.accounting_work_state enable row level security;
 
 alter table app.accounting_work_attempts enable row level security;
+
+alter table app.accounting_work_completions enable row level security;
 
 alter table app.order_cost_applications enable row level security;
 
@@ -475,6 +533,15 @@ select
     )
   );
 
+create policy accounting_work_completions_select_owner on app.accounting_work_completions for
+select
+  to authenticated using (
+    (
+      select
+        app.is_owner ()
+    )
+  );
+
 create policy order_cost_applications_select_owner on app.order_cost_applications for
 select
   to authenticated using (
@@ -507,6 +574,7 @@ app.accounting_rederive_spans,
 app.accounting_work_events,
 app.accounting_work_state,
 app.accounting_work_attempts,
+app.accounting_work_completions,
 app.order_cost_applications,
 app.order_cost_movement_links,
 app.order_cost_state
@@ -532,6 +600,7 @@ select
   app.accounting_work_events,
   app.accounting_work_state,
   app.accounting_work_attempts,
+  app.accounting_work_completions,
   app.order_cost_applications,
   app.order_cost_movement_links,
   app.order_cost_state to authenticated,
@@ -2473,6 +2542,37 @@ from
   authenticated,
   service_role;
 
+create function app.accounting_order_pending (p_order_id text) returns table (has_new boolean, eff_generation integer) language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    pg_catalog.bool_or(e.work_generation is null),
+    coalesce(max(ws.work_generation), 0) + case
+      when pg_catalog.bool_or(e.work_generation is null) then 1
+      else 0
+    end
+  from
+    app.accounting_work_events e
+    left join app.accounting_work_state ws on ws.order_id = e.order_id
+  where
+    e.order_id = p_order_id
+    and e.processed_at is null
+  group by
+    e.order_id
+  having
+    max(ws.failed_at) is null
+    or pg_catalog.bool_or(e.work_generation is null);
+$$;
+
+comment on function app.accounting_order_pending (text) is 'The same pending rule as accounting_pending_orders for one named order: a row only while the order has unprocessed work and is not parked, with the generation the next attempt belongs to. Private.';
+
+revoke all on function app.accounting_order_pending (text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 -- ============================================================================
 -- 10. Coordinator. One order, atomically, under the ledger lock. Reads the
 -- immutable inputs only. Never touches the POS mirror.
@@ -2731,17 +2831,8 @@ begin
   end if;
 
   v_owner_id := v_head.owner_application_id;
-  v_event := null;
-
-  if v_owner_id is not null then
-    select
-      a.event_position
-    into v_event
-    from
-      app.order_cost_applications a
-    where
-      a.id = v_owner_id;
-  end if;
+  -- The order's own position, kept across incomplete and canceled spells.
+  v_event := v_head.event_position;
 
   v_id := pg_catalog.nextval(
     pg_catalog.pg_get_serial_sequence('app.order_cost_applications', 'id')
@@ -3008,6 +3099,7 @@ begin
     disposition = v_disposition,
     signature = v_sig,
     causes = v_causes,
+    event_position = coalesce(h.event_position, v_event),
     evaluated_at = v_now,
     updated_at = v_now
   where
@@ -3031,7 +3123,7 @@ begin
 end;
 $$;
 
-comment on function app.process_order_accounting (text, uuid, integer) is 'Evaluates one order against its latest cost input and brings its stock effect to the desired state: retire every movement of the previous application, then post the replacement at the snapshot instant and shift, or record an incomplete or none result. An identical economic signature writes an evaluation receipt only. missing_cost_basis rolls the transition back and returns blocked. Canceled, missing and refunded orders keep their application (disposition_pending). Caller holds the ledger lock. Private.';
+comment on function app.process_order_accounting (text, uuid, integer) is 'Evaluates one order against its latest cost input and brings its stock effect to the desired state: retire every movement of the previous application, then post the replacement at the snapshot instant and shift, or record an incomplete or none result. An identical economic signature writes an evaluation receipt only. missing_cost_basis rolls the transition back and returns blocked. Canceled, missing and refunded orders keep their application (disposition_pending). A sale takes its same-instant event position once, from order_cost_state.event_position, and keeps it through any incomplete spell. Caller holds the ledger lock. Private.';
 
 revoke all on function app.process_order_accounting (text, uuid, integer)
 from
@@ -3046,13 +3138,23 @@ from
 -- running), pos_shifts SHARE, order-accounting rows by order id, then balances
 -- inside the posting functions. Never locks pos_orders.
 -- ============================================================================
-create function app.run_accounting_work (p_attempt_id uuid, p_limit integer) returns jsonb language plpgsql volatile security definer
+create function app.run_accounting_work (
+  p_attempt_id uuid,
+  p_limit integer,
+  p_order_id text default null,
+  p_work_generation integer default null
+) returns jsonb language plpgsql volatile security definer
 set
-  search_path = '' as $$
+  search_path = ''
+set
+  statement_timeout = '6s'
+set
+  lock_timeout = '250ms' as $$
 declare
-  v_started timestamptz := pg_catalog.clock_timestamp ();
-  v_ids text[];
-  v_pending record;
+  v_order text;
+  v_h0 record;
+  v_cur_new boolean;
+  v_inserted integer;
   v_span record;
   v_span_orders text[];
   v_span_times timestamptz[];
@@ -3091,6 +3193,18 @@ begin
       using errcode = '22023';
   end if;
 
+  if (p_order_id is null) is distinct from (p_work_generation is null)
+  or (
+    p_order_id is not null
+    and (
+      pg_catalog.btrim (p_order_id) = ''
+      or p_work_generation < 1
+    )
+  ) then
+    raise exception 'order id and work generation are given together'
+      using errcode = '22023';
+  end if;
+
   if not exists (
     select
       1
@@ -3099,9 +3213,6 @@ begin
   ) then
     return pg_catalog.jsonb_build_object('status', 'not_activated');
   end if;
-
-  perform pg_catalog.set_config('lock_timeout', '250ms', true);
-  perform pg_catalog.set_config('statement_timeout', '6s', true);
 
   if not pg_catalog.pg_try_advisory_xact_lock (7342750000000000001::bigint) then
     return pg_catalog.jsonb_build_object('status', 'busy');
@@ -3131,6 +3242,39 @@ begin
     when lock_not_available then
       return pg_catalog.jsonb_build_object('status', 'busy');
   end;
+
+  -- The one order this call may process is named before anything else runs.
+  -- Work the slice below enqueues is left for the next call, so a failure of
+  -- this call can only belong to the order the caller was told about.
+  select
+    p.order_id,
+    p.eff_generation
+  into v_h0
+  from
+    app.accounting_pending_orders (1) p;
+
+  if p_order_id is not null
+  and (
+    v_h0.order_id is distinct from p_order_id
+    or v_h0.eff_generation is distinct from p_work_generation
+  ) then
+    return pg_catalog.jsonb_build_object(
+      'status',
+      'stale',
+      'head',
+      case
+        when v_h0.order_id is null then null
+        else pg_catalog.jsonb_build_object(
+          'order_id',
+          v_h0.order_id,
+          'work_generation',
+          v_h0.eff_generation
+        )
+      end
+    );
+  end if;
+
+  v_order := v_h0.order_id;
 
   -- One bounded slice of one rederive span: 100 orders by keyset.
   select
@@ -3237,63 +3381,52 @@ begin
       sp.id = v_span.id;
   end if;
 
-  select
-    pg_catalog.array_agg(p.order_id)
-  into v_ids
-  from
-    app.accounting_pending_orders (p_limit) p;
-
-  if v_ids is not null then
+  if v_order is not null then
     insert into
       app.accounting_work_state (order_id)
-    select
-      u.order_id
-    from
-      pg_catalog.unnest(v_ids) as u (order_id)
+    values
+      (v_order)
     on conflict (order_id) do nothing;
 
     insert into
       app.order_cost_state (order_id)
-    select
-      u.order_id
-    from
-      pg_catalog.unnest(v_ids) as u (order_id)
+    values
+      (v_order)
     on conflict (order_id) do nothing;
 
     perform 1
     from
       app.accounting_work_state ws
     where
-      ws.order_id = any (v_ids)
-    order by
-      ws.order_id
+      ws.order_id = v_order
     for update;
 
     perform 1
     from
       app.order_cost_state h
     where
-      h.order_id = any (v_ids)
-    order by
-      h.order_id
+      h.order_id = v_order
     for update;
+
+    -- The slice may have added an event to this order: take the generation
+    -- as it is now.
+    select
+      pe.has_new,
+      pe.eff_generation
+    into
+      v_cur_new,
+      v_gen
+    from
+      app.accounting_order_pending (v_order) pe;
   end if;
 
-  for v_pending in
-  select
-    p.order_id,
-    p.has_new,
-    p.eff_generation
-  from
-    app.accounting_pending_orders (p_limit) p loop
-    v_gen := v_pending.eff_generation;
-
-    if v_pending.has_new then
+  if v_gen is not null then
+    if v_cur_new then
       update app.accounting_work_events e
       set
         work_generation = v_gen
       where
-        e.order_id = v_pending.order_id
+        e.order_id = v_order
         and e.work_generation is null;
 
       update app.accounting_work_state ws
@@ -3303,11 +3436,11 @@ begin
         failed_at = null,
         updated_at = pg_catalog.clock_timestamp ()
       where
-        ws.order_id = v_pending.order_id;
+        ws.order_id = v_order;
     end if;
 
     begin
-      v_result := app.process_order_accounting (v_pending.order_id, p_attempt_id, v_gen);
+      v_result := app.process_order_accounting (v_order, p_attempt_id, v_gen);
 
       select
         coalesce(
@@ -3328,19 +3461,38 @@ begin
         last_reason = v_result ->> 'reason',
         blocked_item_ids = v_blocked,
         last_error_code = null,
-        last_attempt_id = p_attempt_id,
         updated_at = pg_catalog.clock_timestamp ()
       where
-        ws.order_id = v_pending.order_id;
+        ws.order_id = v_order;
 
       update app.accounting_work_events e
       set
         processed_at = pg_catalog.clock_timestamp ()
       where
-        e.order_id = v_pending.order_id
+        e.order_id = v_order
         and e.work_generation is not null
         and e.work_generation <= v_gen
         and e.processed_at is null;
+
+      -- Evidence that this call committed, for every outcome (blocked and
+      -- disposition_pending leave no receipt).
+      insert into
+        app.accounting_work_completions (
+          attempt_id,
+          order_id,
+          work_generation,
+          outcome,
+          application_id
+        )
+      values
+        (
+          p_attempt_id,
+          v_order,
+          v_gen,
+          v_result ->> 'outcome',
+          (v_result ->> 'application_id')::bigint
+        )
+      on conflict (attempt_id) do nothing;
 
       v_processed := v_processed + 1;
 
@@ -3380,7 +3532,7 @@ begin
           )
         values
           (
-            v_pending.order_id,
+            v_order,
             v_gen,
             p_attempt_id,
             'caught',
@@ -3389,35 +3541,36 @@ begin
           )
         on conflict do nothing;
 
-        update app.accounting_work_state ws
-        set
-          attempts = ws.attempts + 1,
-          failed_at = case
-            when ws.attempts + 1 >= 5 then pg_catalog.clock_timestamp ()
-            else ws.failed_at
-          end,
-          last_reason = v_reason,
-          last_error_code = v_sqlstate,
-          last_attempt_id = p_attempt_id,
-          updated_at = pg_catalog.clock_timestamp ()
-        where
-          ws.order_id = v_pending.order_id;
+        get diagnostics v_inserted = row_count;
+
+        -- A repeated attempt id is charged once.
+        if v_inserted = 1 then
+          update app.accounting_work_state ws
+          set
+            attempts = ws.attempts + 1,
+            failed_at = case
+              when ws.attempts + 1 >= 5 then pg_catalog.clock_timestamp ()
+              else ws.failed_at
+            end,
+            last_reason = v_reason,
+            last_error_code = v_sqlstate,
+            updated_at = pg_catalog.clock_timestamp ()
+          where
+            ws.order_id = v_order;
+        end if;
 
         v_failed := v_failed + 1;
 
         if v_reason = 'critical' then
           v_critical := pg_catalog.jsonb_build_object(
             'order_id',
-            v_pending.order_id,
+            v_order,
             'work_generation',
             v_gen
           );
         end if;
     end;
-
-    exit when v_critical is not null
-    or pg_catalog.clock_timestamp () - v_started > interval '2 seconds';
-  end loop;
+  end if;
 
   select
     p.order_id,
@@ -3485,9 +3638,9 @@ begin
 end;
 $$;
 
-comment on function app.run_accounting_work (uuid, integer) is 'Owner or service_role. Processes up to p_limit pending orders in occurrence order under the ledger lock, after one bounded slice of a rederive span. Each order runs in its own subtransaction; a caught error rolls back that order and records the attempt. Five attempts in one work generation park the order (failed_at) until a new event or retry_accounting_work. blocked, none and disposition_pending count as success. critical stops the worker. Returns not_activated before an inventory_activation row exists, busy when the ledger lock is held, sync_running while a POS sync run is open. head is the next pending order and the generation a failure of this call would be charged to.';
+comment on function app.run_accounting_work (uuid, integer, text, integer) is 'Owner or service_role. Processes ONE pending order per call (p_limit is validated, 1 to 10, and reserved), after one bounded slice of a rederive span, under the ledger lock. The order is the head of the queue when the call starts; work the slice enqueues waits for the next call, so a failure of the call belongs to that order. With p_order_id and p_work_generation (given together) the call processes only that order in that generation and otherwise returns stale with the current head, so a caller that loses the reply knows which order to report. The order runs in a subtransaction; a caught error rolls it back and records the attempt, once per attempt id. Five attempts in one work generation park the order (failed_at) until a new event or retry_accounting_work. Every processed outcome writes an accounting_work_completions row for the attempt id. blocked, none and disposition_pending count as success. critical stops the worker. Returns not_activated before an inventory_activation row exists, busy when the ledger lock is held, sync_running while a POS sync run is open. head is the next pending order and the generation to bind the next call to. The function settings (statement_timeout 6s, lock_timeout 250ms) are applied by PostgREST before the call, so they bound a Data API call; a direct SQL caller must set its own statement_timeout.';
 
-revoke all on function app.run_accounting_work (uuid, integer)
+revoke all on function app.run_accounting_work (uuid, integer, text, integer)
 from
   public,
   anon,
@@ -3495,27 +3648,92 @@ from
   service_role;
 
 grant
-execute on function app.run_accounting_work (uuid, integer) to authenticated,
+execute on function app.run_accounting_work (uuid, integer, text, integer) to authenticated,
+service_role;
+
+create function app.accounting_next_work () returns jsonb language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_head record;
+begin
+  perform app.assert_pos_write_allowed ();
+
+  if not exists (
+    select
+      1
+    from
+      app.inventory_activation
+  ) then
+    return pg_catalog.jsonb_build_object('status', 'not_activated', 'head', null);
+  end if;
+
+  select
+    p.order_id,
+    p.eff_generation
+  into v_head
+  from
+    app.accounting_pending_orders (1) p;
+
+  return pg_catalog.jsonb_build_object(
+    'status',
+    case
+      when v_head.order_id is null then 'empty'
+      else 'ok'
+    end,
+    'head',
+    case
+      when v_head.order_id is null then null
+      else pg_catalog.jsonb_build_object(
+        'order_id',
+        v_head.order_id,
+        'work_generation',
+        v_head.eff_generation
+      )
+    end
+  );
+end;
+$$;
+
+comment on function app.accounting_next_work () is 'Owner or service_role. Read-only. The order the next worker call would process and its work generation, so a caller can bind the call (and a later failure report) to that order. empty when nothing is pending.';
+
+revoke all on function app.accounting_next_work ()
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+grant
+execute on function app.accounting_next_work () to authenticated,
 service_role;
 
 -- ============================================================================
 -- 12. Escaped failures and retry.
 -- ============================================================================
-create function app.record_accounting_call_failure (p_attempt_id uuid, p_work_generation integer) returns jsonb language plpgsql volatile security definer
+create function app.record_accounting_call_failure (
+  p_attempt_id uuid,
+  p_order_id text,
+  p_work_generation integer
+) returns jsonb language plpgsql volatile security definer
 set
-  search_path = '' as $$
+  search_path = ''
+set
+  lock_timeout = '250ms' as $$
 declare
-  v_head record;
+  v_pending record;
   v_inserted integer;
 begin
   perform app.assert_pos_write_allowed ();
 
-  if p_attempt_id is null then
-    raise exception 'attempt id is required'
+  if p_attempt_id is null
+  or p_order_id is null
+  or pg_catalog.btrim (p_order_id) = ''
+  or p_work_generation is null
+  or p_work_generation < 1 then
+    raise exception 'attempt id, order id and work generation are required'
       using errcode = '22023';
   end if;
-
-  perform pg_catalog.set_config('lock_timeout', '250ms', true);
 
   if not pg_catalog.pg_try_advisory_xact_lock (7342750000000000001::bigint) then
     return pg_catalog.jsonb_build_object('status', 'busy');
@@ -3533,71 +3751,61 @@ begin
     return pg_catalog.jsonb_build_object('status', 'duplicate');
   end if;
 
-  -- The call may have committed after the caller lost the reply.
+  -- The call committed and only its reply was lost.
   if exists (
     select
       1
     from
-      app.accounting_work_state ws
+      app.accounting_work_completions c
     where
-      ws.last_attempt_id = p_attempt_id
-  )
-  or exists (
-    select
-      1
-    from
-      app.order_cost_applications a
-    where
-      a.attempt_id = p_attempt_id
+      c.attempt_id = p_attempt_id
   ) then
     return pg_catalog.jsonb_build_object('status', 'committed');
   end if;
 
   select
-    p.order_id,
-    p.has_new,
-    p.eff_generation
-  into v_head
+    pe.has_new,
+    pe.eff_generation
+  into v_pending
   from
-    app.accounting_pending_orders (1) p;
+    app.accounting_order_pending (p_order_id) pe;
 
-  if v_head.order_id is null then
+  if v_pending.eff_generation is null then
     return pg_catalog.jsonb_build_object('status', 'no_work');
   end if;
 
-  if p_work_generation is not null
-  and p_work_generation is distinct from v_head.eff_generation then
+  if v_pending.eff_generation is distinct from p_work_generation then
     return pg_catalog.jsonb_build_object('status', 'stale');
   end if;
 
   insert into
     app.accounting_work_state (order_id)
   values
-    (v_head.order_id)
+    (p_order_id)
   on conflict (order_id) do nothing;
 
   perform 1
   from
     app.accounting_work_state ws
   where
-    ws.order_id = v_head.order_id
+    ws.order_id = p_order_id
   for update;
 
-  if v_head.has_new then
+  if v_pending.has_new then
     update app.accounting_work_events e
     set
-      work_generation = v_head.eff_generation
+      work_generation = v_pending.eff_generation
     where
-      e.order_id = v_head.order_id
+      e.order_id = p_order_id
       and e.work_generation is null;
 
     update app.accounting_work_state ws
     set
-      work_generation = v_head.eff_generation,
+      work_generation = v_pending.eff_generation,
       attempts = 0,
       failed_at = null
     where
-      ws.order_id = v_head.order_id;
+      ws.order_id = p_order_id;
   end if;
 
   insert into
@@ -3611,8 +3819,8 @@ begin
     )
   values
     (
-      v_head.order_id,
-      v_head.eff_generation,
+      p_order_id,
+      v_pending.eff_generation,
       p_attempt_id,
       'escaped',
       null,
@@ -3632,10 +3840,9 @@ begin
       end,
       last_reason = 'escaped',
       last_error_code = null,
-      last_attempt_id = p_attempt_id,
       updated_at = pg_catalog.clock_timestamp ()
     where
-      ws.order_id = v_head.order_id;
+      ws.order_id = p_order_id;
   end if;
 
   return pg_catalog.jsonb_build_object(
@@ -3645,16 +3852,16 @@ begin
       else 'duplicate'
     end,
     'order_id',
-    v_head.order_id,
+    p_order_id,
     'work_generation',
-    v_head.eff_generation
+    v_pending.eff_generation
   );
 end;
 $$;
 
-comment on function app.record_accounting_call_failure (uuid, integer) is 'Owner or service_role. Records a worker call that failed without a reply (statement timeout, lost connection). Under the ledger lock it first checks that the call did not commit, then charges one attempt to the order the next call would have processed, in the generation the caller saw. A repeated report of the same attempt id does nothing. Without a reply the failing order is not known; the head order is charged.';
+comment on function app.record_accounting_call_failure (uuid, text, integer) is 'Owner or service_role. Records a worker call that failed without a reply (statement timeout, lost connection) against the order the call was bound to, and only that order. Under the ledger lock it answers duplicate when the attempt id was already charged, committed when the call left completion evidence, no_work when the order has nothing pending, stale when it is pending in another generation; otherwise it charges one attempt in the generation the caller bound. Never charges the queue head or any other order.';
 
-revoke all on function app.record_accounting_call_failure (uuid, integer)
+revoke all on function app.record_accounting_call_failure (uuid, text, integer)
 from
   public,
   anon,
@@ -3662,18 +3869,18 @@ from
   service_role;
 
 grant
-execute on function app.record_accounting_call_failure (uuid, integer) to authenticated,
+execute on function app.record_accounting_call_failure (uuid, text, integer) to authenticated,
 service_role;
 
 create function app.retry_accounting_work (p_order_id text) returns jsonb language plpgsql volatile security definer
 set
-  search_path = '' as $$
+  search_path = ''
+set
+  lock_timeout = '250ms' as $$
 declare
   v_failed timestamptz;
 begin
   perform app.assert_pos_write_allowed ();
-
-  perform pg_catalog.set_config('lock_timeout', '250ms', true);
 
   if not pg_catalog.pg_try_advisory_xact_lock (7342750000000000001::bigint) then
     return pg_catalog.jsonb_build_object('status', 'busy');

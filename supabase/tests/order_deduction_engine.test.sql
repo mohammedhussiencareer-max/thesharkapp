@@ -366,8 +366,62 @@ begin
 end;
 $$;
 
-create function pg_temp.work (p_limit integer default 10) returns jsonb language sql as $$
-  select app.run_accounting_work(gen_random_uuid(), p_limit);
+create function pg_temp.sum_counts (acc jsonb, v jsonb) returns jsonb language plpgsql as $$
+declare
+  k text;
+begin
+  foreach k in array array[
+    'processed', 'applied', 'unchanged', 'incomplete', 'none', 'blocked',
+    'disposition_pending', 'failed'
+  ] loop
+    acc := acc || jsonb_build_object(
+      k, coalesce((acc ->> k)::integer, 0) + coalesce((v ->> k)::integer, 0)
+    );
+  end loop;
+
+  return acc;
+end;
+$$;
+
+-- Up to p_limit single-order worker calls; stops at the first call that is not
+-- 'processed' or that had a failure. The worker itself takes one order a call.
+create function pg_temp.work (p_limit integer default 10) returns jsonb language plpgsql as $$
+declare
+  v jsonb;
+  n integer := 0;
+  acc jsonb := '{}'::jsonb;
+begin
+  loop
+    v := app.run_accounting_work(gen_random_uuid(), 1);
+    n := n + 1;
+    acc := pg_temp.sum_counts(acc, v);
+
+    exit when v ->> 'status' <> 'processed'
+      or coalesce((v ->> 'failed')::integer, 0) > 0
+      or n >= p_limit;
+  end loop;
+
+  return jsonb_build_object(
+    'status',
+    case
+      when v ->> 'status' = 'empty'
+        and coalesce((acc ->> 'processed')::integer, 0)
+          + coalesce((acc ->> 'failed')::integer, 0) > 0 then 'processed'
+      else v ->> 'status'
+    end,
+    'processed', coalesce((acc ->> 'processed')::integer, 0),
+    'applied', coalesce((acc ->> 'applied')::integer, 0),
+    'unchanged', coalesce((acc ->> 'unchanged')::integer, 0),
+    'incomplete', coalesce((acc ->> 'incomplete')::integer, 0),
+    'none', coalesce((acc ->> 'none')::integer, 0),
+    'blocked', coalesce((acc ->> 'blocked')::integer, 0),
+    'disposition_pending', coalesce((acc ->> 'disposition_pending')::integer, 0),
+    'failed', coalesce((acc ->> 'failed')::integer, 0),
+    'remaining', v -> 'remaining',
+    'head', v -> 'head',
+    'critical', v -> 'critical'
+  );
+end;
 $$;
 
 create function pg_temp.drain () returns jsonb language plpgsql as $$
@@ -378,10 +432,10 @@ declare
   k text;
 begin
   loop
-    v := app.run_accounting_work(gen_random_uuid(), 10);
+    v := app.run_accounting_work(gen_random_uuid(), 1);
     n := n + 1;
 
-    exit when v ->> 'status' <> 'processed' or n >= 60;
+    exit when v ->> 'status' <> 'processed' or n >= 400;
 
     foreach k in array array[
       'applied', 'unchanged', 'incomplete', 'none', 'blocked',
@@ -438,6 +492,7 @@ from
       'accounting_work_events',
       'accounting_work_state',
       'accounting_work_attempts',
+      'accounting_work_completions',
       'order_cost_applications',
       'order_cost_movement_links',
       'order_cost_state'
@@ -461,6 +516,7 @@ select
             'accounting_work_events',
             'accounting_work_state',
             'accounting_work_attempts',
+            'accounting_work_completions',
             'order_cost_applications',
             'order_cost_movement_links',
             'order_cost_state'
@@ -468,7 +524,7 @@ select
         )
         and c.relrowsecurity
     ),
-    8::bigint,
+    9::bigint,
     'every new table has row level security on'
   );
 
@@ -479,6 +535,7 @@ select
       cross join unnest(array[
         'app.process_order_accounting(text,uuid,integer)',
         'app.accounting_pending_orders(integer)',
+        'app.accounting_order_pending(text)',
         'app.resolve_order_snapshot_exact(bigint,boolean,boolean)',
         'app.round_order_requirements(jsonb)',
         'app.resolve_order_requirements_core(text,boolean,timestamptz,text,jsonb,boolean)',
@@ -494,22 +551,69 @@ select
     $$select r.role, p.fn, has_function_privilege(r.role, p.fn, 'execute')
       from unnest(array['anon', 'authenticated', 'service_role']) as r (role)
       cross join unnest(array[
-        'app.run_accounting_work(uuid,integer)',
-        'app.record_accounting_call_failure(uuid,integer)',
+        'app.run_accounting_work(uuid,integer,text,integer)',
+        'app.record_accounting_call_failure(uuid,text,integer)',
+        'app.accounting_next_work()',
         'app.retry_accounting_work(text)'
       ]) as p (fn)
       order by 2, 1$$,
     $$values
-      ('anon', 'app.record_accounting_call_failure(uuid,integer)', false),
-      ('authenticated', 'app.record_accounting_call_failure(uuid,integer)', true),
-      ('service_role', 'app.record_accounting_call_failure(uuid,integer)', true),
+      ('anon', 'app.accounting_next_work()', false),
+      ('authenticated', 'app.accounting_next_work()', true),
+      ('service_role', 'app.accounting_next_work()', true),
+      ('anon', 'app.record_accounting_call_failure(uuid,text,integer)', false),
+      ('authenticated', 'app.record_accounting_call_failure(uuid,text,integer)', true),
+      ('service_role', 'app.record_accounting_call_failure(uuid,text,integer)', true),
       ('anon', 'app.retry_accounting_work(text)', false),
       ('authenticated', 'app.retry_accounting_work(text)', true),
       ('service_role', 'app.retry_accounting_work(text)', true),
-      ('anon', 'app.run_accounting_work(uuid,integer)', false),
-      ('authenticated', 'app.run_accounting_work(uuid,integer)', true),
-      ('service_role', 'app.run_accounting_work(uuid,integer)', true)$$,
+      ('anon', 'app.run_accounting_work(uuid,integer,text,integer)', false),
+      ('authenticated', 'app.run_accounting_work(uuid,integer,text,integer)', true),
+      ('service_role', 'app.run_accounting_work(uuid,integer,text,integer)', true)$$,
     'only authenticated and service_role may call the worker RPCs; they check the owner inside'
+  );
+
+select
+  is (
+    (
+      select
+        p.proconfig
+      from
+        pg_catalog.pg_proc p
+      where
+        p.oid = 'app.run_accounting_work(uuid,integer,text,integer)'::regprocedure
+    ),
+    array[
+      'search_path=""',
+      'statement_timeout=6s',
+      'lock_timeout=250ms'
+    ],
+    'the worker declares its timeouts as function settings, which PostgREST applies before the call'
+  );
+
+select
+  is (
+    (
+      select
+        p.proconfig
+      from
+        pg_catalog.pg_proc p
+      where
+        p.oid = 'app.record_accounting_call_failure(uuid,text,integer)'::regprocedure
+    ),
+    array['search_path=""', 'lock_timeout=250ms'],
+    'the failure recorder declares its lock timeout as a function setting'
+  );
+
+select
+  is_empty (
+    $$select p.proname
+      from pg_catalog.pg_proc p
+      join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'app'
+        and p.proname in ('run_accounting_work', 'record_accounting_call_failure', 'retry_accounting_work')
+        and p.prosrc ~ 'set_config'$$,
+    'no worker function re-sets its timeouts inside the running statement'
   );
 
 select
@@ -727,9 +831,16 @@ select
 -- Not activated: nothing is processed and nothing is written.
 select
   is (
-    pg_temp.work (),
+    app.run_accounting_work (gen_random_uuid(), 1),
     '{"status": "not_activated"}'::jsonb,
     'the worker returns not_activated while no activation row exists'
+  );
+
+select
+  is (
+    app.accounting_next_work (),
+    '{"status": "not_activated", "head": null}'::jsonb,
+    'the peek returns not_activated while no activation row exists'
   );
 
 select
@@ -853,12 +964,65 @@ select
     'a null limit is refused'
   );
 
+select
+  throws_ok (
+    $$select app.run_accounting_work(gen_random_uuid(), 1, 'o-pre', null)$$,
+    '22023',
+    'order id and work generation are given together',
+    'a binding with an order and no generation is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.run_accounting_work(gen_random_uuid(), 1, null, 1)$$,
+    '22023',
+    'order id and work generation are given together',
+    'a binding with a generation and no order is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.run_accounting_work(gen_random_uuid(), 1, 'o-pre', 0)$$,
+    '22023',
+    'order id and work generation are given together',
+    'a binding with generation 0 is refused'
+  );
+
+select
+  throws_ok (
+    $$select app.record_accounting_call_failure(gen_random_uuid(), null, 1)$$,
+    '22023',
+    'attempt id, order id and work generation are required',
+    'the failure report must name an order'
+  );
+
+select
+  throws_ok (
+    $$select app.record_accounting_call_failure(gen_random_uuid(), 'o-pre', null)$$,
+    '22023',
+    'attempt id, order id and work generation are required',
+    'the failure report must name a generation'
+  );
+
+select
+  throws_ok (
+    $$select app.record_accounting_call_failure(null, 'o-pre', 1)$$,
+    '22023',
+    'attempt id, order id and work generation are required',
+    'the failure report must name an attempt'
+  );
+
 -- ---------------------------------------------------------------------------
 -- First deduction, replay, crash retry.
 -- ---------------------------------------------------------------------------
 create temp table first_run as
 select
-  app.run_accounting_work ('a5400000-0000-4000-8000-0000000000f1', 10) as r;
+  app.run_accounting_work (
+    'a5400000-0000-4000-8000-0000000000f1',
+    10,
+    'o-pre',
+    1
+  ) as r;
 
 select
   is (
@@ -923,11 +1087,20 @@ select
 
 select
   results_eq (
-    $$select ws.last_outcome, ws.attempts, ws.failed_at is null, ws.work_generation,
-             ws.last_attempt_id::text
+    $$select ws.last_outcome, ws.attempts, ws.failed_at is null, ws.work_generation
       from app.accounting_work_state ws where ws.order_id = 'o-pre'$$,
-    $$values ('applied', 0, true, 1, 'a5400000-0000-4000-8000-0000000000f1')$$,
+    $$values ('applied', 0, true, 1)$$,
     'the work state records the outcome'
+  );
+
+select
+  results_eq (
+    $$select c.attempt_id::text, c.order_id, c.work_generation, c.outcome,
+             c.application_id = (select a.id from app.order_cost_applications a where a.order_id = 'o-pre')
+      from app.accounting_work_completions c
+      where c.attempt_id = 'a5400000-0000-4000-8000-0000000000f1'$$,
+    $$values ('a5400000-0000-4000-8000-0000000000f1', 'o-pre', 1, 'applied', true)$$,
+    'the call left completion evidence naming its order, generation and receipt'
   );
 
 select
@@ -1800,6 +1973,77 @@ select
   );
 
 select
+  results_eq (
+    $$select c.outcome, c.work_generation, c.application_id is null
+      from app.accounting_work_completions c where c.order_id = 'o-nocost'$$,
+    $$values ('blocked', 1, true)$$,
+    'a blocked call leaves completion evidence for its attempt although it has no receipt'
+  );
+
+select
+  is (
+    app.record_accounting_call_failure (
+      (
+        select
+          c.attempt_id
+        from
+          app.accounting_work_completions c
+        where
+          c.order_id = 'o-nocost'
+      ),
+      'o-nocost',
+      1
+    ) ->> 'status',
+    'committed',
+    'a late failure report for the blocked call is answered committed'
+  );
+
+-- The same late report, naming an unrelated order that is pending now.
+select
+  pg_temp.mk_order (
+    'o-late-1',
+    'shift-e0',
+    'complete',
+    'hall',
+    '2030-03-03T10:00:00Z',
+    'pos-a',
+    1
+  );
+
+select
+  is (
+    app.record_accounting_call_failure (
+      (
+        select
+          c.attempt_id
+        from
+          app.accounting_work_completions c
+        where
+          c.order_id = 'o-nocost'
+      ),
+      'o-late-1',
+      1
+    ) ->> 'status',
+    'committed',
+    'a late report of a committed blocked call cannot charge an unrelated pending order'
+  );
+
+select
+  is_empty (
+    $$select 1 from app.accounting_work_attempts where order_id = 'o-late-1'
+      union all
+      select 1 from app.accounting_work_state where order_id = 'o-late-1' and attempts <> 0$$,
+    'the unrelated order was not charged'
+  );
+
+select
+  is (
+    (pg_temp.work () ->> 'none')::integer,
+    1,
+    'the unrelated order is processed normally'
+  );
+
+select
   is (
     (
       select
@@ -2082,6 +2326,37 @@ select
     'the work state records disposition_pending'
   );
 
+select
+  results_eq (
+    $$select c.order_id, c.outcome, c.application_id is null
+      from app.accounting_work_completions c
+      where c.order_id in ('o-cancel', 'o-miss', 'o-refund') and c.outcome = 'disposition_pending'
+      order by 1$$,
+    $$values ('o-cancel', 'disposition_pending', true),
+             ('o-miss', 'disposition_pending', true),
+             ('o-refund', 'disposition_pending', true)$$,
+    'each disposition_pending call left completion evidence although it wrote no receipt'
+  );
+
+select
+  is (
+    app.record_accounting_call_failure (
+      (
+        select
+          c.attempt_id
+        from
+          app.accounting_work_completions c
+        where
+          c.order_id = 'o-cancel'
+          and c.outcome = 'disposition_pending'
+      ),
+      'o-cancel',
+      1
+    ) ->> 'status',
+    'committed',
+    'a late failure report for the disposition_pending call is answered committed'
+  );
+
 -- ---------------------------------------------------------------------------
 -- Chronological processing.
 -- ---------------------------------------------------------------------------
@@ -2356,7 +2631,7 @@ $$;
 create trigger p54_boom
 before insert on app.order_cost_applications for each row when (
   new.order_id like 'o-fail%'
-  or new.order_id = 'o-slow'
+  or new.order_id like 'o-slow%'
 )
 execute function public.p54_boom ();
 
@@ -2383,7 +2658,12 @@ select
 
 create temp table fail_run as
 select
-  app.run_accounting_work ('a5400000-0000-4000-8000-0000000000f2', 10) as r;
+  app.run_accounting_work (
+    'a5400000-0000-4000-8000-0000000000f2',
+    10,
+    'o-fail',
+    1
+  ) as r;
 
 select
   results_eq (
@@ -2698,9 +2978,13 @@ select
     1
   );
 
-create function pg_temp.run_with_timeout (p_attempt uuid) returns text language plpgsql as $$
+create function pg_temp.run_with_timeout (
+  p_attempt uuid,
+  p_order text default null,
+  p_generation integer default null
+) returns text language plpgsql as $$
 begin
-  perform app.run_accounting_work(p_attempt, 1);
+  perform app.run_accounting_work(p_attempt, 1, p_order, p_generation);
 
   return 'finished';
 exception
@@ -2714,7 +2998,11 @@ set
 
 create temp table slow_run as
 select
-  pg_temp.run_with_timeout ('a5400000-0000-4000-8000-0000000000f3') as r;
+  pg_temp.run_with_timeout (
+    'a5400000-0000-4000-8000-0000000000f3',
+    'o-slow',
+    1
+  ) as r;
 
 set
   local statement_timeout = 0;
@@ -2739,8 +3027,8 @@ select
 
 select
   results_eq (
-    $$select app.record_accounting_call_failure('a5400000-0000-4000-8000-0000000000f3', null) ->> 'status',
-             app.record_accounting_call_failure('a5400000-0000-4000-8000-0000000000f3', null) ->> 'status'$$,
+    $$select app.record_accounting_call_failure('a5400000-0000-4000-8000-0000000000f3', 'o-slow', 1) ->> 'status',
+             app.record_accounting_call_failure('a5400000-0000-4000-8000-0000000000f3', 'o-slow', 1) ->> 'status'$$,
     $$values ('recorded', 'duplicate')$$,
     'the recorder reports the escaped call, and a repeat is a no-op'
   );
@@ -2758,19 +3046,27 @@ select
     $$select ws.attempts, ws.last_reason, ws.failed_at is null
       from app.accounting_work_state ws where ws.order_id = 'o-slow'$$,
     $$values (1, 'escaped', true)$$,
-    'the head order was charged one attempt'
+    'the bound order was charged one attempt'
   );
 
 select
   is (
-    app.record_accounting_call_failure ('a5400000-0000-4000-8000-0000000000f4', 99) ->> 'status',
+    app.record_accounting_call_failure (
+      'a5400000-0000-4000-8000-0000000000f4',
+      'o-slow',
+      99
+    ) ->> 'status',
     'stale',
-    'a generation hint that no longer matches is stale'
+    'a generation that no longer matches is stale'
   );
 
 select
   is (
-    app.record_accounting_call_failure ('a5400000-0000-4000-8000-0000000000f2', null) ->> 'status',
+    app.record_accounting_call_failure (
+      'a5400000-0000-4000-8000-0000000000f2',
+      'o-slow',
+      1
+    ) ->> 'status',
     'duplicate',
     'an attempt id that already failed in a caught call is not counted again'
   );
@@ -2791,13 +3087,17 @@ select
 
 select
   is (
-    app.record_accounting_call_failure ('a5400000-0000-4000-8000-0000000000f1', null) ->> 'status',
+    app.record_accounting_call_failure (
+      'a5400000-0000-4000-8000-0000000000f1',
+      'o-slow',
+      1
+    ) ->> 'status',
     'committed',
     'an attempt that committed is reported committed, not failed'
   );
 
 select
-  app.record_accounting_call_failure (gen_random_uuid(), null)
+  app.record_accounting_call_failure (gen_random_uuid(), 'o-slow', 1)
 from
   generate_series(1, 4);
 
@@ -2811,9 +3111,9 @@ select
 
 select
   is (
-    app.record_accounting_call_failure (gen_random_uuid(), null) ->> 'status',
+    app.record_accounting_call_failure (gen_random_uuid(), 'o-slow', 1) ->> 'status',
     'no_work',
-    'with no eligible order the recorder has nothing to charge'
+    'a parked order has nothing pending to charge'
   );
 
 select
@@ -2827,6 +3127,223 @@ select
     (pg_temp.work () ->> 'applied')::integer,
     1,
     'the order recovers after the retry'
+  );
+
+-- ---------------------------------------------------------------------------
+-- A failed call can only charge the order it was bound to. The orders sit
+-- before stock start, so they take no stock.
+-- ---------------------------------------------------------------------------
+select
+  set_config('p54.boom', 'sleep', true);
+
+select
+  pg_temp.mk_order (
+    'o-ok-1',
+    'shift-e0',
+    'complete',
+    'hall',
+    '2030-03-01T10:00:00Z',
+    'pos-a',
+    1
+  );
+
+select
+  pg_temp.mk_order (
+    'o-slow-2',
+    'shift-e0',
+    'complete',
+    'hall',
+    '2030-03-01T11:00:00Z',
+    'pos-a',
+    1
+  );
+
+select
+  results_eq (
+    $$select app.accounting_next_work() ->> 'status',
+             app.accounting_next_work() -> 'head' ->> 'order_id',
+             (app.accounting_next_work() -> 'head' ->> 'work_generation')::integer$$,
+    $$values ('ok', 'o-ok-1', 1)$$,
+    'the peek names the head of the queue and its generation'
+  );
+
+select
+  results_eq (
+    $$select r ->> 'status', r -> 'head' ->> 'order_id'
+      from (select app.run_accounting_work('a5400000-0000-4000-8000-000000000101', 1, 'o-slow-2', 1) as r) x$$,
+    $$values ('stale', 'o-ok-1')$$,
+    'a call bound to an order that is not the head is stale and names the real head'
+  );
+
+select
+  is_empty (
+    $$select 1 from app.accounting_work_completions where attempt_id = 'a5400000-0000-4000-8000-000000000101'
+      union all select 1 from app.accounting_work_attempts where order_id in ('o-ok-1', 'o-slow-2')
+      union all select 1 from app.accounting_work_state where order_id in ('o-ok-1', 'o-slow-2')$$,
+    'a stale call changed nothing'
+  );
+
+-- Room for ten orders, yet the call takes the head only.
+create temp table room_run as
+select
+  app.run_accounting_work ('a5400000-0000-4000-8000-000000000102', 10) as r;
+
+select
+  results_eq (
+    $$select (r ->> 'processed')::integer, (r ->> 'none')::integer, (r ->> 'failed')::integer,
+             (r ->> 'remaining')::integer, r -> 'head' ->> 'order_id'
+      from room_run$$,
+    $$values (1, 1, 0, 1, 'o-slow-2')$$,
+    'a call with room for ten takes the head only and names the next order'
+  );
+
+set
+  local statement_timeout = '400ms';
+
+create temp table bound_slow_run as
+select
+  pg_temp.run_with_timeout (
+    'a5400000-0000-4000-8000-000000000103',
+    'o-slow-2',
+    1
+  ) as r;
+
+set
+  local statement_timeout = 0;
+
+select
+  is (
+    (
+      select
+        r
+      from
+        bound_slow_run
+    ),
+    'canceled',
+    'the slow bound call is cancelled and rolls back'
+  );
+
+select
+  is (
+    app.record_accounting_call_failure (
+      'a5400000-0000-4000-8000-000000000103',
+      'o-slow-2',
+      1
+    ) ->> 'status',
+    'recorded',
+    'the report charges the order the call was bound to'
+  );
+
+select
+  is (
+    app.record_accounting_call_failure (
+      'a5400000-0000-4000-8000-000000000104',
+      'o-ok-1',
+      1
+    ) ->> 'status',
+    'no_work',
+    'a report naming the healthy, already processed order charges nothing'
+  );
+
+select
+  results_eq (
+    $$select ws.order_id, ws.attempts, ws.failed_at is null
+      from app.accounting_work_state ws where ws.order_id in ('o-ok-1', 'o-slow-2') order by 1$$,
+    $$values ('o-ok-1', 0, true), ('o-slow-2', 1, true)$$,
+    'only the slow order carries the failure; the healthy order is at zero'
+  );
+
+select
+  results_eq (
+    $$select t.order_id from app.accounting_work_attempts t where t.order_id in ('o-ok-1', 'o-slow-2')$$,
+    $$values ('o-slow-2')$$,
+    'the healthy order has no attempt row'
+  );
+
+select
+  set_config('p54.boom', 'off', true);
+
+select
+  is (
+    pg_temp.drain () ->> 'status',
+    'empty',
+    'the charged order recovers once the fault is gone'
+  );
+
+select
+  results_eq (
+    $$select ws.attempts, ws.failed_at is null from app.accounting_work_state ws where ws.order_id = 'o-slow-2'$$,
+    $$values (0, true)$$,
+    'a success resets the count'
+  );
+
+-- ---------------------------------------------------------------------------
+-- A caught attempt that is repeated is charged once.
+-- ---------------------------------------------------------------------------
+select
+  set_config('p54.boom', 'plain', true);
+
+select
+  pg_temp.mk_order (
+    'o-fail-rep',
+    'shift-e0',
+    'complete',
+    'hall',
+    '2030-03-02T10:00:00Z',
+    'pos-a',
+    1
+  );
+
+select
+  app.run_accounting_work (
+    'a5400000-0000-4000-8000-000000000111',
+    1,
+    'o-fail-rep',
+    1
+  )
+from
+  generate_series(1, 5);
+
+select
+  results_eq (
+    $$select ws.attempts, ws.failed_at is null, ws.last_error_code
+      from app.accounting_work_state ws where ws.order_id = 'o-fail-rep'$$,
+    $$values (1, true, 'XX000')$$,
+    'one attempt id repeated five times is charged once and does not park the order'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.accounting_work_attempts
+      where
+        order_id = 'o-fail-rep'
+    ),
+    1::bigint,
+    'and leaves one attempt row'
+  );
+
+select
+  app.run_accounting_work (gen_random_uuid(), 1, 'o-fail-rep', 1);
+
+select
+  results_eq (
+    $$select ws.attempts from app.accounting_work_state ws where ws.order_id = 'o-fail-rep'$$,
+    $$values (2)$$,
+    'a different attempt id is a new attempt'
+  );
+
+select
+  set_config('p54.boom', 'off', true);
+
+select
+  is (
+    pg_temp.drain () ->> 'status',
+    'empty',
+    'the order recovers once the fault is gone'
   );
 
 -- ---------------------------------------------------------------------------
@@ -3213,8 +3730,246 @@ select
   );
 
 -- ---------------------------------------------------------------------------
+-- A sale that turns incomplete and is repaired keeps its place among the
+-- events at the same instant (design 5.5).
+-- ---------------------------------------------------------------------------
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    parent_item_id
+  )
+values
+  (
+    'a5400000-0000-4000-8000-00000000000b',
+    'p54-ev',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  );
+
+insert into
+  app.item_loss_versions (
+    effective_from,
+    created_change_id,
+    item_id,
+    loss_pct
+  )
+values
+  (
+    '2000-01-01 00:00:00+00',
+    (
+      select
+        id
+      from
+        app.costing_changes
+      where
+        request_id = 'a5400000-0000-4000-8000-0000000000c0'
+    ),
+    'a5400000-0000-4000-8000-00000000000b',
+    0
+  );
+
+select
+  pg_temp.policies ('pos-ev');
+
+select
+  pg_temp.map_stock (
+    'pos-ev',
+    'a5400000-0000-4000-8000-00000000000b',
+    '1',
+    '2030-01-01T00:00:00Z'
+  );
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'a5400000-0000-4000-8000-00000000000b', 'movement_type', 'opening',
+      'occurred_at', '2030-07-02T08:00:00Z', 'quantity', 1, 'unit_cost', 10
+    )))$$,
+    'the item opens with one unit at 10'
+  );
+
+select
+  is (
+    pg_temp.drain () ->> 'status',
+    'empty',
+    'the new mapping drains'
+  );
+
+create function pg_temp.live_cost (p_order text) returns numeric language sql as $$
+  select
+    coalesce(sum(abs(m.total_cost)), 0)
+  from
+    app.order_cost_movement_links l
+    join app.stock_movements m on m.id = l.movement_id
+  where
+    l.application_id = (
+      select h.owner_application_id from app.order_cost_state h where h.order_id = p_order
+    );
+$$;
+
+select
+  pg_temp.mk_order (
+    'o-ev',
+    'shift-e1',
+    'complete',
+    'hall',
+    '2030-07-02T10:00:00Z',
+    'pos-ev',
+    1
+  );
+
+select
+  is (
+    (pg_temp.drain () ->> 'applied')::integer,
+    1,
+    'the sale is posted'
+  );
+
+select
+  is (
+    pg_temp.live_cost ('o-ev'),
+    10::numeric,
+    'it takes the only unit, at 10'
+  );
+
+create temp table ev_before as
+select
+  h.event_position,
+  h.owner_application_id
+from
+  app.order_cost_state h
+where
+  h.order_id = 'o-ev';
+
+select
+  isnt (
+    (
+      select
+        event_position
+      from
+        ev_before
+    ),
+    null,
+    'the order took a position at its first sale'
+  );
+
+-- The order moves before the item opened: it turns incomplete and its sale is retired.
+select
+  pg_temp.edit_order ('o-ev', null, null, null, '2030-07-02T07:00:00Z');
+
+select
+  is (
+    (pg_temp.drain () ->> 'incomplete')::integer,
+    1,
+    'the order turns incomplete'
+  );
+
+select
+  results_eq (
+    $$select h.disposition, h.owner_application_id is null, h.event_position
+      from app.order_cost_state h where h.order_id = 'o-ev'$$,
+    $$select 'incomplete', true, event_position from ev_before$$,
+    'it no longer owns an application but keeps its position'
+  );
+
+-- A purchase arrives at the instant of the original sale.
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(jsonb_build_object(
+      'item_id', 'a5400000-0000-4000-8000-00000000000b', 'movement_type', 'purchase',
+      'occurred_at', '2030-07-02T10:00:00Z', 'quantity', 1, 'unit_cost', 30
+    )))$$,
+    'a purchase of one unit at 30 arrives at the same instant as the sale'
+  );
+
+-- The gap is repaired: the order moves back to its instant.
+select
+  pg_temp.edit_order ('o-ev', null, null, null, '2030-07-02T10:00:00Z');
+
+select
+  is (
+    (pg_temp.drain () ->> 'applied')::integer,
+    1,
+    'the repaired order posts a new sale'
+  );
+
+select
+  results_eq (
+    $$select h.event_position, h.owner_application_id is distinct from b.owner_application_id
+      from app.order_cost_state h, ev_before b where h.order_id = 'o-ev'$$,
+    $$select event_position, true from ev_before$$,
+    'the replacement application keeps the original position'
+  );
+
+select
+  results_eq (
+    $$select m.event_position = b.event_position
+      from app.order_cost_state h
+      join app.order_cost_movement_links l on l.application_id = h.owner_application_id
+      join app.stock_movements m on m.id = l.movement_id, ev_before b
+      where h.order_id = 'o-ev'$$,
+    $$values (true)$$,
+    'and so does the new sale movement'
+  );
+
+select
+  is (
+    pg_temp.live_cost ('o-ev'),
+    10::numeric,
+    'the repaired sale still replays before the same-instant purchase and costs 10, not 20'
+  );
+
+select
+  is (
+    pg_temp.state_of (
+      $$update app.order_cost_state set event_position = event_position + 1 where order_id = 'o-ev'$$
+    ),
+    '55000',
+    'an order event position cannot be changed'
+  );
+
+select
+  is (
+    pg_temp.state_of (
+      $$update app.order_cost_state set event_position = null where order_id = 'o-ev'$$
+    ),
+    '55000',
+    'or cleared'
+  );
+
+-- ---------------------------------------------------------------------------
 -- Append-only guards.
 -- ---------------------------------------------------------------------------
+select
+  is (
+    pg_temp.state_of (
+      $$update app.accounting_work_completions set outcome = 'none'$$
+    ),
+    '55000',
+    'completion evidence cannot be updated'
+  );
+
+select
+  is (
+    pg_temp.state_of ($$delete from app.accounting_work_completions$$),
+    '55000',
+    'completion evidence cannot be deleted'
+  );
+
+select
+  ok (
+    pg_temp.state_of ($$truncate app.accounting_work_completions$$) in ('55000', '0A000'),
+    'completion evidence cannot be truncated'
+  );
+
 select
   is (
     pg_temp.state_of (
@@ -3365,7 +4120,7 @@ select
 
 select
   throws_ok (
-    $$select app.record_accounting_call_failure(gen_random_uuid(), null)$$,
+    $$select app.record_accounting_call_failure(gen_random_uuid(), 'o-fail', 1)$$,
     '42501',
     null::text,
     'a non-owner cannot report a failed call'

@@ -39,6 +39,26 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"accounting_work_completions": {
+                  Row: {
+                    "application_id": number | null,"attempt_id": string,"completed_at": string,"order_id": string,"outcome": string,"work_generation": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "application_id"?: number | null,"attempt_id": string,"completed_at"?: string,"order_id": string,"outcome": string,"work_generation": number
+                  }
+                  Update: {
+                    "application_id"?: number | null,"attempt_id"?: string,"completed_at"?: string,"order_id"?: string,"outcome"?: string,"work_generation"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "accounting_work_completions_application_id_fkey"
+      columns: ["application_id"]
+isOneToOne: false
+      referencedRelation: "order_cost_applications"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"accounting_work_events": {
                   Row: {
                     "cause": string,"cost_input_id": number | null,"created_at": string,"id": number,"order_id": string,"processed_at": string | null,"source_key": string,"span_id": number | null,"work_generation": number | null
@@ -67,14 +87,14 @@ isOneToOne: false
                   ]
                 },"accounting_work_state": {
                   Row: {
-                    "attempts": number,"blocked_item_ids": (string)[],"failed_at": string | null,"last_attempt_id": string | null,"last_error_code": string | null,"last_outcome": string | null,"last_reason": string | null,"order_id": string,"updated_at": string,"work_generation": number
+                    "attempts": number,"blocked_item_ids": (string)[],"failed_at": string | null,"last_error_code": string | null,"last_outcome": string | null,"last_reason": string | null,"order_id": string,"updated_at": string,"work_generation": number
                   }
                   ComputedFields: never
                   Insert: {
-                    "attempts"?: number,"blocked_item_ids"?: (string)[],"failed_at"?: string | null,"last_attempt_id"?: string | null,"last_error_code"?: string | null,"last_outcome"?: string | null,"last_reason"?: string | null,"order_id": string,"updated_at"?: string,"work_generation"?: number
+                    "attempts"?: number,"blocked_item_ids"?: (string)[],"failed_at"?: string | null,"last_error_code"?: string | null,"last_outcome"?: string | null,"last_reason"?: string | null,"order_id": string,"updated_at"?: string,"work_generation"?: number
                   }
                   Update: {
-                    "attempts"?: number,"blocked_item_ids"?: (string)[],"failed_at"?: string | null,"last_attempt_id"?: string | null,"last_error_code"?: string | null,"last_outcome"?: string | null,"last_reason"?: string | null,"order_id"?: string,"updated_at"?: string,"work_generation"?: number
+                    "attempts"?: number,"blocked_item_ids"?: (string)[],"failed_at"?: string | null,"last_error_code"?: string | null,"last_outcome"?: string | null,"last_reason"?: string | null,"order_id"?: string,"updated_at"?: string,"work_generation"?: number
                   }
                   Relationships: [
                     
@@ -485,14 +505,14 @@ isOneToOne: true
                   ]
                 },"order_cost_state": {
                   Row: {
-                    "causes": NonNullable<Json>,"disposition": string | null,"evaluated_at": string | null,"latest_application_id": number | null,"latest_input_id": number | null,"order_id": string,"owner_application_id": number | null,"signature": string | null,"updated_at": string
+                    "causes": NonNullable<Json>,"disposition": string | null,"evaluated_at": string | null,"event_position": number | null,"latest_application_id": number | null,"latest_input_id": number | null,"order_id": string,"owner_application_id": number | null,"signature": string | null,"updated_at": string
                   }
                   ComputedFields: never
                   Insert: {
-                    "causes"?: NonNullable<Json>,"disposition"?: string | null,"evaluated_at"?: string | null,"latest_application_id"?: number | null,"latest_input_id"?: number | null,"order_id": string,"owner_application_id"?: number | null,"signature"?: string | null,"updated_at"?: string
+                    "causes"?: NonNullable<Json>,"disposition"?: string | null,"evaluated_at"?: string | null,"event_position"?: number | null,"latest_application_id"?: number | null,"latest_input_id"?: number | null,"order_id": string,"owner_application_id"?: number | null,"signature"?: string | null,"updated_at"?: string
                   }
                   Update: {
-                    "causes"?: NonNullable<Json>,"disposition"?: string | null,"evaluated_at"?: string | null,"latest_application_id"?: number | null,"latest_input_id"?: number | null,"order_id"?: string,"owner_application_id"?: number | null,"signature"?: string | null,"updated_at"?: string
+                    "causes"?: NonNullable<Json>,"disposition"?: string | null,"evaluated_at"?: string | null,"event_position"?: number | null,"latest_application_id"?: number | null,"latest_input_id"?: number | null,"order_id"?: string,"owner_application_id"?: number | null,"signature"?: string | null,"updated_at"?: string
                   }
                   Relationships: [
                     {
@@ -1579,7 +1599,15 @@ isOneToOne: false
                 }
           }
           Functions: {
-            "accounting_pending_orders":
+            "accounting_next_work":
+{ Args: Record<PropertyKey, never>; Returns: Json
+                           },
+"accounting_order_pending":
+{ Args: { "p_order_id": string }; Returns: {
+              "eff_generation": number,"has_new": boolean
+            }[]
+                           },
+"accounting_pending_orders":
 { Args: { "p_limit": number }; Returns: {
               "eff_generation": number,"has_new": boolean,"order_id": string
             }[]
@@ -2013,7 +2041,7 @@ isOneToOne: false
 { Args: { "p_item_ids": (string)[] }; Returns: (string)[]
                            },
 "record_accounting_call_failure":
-{ Args: { "p_attempt_id": string,"p_work_generation": number }; Returns: Json
+{ Args: { "p_attempt_id": string,"p_order_id": string,"p_work_generation": number }; Returns: Json
                            },
 "record_count":
 { Args: { "p_count": Json }; Returns: Json
@@ -2091,7 +2119,7 @@ isOneToOne: false
 { Args: { "p_exact": Json }; Returns: Json
                            },
 "run_accounting_work":
-{ Args: { "p_attempt_id": string,"p_limit": number }; Returns: Json
+{ Args: { "p_attempt_id": string,"p_limit": number,"p_order_id"?: string,"p_work_generation"?: number }; Returns: Json
                            },
 "schedule_token":
 { Args: { "p_family": string,"p_item_id": string,"p_unit_code": string }; Returns: string

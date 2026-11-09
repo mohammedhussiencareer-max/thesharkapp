@@ -9,8 +9,10 @@ import {
   SupabaseRpcError,
   zeroAccountingCounts,
   type AccountingDb,
+  type AccountingOrderRef,
   type AccountingRun,
   type FailureReport,
+  type NextWork,
 } from './supabase-write.ts';
 
 function run(
@@ -27,15 +29,37 @@ function run(
   };
 }
 
+const orderA: AccountingOrderRef = { orderId: 'order-a', workGeneration: 1 };
+const orderB: AccountingOrderRef = { orderId: 'order-b', workGeneration: 3 };
+const orderC: AccountingOrderRef = { orderId: 'order-c', workGeneration: 2 };
+
 type Script = Array<AccountingRun | Error>;
 
-function fakeDb(script: Script, report: FailureReport | Error = 'recorded') {
-  const runs: Array<{ attemptId: string; limit: number }> = [];
-  const reports: Array<{ attemptId: string; generation: number | null }> = [];
+function fakeDb(
+  script: Script,
+  report: FailureReport | Error = 'recorded',
+  peek: NextWork | Error = { status: 'ok', head: orderA },
+) {
+  const runs: Array<{
+    attemptId: string;
+    limit: number;
+    binding: AccountingOrderRef | null;
+  }> = [];
+  const reports: Array<{
+    attemptId: string;
+    orderId: string;
+    generation: number;
+  }> = [];
   const queue = [...script];
   const db: AccountingDb = {
-    async runAccountingWork(attemptId, limit) {
-      runs.push({ attemptId, limit });
+    async getNextWork() {
+      if (peek instanceof Error) {
+        throw peek;
+      }
+      return peek;
+    },
+    async runAccountingWork(attemptId, limit, binding) {
+      runs.push({ attemptId, limit, binding });
       const next = queue.shift();
       if (next === undefined) {
         throw new Error('script exhausted');
@@ -45,8 +69,8 @@ function fakeDb(script: Script, report: FailureReport | Error = 'recorded') {
       }
       return next;
     },
-    async recordAccountingCallFailure(attemptId, generation) {
-      reports.push({ attemptId, generation });
+    async recordAccountingCallFailure(attemptId, orderId, generation) {
+      reports.push({ attemptId, orderId, generation });
       if (report instanceof Error) {
         throw report;
       }
@@ -62,52 +86,85 @@ function ids() {
 }
 
 describe('drainAccountingWork', () => {
-  it('stops at once when nothing is queued', async () => {
-    const { db, runs, reports } = fakeDb([run('empty')]);
+  it('sends one order a call', () => {
+    expect(DRAIN_BATCH_LIMIT).toBe(1);
+  });
+
+  it('stops at once when nothing is queued, still asking the worker once', async () => {
+    const { db, runs, reports } = fakeDb([run('empty')], 'recorded', {
+      status: 'empty',
+      head: null,
+    });
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('empty');
     expect(outcome.calls).toBe(1);
     expect(runs).toEqual([
       {
         attemptId: '00000000-0000-4000-8000-000000000001',
-        limit: DRAIN_BATCH_LIMIT,
+        limit: 1,
+        binding: null,
       },
     ]);
     expect(reports).toEqual([]);
   });
 
-  it('loops until empty, sums counts and uses a fresh attempt id per call', async () => {
+  it('stops before any worker call when the engine is not activated', async () => {
+    const { db, runs } = fakeDb([], 'recorded', {
+      status: 'not_activated',
+      head: null,
+    });
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('not_activated');
+    expect(outcome.calls).toBe(0);
+    expect(runs).toEqual([]);
+  });
+
+  it('stops without a worker call or a report when the peek fails', async () => {
+    const { db, runs, reports } = fakeDb(
+      [],
+      'recorded',
+      new SupabaseRpcError('Supabase RPC failed: network', 'network'),
+    );
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('call_failed');
+    expect(outcome.report).toBe('not_needed');
+    expect(outcome.error).toBe('Supabase RPC failed: network');
+    expect(runs).toEqual([]);
+    expect(reports).toEqual([]);
+  });
+
+  it('loops until empty, sums counts, uses a fresh attempt id and binds each call to the previous head', async () => {
     const { db, runs } = fakeDb([
-      run(
-        'processed',
-        { processed: 5, applied: 4, unchanged: 1, remaining: 7 },
-        {
-          orderId: 'order-a',
-          workGeneration: 1,
-        },
-      ),
-      run('processed', { processed: 5, applied: 5, remaining: 2 }),
-      run('processed', { processed: 2, none: 2, remaining: 0 }),
+      run('processed', { processed: 1, applied: 1, remaining: 3 }, orderB),
+      run('processed', { processed: 1, unchanged: 1, remaining: 2 }, orderC),
+      run('processed', { processed: 1, none: 1, remaining: 0 }),
       run('empty'),
     ]);
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('empty');
     expect(outcome.calls).toBe(4);
     expect(outcome.counts).toMatchObject({
-      processed: 12,
-      applied: 9,
+      processed: 3,
+      applied: 1,
       unchanged: 1,
-      none: 2,
+      none: 1,
       remaining: 0,
     });
     expect(new Set(runs.map((call) => call.attemptId)).size).toBe(4);
+    expect(runs.map((call) => call.binding)).toEqual([
+      orderA,
+      orderB,
+      orderC,
+      null,
+    ]);
+    expect(runs.every((call) => call.limit === 1)).toBe(true);
   });
 
   it.each(['busy', 'sync_running', 'not_activated'] as const)(
     'stops without a report on %s',
     async (status) => {
       const { db, reports } = fakeDb([
-        run('processed', { processed: 1, remaining: 3 }),
+        run('processed', { processed: 1, remaining: 3 }, orderB),
         run(status),
       ]);
       const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
@@ -118,6 +175,34 @@ describe('drainAccountingWork', () => {
       expect(reports).toEqual([]);
     },
   );
+
+  it('rebinds to the real head when the worker answers stale, without counting it', async () => {
+    const { db, runs } = fakeDb([
+      run('stale', {}, orderB),
+      run('processed', { processed: 1, applied: 1, remaining: 0 }),
+      run('empty'),
+    ]);
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('empty');
+    expect(outcome.calls).toBe(3);
+    expect(outcome.counts).toMatchObject({ processed: 1, applied: 1 });
+    expect(runs.map((call) => call.binding)).toEqual([orderA, orderB, null]);
+  });
+
+  it('gives up after repeated stale answers, without a report', async () => {
+    const { db, runs, reports } = fakeDb([
+      run('stale', {}, orderB),
+      run('stale', {}, orderC),
+      run('stale', {}, orderB),
+      run('stale', {}, orderC),
+    ]);
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('stale');
+    expect(outcome.calls).toBe(4);
+    expect(outcome.report).toBeNull();
+    expect(runs).toHaveLength(4);
+    expect(reports).toEqual([]);
+  });
 
   it('stops on critical and names the order', async () => {
     const { db } = fakeDb([
@@ -132,9 +217,9 @@ describe('drainAccountingWork', () => {
     expect(formatDrain(outcome)).toContain('critical_order=order-crit');
   });
 
-  it('stops when an order failed inside the call, without reporting', async () => {
+  it('stops when the order failed inside the call, without reporting', async () => {
     const { db, reports } = fakeDb([
-      run('processed', { processed: 2, failed: 1, remaining: 5 }),
+      run('processed', { processed: 0, failed: 1, remaining: 5 }, orderA),
     ]);
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('order_failed');
@@ -146,7 +231,7 @@ describe('drainAccountingWork', () => {
     let now = 0;
     const { db } = fakeDb(
       Array.from({ length: 10 }, () =>
-        run('processed', { processed: 1, remaining: 9 }),
+        run('processed', { processed: 1, remaining: 9 }, orderB),
       ),
     );
     const outcome = await drainAccountingWork(db, {
@@ -161,7 +246,7 @@ describe('drainAccountingWork', () => {
     expect(DRAIN_BUDGET_MS).toBe(60_000);
   });
 
-  it('reports an escaped failure with the same attempt id and the last head generation', async () => {
+  it('reports an escaped failure with the same attempt id, naming only the bound order', async () => {
     const timeout = new SupabaseRpcError(
       'Supabase RPC failed: network',
       'network',
@@ -170,7 +255,7 @@ describe('drainAccountingWork', () => {
       [
         run(
           'processed',
-          { processed: 5, remaining: 3 },
+          { processed: 1, remaining: 3 },
           {
             orderId: 'order-next',
             workGeneration: 4,
@@ -184,10 +269,16 @@ describe('drainAccountingWork', () => {
     expect(outcome.stop).toBe('call_failed');
     expect(outcome.report).toBe('recorded');
     expect(outcome.error).toBe('Supabase RPC failed: network');
-    expect(reports).toEqual([{ attemptId: runs[1]?.attemptId, generation: 4 }]);
+    expect(reports).toEqual([
+      {
+        attemptId: runs[1]?.attemptId,
+        orderId: 'order-next',
+        generation: 4,
+      },
+    ]);
   });
 
-  it('reports a server error on the first call with no generation hint', async () => {
+  it('reports a server error on the first call against the order the peek named', async () => {
     const { db, runs, reports } = fakeDb(
       [
         new SupabaseRpcError(
@@ -202,8 +293,24 @@ describe('drainAccountingWork', () => {
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.report).toBe('committed');
     expect(reports).toEqual([
-      { attemptId: runs[0]?.attemptId, generation: null },
+      {
+        attemptId: runs[0]?.attemptId,
+        orderId: 'order-a',
+        generation: 1,
+      },
     ]);
+  });
+
+  it('makes no report when the failed call was bound to no order', async () => {
+    const { db, reports } = fakeDb(
+      [new SupabaseRpcError('Supabase RPC failed: network', 'network')],
+      'recorded',
+      { status: 'empty', head: null },
+    );
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('call_failed');
+    expect(outcome.report).toBe('not_needed');
+    expect(reports).toEqual([]);
   });
 
   it('does not report a refused call', async () => {

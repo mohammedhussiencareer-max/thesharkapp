@@ -305,7 +305,10 @@ values
   );
 
 select
-  app.run_accounting_work ('b4c00000-0000-4000-8000-000000000402', 5);
+  app.run_accounting_work ('b4c00000-0000-4000-8000-000000000402', 1);
+
+select
+  app.run_accounting_work ('b4c00000-0000-4000-8000-000000000404', 1);
 
 insert into
   app.accounting_work_attempts (

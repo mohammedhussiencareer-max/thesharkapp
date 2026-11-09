@@ -6,6 +6,7 @@ import {
   zeroAccountingCounts,
   type AccountingDb,
   type AccountingRun,
+  type NextWork,
   type PosDb,
 } from './supabase-write.ts';
 import type { IngestCounts } from './types.ts';
@@ -50,6 +51,14 @@ function idle(status: AccountingRun['status']): AccountingRun {
   return { status, counts: zeroAccountingCounts(), head: null, critical: null };
 }
 
+async function nobody(): Promise<NextWork> {
+  return { status: 'empty', head: null };
+}
+
+async function someone(): Promise<NextWork> {
+  return { status: 'ok', head: { orderId: 'order-a', workGeneration: 1 } };
+}
+
 function run(input: {
   db: PosDb;
   accountingDb?: AccountingDb;
@@ -80,6 +89,7 @@ describe('runPosSync accounting drain', () => {
       db: posDb(events),
       logs,
       accountingDb: {
+        getNextWork: nobody,
         async runAccountingWork() {
           events.push('drain');
           return idle('empty');
@@ -108,6 +118,7 @@ describe('runPosSync accounting drain', () => {
       db: posDb(events),
       logs,
       accountingDb: {
+        getNextWork: someone,
         async runAccountingWork() {
           return idle('busy');
         },
@@ -123,11 +134,12 @@ describe('runPosSync accounting drain', () => {
   it('never marks the sync failed when the drain call fails', async () => {
     const events: string[] = [];
     const logs: string[] = [];
-    const reported: Array<[string, number | null]> = [];
+    const reported: Array<[string, string, number]> = [];
     const result = await run({
       db: posDb(events),
       logs,
       accountingDb: {
+        getNextWork: someone,
         async runAccountingWork() {
           throw new SupabaseRpcError(
             'Supabase RPC failed: HTTP 500',
@@ -136,8 +148,8 @@ describe('runPosSync accounting drain', () => {
             '57014',
           );
         },
-        async recordAccountingCallFailure(attemptId, generation) {
-          reported.push([attemptId, generation]);
+        async recordAccountingCallFailure(attemptId, orderId, generation) {
+          reported.push([attemptId, orderId, generation]);
           return 'recorded';
         },
       },
@@ -145,6 +157,7 @@ describe('runPosSync accounting drain', () => {
     expect(events).toEqual(['start', 'ingest', 'finish:ok']);
     expect(result.shiftIds).toEqual([]);
     expect(reported).toHaveLength(1);
+    expect(reported[0]?.slice(1)).toEqual(['order-a', 1]);
     expect(logs.at(-1)).toMatch(
       /^accounting drain stop=call_failed .* report=recorded error=Supabase RPC failed: HTTP 500$/,
     );
@@ -163,6 +176,7 @@ describe('runPosSync accounting drain', () => {
       },
       db: posDb(events),
       accountingDb: {
+        getNextWork: someone,
         async runAccountingWork() {
           throw new SupabaseRpcError('Supabase RPC failed: network', 'network');
         },
@@ -213,6 +227,7 @@ describe('runPosSync accounting drain', () => {
         },
         db,
         accountingDb: {
+          getNextWork: nobody,
           async runAccountingWork() {
             drained = true;
             return idle('empty');

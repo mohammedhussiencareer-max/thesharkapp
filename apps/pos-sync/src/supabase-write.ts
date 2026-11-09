@@ -16,6 +16,7 @@ const RPC_NAMES = new Set([
   'finish_pos_sync_run',
   'run_accounting_work',
   'record_accounting_call_failure',
+  'accounting_next_work',
 ]);
 
 const ACCOUNTING_CALL_TIMEOUT_MS = 20_000;
@@ -63,6 +64,7 @@ export function isUnknownOutcome(error: unknown): boolean {
 
 export type AccountingStatus =
   | 'processed'
+  | 'stale'
   | 'empty'
   | 'busy'
   | 'sync_running'
@@ -109,11 +111,24 @@ export type PosDb = {
   ): Promise<void>;
 };
 
+export type NextWork = {
+  status: 'ok' | 'empty' | 'not_activated';
+  head: AccountingOrderRef | null;
+};
+
+// A worker call is bound to the order it may process; a failure report names
+// that same order and generation, so it can only ever charge that order.
 export type AccountingDb = {
-  runAccountingWork(attemptId: string, limit: number): Promise<AccountingRun>;
+  getNextWork(): Promise<NextWork>;
+  runAccountingWork(
+    attemptId: string,
+    limit: number,
+    binding: AccountingOrderRef | null,
+  ): Promise<AccountingRun>;
   recordAccountingCallFailure(
     attemptId: string,
-    workGeneration: number | null,
+    orderId: string,
+    workGeneration: number,
   ): Promise<FailureReport>;
 };
 
@@ -207,20 +222,34 @@ export function createSupabaseDb(
         p_error: error,
       });
     },
-    async runAccountingWork(attemptId, limit) {
+    async getNextWork() {
+      return parseNextWork(
+        await rpc('accounting_next_work', {}, ACCOUNTING_CALL_TIMEOUT_MS),
+      );
+    },
+    async runAccountingWork(attemptId, limit, binding) {
       return parseAccountingRun(
         await rpc(
           'run_accounting_work',
-          { p_attempt_id: attemptId, p_limit: limit },
+          {
+            p_attempt_id: attemptId,
+            p_limit: limit,
+            p_order_id: binding?.orderId ?? null,
+            p_work_generation: binding?.workGeneration ?? null,
+          },
           ACCOUNTING_CALL_TIMEOUT_MS,
         ),
       );
     },
-    async recordAccountingCallFailure(attemptId, workGeneration) {
+    async recordAccountingCallFailure(attemptId, orderId, workGeneration) {
       return parseFailureReport(
         await rpc(
           'record_accounting_call_failure',
-          { p_attempt_id: attemptId, p_work_generation: workGeneration },
+          {
+            p_attempt_id: attemptId,
+            p_order_id: orderId,
+            p_work_generation: workGeneration,
+          },
           ACCOUNTING_CALL_TIMEOUT_MS,
         ),
       );
@@ -321,6 +350,7 @@ function countField(value: unknown): number {
 
 const ACCOUNTING_STATUSES = new Set<string>([
   'processed',
+  'stale',
   'empty',
   'busy',
   'sync_running',
@@ -362,6 +392,14 @@ function parseAccountingRun(value: unknown): AccountingRun {
       critical: null,
     };
   }
+  if (status === 'stale') {
+    return {
+      status,
+      counts: zeroAccountingCounts(),
+      head: parseOrderRef(value.head),
+      critical: null,
+    };
+  }
   const counts: AccountingCounts = {
     processed: countField(value.processed),
     applied: countField(value.applied),
@@ -379,6 +417,23 @@ function parseAccountingRun(value: unknown): AccountingRun {
     throw unexpectedResponse();
   }
   return { status, counts, head, critical };
+}
+
+const NEXT_WORK_STATUSES = new Set<string>(['ok', 'empty', 'not_activated']);
+
+function parseNextWork(value: unknown): NextWork {
+  if (
+    !isRecord(value) ||
+    typeof value.status !== 'string' ||
+    !NEXT_WORK_STATUSES.has(value.status)
+  ) {
+    throw unexpectedResponse();
+  }
+  const head = parseOrderRef(value.head);
+  if ((value.status === 'ok') !== (head !== null)) {
+    throw unexpectedResponse();
+  }
+  return { status: value.status as NextWork['status'], head };
 }
 
 function parseOrderRef(value: unknown): AccountingOrderRef | null {

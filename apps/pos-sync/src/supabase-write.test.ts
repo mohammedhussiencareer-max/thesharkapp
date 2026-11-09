@@ -200,12 +200,34 @@ function sentBody(call: { init: RequestInit } | undefined): unknown {
 
 describe('accounting RPCs', () => {
   it('calls the app profile with the caller attempt id and a timeout', async () => {
-    const { db, calls } = accountingDb((url) =>
-      new URL(url).pathname.endsWith('/run_accounting_work')
-        ? new Response(JSON.stringify(processedBody), { status: 200 })
-        : new Response(JSON.stringify({ status: 'recorded' }), { status: 200 }),
-    );
-    await expect(db.runAccountingWork(ATTEMPT, 5)).resolves.toEqual({
+    const { db, calls } = accountingDb((url) => {
+      const path = new URL(url).pathname;
+      if (path.endsWith('/run_accounting_work')) {
+        return new Response(JSON.stringify(processedBody), { status: 200 });
+      }
+      if (path.endsWith('/accounting_next_work')) {
+        return new Response(
+          JSON.stringify({
+            status: 'ok',
+            head: { order_id: 'order-test-9', work_generation: 2 },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ status: 'recorded' }), {
+        status: 200,
+      });
+    });
+    await expect(db.getNextWork()).resolves.toEqual({
+      status: 'ok',
+      head: { orderId: 'order-test-9', workGeneration: 2 },
+    });
+    await expect(
+      db.runAccountingWork(ATTEMPT, 1, {
+        orderId: 'order-test-9',
+        workGeneration: 2,
+      }),
+    ).resolves.toEqual({
       status: 'processed',
       counts: {
         processed: 3,
@@ -221,28 +243,35 @@ describe('accounting RPCs', () => {
       head: { orderId: 'order-test-9', workGeneration: 2 },
       critical: null,
     });
-    await expect(db.recordAccountingCallFailure(ATTEMPT, 2)).resolves.toBe(
-      'recorded',
+    await expect(db.runAccountingWork(ATTEMPT, 1, null)).resolves.toMatchObject(
+      { status: 'processed' },
     );
-    await expect(db.recordAccountingCallFailure(ATTEMPT, null)).resolves.toBe(
-      'recorded',
-    );
+    await expect(
+      db.recordAccountingCallFailure(ATTEMPT, 'order-test-9', 2),
+    ).resolves.toBe('recorded');
     expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
+      '/rest/v1/rpc/accounting_next_work',
+      '/rest/v1/rpc/run_accounting_work',
       '/rest/v1/rpc/run_accounting_work',
       '/rest/v1/rpc/record_accounting_call_failure',
-      '/rest/v1/rpc/record_accounting_call_failure',
     ]);
-    expect(sentBody(calls[0])).toEqual({
-      p_attempt_id: ATTEMPT,
-      p_limit: 5,
-    });
+    expect(sentBody(calls[0])).toEqual({});
     expect(sentBody(calls[1])).toEqual({
       p_attempt_id: ATTEMPT,
+      p_limit: 1,
+      p_order_id: 'order-test-9',
       p_work_generation: 2,
     });
     expect(sentBody(calls[2])).toEqual({
       p_attempt_id: ATTEMPT,
+      p_limit: 1,
+      p_order_id: null,
       p_work_generation: null,
+    });
+    expect(sentBody(calls[3])).toEqual({
+      p_attempt_id: ATTEMPT,
+      p_order_id: 'order-test-9',
+      p_work_generation: 2,
     });
     for (const call of calls) {
       const headers = new Headers(call.init.headers);
@@ -273,10 +302,91 @@ describe('accounting RPCs', () => {
             { status: 200 },
           ),
       );
-      const run = await db.runAccountingWork(ATTEMPT, 5);
+      const run = await db.runAccountingWork(ATTEMPT, 1, null);
       expect(run.status).toBe(status);
       expect(run.critical).toBeNull();
     }
+  });
+
+  it('returns the real head with zero counts for a stale bound call', async () => {
+    const { db } = accountingDb(
+      () =>
+        new Response(
+          JSON.stringify({
+            status: 'stale',
+            head: { order_id: 'order-test-4', work_generation: 5 },
+          }),
+          { status: 200 },
+        ),
+    );
+    const run = await db.runAccountingWork(ATTEMPT, 1, {
+      orderId: 'order-test-9',
+      workGeneration: 2,
+    });
+    expect(run.status).toBe('stale');
+    expect(run.head).toEqual({ orderId: 'order-test-4', workGeneration: 5 });
+    expect(run.counts.processed).toBe(0);
+    expect(run.counts.remaining).toBe(0);
+    expect(run.critical).toBeNull();
+  });
+
+  it('parses the next-work peek and rejects malformed ones', async () => {
+    const valid: Array<[unknown, unknown]> = [
+      [
+        {
+          status: 'ok',
+          head: { order_id: 'order-test-9', work_generation: 2 },
+        },
+        {
+          status: 'ok',
+          head: { orderId: 'order-test-9', workGeneration: 2 },
+        },
+      ],
+      [
+        { status: 'empty', head: null },
+        { status: 'empty', head: null },
+      ],
+      [{ status: 'not_activated' }, { status: 'not_activated', head: null }],
+    ];
+    for (const [body, expected] of valid) {
+      const { db } = accountingDb(
+        () => new Response(JSON.stringify(body), { status: 200 }),
+      );
+      await expect(db.getNextWork()).resolves.toEqual(expected);
+    }
+    const malformed: unknown[] = [
+      null,
+      [],
+      'ok',
+      { status: 'weird', head: null },
+      { status: 'ok' },
+      { status: 'ok', head: null },
+      {
+        status: 'empty',
+        head: { order_id: 'order-test-9', work_generation: 2 },
+      },
+      { status: 'ok', head: { order_id: 'bad id!', work_generation: 2 } },
+      { status: 'ok', head: { order_id: 'order-test-9', work_generation: 0 } },
+    ];
+    for (const body of malformed) {
+      const { db } = accountingDb(
+        () => new Response(JSON.stringify(body), { status: 200 }),
+      );
+      await expect(db.getNextWork()).rejects.toThrow(
+        /^Supabase RPC failed: unexpected response$/,
+      );
+    }
+  });
+
+  it('hides error bodies of the next-work peek', async () => {
+    const secret = 'pii-customer-name ya29.SECRET-DB';
+    const { db } = accountingDb(() => new Response(secret, { status: 500 }));
+    const error = await db.getNextWork().then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(SupabaseRpcError);
+    expect((error as Error).message).toBe('Supabase RPC failed: HTTP 500');
   });
 
   it('returns the critical order only with the critical status', async () => {
@@ -288,7 +398,7 @@ describe('accounting RPCs', () => {
           { status: 200 },
         ),
     );
-    const run = await db.runAccountingWork(ATTEMPT, 5);
+    const run = await db.runAccountingWork(ATTEMPT, 1, null);
     expect(run.status).toBe('critical');
     expect(run.critical).toEqual({
       orderId: 'order-test-7',
@@ -303,7 +413,7 @@ describe('accounting RPCs', () => {
       const { db: other } = accountingDb(
         () => new Response(JSON.stringify(body), { status: 200 }),
       );
-      await expect(other.runAccountingWork(ATTEMPT, 5)).rejects.toThrow(
+      await expect(other.runAccountingWork(ATTEMPT, 1, null)).rejects.toThrow(
         /^Supabase RPC failed: unexpected response$/,
       );
     }
@@ -326,7 +436,7 @@ describe('accounting RPCs', () => {
       const { db } = accountingDb(
         () => new Response(JSON.stringify(body), { status: 200 }),
       );
-      await expect(db.runAccountingWork(ATTEMPT, 5)).rejects.toThrow(
+      await expect(db.runAccountingWork(ATTEMPT, 1, null)).rejects.toThrow(
         /^Supabase RPC failed: unexpected response$/,
       );
     }
@@ -334,14 +444,14 @@ describe('accounting RPCs', () => {
       const { db } = accountingDb(
         () => new Response(JSON.stringify(body), { status: 200 }),
       );
-      await expect(db.recordAccountingCallFailure(ATTEMPT, 1)).rejects.toThrow(
-        /^Supabase RPC failed: unexpected response$/,
-      );
+      await expect(
+        db.recordAccountingCallFailure(ATTEMPT, 'order-test-9', 1),
+      ).rejects.toThrow(/^Supabase RPC failed: unexpected response$/);
     }
     const { db: notJson } = accountingDb(
       () => new Response('<html>', { status: 200 }),
     );
-    await expect(notJson.runAccountingWork(ATTEMPT, 5)).rejects.toThrow(
+    await expect(notJson.runAccountingWork(ATTEMPT, 1, null)).rejects.toThrow(
       /^Supabase RPC failed: unexpected response$/,
     );
   });
@@ -373,7 +483,7 @@ describe('accounting RPCs', () => {
       const { db } = accountingDb(
         () => new Response(item.body, { status: item.status }),
       );
-      const error = await db.runAccountingWork(ATTEMPT, 5).then(
+      const error = await db.runAccountingWork(ATTEMPT, 1, null).then(
         () => null,
         (caught: unknown) => caught,
       );
@@ -393,7 +503,7 @@ describe('accounting RPCs', () => {
         throw new TypeError('socket hang up ya29.SECRET');
       },
     );
-    const lostError = await lost.runAccountingWork(ATTEMPT, 5).then(
+    const lostError = await lost.runAccountingWork(ATTEMPT, 1, null).then(
       () => null,
       (caught: unknown) => caught,
     );
@@ -408,7 +518,7 @@ describe('accounting RPCs', () => {
       },
     );
     const timeoutError = await timeout
-      .recordAccountingCallFailure(ATTEMPT, 1)
+      .recordAccountingCallFailure(ATTEMPT, 'order-test-9', 1)
       .then(
         () => null,
         (caught: unknown) => caught,
@@ -431,10 +541,12 @@ describe('accounting RPCs', () => {
           },
         }) as unknown as Response,
     );
-    const unreadableError = await unreadable.runAccountingWork(ATTEMPT, 5).then(
-      () => null,
-      (caught: unknown) => caught,
-    );
+    const unreadableError = await unreadable
+      .runAccountingWork(ATTEMPT, 1, null)
+      .then(
+        () => null,
+        (caught: unknown) => caught,
+      );
     expect((unreadableError as Error).message).toBe(
       'Supabase RPC failed: unexpected response',
     );
@@ -447,6 +559,7 @@ describe('accounting RPCs', () => {
     );
     expect(Object.keys(db).sort()).toEqual([
       'finishRun',
+      'getNextWork',
       'ingest',
       'recordAccountingCallFailure',
       'runAccountingWork',

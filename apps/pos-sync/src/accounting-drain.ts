@@ -5,11 +5,15 @@ import {
   zeroAccountingCounts,
   type AccountingCounts,
   type AccountingDb,
+  type AccountingOrderRef,
   type FailureReport,
 } from './supabase-write.ts';
 
 export const DRAIN_BUDGET_MS = 60_000;
-export const DRAIN_BATCH_LIMIT = 5;
+// One order a call, so a call that fails without a reply belongs to the one
+// order it was bound to.
+export const DRAIN_BATCH_LIMIT = 1;
+const MAX_CONSECUTIVE_STALE = 3;
 
 export type DrainStop =
   | 'empty'
@@ -19,6 +23,7 @@ export type DrainStop =
   | 'critical'
   | 'order_failed'
   | 'call_failed'
+  | 'stale'
   | 'budget';
 
 export type DrainOutcome = {
@@ -32,30 +37,31 @@ export type DrainOutcome = {
 
 export type DrainOptions = {
   budgetMs: number;
-  limit: number;
   clock: () => number;
   newAttemptId: () => string;
 };
 
 const DEFAULTS: DrainOptions = {
   budgetMs: DRAIN_BUDGET_MS,
-  limit: DRAIN_BATCH_LIMIT,
   clock: () => Date.now(),
   newAttemptId: () => randomUUID(),
 };
 
-// Runs the accounting worker until it has nothing left, is blocked, fails, or
-// the time budget ends. A call that fails without a reply is reported once with
-// the attempt id the caller chose before the call. Never throws.
+// Runs the accounting worker, one order a call, until it has nothing left, is
+// blocked, fails, or the time budget ends. Each call is bound to the order the
+// previous reply named as next (the first from accounting_next_work). A call
+// that fails without a reply is reported once, with the attempt id chosen
+// before the call, naming only the order it was bound to. Never throws.
 export async function drainAccountingWork(
   db: AccountingDb,
   options: Partial<DrainOptions> = {},
 ): Promise<DrainOutcome> {
-  const { budgetMs, limit, clock, newAttemptId } = { ...DEFAULTS, ...options };
+  const { budgetMs, clock, newAttemptId } = { ...DEFAULTS, ...options };
   const started = clock();
   const counts = zeroAccountingCounts();
   let calls = 0;
-  let hint: number | null = null;
+  let stale = 0;
+  let binding: AccountingOrderRef | null;
   let criticalOrderId: string | null = null;
 
   const done = (
@@ -71,6 +77,16 @@ export async function drainAccountingWork(
     error,
   });
 
+  try {
+    const next = await db.getNextWork();
+    if (next.status === 'not_activated') {
+      return done('not_activated');
+    }
+    binding = next.head;
+  } catch (error) {
+    return done('call_failed', 'not_needed', safeErrorMessage(error));
+  }
+
   for (;;) {
     if (clock() - started >= budgetMs) {
       return done('budget');
@@ -79,10 +95,19 @@ export async function drainAccountingWork(
     calls += 1;
     let run;
     try {
-      run = await db.runAccountingWork(attemptId, limit);
+      run = await db.runAccountingWork(attemptId, DRAIN_BATCH_LIMIT, binding);
     } catch (error) {
-      return failedCall(db, attemptId, hint, error, done);
+      return failedCall(db, attemptId, binding, error, done);
     }
+    if (run.status === 'stale') {
+      stale += 1;
+      if (stale > MAX_CONSECUTIVE_STALE) {
+        return done('stale');
+      }
+      binding = run.head;
+      continue;
+    }
+    stale = 0;
     counts.processed += run.counts.processed;
     counts.applied += run.counts.applied;
     counts.unchanged += run.counts.unchanged;
@@ -92,7 +117,7 @@ export async function drainAccountingWork(
     counts.disposition_pending += run.counts.disposition_pending;
     counts.failed += run.counts.failed;
     counts.remaining = run.counts.remaining;
-    hint = run.head?.workGeneration ?? null;
+    binding = run.head;
     if (run.status === 'critical') {
       criticalOrderId = run.critical?.orderId ?? null;
       return done('critical');
@@ -109,7 +134,7 @@ export async function drainAccountingWork(
 async function failedCall(
   db: AccountingDb,
   attemptId: string,
-  hint: number | null,
+  binding: AccountingOrderRef | null,
   error: unknown,
   done: (
     stop: DrainStop,
@@ -118,11 +143,16 @@ async function failedCall(
   ) => DrainOutcome,
 ): Promise<DrainOutcome> {
   const message = safeErrorMessage(error);
-  if (!isUnknownOutcome(error)) {
+  // Without a bound order there is nothing a failure could be charged to.
+  if (binding === null || !isUnknownOutcome(error)) {
     return done('call_failed', 'not_needed', message);
   }
   try {
-    const report = await db.recordAccountingCallFailure(attemptId, hint);
+    const report = await db.recordAccountingCallFailure(
+      attemptId,
+      binding.orderId,
+      binding.workGeneration,
+    );
     return done('call_failed', report, message);
   } catch (reportError) {
     return done(
