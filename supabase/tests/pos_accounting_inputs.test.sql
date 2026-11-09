@@ -2903,6 +2903,96 @@ select
     'an omitted shift that spans a from cutoff is not transaction coverage'
   );
 
+-- An order can be mirrored before its shift parent. Every mirrored shift is
+-- presented here, so only the never-mirrored parent can deny coverage.
+insert into
+  app.pos_orders (
+    id,
+    shift_id,
+    status,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    version
+  )
+values
+  (
+    'order-no-parent',
+    'shift-never-mirrored',
+    'complete',
+    '2031-01-02T12:00:00Z',
+    10,
+    0,
+    0,
+    0,
+    0,
+    10,
+    '2031-01-02T12:00:00Z',
+    repeat('b', 64),
+    1
+  );
+
+insert into
+  input_runs (k, n)
+values
+  (
+    'noparent-from',
+    pg_temp.finished_run (
+      'window35',
+      (
+        select
+          array_agg(shift.id)
+        from
+          app.pos_shifts shift
+      ),
+      jsonb_build_object('from', '2031-01-01T10:00:00Z'::timestamptz)
+    )
+  ),
+  (
+    'noparent-all',
+    pg_temp.finished_run (
+      'full',
+      (
+        select
+          array_agg(shift.id)
+        from
+          app.pos_shifts shift
+      ),
+      jsonb_build_object('all', true)
+    )
+  );
+
+select
+  is (
+    (
+      select
+        array_agg(
+          cov.transactions_covered
+          order by
+            cov.run_id
+        )
+      from
+        app.pos_sync_coverage cov
+      where
+        cov.run_id in (
+          select
+            n
+          from
+            input_runs
+          where
+            k in ('noparent-from', 'noparent-all')
+        )
+    ),
+    array[false, false],
+    'an in-scope order whose shift was never mirrored is not transaction coverage'
+  );
+
 select
   *
 from

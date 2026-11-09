@@ -1171,33 +1171,50 @@ begin
     v_scope_shifts := coalesce(v_scope_shifts, '{}'::text[]);
     v_transactions := case
       when v_kind = 'shift_ids' then v_scope_shifts <@ v_presented
+      -- An order can be mirrored before its shift parent is, so required shift
+      -- ids come from the orders in scope as well as from the shift mirror.
       when v_kind = 'all' then not exists (
         select
           1
         from
-          app.pos_shifts shift
+          (
+            select
+              shift.id
+            from
+              app.pos_shifts shift
+            union
+            select
+              o.shift_id
+            from
+              app.pos_orders o
+            where
+              o.shift_id is not null
+          ) as required (id)
         where
-          shift.id <> all (v_presented)
+          required.id <> all (v_presented)
       )
       when v_kind = 'from' then not exists (
         select
           1
         from
-          app.pos_shifts shift
+          (
+            select
+              shift.id
+            from
+              app.pos_shifts shift
+            where
+              shift.opened_at >= v_from
+            union
+            select
+              o.shift_id
+            from
+              app.pos_orders o
+            where
+              o.ordered_at >= v_from
+              and o.shift_id is not null
+          ) as required (id)
         where
-          shift.id <> all (v_presented)
-          and (
-            shift.opened_at >= v_from
-            or exists (
-              select
-                1
-              from
-                app.pos_orders o
-              where
-                o.shift_id = shift.id
-                and o.ordered_at >= v_from
-            )
-          )
+          required.id <> all (v_presented)
       )
       when v_applied then false
       else pg_catalog.cardinality(v_presented) > 0
