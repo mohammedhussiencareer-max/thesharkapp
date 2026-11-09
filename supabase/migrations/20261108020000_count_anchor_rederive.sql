@@ -1090,11 +1090,19 @@ begin
   from
     ledger_scratch.recompute_row q;
 
+  -- Anchors are replay events too, so they count against the same cap.
   if (
     select
       count(*)
     from
       ledger_scratch.recompute_row
+  ) + (
+    select
+      count(*)
+    from
+      app.stock_count_anchors anchor
+    where
+      anchor.item_id = any (p_item_ids)
   ) > 100000 then
     perform app.raise_recompute_failure ('recompute_limit');
   end if;
@@ -1689,7 +1697,7 @@ exception
 end;
 $$;
 
-comment on function app.replay_execute (uuid[], jsonb, uuid, boolean) is 'Replays one component. Count lines are virtual anchors applied after ordinary events at the same instant. On write, settles count compensation and rebuilds balances. The 100000-row cap counts economic replay rows, not anchors.';
+comment on function app.replay_execute (uuid[], jsonb, uuid, boolean) is 'Replays one component. Count lines are virtual anchors applied after ordinary events at the same instant. On write, settles count compensation and rebuilds balances. The 100000-row cap counts economic replay rows and anchors together.';
 
 revoke all on function app.replay_execute (uuid[], jsonb, uuid, boolean)
 from

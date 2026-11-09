@@ -1667,6 +1667,17 @@ select
     'postings reject truncate'
   );
 
+-- A 100001-event component is too slow for this suite (see
+-- backdated_recompute.test.sql), so the cap's inputs are checked in the source.
+select
+  matches (
+    pg_catalog.pg_get_functiondef (
+      'app.replay_execute(uuid[],jsonb,uuid,boolean)'::regprocedure
+    ),
+    'ledger_scratch\.recompute_row\s+\)\s+\+\s+\(\s+select\s+count\(\*\)\s+from\s+app\.stock_count_anchors',
+    'the replay cap counts anchors together with replay rows'
+  );
+
 select
   *
 from
