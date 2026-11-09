@@ -1,5 +1,5 @@
 import { historySurplusWarning } from '@/counts/errors';
-import { formatFrequency } from '@/counts/format';
+import { formatFrequency, formatSignedMoney } from '@/counts/format';
 import type { CountRecord } from '@/counts/types';
 import { formatMoneyText } from '@/purchases/decimal';
 import { formatCairoDateTime } from '@/purchases/time';
@@ -20,6 +20,9 @@ export function CountList({ counts }: { counts: readonly CountRecord[] }) {
           <p>{`الأصناف ${count.itemCount}`}</p>
           <p>{`عجز ${formatMoneyText(count.shortageValue)}`}</p>
           <p>{`زيادة ${formatMoneyText(count.surplusValue)}`}</p>
+          <p>{`فرق التعديل ${formatSignedMoney(count.revisedDifference)}`}</p>
+          <p>{`مجموع التعويض ${formatSignedMoney(count.compensatorSum)}`}</p>
+          {count.hasCompensator ? <p>معدّل</p> : null}
           {count.hasSurplus ? <p>{historySurplusWarning}</p> : null}
           {count.note ? <p>{count.note}</p> : null}
         </article>

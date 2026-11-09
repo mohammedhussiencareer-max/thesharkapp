@@ -265,6 +265,9 @@ describe('counts api', () => {
           shortage_value_text: '10.00',
           surplus_value_text: '0.00',
           has_surplus: false,
+          revised_difference_text: '0.00',
+          compensator_sum_text: '0.00',
+          has_compensator: false,
         },
         {
           id: 'newer',
@@ -276,6 +279,9 @@ describe('counts api', () => {
           shortage_value_text: '240.00',
           surplus_value_text: '50.00',
           has_surplus: true,
+          revised_difference_text: '20.00',
+          compensator_sum_text: '20.00',
+          has_compensator: true,
         },
       ],
       error: null,
@@ -289,12 +295,17 @@ describe('counts api', () => {
       { column: 'id', ascending: true },
     ]);
     expect(String(built.captured.select)).toContain('shortage_value::text');
+    expect(String(built.captured.select)).toContain('revised_difference::text');
+    expect(String(built.captured.select)).toContain('compensator_sum::text');
     expect(counts.map((row) => row.id)).toEqual(['newer', 'older']);
     expect(counts[0]).toMatchObject({
       frequency: 'weekly',
       shortageValue: '240.00',
       surplusValue: '50.00',
       hasSurplus: true,
+      revisedDifference: '20.00',
+      compensatorSum: '20.00',
+      hasCompensator: true,
       note: 'صباح',
     });
   });

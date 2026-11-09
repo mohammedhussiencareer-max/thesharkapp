@@ -69,6 +69,9 @@ function countRow(id: string, note: string | null = 'جرد الصباح'): Coun
     shortageValue: '150.00',
     surplusValue: '0.00',
     hasSurplus: false,
+    revisedDifference: '0.00',
+    compensatorSum: '0.00',
+    hasCompensator: false,
   };
 }
 
@@ -140,8 +143,28 @@ describe('CountsPage', () => {
       await screen.findByRole('article', { name: 'جرد الصباح' }),
     ).toBeInTheDocument();
     expect(screen.getByText('عجز 150.00 ج.م')).toBeInTheDocument();
+    expect(screen.getByText('فرق التعديل 0.00 ج.م')).toBeInTheDocument();
+    expect(screen.getByText('مجموع التعويض 0.00 ج.م')).toBeInTheDocument();
+    expect(screen.queryByText('معدّل')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'تحديث' })).toBeEnabled();
+  });
+
+  it('labels a count معدّل when a compensator exists', async () => {
+    vi.mocked(listCounts).mockResolvedValue([
+      {
+        ...countRow('revised'),
+        revisedDifference: '200.00',
+        compensatorSum: '200.00',
+        hasCompensator: true,
+      },
+    ]);
+    await renderPage();
+    const card = await screen.findByRole('article', { name: 'جرد الصباح' });
+    expect(card).toHaveTextContent('عجز 150.00 ج.م');
+    expect(card).toHaveTextContent('فرق التعديل 200.00 ج.م');
+    expect(card).toHaveTextContent('مجموع التعويض 200.00 ج.م');
+    expect(card).toHaveTextContent('معدّل');
   });
 
   it('keeps the request id across a failed save and mints a new one after success', async () => {

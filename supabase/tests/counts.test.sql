@@ -3104,16 +3104,14 @@ select
   );
 
 select
-  throws_ok (
+  lives_ok (
     $$select app.post_movements(jsonb_build_array(jsonb_build_object(
       'item_id', 'c1900000-0000-4000-8000-000000000008',
       'movement_type', 'waste',
       'occurred_at', '2026-10-22T09:00:00Z',
       'quantity', '1'
     )))$$,
-    'P0001',
-    'back-dated movement not supported yet',
-    'a loss before a later matching count is refused'
+    'a loss before a later matching count is compensated back to the observation'
   );
 
 select
@@ -3122,7 +3120,7 @@ select
       from app.item_balances
       where item_id = 'c1900000-0000-4000-8000-000000000008'$$,
     $$values (10::numeric(20, 6), '2026-10-22T10:00:00Z'::timestamptz + interval '1 microsecond')$$,
-    'the refused loss leaves the counted quantity and the watermark'
+    'the compensated loss leaves the counted quantity and the watermark'
   );
 
 -- An item with no movements still gets a balance row from the lock. Counting
@@ -3157,24 +3155,40 @@ select
   );
 
 select
-  throws_ok (
+  lives_ok (
     $$select app.post_movements(jsonb_build_array(jsonb_build_object(
       'item_id', 'c1900000-0000-4000-8000-000000000009',
       'movement_type', 'waste',
       'occurred_at', '2026-10-22T09:00:00Z',
       'quantity', '1'
     )))$$,
-    'P0001',
-    'back-dated movement not supported yet',
-    'a movement before a zero count of a never-moved item is refused'
+    'a movement before a zero count of a never-moved item is compensated'
   );
 
 select
-  is_empty (
-    $$select id
+  results_eq (
+    $$select movement_type::text, quantity, total_cost
       from app.stock_movements
-      where item_id = 'c1900000-0000-4000-8000-000000000009'$$,
-    'the zero count and the refused movement post nothing'
+      where item_id = 'c1900000-0000-4000-8000-000000000009'
+      order by movement_type::text$$,
+    $$values
+      ('count_compensation'::text, 1::numeric(20, 6), 0::numeric(14, 2)),
+      ('waste'::text, -1::numeric(20, 6), 0::numeric(14, 2))$$,
+    'the waste is kept and a compensator restores the zero observation'
+  );
+
+select
+  is (
+    (
+      select
+        on_hand_qty
+      from
+        app.item_balances
+      where
+        item_id = 'c1900000-0000-4000-8000-000000000009'
+    ),
+    0::numeric(20, 6),
+    'on-hand after the zero anchor stays the observed zero'
   );
 
 -- Equal-time barrier. Opening 10, count 9, then a sale at exactly counted_at
@@ -3446,16 +3460,14 @@ select
   );
 
 select
-  throws_ok (
+  lives_ok (
     $$select app.post_movements(jsonb_build_array(jsonb_build_object(
       'item_id', 'c1900000-0000-4000-8000-000000000010',
       'movement_type', 'sale',
       'occurred_at', '2026-10-22T10:00:00Z',
       'quantity', '1'
     )))$$,
-    'P0001',
-    'back-dated movement not supported yet',
-    'a late sale at exactly the count time is refused'
+    'a sale at exactly the count time is compensated and the observation stays'
   );
 
 select
@@ -3467,7 +3479,7 @@ select
       9::numeric(20, 6),
       '2026-10-22T10:00:00Z'::timestamptz + interval '1 microsecond'
     )$$,
-    'the refused sale leaves the counted quantity and the watermark just after the count'
+    'the compensated sale leaves the counted quantity and the watermark just after the count'
   );
 
 -- A newer ok run with no finish cannot prove coverage, even though it started
@@ -3741,9 +3753,9 @@ select
 select
   throws_ok (
     $$truncate app.stock_count_lines$$,
-    '55000',
-    'app.stock_count_lines is append-only; TRUNCATE is not allowed',
-    'append-only trigger blocks count line truncate'
+    '0A000',
+    'cannot truncate a table referenced in a foreign key constraint',
+    'an anchor reference blocks count line truncate before the append-only trigger'
   );
 
 select
