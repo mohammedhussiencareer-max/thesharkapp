@@ -378,6 +378,62 @@ describe('accounting RPCs', () => {
     }
   });
 
+  it('accepts every order id that ingest accepts and rejects unsafe ones', async () => {
+    const valid = ['order.v2', 'o'.repeat(129), 'o'.repeat(1500), 'a-b_c.d~e'];
+    const invalid = [
+      '',
+      'o'.repeat(1501),
+      'a/b',
+      'a b',
+      '..',
+      'a..b',
+      'a%2Fb',
+      'a:b',
+      'a?b',
+      'a#b',
+      'a\\b',
+      'a\nb',
+    ];
+    const bodies = (id: string): Array<[unknown, 'next' | 'run']> => [
+      [{ status: 'ok', head: { order_id: id, work_generation: 1 } }, 'next'],
+      [{ ...processedBody, head: { order_id: id, work_generation: 1 } }, 'run'],
+      [{ status: 'stale', head: { order_id: id, work_generation: 1 } }, 'run'],
+      [
+        {
+          ...processedBody,
+          status: 'critical',
+          critical: { order_id: id, work_generation: 1 },
+        },
+        'run',
+      ],
+    ];
+    const call = (
+      db: ReturnType<typeof accountingDb>['db'],
+      kind: 'next' | 'run',
+    ) =>
+      kind === 'next'
+        ? db.getNextWork()
+        : db.runAccountingWork(ATTEMPT, 1, null);
+    for (const id of valid) {
+      for (const [body, kind] of bodies(id)) {
+        const { db } = accountingDb(
+          () => new Response(JSON.stringify(body), { status: 200 }),
+        );
+        await expect(call(db, kind)).resolves.toBeDefined();
+      }
+    }
+    for (const id of invalid) {
+      for (const [body, kind] of bodies(id)) {
+        const { db } = accountingDb(
+          () => new Response(JSON.stringify(body), { status: 200 }),
+        );
+        await expect(call(db, kind)).rejects.toThrow(
+          /^Supabase RPC failed: unexpected response$/,
+        );
+      }
+    }
+  });
+
   it('hides error bodies of the next-work peek', async () => {
     const secret = 'pii-customer-name ya29.SECRET-DB';
     const { db } = accountingDb(() => new Response(secret, { status: 500 }));

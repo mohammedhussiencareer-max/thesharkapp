@@ -14,6 +14,10 @@ export const DRAIN_BUDGET_MS = 60_000;
 // order it was bound to.
 export const DRAIN_BATCH_LIMIT = 1;
 const MAX_CONSECUTIVE_STALE = 3;
+// Waits before each repeat of a failure report the ledger lock turned away.
+export const RECORDER_BACKOFF_MS: readonly number[] = [
+  250, 500, 1_000, 2_000, 4_000,
+];
 
 export type DrainStop =
   | 'empty'
@@ -39,12 +43,18 @@ export type DrainOptions = {
   budgetMs: number;
   clock: () => number;
   newAttemptId: () => string;
+  sleep: (ms: number) => Promise<void>;
 };
 
 const DEFAULTS: DrainOptions = {
   budgetMs: DRAIN_BUDGET_MS,
   clock: () => Date.now(),
   newAttemptId: () => randomUUID(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+type Pacing = Pick<DrainOptions, 'budgetMs' | 'clock' | 'sleep'> & {
+  started: number;
 };
 
 // Runs the accounting worker, one order a call, until it has nothing left, is
@@ -54,13 +64,20 @@ const DEFAULTS: DrainOptions = {
 // spans and returns the head, which the next call is bound to; an unbound call
 // processes no order, so it has nothing a failure could be charged to. A call
 // that fails without a reply is reported once, with the attempt id chosen
-// before the call, naming only the order it was bound to. Never throws.
+// before the call, naming only the order it was bound to. A report the ledger
+// lock turns away (busy) is repeated with that same attempt id after a growing
+// pause, while the budget lasts, so contention cannot lose the attempt. Never
+// throws.
 export async function drainAccountingWork(
   db: AccountingDb,
   options: Partial<DrainOptions> = {},
 ): Promise<DrainOutcome> {
-  const { budgetMs, clock, newAttemptId } = { ...DEFAULTS, ...options };
+  const { budgetMs, clock, newAttemptId, sleep } = {
+    ...DEFAULTS,
+    ...options,
+  };
   const started = clock();
+  const pacing: Pacing = { budgetMs, clock, sleep, started };
   const counts = zeroAccountingCounts();
   let calls = 0;
   let stale = 0;
@@ -100,7 +117,7 @@ export async function drainAccountingWork(
     try {
       run = await db.runAccountingWork(attemptId, DRAIN_BATCH_LIMIT, binding);
     } catch (error) {
-      return failedCall(db, attemptId, binding, error, done);
+      return failedCall(db, attemptId, binding, error, pacing, done);
     }
     if (run.status === 'stale') {
       stale += 1;
@@ -139,6 +156,7 @@ async function failedCall(
   attemptId: string,
   binding: AccountingOrderRef | null,
   error: unknown,
+  pacing: Pacing,
   done: (
     stop: DrainStop,
     report?: DrainOutcome['report'],
@@ -151,11 +169,23 @@ async function failedCall(
     return done('call_failed', 'not_needed', message);
   }
   try {
-    const report = await db.recordAccountingCallFailure(
+    let report = await db.recordAccountingCallFailure(
       attemptId,
       binding.orderId,
       binding.workGeneration,
     );
+    for (const pause of RECORDER_BACKOFF_MS) {
+      const { clock, started, budgetMs, sleep } = pacing;
+      if (report !== 'busy' || clock() - started + pause > budgetMs) {
+        break;
+      }
+      await sleep(pause);
+      report = await db.recordAccountingCallFailure(
+        attemptId,
+        binding.orderId,
+        binding.workGeneration,
+      );
+    }
     return done('call_failed', report, message);
   } catch (reportError) {
     return done(

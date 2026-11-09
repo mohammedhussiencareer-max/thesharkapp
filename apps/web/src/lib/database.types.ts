@@ -2067,6 +2067,11 @@ isOneToOne: false
 "replay_component":
 { Args: { "p_cause": string,"p_item_ids": (string)[],"p_pending": Json,"p_write": boolean }; Returns: undefined
                            },
+"replay_components":
+{ Args: { "p_item_ids": (string)[] }; Returns: {
+              "member_ids": (string)[]
+            }[]
+                           },
 "replay_execute":
 { Args: { "p_cause": string,"p_item_ids": (string)[],"p_pending": Json,"p_write": boolean }; Returns: undefined
                            },

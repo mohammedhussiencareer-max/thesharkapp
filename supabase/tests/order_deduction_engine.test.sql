@@ -4191,6 +4191,387 @@ select
   );
 
 -- ---------------------------------------------------------------------------
+-- Unrelated histories are replayed as separate components (design 8.5). The
+-- 100000-row cap is per replay, so the proxy for it is the item set every
+-- replay loads, logged when the scratch table is next truncated.
+-- ---------------------------------------------------------------------------
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    parent_item_id
+  )
+values
+  (
+    'a5400000-0000-4000-8000-00000000000c',
+    'p54-comp-x',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'a5400000-0000-4000-8000-00000000000d',
+    'p54-comp-y',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'a5400000-0000-4000-8000-00000000000e',
+    'p54-comp-mix',
+    'fish_mixed',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'a5400000-0000-4000-8000-00000000000f',
+    'p54-comp-size',
+    'fish_size',
+    'kg',
+    'daily',
+    0,
+    'a5400000-0000-4000-8000-00000000000e'
+  );
+
+insert into
+  app.item_loss_versions (
+    effective_from,
+    created_change_id,
+    item_id,
+    loss_pct
+  )
+select
+  '2000-01-01 00:00:00+00',
+  (
+    select
+      id
+    from
+      app.costing_changes
+    where
+      request_id = 'a5400000-0000-4000-8000-0000000000c0'
+  ),
+  i.id,
+  0
+from
+  app.stock_items i
+where
+  i.name like 'p54-comp-%';
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.replay_components (
+          array[
+            'a5400000-0000-4000-8000-00000000000d',
+            'a5400000-0000-4000-8000-00000000000c'
+          ]::uuid[]
+        )
+    ),
+    2::bigint,
+    'two unrelated items are two components'
+  );
+
+select
+  results_eq (
+    $$select member_ids from app.replay_components(array[
+        'a5400000-0000-4000-8000-00000000000d',
+        'a5400000-0000-4000-8000-00000000000c',
+        'a5400000-0000-4000-8000-00000000000c']::uuid[])$$,
+    $$values (array['a5400000-0000-4000-8000-00000000000c']::uuid[]),
+             (array['a5400000-0000-4000-8000-00000000000d']::uuid[])$$,
+    'components come in ascending order of their lowest item, each item once'
+  );
+
+select
+  results_eq (
+    $$select member_ids from app.replay_components(array[
+        'a5400000-0000-4000-8000-00000000000f',
+        'a5400000-0000-4000-8000-00000000000d',
+        'a5400000-0000-4000-8000-00000000000e',
+        'a5400000-0000-4000-8000-00000000000c']::uuid[])$$,
+    $$values (array['a5400000-0000-4000-8000-00000000000c']::uuid[]),
+             (array['a5400000-0000-4000-8000-00000000000d']::uuid[]),
+             (array['a5400000-0000-4000-8000-00000000000e',
+                    'a5400000-0000-4000-8000-00000000000f']::uuid[])$$,
+    'a mixed fish and its size item stay one component'
+  );
+
+select
+  is_empty (
+    $$select 1 from app.replay_components(array[null, null]::uuid[])$$,
+    'no item, no component'
+  );
+
+select
+  is_empty (
+    $$select 1 from app.replay_components(null)$$,
+    'a missing list has no component'
+  );
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(
+      jsonb_build_object('item_id', 'a5400000-0000-4000-8000-00000000000c', 'movement_type', 'opening',
+        'occurred_at', '2030-08-01T08:00:00Z', 'quantity', 100, 'unit_cost', 10),
+      jsonb_build_object('item_id', 'a5400000-0000-4000-8000-00000000000d', 'movement_type', 'opening',
+        'occurred_at', '2030-08-01T08:00:00Z', 'quantity', 100, 'unit_cost', 20),
+      jsonb_build_object('item_id', 'a5400000-0000-4000-8000-00000000000e', 'movement_type', 'opening',
+        'occurred_at', '2030-08-01T08:00:00Z', 'quantity', 100, 'unit_cost', 30),
+      jsonb_build_object('item_id', 'a5400000-0000-4000-8000-00000000000f', 'movement_type', 'opening',
+        'occurred_at', '2030-08-01T08:00:00Z', 'quantity', 100, 'unit_cost', 40)
+    ))$$,
+    'the four stock items open'
+  );
+
+select
+  pg_temp.policies ('pos-cx');
+
+select
+  pg_temp.policies ('pos-cy');
+
+select
+  pg_temp.policies ('pos-cz');
+
+select
+  pg_temp.map_stock (
+    'pos-cx',
+    'a5400000-0000-4000-8000-00000000000c',
+    '1',
+    '2030-01-01T00:00:00Z'
+  );
+
+select
+  pg_temp.map_stock (
+    'pos-cy',
+    'a5400000-0000-4000-8000-00000000000d',
+    '1',
+    '2030-01-01T00:00:00Z'
+  );
+
+select
+  pg_temp.map_stock (
+    'pos-cz',
+    'a5400000-0000-4000-8000-00000000000f',
+    '1',
+    '2030-01-01T00:00:00Z'
+  );
+
+select
+  is (
+    pg_temp.drain () ->> 'status',
+    'empty',
+    'the new mappings drain'
+  );
+
+create table public.p54_replay_log (n serial primary key, items uuid[] not null);
+
+create function public.p54_log_replay () returns trigger language plpgsql as $$
+begin
+  insert into public.p54_replay_log (items)
+  select coalesce(array_agg(distinct r.item_id order by r.item_id), '{}')
+  from ledger_scratch.recompute_row r;
+
+  return null;
+end;
+$$;
+
+create trigger p54_log_replay
+before truncate on ledger_scratch.recompute_row for each statement
+execute function public.p54_log_replay ();
+
+truncate ledger_scratch.recompute_row;
+
+delete from public.p54_replay_log;
+
+select
+  pg_temp.mk_order (
+    'o-comp-1',
+    'shift-e1',
+    'complete',
+    'hall',
+    '2030-08-01T10:00:00Z',
+    'pos-cx',
+    2,
+    'pos-cy',
+    3
+  );
+
+select
+  is (
+    (pg_temp.drain () ->> 'applied')::integer,
+    1,
+    'an order that consumes two unrelated items is posted'
+  );
+
+truncate ledger_scratch.recompute_row;
+
+select
+  is (
+    pg_temp.net_qty (
+      'o-comp-1',
+      'a5400000-0000-4000-8000-00000000000c'
+    ),
+    -2::numeric,
+    'the first item is taken in full'
+  );
+
+select
+  is (
+    pg_temp.net_qty (
+      'o-comp-1',
+      'a5400000-0000-4000-8000-00000000000d'
+    ),
+    -3::numeric,
+    'the second item is taken in full'
+  );
+
+select
+  is_empty (
+    $$select n from public.p54_replay_log
+      where items @> array['a5400000-0000-4000-8000-00000000000c']::uuid[]
+        and items @> array['a5400000-0000-4000-8000-00000000000d']::uuid[]$$,
+    'posting never replays the two unrelated items together'
+  );
+
+select
+  results_eq (
+    $$select count(*) filter (where items = array['a5400000-0000-4000-8000-00000000000c']::uuid[]),
+             count(*) filter (where items = array['a5400000-0000-4000-8000-00000000000d']::uuid[])
+      from public.p54_replay_log$$,
+    $$values (2::bigint, 2::bigint)$$,
+    'each item is valued and then confirmed in a replay of its own'
+  );
+
+select
+  ok (
+    (
+      select
+        min(m.id)
+      from
+        app.stock_movements m
+      where
+        m.item_id = 'a5400000-0000-4000-8000-00000000000c'
+        and m.source_type = 'engine'
+    ) < (
+      select
+        min(m.id)
+      from
+        app.stock_movements m
+      where
+        m.item_id = 'a5400000-0000-4000-8000-00000000000d'
+        and m.source_type = 'engine'
+    ),
+    'components are posted in ascending order of their lowest item'
+  );
+
+delete from public.p54_replay_log;
+
+select
+  pg_temp.edit_order ('o-comp-1', 4, null);
+
+select
+  is (
+    (pg_temp.drain () ->> 'applied')::integer,
+    1,
+    'the edited order is retired and posted again'
+  );
+
+truncate ledger_scratch.recompute_row;
+
+select
+  is_empty (
+    $$select n from public.p54_replay_log
+      where items @> array['a5400000-0000-4000-8000-00000000000c']::uuid[]
+        and items @> array['a5400000-0000-4000-8000-00000000000d']::uuid[]$$,
+    'retirement and reposting never replay the two unrelated items together'
+  );
+
+select
+  results_eq (
+    $$select count(*) filter (where items = array['a5400000-0000-4000-8000-00000000000c']::uuid[]),
+             count(*) filter (where items = array['a5400000-0000-4000-8000-00000000000d']::uuid[])
+      from public.p54_replay_log$$,
+    $$values (3::bigint, 3::bigint)$$,
+    'each item is replayed once to retire and twice to post'
+  );
+
+select
+  results_eq (
+    $$select pg_temp.net_qty('o-comp-1', 'a5400000-0000-4000-8000-00000000000c'),
+             pg_temp.net_qty('o-comp-1', 'a5400000-0000-4000-8000-00000000000d')$$,
+    $$values (-4::numeric, -4::numeric)$$,
+    'only the new quantities are left on the ledger'
+  );
+
+delete from public.p54_replay_log;
+
+select
+  pg_temp.mk_order (
+    'o-comp-2',
+    'shift-e1',
+    'complete',
+    'hall',
+    '2030-08-01T11:00:00Z',
+    'pos-cx',
+    1,
+    'pos-cz',
+    1
+  );
+
+select
+  is (
+    (pg_temp.drain () ->> 'applied')::integer,
+    1,
+    'an order that consumes a size item and an unrelated item is posted'
+  );
+
+truncate ledger_scratch.recompute_row;
+
+select
+  is_empty (
+    $$select n from public.p54_replay_log
+      where items && array['a5400000-0000-4000-8000-00000000000c']::uuid[]
+        and items && array['a5400000-0000-4000-8000-00000000000e',
+                           'a5400000-0000-4000-8000-00000000000f']::uuid[]$$,
+    'the unrelated item is never replayed with the mixed fish family'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        public.p54_replay_log
+      where
+        items @> array[
+          'a5400000-0000-4000-8000-00000000000e',
+          'a5400000-0000-4000-8000-00000000000f'
+        ]::uuid[]
+    ),
+    'the size item is replayed together with its mixed fish'
+  );
+
+drop trigger p54_log_replay on ledger_scratch.recompute_row;
+
+drop table public.p54_replay_log;
+
+drop function public.p54_log_replay ();
+
+-- ---------------------------------------------------------------------------
 -- Privileges and RLS.
 -- ---------------------------------------------------------------------------
 select

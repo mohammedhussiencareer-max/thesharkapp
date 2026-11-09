@@ -2574,6 +2574,596 @@ from
   service_role;
 
 -- ============================================================================
+-- 9a. Replay components. The 100000-row replay cap is per connected component,
+-- so unrelated histories that one order happens to consume are replayed one at
+-- a time. Sorting connectivity (both directions, transitive batches) is the
+-- unchanged app.recompute_item_set.
+-- ============================================================================
+create function app.replay_components (p_item_ids uuid[]) returns table (member_ids uuid[]) language plpgsql stable security definer
+set
+  search_path = '' as $$
+declare
+  v_left uuid[];
+  v_closure uuid[];
+begin
+  select
+    coalesce(
+      pg_catalog.array_agg(
+        distinct t.item_id
+        order by
+          t.item_id
+      ),
+      '{}'::uuid[]
+    )
+  into v_left
+  from
+    pg_catalog.unnest(p_item_ids) as t (item_id)
+  where
+    t.item_id is not null;
+
+  while coalesce(pg_catalog.cardinality (v_left), 0) > 0 loop
+    v_closure := app.recompute_item_set (array[v_left[1]]);
+
+    select
+      coalesce(
+        pg_catalog.array_agg(
+          t.item_id
+          order by
+            t.item_id
+        ) filter (
+          where
+            t.item_id = any (v_closure)
+        ),
+        '{}'::uuid[]
+      ),
+      coalesce(
+        pg_catalog.array_agg(
+          t.item_id
+          order by
+            t.item_id
+        ) filter (
+          where
+            t.item_id <> all (v_closure)
+        ),
+        '{}'::uuid[]
+      )
+    into member_ids,
+    v_left
+    from
+      pg_catalog.unnest(v_left) as t (item_id);
+
+    return next;
+  end loop;
+end;
+$$;
+
+comment on function app.replay_components (uuid[]) is 'Splits the given items into the connected components app.recompute_item_set would replay, one row per component, each holding only the given items that belong to it. Ordered by the lowest item id of each component, so the order is stable. Private.';
+
+revoke all on function app.replay_components (uuid[])
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+-- retire_movements, based on its only definition (20261108010000_outflow_reversals).
+-- Only the closing replay changes: each component of the affected items is
+-- replayed on its own instead of their union.
+create or replace function app.retire_movements (p_movement_ids bigint[], p_cause uuid) returns bigint[] language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_id bigint;
+  v_new bigint;
+  v_ids bigint[] := '{}'::bigint[];
+  v_items uuid[];
+  v_item uuid;
+  v_type app.movement_type;
+  v_rev_type app.movement_type;
+  v_qty numeric(20, 6);
+  v_total numeric(14, 2);
+  v_unit numeric(20, 6);
+  v_adj numeric(14, 2);
+  v_adj_unit numeric(20, 6);
+  v_at timestamptz;
+  v_shift text;
+  v_prov boolean;
+  v_event bigint;
+  v_piece integer;
+  v_rev_total numeric(14, 2);
+  v_rev_unit numeric(20, 6);
+  v_resolved text;
+  v_comp record;
+begin
+  perform app.assert_ledger_lock_held ();
+
+  if p_cause is null then
+    raise exception 'cause batch is required'
+      using errcode = '22023';
+  end if;
+
+  if p_movement_ids is null
+  or coalesce(pg_catalog.array_length(p_movement_ids, 1), 0) = 0
+  or exists (
+    select
+      1
+    from
+      pg_catalog.unnest (p_movement_ids) as listed (id)
+    where
+      listed.id is null
+  ) then
+    raise exception 'movement ids are required'
+      using errcode = '22023';
+  end if;
+
+  if (
+    select
+      count(*)
+    from
+      pg_catalog.unnest (p_movement_ids) as listed (id)
+  ) is distinct from (
+    select
+      count(distinct listed.id)
+    from
+      pg_catalog.unnest (p_movement_ids) as listed (id)
+  ) then
+    raise exception 'duplicate movement id'
+      using errcode = '22023';
+  end if;
+
+  lock table app.pos_shifts in share mode;
+
+  if (
+    select
+      count(*)
+    from
+      app.stock_movements sm
+    where
+      sm.id = any (p_movement_ids)
+  ) is distinct from coalesce(pg_catalog.array_length(p_movement_ids, 1), 0) then
+    raise exception 'unknown movement'
+      using errcode = '22023';
+  end if;
+
+  select
+    coalesce(
+      pg_catalog.array_agg(
+        distinct sm.item_id
+        order by
+          sm.item_id
+      ),
+      '{}'::uuid[]
+    )
+  into v_items
+  from
+    app.stock_movements sm
+  where
+    sm.id = any (p_movement_ids);
+
+  perform app.prepare_balance_locks (app.recompute_item_set (v_items));
+
+  for v_id in
+    select
+      sm.id
+    from
+      app.stock_movements sm
+    where
+      sm.id = any (p_movement_ids)
+    order by
+      sm.id
+  loop
+    select
+      sm.item_id,
+      sm.movement_type,
+      sm.quantity,
+      sm.total_cost,
+      sm.unit_cost,
+      sm.occurred_at,
+      sm.shift_id,
+      sm.is_provisional,
+      sm.event_position,
+      sm.piece_position
+    into
+      v_item,
+      v_type,
+      v_qty,
+      v_total,
+      v_unit,
+      v_at,
+      v_shift,
+      v_prov,
+      v_event,
+      v_piece
+    from
+      app.stock_movements sm
+    where
+      sm.id = v_id
+    for share;
+
+    if v_type = 'sale' then
+      v_rev_type := 'sale_reversal';
+    elsif v_type = 'waste' then
+      v_rev_type := 'waste_reversal';
+    else
+      raise exception 'only a sale or waste movement can be reversed'
+        using errcode = '22023';
+    end if;
+
+    if exists (
+      select
+        1
+      from
+        app.stock_movements rev
+      where
+        rev.reverses_movement_id = v_id
+    ) then
+      raise exception 'movement is already reversed'
+        using errcode = '22023';
+    end if;
+
+    select
+      coalesce(sum(ca.total_cost), 0),
+      coalesce(sum(ca.unit_cost), 0)
+    into
+      v_adj,
+      v_adj_unit
+    from
+      app.stock_movements ca
+    where
+      ca.adjusts_movement_id = v_id
+      and ca.movement_type = 'cost_adjustment';
+
+    v_rev_total := app.assert_recompute_range (-(v_total + v_adj), 2, true);
+    v_rev_unit := app.assert_recompute_range (v_unit + v_adj_unit, 6, true);
+
+    -- Pin the target's shift attribution before copying it, so a later
+    -- boundary change cannot give the reversal a different shift.
+    if v_shift is null
+    and not exists (
+      select
+        1
+      from
+        app.movement_attributions ma
+      where
+        ma.movement_id = v_id
+    ) then
+      perform app.shift_for_target (v_id);
+    end if;
+
+    insert into
+      app.stock_movements (
+        batch_id,
+        item_id,
+        movement_type,
+        occurred_at,
+        quantity,
+        unit_cost,
+        total_cost,
+        is_provisional,
+        shift_id,
+        source_type,
+        source_id,
+        reverses_movement_id,
+        event_position,
+        piece_position,
+        engine_valued
+      )
+    values
+      (
+        p_cause,
+        v_item,
+        v_rev_type,
+        v_at,
+        -v_qty,
+        v_rev_unit,
+        v_rev_total,
+        v_prov,
+        v_shift,
+        'reversal',
+        v_id::text,
+        v_id,
+        v_event,
+        v_piece,
+        false
+      )
+    returning
+      id into v_new;
+
+    insert into
+      app.movement_attributions (movement_id, shift_id)
+    select
+      v_new,
+      ma.shift_id
+    from
+      app.movement_attributions ma
+    where
+      ma.movement_id = v_id
+      and not exists (
+        select
+          1
+        from
+          app.movement_attributions existing
+        where
+          existing.movement_id = v_new
+      );
+
+    v_resolved := app.shift_for_target (v_new);
+
+    -- One revision for the reversal itself. Replay does not see the pair, so
+    -- the generic adjustment loop does not note it again.
+    perform app.note_period_revision (
+      v_new,
+      v_resolved,
+      app.profit_bucket (v_rev_type),
+      v_rev_total,
+      v_item,
+      p_cause
+    );
+
+    v_ids := v_ids || v_new;
+  end loop;
+
+  for v_comp in
+    select
+      c.member_ids
+    from
+      app.replay_components (v_items) c
+  loop
+    perform app.replay_component (v_comp.member_ids, '[]'::jsonb, p_cause, true);
+  end loop;
+
+  return v_ids;
+end;
+$$;
+
+comment on function app.retire_movements (bigint[], uuid) is 'Appends one exact inverse per target, then replays each connected component of the affected items on its own, in a stable order, through app.replay_component. Caller holds the ledger lock. Private.';
+
+-- post_engine_outflows, based on its only definition (20261108010000_outflow_reversals).
+-- Only the replays change: each component of the items on the lines is valued,
+-- posted and confirmed on its own, one after the other, in the calling transaction.
+create or replace function app.post_engine_outflows (p_lines jsonb) returns uuid language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_batch uuid;
+  v_elem jsonb;
+  v_item uuid;
+  v_type text;
+  v_at timestamptz;
+  v_qty numeric;
+  v_shift text;
+  v_source text;
+  v_note text;
+  v_event bigint;
+  v_n integer := 0;
+  v_items uuid[] := '{}'::uuid[];
+  v_times timestamptz[] := '{}'::timestamptz[];
+  v_types text[] := '{}'::text[];
+  v_pending jsonb := '[]'::jsonb;
+  v_line jsonb;
+  v_posted record;
+  v_comp record;
+  v_comp_pending jsonb;
+begin
+  perform app.assert_ledger_lock_held ();
+
+  lock table app.pos_shifts in share mode;
+
+  if p_lines is null
+  or pg_catalog.jsonb_typeof(p_lines) <> 'array'
+  or pg_catalog.jsonb_array_length(p_lines) = 0 then
+    raise exception 'p_lines must be a non-empty jsonb array'
+      using errcode = '22023';
+  end if;
+
+  v_batch := pg_catalog.gen_random_uuid ();
+
+  for v_elem in
+    select
+      elem.value
+    from
+      pg_catalog.jsonb_array_elements(p_lines) as elem (value)
+  loop
+    if pg_catalog.jsonb_typeof(v_elem) <> 'object' then
+      raise exception 'each outflow line must be a jsonb object'
+        using errcode = '22023';
+    end if;
+
+    v_item := (v_elem ->> 'item_id')::uuid;
+    v_type := v_elem ->> 'movement_type';
+    v_at := (v_elem ->> 'occurred_at')::timestamptz;
+    v_qty := (v_elem ->> 'quantity')::numeric;
+    v_shift := v_elem ->> 'shift_id';
+    v_source := v_elem ->> 'source_id';
+    v_note := v_elem ->> 'note';
+
+    if v_item is null
+    or v_type is null
+    or v_at is null
+    or v_qty is null then
+      raise exception 'item_id, movement_type, occurred_at, and quantity are required'
+        using errcode = '22023';
+    end if;
+
+    if not pg_catalog.isfinite(v_at) then
+      raise exception 'occurred_at must be a finite timestamp'
+        using errcode = '22023';
+    end if;
+
+    if v_qty in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+    or v_qty <= 0 then
+      raise exception 'outflow quantity must be a finite number > 0'
+        using errcode = '22023';
+    end if;
+
+    if v_type not in ('sale', 'waste') then
+      raise exception 'engine outflow movement_type must be sale or waste'
+        using errcode = '22023';
+    end if;
+
+    if not exists (
+      select
+        1
+      from
+        app.stock_items si
+      where
+        si.id = v_item
+    ) then
+      raise exception 'unknown stock_item id: %',
+      v_item
+        using errcode = '22023';
+    end if;
+
+    v_event := null;
+
+    if v_elem ? 'event_position'
+    and v_elem ->> 'event_position' is not null then
+      v_event := (v_elem ->> 'event_position')::bigint;
+    end if;
+
+    v_n := v_n + 1;
+    v_items := v_items || v_item;
+    v_times := v_times || v_at;
+    v_types := v_types || v_type;
+    v_line := pg_catalog.jsonb_build_object(
+      'line_key',
+      v_n,
+      'batch_id',
+      v_batch,
+      'item_id',
+      v_item,
+      'movement_type',
+      v_type,
+      'occurred_at',
+      v_at,
+      'quantity',
+      -v_qty,
+      'unit_cost',
+      0,
+      'total_cost',
+      0,
+      'is_input_total',
+      false,
+      'shift_id',
+      v_shift,
+      'source_type',
+      'engine',
+      'source_id',
+      v_source,
+      'note',
+      v_note,
+      'engine_valued',
+      true,
+      'piece_position',
+      0
+    );
+
+    if v_event is not null then
+      v_line := v_line || pg_catalog.jsonb_build_object('event_position', v_event);
+    end if;
+
+    v_pending := v_pending || pg_catalog.jsonb_build_array(v_line);
+  end loop;
+
+  -- Same helper and error text as post_backdated_batch, before either replay.
+  -- A later opening must not cover a line dated before it.
+  perform app.assert_not_before_opening (v_items, v_times, v_types);
+
+  -- The replay scratch holds one component at a time, so each component is
+  -- valued, inserted and confirmed before the next one starts.
+  for v_comp in
+    select
+      c.member_ids
+    from
+      app.replay_components (v_items) c
+  loop
+    select
+      coalesce(
+        pg_catalog.jsonb_agg(
+          pend.value
+          order by
+            (pend.value ->> 'line_key')::integer
+        ),
+        '[]'::jsonb
+      )
+    into v_comp_pending
+    from
+      pg_catalog.jsonb_array_elements(v_pending) as pend (value)
+    where
+      (pend.value ->> 'item_id')::uuid = any (v_comp.member_ids);
+
+    perform app.replay_component (v_comp.member_ids, v_comp_pending, v_batch, false);
+
+    for v_posted in
+      insert into
+        app.stock_movements (
+          batch_id,
+          item_id,
+          movement_type,
+          occurred_at,
+          quantity,
+          unit_cost,
+          total_cost,
+          is_provisional,
+          shift_id,
+          source_type,
+          source_id,
+          note,
+          engine_valued,
+          event_position,
+          piece_position
+        )
+      select
+        v_batch,
+        piece.item_id,
+        piece.movement_type,
+        piece.occurred_at,
+        piece.quantity,
+        piece.unit_cost,
+        piece.total_cost,
+        piece.is_provisional,
+        piece.shift_id,
+        piece.source_type,
+        piece.source_id,
+        piece.note,
+        true,
+        pending_row.event_position,
+        piece.piece_no
+      from
+        ledger_scratch.recompute_piece piece
+        join ledger_scratch.recompute_row pending_row on pending_row.line_key = piece.line_key
+        and pending_row.is_pending
+      order by
+        piece.line_key,
+        piece.piece_no
+      returning
+        id,
+        item_id,
+        movement_type,
+        total_cost
+    loop
+      -- One revision for the posted piece. The confirming replay notes only a
+      -- later valuation adjustment, whose source id is the adjustment row.
+      perform app.note_period_revision (
+        v_posted.id,
+        app.shift_for_target (v_posted.id),
+        app.profit_bucket (v_posted.movement_type),
+        v_posted.total_cost,
+        v_posted.item_id,
+        v_batch
+      );
+    end loop;
+
+    perform app.replay_component (v_comp.member_ids, '[]'::jsonb, v_batch, true);
+  end loop;
+
+  return v_batch;
+end;
+$$;
+
+comment on function app.post_engine_outflows (jsonb) is 'Posts sale or waste lines with the engine provisional cost basis, valued by replay so a following replay inserts no adjustment. Notes each inserted piece once. Values, posts and confirms each connected component of the lines'' items on its own, in a stable order, so the replay cap applies per component. Caller holds the ledger lock. Private. Public post_movements does not call this.';
+
+-- ============================================================================
 -- 10. Coordinator. One order, atomically, under the ledger lock. Reads the
 -- immutable inputs only. Never touches the POS mirror.
 -- ============================================================================

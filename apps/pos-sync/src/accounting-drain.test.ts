@@ -4,6 +4,7 @@ import {
   formatDrain,
   DRAIN_BATCH_LIMIT,
   DRAIN_BUDGET_MS,
+  RECORDER_BACKOFF_MS,
 } from './accounting-drain.ts';
 import {
   SupabaseRpcError,
@@ -37,9 +38,10 @@ type Script = Array<AccountingRun | Error>;
 
 function fakeDb(
   script: Script,
-  report: FailureReport | Error = 'recorded',
+  report: FailureReport | Error | Array<FailureReport | Error> = 'recorded',
   peek: NextWork | Error = { status: 'ok', head: orderA },
 ) {
+  const replies = Array.isArray(report) ? [...report] : null;
   const runs: Array<{
     attemptId: string;
     limit: number;
@@ -71,10 +73,14 @@ function fakeDb(
     },
     async recordAccountingCallFailure(attemptId, orderId, generation) {
       reports.push({ attemptId, orderId, generation });
-      if (report instanceof Error) {
-        throw report;
+      const reply = replies === null ? report : (replies.shift() ?? 'busy');
+      if (reply instanceof Error) {
+        throw reply;
       }
-      return report;
+      if (Array.isArray(reply)) {
+        throw new Error('unexpected report script');
+      }
+      return reply;
     },
   };
   return { db, runs, reports };
@@ -391,6 +397,152 @@ describe('drainAccountingWork', () => {
     expect(outcome.error).toBe(
       'Supabase RPC failed: network; Supabase RPC failed: network',
     );
+  });
+
+  describe('a failure report the ledger lock turns away', () => {
+    const lost = new SupabaseRpcError(
+      'Supabase RPC failed: network',
+      'network',
+    );
+
+    function pauses(clockStart = 0) {
+      let now = clockStart;
+      const slept: number[] = [];
+      return {
+        slept,
+        clock: () => now,
+        sleep: async (ms: number) => {
+          slept.push(ms);
+          now += ms;
+        },
+      };
+    }
+
+    it('is repeated with the same attempt id after growing pauses until it is recorded', async () => {
+      const { db, runs, reports } = fakeDb(
+        [lost],
+        ['busy', 'busy', 'recorded'],
+      );
+      const pace = pauses();
+      const outcome = await drainAccountingWork(db, {
+        newAttemptId: ids(),
+        ...pace,
+      });
+      expect(outcome.stop).toBe('call_failed');
+      expect(outcome.report).toBe('recorded');
+      expect(outcome.calls).toBe(1);
+      expect(pace.slept).toEqual([250, 500]);
+      expect(reports).toEqual(
+        Array.from({ length: 3 }, () => ({
+          attemptId: runs[0]?.attemptId,
+          orderId: 'order-a',
+          generation: 1,
+        })),
+      );
+    });
+
+    it('is repeated a bounded number of times and then left busy', async () => {
+      const { db, runs, reports } = fakeDb(
+        [lost],
+        Array.from({ length: 20 }, () => 'busy' as const),
+      );
+      const pace = pauses();
+      const outcome = await drainAccountingWork(db, {
+        newAttemptId: ids(),
+        ...pace,
+      });
+      expect(outcome.stop).toBe('call_failed');
+      expect(outcome.report).toBe('busy');
+      expect(pace.slept).toEqual([...RECORDER_BACKOFF_MS]);
+      expect(reports).toHaveLength(RECORDER_BACKOFF_MS.length + 1);
+      expect(new Set(reports.map((r) => r.attemptId))).toEqual(
+        new Set([runs[0]?.attemptId]),
+      );
+    });
+
+    it('stops repeating when the budget cannot cover the next pause, and later drains stay correct', async () => {
+      const next = ids();
+      const first = fakeDb([lost], ['busy', 'busy', 'busy', 'busy']);
+      const pace = pauses();
+      const outcome = await drainAccountingWork(first.db, {
+        newAttemptId: next,
+        budgetMs: 1_000,
+        ...pace,
+      });
+      expect(outcome.stop).toBe('call_failed');
+      expect(outcome.report).toBe('busy');
+      expect(outcome.calls).toBe(1);
+      expect(pace.slept).toEqual([250, 500]);
+      expect(first.reports).toHaveLength(3);
+      expect(first.runs).toHaveLength(1);
+
+      const second = fakeDb([
+        run('processed', { processed: 1, applied: 1 }),
+        run('empty'),
+      ]);
+      const later = await drainAccountingWork(second.db, {
+        newAttemptId: next,
+      });
+      expect(later.stop).toBe('empty');
+      expect(later.counts.applied).toBe(1);
+      expect(second.reports).toEqual([]);
+      expect(second.runs.map((r) => r.binding)).toEqual([orderA, null]);
+      const used = [...first.runs, ...second.runs].map((r) => r.attemptId);
+      expect(new Set(used).size).toBe(used.length);
+    });
+
+    it('is still made once when the failed call used up the budget, but not repeated', async () => {
+      const { db, reports } = fakeDb([lost], ['busy', 'recorded']);
+      const pace = pauses();
+      let reads = 0;
+      const outcome = await drainAccountingWork(db, {
+        newAttemptId: ids(),
+        clock: () => (reads++ < 2 ? 0 : DRAIN_BUDGET_MS + 1),
+        sleep: pace.sleep,
+      });
+      expect(outcome.stop).toBe('call_failed');
+      expect(outcome.report).toBe('busy');
+      expect(reports).toHaveLength(1);
+      expect(pace.slept).toEqual([]);
+    });
+
+    it.each([
+      'recorded',
+      'committed',
+      'duplicate',
+      'no_work',
+      'stale',
+    ] as const)('is not repeated once the answer is %s', async (answer) => {
+      const { db, reports } = fakeDb([lost], answer);
+      const pace = pauses();
+      const outcome = await drainAccountingWork(db, {
+        newAttemptId: ids(),
+        ...pace,
+      });
+      expect(outcome.report).toBe(answer);
+      expect(reports).toHaveLength(1);
+      expect(pace.slept).toEqual([]);
+    });
+
+    it('ends unreported when a repeat itself fails, keeping the attempt id', async () => {
+      const { db, runs, reports } = fakeDb(
+        [lost],
+        [
+          'busy',
+          new SupabaseRpcError('Supabase RPC failed: network', 'network'),
+        ],
+      );
+      const pace = pauses();
+      const outcome = await drainAccountingWork(db, {
+        newAttemptId: ids(),
+        ...pace,
+      });
+      expect(outcome.report).toBe('unreported');
+      expect(reports.map((r) => r.attemptId)).toEqual([
+        runs[0]?.attemptId,
+        runs[0]?.attemptId,
+      ]);
+    });
   });
 
   it('redacts secrets from a reported error', async () => {

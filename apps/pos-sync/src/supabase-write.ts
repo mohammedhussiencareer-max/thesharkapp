@@ -1,5 +1,5 @@
 import { assertLocalSupabaseUrl } from './local-guard.ts';
-import { isRecord } from './decode.ts';
+import { isRecord, isSafeDocumentId } from './decode.ts';
 import type {
   IngestCounts,
   PosOrderIngest,
@@ -374,8 +374,6 @@ const FAILURE_REPORTS = new Set<string>([
   'busy',
 ]);
 
-const ORDER_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
-
 function parseAccountingRun(value: unknown): AccountingRun {
   if (
     !isRecord(value) ||
@@ -444,7 +442,7 @@ function parseOrderRef(value: unknown): AccountingOrderRef | null {
   if (
     !isRecord(value) ||
     typeof value.order_id !== 'string' ||
-    !ORDER_ID_PATTERN.test(value.order_id) ||
+    !isSafeDocumentId(value.order_id) ||
     typeof value.work_generation !== 'number' ||
     !Number.isInteger(value.work_generation) ||
     value.work_generation < 1
