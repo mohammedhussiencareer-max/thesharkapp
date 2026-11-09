@@ -443,6 +443,26 @@ isOneToOne: true
       referencedColumns: ["id"]
     }
                   ]
+                },"pos_cost_inputs": {
+                  Row: {
+                    "captured_at": string,"digest": string,"id": number,"input_revision": number,"missing_from_pos": boolean,"order_id": string,"origin": string,"refund_revision_ids": (number)[],"snapshot_id": number,"source_run_id": number | null
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "captured_at"?: string,"digest": string,"id"?: never,"input_revision": number,"missing_from_pos": boolean,"order_id": string,"origin": string,"refund_revision_ids": (number)[],"snapshot_id": number,"source_run_id"?: number | null
+                  }
+                  Update: {
+                    "captured_at"?: string,"digest"?: string,"id"?: never,"input_revision"?: number,"missing_from_pos"?: boolean,"order_id"?: string,"origin"?: string,"refund_revision_ids"?: (number)[],"snapshot_id"?: number,"source_run_id"?: number | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "pos_cost_inputs_snapshot_id_fkey"
+      columns: ["snapshot_id"]
+isOneToOne: false
+      referencedRelation: "pos_order_snapshots"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"pos_map_subjects": {
                   Row: {
                     "created_change_id": number,"id": string,"kind": string,"option_scope": string | null,"option_value": string | null,"pos_item_id": string | null,"size_key": Json | null
@@ -533,6 +553,20 @@ isOneToOne: false
       referencedColumns: ["id"]
     }
                   ]
+                },"pos_order_snapshots": {
+                  Row: {
+                    "captured_at": string,"content_hash": string,"delivery_fee": number,"discount": number,"financial_revision": number | null,"id": number,"last_financial_operation_key": string | null,"lines": NonNullable<Json>,"order_id": string,"order_number": number | null,"order_type": string | null,"ordered_at": string,"origin": string,"payment_type": string | null,"pos_update_time": string,"service_tax": number,"shift_id": string,"source_run_id": number | null,"status": string,"subtotal": number,"tax": number,"total": number,"version": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "captured_at"?: string,"content_hash": string,"delivery_fee": number,"discount": number,"financial_revision"?: number | null,"id"?: never,"last_financial_operation_key"?: string | null,"lines": NonNullable<Json>,"order_id": string,"order_number"?: number | null,"order_type"?: string | null,"ordered_at": string,"origin": string,"payment_type"?: string | null,"pos_update_time": string,"service_tax": number,"shift_id": string,"source_run_id"?: number | null,"status": string,"subtotal": number,"tax": number,"total": number,"version": number
+                  }
+                  Update: {
+                    "captured_at"?: string,"content_hash"?: string,"delivery_fee"?: number,"discount"?: number,"financial_revision"?: number | null,"id"?: never,"last_financial_operation_key"?: string | null,"lines"?: NonNullable<Json>,"order_id"?: string,"order_number"?: number | null,"order_type"?: string | null,"ordered_at"?: string,"origin"?: string,"payment_type"?: string | null,"pos_update_time"?: string,"service_tax"?: number,"shift_id"?: string,"source_run_id"?: number | null,"status"?: string,"subtotal"?: number,"tax"?: number,"total"?: number,"version"?: number
+                  }
+                  Relationships: [
+                    
+                  ]
                 },"pos_orders": {
                   Row: {
                     "content_hash": string,"delivery_fee": number,"discount": number,"financial_revision": number | null,"first_synced_at": string,"id": string,"last_financial_operation_key": string | null,"last_synced_at": string,"missing_from_pos": boolean,"order_number": number | null,"order_type": string | null,"ordered_at": string,"payment_type": string | null,"pos_update_time": string,"service_tax": number,"shift_id": string,"status": string,"subtotal": number,"tax": number,"total": number,"version": number
@@ -543,6 +577,20 @@ isOneToOne: false
                   }
                   Update: {
                     "content_hash"?: string,"delivery_fee"?: number,"discount"?: number,"financial_revision"?: number | null,"first_synced_at"?: string,"id"?: string,"last_financial_operation_key"?: string | null,"last_synced_at"?: string,"missing_from_pos"?: boolean,"order_number"?: number | null,"order_type"?: string | null,"ordered_at"?: string,"payment_type"?: string | null,"pos_update_time"?: string,"service_tax"?: number,"shift_id"?: string,"status"?: string,"subtotal"?: number,"tax"?: number,"total"?: number,"version"?: number
+                  }
+                  Relationships: [
+                    
+                  ]
+                },"pos_refund_revisions": {
+                  Row: {
+                    "amount": number,"captured_at": string,"id": number,"occurred_at": string,"order_id": string | null,"origin": string,"present": boolean,"shift_id": string,"source_run_id": number | null,"tx_id": string,"tx_type": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "amount": number,"captured_at"?: string,"id"?: never,"occurred_at": string,"order_id"?: string | null,"origin": string,"present": boolean,"shift_id": string,"source_run_id"?: number | null,"tx_id": string,"tx_type": number
+                  }
+                  Update: {
+                    "amount"?: number,"captured_at"?: string,"id"?: never,"occurred_at"?: string,"order_id"?: string | null,"origin"?: string,"present"?: boolean,"shift_id"?: string,"source_run_id"?: number | null,"tx_id"?: string,"tx_type"?: number
                   }
                   Relationships: [
                     
@@ -587,6 +635,20 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"pos_sync_coverage": {
+                  Row: {
+                    "finished_at": string,"legacy_direct": boolean,"orders_scope_applied": boolean,"presented_shift_ids": (string)[],"run_id": number,"scope_from": string | null,"scope_kind": string | null,"scope_shift_ids": (string)[],"started_at": string,"transactions_covered": boolean
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "finished_at": string,"legacy_direct"?: boolean,"orders_scope_applied": boolean,"presented_shift_ids": (string)[],"run_id": number,"scope_from"?: string | null,"scope_kind"?: string | null,"scope_shift_ids": (string)[],"started_at": string,"transactions_covered": boolean
+                  }
+                  Update: {
+                    "finished_at"?: string,"legacy_direct"?: boolean,"orders_scope_applied"?: boolean,"presented_shift_ids"?: (string)[],"run_id"?: number,"scope_from"?: string | null,"scope_kind"?: string | null,"scope_shift_ids"?: (string)[],"started_at"?: string,"transactions_covered"?: boolean
+                  }
+                  Relationships: [
+                    
+                  ]
                 },"pos_sync_run_orders": {
                   Row: {
                     "order_id": string,"run_id": number
@@ -609,14 +671,14 @@ isOneToOne: false
                   ]
                 },"pos_sync_runs": {
                   Row: {
-                    "counts": Json | null,"error": string | null,"finished_at": string | null,"id": number,"mode": string,"scope_applied": boolean,"started_at": string,"status": string
+                    "counts": Json | null,"error": string | null,"finished_at": string | null,"id": number,"mode": string,"presented_shift_ids": (string)[],"scope_applied": boolean,"scope_from": string | null,"scope_kind": string | null,"scope_shift_ids": (string)[],"started_at": string,"status": string
                   }
                   ComputedFields: never
                   Insert: {
-                    "counts"?: Json | null,"error"?: string | null,"finished_at"?: string | null,"id"?: never,"mode": string,"scope_applied"?: boolean,"started_at"?: string,"status"?: string
+                    "counts"?: Json | null,"error"?: string | null,"finished_at"?: string | null,"id"?: never,"mode": string,"presented_shift_ids"?: (string)[],"scope_applied"?: boolean,"scope_from"?: string | null,"scope_kind"?: string | null,"scope_shift_ids"?: (string)[],"started_at"?: string,"status"?: string
                   }
                   Update: {
-                    "counts"?: Json | null,"error"?: string | null,"finished_at"?: string | null,"id"?: never,"mode"?: string,"scope_applied"?: boolean,"started_at"?: string,"status"?: string
+                    "counts"?: Json | null,"error"?: string | null,"finished_at"?: string | null,"id"?: never,"mode"?: string,"presented_shift_ids"?: (string)[],"scope_applied"?: boolean,"scope_from"?: string | null,"scope_kind"?: string | null,"scope_shift_ids"?: (string)[],"started_at"?: string,"status"?: string
                   }
                   Relationships: [
                     
@@ -1333,6 +1395,9 @@ isOneToOne: false
 "add_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
                            },
+"append_pos_cost_input":
+{ Args: { "p_order_id": string,"p_origin": string,"p_run_id": number }; Returns: number
+                           },
 "apply_inflow_movement":
 { Args: { "p_batch_id": string,"p_in_qty": number,"p_in_total_cost"?: number,"p_in_unit_cost": number,"p_item_id": string,"p_movement_type": Database["app"]['Enums']["movement_type"],"p_note": string,"p_occurred_at": string,"p_shift_id": string,"p_source_id": string,"p_source_type": string }; Returns: undefined
                            },
@@ -1366,8 +1431,17 @@ isOneToOne: false
 "backfill_legacy_costing":
 { Args: { "p_at": string }; Returns: Json
                            },
+"backfill_pos_accounting_inputs":
+{ Args: Record<PropertyKey, never>; Returns: undefined
+                           },
 "batch_is_forward":
 { Args: { "p_item_ids": (string)[],"p_occurred_at": (string)[] }; Returns: boolean
+                           },
+"capture_pos_order_snapshot":
+{ Args: { "p_order_id": string,"p_origin": string,"p_run_id": number }; Returns: number
+                           },
+"capture_pos_refund_revisions":
+{ Args: { "p_run_id": number,"p_shifts": Json }; Returns: (string)[]
                            },
 "commit_recipe_import":
 { Args: { "p_payload": Json,"p_request_id": string }; Returns: Json
@@ -1621,6 +1695,38 @@ isOneToOne: false
 "pos_option_schedule":
 { Args: { "p_option_value": string,"p_pos_item_id": string,"p_scope": string,"p_size_key": Json }; Returns: Json
                            },
+"pos_preparation_input":
+{ Args: { "p_order_id": string }; Returns: {
+              "captured_at": string,
+"content_hash": string,
+"delivery_fee": number,
+"discount": number,
+"financial_revision": number | null,
+"id": number,
+"last_financial_operation_key": string | null,
+"lines": NonNullable<Json>,
+"order_id": string,
+"order_number": number | null,
+"order_type": string | null,
+"ordered_at": string,
+"origin": string,
+"payment_type": string | null,
+"pos_update_time": string,
+"service_tax": number,
+"shift_id": string,
+"source_run_id": number | null,
+"status": string,
+"subtotal": number,
+"tax": number,
+"total": number,
+"version": number
+            }[]
+                          SetofOptions: {
+        from: "*"
+        to: "pos_order_snapshots"
+        isOneToOne: false
+        isSetofReturn: true
+      } },
 "pos_qty":
 { Args: { "p_value": number }; Returns: number
                            },
@@ -1629,6 +1735,9 @@ isOneToOne: false
                            },
 "pos_size_key_normalize":
 { Args: { "p_key": Json }; Returns: Json
+                           },
+"pos_sync_scope_covers_count":
+{ Args: { "p_applied": boolean,"p_counted_at": string,"p_from": string,"p_kind": string,"p_shift_ids": (string)[] }; Returns: boolean
                            },
 "pos_text_id":
 { Args: { "p_value": string,"p_what": string }; Returns: string
