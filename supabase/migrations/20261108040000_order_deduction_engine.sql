@@ -3274,7 +3274,10 @@ begin
     );
   end if;
 
-  v_order := v_h0.order_id;
+  -- Only a call that names its order processes one. A call that names none is
+  -- maintenance: it expands a span slice and returns the head, so every order
+  -- that is processed has a caller who can report its failure.
+  v_order := p_order_id;
 
   -- One bounded slice of one rederive span: 100 orders by keyset.
   select
@@ -3638,7 +3641,7 @@ begin
 end;
 $$;
 
-comment on function app.run_accounting_work (uuid, integer, text, integer) is 'Owner or service_role. Processes ONE pending order per call (p_limit is validated, 1 to 10, and reserved), after one bounded slice of a rederive span, under the ledger lock. The order is the head of the queue when the call starts; work the slice enqueues waits for the next call, so a failure of the call belongs to that order. With p_order_id and p_work_generation (given together) the call processes only that order in that generation and otherwise returns stale with the current head, so a caller that loses the reply knows which order to report. The order runs in a subtransaction; a caught error rolls it back and records the attempt, once per attempt id. Five attempts in one work generation park the order (failed_at) until a new event or retry_accounting_work. Every processed outcome writes an accounting_work_completions row for the attempt id. blocked, none and disposition_pending count as success. critical stops the worker. Returns not_activated before an inventory_activation row exists, busy when the ledger lock is held, sync_running while a POS sync run is open. head is the next pending order and the generation to bind the next call to. The function settings (statement_timeout 6s, lock_timeout 250ms) are applied by PostgREST before the call, so they bound a Data API call; a direct SQL caller must set its own statement_timeout.';
+comment on function app.run_accounting_work (uuid, integer, text, integer) is 'Owner or service_role. Processes ONE pending order per call (p_limit is validated, 1 to 10, and reserved), after one bounded slice of a rederive span, under the ledger lock. A call must name its order: with p_order_id and p_work_generation (given together) it processes only that order in that generation, which must be the head of the queue when the call starts, and otherwise returns stale with the current head, so a caller that loses the reply knows which order to report. A call that names no order is maintenance only: it expands a span slice and returns the head (status processed with zero counts, or empty when nothing is pending and no span is open), and processes no order even when one is pending, so no order is ever processed without a caller who can report its failure. Work the slice enqueues waits for the next call. The order runs in a subtransaction; a caught error rolls it back and records the attempt, once per attempt id. Five attempts in one work generation park the order (failed_at) until a new event or retry_accounting_work. Every processed outcome writes an accounting_work_completions row for the attempt id. blocked, none and disposition_pending count as success. critical stops the worker. Returns not_activated before an inventory_activation row exists, busy when the ledger lock is held, sync_running while a POS sync run is open. head is the next pending order and the generation to bind the next call to. The function settings (statement_timeout 6s, lock_timeout 250ms) are applied by PostgREST before the call, so they bound a Data API call; a direct SQL caller must set its own statement_timeout.';
 
 revoke all on function app.run_accounting_work (uuid, integer, text, integer)
 from

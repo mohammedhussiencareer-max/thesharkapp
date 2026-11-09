@@ -304,11 +304,22 @@ values
     repeat('a', 32)
   );
 
-select
-  app.run_accounting_work ('b4c00000-0000-4000-8000-000000000402', 1);
-
-select
-  app.run_accounting_work ('b4c00000-0000-4000-8000-000000000404', 1);
+-- A call that names no order only expands the rederive spans and returns the
+-- head, so each order is processed by a call bound to the head just named.
+do $$
+declare
+  r jsonb := app.run_accounting_work('b4c00000-0000-4000-8000-000000000405', 1);
+begin
+  r := app.run_accounting_work(
+    'b4c00000-0000-4000-8000-000000000402', 1,
+    r -> 'head' ->> 'order_id', (r -> 'head' ->> 'work_generation')::integer
+  );
+  r := app.run_accounting_work(
+    'b4c00000-0000-4000-8000-000000000404', 1,
+    r -> 'head' ->> 'order_id', (r -> 'head' ->> 'work_generation')::integer
+  );
+end;
+$$;
 
 insert into
   app.accounting_work_attempts (

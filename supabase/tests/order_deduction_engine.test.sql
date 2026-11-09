@@ -383,22 +383,35 @@ begin
 end;
 $$;
 
--- Up to p_limit single-order worker calls; stops at the first call that is not
--- 'processed' or that had a failure. The worker itself takes one order a call.
+-- Works the way the runner does: a bound call for the head it was told about,
+-- a maintenance call (no binding) when there is none. Stops at p_limit bound
+-- calls, at the first call that is not 'processed', or at a failure. The worker
+-- itself takes one order a call.
 create function pg_temp.work (p_limit integer default 10) returns jsonb language plpgsql as $$
 declare
   v jsonb;
+  h jsonb := app.accounting_next_work() -> 'head';
   n integer := 0;
+  g integer := 0;
   acc jsonb := '{}'::jsonb;
 begin
   loop
-    v := app.run_accounting_work(gen_random_uuid(), 1);
-    n := n + 1;
+    v := app.run_accounting_work(
+      gen_random_uuid(), 1, h ->> 'order_id', (h ->> 'work_generation')::integer
+    );
+    g := g + 1;
+
+    if h ->> 'order_id' is not null then
+      n := n + 1;
+    end if;
+
+    h := v -> 'head';
     acc := pg_temp.sum_counts(acc, v);
 
     exit when v ->> 'status' <> 'processed'
       or coalesce((v ->> 'failed')::integer, 0) > 0
-      or n >= p_limit;
+      or n >= p_limit
+      or g >= 2000;
   end loop;
 
   return jsonb_build_object(
@@ -427,15 +440,19 @@ $$;
 create function pg_temp.drain () returns jsonb language plpgsql as $$
 declare
   v jsonb;
+  h jsonb := app.accounting_next_work() -> 'head';
   n integer := 0;
   acc jsonb := '{}'::jsonb;
   k text;
 begin
   loop
-    v := app.run_accounting_work(gen_random_uuid(), 1);
+    v := app.run_accounting_work(
+      gen_random_uuid(), 1, h ->> 'order_id', (h ->> 'work_generation')::integer
+    );
     n := n + 1;
+    h := v -> 'head';
 
-    exit when v ->> 'status' <> 'processed' or n >= 400;
+    exit when v ->> 'status' <> 'processed' or n >= 800;
 
     foreach k in array array[
       'applied', 'unchanged', 'incomplete', 'none', 'blocked',
@@ -3183,10 +3200,58 @@ select
     'a stale call changed nothing'
   );
 
--- Room for ten orders, yet the call takes the head only.
+-- A call that names no order is maintenance: it processes nothing even though
+-- two orders are pending, writes no per-order row, and names the head.
+create temp table maintenance_run as
+select
+  app.run_accounting_work ('a5400000-0000-4000-8000-000000000105', 10) as r;
+
+select
+  results_eq (
+    $$select r ->> 'status', (r ->> 'processed')::integer, (r ->> 'failed')::integer,
+             r -> 'head' ->> 'order_id', (r -> 'head' ->> 'work_generation')::integer
+      from maintenance_run$$,
+    $$values ('processed', 0, 0, 'o-ok-1', 1)$$,
+    'a call with no order processes nothing and returns the head'
+  );
+
+select
+  is_empty (
+    $$select 1 from app.accounting_work_completions where attempt_id = 'a5400000-0000-4000-8000-000000000105'
+      union all select 1 from app.accounting_work_attempts where order_id in ('o-ok-1', 'o-slow-2')
+      union all select 1 from app.accounting_work_state where order_id in ('o-ok-1', 'o-slow-2')
+      union all select 1 from app.order_cost_state where order_id in ('o-ok-1', 'o-slow-2')
+      union all select 1 from app.order_cost_applications where order_id in ('o-ok-1', 'o-slow-2')$$,
+    'and leaves no evidence, state or receipt for any order'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.accounting_work_events
+      where
+        order_id in ('o-ok-1', 'o-slow-2')
+        and processed_at is null
+    ),
+    2::bigint,
+    'and both pending events stay open'
+  );
+
+-- Bound to the head the maintenance call named, with room for ten orders, the
+-- call still takes that one order only.
 create temp table room_run as
 select
-  app.run_accounting_work ('a5400000-0000-4000-8000-000000000102', 10) as r;
+  app.run_accounting_work (
+    'a5400000-0000-4000-8000-000000000102',
+    10,
+    m.r -> 'head' ->> 'order_id',
+    (m.r -> 'head' ->> 'work_generation')::integer
+  ) as r
+from
+  maintenance_run m;
 
 select
   results_eq (
@@ -3194,7 +3259,7 @@ select
              (r ->> 'remaining')::integer, r -> 'head' ->> 'order_id'
       from room_run$$,
     $$values (1, 1, 0, 1, 'o-slow-2')$$,
-    'a call with room for ten takes the head only and names the next order'
+    'the bound call takes the head only and names the next order'
   );
 
 set
@@ -3436,9 +3501,25 @@ select
 set
   local statement_timeout = 0;
 
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.accounting_work_events
+      where
+        cause = 'pos_input'
+        and order_id like 'o-bulk-%'
+        and processed_at is null
+    ),
+    120::bigint,
+    'all 120 bulk orders are pending before the maintenance call'
+  );
+
 create temp table bulk_first as
 select
-  pg_temp.work (1) as r;
+  app.run_accounting_work (gen_random_uuid(), 1) as r;
 
 select
   results_eq (
@@ -3446,7 +3527,24 @@ select
       from app.accounting_rederive_spans
       where family = 'pos_map' and effective_to = '2030-01-01T00:00:00Z'$$,
     $$values (100::bigint, true)$$,
-    'one call expands at most 100 orders of a span'
+    'a call with no order still expands at most 100 orders of a span'
+  );
+
+select
+  results_eq (
+    $$select (r ->> 'processed')::integer, (r ->> 'failed')::integer, r ->> 'status',
+             r -> 'head' ->> 'order_id' is not null
+      from bulk_first$$,
+    $$values (0, 0, 'processed', true)$$,
+    'while processing none of the pending orders'
+  );
+
+select
+  is_empty (
+    $$select 1 from app.accounting_work_state where order_id like 'o-bulk-%'
+      union all select 1 from app.order_cost_state where order_id like 'o-bulk-%'
+      union all select 1 from app.order_cost_applications where order_id like 'o-bulk-%'$$,
+    'and touches no per-order row'
   );
 
 select

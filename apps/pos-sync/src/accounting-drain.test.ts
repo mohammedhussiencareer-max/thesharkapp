@@ -160,6 +160,58 @@ describe('drainAccountingWork', () => {
     expect(runs.every((call) => call.limit === 1)).toBe(true);
   });
 
+  it('treats an unbound call as maintenance: its head leads to a bound call and the drain still ends on empty', async () => {
+    const { db, runs } = fakeDb(
+      [
+        run('processed', { remaining: 1 }, orderB),
+        run('processed', { processed: 1, applied: 1, remaining: 0 }),
+        run('empty'),
+      ],
+      'recorded',
+      { status: 'empty', head: null },
+    );
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('empty');
+    expect(outcome.calls).toBe(3);
+    expect(outcome.counts).toMatchObject({ processed: 1, applied: 1 });
+    expect(runs.map((call) => call.binding)).toEqual([null, orderB, null]);
+    expect(runs.every((call) => call.limit === 1)).toBe(true);
+  });
+
+  it('keeps making unbound calls while a span is still expanding, then ends on empty', async () => {
+    const { db, runs } = fakeDb(
+      [run('processed'), run('processed'), run('empty')],
+      'recorded',
+      { status: 'empty', head: null },
+    );
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('empty');
+    expect(outcome.calls).toBe(3);
+    expect(runs.map((call) => call.binding)).toEqual([null, null, null]);
+  });
+
+  it('reports the order a maintenance call named when the bound call that processes it is lost', async () => {
+    const { db, runs, reports } = fakeDb(
+      [
+        run('processed', { remaining: 1 }, orderC),
+        new SupabaseRpcError('Supabase RPC failed: network', 'network'),
+      ],
+      'recorded',
+      { status: 'empty', head: null },
+    );
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('call_failed');
+    expect(outcome.report).toBe('recorded');
+    expect(runs.map((call) => call.binding)).toEqual([null, orderC]);
+    expect(reports).toEqual([
+      {
+        attemptId: runs[1]?.attemptId,
+        orderId: 'order-c',
+        generation: 2,
+      },
+    ]);
+  });
+
   it.each(['busy', 'sync_running', 'not_activated'] as const)(
     'stops without a report on %s',
     async (status) => {
@@ -301,7 +353,7 @@ describe('drainAccountingWork', () => {
     ]);
   });
 
-  it('makes no report when the failed call was bound to no order', async () => {
+  it('makes no report when an unbound (maintenance) call fails, as it processed no order', async () => {
     const { db, reports } = fakeDb(
       [new SupabaseRpcError('Supabase RPC failed: network', 'network')],
       'recorded',

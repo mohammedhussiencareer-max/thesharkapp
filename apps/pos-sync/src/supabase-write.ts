@@ -117,7 +117,8 @@ export type NextWork = {
 };
 
 // A worker call is bound to the order it may process; a failure report names
-// that same order and generation, so it can only ever charge that order.
+// that same order and generation, so it can only ever charge that order. An
+// unbound call (null) is maintenance: it processes no order.
 export type AccountingDb = {
   getNextWork(): Promise<NextWork>;
   runAccountingWork(

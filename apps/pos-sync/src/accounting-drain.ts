@@ -49,7 +49,10 @@ const DEFAULTS: DrainOptions = {
 
 // Runs the accounting worker, one order a call, until it has nothing left, is
 // blocked, fails, or the time budget ends. Each call is bound to the order the
-// previous reply named as next (the first from accounting_next_work). A call
+// previous reply named as next (the first from accounting_next_work). With no
+// order known the call is unbound: the worker then only expands its rederive
+// spans and returns the head, which the next call is bound to; an unbound call
+// processes no order, so it has nothing a failure could be charged to. A call
 // that fails without a reply is reported once, with the attempt id chosen
 // before the call, naming only the order it was bound to. Never throws.
 export async function drainAccountingWork(
@@ -143,7 +146,7 @@ async function failedCall(
   ) => DrainOutcome,
 ): Promise<DrainOutcome> {
   const message = safeErrorMessage(error);
-  // Without a bound order there is nothing a failure could be charged to.
+  // An unbound call is maintenance and processed no order: nothing to charge.
   if (binding === null || !isUnknownOutcome(error)) {
     return done('call_failed', 'not_needed', message);
   }
