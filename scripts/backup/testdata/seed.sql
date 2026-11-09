@@ -285,3 +285,64 @@ select
   );
 
 select app.finish_pos_sync_run (:run_id, 'ok', '{}'::jsonb, null);
+
+-- Order deduction engine: the activation row carries an owner foreign key, one
+-- worker pass leaves receipts and state, one order is parked after five failed
+-- attempts, and one decision event is left pending.
+insert into
+  app.inventory_activation (
+    stock_started_at,
+    approved_by,
+    request_id,
+    opening_manifest_hash
+  )
+values
+  (
+    '2026-08-01T00:00:00Z',
+    :'owner',
+    'b4c00000-0000-4000-8000-000000000401',
+    repeat('a', 32)
+  );
+
+-- A call that names no order only expands the rederive spans and returns the
+-- head, so each order is processed by a call bound to the head just named.
+do $$
+declare
+  r jsonb := app.run_accounting_work('b4c00000-0000-4000-8000-000000000405', 1);
+begin
+  r := app.run_accounting_work(
+    'b4c00000-0000-4000-8000-000000000402', 1,
+    r -> 'head' ->> 'order_id', (r -> 'head' ->> 'work_generation')::integer
+  );
+  r := app.run_accounting_work(
+    'b4c00000-0000-4000-8000-000000000404', 1,
+    r -> 'head' ->> 'order_id', (r -> 'head' ->> 'work_generation')::integer
+  );
+end;
+$$;
+
+insert into
+  app.accounting_work_attempts (
+    order_id,
+    work_generation,
+    attempt_id,
+    kind,
+    sqlstate,
+    reason
+  )
+values
+  ('order-seed-2', 1, 'b4c00000-0000-4000-8000-000000000403', 'caught', 'XX000', 'error');
+
+update app.accounting_work_state
+set
+  attempts = 5,
+  failed_at = '2026-08-08T00:00:00Z',
+  last_reason = 'error',
+  last_error_code = 'XX000'
+where
+  order_id = 'order-seed-2';
+
+insert into
+  app.accounting_work_events (order_id, cause, source_key)
+values
+  ('order-seed-1', 'decision', 'seed:pending-decision');

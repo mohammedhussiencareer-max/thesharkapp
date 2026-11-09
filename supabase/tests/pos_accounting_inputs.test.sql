@@ -478,9 +478,9 @@ select
 select
   throws_ok (
     'truncate app.pos_cost_inputs',
-    '55000',
-    'app.pos_cost_inputs is append-only; TRUNCATE is not allowed',
-    'cost inputs reject truncate'
+    '0A000',
+    'cannot truncate a table referenced in a foreign key constraint',
+    'cost inputs reject truncate because work events and receipts reference them'
   );
 
 select
