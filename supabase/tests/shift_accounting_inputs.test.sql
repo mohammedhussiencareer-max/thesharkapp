@@ -5395,6 +5395,26 @@ select
 
 select
   results_eq (
+    $$select document.request_id = md5('p77-waste-80')::uuid,
+            sm.movement_type::text,
+            sm.total_cost::text
+      from app.waste_documents document
+      join app.stock_movements sm
+        on sm.batch_id = document.batch_id
+        or sm.batch_id = document.retire_batch_id
+      where document.request_id in (
+        md5('p77-waste-80')::uuid,
+        md5('p77-waste-100')::uuid
+      )
+      order by document.id, sm.id$$,
+    $$values (true, 'waste', '-80.00'),
+             (false, 'waste_reversal', '80.00'),
+             (false, 'waste', '-100.00')$$,
+    'record_waste posts cost 80.00 and the correction retires it and posts 100.00'
+  );
+
+select
+  results_eq (
     $$select diff.cause_kind, diff.waste_difference, diff.profit_difference, diff.is_latest
       from app.accounting_revision_differences diff
       join app.waste_documents document
@@ -5682,7 +5702,7 @@ insert into
 select
   application.retire_batch,
   pg_temp.u (6),
-  'waste',
+  'waste'::app.movement_type,
   application.occurred_at,
   -1,
   10,
@@ -5696,7 +5716,7 @@ union all
 select
   application.posting_batch,
   pg_temp.u (6),
-  'waste',
+  'waste'::app.movement_type,
   application.occurred_at,
   -1,
   20,
@@ -5821,7 +5841,7 @@ insert into
 select
   correction.retire_batch_id,
   pg_temp.u (6),
-  'waste',
+  'waste'::app.movement_type,
   correction.occurred_at,
   -1,
   8,
@@ -5836,7 +5856,7 @@ union all
 select
   correction.batch_id,
   pg_temp.u (6),
-  'waste',
+  'waste'::app.movement_type,
   correction.occurred_at,
   -1,
   10,

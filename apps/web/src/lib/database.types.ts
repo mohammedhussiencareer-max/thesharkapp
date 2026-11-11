@@ -1275,14 +1275,14 @@ isOneToOne: false
                   ]
                 },"sales_revision_facts": {
                   Row: {
-                    "id": number,"net_sales_difference": number,"order_id": string | null,"recorded_at": string,"shift_id": string,"source_at": string,"source_kind": string,"source_revision_id": number
+                    "captured_at": string,"id": number,"net_sales_difference": number,"order_id": string | null,"recorded_at": string,"shift_id": string,"source_at": string,"source_kind": string,"source_revision_id": number
                   }
                   ComputedFields: never
                   Insert: {
-                    "id"?: never,"net_sales_difference": number,"order_id"?: string | null,"recorded_at"?: string,"shift_id": string,"source_at": string,"source_kind": string,"source_revision_id": number
+                    "captured_at": string,"id"?: never,"net_sales_difference": number,"order_id"?: string | null,"recorded_at"?: string,"shift_id": string,"source_at": string,"source_kind": string,"source_revision_id": number
                   }
                   Update: {
-                    "id"?: never,"net_sales_difference"?: number,"order_id"?: string | null,"recorded_at"?: string,"shift_id"?: string,"source_at"?: string,"source_kind"?: string,"source_revision_id"?: number
+                    "captured_at"?: string,"id"?: never,"net_sales_difference"?: number,"order_id"?: string | null,"recorded_at"?: string,"shift_id"?: string,"source_at"?: string,"source_kind"?: string,"source_revision_id"?: number
                   }
                   Relationships: [
                     
@@ -1770,7 +1770,7 @@ isOneToOne: false
           Views: {
             "accounting_revision_differences": {
                   Row: {
-                    "cause_id": string | null,"cause_kind": string | null,"cogs_difference": string | null,"count_difference": string | null,"cumulative_cogs_difference": string | null,"cumulative_count_difference": string | null,"cumulative_net_sales_difference": string | null,"cumulative_profit_difference": string | null,"cumulative_waste_difference": string | null,"is_latest": boolean | null,"net_sales_difference": string | null,"profit_difference": string | null,"recorded_at": string | null,"shift_id": string | null,"source_at": string | null,"waste_difference": string | null
+                    "captured_at": string | null,"cause_id": string | null,"cause_kind": string | null,"cause_sort": number | null,"cogs_difference": string | null,"count_difference": string | null,"cumulative_cogs_difference": string | null,"cumulative_count_difference": string | null,"cumulative_net_sales_difference": string | null,"cumulative_profit_difference": string | null,"cumulative_waste_difference": string | null,"is_latest": boolean | null,"net_sales_difference": string | null,"profit_difference": string | null,"recorded_at": string | null,"shift_id": string | null,"source_at": string | null,"waste_difference": string | null
                   }
                   ComputedFields: never
                   Relationships: [
