@@ -818,6 +818,264 @@ begin
       v_comp,
       'shift-read'
     );
+
+  -- o-fail and o-both have no snapshot, so least(ordered_at) is null and they
+  -- are relevant to every count. Date them after the probe. o-park is parked
+  -- with only claimed events and a snapshot before the probe count. The cost
+  -- input trigger appends an unclaimed event; the probe orders are claimed
+  -- again below so an unclaimed event cannot make the old predicate true.
+  with
+    snaps as (
+      insert into
+        app.pos_order_snapshots (
+          order_id,
+          version,
+          shift_id,
+          status,
+          ordered_at,
+          subtotal,
+          discount,
+          tax,
+          service_tax,
+          delivery_fee,
+          total,
+          pos_update_time,
+          content_hash,
+          lines,
+          origin
+        )
+      values
+        (
+          'o-fail',
+          1,
+          'shift-read',
+          'complete',
+          '2026-06-01 00:00:00+00',
+          10.00,
+          0,
+          0,
+          0,
+          0,
+          10.00,
+          '2026-06-01 00:00:00+00',
+          repeat('a1', 32),
+          '[]'::jsonb,
+          'sync'
+        ),
+        (
+          'o-both',
+          1,
+          'shift-read',
+          'complete',
+          '2026-06-01 00:00:00+00',
+          10.00,
+          0,
+          0,
+          0,
+          0,
+          10.00,
+          '2026-06-01 00:00:00+00',
+          repeat('a2', 32),
+          '[]'::jsonb,
+          'sync'
+        ),
+        (
+          'o-park',
+          1,
+          'shift-read',
+          'complete',
+          '2025-01-01 00:00:00+00',
+          10.00,
+          0,
+          0,
+          0,
+          0,
+          10.00,
+          '2025-01-01 00:00:00+00',
+          repeat('a3', 32),
+          '[]'::jsonb,
+          'sync'
+        )
+      returning
+        id,
+        order_id
+    )
+  insert into
+    app.pos_cost_inputs (
+      order_id,
+      input_revision,
+      snapshot_id,
+      missing_from_pos,
+      refund_revision_ids,
+      digest,
+      origin
+    )
+  select
+    snaps.order_id,
+    1,
+    snaps.id,
+    false,
+    '{}'::bigint[],
+    md5(snaps.order_id),
+    'sync'
+  from
+    snaps;
+
+  insert into
+    app.accounting_work_state (
+      order_id,
+      work_generation,
+      attempts,
+      failed_at,
+      last_outcome,
+      last_reason,
+      last_error_code
+    )
+  values
+    (
+      'o-park',
+      1,
+      5,
+      '2025-02-01 00:00:00+00',
+      null,
+      null,
+      null
+    );
+
+  update app.accounting_work_events
+  set
+    work_generation = 1
+  where
+    order_id in ('o-fail', 'o-park')
+    and work_generation is null;
+
+  insert into
+    app.stock_counts (id, request_id, frequency, counted_at, note)
+  values
+    (
+      'a7800000-0000-4000-8000-000000000040',
+      'a7800000-0000-4000-8000-000000000140',
+      'daily',
+      '2025-06-01 00:00:00+00',
+      'جرد متوقف'
+    ),
+    (
+      'a7800000-0000-4000-8000-000000000041',
+      'a7800000-0000-4000-8000-000000000141',
+      'daily',
+      '2024-01-01 00:00:00+00',
+      'جرد قبل الشغل'
+    );
+
+  insert into
+    app.stock_count_lines (
+      count_id,
+      line_no,
+      item_id,
+      expected_base_unit,
+      counted_qty,
+      expected_qty,
+      delta_qty,
+      delta_value
+    )
+  values
+    (
+      'a7800000-0000-4000-8000-000000000040',
+      1,
+      v_item_1,
+      'kg',
+      1,
+      1,
+      0,
+      0
+    ),
+    (
+      'a7800000-0000-4000-8000-000000000041',
+      1,
+      v_item_1,
+      'kg',
+      1,
+      1,
+      0,
+      0
+    );
+end;
+$$;
+
+create function pg_temp.roster_pages_cover_every_item () returns boolean language plpgsql as $$
+declare
+  v_cursor uuid := null;
+  v_page jsonb;
+  v_next text;
+  v_count integer;
+  v_item uuid;
+  v_seen uuid[] := '{}'::uuid[];
+  v_catalog integer;
+  v_guard integer := 0;
+begin
+  select
+    count(*)
+  into
+    v_catalog
+  from
+    app.stock_items;
+
+  loop
+    v_guard := v_guard + 1;
+
+    if v_guard > v_catalog + 2 then
+      return false;
+    end if;
+
+    v_page := app.opening_activation_review (v_cursor, 1);
+    v_count := pg_catalog.jsonb_array_length(v_page -> 'roster');
+    v_next := v_page ->> 'next_item_id';
+
+    if v_next is not null then
+      if v_count <> 1 then
+        return false;
+      end if;
+
+      v_item := (v_page #>> '{roster,0,item_id}')::uuid;
+
+      if v_next::uuid is distinct from v_item
+      or v_item = any (v_seen) then
+        return false;
+      end if;
+
+      v_seen := v_seen || v_item;
+      v_cursor := v_item;
+    else
+      if v_count > 1 then
+        return false;
+      end if;
+
+      if v_count = 1 then
+        v_item := (v_page #>> '{roster,0,item_id}')::uuid;
+
+        if v_item = any (v_seen) then
+          return false;
+        end if;
+
+        v_seen := v_seen || v_item;
+      end if;
+
+      exit;
+    end if;
+  end loop;
+
+  if coalesce(pg_catalog.array_length(v_seen, 1), 0) <> v_catalog then
+    return false;
+  end if;
+
+  return not exists (
+    select
+      1
+    from
+      app.stock_items item
+    where
+      not item.id = any (v_seen)
+  );
 end;
 $$;
 
@@ -844,8 +1102,8 @@ select
 select
   is (
     app.accounting_processing_summary () ->> 'failed_count',
-    '2',
-    'every parked order is failed, even when a new event is pending'
+    '3',
+    'every parked order is failed, including the claimed probe order'
   );
 
 select
@@ -858,8 +1116,8 @@ select
 select
   is (
     app.accounting_processing_summary () ->> 'open_event_count',
-    '5',
-    'open events stay visible while work remains, including the event each cost input appends'
+    '8',
+    'open events stay visible while work remains, including the event each dated probe input appends'
   );
 
 select
@@ -1091,6 +1349,12 @@ select
   );
 
 select
+  ok (
+    pg_temp.roster_pages_cover_every_item (),
+    'paging the roster one item at a time visits every item once'
+  );
+
+select
   is (
     app.stock_count_derivation_detail ('a7800000-0000-4000-8000-000000000099') ->> 'found',
     'false',
@@ -1109,6 +1373,52 @@ select
     app.stock_count_derivation_detail ('a7800000-0000-4000-8000-000000000030') ->> 'waiting_for_processing',
     'true',
     'a pending order at or before the count is waiting'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)::text
+      from
+        app.accounting_work_events event
+      where
+        event.order_id = 'o-park'
+        and event.processed_at is null
+        and event.work_generation is null
+    ),
+    '0',
+    'the parked probe order has no unclaimed event'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)::text
+      from
+        app.accounting_work_events event
+      where
+        event.order_id = 'o-park'
+        and event.processed_at is null
+        and event.work_generation is not null
+    ),
+    '1',
+    'the parked probe order still holds its claimed event'
+  );
+
+select
+  is (
+    app.stock_count_derivation_detail ('a7800000-0000-4000-8000-000000000040') ->> 'waiting_for_processing',
+    'true',
+    'a parked order with only claimed events still leaves the later count waiting'
+  );
+
+select
+  is (
+    app.stock_count_derivation_detail ('a7800000-0000-4000-8000-000000000041') ->> 'waiting_for_processing',
+    'false',
+    'unresolved work after the count does not make an earlier count wait'
   );
 
 select

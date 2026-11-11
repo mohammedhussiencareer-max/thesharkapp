@@ -91,6 +91,73 @@ describe('CountDerivation', () => {
     expect(loadCountDerivation).toHaveBeenCalledWith('count-1');
   });
 
+  function withSettlement(
+    source: Detail,
+    patch: {
+      latestExpectedQty: string;
+      compensatorQty: string;
+      historyExpectedQty: string;
+      waitingForProcessing: boolean;
+    },
+  ): Detail {
+    const line = source.lines[0];
+    if (!line) throw new Error('the fixture has no line');
+    const history = line.derivations[0];
+    if (!history) throw new Error('the fixture has no derivation');
+    return {
+      ...source,
+      waitingForProcessing: patch.waitingForProcessing,
+      lines: [
+        {
+          ...line,
+          latestExpectedQty: patch.latestExpectedQty,
+          compensatorQty: patch.compensatorQty,
+          derivations: [{ ...history, expectedQty: patch.historyExpectedQty }],
+        },
+      ],
+    };
+  }
+
+  it('reloads the settlement when a refresh arrives and when reopened', async () => {
+    const compensated = withSettlement(detail, {
+      latestExpectedQty: '4.5',
+      compensatorQty: '7',
+      historyExpectedQty: '3.25',
+      waitingForProcessing: false,
+    });
+    const reopened = withSettlement(detail, {
+      latestExpectedQty: '1.25',
+      compensatorQty: '9',
+      historyExpectedQty: '0.75',
+      waitingForProcessing: false,
+    });
+    vi.mocked(loadCountDerivation)
+      .mockResolvedValueOnce(detail)
+      .mockResolvedValueOnce(compensated)
+      .mockResolvedValueOnce(reopened);
+    const view = render(<CountDerivation countId="count-1" refreshKey={0} />);
+    fireEvent.click(screen.getByRole('button', { name: 'تفاصيل الاشتقاق' }));
+    expect(await screen.findAllByText('6')).toHaveLength(2);
+    expect(screen.getByText('مستني معالجة الخصم')).toBeInTheDocument();
+
+    view.rerender(<CountDerivation countId="count-1" refreshKey={1} />);
+    expect(await screen.findByText('7')).toBeInTheDocument();
+    expect(screen.getByText('4.5')).toBeInTheDocument();
+    expect(screen.getByText('3.25')).toBeInTheDocument();
+    expect(screen.queryAllByText('6')).toHaveLength(0);
+    expect(screen.queryByText('مستني معالجة الخصم')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'تفاصيل الاشتقاق' }));
+    view.rerender(<CountDerivation countId="count-1" refreshKey={2} />);
+    fireEvent.click(screen.getByRole('button', { name: 'تفاصيل الاشتقاق' }));
+    expect(await screen.findByText('9')).toBeInTheDocument();
+    expect(screen.getByText('1.25')).toBeInTheDocument();
+    expect(screen.getByText('0.75')).toBeInTheDocument();
+    expect(screen.queryByText('7')).toBeNull();
+    expect(screen.queryByText('4.5')).toBeNull();
+    expect(loadCountDerivation).toHaveBeenCalledTimes(3);
+  });
+
   it('shows a load failure as an alert', async () => {
     vi.mocked(loadCountDerivation).mockRejectedValue(
       new Error('حصل خطأ. حاول تاني.'),

@@ -942,13 +942,29 @@ begin
     ),
     (
       select
-        extra.id
+        included.id
       from
-        ordered extra
+        (
+          select
+            ordered.id
+          from
+            ordered
+          order by
+            ordered.id
+          limit
+            v_limit
+        ) included
+      where
+        exists (
+          select
+            1
+          from
+            ordered extra
+          offset
+            v_limit
+        )
       order by
-        extra.id
-      offset
-        v_limit
+        included.id desc
       limit
         1
     )
@@ -1053,7 +1069,7 @@ begin
 end;
 $$;
 
-comment on function app.opening_activation_review (uuid, integer) is 'Owner only. One page of the stock roster, including items with no opening line. A stored opening line is a positive observation; a zero is not stored, so a missing line is not a recorded zero. The checklist and can_activate describe the whole catalog, not the page. can_activate is a data-gap flag for a later writer and is false while activation is already recorded. Does not record activation.';
+comment on function app.opening_activation_review (uuid, integer) is 'Owner only. One page of the stock roster, including items with no opening line. A stored opening line is a positive observation; a zero is not stored, so a missing line is not a recorded zero. next_item_id is the last item included on this page when another item remains, and null when the page is short. The next page starts after that id, so no item is skipped. The checklist and can_activate describe the whole catalog, not the page. can_activate is a data-gap flag for a later writer and is false while activation is already recorded. Does not record activation.';
 
 revoke all on function app.opening_activation_review (uuid, integer)
 from
@@ -1124,24 +1140,21 @@ begin
 
   v_waiting_sync := not app.count_sync_scope_covered (v_at);
 
+  -- Unprocessed events stay relevant after the order is parked. Retrying a
+  -- claimed parked order can still change the settlement, so this warning
+  -- does not use worker eligibility.
   select
     exists (
       select
         1
       from
         (
-          select
+          select distinct
             e.order_id
           from
             app.accounting_work_events e
-            left join app.accounting_work_state ws on ws.order_id = e.order_id
           where
             e.processed_at is null
-          group by
-            e.order_id
-          having
-            max(ws.failed_at) is null
-            or pg_catalog.bool_or(e.work_generation is null)
         ) pending
         left join lateral (
           select
@@ -1392,7 +1405,7 @@ begin
 end;
 $$;
 
-comment on function app.stock_count_derivation_detail (uuid) is 'Owner only. One count: original observation, latest derivation, compensators, value adjustments on that settlement, surplus, and whether a covering sync or pending accounting work still reaches the count instant. Quantities and money are decimal text. Does not post stock.';
+comment on function app.stock_count_derivation_detail (uuid) is 'Owner only. One count: original observation, latest derivation, compensators, value adjustments on that settlement, surplus, and whether a covering sync or pending accounting work still reaches the count instant. An unresolved event stays relevant after its order is parked, because retrying that order can still change the settlement. Quantities and money are decimal text. Does not post stock.';
 
 revoke all on function app.stock_count_derivation_detail (uuid)
 from

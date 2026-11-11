@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../src/lib/database.types';
@@ -14,7 +14,7 @@ export type SeededOrders = {
   stale: SeededOrder;
 };
 
-const envKey = 'E2E_ORDER_DECISIONS';
+const seededFile = join(import.meta.dirname, '.seeded-orders.json');
 const container =
   process.env.E2E_SUPABASE_DB_CONTAINER ?? 'supabase_db_thesharkapp';
 
@@ -217,8 +217,62 @@ export async function seedOrderDecisions(
     }
   }
 
-  process.env[envKey] = JSON.stringify(seeded);
+  // Another project's worker does not inherit this process's env, and the
+  // activation row cannot be removed, so the dormant project runs first.
+  writeFileSync(seededFile, `${JSON.stringify(seeded)}\n`);
   return seeded;
+}
+
+/**
+ * One mapped complete order, left pending. The activate project has already
+ * drained the queue, so processing can expect this order alone.
+ */
+export async function seedPendingAccountingOrder(
+  client: SupabaseClient<Database>,
+  apiUrl: string,
+): Promise<string> {
+  assertLocalSupabaseUrl(apiUrl);
+  const key = (1e13 - Date.now()).toString().padStart(14, '0');
+  const orderId = `order-e2e-run-${key}`;
+  const shiftId = `shift-e2e-run-${key}`;
+  const ordered = Date.now() - 2 * hour;
+  const iso = (offset: number) => new Date(ordered + offset).toISOString();
+  await ingest(
+    client,
+    shiftId,
+    {
+      id: shiftId,
+      opened_at: iso(-hour),
+      closed_at: iso(hour),
+      is_active: false,
+      pos_update_time: iso(minute),
+      drawer_cash_net: null,
+      drawer_credit: null,
+      transactions: [],
+    },
+    [
+      {
+        id: orderId,
+        order_number: 700000 + (Math.floor(Date.now() / 1000) % 100000),
+        shift_id: shiftId,
+        status: 'complete',
+        order_type: 'e2e-od-hall',
+        payment_type: 'cash',
+        ordered_at: iso(0),
+        subtotal: '50.00',
+        discount: '0.00',
+        tax: '0.00',
+        service_tax: '0.00',
+        delivery_fee: '0.00',
+        total: '50.00',
+        pos_update_time: iso(minute),
+        content_hash: createHash('sha256').update(orderId).digest('hex'),
+        lines: [lineJson(orderId, 0, { item: 'a', quantity: '1' })],
+      },
+    ],
+    0,
+  );
+  return orderId;
 }
 
 async function ingest(
@@ -226,6 +280,7 @@ async function ingest(
   shiftId: string,
   shift: Json,
   orders: Json[],
+  transactionCount = 1,
 ): Promise<void> {
   const app = client.schema('app');
   const started = await app.rpc('start_pos_sync_run', { p_mode: 'recent' });
@@ -246,7 +301,7 @@ async function ingest(
     const finished = await app.rpc('finish_pos_sync_run', {
       p_run_id: runId,
       p_status: 'ok',
-      p_counts: { orders: orders.length, transactions: 1 },
+      p_counts: { orders: orders.length, transactions: transactionCount },
       p_error: '',
     });
     if (finished.error) throw finished.error;
@@ -261,9 +316,12 @@ async function ingest(
   }
 }
 
-/** The orders global setup seeded for this run. */
+/** The orders the activate project recorded for this run. */
 export function seededOrderDecisions(): SeededOrders {
-  const text = process.env[envKey];
-  if (!text) throw new Error('global setup did not seed the order decisions');
-  return JSON.parse(text) as SeededOrders;
+  if (!existsSync(seededFile)) {
+    throw new Error(
+      'the activate project did not record the order decision fixture',
+    );
+  }
+  return JSON.parse(readFileSync(seededFile, 'utf8')) as SeededOrders;
 }

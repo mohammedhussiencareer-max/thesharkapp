@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { loadCountDerivation } from '@/accounting/api';
 import { movementLabel } from '@/accounting/labels';
 import type { CountDerivation, CountPosting } from '@/accounting/types';
@@ -92,27 +92,58 @@ function DetailBody({ detail }: { detail: CountDerivation }) {
   );
 }
 
-/** Loads derivation history for one count when the owner asks for it. */
-export function CountDerivation({ countId }: { countId: string }) {
+/**
+ * Loads derivation history for one count when the owner asks for it.
+ * A page refresh drops the cached detail. Opening again reads it again.
+ */
+export function CountDerivation({
+  countId,
+  refreshKey = 0,
+}: {
+  countId: string;
+  refreshKey?: number;
+}) {
   const [open, setOpen] = useState(false);
   const [detail, setDetail] = useState<CountDerivation | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [seenRefresh, setSeenRefresh] = useState(refreshKey);
+  if (seenRefresh !== refreshKey) {
+    setSeenRefresh(refreshKey);
+    setDetail(null);
+    setError(null);
+    if (open) setLoading(true);
+  }
 
-  async function toggle(): Promise<void> {
+  function toggle(): void {
     const next = !open;
     setOpen(next);
-    if (!next || detail || loading) return;
-    setLoading(true);
+    if (!next) return;
+    setDetail(null);
     setError(null);
-    try {
-      setDetail(await loadCountDerivation(countId));
-    } catch (failure) {
-      setError(messageFrom(failure));
-    } finally {
-      setLoading(false);
-    }
+    setLoading(true);
   }
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const next = await loadCountDerivation(countId);
+        if (cancelled) return;
+        setDetail(next);
+        setError(null);
+      } catch (failure) {
+        if (cancelled) return;
+        setError(messageFrom(failure));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, countId, refreshKey]);
 
   return (
     <div className="flex flex-col gap-2">

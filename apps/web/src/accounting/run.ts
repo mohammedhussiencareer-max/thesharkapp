@@ -123,7 +123,10 @@ export function zeroAccountingCounts(): AccountingCounts {
  * One order per call. The attempt id is chosen before the call. The first
  * call may be unbound maintenance. A later call is bound to the head the
  * previous reply named. An unknown outcome of a bound call is reported with
- * that same attempt id. A full page reload drops the in-memory id.
+ * that same attempt id. The attempt stays until the recorder returns an
+ * acknowledged terminal status: recorded, committed, duplicate, no_work, or
+ * stale. busy is not terminal, and a recorder error does not replace the
+ * worker error. A full page reload drops the in-memory id.
  * Never throws.
  */
 export async function runAccountingWork(
@@ -256,7 +259,9 @@ async function failedCall(
       );
     }
     return done('call_failed', report, error);
-  } catch (reportError) {
-    return done('call_failed', 'unreported', reportError);
+  } catch {
+    // Recording did not acknowledge a terminal status. The worker outcome is
+    // still unknown, so the recorder's error must not become the cause.
+    return done('call_failed', 'unreported', error);
   }
 }

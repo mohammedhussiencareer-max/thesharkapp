@@ -146,6 +146,64 @@ describe('ProcessingPanel', () => {
     expect(hasAction(accountingRunSubject)).toBe(true);
   });
 
+  it('keeps a bound attempt when the reported cause is a recorder refusal', async () => {
+    vi.mocked(runDeductions).mockImplementationOnce((onBound) => {
+      onBound?.({
+        attemptId: 'attempt-rec',
+        orderId: 'order-9',
+        workGeneration: 3,
+      });
+      return Promise.resolve(
+        outcome({
+          stop: 'call_failed',
+          report: 'unreported',
+          cause: writeError({
+            code: '42501',
+            message: 'permission denied raw',
+          }),
+        }),
+      );
+    });
+    render(<ProcessingPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'شغّل الخصم' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(hasAction(accountingRunSubject)).toBe(true);
+    expect(screen.queryByRole('button', { name: 'شغّل الخصم' })).toBeNull();
+    expect(screen.queryByText('المالك بس يقدر يشغّل الحساب')).toBeNull();
+  });
+
+  it('keeps the unknown attempt when a retry recording is a payload refusal', async () => {
+    vi.mocked(runDeductions).mockImplementationOnce((onBound) => {
+      onBound?.({
+        attemptId: 'attempt-3',
+        orderId: 'order-9',
+        workGeneration: 2,
+      });
+      return Promise.resolve(
+        outcome({
+          stop: 'call_failed',
+          report: 'unreported',
+          cause: Object.assign(new Error('timeout'), { code: '57014' }),
+        }),
+      );
+    });
+    vi.mocked(recordRunFailure).mockRejectedValueOnce(
+      writeError({ code: '22023', message: 'bad payload' }),
+    );
+    render(<ProcessingPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'شغّل الخصم' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(await screen.findByText('الطلب مش مظبوط')).toBeInTheDocument();
+    expect(screen.getByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(hasAction(accountingRunSubject)).toBe(true);
+    expect(recordRunFailure).toHaveBeenCalledWith({
+      attemptId: 'attempt-3',
+      orderId: 'order-9',
+      workGeneration: 2,
+    });
+  });
+
   it('settles a recorded failure and does not revive it when reload fails', async () => {
     vi.mocked(loadProcessingSummary)
       .mockResolvedValueOnce(summary)

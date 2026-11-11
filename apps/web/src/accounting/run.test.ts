@@ -204,6 +204,24 @@ describe('runAccountingWork', () => {
     expect(record).not.toHaveBeenCalled();
   });
 
+  it('keeps the worker error when recording the failure is refused', async () => {
+    const worker = Object.assign(new Error('timeout'), { code: '57014' });
+    const recorder = Object.assign(new Error('denied'), { code: '42501' });
+    const db = harness({
+      runAccountingWork: vi.fn(() => Promise.reject(worker)),
+      recordAccountingCallFailure: vi.fn(() => Promise.reject(recorder)),
+    });
+    const result = await runAccountingWork(db, {
+      clock: () => 0,
+      sleep: noSleep,
+      newAttemptId: () => 'attempt-fixed',
+    });
+    expect(result.stop).toBe('call_failed');
+    expect(result.report).toBe('unreported');
+    expect(result.cause).toBe(worker);
+    expect(result.cause).toMatchObject({ code: '57014' });
+  });
+
   it('returns call_failed when the next-work read throws', async () => {
     const db = harness({
       getNextWork: vi.fn(() => Promise.reject(new Error('down'))),

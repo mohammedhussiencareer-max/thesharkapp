@@ -15,6 +15,7 @@ import {
   accountingRetrySubject,
   accountingRunSubject,
   type AttemptReport,
+  type FailureReport,
   type RunHeld,
   type RunOutcome,
 } from '@/accounting/run';
@@ -41,6 +42,20 @@ const busyNotice = 'الحساب مشغول، حاول تاني';
 const notFailedNotice = 'الطلب مش متوقف';
 const retriedNotice = 'الطلب رجع للشغل';
 const dormantNotice = 'الخصم لسه ما اتفعّلش. التشغيل بيرجع من غير ما يكتب.';
+
+/** recorded, committed, duplicate, no_work, and stale. busy is not terminal. */
+function acknowledgedReport(status: FailureReport): boolean {
+  switch (status) {
+    case 'recorded':
+    case 'committed':
+    case 'duplicate':
+    case 'no_work':
+    case 'stale':
+      return true;
+    case 'busy':
+      return false;
+  }
+}
 
 function retireRefusal(
   subject: string,
@@ -117,7 +132,11 @@ export function ProcessingPanel() {
         setNotice(messageFrom(error));
         return;
       }
-      if (outcome.stop === 'call_failed' && isDefiniteRefusal(outcome.cause)) {
+      if (
+        outcome.stop === 'call_failed' &&
+        outcome.report === 'not_needed' &&
+        isDefiniteRefusal(outcome.cause)
+      ) {
         retireRefusal(accountingRunSubject, action.requestId, outcome.cause);
         setNotice(messageFrom(outcome.cause));
         return;
@@ -152,7 +171,7 @@ export function ProcessingPanel() {
       }
       try {
         const status = await recordRunFailure(action.report);
-        if (status === 'busy') {
+        if (!acknowledgedReport(status)) {
           setNotice(busyNotice);
           return;
         }
@@ -160,7 +179,7 @@ export function ProcessingPanel() {
         setNotice(recordedNotice);
         requestReload();
       } catch (error) {
-        settleAction(accountingRunSubject, action.requestId, error);
+        // The attempt stays until recording acknowledges a terminal status.
         setNotice(messageFrom(error));
       }
     } finally {

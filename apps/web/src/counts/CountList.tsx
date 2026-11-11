@@ -5,7 +5,13 @@ import type { CountRecord } from '@/counts/types';
 import { formatMoneyText } from '@/purchases/decimal';
 import { formatCairoDateTime } from '@/purchases/time';
 
-export function CountList({ counts }: { counts: readonly CountRecord[] }) {
+export function CountList({
+  counts,
+  refreshKey = 0,
+}: {
+  counts: readonly CountRecord[];
+  refreshKey?: number;
+}) {
   return (
     <section className="flex flex-col gap-3">
       <h2 className="text-lg font-semibold">الجرد السابق</h2>
@@ -26,7 +32,7 @@ export function CountList({ counts }: { counts: readonly CountRecord[] }) {
           {count.hasCompensator ? <p>معدّل</p> : null}
           {count.hasSurplus ? <p>{historySurplusWarning}</p> : null}
           {count.note ? <p>{count.note}</p> : null}
-          <CountDerivation countId={count.id} />
+          <CountDerivation countId={count.id} refreshKey={refreshKey} />
         </article>
       ))}
     </section>
