@@ -78,7 +78,8 @@ export function DecisionForm({
     (choice === 'made' && terminal && row.returned.length > 0);
   const basisReady = row.basisStatus === 'ready';
   const returnsShown = returnsApply && basisReady;
-  const clearing = returnsShown && clearReturned;
+  const retainedShown = !returnsShown && row.returned.length > 0;
+  const clearing = (returnsShown || retainedShown) && clearReturned;
   const parsed =
     returnsShown && !clearReturned
       ? returnedFromDraft(row.basisItems, draft)
@@ -275,6 +276,23 @@ export function DecisionForm({
         ) : (
           <p>مفيش أساس تحضير جاهز — الكميات المرتجعة مش متاحة</p>
         )
+      ) : null}
+      {retainedShown ? (
+        <fieldset className="flex flex-col gap-2" disabled={blocked}>
+          <legend className="font-semibold">الكميات المرتجعة المحفوظة</legend>
+          <p>
+            الكميات دي مش بتأثر على القرار ده، بس بتتحفظ معاه ولازم تناسب أساس
+            التحضير الحالي. لو مبقتش مناسبة امسحها.
+          </p>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={clearReturned}
+              onChange={(event) => setClearReturned(event.target.checked)}
+            />
+            امسح الكميات المرتجعة المؤكدة
+          </label>
+        </fieldset>
       ) : null}
       {flipping && reasonProblem ? <p>{reasonProblem}</p> : null}
       {problem ? <p role="alert">{problem}</p> : null}

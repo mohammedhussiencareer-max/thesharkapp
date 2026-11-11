@@ -2907,6 +2907,266 @@ select
   );
 
 -- ---------------------------------------------------------------------------
+-- Review round 3.
+-- ---------------------------------------------------------------------------
+-- A partial refund with Q = 2, R = 1 that became full and was confirmed as not
+-- made: the confirmed R is retained on the decision but posts nothing.
+create function pg_temp.carried (p_id text, p_at timestamptz) returns void language plpgsql as $$
+begin
+  perform pg_temp.mk_order(p_id, p_at, 'pos-a', 2, null, null, 100);
+  perform pg_temp.refund(p_id, p_id || 'a', 20);
+  perform pg_temp.drain();
+  perform pg_temp.decide(p_id, 'not_made', 'one kg came back', pg_temp.ret('1', '1'));
+  perform pg_temp.refund(p_id, p_id || 'b', 80);
+  perform pg_temp.drain();
+  perform pg_temp.decide(p_id, 'not_made', 'nothing was made', null);
+end;
+$$;
+
+-- Finding 1: a retained allocation is validated against the new basis.
+select
+  pg_temp.carried ('d-u1', '2030-06-12T16:00:00Z');
+
+select
+  pg_temp.edit_order ('d-u1', 0.5, null);
+
+select
+  pg_temp.drain ();
+
+insert into
+  kv
+select
+  'u1-events',
+  pg_temp.ev_count ('d-u1')::text;
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision
+      from (select pg_temp.q('d-u1') as q) x$$,
+    $$values ('quantities_changed', true)$$,
+    'h1: shrinking Q below R puts the row back in the pending queue'
+  );
+
+select
+  throws_ok (
+    $$select pg_temp.decide('d-u1', 'not_made', null, null)$$,
+    '22023',
+    'the retained returned quantities no longer fit the preparation basis; clear them or choose the decision they apply to',
+    'h1: confirming again with the retained R above the new Q is refused'
+  );
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision, pg_temp.ev_count('d-u1')::text
+      from (select pg_temp.q('d-u1') as q) x$$,
+    $$select 'quantities_changed', true, v from kv where k = 'u1-events'$$,
+    'h1: the refusal stores nothing and the review stays'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-u1', 'not_made', null, '[]'::jsonb)$$,
+    'h1: clearing the retained R is accepted'
+  );
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision, jsonb_array_length((pg_temp.ev('d-u1')).returned)
+      from (select pg_temp.q('d-u1') as q) x$$,
+    $$values (null, false, 0)$$,
+    'h1: the cleared decision leaves the review queue'
+  );
+
+select
+  pg_temp.carried ('d-u2', '2030-06-12T16:30:00Z');
+
+select
+  pg_temp.edit_order ('d-u2', 0.5, null);
+
+select
+  pg_temp.drain ();
+
+select
+  throws_ok (
+    $$select pg_temp.decide('d-u2', 'not_made', null, null)$$,
+    '22023',
+    'the retained returned quantities no longer fit the preparation basis; clear them or choose the decision they apply to',
+    'h1: the refusal is the same for another shrunk order'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-u2', 'made', 'made after all', pg_temp.ret('1', '0.25'))$$,
+    'h1: R can be corrected under the decision it applies to'
+  );
+
+select
+  results_eq (
+    $$select (q).review_reason, (pg_temp.ev('d-u2')).returned ->> 0
+      from (select pg_temp.q('d-u2') as q) x$$,
+    $$values (null, '{"returned": "0.25", "stock_item_id": "a5500000-0000-4000-8000-000000000001"}')$$,
+    'h1: the corrected R is stored and the review is cleared'
+  );
+
+select
+  pg_temp.carried ('d-u3', '2030-06-12T17:00:00Z');
+
+update app.pos_order_lines
+set
+  item_id = 'pos-c'
+where
+  order_id = 'd-u3';
+
+select
+  pg_temp.edit_order ('d-u3', null, null);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision
+      from (select pg_temp.q('d-u3') as q) x$$,
+    $$values ('items_changed', true)$$,
+    'h2: remapping the item puts the row back in the pending queue'
+  );
+
+select
+  throws_ok (
+    $$select pg_temp.decide('d-u3', 'not_made', null, null)$$,
+    '22023',
+    'the retained returned quantities no longer fit the preparation basis; clear them or choose the decision they apply to',
+    'h2: confirming again with R on an item the order no longer uses is refused'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-u3', 'not_made', null, '[]'::jsonb)$$,
+    'h2: clearing the retained R is accepted'
+  );
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision
+      from (select pg_temp.q('d-u3') as q) x$$,
+    $$values (null, false)$$,
+    'h2: the cleared decision leaves the review queue'
+  );
+
+-- Finding 2: a canceled order made with a retained R, back as a complete order.
+create function pg_temp.canceled_made (p_id text, p_at timestamptz) returns void language plpgsql as $$
+begin
+  perform pg_temp.mk_order(p_id, p_at, 'pos-a', 2, null, null, 100);
+  perform pg_temp.refund(p_id, p_id || 'a', 20);
+  perform pg_temp.drain();
+  perform pg_temp.decide(p_id, 'not_made', 'one kg came back', pg_temp.ret('1', '1'));
+  perform pg_temp.cancel(p_id, false);
+  perform pg_temp.refund(p_id, p_id || 'a', 20, false);
+  perform pg_temp.drain();
+  perform pg_temp.decide(p_id, 'made', 'it was made before the cancel', null);
+end;
+$$;
+
+select
+  pg_temp.canceled_made ('d-v1', '2030-06-12T17:30:00Z');
+
+select
+  results_eq (
+    $$select (q).current_class, (q).decision, jsonb_array_length((q).returned), pg_temp.net('d-v1', '1')
+      from (select pg_temp.q('d-v1') as q) x$$,
+    $$values ('canceled', 'made', 1, -1::numeric)$$,
+    'i1: the canceled order is made with R retained: 1 kg of waste, no refunds linked'
+  );
+
+insert into
+  kv
+select
+  'v1-events',
+  pg_temp.ev_count ('d-v1')::text;
+
+update app.pos_order_lines
+set
+  quantity = 3
+where
+  order_id = 'd-v1';
+
+select
+  pg_temp.reappear ('d-v1');
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).current_class, (q).needs_decision, pg_temp.net('d-v1', '1'),
+        pg_temp.ev_count('d-v1')::text
+      from (select pg_temp.q('d-v1') as q) x$$,
+    $$select 'quantities_changed', null, true, -1::numeric, v from kv where k = 'v1-events'$$,
+    'i1: a complete order with a new quantity waits for the owner; the waste stays, no sale of 3 is posted'
+  );
+
+select
+  results_eq (
+    $$select last_outcome, last_reason from app.accounting_work_state where order_id = 'd-v1'$$,
+    $$values ('disposition_pending', 'needs_review')$$,
+    'i1: the work state reports a pending decision'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-v1', 'made', null, null)$$,
+    'i1: the owner rebases the decision on the new quantity'
+  );
+
+select
+  results_eq (
+    $$select is_open, pg_temp.disp('d-v1'), pg_temp.net('d-v1', '1')
+      from app.order_disposition_state where order_id = 'd-v1'$$,
+    $$values (false, 'sale', -3::numeric)$$,
+    'i1: after the rebase the episode closes and the order is an ordinary 3 kg sale'
+  );
+
+select
+  pg_temp.canceled_made ('d-v2', '2030-06-12T18:00:00Z');
+
+update app.pos_order_lines
+set
+  item_id = 'pos-c'
+where
+  order_id = 'd-v2';
+
+select
+  pg_temp.reappear ('d-v2');
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).current_class, (q).needs_decision, pg_temp.net('d-v2', '1')
+      from (select pg_temp.q('d-v2') as q) x$$,
+    $$values ('items_changed', null, true, -1::numeric)$$,
+    'i2: a complete order with other items waits for the owner; the waste stays'
+  );
+
+select
+  pg_temp.canceled_made ('d-v3', '2030-06-12T18:30:00Z');
+
+select
+  pg_temp.reappear ('d-v3');
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select is_open, pg_temp.disp('d-v3'), pg_temp.net('d-v3', '1')
+      from app.order_disposition_state where order_id = 'd-v3'$$,
+    $$values (false, 'sale', -2::numeric)$$,
+    'i3: a complete order on the same basis still closes without a review'
+  );
+
+-- ---------------------------------------------------------------------------
 -- Sync in progress.
 -- ---------------------------------------------------------------------------
 insert into

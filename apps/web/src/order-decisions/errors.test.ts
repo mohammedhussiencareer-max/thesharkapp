@@ -31,6 +31,20 @@ describe('order decision errors', () => {
       }),
     ).toContain('الكمية المرتجعة');
     expect(
+      mapDecisionError({
+        code: '22023',
+        message:
+          'the retained returned quantities no longer fit the preparation basis; clear them or choose the decision they apply to',
+      }),
+    ).toContain('المحفوظة');
+    expect(
+      mapDecisionError({
+        code: '22023',
+        message:
+          'the retained returned quantities need a preparation basis; clear them or choose the decision they apply to',
+      }),
+    ).toContain('المحفوظة');
+    expect(
       mapDecisionError({ code: '55P03', hint: 'a POS sync is running' }),
     ).toContain('مزامنة');
   });

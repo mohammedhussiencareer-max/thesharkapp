@@ -289,6 +289,43 @@ describe('DecisionCard', () => {
     expect(lastWrite().returned).toBeNull();
   });
 
+  it('lets the owner clear a retained set that does not apply to the decision, and otherwise carries it', async () => {
+    vi.mocked(setOrderDisposition).mockResolvedValue(saved);
+    renderCard(
+      queueRow({
+        currentClass: 'full_refund',
+        decidedClass: 'full_refund',
+        decision: 'not_made',
+        returned: [{ stockItemId: 'item-a', returned: '0.5' }],
+      }),
+    );
+    expect(screen.queryByLabelText(/المرتجع من/)).toBeNull();
+    const clear = screen.getByRole('checkbox', {
+      name: 'امسح الكميات المرتجعة المؤكدة',
+    });
+    expect(clear).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد القرار' }));
+    await screen.findByRole('status');
+    expect(lastWrite().returned).toBeNull();
+  });
+
+  it('sends an empty list when the retained set is cleared under a decision it does not apply to', async () => {
+    vi.mocked(setOrderDisposition).mockResolvedValue(saved);
+    renderCard(
+      queueRow({
+        currentClass: null,
+        decidedClass: 'canceled',
+        returned: [{ stockItemId: 'item-a', returned: '0.5' }],
+      }),
+    );
+    fireEvent.click(
+      screen.getByRole('checkbox', { name: 'امسح الكميات المرتجعة المؤكدة' }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد القرار' }));
+    await screen.findByRole('status');
+    expect(lastWrite().returned).toEqual([]);
+  });
+
   it('does not offer returned quantities without a ready preparation basis', () => {
     renderCard(partial({ basisStatus: 'incomplete' }));
     choose('ماتعملش');

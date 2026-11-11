@@ -1402,6 +1402,7 @@ declare
   v_open boolean := false;
   v_alloc boolean := false;
   v_confirmed boolean := false;
+  v_basis_review text;
   v_closing boolean := false;
   v_review text;
   v_kept jsonb;
@@ -1515,52 +1516,11 @@ begin
       -- its basis is reviewed, because the owner confirmed it against that basis.
       v_confirmed := coalesce(pg_catalog.jsonb_array_length(v_ev.returned) > 0, false);
 
-      -- It makes the posting the preparation quantities less the returned ones
-      -- only where it applies: for a not-made partial refund the sale, for a
-      -- made terminal order the waste.
-      v_alloc := coalesce(
-        v_confirmed
-        and (
-          (
-            v_ev.decision = 'not_made'
-            and app.disposition_family (v_ctx ->> 'class') = 'partial'
-          )
-          or (
-            v_ev.decision = 'made'
-            and app.disposition_family (v_ctx ->> 'class') = 'terminal'
-          )
-        ),
-        false
-      );
-
-      -- A changed refund set is reviewed before anything else, so an order
-      -- that looks ordinary again cannot replace a decision at once.
-      if v_ctx ->> 'refund_signature' is distinct from v_ev.refund_signature then
-        v_review := 'refund_changed';
-      elsif v_ctx ->> 'class' is null
-      and v_ev.class in ('canceled', 'missing', 'none') then
-        -- The order is an ordinary sale again; the history stays.
-        v_closing := true;
-        v_alloc := false;
-
-        update app.order_disposition_state ds
-        set
-          is_open = false,
-          class = null,
-          review_reason = null,
-          cost_input_id = v_input.id,
-          context = v_ctx - 'exact' - 'res',
-          token = null,
-          updated_at = v_now
-        where
-          ds.order_id = p_order_id;
-      elsif app.disposition_family (v_ctx ->> 'class') is distinct from app.disposition_family (v_ev.class) then
-        v_review := 'class_changed';
-      elsif v_confirmed then
+      if v_confirmed then
         if v_ctx ->> 'q_status' is distinct from 'ready' then
-          v_review := 'items_changed';
+          v_basis_review := 'items_changed';
         elsif v_ctx ->> 'q_signature' is distinct from v_ev.q_signature then
-          v_review := case
+          v_basis_review := case
             when (
               select
                 pg_catalog.array_agg(
@@ -1583,6 +1543,60 @@ begin
             else 'quantities_changed'
           end;
         end if;
+      end if;
+
+      -- It makes the posting the preparation quantities less the returned ones
+      -- only where it applies: for a not-made partial refund the sale, for a
+      -- made terminal order the waste.
+      v_alloc := coalesce(
+        v_confirmed
+        and (
+          (
+            v_ev.decision = 'not_made'
+            and app.disposition_family (v_ctx ->> 'class') = 'partial'
+          )
+          or (
+            v_ev.decision = 'made'
+            and app.disposition_family (v_ctx ->> 'class') = 'terminal'
+          )
+        ),
+        false
+      );
+
+      -- A changed refund set is reviewed before anything else, so an order
+      -- that looks ordinary again cannot replace a decision at once.
+      if v_ctx ->> 'refund_signature' is distinct from v_ev.refund_signature then
+        v_review := 'refund_changed';
+      elsif v_basis_review is not null
+      and (
+        (
+          v_ctx ->> 'class' is null
+          and v_ev.class in ('canceled', 'missing', 'none')
+        )
+        or app.disposition_family (v_ctx ->> 'class') is not distinct from app.disposition_family (v_ev.class)
+      ) then
+        -- A confirmed allocation was made on another basis; this also holds
+        -- back the automatic closure of an order that is ordinary again.
+        v_review := v_basis_review;
+      elsif v_ctx ->> 'class' is null
+      and v_ev.class in ('canceled', 'missing', 'none') then
+        -- The order is an ordinary sale again; the history stays.
+        v_closing := true;
+        v_alloc := false;
+
+        update app.order_disposition_state ds
+        set
+          is_open = false,
+          class = null,
+          review_reason = null,
+          cost_input_id = v_input.id,
+          context = v_ctx - 'exact' - 'res',
+          token = null,
+          updated_at = v_now
+        where
+          ds.order_id = p_order_id;
+      elsif app.disposition_family (v_ctx ->> 'class') is distinct from app.disposition_family (v_ev.class) then
+        v_review := 'class_changed';
       end if;
 
       if v_review is not null then
@@ -2729,10 +2743,16 @@ begin
 
   v_r := coalesce(v_ret, v_ev.returned);
 
-  if v_applicable
-  and pg_catalog.jsonb_array_length(v_r) > 0 then
+  -- A confirmed allocation is checked against the current basis whether or
+  -- not it affects this posting: a retained one is stored on the new event, so
+  -- it must fit, or the owner clears it.
+  if pg_catalog.jsonb_array_length(v_r) > 0 then
     if v_ctx ->> 'q_status' <> 'ready' then
-      raise exception 'the preparation basis is not available'
+      raise exception '%',
+      case
+        when v_applicable then 'the preparation basis is not available'
+        else 'the retained returned quantities need a preparation basis; clear them or choose the decision they apply to'
+      end
         using errcode = '22023';
     end if;
 
@@ -2752,7 +2772,11 @@ begin
             and (r.value ->> 'returned')::numeric <= (q.value ->> 'quantity')::numeric
         )
     ) then
-      raise exception 'returned quantities must be listed items and not exceed the prepared quantities'
+      raise exception '%',
+      case
+        when v_applicable then 'returned quantities must be listed items and not exceed the prepared quantities'
+        else 'the retained returned quantities no longer fit the preparation basis; clear them or choose the decision they apply to'
+      end
         using errcode = '22023';
     end if;
   end if;
@@ -2888,7 +2912,7 @@ begin
 end;
 $$;
 
-comment on function app.set_order_disposition (uuid, text, text, text, text, jsonb) is 'Owner only. Records the owner''s made or not_made decision for the order''s open episode and applies it, in one transaction under the ledger lock, with the worker''s lock order. p_token is the order_decision_queue token; a changed order is 40001. A flip (a decision different from the prior one) needs a non-blank reason of at most 300 characters. p_returned replaces the cumulative returned quantities ([{stock_item_id, returned}], decimal text, zeros kept; allowed for a not-made partial refund and for a made canceled, missing or fully refunded order): a non-empty list is a confirmed set (all zeros is a confirmed zero that still needs review when the preparation basis changes), an empty list clears it, null keeps the prior ones. The request id makes the call idempotent: the same payload returns the stored result, a different payload is 22023. An unresolved refund (a negative amount) cannot be decided. Returns not_activated, without writing, before inventory activation. A running POS sync is 55P03 and the call can be retried with the same request id. Returns the outcome and the exact resulting differences as decimal text.';
+comment on function app.set_order_disposition (uuid, text, text, text, text, jsonb) is 'Owner only. Records the owner''s made or not_made decision for the order''s open episode and applies it, in one transaction under the ledger lock, with the worker''s lock order. p_token is the order_decision_queue token; a changed order is 40001. A flip (a decision different from the prior one) needs a non-blank reason of at most 300 characters. p_returned replaces the cumulative returned quantities ([{stock_item_id, returned}], decimal text, zeros kept; allowed for a not-made partial refund and for a made canceled, missing or fully refunded order): a non-empty list is a confirmed set (all zeros is a confirmed zero that still needs review when the preparation basis changes), an empty list clears it, null keeps the prior ones; a kept or confirmed set is checked against the current preparation basis even when the decision does not apply it, so the owner must clear or correct a set that no longer fits. The request id makes the call idempotent: the same payload returns the stored result, a different payload is 22023. An unresolved refund (a negative amount) cannot be decided. Returns not_activated, without writing, before inventory activation. A running POS sync is 55P03 and the call can be retried with the same request id. Returns the outcome and the exact resulting differences as decimal text.';
 
 revoke all on function app.set_order_disposition (uuid, text, text, text, text, jsonb)
 from

@@ -37,6 +37,10 @@ const phrases: ReadonlyArray<readonly [string, string]> = [
     'returned quantities must be listed items',
     'الكمية المرتجعة لازم تكون لصنف من الطلب ومتزيدش عن المحضّر',
   ],
+  [
+    'the retained returned quantities',
+    'الكميات المرتجعة المحفوظة مبقتش مناسبة لأساس التحضير — امسحها أو قرّر القرار اللي بتتطبق عليه',
+  ],
   ['a stock item is listed twice', 'صنف اتكرر في الكميات المرتجعة'],
   ['the order has no open decision', 'الطلب ده مالوش قرار مفتوح دلوقتي'],
   [
