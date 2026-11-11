@@ -17,6 +17,12 @@ describe('accounting labels', () => {
     expect(causeLabel('incomplete_application')).toBe('فيه خصم ناقص');
     expect(causeLabel('unmapped_base')).toBe('الصنف مش مربوط');
     expect(causeLabel('packaging_unreviewed')).toBe('التغليف لسه ما اتراجعش');
+    expect(causeLabel('returned_all')).toBe('الطلب اترجع كله');
+    expect(causeLabel('application')).toBe('خصم طلب');
+    expect(causeLabel('waste_document')).toBe('مستند هالك');
+    expect(causeLabel('ledger')).toBe('حركة دفتر');
+    expect(causeLabel('order_total')).toBe('إجمالي الطلب');
+    expect(causeLabel('refund')).toBe('مرتجع');
     expect(causeLabel('custom_cause')).toBe('custom_cause');
     expect(movementLabel('count_compensation')).toBe('تعويض جرد');
     expect(movementLabel('other')).toBe('other');

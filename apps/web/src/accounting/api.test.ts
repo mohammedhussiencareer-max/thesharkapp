@@ -283,11 +283,48 @@ describe('accounting mappers', () => {
       status_label: 'ناقص',
       revised: true,
       causes: ['open_orders', 'Not A Code', 'pending_applications'],
+      revisions: [
+        {
+          cause_kind: 'waste_document',
+          source_at: '2026-09-07T10:00:00.000Z',
+          is_latest: false,
+          cause_id: 'SECRETID',
+        },
+        {
+          cause_kind: 'order_total',
+          source_at: null,
+          is_latest: true,
+        },
+        { cause_kind: 'NOT A KIND', source_at: null, is_latest: false },
+        { leak: true },
+      ],
       latest_difference: zeroDifference,
       cumulative_difference: { ...zeroDifference, profit_difference: '0.00' },
     });
     expect(status.causes).toEqual(['open_orders', 'pending_applications']);
+    expect(status.revisions).toEqual([
+      {
+        causeKind: 'waste_document',
+        sourceAt: '2026-09-07T10:00:00.000Z',
+        isLatest: false,
+      },
+      { causeKind: 'order_total', sourceAt: null, isLatest: true },
+    ]);
     expect(status.revised).toBe(true);
+    expect(JSON.stringify(status)).not.toContain('SECRETID');
+    expect(JSON.stringify(status)).not.toContain('leak');
+    expect(() =>
+      shiftStatusOf({
+        shift_id: 'shift-1',
+        opened_at: '2026-01-01T00:00:00.000Z',
+        status_label: 'ناقص',
+        revised: false,
+        causes: [],
+        revisions: {},
+        latest_difference: zeroDifference,
+        cumulative_difference: zeroDifference,
+      }),
+    ).toThrow(genericCatalogError);
   });
 
   it('treats idle worker replies as no progress and requires a critical head', () => {

@@ -3,7 +3,30 @@ import { formatSignedDifference } from '@/accounting/format';
 import type {
   DifferenceVector,
   ShiftAccountingStatus,
+  ShiftRevision,
 } from '@/accounting/types';
+import { formatCairo } from '@/lib/cairo';
+
+function revisionKinds(revisions: readonly ShiftRevision[]): string[] {
+  const seen = new Set<string>();
+  const kinds: string[] = [];
+  for (const revision of revisions) {
+    if (seen.has(revision.causeKind)) continue;
+    seen.add(revision.causeKind);
+    kinds.push(revision.causeKind);
+  }
+  return kinds;
+}
+
+function latestRevision(
+  revisions: readonly ShiftRevision[],
+): ShiftRevision | null {
+  for (let index = revisions.length - 1; index >= 0; index -= 1) {
+    const revision = revisions[index];
+    if (revision?.isLatest) return revision;
+  }
+  return revisions[revisions.length - 1] ?? null;
+}
 
 function DifferenceList({
   label,
@@ -43,6 +66,10 @@ export function ShiftStatus({
   capped: boolean;
   missing: boolean;
 }) {
+  const kinds = status ? revisionKinds(status.revisions) : [];
+  const sourceAt = status
+    ? (latestRevision(status.revisions)?.sourceAt ?? null)
+    : null;
   return (
     <section aria-label="حالة الوردية" className="flex flex-col gap-1">
       <h3 className="font-semibold">حالة الوردية</h3>
@@ -63,6 +90,18 @@ export function ShiftStatus({
                 <li key={code}>{causeLabel(code)}</li>
               ))}
             </ul>
+          ) : null}
+          {kinds.length > 0 ? (
+            <ul aria-label="أسباب الفروق">
+              {kinds.map((kind) => (
+                <li key={kind}>{causeLabel(kind)}</li>
+              ))}
+            </ul>
+          ) : null}
+          {sourceAt ? (
+            <p>
+              وقت الواقعة <span dir="ltr">{formatCairo(sourceAt)}</span>
+            </p>
           ) : null}
           <DifferenceList label="آخر فرق" vector={status.latestDifference} />
           <DifferenceList

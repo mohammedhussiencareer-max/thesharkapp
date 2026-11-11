@@ -270,12 +270,20 @@ export type DifferenceVector = {
   profitDifference: string;
 };
 
+/** One revision row on a shift. Kinds match `accounting_revision_differences`. */
+export type ShiftRevision = {
+  causeKind: string;
+  sourceAt: string | null;
+  isLatest: boolean;
+};
+
 export type ShiftAccountingStatus = {
   shiftId: string;
   openedAt: string;
   statusLabel: string;
   revised: boolean;
   causes: string[];
+  revisions: ShiftRevision[];
   latestDifference: DifferenceVector;
   cumulativeDifference: DifferenceVector;
 };

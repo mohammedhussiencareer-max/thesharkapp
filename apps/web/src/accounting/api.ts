@@ -42,6 +42,7 @@ import {
   type AdjustmentRow,
   type RosterItem,
   type ShiftAccountingStatus,
+  type ShiftRevision,
   type SyncCoverage,
 } from '@/accounting/types';
 import { genericCatalogError } from '@/items/errors';
@@ -531,6 +532,39 @@ function differenceOf(value: unknown): DifferenceVector {
   };
 }
 
+const causeCode = /^[a-z0-9_]{1,64}$/;
+
+function revisionsOf(value: unknown): ShiftRevision[] {
+  if (value === null || value === undefined) return [];
+  if (!Array.isArray(value)) bad();
+  const revisions: ShiftRevision[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const row = entry as Record<string, unknown>;
+    if (typeof row.cause_kind !== 'string' || !causeCode.test(row.cause_kind)) {
+      continue;
+    }
+    if (typeof row.is_latest !== 'boolean') continue;
+    if (
+      row.source_at !== null &&
+      row.source_at !== undefined &&
+      typeof row.source_at !== 'string'
+    ) {
+      continue;
+    }
+    const sourceAt =
+      typeof row.source_at === 'string' && row.source_at.length > 0
+        ? row.source_at
+        : null;
+    revisions.push({
+      causeKind: row.cause_kind,
+      sourceAt,
+      isLatest: row.is_latest,
+    });
+  }
+  return revisions;
+}
+
 export function shiftStatusOf(value: unknown): ShiftAccountingStatus {
   const row = record(value);
   if (!Array.isArray(row.causes)) bad();
@@ -541,8 +575,9 @@ export function shiftStatusOf(value: unknown): ShiftAccountingStatus {
     revised: flag(row.revised),
     causes: row.causes.filter(
       (cause): cause is string =>
-        typeof cause === 'string' && /^[a-z0-9_]{1,64}$/.test(cause),
+        typeof cause === 'string' && causeCode.test(cause),
     ),
+    revisions: revisionsOf(row.revisions),
     latestDifference: differenceOf(row.latest_difference),
     cumulativeDifference: differenceOf(row.cumulative_difference),
   };

@@ -70,6 +70,12 @@ export const causeLabels: Record<string, string> = {
   packaging_kind: 'صنف التغليف مش تغليف',
   packaging_unit: 'وحدة التغليف مش متحولة',
   packaging_weight_unit: 'وزن التغليف مش مظبوط',
+  returned_all: 'الطلب اترجع كله',
+  application: 'خصم طلب',
+  waste_document: 'مستند هالك',
+  ledger: 'حركة دفتر',
+  order_total: 'إجمالي الطلب',
+  refund: 'مرتجع',
 };
 
 export const movementLabels: Record<string, string> = {
