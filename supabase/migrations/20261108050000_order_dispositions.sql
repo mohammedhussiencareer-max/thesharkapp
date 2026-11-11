@@ -31,6 +31,12 @@
 -- included; an empty list is cleared. A repost of the same quantities inside an
 -- episode, or when it closes, keeps the previous movement pieces. Any confirmed
 -- R is reviewed when its basis changes, whether or not the decision applies it.
+-- A reviewed terminal decision without a confirmed R is reviewed too when the
+-- preparation basis changes; the conservative made default applies meanwhile
+-- (a not_made decision is followed by a new unreviewed made event, the owner's
+-- event stays in the history). An episode closes only after the application
+-- that ends it succeeds; a blocked posting keeps the episode open, with the
+-- context and token saved, so the closing decision still gets its effect.
 -- ============================================================================
 -- 0. Lock order. The ledger advisory lock is first, then the tables this
 -- migration references by foreign key, NOWAIT, in a fixed order.
@@ -155,7 +161,7 @@ create table app.order_disposition_state (
   )
 );
 
-comment on table app.order_disposition_state is 'Derived head per order, written only by the coordinator and set_order_disposition under the ledger lock. is_open marks a running episode. class is the current classification of the latest input. review_reason is set while the application and allocation stay in force and the owner must decide again (refund_changed, class_changed, items_changed, quantities_changed), or while a negative refund amount makes the order unresolved. token is the optimistic token the owner screen must send.';
+comment on table app.order_disposition_state is 'Derived head per order, written only by the coordinator and set_order_disposition under the ledger lock. is_open marks a running episode. class is the current classification of the latest input. review_reason is set while the application and allocation stay in force and the owner must decide again (refund_changed, class_changed, items_changed, quantities_changed), or while a negative refund amount makes the order unresolved. A reviewed terminal decision without a confirmed allocation goes back to review (items_changed, quantities_changed) when the preparation basis changes. context and token are saved on every pass that leaves the episode open, also when the posting is blocked, so the row stays readable. token is the optimistic token the owner screen must send.';
 
 create table app.order_disposition_requests (
   request_id uuid primary key,
@@ -1403,6 +1409,8 @@ declare
   v_alloc boolean := false;
   v_confirmed boolean := false;
   v_basis_review text;
+  v_prep_review text;
+  v_hold text;
   v_closing boolean := false;
   v_review text;
   v_kept jsonb;
@@ -1543,6 +1551,34 @@ begin
             else 'quantities_changed'
           end;
         end if;
+      elsif v_ev.owner_reviewed
+      and app.disposition_family (v_ev.class) = 'terminal'
+      and v_ctx ->> 'prep_hash' is distinct from v_ev.prep_hash then
+        -- A reviewed canceled, missing or fully refunded decision without a
+        -- confirmed allocation was made on another preparation basis.
+        v_prep_review := case
+          when v_ctx ->> 'q_status' is distinct from 'ready'
+          or (
+            select
+              pg_catalog.array_agg(
+                e.value ->> 'stock_item_id'
+                order by
+                  e.value ->> 'stock_item_id'
+              )
+            from
+              pg_catalog.jsonb_array_elements(v_ctx -> 'q_items') as e (value)
+          ) is distinct from (
+            select
+              pg_catalog.array_agg(
+                e.value ->> 'stock_item_id'
+                order by
+                  e.value ->> 'stock_item_id'
+              )
+            from
+              pg_catalog.jsonb_array_elements(v_ev.q_items) as e (value)
+          ) then 'items_changed'
+          else 'quantities_changed'
+        end;
       end if;
 
       -- It makes the posting the preparation quantities less the returned ones
@@ -1580,21 +1616,11 @@ begin
         v_review := v_basis_review;
       elsif v_ctx ->> 'class' is null
       and v_ev.class in ('canceled', 'missing', 'none') then
-        -- The order is an ordinary sale again; the history stays.
+        -- The order is an ordinary sale again; the history stays. The episode
+        -- closes only once its application is recorded (end of this function),
+        -- so a blocked posting is retried with the same decision.
         v_closing := true;
         v_alloc := false;
-
-        update app.order_disposition_state ds
-        set
-          is_open = false,
-          class = null,
-          review_reason = null,
-          cost_input_id = v_input.id,
-          context = v_ctx - 'exact' - 'res',
-          token = null,
-          updated_at = v_now
-        where
-          ds.order_id = p_order_id;
       elsif app.disposition_family (v_ctx ->> 'class') is distinct from app.disposition_family (v_ev.class) then
         v_review := 'class_changed';
       end if;
@@ -1641,6 +1667,81 @@ begin
       end if;
 
       if not v_closing then
+        if v_prep_review is not null then
+          -- The preparation basis changed under a reviewed terminal decision:
+          -- the owner reviews again and the conservative made default applies
+          -- meanwhile. A not-made decision gets a new unreviewed default event
+          -- (the owner's event stays in the history); a made one already is it.
+          v_hold := v_prep_review;
+
+          if v_ev.decision = 'not_made' then
+            insert into
+              app.order_disposition_events (
+                order_id,
+                episode,
+                decision,
+                class,
+                source,
+                owner_reviewed,
+                actor,
+                reason,
+                prior_event_id,
+                cost_input_id,
+                prep_snapshot_id,
+                prep_hash,
+                q_items,
+                q_signature,
+                refund_revision_ids,
+                refund_signature,
+                order_total,
+                refund_total,
+                returned
+              )
+            values
+              (
+                p_order_id,
+                v_ds.episode,
+                'made',
+                v_ctx ->> 'class',
+                'system_default',
+                false,
+                null,
+                null,
+                v_ev.id,
+                v_input.id,
+                (v_ctx ->> 'prep_snapshot_id')::bigint,
+                v_ctx ->> 'prep_hash',
+                v_ctx -> 'q_items',
+                v_ctx ->> 'q_signature',
+                v_input.refund_revision_ids,
+                v_ctx ->> 'refund_signature',
+                v_ev.order_total,
+                (v_ctx ->> 'refund_total')::numeric,
+                '[]'::jsonb
+              )
+            returning
+              * into v_ev;
+
+            update app.order_disposition_state ds
+            set
+              event_id = v_ev.id,
+              class = v_ctx ->> 'class',
+              review_reason = v_hold,
+              cost_input_id = v_input.id,
+              context = v_ctx - 'exact' - 'res',
+              token = app.disposition_token (v_ctx, v_ev.id),
+              updated_at = v_now
+            where
+              ds.order_id = p_order_id;
+          end if;
+        elsif not v_ev.owner_reviewed
+        and v_ev.prior_event_id is not null
+        and v_ds.review_reason in ('items_changed', 'quantities_changed') then
+          -- The default that replaced a reviewed decision keeps the reason the
+          -- owner is asked about until the owner decides.
+          v_hold := v_ds.review_reason;
+        end if;
+
         v_open := true;
         v_path := case
           when app.disposition_family (v_ev.class) = 'terminal'
@@ -1699,6 +1800,10 @@ begin
       returning
         * into v_ev;
 
+      v_ctx := v_ctx || pg_catalog.jsonb_build_object('sig_same', true);
+
+      -- The row is readable and decidable from the start, even when the
+      -- posting below is blocked and returns early.
       update app.order_disposition_state ds
       set
         episode = v_episode,
@@ -1706,11 +1811,13 @@ begin
         event_id = v_ev.id,
         class = v_ctx ->> 'class',
         review_reason = null,
-        cost_input_id = v_input.id
+        cost_input_id = v_input.id,
+        context = v_ctx - 'exact' - 'res',
+        token = app.disposition_token (v_ctx, v_ev.id),
+        updated_at = v_now
       where
         ds.order_id = p_order_id;
 
-      v_ctx := v_ctx || pg_catalog.jsonb_build_object('sig_same', true);
       v_open := true;
       v_path := case
         when app.disposition_family (v_ev.class) = 'terminal' then 'waste'
@@ -2074,6 +2181,27 @@ begin
             pg_catalog.jsonb_array_elements(v_reqs) as e (value);
         end if;
 
+        -- An open or closing episode keeps its current context and token, so
+        -- the owner can read and decide the row while the posting is blocked.
+        if v_open
+        or v_closing then
+          update app.order_disposition_state ds
+          set
+            class = v_ctx ->> 'class',
+            review_reason = coalesce(
+              v_hold,
+              case
+                when v_ctx ->> 'class' = 'unresolved_refund' then 'unresolved_refund'
+              end
+            ),
+            cost_input_id = v_input.id,
+            context = v_ctx - 'exact' - 'res',
+            token = app.disposition_token (v_ctx, v_ev.id),
+            updated_at = v_now
+          where
+            ds.order_id = p_order_id;
+        end if;
+
         update app.order_cost_state h
         set
           latest_input_id = v_input.id,
@@ -2276,10 +2404,12 @@ begin
       update app.order_disposition_state ds
       set
         class = v_ctx ->> 'class',
-        review_reason = case
-          when v_ctx ->> 'class' = 'unresolved_refund' then 'unresolved_refund'
-          else null
-        end,
+        review_reason = coalesce(
+          v_hold,
+          case
+            when v_ctx ->> 'class' = 'unresolved_refund' then 'unresolved_refund'
+          end
+        ),
         cost_input_id = v_input.id,
         context = v_ctx - 'exact' - 'res',
         token = app.disposition_token (v_ctx, v_ev.id),
@@ -2287,6 +2417,22 @@ begin
       where
         ds.order_id = p_order_id;
     end if;
+  end if;
+
+  -- The episode of an order that is ordinary again closes only now that its
+  -- application is recorded, with the closing decision's effect already linked.
+  if v_closing then
+    update app.order_disposition_state ds
+    set
+      is_open = false,
+      class = null,
+      review_reason = null,
+      cost_input_id = v_input.id,
+      context = v_ctx - 'exact' - 'res',
+      token = null,
+      updated_at = v_now
+    where
+      ds.order_id = p_order_id;
   end if;
 
   return pg_catalog.jsonb_build_object(
@@ -2307,7 +2453,7 @@ begin
 end;
 $$;
 
-comment on function app.process_order_accounting (text, uuid, integer) is 'Evaluates one order against its latest cost input and brings its stock effect to the desired state: retire every movement of the previous application, then post the replacement at the snapshot instant and shift, or record an incomplete or none result. An identical economic signature writes an evaluation receipt only. missing_cost_basis rolls the transition back and returns blocked. Canceled, missing and refunded orders open a decision episode with a system default (made) the first time they appear: canceled, missing and fully refunded orders post prepared waste of the preparation basis when made and nothing when not made; a partial refund stays a sale, and when not made with confirmed returned quantities it posts the kept quantities (preparation quantities of the retained preparation basis less the returned ones); a made terminal order with confirmed returned quantities posts prepared waste of the same kept quantities. A repost of unchanged quantities inside an episode keeps the previous movement pieces (one line per piece). The refund set is compared before an order that looks ordinary again closes its episode, and the owner''s closing decision records its effect before the episode closes. Missing takes precedence over the underlying status. A change of the linked refund set, of the class family, or (for a returned allocation) of the preparation quantities leaves the application and allocation in force and returns disposition_pending for an owner decision. Without an episode the path is the PR 4 path. A sale or waste takes its same-instant event position once, from order_cost_state.event_position. Caller holds the ledger lock. Private.';
+comment on function app.process_order_accounting (text, uuid, integer) is 'Evaluates one order against its latest cost input and brings its stock effect to the desired state: retire every movement of the previous application, then post the replacement at the snapshot instant and shift, or record an incomplete or none result. An identical economic signature writes an evaluation receipt only. missing_cost_basis rolls the transition back and returns blocked. Canceled, missing and refunded orders open a decision episode with a system default (made) the first time they appear: canceled, missing and fully refunded orders post prepared waste of the preparation basis when made and nothing when not made; a partial refund stays a sale, and when not made with confirmed returned quantities it posts the kept quantities (preparation quantities of the retained preparation basis less the returned ones); a made terminal order with confirmed returned quantities posts prepared waste of the same kept quantities. A repost of unchanged quantities inside an episode keeps the previous movement pieces (one line per piece). The refund set is compared before an order that looks ordinary again closes its episode, and the owner''s closing decision records its effect before the episode closes; the episode closes only after the application succeeds, so a blocked posting keeps it open and the retry links the effect to the closing decision. A blocked result saves the current context and token on the decision state first. A reviewed canceled, missing or fully refunded decision without a confirmed allocation whose preparation basis changed (hash) is reviewed again (items_changed or quantities_changed) with the conservative made default meanwhile: a not_made decision is followed by a new unreviewed made event. Missing takes precedence over the underlying status. A change of the linked refund set, of the class family, or (for a returned allocation) of the preparation quantities leaves the application and allocation in force and returns disposition_pending for an owner decision. Without an episode the path is the PR 4 path. A sale or waste takes its same-instant event position once, from order_cost_state.event_position. Caller holds the ledger lock. Private.';
 
 revoke all on function app.process_order_accounting (text, uuid, integer)
 from

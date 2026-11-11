@@ -3167,6 +3167,495 @@ select
   );
 
 -- ---------------------------------------------------------------------------
+-- Final review.
+-- ---------------------------------------------------------------------------
+-- Fish e and f have no cost basis (no purchase, no opening price) until the
+-- purchase below, so any posting of them is blocked.
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    parent_item_id
+  )
+values
+  (
+    'a5500000-0000-4000-8000-000000000005',
+    'p55-fish-e',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  ),
+  (
+    'a5500000-0000-4000-8000-000000000006',
+    'p55-fish-f',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  );
+
+insert into
+  app.item_loss_versions (
+    effective_from,
+    created_change_id,
+    item_id,
+    loss_pct
+  )
+select
+  '2000-01-01 00:00:00+00',
+  (
+    select
+      id
+    from
+      app.costing_changes
+    where
+      request_id = 'a5500000-0000-4000-8000-0000000000c0'
+  ),
+  i.id,
+  0
+from
+  app.stock_items i
+where
+  i.name in ('p55-fish-e', 'p55-fish-f');
+
+select
+  pg_temp.policies ('pos-g');
+
+select
+  pg_temp.policies ('pos-h');
+
+select
+  pg_temp.map_stock (
+    'pos-g',
+    'a5500000-0000-4000-8000-000000000005',
+    '1',
+    '2030-01-01T00:00:00Z'
+  );
+
+select
+  pg_temp.map_stock (
+    'pos-h',
+    'a5500000-0000-4000-8000-000000000006',
+    '1',
+    '2030-01-01T00:00:00Z'
+  );
+
+-- Finding 1: a newly canceled order whose waste cannot be costed yet.
+select
+  pg_temp.mk_order (
+    'd-w1',
+    '2030-06-13T09:00:00Z',
+    'pos-g',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.cancel ('d-w1', false);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select last_outcome, last_reason from app.accounting_work_state where order_id = 'd-w1'$$,
+    $$values ('blocked', 'missing_cost_basis')$$,
+    'j1: the default waste of the new cancel is blocked for want of a cost basis'
+  );
+
+select
+  results_eq (
+    $$select (q).token is not null, (q).basis_status, (q).current_class, (q).decision, (q).needs_decision
+      from (select pg_temp.q('d-w1') as q) x$$,
+    $$values (true, 'ready', 'canceled', 'made', true)$$,
+    'j2: the blocked row still carries its token and preparation basis, so it can be read and decided'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-w1', 'not_made', 'it was never prepared')$$,
+    'j3: the owner can choose not made while the waste is blocked'
+  );
+
+select
+  results_eq (
+    $$select (q).decision, (q).owner_reviewed, (q).needs_decision, pg_temp.moves('d-w1')::text
+      from (select pg_temp.q('d-w1') as q) x$$,
+    $$values ('not_made', true, false, '0')$$,
+    'j4: the decision is stored and nothing is posted'
+  );
+
+select
+  pg_temp.mk_order (
+    'd-w2',
+    '2030-06-13T09:30:00Z',
+    'pos-g',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.cancel ('d-w2', false);
+
+select
+  pg_temp.drain ();
+
+-- Finding 2: a closing decision confirmed while the sale is blocked. A partial
+-- refund with a confirmed R = Q posts nothing, then the refund is removed.
+select
+  pg_temp.mk_order (
+    'd-w3',
+    '2030-06-13T10:00:00Z',
+    'pos-g',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.refund ('d-w3', 'w3a', 20);
+
+select
+  pg_temp.drain ();
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-w3', 'not_made', 'all of it came back', pg_temp.ret('5', '2'))$$,
+    'k1: the partial refund is not made with R = Q'
+  );
+
+select
+  results_eq (
+    $$select pg_temp.disp('d-w3'), pg_temp.moves('d-w3')::text$$,
+    $$values ('none', '0')$$,
+    'k1: nothing is posted for the order'
+  );
+
+select
+  pg_temp.refund ('d-w3', 'w3a', 20, false);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).current_class, (q).needs_decision
+      from (select pg_temp.q('d-w3') as q) x$$,
+    $$values ('refund_changed', null, true)$$,
+    'k2: the removed refund puts the order back in the pending queue'
+  );
+
+select
+  is (
+    pg_temp.decide ('d-w3', 'made', 'the refund was a mistake') ->> 'outcome',
+    'blocked',
+    'k3: confirming the closing decision posts nothing while the sale is blocked'
+  );
+
+select
+  results_eq (
+    $$select s.is_open, (q).decided_class, (q).current_class, (q).decision, (q).token is not null,
+        (q).basis_status, (q).needs_decision
+      from app.order_disposition_state s, (select pg_temp.q('d-w3') as q) x
+      where s.order_id = 'd-w3'$$,
+    $$values (true, 'none', null, 'made', true, 'ready', false)$$,
+    'k4: the episode stays open and readable until the closing decision is applied'
+  );
+
+-- An order that is ordinary again, closed automatically, with its sale blocked.
+select
+  pg_temp.mk_order (
+    'd-w4',
+    '2030-06-13T10:30:00Z',
+    'pos-h',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.cancel ('d-w4', false);
+
+select
+  pg_temp.drain ();
+
+select
+  pg_temp.reappear ('d-w4');
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select s.is_open, (q).current_class, (q).token is not null, w.last_outcome
+      from app.order_disposition_state s
+      join app.accounting_work_state w on w.order_id = s.order_id,
+      (select pg_temp.q('d-w4') as q) x
+      where s.order_id = 'd-w4'$$,
+    $$values (true, null, true, 'blocked')$$,
+    'k5: an order that is ordinary again does not close while its sale is blocked'
+  );
+
+-- The opening cost basis arrives and wakes the blocked work.
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(
+      jsonb_build_object('item_id', 'a5500000-0000-4000-8000-000000000005', 'movement_type', 'purchase',
+        'occurred_at', '2030-05-01T00:00:00Z', 'quantity', 20, 'unit_cost', 4),
+      jsonb_build_object('item_id', 'a5500000-0000-4000-8000-000000000006', 'movement_type', 'purchase',
+        'occurred_at', '2030-05-01T00:00:00Z', 'quantity', 20, 'unit_cost', 5)
+    ))$$,
+    'j5: fish e and f are bought'
+  );
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).token is not null, (q).needs_decision, pg_temp.net('d-w2', '5')
+      from (select pg_temp.q('d-w2') as q) x$$,
+    $$values (true, true, -2::numeric)$$,
+    'j5: the woken default waste posts and the row stays readable'
+  );
+
+select
+  results_eq (
+    $$select s.is_open, pg_temp.disp('d-w3'), pg_temp.net('d-w3', '5')
+      from app.order_disposition_state s where s.order_id = 'd-w3'$$,
+    $$values (false, 'sale', -2::numeric)$$,
+    'k6: the woken closing decision posts the 2 kg sale and then closes the episode'
+  );
+
+select
+  is (
+    (
+      select
+        a.stock_qty_delta
+      from
+        app.order_disposition_applications a
+      where
+        a.event_id = (pg_temp.ev ('d-w3')).id
+    ),
+    -2::numeric,
+    'k6: the sale is linked to the closing decision'
+  );
+
+select
+  results_eq (
+    $$select s.is_open, pg_temp.disp('d-w4'), pg_temp.net('d-w4', '6')
+      from app.order_disposition_state s where s.order_id = 'd-w4'$$,
+    $$values (false, 'sale', -2::numeric)$$,
+    'k7: the order that is ordinary again closes once its sale posts'
+  );
+
+-- Finding 3: a reviewed terminal decision without an allocation, then a revised
+-- preparation snapshot.
+create function pg_temp.canceled_not_made (p_id text, p_at timestamptz) returns void language plpgsql as $$
+begin
+  perform pg_temp.mk_order(p_id, p_at, 'pos-a', 2, null, null, 100);
+  perform pg_temp.drain();
+  perform pg_temp.cancel(p_id, false);
+  perform pg_temp.drain();
+  perform pg_temp.decide(p_id, 'not_made', 'it was never made');
+end;
+$$;
+
+select
+  pg_temp.canceled_not_made ('d-y1', '2030-06-14T09:00:00Z');
+
+select
+  results_eq (
+    $$select (q).decision, (q).owner_reviewed, (q).needs_decision, pg_temp.net('d-y1', '1')
+      from (select pg_temp.q('d-y1') as q) x$$,
+    $$values ('not_made', true, false, 0::numeric)$$,
+    'l1: the canceled order is reviewed as not made and posts nothing'
+  );
+
+insert into
+  kv
+select
+  'y1-events',
+  pg_temp.ev_count ('d-y1')::text;
+
+select
+  pg_temp.edit_order ('d-y1', null, 130);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision, (q).decision, (q).owner_reviewed, pg_temp.ev_count('d-y1')::text,
+        pg_temp.net('d-y1', '1')
+      from (select pg_temp.q('d-y1') as q) x$$,
+    $$select null, false, 'not_made', true, v, 0::numeric from kv where k = 'y1-events'$$,
+    'l2: a total-only edit leaves the preparation hash, so the reviewed decision is kept'
+  );
+
+select
+  pg_temp.edit_order ('d-y1', 3, null);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision, (q).decision, (q).source, (q).owner_reviewed,
+        pg_temp.ev_count('d-y1') - v::bigint, pg_temp.net('d-y1', '1')
+      from (select pg_temp.q('d-y1') as q) x, kv where k = 'y1-events'$$,
+    $$values ('quantities_changed', true, 'made', 'system_default', false, 1::bigint, -3::numeric)$$,
+    'l3: new quantities under a reviewed not-made decision: review, and the made default wastes 3 kg meanwhile'
+  );
+
+select
+  results_eq (
+    $$select h ->> 'decision', h ->> 'source'
+      from (select jsonb_array_elements((pg_temp.q('d-y1')).history) as h) x
+      order by (h ->> 'event_id')::bigint$$,
+    $$values ('made', 'system_default'), ('not_made', 'owner'), ('made', 'system_default')$$,
+    'l3: the owner''s decision stays in the history between the two defaults'
+  );
+
+select
+  pg_temp.edit_order ('d-y1', null, 140);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision, (q).decision, pg_temp.ev_count('d-y1') - v::bigint,
+        pg_temp.net('d-y1', '1')
+      from (select pg_temp.q('d-y1') as q) x, kv where k = 'y1-events'$$,
+    $$values ('quantities_changed', true, 'made', 1::bigint, -3::numeric)$$,
+    'l4: a later evaluation keeps the pending review and adds no event'
+  );
+
+select
+  throws_ok (
+    $$select pg_temp.decide('d-y1', 'not_made', null)$$,
+    '22023',
+    'a reason is required to change a decision',
+    'l5: returning to not made after the default needs a reason'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-y1', 'not_made', 'still not made')$$,
+    'l5: the owner reviews the new basis and decides not made again'
+  );
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision, (q).decision, (q).owner_reviewed, pg_temp.net('d-y1', '1')
+      from (select pg_temp.q('d-y1') as q) x$$,
+    $$values (null, false, 'not_made', true, 0::numeric)$$,
+    'l5: the review is cleared and the waste is retired'
+  );
+
+select
+  pg_temp.canceled_not_made ('d-y2', '2030-06-14T09:30:00Z');
+
+update app.pos_order_lines
+set
+  item_id = 'pos-c'
+where
+  order_id = 'd-y2';
+
+select
+  pg_temp.edit_order ('d-y2', null, null);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision, (q).decision, pg_temp.net('d-y2', '1'), pg_temp.net('d-y2', '2')
+      from (select pg_temp.q('d-y2') as q) x$$,
+    $$values ('items_changed', true, 'made', 0::numeric, -2::numeric)$$,
+    'l6: other items under a reviewed not-made decision: review, and the made default wastes the new items'
+  );
+
+-- A made decision follows the new basis and is reviewed again.
+select
+  pg_temp.mk_order (
+    'd-y3',
+    '2030-06-14T10:00:00Z',
+    'pos-a',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.cancel ('d-y3', false);
+
+select
+  pg_temp.drain ();
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-y3', 'made')$$,
+    'l7: the owner confirms the made default'
+  );
+
+insert into
+  kv
+select
+  'y3-events',
+  pg_temp.ev_count ('d-y3')::text;
+
+select
+  pg_temp.edit_order ('d-y3', 3, null);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision, (q).decision, (q).source, pg_temp.ev_count('d-y3') - v::bigint,
+        pg_temp.net('d-y3', '1')
+      from (select pg_temp.q('d-y3') as q) x, kv where k = 'y3-events'$$,
+    $$values ('quantities_changed', true, 'made', 'owner', 0::bigint, -3::numeric)$$,
+    'l7: new quantities under a reviewed made decision: review, the waste follows the new basis, no extra event'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-y3', 'made')$$,
+    'l8: the owner confirms the made decision on the new basis'
+  );
+
+select
+  pg_temp.edit_order ('d-y3', null, 150);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision, pg_temp.net('d-y3', '1')
+      from (select pg_temp.q('d-y3') as q) x$$,
+    $$values (null, false, -3::numeric)$$,
+    'l8: the unchanged hash keeps the confirmed made decision'
+  );
+
+-- ---------------------------------------------------------------------------
 -- Sync in progress.
 -- ---------------------------------------------------------------------------
 insert into

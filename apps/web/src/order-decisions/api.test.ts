@@ -127,6 +127,64 @@ describe('order decisions api', () => {
       expect(rowOf(rawRow({ current_class: null })).currentClass).toBeNull();
     });
 
+    it('accepts a closing decision that is still open while its posting is blocked', () => {
+      const row = rowOf(
+        rawRow({
+          current_class: null,
+          decided_class: 'none',
+          decision: 'made',
+          source: 'owner',
+          owner_reviewed: true,
+          needs_decision: false,
+          token: 'token-2',
+        }),
+      );
+      expect(row.currentClass).toBeNull();
+      expect(row.decidedClass).toBe('none');
+      expect(row.token).toBe('token-2');
+    });
+
+    it('accepts the made default that replaced a reviewed decision', () => {
+      const history = (
+        eventId: number,
+        decision: string,
+        source: string,
+        reviewed: boolean,
+      ) => ({
+        event_id: eventId,
+        episode: 1,
+        decision,
+        class: 'canceled',
+        source,
+        owner_reviewed: reviewed,
+        reason: null,
+        created_at: '2030-06-01T10:00:00+00:00',
+        returned: [],
+        differences: okResult.differences,
+      });
+      const row = rowOf(
+        rawRow({
+          review_reason: 'quantities_changed',
+          event_id: 13,
+          history: [
+            history(13, 'made', 'system_default', false),
+            history(12, 'not_made', 'owner', true),
+            history(11, 'made', 'system_default', false),
+          ],
+        }),
+      );
+      expect(row.reviewReason).toBe('quantities_changed');
+      expect(row.source).toBe('system_default');
+      expect(row.history.map((entry) => entry.eventId)).toEqual([13, 12, 11]);
+    });
+
+    it('refuses a row without a token or a preparation basis status', () => {
+      expect(() => rowOf(rawRow({ token: null }))).toThrow(genericCatalogError);
+      expect(() => rowOf(rawRow({ basis_status: null }))).toThrow(
+        genericCatalogError,
+      );
+    });
+
     it('refuses a JSON number for money', () => {
       expect(() => rowOf(rawRow({ order_total: 180 }))).toThrow(
         genericCatalogError,
