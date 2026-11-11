@@ -279,6 +279,40 @@ select
             'options', '[]'::jsonb
           )
         )
+      ),
+      jsonb_build_object(
+        'id', 'order-seed-3',
+        'order_number', 1003,
+        'shift_id', 'shift-seed-1',
+        'status', 'canceled',
+        'order_type', 'takeaway',
+        'payment_type', 'cash',
+        'ordered_at', '2026-08-07T13:00:00Z',
+        'subtotal', 60,
+        'discount', 0,
+        'tax', 0,
+        'service_tax', 0,
+        'delivery_fee', 0,
+        'total', 60,
+        'financial_revision', 1,
+        'last_financial_operation_key', 'op-seed-3',
+        'pos_update_time', '2026-08-07T13:00:00Z',
+        'content_hash', repeat('ef', 32),
+        'lines', jsonb_build_array(
+          jsonb_build_object(
+            'line_id', 'line-seed-3',
+            'item_id', 'item-seed-1',
+            'item_name', 'Seed item',
+            'size_name', 'Large',
+            'quantity', 1,
+            'weighted_qty', null,
+            'weighted_unit', 'kg',
+            'unit_price', 60,
+            'price_per_kg', null,
+            'line_total', 60,
+            'options', '[]'::jsonb
+          )
+        )
       )
     ),
     null
@@ -318,8 +352,25 @@ begin
     'b4c00000-0000-4000-8000-000000000404', 1,
     r -> 'head' ->> 'order_id', (r -> 'head' ->> 'work_generation')::integer
   );
+  r := app.run_accounting_work(
+    'b4c00000-0000-4000-8000-000000000407', 1,
+    r -> 'head' ->> 'order_id', (r -> 'head' ->> 'work_generation')::integer
+  );
 end;
 $$;
+
+-- Order dispositions: the canceled order has a system default; the owner flips
+-- it, which writes an owner event (actor is an owner foreign key), a stored
+-- request and an application effect.
+select
+  app.set_order_disposition (
+    'b4c00000-0000-4000-8000-000000000406',
+    'order-seed-3',
+    'not_made',
+    (select token from app.order_decision_queue where order_id = 'order-seed-3'),
+    'seed flip',
+    null
+  );
 
 insert into
   app.accounting_work_attempts (

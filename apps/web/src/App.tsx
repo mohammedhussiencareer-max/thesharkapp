@@ -11,6 +11,7 @@ import { PackagingPage } from '@/pages/PackagingPage';
 import { ItemsPage } from '@/pages/ItemsPage';
 import { LoginPage } from '@/pages/LoginPage';
 import { OpeningPage } from '@/pages/OpeningPage';
+import { OrderDecisionsPage } from '@/pages/OrderDecisionsPage';
 import { PurchasesPage } from '@/pages/PurchasesPage';
 import { RecipeImportPage } from '@/pages/RecipeImportPage';
 import { RecipePage } from '@/pages/RecipePage';
@@ -139,6 +140,14 @@ export function AppRoutes() {
         element={
           <RequireOwner>
             <CountsPage />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/order-decisions"
+        element={
+          <RequireOwner>
+            <OrderDecisionsPage />
           </RequireOwner>
         }
       />

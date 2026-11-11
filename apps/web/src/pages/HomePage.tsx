@@ -72,6 +72,12 @@ export function HomePage({
       >
         المصاريف
       </Link>
+      <Link
+        className="inline-flex w-fit rounded bg-neutral-900 px-3 py-2 text-white"
+        to="/order-decisions"
+      >
+        قرارات الطلبات
+      </Link>
       <button type="button" onClick={onSignOut}>
         تسجيل الخروج
       </button>

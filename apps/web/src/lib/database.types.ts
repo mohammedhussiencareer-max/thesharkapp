@@ -535,6 +535,134 @@ isOneToOne: false
       referencedColumns: ["id"]
     }
                   ]
+                },"order_disposition_applications": {
+                  Row: {
+                    "application_id": number,"cogs_cost_delta": number,"created_at": string,"event_id": number,"order_id": string,"profit_delta": number,"stock_qty_delta": number,"stock_value_delta": number,"waste_cost_delta": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "application_id": number,"cogs_cost_delta": number,"created_at"?: string,"event_id": number,"order_id": string,"profit_delta": number,"stock_qty_delta": number,"stock_value_delta": number,"waste_cost_delta": number
+                  }
+                  Update: {
+                    "application_id"?: number,"cogs_cost_delta"?: number,"created_at"?: string,"event_id"?: number,"order_id"?: string,"profit_delta"?: number,"stock_qty_delta"?: number,"stock_value_delta"?: number,"waste_cost_delta"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "order_disposition_applications_application_id_fkey"
+      columns: ["application_id"]
+isOneToOne: true
+      referencedRelation: "order_cost_applications"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "order_disposition_applications_event_id_fkey"
+      columns: ["event_id"]
+isOneToOne: false
+      referencedRelation: "order_decision_queue"
+      referencedColumns: ["event_id"]
+    },{
+      foreignKeyName: "order_disposition_applications_event_id_fkey"
+      columns: ["event_id"]
+isOneToOne: false
+      referencedRelation: "order_disposition_events"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"order_disposition_events": {
+                  Row: {
+                    "actor": string | null,"class": string,"cost_input_id": number,"created_at": string,"decision": string,"episode": number,"id": number,"order_id": string,"order_total": number,"owner_reviewed": boolean,"prep_hash": string | null,"prep_snapshot_id": number | null,"prior_event_id": number | null,"q_items": NonNullable<Json>,"q_signature": string | null,"reason": string | null,"refund_revision_ids": (number)[],"refund_signature": string,"refund_total": number,"returned": NonNullable<Json>,"source": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "actor"?: string | null,"class": string,"cost_input_id": number,"created_at"?: string,"decision": string,"episode": number,"id"?: never,"order_id": string,"order_total": number,"owner_reviewed": boolean,"prep_hash"?: string | null,"prep_snapshot_id"?: number | null,"prior_event_id"?: number | null,"q_items"?: NonNullable<Json>,"q_signature"?: string | null,"reason"?: string | null,"refund_revision_ids"?: (number)[],"refund_signature": string,"refund_total": number,"returned"?: NonNullable<Json>,"source": string
+                  }
+                  Update: {
+                    "actor"?: string | null,"class"?: string,"cost_input_id"?: number,"created_at"?: string,"decision"?: string,"episode"?: number,"id"?: never,"order_id"?: string,"order_total"?: number,"owner_reviewed"?: boolean,"prep_hash"?: string | null,"prep_snapshot_id"?: number | null,"prior_event_id"?: number | null,"q_items"?: NonNullable<Json>,"q_signature"?: string | null,"reason"?: string | null,"refund_revision_ids"?: (number)[],"refund_signature"?: string,"refund_total"?: number,"returned"?: NonNullable<Json>,"source"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "order_disposition_events_cost_input_id_fkey"
+      columns: ["cost_input_id"]
+isOneToOne: false
+      referencedRelation: "pos_cost_inputs"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "order_disposition_events_prep_snapshot_id_fkey"
+      columns: ["prep_snapshot_id"]
+isOneToOne: false
+      referencedRelation: "pos_order_snapshots"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "order_disposition_events_prior_event_id_fkey"
+      columns: ["prior_event_id"]
+isOneToOne: false
+      referencedRelation: "order_decision_queue"
+      referencedColumns: ["event_id"]
+    },{
+      foreignKeyName: "order_disposition_events_prior_event_id_fkey"
+      columns: ["prior_event_id"]
+isOneToOne: false
+      referencedRelation: "order_disposition_events"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"order_disposition_requests": {
+                  Row: {
+                    "created_at": string,"event_id": number,"order_id": string,"payload_hash": string,"request_id": string,"result": NonNullable<Json>
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_at"?: string,"event_id": number,"order_id": string,"payload_hash": string,"request_id": string,"result": NonNullable<Json>
+                  }
+                  Update: {
+                    "created_at"?: string,"event_id"?: number,"order_id"?: string,"payload_hash"?: string,"request_id"?: string,"result"?: NonNullable<Json>
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "order_disposition_requests_event_id_fkey"
+      columns: ["event_id"]
+isOneToOne: false
+      referencedRelation: "order_decision_queue"
+      referencedColumns: ["event_id"]
+    },{
+      foreignKeyName: "order_disposition_requests_event_id_fkey"
+      columns: ["event_id"]
+isOneToOne: false
+      referencedRelation: "order_disposition_events"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"order_disposition_state": {
+                  Row: {
+                    "class": string | null,"context": NonNullable<Json>,"cost_input_id": number | null,"episode": number,"event_id": number | null,"is_open": boolean,"order_id": string,"review_reason": string | null,"token": string | null,"updated_at": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "class"?: string | null,"context"?: NonNullable<Json>,"cost_input_id"?: number | null,"episode"?: number,"event_id"?: number | null,"is_open"?: boolean,"order_id": string,"review_reason"?: string | null,"token"?: string | null,"updated_at"?: string
+                  }
+                  Update: {
+                    "class"?: string | null,"context"?: NonNullable<Json>,"cost_input_id"?: number | null,"episode"?: number,"event_id"?: number | null,"is_open"?: boolean,"order_id"?: string,"review_reason"?: string | null,"token"?: string | null,"updated_at"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "order_disposition_state_cost_input_id_fkey"
+      columns: ["cost_input_id"]
+isOneToOne: false
+      referencedRelation: "pos_cost_inputs"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "order_disposition_state_event_id_fkey"
+      columns: ["event_id"]
+isOneToOne: false
+      referencedRelation: "order_decision_queue"
+      referencedColumns: ["event_id"]
+    },{
+      foreignKeyName: "order_disposition_state_event_id_fkey"
+      columns: ["event_id"]
+isOneToOne: false
+      referencedRelation: "order_disposition_events"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"owner": {
                   Row: {
                     "created_at": string,"id": boolean,"user_id": string
@@ -1470,6 +1598,14 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"order_decision_queue": {
+                  Row: {
+                    "basis_items": Json | null,"basis_status": string | null,"current_class": string | null,"decided_at": string | null,"decided_class": string | null,"decided_order_total": string | null,"decided_refund_total": string | null,"decision": string | null,"decision_reason": string | null,"differences": Json | null,"episode": number | null,"event_id": number | null,"history": Json | null,"missing_from_pos": boolean | null,"needs_decision": boolean | null,"order_id": string | null,"order_number": number | null,"order_status": string | null,"order_total": string | null,"ordered_at": string | null,"owner_reviewed": boolean | null,"refund_total": string | null,"refunds": Json | null,"returned": Json | null,"review_reason": string | null,"source": string | null,"token": string | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    
+                  ]
                 },"packaging_line_rows": {
                   Row: {
                     "capacity_kg": number | null,"id": string | null,"line_no": number | null,"quantity": number | null,"stock_item_id": string | null,"subject_id": string | null,"unit_code": string | null,"version_id": string | null
@@ -1596,6 +1732,14 @@ isOneToOne: false
                         Relationships: [
                     
                   ]
+                },"unlinked_refunds": {
+                  Row: {
+                    "amount": string | null,"occurred_at": string | null,"shift_id": string | null,"tx_id": string | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    
+                  ]
                 }
           }
           Functions: {
@@ -1626,6 +1770,9 @@ isOneToOne: false
                            },
 "append_pos_cost_input":
 { Args: { "p_order_id": string,"p_origin": string,"p_run_id": number }; Returns: number
+                           },
+"apply_decision_work":
+{ Args: { "p_order_id": string }; Returns: Json
                            },
 "apply_inflow_movement":
 { Args: { "p_batch_id": string,"p_in_qty": number,"p_in_total_cost"?: number,"p_in_unit_cost": number,"p_item_id": string,"p_movement_type": Database["app"]['Enums']["movement_type"],"p_note": string,"p_occurred_at": string,"p_shift_id": string,"p_source_id": string,"p_source_type": string }; Returns: undefined
@@ -1698,6 +1845,29 @@ isOneToOne: false
                            },
 "delete_unit_conversion":
 { Args: { "p_expected_base_unit": string,"p_expected_factor": number,"p_item_id": string,"p_unit": string }; Returns: undefined
+                           },
+"disposition_class_of":
+{ Args: { "p_ctx": Json,"p_total": number }; Returns: string
+                           },
+"disposition_context":
+{ Args: { "p_input_id": number }; Returns: Json
+                           },
+"disposition_effect":
+{ Args: { "p_post": string,"p_retire": string }; Returns: {
+              "cogs_cost_delta": number,"profit_delta": number,"stock_qty_delta": number,"stock_value_delta": number,"waste_cost_delta": number
+            }[]
+                           },
+"disposition_effective_context":
+{ Args: { "p_event_id": number,"p_input_id": number }; Returns: Json
+                           },
+"disposition_family":
+{ Args: { "p_class": string }; Returns: string
+                           },
+"disposition_token":
+{ Args: { "p_ctx": Json,"p_event_id": number }; Returns: string
+                           },
+"engine_outflow_lines":
+{ Args: { "p_event_position": number,"p_keep_application_id": number,"p_movement_type": string,"p_occurred_at": string,"p_requirements": Json,"p_shift_id": string,"p_source_id": string }; Returns: Json
                            },
 "ensure_provisional_seed":
 { Args: { "p_item_id": string }; Returns: number
@@ -2148,6 +2318,9 @@ isOneToOne: false
                            },
 "set_month_expense_complete":
 { Args: { "p_complete": boolean,"p_month": string }; Returns: undefined
+                           },
+"set_order_disposition":
+{ Args: { "p_decision": string,"p_order_id": string,"p_reason": string,"p_request_id": string,"p_returned": Json,"p_token": string }; Returns: Json
                            },
 "set_order_type_packaging":
 { Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_order_type": string,"p_policy": Json,"p_reason": string,"p_request_id": string }; Returns: Json

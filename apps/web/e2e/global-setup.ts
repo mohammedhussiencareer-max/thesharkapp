@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from '../src/lib/database.types';
 import { assertLocalSupabaseUrl, developmentSupabaseUrl } from './local-guard';
+import { seedOrderDecisions } from './seed-order-decisions';
 import { seedSales } from './seed-sales';
 import { localServiceRoleKey, ownerEmail, ownerPassword } from './.test-owner';
 
@@ -48,6 +49,7 @@ export default async function globalSetup(): Promise<void> {
     .upsert({ id: true, user_id: userId }, { onConflict: 'id' });
   if (saved.error) throw saved.error;
   await seedSales(client, localApiUrl);
+  await seedOrderDecisions(client, localApiUrl);
 }
 
 async function findOwnerId(

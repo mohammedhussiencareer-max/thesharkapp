@@ -26,6 +26,7 @@ export const OWNER_FK_COLUMNS = [
   'app.costing_changes.actor_id',
   'app.inventory_activation.approved_by',
   'app.item_opening_prices.approved_by',
+  'app.order_disposition_events.actor',
   'app.owner.user_id',
 ];
 
