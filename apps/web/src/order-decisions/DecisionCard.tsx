@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { formatCairo } from '@/lib/cairo';
 import { DecisionForm } from '@/order-decisions/DecisionForm';
 import { DifferencesList } from '@/order-decisions/DifferencesList';
@@ -93,6 +94,9 @@ export function DecisionCard({
     >
       <header className="flex flex-col gap-1">
         <h2 className="text-lg font-semibold">{title}</h2>
+        <Link to={`/orders/${encodeURIComponent(row.orderId)}`}>
+          تكلفة الطلب
+        </Link>
         <p>{formatCairo(row.orderedAt)}</p>
         <p>
           {row.currentClass ? classLabels[row.currentClass] : classLabels.none}

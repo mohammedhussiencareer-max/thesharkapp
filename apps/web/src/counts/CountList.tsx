@@ -1,3 +1,4 @@
+import { CountDerivation } from '@/accounting/CountDerivation';
 import { historySurplusWarning } from '@/counts/errors';
 import { formatFrequency, formatSignedMoney } from '@/counts/format';
 import type { CountRecord } from '@/counts/types';
@@ -25,6 +26,7 @@ export function CountList({ counts }: { counts: readonly CountRecord[] }) {
           {count.hasCompensator ? <p>معدّل</p> : null}
           {count.hasSurplus ? <p>{historySurplusWarning}</p> : null}
           {count.note ? <p>{count.note}</p> : null}
+          <CountDerivation countId={count.id} />
         </article>
       ))}
     </section>

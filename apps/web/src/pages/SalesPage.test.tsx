@@ -9,6 +9,30 @@ vi.mock('@/sales/api', () => ({
   loadSalesHome: vi.fn(),
 }));
 
+vi.mock('@/accounting/api', () => ({
+  loadProcessingSummary: vi.fn(() =>
+    Promise.resolve({
+      activated: false,
+      pendingCount: '0',
+      blockedCount: '0',
+      failedCount: '0',
+      processedEventCount: '0',
+      openEventCount: '0',
+      openSpanCount: '0',
+      coverage: null,
+      parked: [],
+      parkedCount: '0',
+      parkedTruncated: false,
+    }),
+  ),
+  loadShiftStatuses: vi.fn(() =>
+    Promise.resolve({ byId: new Map(), capped: false }),
+  ),
+  runDeductions: vi.fn(),
+  recordRunFailure: vi.fn(),
+  retryParkedOrder: vi.fn(),
+}));
+
 function shift(netSales: string): ShiftSummary {
   return {
     shiftId: 'shift-test-1',

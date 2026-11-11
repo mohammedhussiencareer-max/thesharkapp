@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { ShiftStatus } from '@/accounting/ShiftStatus';
+import type { ShiftAccountingStatus } from '@/accounting/types';
 import { formatCairo } from '@/lib/cairo';
 import { formatEgpText } from '@/lib/money';
 import { pageShell } from '@/lib/page-style';
@@ -51,10 +53,15 @@ function OrderRow({ order }: { order: SalesOrder }) {
             السطور
           </button>
         </td>
+        <td>
+          <Link to={`/orders/${encodeURIComponent(order.id)}`}>
+            تكلفة الطلب
+          </Link>
+        </td>
       </tr>
       {open ? (
         <tr>
-          <td colSpan={8}>
+          <td colSpan={9}>
             <OrderLines order={order} />
           </td>
         </tr>
@@ -63,7 +70,19 @@ function OrderRow({ order }: { order: SalesOrder }) {
   );
 }
 
-export function ShiftDetailView({ detail }: { detail: ShiftDetailData }) {
+export function ShiftDetailView({
+  detail,
+  status = null,
+  statusCapped = false,
+  statusMissing = false,
+  showStatus = false,
+}: {
+  detail: ShiftDetailData;
+  status?: ShiftAccountingStatus | null;
+  statusCapped?: boolean;
+  statusMissing?: boolean;
+  showStatus?: boolean;
+}) {
   const { summary } = detail;
   const unknown = unknownTxLabel(summary.unknownTx);
   const opened = formatCairo(summary.openedAt);
@@ -90,6 +109,13 @@ export function ShiftDetailView({ detail }: { detail: ShiftDetailData }) {
       </p>
       <p>{reconciliationBadge(summary)}</p>
       {unknown ? <p>{unknown}</p> : null}
+      {showStatus ? (
+        <ShiftStatus
+          status={status}
+          capped={statusCapped}
+          missing={statusMissing}
+        />
+      ) : null}
       <table className="w-full border-collapse text-start">
         <caption className="sr-only">طلبات الوردية</caption>
         <thead>
@@ -102,6 +128,7 @@ export function ShiftDetailView({ detail }: { detail: ShiftDetailData }) {
             <th>الإجمالي</th>
             <th>المرتجع</th>
             <th>السطور</th>
+            <th>التكلفة</th>
           </tr>
         </thead>
         <tbody>

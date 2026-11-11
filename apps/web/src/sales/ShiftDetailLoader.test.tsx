@@ -9,6 +9,12 @@ vi.mock('@/sales/api', () => ({
   loadShiftDetail: vi.fn(),
 }));
 
+vi.mock('@/accounting/api', () => ({
+  loadShiftStatuses: vi.fn(() =>
+    Promise.resolve({ byId: new Map(), capped: false }),
+  ),
+}));
+
 function detail(orderNumber: number): ShiftDetail {
   return {
     summary: {
