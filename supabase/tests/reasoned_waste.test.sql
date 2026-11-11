@@ -1894,6 +1894,183 @@ select
     'the history exposes the saved conversion, quantities as decimal text and the value'
   );
 
+-- ---------------------------------------------------------------------------
+-- 19. A correction of the same event keeps the previous movement pieces.
+-- ---------------------------------------------------------------------------
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    parent_item_id
+  )
+values
+  (
+    pg_temp.u (8),
+    'p66-pieces',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  );
+
+insert into
+  app.item_loss_versions (
+    effective_from,
+    created_change_id,
+    item_id,
+    loss_pct
+  )
+select
+  '2000-01-01 00:00:00+00',
+  c.id,
+  pg_temp.u (8),
+  0
+from
+  app.costing_changes c
+where
+  c.request_id = pg_temp.u (900);
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        pg_temp.u (8),
+        'movement_type',
+        'opening',
+        'occurred_at',
+        '2030-05-01T00:00:00Z',
+        'quantity',
+        1,
+        'unit_cost',
+        100.01
+      )
+    )
+  );
+
+select
+  app.record_waste (
+    pg_temp.u (300),
+    pg_temp.d (
+      '2030-06-01T15:00:00Z',
+      'spoilage',
+      null,
+      null,
+      jsonb_build_array(pg_temp.ln (8, '2', 'kg'))
+    )
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        pg_temp.u (8),
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2030-05-15T00:00:00Z',
+        'quantity',
+        2,
+        'unit_cost',
+        100.005
+      )
+    )
+  );
+
+select
+  results_eq (
+    $$select sm.quantity::text from app.waste_line_movements wm
+      join app.stock_movements sm on sm.id = wm.movement_id
+      where wm.document_id = pg_temp.doc_id (300) order by sm.piece_position, sm.id$$,
+    $$values ('-1.000000'), ('-1.000000')$$,
+    'the shortfall record posted two pieces before the backdated purchase'
+  );
+
+insert into
+  kv
+select
+  'p1',
+  app.record_waste (
+    pg_temp.u (301),
+    pg_temp.d (
+      '2030-06-01T15:00:00Z',
+      'staff_meal',
+      null,
+      pg_temp.doc_id (300)::text,
+      jsonb_build_array(pg_temp.ln (8, '2', 'kg'))
+    )
+  );
+
+select
+  is (
+    (
+      select
+        v -> 'differences'
+      from
+        kv
+      where
+        k = 'p1'
+    ),
+    '{"cogs": "0.00", "profit": "0.00", "waste": "0.00", "stock_value": "0.00", "stock_quantity": "0"}'::jsonb,
+    'a reason-only correction after a backdated purchase changes no profit'
+  );
+
+select
+  results_eq (
+    $$select sm.quantity::text from app.waste_line_movements wm
+      join app.stock_movements sm on sm.id = wm.movement_id
+      where wm.document_id = pg_temp.doc_id (301) order by sm.piece_position, sm.id$$,
+    $$values ('-1.000000'), ('-1.000000')$$,
+    'the correction keeps the previous piece partition'
+  );
+
+select
+  results_eq (
+    $$select sum(sm.total_cost)::text from app.waste_line_movements wm
+      join app.stock_movements sm on sm.id = wm.movement_id
+      where wm.document_id = pg_temp.doc_id (301)$$,
+    $$select sum(sm.total_cost)::text from app.waste_line_movements wm
+      join app.stock_movements sm on sm.id = wm.movement_id
+      where wm.document_id = pg_temp.doc_id (300)$$,
+    'the per-piece rounding is the same as before'
+  );
+
+-- A changed time is a different event: the line is posted as one piece again.
+insert into
+  kv
+select
+  'p2',
+  app.record_waste (
+    pg_temp.u (302),
+    pg_temp.d (
+      '2030-06-01T15:30:00Z',
+      'staff_meal',
+      null,
+      pg_temp.doc_id (301)::text,
+      jsonb_build_array(pg_temp.ln (8, '2', 'kg'))
+    )
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.waste_line_movements wm
+      where
+        wm.document_id = pg_temp.doc_id (302)
+    ),
+    1::bigint,
+    'a changed time does not reuse the previous pieces'
+  );
+
 select
   *
 from

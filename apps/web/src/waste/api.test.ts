@@ -6,6 +6,7 @@ import {
   historyColumns,
   historyPageSize,
   loadHistoryPage,
+  maxHistoryPageSize,
   recordWaste,
   resultOf,
 } from '@/waste/api';
@@ -174,6 +175,14 @@ describe('waste api', () => {
       expect(captured.filters).toEqual([]);
       expect(captured.limits).toEqual([2]);
       expect(page.next).toBe('7');
+    });
+
+    it('never asks for more than the page cap, so a full page is not the API row cap', async () => {
+      const captured = query({ data: [], error: null });
+      await loadHistoryPage(null, 5000);
+      await loadHistoryPage(null, 0);
+      expect(captured.limits).toEqual([maxHistoryPageSize, 1]);
+      expect(maxHistoryPageSize).toBeLessThan(1000);
     });
 
     it('fails with the generic message and no raw server text', async () => {

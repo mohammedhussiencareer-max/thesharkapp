@@ -7,6 +7,7 @@ import { listStockChoices } from '@/purchases/api';
 import type { StockChoice } from '@/purchases/types';
 import { historyPageSize, loadHistoryPage } from '@/waste/api';
 import { freshStart, newWasteSubject } from '@/waste/format';
+import { reloadHistory } from '@/waste/history';
 import type { HistoryEntry } from '@/waste/types';
 import { useWasteAction } from '@/waste/useWasteAction';
 import { WasteForm } from '@/waste/WasteForm';
@@ -23,11 +24,13 @@ export function WastePage() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [loadId, setLoadId] = useState(0);
   const [formKey, setFormKey] = useState(0);
-  const seqRef = useRef(0);
+  const loadSeqRef = useRef(0);
+  const historySeqRef = useRef(0);
   const loadedRef = useRef(0);
 
   useEffect(() => {
-    const seq = ++seqRef.current;
+    const seq = ++loadSeqRef.current;
+    const historySeq = ++historySeqRef.current;
     let cancelled = false;
     void (async () => {
       try {
@@ -35,18 +38,20 @@ export function WastePage() {
           listStockChoices(),
           loadHistoryPage(null),
         ]);
-        if (cancelled || seq !== seqRef.current) return;
+        if (cancelled || seq !== loadSeqRef.current) return;
         setChoices(items);
-        setEntries(page.entries);
-        setNext(page.next);
-        loadedRef.current = page.entries.length;
         setLoadError(null);
-        setMoreError(null);
+        if (historySeq === historySeqRef.current) {
+          setEntries(page.entries);
+          setNext(page.next);
+          loadedRef.current = page.entries.length;
+          setMoreError(null);
+        }
       } catch (error) {
-        if (cancelled || seq !== seqRef.current) return;
+        if (cancelled || seq !== loadSeqRef.current) return;
         setLoadError(messageFrom(error));
       } finally {
-        if (!cancelled && seq === seqRef.current) setLoading(false);
+        if (!cancelled && seq === loadSeqRef.current) setLoading(false);
       }
     })();
     return () => {
@@ -62,12 +67,12 @@ export function WastePage() {
 
   async function loadMore() {
     if (next === null || loadingMore) return;
-    const seq = seqRef.current;
+    const seq = historySeqRef.current;
     setLoadingMore(true);
     setMoreError(null);
     try {
       const page = await loadHistoryPage(next);
-      if (seq !== seqRef.current) return;
+      if (seq !== historySeqRef.current) return;
       setEntries((current) => {
         const known = new Set((current ?? []).map((entry) => entry.id));
         const merged = [
@@ -79,7 +84,7 @@ export function WastePage() {
       });
       setNext(page.next);
     } catch (error) {
-      if (seq === seqRef.current) setMoreError(messageFrom(error));
+      if (seq === historySeqRef.current) setMoreError(messageFrom(error));
     } finally {
       setLoadingMore(false);
     }
@@ -87,12 +92,11 @@ export function WastePage() {
 
   // Re-reads everything already on screen plus the new document, so a corrected row refreshes too.
   const reload = useCallback(async (): Promise<void> => {
-    const seq = ++seqRef.current;
-    const page = await loadHistoryPage(
-      null,
+    const seq = ++historySeqRef.current;
+    const page = await reloadHistory(
       Math.max(historyPageSize, loadedRef.current + 1),
     );
-    if (seq !== seqRef.current) return;
+    if (seq !== historySeqRef.current) return;
     setEntries(page.entries);
     setNext(page.next);
     loadedRef.current = page.entries.length;

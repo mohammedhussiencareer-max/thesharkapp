@@ -686,32 +686,71 @@ begin
   end if;
 
   if not v_void then
+    -- A line with the same item, time and base quantity as before reposts each previous piece, in order.
+    with
+      prior as (
+        select
+          pl.item_id,
+          pl.base_quantity,
+          pg_catalog.abs(sm.quantity) as qty,
+          pg_catalog.row_number() over (
+            partition by
+              pl.id
+            order by
+              sm.event_position,
+              coalesce(sm.piece_position, 0),
+              sm.id
+          ) as ord,
+          pg_catalog.sum(pg_catalog.abs(sm.quantity)) over (
+            partition by
+              pl.id
+          ) as total
+        from
+          app.waste_lines pl
+          join app.waste_line_movements wm on wm.line_id = pl.id
+          join app.stock_movements sm on sm.id = wm.movement_id
+        where
+          v_pred is not null
+          and v_prev.occurred_at = v_at
+          and pl.document_id = v_pred
+      )
     select
       pg_catalog.jsonb_agg(
         pg_catalog.jsonb_build_object(
           'item_id',
-          r.value ->> 'item_id',
+          req.item_id,
           'movement_type',
           'waste',
           'occurred_at',
           v_at,
           'quantity',
-          (r.value ->> 'base_quantity')::numeric,
+          coalesce(pr.qty, req.base_quantity),
           'shift_id',
           v_shift,
           'source_id',
-          'waste:' || p_request_id::text || ':' || (r.value ->> 'line_no'),
+          'waste:' || p_request_id::text || ':' || req.line_no::text,
           'note',
           null,
           'event_position',
           v_event
         )
         order by
-          (r.value ->> 'line_no')::integer
+          req.line_no,
+          coalesce(pr.ord, 1)
       )
     into v_lines
     from
-      pg_catalog.jsonb_array_elements(v_res) as r (value);
+      (
+        select
+          (r.value ->> 'line_no')::integer as line_no,
+          r.value ->> 'item_id' as item_id,
+          (r.value ->> 'base_quantity')::numeric as base_quantity
+        from
+          pg_catalog.jsonb_array_elements(v_res) as r (value)
+      ) req
+      left join prior pr on pr.item_id::text = req.item_id
+      and pr.base_quantity = req.base_quantity
+      and pr.total = req.base_quantity;
 
     begin
       v_batch := app.post_engine_outflows (v_lines);

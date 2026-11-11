@@ -151,6 +151,94 @@ describe('WastePage', () => {
     expect(screen.queryByRole('button', { name: 'عرض المزيد' })).toBeNull();
   });
 
+  it('reloads a long history through bounded keyset pages and keeps paging after a save', async () => {
+    const ids = (from: number, to: number) => {
+      const out: string[] = [];
+      for (let id = from; id >= to; id -= 1) out.push(String(id));
+      return out;
+    };
+    const slice = (from: number, to: number, next: string | null) => ({
+      entries: ids(from, to).map((id) => historyEntry({ id })),
+      next,
+    });
+    vi.mocked(loadHistoryPage).mockImplementation((after) => {
+      if (after === null) return Promise.resolve(slice(60, 41, '41'));
+      if (after === '41') return Promise.resolve(slice(40, 21, '21'));
+      if (after === '21') return Promise.resolve(slice(20, 1, null));
+      if (after === '20') return Promise.resolve(slice(19, 1, null));
+      return Promise.reject(new Error(`unexpected cursor ${after}`));
+    });
+    vi.mocked(recordWaste).mockResolvedValue(wasteResult());
+    renderPage();
+    await screen.findByRole('article', { name: 'سجل رقم 60' });
+    fireEvent.click(screen.getByRole('button', { name: 'عرض المزيد' }));
+    await screen.findByRole('article', { name: 'سجل رقم 21' });
+    expect(screen.getAllByRole('article')).toHaveLength(40);
+
+    const { submit } = await fillNew();
+    fireEvent.click(submit);
+    await screen.findByRole('status');
+
+    const calls = vi.mocked(loadHistoryPage).mock.calls;
+    expect(calls.slice(2)).toEqual([[null], ['41'], ['21']]);
+    await waitFor(() =>
+      expect(screen.getAllByRole('article')).toHaveLength(41),
+    );
+    const more = screen.getByRole('button', { name: 'عرض المزيد' });
+    fireEvent.click(more);
+    await screen.findByRole('article', { name: 'سجل رقم 1' });
+    expect(vi.mocked(loadHistoryPage)).toHaveBeenLastCalledWith('20');
+    expect(screen.getAllByRole('article')).toHaveLength(60);
+    expect(screen.queryByRole('button', { name: 'عرض المزيد' })).toBeNull();
+  });
+
+  it('keeps Refresh usable when a save reloads the history while a refresh is pending', async () => {
+    let finishChoices: (value: ReturnType<typeof stockChoice>[]) => void = () =>
+      undefined;
+    let finishHistory: (value: {
+      entries: ReturnType<typeof historyEntry>[];
+      next: string | null;
+    }) => void = () => undefined;
+    vi.mocked(recordWaste).mockResolvedValue(wasteResult());
+    renderPage();
+    const { submit } = await fillNew();
+    await screen.findByText('مفيش هالك متسجل');
+
+    vi.mocked(listStockChoices).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishChoices = resolve;
+        }),
+    );
+    vi.mocked(loadHistoryPage).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishHistory = resolve;
+        }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'تحديث' }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'تحديث' })).toBeDisabled(),
+    );
+
+    vi.mocked(loadHistoryPage).mockResolvedValue({
+      entries: [historyEntry({ id: '8' })],
+      next: null,
+    });
+    fireEvent.click(submit);
+    await screen.findByRole('status');
+    await screen.findByRole('article', { name: 'سجل رقم 8' });
+    expect(screen.getByRole('button', { name: 'تحديث' })).toBeDisabled();
+
+    finishChoices([stockChoice()]);
+    finishHistory({ entries: [historyEntry({ id: '5' })], next: null });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'تحديث' })).toBeEnabled(),
+    );
+    expect(screen.getByRole('article', { name: 'سجل رقم 8' })).toBeVisible();
+    expect(screen.queryByRole('article', { name: 'سجل رقم 5' })).toBeNull();
+  });
+
   it('explains what is wrong without sending anything', async () => {
     renderPage();
     const form = await screen.findByRole('form', { name: 'تسجيل هالك جديد' });

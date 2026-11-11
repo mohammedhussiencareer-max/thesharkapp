@@ -28,6 +28,9 @@ import {
 /** Rows per keyset page of the history. */
 export const historyPageSize = 20;
 
+/** Well under the API row cap, so a full page is never mistaken for the end. */
+export const maxHistoryPageSize = 100;
+
 function appDb() {
   if (!supabase) throw new Error(genericCatalogError);
   return supabase.schema('app');
@@ -189,15 +192,16 @@ export async function loadHistoryPage(
   after: string | null,
   size: number = historyPageSize,
 ): Promise<HistoryPage> {
+  const limit = Math.min(Math.max(1, size), maxHistoryPageSize);
   let query = appDb().from('waste_history').select(historyColumns);
   if (after !== null) query = query.lt('id', Number(after));
   const { data, error } = await query
     .order('id', { ascending: false })
-    .limit(size);
+    .limit(limit);
   if (error || !Array.isArray(data)) throw new Error(genericCatalogError);
   const entries = data.map(entryOf);
   const last = entries[entries.length - 1];
-  return { entries, next: entries.length === size && last ? last.id : null };
+  return { entries, next: entries.length === limit && last ? last.id : null };
 }
 
 export function resultOf(value: unknown): WasteResult {
