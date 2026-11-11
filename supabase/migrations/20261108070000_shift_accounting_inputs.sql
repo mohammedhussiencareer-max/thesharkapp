@@ -57,10 +57,13 @@ create table app.item_tracking_history (
   active boolean not null,
   count_frequency text not null check (count_frequency in ('daily', 'weekly')),
   known_since timestamptz not null check (pg_catalog.isfinite (known_since)),
-  recorded_at timestamptz not null default pg_catalog.clock_timestamp () check (pg_catalog.isfinite (recorded_at))
+  recorded_at timestamptz not null default pg_catalog.clock_timestamp () check (pg_catalog.isfinite (recorded_at)),
+  basis text not null check (basis in ('observed', 'backfill'))
 );
 
-comment on table app.item_tracking_history is 'Append-only. One row each time a stock item is inserted or its active flag or count_frequency changes. known_since is when that pair became known: the item created_at on insert, the change clock on update, and this migration''s clock for the backfill of items that already existed. A shift''s required roster reads the latest row with known_since at or before the shift opened. A later edit cannot remove an item from that roster.';
+comment on table app.item_tracking_history is 'Append-only. One row each time a stock item is inserted or its active flag or count_frequency changes. known_since is when that pair became known: the item created_at on insert, the change clock on update, and this migration''s clock for the backfill of items that already existed. basis is observed for those trigger rows and backfill for the migration clock. A shift''s required roster reads the latest row with known_since at or before the shift opened. A later edit cannot remove an item from that roster. A backfill row with no history at or before the shift opened is unknown tracking, not an empty roster.';
+
+comment on column app.item_tracking_history.basis is 'observed when a trigger wrote the row from an insert or a real catalog change. backfill when this migration recorded items that already existed, at the migration clock. The clock is not rewritten to created_at.';
 
 comment on column app.item_tracking_history.known_since is 'The earliest instant this active/count_frequency pair is known to have been in force. Not a guess about unobserved edits before the row was written.';
 
@@ -85,7 +88,7 @@ begin
   end if;
 
   insert into
-    app.item_tracking_history (item_id, active, count_frequency, known_since)
+    app.item_tracking_history (item_id, active, count_frequency, known_since, basis)
   values
     (
       new.id,
@@ -94,7 +97,8 @@ begin
       case
         when tg_op = 'INSERT' then new.created_at
         else pg_catalog.clock_timestamp()
-      end
+      end,
+      'observed'
     );
 
   return null;
@@ -121,12 +125,19 @@ execute function app.trg_stock_items_tracking_history ();
 alter table app.stock_items enable always trigger trg_stock_items_tracking_history;
 
 insert into
-  app.item_tracking_history (item_id, active, count_frequency, known_since)
+  app.item_tracking_history (
+    item_id,
+    active,
+    count_frequency,
+    known_since,
+    basis
+  )
 select
   item.id,
   item.active,
   item.count_frequency,
-  pg_catalog.clock_timestamp ()
+  pg_catalog.clock_timestamp (),
+  'backfill'
 from
   app.stock_items item
 order by
@@ -179,11 +190,14 @@ service_role;
 -- ============================================================================
 -- 2. Sales revision facts, written from immutable inputs.
 -- The first cost input of an order is its baseline recognition, not a
--- revision. A later input whose recognized total changed (complete and not
--- missing) is one fact, keyed by that cost input. Every type-3 refund
--- revision is one fact, keyed by the refund revision, including a change
--- whose net sales difference is zero. Re-ingest that inserts no new
--- revision inserts no new fact. These writers take no ledger lock.
+-- revision. A later input on the same shift records the net change. A later
+-- input on a different shift records the removal on the old shift and the
+-- new total on the new shift, even when the two totals are equal. Every
+-- type-3 refund revision is one fact, keyed by the refund revision,
+-- including a change whose net sales difference is zero. source_at is the
+-- source document's time. recorded_at is when this row was materialized.
+-- Re-ingest that inserts no new revision inserts no new fact. These writers
+-- take no ledger lock.
 -- ============================================================================
 create table app.sales_revision_facts (
   id bigint generated always as identity primary key,
@@ -195,23 +209,27 @@ create table app.sales_revision_facts (
   ),
   shift_id text not null check (length(pg_catalog.btrim (shift_id)) > 0),
   net_sales_difference numeric(14, 2) not null,
+  source_at timestamptz not null,
   recorded_at timestamptz not null default pg_catalog.clock_timestamp (),
-  constraint sales_revision_facts_source_key unique (source_kind, source_revision_id),
+  constraint sales_revision_facts_source_key unique (source_kind, source_revision_id, shift_id),
   constraint sales_revision_facts_finite_chk check (
     net_sales_difference not in (
       'NaN'::numeric,
       'Infinity'::numeric,
       '-Infinity'::numeric
     )
+    and pg_catalog.isfinite (source_at)
     and pg_catalog.isfinite (recorded_at)
   )
 );
 
-comment on table app.sales_revision_facts is 'Append-only. One row per changed order recognition or type-3 refund revision. source_kind and source_revision_id are the immutable input that caused it (a pos_cost_inputs id or a pos_refund_revisions id). net_sales_difference is the change in recognized sales: order totals use the order shift, refunds use the refund shift and reduce sales when the refund amount rises. A zero difference is still a row when a refund revision was written. Replaying the same source id writes nothing.';
+comment on table app.sales_revision_facts is 'Append-only. One row per shift affected by a changed order recognition or a type-3 refund revision. source_kind, source_revision_id and shift_id are the immutable input and the shift the difference belongs to. A shift transfer is two rows for one cost input: the old recognized total removed from the old shift, and the new recognized total added to the new shift. net_sales_difference is the change in recognized sales on that shift. Refunds reduce sales when the refund amount rises. A zero difference is still a row when a refund revision was written. source_at orders revisions by the source document. recorded_at is materialization time and is not the revision order. Replaying the same source and shift writes nothing.';
 
-comment on column app.sales_revision_facts.net_sales_difference is 'Recognized sales after this source revision, minus recognized sales before it. Positive means more net sales. Refund amounts use the opposite sign.';
+comment on column app.sales_revision_facts.net_sales_difference is 'Recognized sales after this source revision, minus recognized sales before it, on this shift. A transfer writes the full removal and the full addition, not only the net of the two totals. Positive means more net sales. Refund amounts use the opposite sign.';
 
-create index sales_revision_facts_shift_idx on app.sales_revision_facts (shift_id, recorded_at, id);
+comment on column app.sales_revision_facts.source_at is 'When the source document says the revision happened: the new snapshot pos_update_time (or ordered_at) for an order total, including both legs of a shift transfer, and the refund revision occurred_at for a refund. Revision order uses this, not recorded_at.';
+
+create index sales_revision_facts_shift_idx on app.sales_revision_facts (shift_id, source_at, id);
 
 create trigger trg_sales_revision_facts_no_update_delete
 before update or delete on app.sales_revision_facts for each row
@@ -231,9 +249,11 @@ declare
   v_total numeric(14, 2);
   v_status text;
   v_shift text;
+  v_source_at timestamptz;
   v_prev_missing boolean;
   v_prev_total numeric(14, 2);
   v_prev_status text;
+  v_prev_shift text;
   v_new numeric(14, 2);
   v_old numeric(14, 2);
 begin
@@ -243,14 +263,16 @@ begin
     input.missing_from_pos,
     snap.total,
     snap.status,
-    snap.shift_id
+    snap.shift_id,
+    coalesce(snap.pos_update_time, snap.ordered_at)
   into
     v_order,
     v_revision,
     v_missing,
     v_total,
     v_status,
-    v_shift
+    v_shift,
+    v_source_at
   from
     app.pos_cost_inputs input
     join app.pos_order_snapshots snap on snap.id = input.snapshot_id
@@ -264,11 +286,13 @@ begin
   select
     prev.missing_from_pos,
     snap.total,
-    snap.status
+    snap.status,
+    snap.shift_id
   into
     v_prev_missing,
     v_prev_total,
-    v_prev_status
+    v_prev_status,
+    v_prev_shift
   from
     app.pos_cost_inputs prev
     join app.pos_order_snapshots snap on snap.id = prev.snapshot_id
@@ -278,6 +302,7 @@ begin
 
   if not found then
     v_old := 0;
+    v_prev_shift := v_shift;
   else
     v_old := case
       when v_prev_status = 'complete'
@@ -292,31 +317,84 @@ begin
     else 0
   end;
 
-  if v_new is not distinct from v_old then
+  -- Same shift: one net delta, and an unchanged total is not a revision.
+  if v_prev_shift is not distinct from v_shift then
+    if v_new is not distinct from v_old then
+      return;
+    end if;
+
+    insert into
+      app.sales_revision_facts (
+        source_kind,
+        source_revision_id,
+        order_id,
+        shift_id,
+        net_sales_difference,
+        source_at
+      )
+    values
+      (
+        'order_total',
+        p_input_id,
+        v_order,
+        v_shift,
+        (v_new - v_old)::numeric(14, 2),
+        v_source_at
+      )
+    on conflict (source_kind, source_revision_id, shift_id) do nothing;
+
     return;
   end if;
 
-  insert into
-    app.sales_revision_facts (
-      source_kind,
-      source_revision_id,
-      order_id,
-      shift_id,
-      net_sales_difference
-    )
-  values
-    (
-      'order_total',
-      p_input_id,
-      v_order,
-      v_shift,
-      (v_new - v_old)::numeric(14, 2)
-    )
-  on conflict (source_kind, source_revision_id) do nothing;
+  -- Different shifts: the old shift loses its recognized total and the new
+  -- shift gains the new total. Equal totals still move. A zero leg is omitted.
+  if v_old is distinct from 0::numeric then
+    insert into
+      app.sales_revision_facts (
+        source_kind,
+        source_revision_id,
+        order_id,
+        shift_id,
+        net_sales_difference,
+        source_at
+      )
+    values
+      (
+        'order_total',
+        p_input_id,
+        v_order,
+        v_prev_shift,
+        (- v_old)::numeric(14, 2),
+        v_source_at
+      )
+    on conflict (source_kind, source_revision_id, shift_id) do nothing;
+  end if;
+
+  if v_new is distinct from 0::numeric then
+    insert into
+      app.sales_revision_facts (
+        source_kind,
+        source_revision_id,
+        order_id,
+        shift_id,
+        net_sales_difference,
+        source_at
+      )
+    values
+      (
+        'order_total',
+        p_input_id,
+        v_order,
+        v_shift,
+        v_new::numeric(14, 2),
+        v_source_at
+      )
+    on conflict (source_kind, source_revision_id, shift_id) do nothing;
+  end if;
 end;
 $$;
 
-comment on function app.note_order_total_sales_revision (bigint) is 'Appends one order_total sales fact when this cost input''s recognized total differs from the previous input of the same order. Recognized total is the snapshot total only while the order is complete and not missing; otherwise it is zero. The first input is the baseline and writes nothing. A repeated call for the same input writes nothing. Does not take the ledger lock.';
+comment on function app.note_order_total_sales_revision (bigint) is 'Appends order_total sales facts for a cost input after the first. Recognized total is the snapshot total only while the order is complete and not missing; otherwise it is zero. The same shift records the net change and writes nothing when that net is zero. A different shift records the old total removed from the old shift and the new total added to the new shift, including a move that does not change the total. Both legs use the new snapshot time as source_at. The first input is the baseline and writes nothing. A repeated call for the same input and shift writes nothing. Does not take the ledger lock.';
 
 revoke all on function app.note_order_total_sales_revision (bigint)
 from
@@ -391,7 +469,8 @@ begin
       source_revision_id,
       order_id,
       shift_id,
-      net_sales_difference
+      net_sales_difference,
+      source_at
     )
   values
     (
@@ -399,9 +478,10 @@ begin
       v_row.id,
       v_row.order_id,
       v_row.shift_id,
-      (v_prev_eff - v_new_eff)::numeric(14, 2)
+      (v_prev_eff - v_new_eff)::numeric(14, 2),
+      v_row.occurred_at
     )
-  on conflict (source_kind, source_revision_id) do nothing;
+  on conflict (source_kind, source_revision_id, shift_id) do nothing;
 end;
 $$;
 
@@ -627,29 +707,51 @@ create view app.shift_count_coverage
 with
   (security_invoker = true) as
 with
-  anchors as (
+  anchors as materialized (
     select
       anchor.count_id,
       anchor.line_no,
       anchor.item_id,
       anchor.counted_at,
+      anchor.shift_id as owning_shift_id,
       counted.frequency,
+      lag(anchor.counted_at) over (
+        partition by
+          anchor.item_id,
+          counted.frequency
+        order by
+          anchor.counted_at,
+          anchor.count_id,
+          anchor.line_no
+      ) as interval_start
+    from
+      app.stock_count_anchors anchor
+      join app.stock_counts counted on counted.id = anchor.count_id
+  ),
+  scope as materialized (
+    select
+      times.counted_at,
+      app.count_sync_scope_covered (times.counted_at) as sync_scope_covered,
       (
         select
           shift.id
         from
           app.pos_shifts shift
         where
-          shift.opened_at <= anchor.counted_at
+          shift.opened_at <= times.counted_at
         order by
           shift.opened_at desc,
           shift.id desc
         limit
           1
-      ) as owning_shift_id
+      ) as interval_owning_shift_id
     from
-      app.stock_count_anchors anchor
-      join app.stock_counts counted on counted.id = anchor.count_id
+      (
+        select distinct
+          anchor.counted_at
+        from
+          anchors anchor
+      ) times
   ),
   placed as (
     select
@@ -659,19 +761,12 @@ with
       anchor.counted_at,
       anchor.frequency,
       anchor.owning_shift_id,
-      (
-        select
-          max(prev.counted_at)
-        from
-          anchors prev
-        where
-          prev.item_id = anchor.item_id
-          and prev.frequency = anchor.frequency
-          and prev.counted_at < anchor.counted_at
-      ) as interval_start,
-      app.count_sync_scope_covered (anchor.counted_at) as sync_scope_covered
+      anchor.interval_start,
+      scope.interval_owning_shift_id,
+      scope.sync_scope_covered
     from
       anchors anchor
+      join scope on scope.counted_at = anchor.counted_at
   ),
   roster as (
     select
@@ -709,6 +804,7 @@ select
   cover.interval_start,
   cover.counted_at as interval_end,
   cover.owning_shift_id,
+  cover.interval_owning_shift_id,
   cover.sync_scope_covered,
   (cover.count_id is not null) as covered
 from
@@ -720,6 +816,7 @@ from
       placed.counted_at,
       placed.interval_start,
       placed.owning_shift_id,
+      placed.interval_owning_shift_id,
       placed.sync_scope_covered
     from
       placed
@@ -745,7 +842,7 @@ from
       1
   ) cover on true;
 
-comment on view app.shift_count_coverage is 'One row per shift and item required at that shift''s open. A daily item is covered only by a daily anchor whose owning shift is this shift: the last shift that had opened at or before the count. A weekly item is covered by a weekly anchor whose interval (previous weekly anchor, this count] contains the shift open. The weekly settlement belongs to that owning shift. sync_scope_covered is the count''s relevant-shift check and is null when the item has no anchor. A partial count leaves the missing items uncovered. security_invoker so owner RLS applies.';
+comment on view app.shift_count_coverage is 'One row per shift and item required at that shift''s open. owning_shift_id is the shift pinned on the anchor when the count was recorded. interval_owning_shift_id is the separate policy of the last shift that had opened at or before the count, and a later boundary edit can move it. A daily item is covered only by a daily anchor whose pinned shift is this shift. A weekly item is covered by a weekly anchor whose interval (previous same-item anchor, this count] contains the shift open. Previous anchors and the count scope proof are computed once per count, not once per item line. sync_scope_covered is null when the item has no anchor. A partial count leaves the missing items uncovered. security_invoker so owner RLS applies.';
 
 -- ============================================================================
 -- 4. Unified revision differences.
@@ -754,9 +851,12 @@ comment on view app.shift_count_coverage is 'One row per shift and item required
 -- period_revisions.amount: that column already describes those movements.
 -- A cost_adjustment inherits its target movement's bucket, the same cases
 -- as app.profit_bucket in 20261108010000_outflow_reversals.sql. Sorting
--- transfers are left out. Each row is one cause. Cumulative columns sum
--- that shift from the earliest cause through this one. is_latest marks the
--- newest cause on the shift. profit = net sales − cogs − waste − count.
+-- transfers are left out. A coordinator correction's retirement batch and
+-- replacement batch are one cause, normalized through the application
+-- receipt. Each row is one cause. Cumulative columns sum that shift from
+-- the earliest source_at through this one. is_latest marks the newest
+-- source on the shift, not the row that was materialized last.
+-- profit = net sales − cogs − waste − count.
 -- ============================================================================
 create view app.accounting_revision_differences
 with
@@ -764,9 +864,16 @@ with
 with
   ledger as (
     select
-      'ledger'::text as cause_kind,
-      revision.cause_batch_id::text as cause_id,
+      case
+        when receipt.application_id is not null then 'application'::text
+        else 'ledger'::text
+      end as cause_kind,
+      coalesce(
+        receipt.application_id::text,
+        revision.cause_batch_id::text
+      ) as cause_id,
       revision.shift_id,
+      min(coalesce(receipt.source_at, revision.created_at)) as source_at,
       min(revision.created_at) as recorded_at,
       0::numeric(14, 2) as net_sales_difference,
       coalesce(
@@ -817,10 +924,25 @@ with
             else null
           end as bucket
       ) bucket
+      left join lateral (
+        select
+          application.id as application_id,
+          application.created_at as source_at
+        from
+          app.order_cost_applications application
+        where
+          application.retire_batch = revision.cause_batch_id
+          or application.posting_batch = revision.cause_batch_id
+        order by
+          application.id
+        limit
+          1
+      ) receipt on true
     where
       revision.shift_id is not null
     group by
-      revision.cause_batch_id,
+      1,
+      2,
       revision.shift_id
     having
       count(*) filter (
@@ -833,6 +955,7 @@ with
       ledger.cause_kind,
       ledger.cause_id,
       ledger.shift_id,
+      ledger.source_at,
       ledger.recorded_at,
       ledger.net_sales_difference,
       ledger.cogs_difference,
@@ -845,6 +968,7 @@ with
       fact.source_kind,
       fact.source_revision_id::text,
       fact.shift_id,
+      fact.source_at,
       fact.recorded_at,
       fact.net_sales_difference,
       0::numeric(14, 2),
@@ -858,6 +982,7 @@ with
       events.cause_kind,
       events.cause_id,
       events.shift_id,
+      events.source_at,
       events.recorded_at,
       events.net_sales_difference,
       events.cogs_difference,
@@ -875,7 +1000,7 @@ with
           partition by
             events.shift_id
           order by
-            events.recorded_at desc,
+            events.source_at desc,
             events.cause_kind desc,
             events.cause_id desc
         ) = 1
@@ -887,7 +1012,7 @@ with
         partition by
           events.shift_id
         order by
-          events.recorded_at,
+          events.source_at,
           events.cause_kind,
           events.cause_id rows between unbounded preceding
           and current row
@@ -897,6 +1022,7 @@ select
   rolled.cause_kind,
   rolled.cause_id,
   rolled.shift_id,
+  rolled.source_at,
   rolled.recorded_at,
   rolled.is_latest,
   rolled.net_sales_difference::numeric(14, 2)::text as net_sales_difference,
@@ -914,7 +1040,61 @@ select
 from
   rolled;
 
-comment on view app.accounting_revision_differences is 'One cause on one shift: its own net sales, COGS, waste, count and profit differences, and the cumulative differences of that shift through this cause. Money is decimal text. is_latest is the newest cause on the shift. A zero profit difference is still a row. Sorting transfers are absent. Cost adjustments use the economic target''s bucket. Ledger amounts come from stock_movements.total_cost, not from period_revisions.amount. security_invoker so owner RLS applies.';
+comment on view app.accounting_revision_differences is 'One cause on one shift: its own net sales, COGS, waste, count and profit differences, and the cumulative differences of that shift through this cause. Money is decimal text. is_latest follows source_at, then cause kind and id. recorded_at is materialization time and does not order the rows. A retirement batch and its replacement batch that share one application receipt are one application cause, so a reclass from COGS to waste is one zero-profit vector. A zero profit difference is still a row. Sorting transfers are absent. Cost adjustments use the economic target''s bucket. Ledger amounts come from stock_movements.total_cost, not from period_revisions.amount. security_invoker so owner RLS applies.';
+
+-- Shifts that still own an order's unsettled work: the latest cost-input
+-- snapshot, the live application's pinned shift, and, when the latest
+-- receipt is incomplete, the shift of the application it retired.
+create function app.order_settlement_shifts (p_order_id text) returns table (shift_id text) language sql stable
+set
+  search_path = '' as $$
+  (
+    select
+      snap.shift_id
+    from
+      app.pos_cost_inputs input
+      join app.pos_order_snapshots snap on snap.id = input.snapshot_id
+    where
+      input.order_id = p_order_id
+    order by
+      input.input_revision desc
+    limit
+      1
+  )
+  union
+  (
+    select
+      owner_app.shift_id
+    from
+      app.order_cost_state state
+      join app.order_cost_applications owner_app on owner_app.id = state.owner_application_id
+    where
+      state.order_id = p_order_id
+      and owner_app.shift_id is not null
+  )
+  union
+  (
+    select
+      retired.shift_id
+    from
+      app.order_cost_state state
+      join app.order_cost_applications latest on latest.id = state.latest_application_id
+      join app.order_cost_applications retired on retired.id = latest.retired_application_id
+    where
+      state.order_id = p_order_id
+      and latest.disposition = 'incomplete'
+      and retired.shift_id is not null
+  );
+$$;
+
+comment on function app.order_settlement_shifts (text) is 'Shifts that still carry one order''s unsettled accounting: the latest cost-input snapshot shift, the live owner application shift, and the retired application shift when the latest receipt is incomplete. Does not follow a mutable pos_orders.shift_id on its own. Private.';
+
+revoke all on function app.order_settlement_shifts (text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
 
 -- ============================================================================
 -- 5. Shift status. Independent causes, a derived label, and the revised badge.
@@ -957,6 +1137,12 @@ declare
   v_orders_covered integer;
   v_lines_denom integer;
   v_lines_covered integer;
+  v_coverage jsonb;
+  v_pack jsonb;
+  v_tracking integer;
+  v_incomplete integer;
+  v_incomplete_codes text[];
+  v_extra text[];
   v_order record;
   v_resolved jsonb;
   v_line_count integer;
@@ -1013,6 +1199,125 @@ begin
   from
     app.opening_stocks opening;
 
+  -- One read of the coverage view for this page. The view already computes
+  -- previous anchors once and the scope proof once per count.
+  select
+    coalesce(
+      pg_catalog.jsonb_object_agg(page.shift_id, page.payload),
+      '{}'::jsonb
+    )
+  into v_coverage
+  from
+    (
+      select
+        coverage.shift_id,
+        pg_catalog.jsonb_build_object(
+          'daily_required',
+          count(*) filter (
+            where
+              coverage.count_frequency = 'daily'
+          ),
+          'daily_covered',
+          count(*) filter (
+            where
+              coverage.count_frequency = 'daily'
+              and coverage.covered
+          ),
+          'weekly_required',
+          count(*) filter (
+            where
+              coverage.count_frequency = 'weekly'
+          ),
+          'weekly_covered',
+          count(*) filter (
+            where
+              coverage.count_frequency = 'weekly'
+              and coverage.covered
+          ),
+          'anchor_sync',
+          coalesce(
+            bool_and(coverage.sync_scope_covered) filter (
+              where
+                coverage.covered
+            ),
+            true
+          ),
+          'daily',
+          coalesce(
+            pg_catalog.jsonb_agg(
+              pg_catalog.jsonb_build_object(
+                'item_id',
+                coverage.item_id,
+                'covered',
+                coverage.covered,
+                'anchor_count_id',
+                coverage.anchor_count_id,
+                'known_since',
+                app.costing_timestamptz_text (coverage.known_since)
+              )
+              order by
+                coverage.item_id
+            ) filter (
+              where
+                coverage.count_frequency = 'daily'
+            ),
+            '[]'::jsonb
+          ),
+          'weekly',
+          coalesce(
+            pg_catalog.jsonb_agg(
+              pg_catalog.jsonb_build_object(
+                'item_id',
+                coverage.item_id,
+                'covered',
+                coverage.covered,
+                'anchor_count_id',
+                coverage.anchor_count_id,
+                'counted_at',
+                app.costing_timestamptz_text (coverage.anchor_counted_at),
+                'interval_start',
+                app.costing_timestamptz_text (coverage.interval_start),
+                'interval_end',
+                app.costing_timestamptz_text (coverage.interval_end),
+                'owning_shift_id',
+                coverage.owning_shift_id,
+                'interval_owning_shift_id',
+                coverage.interval_owning_shift_id,
+                'sync_scope_covered',
+                coverage.sync_scope_covered,
+                'known_since',
+                app.costing_timestamptz_text (coverage.known_since)
+              )
+              order by
+                coverage.item_id
+            ) filter (
+              where
+                coverage.count_frequency = 'weekly'
+            ),
+            '[]'::jsonb
+          )
+        ) as payload
+      from
+        app.shift_count_coverage coverage
+      where
+        coverage.shift_id in (
+          select
+            shift.id
+          from
+            app.pos_shifts shift
+          where
+            p_after_opened_at is null
+            or (shift.opened_at, shift.id) > (p_after_opened_at, p_after_id)
+          order by
+            shift.opened_at,
+            shift.id
+          limit
+            v_limit
+        )
+      group by
+        coverage.shift_id
+    ) page;
+
   for v_shift in
     select
       shift.id,
@@ -1030,102 +1335,14 @@ begin
     limit
       v_limit
   loop
-    select
-      count(*) filter (
-        where
-          coverage.count_frequency = 'daily'
-      ),
-      count(*) filter (
-        where
-          coverage.count_frequency = 'daily'
-          and coverage.covered
-      ),
-      count(*) filter (
-        where
-          coverage.count_frequency = 'weekly'
-      ),
-      count(*) filter (
-        where
-          coverage.count_frequency = 'weekly'
-          and coverage.covered
-      ),
-      coalesce(
-        bool_and(coverage.sync_scope_covered) filter (
-          where
-            coverage.covered
-        ),
-        true
-      )
-    into
-      v_daily_required,
-      v_daily_covered,
-      v_weekly_required,
-      v_weekly_covered,
-      v_anchor_sync
-    from
-      app.shift_count_coverage coverage
-    where
-      coverage.shift_id = v_shift.id;
-
-    select
-      coalesce(
-        pg_catalog.jsonb_agg(
-          pg_catalog.jsonb_build_object(
-            'item_id',
-            coverage.item_id,
-            'covered',
-            coverage.covered,
-            'anchor_count_id',
-            coverage.anchor_count_id,
-            'known_since',
-            app.costing_timestamptz_text (coverage.known_since)
-          )
-          order by
-            coverage.item_id
-        ),
-        '[]'::jsonb
-      )
-    into v_daily
-    from
-      app.shift_count_coverage coverage
-    where
-      coverage.shift_id = v_shift.id
-      and coverage.count_frequency = 'daily';
-
-    select
-      coalesce(
-        pg_catalog.jsonb_agg(
-          pg_catalog.jsonb_build_object(
-            'item_id',
-            coverage.item_id,
-            'covered',
-            coverage.covered,
-            'anchor_count_id',
-            coverage.anchor_count_id,
-            'counted_at',
-            app.costing_timestamptz_text (coverage.anchor_counted_at),
-            'interval_start',
-            app.costing_timestamptz_text (coverage.interval_start),
-            'interval_end',
-            app.costing_timestamptz_text (coverage.interval_end),
-            'owning_shift_id',
-            coverage.owning_shift_id,
-            'sync_scope_covered',
-            coverage.sync_scope_covered,
-            'known_since',
-            app.costing_timestamptz_text (coverage.known_since)
-          )
-          order by
-            coverage.item_id
-        ),
-        '[]'::jsonb
-      )
-    into v_weekly
-    from
-      app.shift_count_coverage coverage
-    where
-      coverage.shift_id = v_shift.id
-      and coverage.count_frequency = 'weekly';
+    v_pack := v_coverage -> v_shift.id;
+    v_daily_required := coalesce((v_pack ->> 'daily_required')::integer, 0);
+    v_daily_covered := coalesce((v_pack ->> 'daily_covered')::integer, 0);
+    v_weekly_required := coalesce((v_pack ->> 'weekly_required')::integer, 0);
+    v_weekly_covered := coalesce((v_pack ->> 'weekly_covered')::integer, 0);
+    v_anchor_sync := coalesce((v_pack ->> 'anchor_sync')::boolean, true);
+    v_daily := coalesce(v_pack -> 'daily', '[]'::jsonb);
+    v_weekly := coalesce(v_pack -> 'weekly', '[]'::jsonb);
 
     select
       exists (
@@ -1183,26 +1400,79 @@ begin
       and not o.missing_from_pos;
 
     select
-      count(distinct event.order_id)
+      count(distinct hit.order_id)
     into v_pending
     from
-      app.accounting_work_events event
-      join app.pos_orders o on o.id = event.order_id
-    where
-      o.shift_id = v_shift.id
-      and event.processed_at is null;
+      (
+        select
+          event.order_id
+        from
+          app.accounting_work_events event
+        where
+          event.processed_at is null
+          and exists (
+            select
+              1
+            from
+              app.order_settlement_shifts (event.order_id) settled
+            where
+              settled.shift_id = v_shift.id
+          )
+        union
+        select
+          snap.order_id
+        from
+          app.accounting_rederive_spans span
+          join app.pos_order_snapshots snap on snap.ordered_at >= span.effective_from
+          and (
+            span.effective_to is null
+            or snap.ordered_at < span.effective_to
+          )
+          and (
+            span.cursor_ordered_at is null
+            or (snap.ordered_at, snap.order_id) > (span.cursor_ordered_at, span.cursor_order_id)
+          )
+          and snap.id = (
+            select
+              input.snapshot_id
+            from
+              app.pos_cost_inputs input
+            where
+              input.order_id = snap.order_id
+            order by
+              input.input_revision desc
+            limit
+              1
+          )
+        where
+          span.completed_at is null
+          and exists (
+            select
+              1
+            from
+              app.order_settlement_shifts (snap.order_id) settled
+            where
+              settled.shift_id = v_shift.id
+          )
+      ) hit;
 
     select
       count(*)
     into v_blocked
     from
       app.accounting_work_state state
-      join app.pos_orders o on o.id = state.order_id
     where
-      o.shift_id = v_shift.id
-      and (
+      (
         state.last_outcome = 'blocked'
         or state.failed_at is not null
+      )
+      and exists (
+        select
+          1
+        from
+          app.order_settlement_shifts (state.order_id) settled
+        where
+          settled.shift_id = v_shift.id
       );
 
     select
@@ -1210,12 +1480,71 @@ begin
     into v_stale
     from
       app.order_cost_state state
-      join app.pos_orders o on o.id = state.order_id
       join app.order_cost_applications application on application.id = state.latest_application_id
     where
-      o.shift_id = v_shift.id
-      and state.latest_input_id is not null
-      and application.cost_input_id is distinct from state.latest_input_id;
+      state.latest_input_id is not null
+      and application.cost_input_id is distinct from state.latest_input_id
+      and exists (
+        select
+          1
+        from
+          app.order_settlement_shifts (state.order_id) settled
+        where
+          settled.shift_id = v_shift.id
+      );
+
+    select
+      count(distinct state.order_id),
+      coalesce(
+        pg_catalog.array_agg(distinct cause.value ->> 'code') filter (
+          where
+            cause.value ->> 'code' is not null
+        ),
+        '{}'::text[]
+      )
+    into
+      v_incomplete,
+      v_incomplete_codes
+    from
+      app.order_cost_state state
+      join app.order_cost_applications application on application.id = state.latest_application_id
+      left join lateral pg_catalog.jsonb_array_elements(application.causes) as cause (value) on true
+    where
+      application.disposition = 'incomplete'
+      and exists (
+        select
+          1
+        from
+          app.order_settlement_shifts (state.order_id) settled
+        where
+          settled.shift_id = v_shift.id
+      );
+
+    select
+      count(*)
+    into v_tracking
+    from
+      app.stock_items item
+    where
+      exists (
+        select
+          1
+        from
+          app.item_tracking_history backfill
+        where
+          backfill.item_id = item.id
+          and backfill.basis = 'backfill'
+          and backfill.known_since > v_shift.opened_at
+      )
+      and not exists (
+        select
+          1
+        from
+          app.item_tracking_history earlier
+        where
+          earlier.item_id = item.id
+          and earlier.known_since <= v_shift.opened_at
+      );
 
     select
       count(*)
@@ -1378,8 +1707,33 @@ begin
 
       if v_resolved ->> 'status' = 'ready' then
         v_orders_covered := v_orders_covered + 1;
-        v_lines_covered := v_lines_covered + v_line_count;
       end if;
+
+      -- Line coverage follows each line's own ready or exception status.
+      -- An unresolved order (packaging, another line) does not zero the lines
+      -- that are already eligible.
+      select
+        count(*)
+      into v_line_count
+      from
+        app.pos_order_lines line
+      where
+        line.order_id = v_order.id
+        and (
+          line.quantity > 0
+          or line.weighted_qty > 0
+        )
+        and exists (
+          select
+            1
+          from
+            pg_catalog.jsonb_array_elements(coalesce(v_resolved -> 'lines', '[]'::jsonb)) as resolved (value)
+          where
+            resolved.value ->> 'line_id' = line.line_id
+            and resolved.value ->> 'status' in ('ready', 'exception')
+        );
+
+      v_lines_covered := v_lines_covered + v_line_count;
     end loop;
 
     v_month := pg_catalog.date_trunc(
@@ -1431,6 +1785,30 @@ begin
 
     if v_stale > 0 then
       v_causes := v_causes || array['stale_applications']::text[];
+    end if;
+
+    if v_tracking > 0 then
+      v_causes := v_causes || array['tracking_unknown']::text[];
+    end if;
+
+    if v_incomplete > 0 then
+      v_causes := v_causes || array['incomplete_application']::text[];
+
+      select
+        coalesce(pg_catalog.array_agg(extra.code), '{}'::text[])
+      into v_extra
+      from
+        (
+          select distinct
+            code
+          from
+            pg_catalog.unnest(coalesce(v_incomplete_codes, '{}'::text[])) as code
+          where
+            code is not null
+            and code <> all (v_causes)
+        ) extra;
+
+      v_causes := v_causes || coalesce(v_extra, '{}'::text[]);
     end if;
 
     if v_unreviewed > 0 then
@@ -1529,6 +1907,8 @@ begin
             diff.cause_kind,
             'cause_id',
             diff.cause_id,
+            'source_at',
+            app.costing_timestamptz_text (diff.source_at),
             'recorded_at',
             app.costing_timestamptz_text (diff.recorded_at),
             'is_latest',
@@ -1555,7 +1935,7 @@ begin
             diff.cumulative_profit_difference
           )
           order by
-            diff.recorded_at,
+            diff.source_at,
             diff.cause_kind,
             diff.cause_id
         ),
@@ -1595,6 +1975,10 @@ begin
       v_lines_denom::text,
       'pending_applications',
       v_pending,
+      'incomplete_applications',
+      v_incomplete,
+      'tracking_unknown_items',
+      v_tracking,
       'stale_applications',
       v_stale,
       'blocked_applications',
@@ -1651,7 +2035,7 @@ begin
 end;
 $$;
 
-comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item. Weekly settlement names the last shift before its anchor and the covered interval. A partial daily roster is تقديري only when no blocker is set. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Sync scope that does not cover the shift, or a covering count whose relevant shifts are not covered, is its own ناقص cause. Quantities and money are decimal text. Does not post stock and does not change record_count.';
+comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item and uses the anchor''s pinned shift. Weekly settlement names that pinned shift, the separate interval-owning shift, and the covered interval. Count coverage for the page is read once. A partial daily roster is تقديري only when no blocker is set. Unknown backfill tracking, an incomplete application, an unfinished rederive span, and unsettled work on either the latest snapshot shift or the live application shift are ناقص. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Completed-order readiness is atomic. Line coverage counts ready and exception lines on their own. Quantities and money are decimal text. Does not post stock and does not change record_count.';
 
 revoke all on function app.list_shift_accounting_status (timestamptz, text, integer)
 from

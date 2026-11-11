@@ -873,6 +873,17 @@ select
     false
   );
 
+-- The blocked head has no receipt. Its snapshot is what pins the shift.
+select
+  pg_temp.cost_input (
+    'p77-o-blocked',
+    'p77-blocked',
+    1,
+    'complete',
+    0,
+    false
+  );
+
 insert into
   app.order_cost_applications (
     order_id,
@@ -1047,7 +1058,8 @@ where
     'p77-o-stale',
     'p77-o-unrev',
     'p77-o-unrefund',
-    'p77-o-revenue'
+    'p77-o-revenue',
+    'p77-o-blocked'
   );
 
 -- Refund revisions through the ingest writer. The second call changes only
@@ -3019,8 +3031,1850 @@ select
   );
 
 -- ---------------------------------------------------------------------------
--- Privileges.
+-- Review round 1. Each case is read back from the status function or the
+-- revision view, not from a fixture that skips the path under test.
 -- ---------------------------------------------------------------------------
+create function pg_temp.one (p_id text) returns jsonb language plpgsql as $$
+declare
+  v_open timestamptz;
+  v_body jsonb;
+begin
+  select
+    shift.opened_at
+  into v_open
+  from
+    app.pos_shifts shift
+  where
+    shift.id = p_id;
+
+  select
+    row
+  into v_body
+  from
+    app.list_shift_accounting_status (v_open - interval '1 second', '', 20) row
+  where
+    row ->> 'shift_id' = p_id;
+
+  return v_body;
+end;
+$$;
+
+create function pg_temp.one_causes (p_id text) returns text[] language plpgsql as $$
+declare
+  v_causes text[];
+begin
+  select
+    coalesce(
+      pg_catalog.array_agg(
+        e.value
+        order by
+          e.value
+      ),
+      '{}'::text[]
+    )
+  into v_causes
+  from
+    pg_catalog.jsonb_array_elements_text(pg_temp.one (p_id) -> 'causes') as e (value);
+
+  return v_causes;
+end;
+$$;
+
+create function pg_temp.seal (p_id text, p_open timestamptz) returns void language plpgsql as $$
+declare
+  v_run bigint;
+begin
+  insert into
+    app.pos_shifts (id, opened_at, closed_at, is_active, pos_update_time)
+  values
+    (p_id, p_open, p_open + interval '10 hours', false, p_open);
+
+  perform pg_temp.daily_count (
+    pg_catalog.gen_random_uuid (),
+    p_open + interval '6 hours',
+    array[pg_temp.u (1), pg_temp.u (2), pg_temp.u (3)]
+  );
+
+  select
+    coalesce(max(coverage.run_id), 772000) + 1
+  into v_run
+  from
+    app.pos_sync_coverage coverage;
+
+  insert into
+    app.pos_sync_coverage (
+      run_id,
+      started_at,
+      finished_at,
+      orders_scope_applied,
+      scope_kind,
+      scope_from,
+      scope_shift_ids,
+      presented_shift_ids,
+      transactions_covered,
+      legacy_direct
+    )
+  values
+    (
+      v_run,
+      pg_catalog.clock_timestamp () - interval '1 minute',
+      pg_catalog.clock_timestamp (),
+      true,
+      'shift_ids',
+      null,
+      array[p_id]::text[],
+      array[p_id]::text[],
+      true,
+      false
+    );
+end;
+$$;
+
+create function pg_temp.account (p_order text) returns jsonb language plpgsql as $$
+declare
+  v_result jsonb;
+begin
+  perform pg_catalog.pg_advisory_xact_lock (7342750000000000001::bigint);
+
+  insert into
+    app.order_cost_state (order_id)
+  values
+    (p_order)
+  on conflict (order_id) do nothing;
+
+  insert into
+    app.accounting_work_state (order_id)
+  values
+    (p_order)
+  on conflict (order_id) do nothing;
+
+  v_result := app.process_order_accounting (p_order, pg_catalog.gen_random_uuid (), 1);
+
+  update app.accounting_work_state
+  set
+    last_outcome = v_result ->> 'outcome',
+    last_reason = v_result ->> 'reason',
+    failed_at = null,
+    work_generation = greatest (work_generation, 1)
+  where
+    order_id = p_order;
+
+  update app.accounting_work_events
+  set
+    work_generation = 1,
+    processed_at = pg_catalog.clock_timestamp ()
+  where
+    order_id = p_order
+    and processed_at is null;
+
+  return v_result;
+end;
+$$;
+
+insert into
+  app.month_expense_status (month, complete, confirmed_at, confirmed_by)
+values
+  (
+    '2026-09-01',
+    true,
+    pg_catalog.clock_timestamp (),
+    'a7700000-0000-4000-8000-0000000000a1'
+  ),
+  (
+    '2026-04-01',
+    true,
+    pg_catalog.clock_timestamp (),
+    'a7700000-0000-4000-8000-0000000000a1'
+  );
+
+-- Finding 5. A move is two facts. An unchanged total still moves.
+select
+  pg_temp.shift ('p77-xfer-a', '2026-09-05 12:00+00', false);
+
+select
+  pg_temp.shift ('p77-xfer-b', '2026-09-06 12:00+00', false);
+
+select
+  pg_temp.ord (
+    'p77-o-xfer-eq',
+    'p77-xfer-a',
+    'complete',
+    '2026-09-05 13:00+00',
+    100
+  );
+
+select
+  pg_temp.cost_input (
+    'p77-o-xfer-eq',
+    'p77-xfer-a',
+    1,
+    'complete',
+    100,
+    false
+  );
+
+select
+  pg_temp.cost_input (
+    'p77-o-xfer-eq',
+    'p77-xfer-b',
+    2,
+    'complete',
+    100,
+    false
+  );
+
+update app.pos_orders
+set
+  shift_id = 'p77-xfer-b'
+where
+  id = 'p77-o-xfer-eq';
+
+select
+  pg_temp.ord (
+    'p77-o-xfer-up',
+    'p77-xfer-a',
+    'complete',
+    '2026-09-05 14:00+00',
+    100
+  );
+
+select
+  pg_temp.cost_input (
+    'p77-o-xfer-up',
+    'p77-xfer-a',
+    1,
+    'complete',
+    100,
+    false
+  );
+
+select
+  pg_temp.cost_input (
+    'p77-o-xfer-up',
+    'p77-xfer-b',
+    2,
+    'complete',
+    130,
+    false
+  );
+
+select
+  pg_temp.ord (
+    'p77-o-xfer-same',
+    'p77-xfer-a',
+    'complete',
+    '2026-09-05 15:00+00',
+    50
+  );
+
+select
+  pg_temp.cost_input (
+    'p77-o-xfer-same',
+    'p77-xfer-a',
+    1,
+    'complete',
+    50,
+    false
+  );
+
+select
+  pg_temp.cost_input (
+    'p77-o-xfer-same',
+    'p77-xfer-a',
+    2,
+    'complete',
+    50,
+    false
+  );
+
+select
+  results_eq (
+    $$select shift_id, net_sales_difference::text
+      from app.sales_revision_facts
+      where order_id = 'p77-o-xfer-eq'
+      order by shift_id$$,
+    $$values ('p77-xfer-a', '-100.00'), ('p77-xfer-b', '100.00')$$,
+    'moving a completed 100.00 order records both shift legs'
+  );
+
+select
+  results_eq (
+    $$select shift_id, net_sales_difference::text
+      from app.sales_revision_facts
+      where order_id = 'p77-o-xfer-up'
+      order by shift_id$$,
+    $$values ('p77-xfer-a', '-100.00'), ('p77-xfer-b', '130.00')$$,
+    'a move that also changes the total is not a single +30 on the new shift'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.sales_revision_facts
+      where
+        order_id = 'p77-o-xfer-same'
+    ),
+    0::bigint,
+    'the same shift and the same total still write nothing'
+  );
+
+select
+  lives_ok (
+    $$select app.note_order_total_sales_revision(input.id)
+      from app.pos_cost_inputs input
+      where input.order_id = 'p77-o-xfer-up' and input.input_revision = 2$$,
+    'replaying a two-leg sales fact is allowed'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.sales_revision_facts
+      where
+        order_id = 'p77-o-xfer-up'
+    ),
+    2::bigint,
+    'the idempotency key keeps both shift facts and does not add a third'
+  );
+
+-- Finding 8. Materialize the refund last. Source time still wins.
+select
+  pg_temp.shift ('p77-chrono', '2026-09-07 12:00+00', false);
+
+select
+  pg_temp.ord (
+    'p77-o-chrono',
+    'p77-chrono',
+    'complete',
+    '2026-09-07 13:00+00',
+    100
+  );
+
+select
+  pg_temp.cost_input (
+    'p77-o-chrono',
+    'p77-chrono',
+    1,
+    'complete',
+    100,
+    false
+  );
+
+insert into
+  app.pos_order_snapshots (
+    order_id,
+    version,
+    shift_id,
+    status,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    lines,
+    origin
+  )
+values
+  (
+    'p77-o-chrono',
+    2,
+    'p77-chrono',
+    'complete',
+    '2026-09-07 13:00+00',
+    130,
+    0,
+    0,
+    0,
+    0,
+    130,
+    '2026-09-07 16:00+00',
+    repeat('cd', 32),
+    '[]'::jsonb,
+    'sync'
+  );
+
+insert into
+  app.pos_cost_inputs (
+    order_id,
+    input_revision,
+    snapshot_id,
+    missing_from_pos,
+    refund_revision_ids,
+    digest,
+    origin
+  )
+select
+  'p77-o-chrono',
+  2,
+  snap.id,
+  false,
+  '{}'::bigint[],
+  md5('p77-o-chrono:2'),
+  'sync'
+from
+  app.pos_order_snapshots snap
+where
+  snap.order_id = 'p77-o-chrono'
+  and snap.version = 2;
+
+do $$
+declare
+  v_sale bigint;
+begin
+  insert into
+    app.stock_movements (
+      batch_id,
+      item_id,
+      movement_type,
+      occurred_at,
+      quantity,
+      unit_cost,
+      total_cost,
+      shift_id
+    )
+  values
+    (
+      pg_temp.u (310),
+      pg_temp.u (1),
+      'sale',
+      '2026-09-07 14:00+00',
+      -1,
+      40,
+      -40,
+      'p77-chrono'
+    )
+  returning
+    id into v_sale;
+
+  insert into
+    app.period_revisions (
+      source_movement_id,
+      shift_id,
+      bucket,
+      amount,
+      item_id,
+      cause_batch_id,
+      created_at
+    )
+  values
+    (
+      v_sale,
+      'p77-chrono',
+      'cogs',
+      -40,
+      pg_temp.u (1),
+      pg_temp.u (311),
+      '2026-09-07 14:00+00'
+    );
+end;
+$$;
+
+insert into
+  app.pos_refund_revisions (
+    shift_id,
+    tx_id,
+    order_id,
+    tx_type,
+    amount,
+    occurred_at,
+    present,
+    origin
+  )
+values
+  (
+    'p77-chrono',
+    'tx-77-chrono',
+    'p77-o-chrono',
+    3,
+    10,
+    '2026-09-07 10:00+00',
+    true,
+    'sync'
+  );
+
+select
+  is (
+    (
+      select
+        cause_kind
+      from
+        app.accounting_revision_differences
+      where
+        shift_id = 'p77-chrono'
+        and is_latest
+    ),
+    'order_total',
+    'the newer order revision stays latest when an older refund is materialized after it'
+  );
+
+select
+  results_eq (
+    $$select cause_kind
+      from app.accounting_revision_differences
+      where shift_id = 'p77-chrono'
+      order by source_at, cause_kind, cause_id$$,
+    $$values ('refund'), ('ledger'), ('order_total')$$,
+    'interleaved historical sources stay in source order'
+  );
+
+select
+  ok (
+    (
+      select
+        fact.recorded_at
+      from
+        app.sales_revision_facts fact
+      where
+        fact.order_id = 'p77-o-chrono'
+        and fact.source_kind = 'refund'
+    ) > (
+      select
+        fact.recorded_at
+      from
+        app.sales_revision_facts fact
+      where
+        fact.order_id = 'p77-o-chrono'
+        and fact.source_kind = 'order_total'
+    ),
+    'the refund fact was materialized after the order fact'
+  );
+
+-- Finding 7. Pinned settlement, not the last shift that had opened.
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+values
+  (
+    'p77-own-a',
+    '2026-05-01 08:00+00',
+    '2026-05-01 20:00+00',
+    false,
+    '2026-05-01 08:00+00'
+  ),
+  (
+    'p77-own-b',
+    '2026-05-01 10:00+00',
+    '2026-05-01 18:00+00',
+    false,
+    '2026-05-01 10:00+00'
+  );
+
+select
+  pg_temp.daily_count (
+    pg_temp.u (320),
+    '2026-05-01 21:00+00',
+    array[pg_temp.u (1)]
+  );
+
+select
+  is (
+    (
+      select
+        anchor.shift_id
+      from
+        app.stock_count_anchors anchor
+      where
+        anchor.count_id = pg_temp.u (320)
+    ),
+    'p77-own-a',
+    'the count after both shifts pins settlement to the last closed shift'
+  );
+
+select
+  is (
+    (
+      select
+        coverage.owning_shift_id
+      from
+        app.shift_count_coverage coverage
+      where
+        coverage.shift_id = 'p77-own-a'
+        and coverage.item_id = pg_temp.u (1)
+    ),
+    'p77-own-a',
+    'reported ownership is the pinned settlement shift'
+  );
+
+select
+  is (
+    (
+      select
+        coverage.interval_owning_shift_id
+      from
+        app.shift_count_coverage coverage
+      where
+        coverage.shift_id = 'p77-own-a'
+        and coverage.item_id = pg_temp.u (1)
+    ),
+    'p77-own-b',
+    'the last shift that had opened is a separate field'
+  );
+
+-- Finding 4. The live application keeps the original shift blocked.
+select
+  pg_temp.seal ('p77-move-a', '2026-09-01 12:00+00');
+
+select
+  pg_temp.seal ('p77-move-b', '2026-09-02 12:00+00');
+
+select
+  pg_temp.ord (
+    'p77-o-move',
+    'p77-move-a',
+    'complete',
+    '2026-09-01 13:00+00',
+    80
+  );
+
+select
+  pg_temp.cost_input (
+    'p77-o-move',
+    'p77-move-a',
+    1,
+    'complete',
+    80,
+    false
+  );
+
+update app.accounting_work_events
+set
+  work_generation = 1,
+  processed_at = pg_catalog.clock_timestamp ()
+where
+  order_id = 'p77-o-move';
+
+insert into
+  app.order_cost_applications (
+    order_id,
+    cost_input_id,
+    snapshot_id,
+    receipt_kind,
+    disposition,
+    occurred_at,
+    shift_id,
+    requirements,
+    signature,
+    work_generation
+  )
+select
+  'p77-o-move',
+  input.id,
+  input.snapshot_id,
+  'posting',
+  'sale',
+  '2026-09-01 13:00+00',
+  'p77-move-a',
+  '[]'::jsonb,
+  md5('p77-o-move-sale'),
+  1
+from
+  app.pos_cost_inputs input
+where
+  input.order_id = 'p77-o-move'
+  and input.input_revision = 1;
+
+insert into
+  app.order_cost_state (
+    order_id,
+    latest_input_id,
+    latest_application_id,
+    owner_application_id,
+    disposition,
+    signature
+  )
+select
+  'p77-o-move',
+  input.id,
+  application.id,
+  application.id,
+  'sale',
+  md5('p77-o-move-sale')
+from
+  app.pos_cost_inputs input
+  join app.order_cost_applications application on application.order_id = input.order_id
+where
+  input.order_id = 'p77-o-move'
+  and input.input_revision = 1;
+
+select
+  pg_temp.cost_input (
+    'p77-o-move',
+    'p77-move-b',
+    2,
+    'complete',
+    80,
+    false
+  );
+
+update app.pos_orders
+set
+  shift_id = 'p77-move-b'
+where
+  id = 'p77-o-move';
+
+update app.order_cost_state
+set
+  latest_input_id = (
+    select
+      input.id
+    from
+      app.pos_cost_inputs input
+    where
+      input.order_id = 'p77-o-move'
+      and input.input_revision = 2
+  )
+where
+  order_id = 'p77-o-move';
+
+select
+  ok (
+    'pending_applications' = any (pg_temp.one_causes ('p77-move-b')),
+    'the shift on the latest snapshot still sees the unsettled event'
+  );
+
+select
+  ok (
+    'pending_applications' = any (pg_temp.one_causes ('p77-move-a'))
+    and 'stale_applications' = any (pg_temp.one_causes ('p77-move-a')),
+    'the original shift keeps the live application and the stale receipt'
+  );
+
+select
+  is (
+    pg_temp.one ('p77-move-a') ->> 'status_label',
+    'ناقص',
+    'moving the order does not leave the original shift final'
+  );
+
+-- Finding 3. An unfinished span is pending before any span event exists,
+-- including orders past the first 100 after the cursor advances.
+select
+  pg_temp.seal ('p77-span-before', '2026-09-10 12:00+00');
+
+select
+  pg_temp.ord (
+    'p77-span-o-before',
+    'p77-span-before',
+    'complete',
+    '2026-09-10 13:00+00',
+    10
+  );
+
+select
+  pg_temp.cost_input (
+    'p77-span-o-before',
+    'p77-span-before',
+    1,
+    'complete',
+    10,
+    false
+  );
+
+update app.accounting_work_events
+set
+  work_generation = 1,
+  processed_at = pg_catalog.clock_timestamp ()
+where
+  order_id = 'p77-span-o-before';
+
+insert into
+  app.costing_changes (request_id, kind, payload, result)
+values
+  (
+    pg_temp.u (330),
+    'owner',
+    '{}'::jsonb,
+    '{}'::jsonb
+  );
+
+insert into
+  app.accounting_rederive_spans (
+    family,
+    version_id,
+    cause,
+    change_id,
+    effective_from,
+    effective_to
+  )
+values
+  (
+    'pos_map',
+    pg_temp.u (331),
+    'insert',
+    (
+      select
+        change.id
+      from
+        app.costing_changes change
+      where
+        change.request_id = pg_temp.u (330)
+    ),
+    '2026-09-10 00:00+00',
+    '2026-09-13 00:00+00'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.accounting_work_events event
+      where
+        event.cause = 'config_span'
+    ),
+    0::bigint,
+    'the span has not been expanded into work events'
+  );
+
+select
+  ok (
+    'pending_applications' = any (pg_temp.one_causes ('p77-span-before')),
+    'an unexpanded span blocks the shift before any event exists'
+  );
+
+select
+  pg_temp.seal ('p77-span-held', '2026-09-11 12:00+00');
+
+select
+  pg_temp.seal ('p77-span-rest', '2026-09-12 12:00+00');
+
+select
+  pg_temp.seal ('p77-span-out', '2026-09-14 12:00+00');
+
+do $$
+declare
+  v_i integer;
+  v_id text;
+  v_shift text;
+  v_at timestamptz;
+begin
+  for v_i in 1..101 loop
+    v_id := 'p77-span-o-' || lpad(v_i::text, 3, '0');
+    v_shift := case
+      when v_i = 101 then 'p77-span-rest'
+      else 'p77-span-held'
+    end;
+    v_at := '2026-09-11 00:00+00'::timestamptz + (v_i || ' minutes')::interval;
+
+    perform pg_temp.ord (v_id, v_shift, 'complete', v_at, 10);
+    perform pg_temp.cost_input (v_id, v_shift, 1, 'complete', 10, false);
+  end loop;
+
+  perform pg_temp.ord (
+    'p77-span-o-out',
+    'p77-span-out',
+    'complete',
+    '2026-09-14 13:00+00',
+    10
+  );
+
+  perform pg_temp.cost_input (
+    'p77-span-o-out',
+    'p77-span-out',
+    1,
+    'complete',
+    10,
+    false
+  );
+
+  update app.accounting_work_events
+  set
+    work_generation = 1,
+    processed_at = pg_catalog.clock_timestamp ()
+  where
+    order_id like 'p77-span-o-%'
+    and processed_at is null;
+
+  update app.accounting_rederive_spans
+  set
+    cursor_ordered_at = '2026-09-11 00:00+00'::timestamptz + interval '100 minutes',
+    cursor_order_id = 'p77-span-o-100'
+  where
+    version_id = pg_temp.u (331);
+end;
+$$;
+
+select
+  is (
+    pg_temp.one ('p77-span-held') ->> 'pending_applications',
+    '0',
+    'orders at or before the span cursor are not still pending'
+  );
+
+select
+  ok (
+    (
+      pg_temp.one ('p77-span-rest') ->> 'pending_applications'
+    )::integer >= 1,
+    'the order after the first 100 candidates stays pending while the span is open'
+  );
+
+select
+  is (
+    pg_temp.one ('p77-span-out') ->> 'pending_applications',
+    '0',
+    'an order outside the span interval is not a remaining candidate'
+  );
+
+select
+  is (
+    pg_temp.one ('p77-span-before') ->> 'pending_applications',
+    '0',
+    'a candidate behind the cursor is not pending once the cursor has passed it'
+  );
+
+-- Finding 9. Lines are covered on their own. The order stays atomic.
+create function pg_temp.policies (p_pos text) returns void language plpgsql as $$
+begin
+  perform app.set_pos_option_policy (
+    md5('opt|' || p_pos)::uuid,
+    p_pos,
+    '["none"]'::jsonb,
+    '2026-01-01T00:00:00Z',
+    null,
+    'none_expected',
+    (
+      select
+        app.pos_base_schedule (p_pos, '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+  perform app.set_base_packaging (
+    md5('bpk|' || p_pos)::uuid,
+    p_pos,
+    '["none"]'::jsonb,
+    '2026-01-01T00:00:00Z',
+    null,
+    '{"none": true}'::jsonb,
+    (
+      select
+        app.packaging_base_schedule (p_pos, '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+end;
+$$;
+
+create function pg_temp.map_stock (
+  p_pos text,
+  p_item uuid,
+  p_qty text,
+  p_from timestamptz
+) returns void language plpgsql as $$
+begin
+  perform app.set_pos_base_mapping (
+    md5('map|' || p_pos || '|' || p_from::text)::uuid,
+    p_pos,
+    '["none"]'::jsonb,
+    p_from,
+    null,
+    pg_catalog.jsonb_build_object(
+      'stock_item_id',
+      p_item,
+      'quantity_per_basis',
+      p_qty,
+      'unit',
+      'kg'
+    ),
+    (
+      select
+        app.pos_base_schedule (p_pos, '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+end;
+$$;
+
+create function pg_temp.type_ok (p_type text) returns void language plpgsql as $$
+begin
+  perform app.set_order_type_packaging (
+    md5('ot|' || p_type)::uuid,
+    p_type,
+    '2026-01-01T00:00:00Z',
+    null,
+    '{"none": true}'::jsonb,
+    (
+      select
+        app.packaging_order_type_schedule (p_type) ->> 'token'
+    ),
+    'fixture'
+  );
+end;
+$$;
+
+select
+  app.set_item_loss (
+    md5('loss|p77-u1')::uuid,
+    pg_temp.u (1),
+    0,
+    '2026-01-01 00:00+00',
+    null,
+    (
+      select
+        app.schedule_token ('loss', pg_temp.u (1), null)
+    ),
+    'fixture'
+  );
+
+select
+  pg_temp.policies ('pos-ready');
+
+select
+  pg_temp.map_stock (
+    'pos-ready',
+    pg_temp.u (1),
+    '1',
+    '2026-01-01 00:00+00'
+  );
+
+select
+  pg_temp.shift ('p77-lines', '2026-12-20 12:00+00', false);
+
+select
+  pg_temp.ord (
+    'p77-o-mix',
+    'p77-lines',
+    'complete',
+    '2026-12-20 13:00+00',
+    20
+  );
+
+select
+  pg_temp.ord (
+    'p77-o-pack',
+    'p77-lines',
+    'complete',
+    '2026-12-20 14:00+00',
+    20
+  );
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    options,
+    line_total
+  )
+values
+  (
+    'p77-o-mix',
+    'l1',
+    'pos-ready',
+    'x',
+    1,
+    '[]'::jsonb,
+    0
+  ),
+  (
+    'p77-o-mix',
+    'l2',
+    'pos-gap',
+    'x',
+    1,
+    '[]'::jsonb,
+    0
+  ),
+  (
+    'p77-o-pack',
+    'l1',
+    'pos-ready',
+    'x',
+    1,
+    '[]'::jsonb,
+    0
+  );
+
+select
+  is (
+    pg_temp.one ('p77-lines') ->> 'completed_orders_covered',
+    '0',
+    'neither order is ready: one line is unmapped and order packaging is unresolved'
+  );
+
+select
+  is (
+    pg_temp.one ('p77-lines') ->> 'completed_orders_denominator',
+    '2',
+    'both complete orders are in the order denominator'
+  );
+
+select
+  is (
+    pg_temp.one ('p77-lines') ->> 'completed_lines_covered',
+    '2',
+    'the mapped lines are covered without the unmapped line or the order packaging'
+  );
+
+select
+  is (
+    pg_temp.one ('p77-lines') ->> 'completed_lines_denominator',
+    '3',
+    'every positive line stays in the line denominator'
+  );
+
+select
+  ok (
+    'order_coverage_incomplete' = any (pg_temp.one_causes ('p77-lines')),
+    'order readiness stays atomic when some lines are already covered'
+  );
+
+-- Findings 2 and 6 go through the coordinator. The sealed control is judged
+-- before the pre-migration item exists, because that item blocks every earlier shift.
+select
+  pg_temp.seal ('p77-seal', '2026-09-16 12:00+00');
+
+select
+  pg_temp.seal ('p77-inc', '2026-09-15 12:00+00');
+
+select
+  pg_temp.seal ('p77-reclass', '2026-09-21 12:00+00');
+
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    active,
+    created_at
+  )
+values
+  (
+    pg_temp.u (8),
+    'p77-reclass-fish',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    true,
+    '2026-09-20 00:00+00'
+  );
+
+select
+  pg_temp.daily_count (
+    pg_temp.u (340),
+    '2026-09-21 18:00+00',
+    array[pg_temp.u (8)]
+  );
+
+select
+  app.set_item_loss (
+    md5('loss|p77-u8')::uuid,
+    pg_temp.u (8),
+    0,
+    '2026-09-01 00:00+00',
+    null,
+    (
+      select
+        app.schedule_token ('loss', pg_temp.u (8), null)
+    ),
+    'fixture'
+  );
+
+select
+  app.post_movements (
+    pg_catalog.jsonb_build_array (
+      pg_catalog.jsonb_build_object (
+        'item_id',
+        pg_temp.u (8),
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-09-20 08:00+00',
+        'quantity',
+        100,
+        'unit_cost',
+        50
+      )
+    )
+  );
+
+select
+  pg_temp.policies ('pos-reclass');
+
+select
+  pg_temp.policies ('pos-inc');
+
+select
+  pg_temp.map_stock (
+    'pos-reclass',
+    pg_temp.u (8),
+    '1',
+    '2026-09-20 00:00+00'
+  );
+
+select
+  pg_temp.type_ok ('hall');
+
+-- These dated writes open rederive spans. Close them so they are not pending
+-- work for the shifts under test. The span case already asserted the open one.
+update app.accounting_rederive_spans
+set
+  completed_at = pg_catalog.clock_timestamp ()
+where
+  completed_at is null;
+
+insert into
+  app.inventory_activation (
+    stock_started_at,
+    approved_by,
+    request_id,
+    opening_manifest_hash
+  )
+values
+  (
+    '2026-09-01 00:00+00',
+    'a7700000-0000-4000-8000-0000000000a1',
+    pg_temp.u (341),
+    repeat('a', 32)
+  );
+
+select
+  pg_temp.ord (
+    'p77-o-reclass',
+    'p77-reclass',
+    'complete',
+    '2026-09-21 13:00+00',
+    100
+  );
+
+update app.pos_orders
+set
+  order_type = 'hall'
+where
+  id = 'p77-o-reclass';
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    options,
+    line_total
+  )
+values
+  (
+    'p77-o-reclass',
+    'l1',
+    'pos-reclass',
+    'x',
+    2,
+    '[]'::jsonb,
+    100
+  );
+
+select
+  app.capture_pos_order_snapshot ('p77-o-reclass', null, 'sync');
+
+select
+  app.append_pos_cost_input ('p77-o-reclass', null, 'sync');
+
+select
+  is (
+    pg_temp.account ('p77-o-reclass') ->> 'outcome',
+    'applied',
+    'the mapped order posts a sale before it is reclassified'
+  );
+
+update app.pos_orders
+set
+  status = 'canceled',
+  version = version + 1,
+  pos_update_time = '2026-09-21 15:00+00',
+  content_hash = repeat('aa', 32)
+where
+  id = 'p77-o-reclass';
+
+delete from app.pos_order_lines
+where
+  order_id = 'p77-o-reclass';
+
+select
+  app.capture_pos_order_snapshot ('p77-o-reclass', null, 'sync');
+
+select
+  app.append_pos_cost_input ('p77-o-reclass', null, 'sync');
+
+select
+  is (
+    pg_temp.account ('p77-o-reclass') ->> 'outcome',
+    'applied',
+    'the cancellation posts prepared waste in its own batch'
+  );
+
+select
+  is (
+    (
+      select
+        count(distinct application.retire_batch) + count(distinct application.posting_batch)
+      from
+        app.order_cost_applications application
+      where
+        application.order_id = 'p77-o-reclass'
+        and application.disposition = 'prepared_waste'
+        and application.retire_batch is not null
+        and application.posting_batch is not null
+    ),
+    2::bigint,
+    'the coordinator retires the sale and posts the waste as two batches'
+  );
+
+select
+  results_eq (
+    $$select
+        diff.cogs_difference,
+        diff.waste_difference,
+        diff.profit_difference
+      from
+        app.accounting_revision_differences diff
+      where
+        diff.shift_id = 'p77-reclass'
+        and diff.cause_kind = 'application'
+        and diff.cogs_difference <> '0.00'
+        and diff.waste_difference <> '0.00'$$,
+    $$values ('-100.00', '100.00', '0.00')$$,
+    'reclassifying the 100.00 sale into waste is one zero-profit vector'
+  );
+
+select
+  ok (
+    not exists (
+      select
+        1
+      from
+        app.order_cost_applications application
+        join app.accounting_revision_differences diff on diff.cause_id in (
+          application.retire_batch::text,
+          application.posting_batch::text
+        )
+      where
+        application.order_id = 'p77-o-reclass'
+        and (
+          application.retire_batch is not null
+          or application.posting_batch is not null
+        )
+    ),
+    'neither batch id is its own revision cause'
+  );
+
+-- Finding 2. A reviewed cancel with a preparation snapshot and no mapping.
+select
+  pg_temp.ord (
+    'p77-o-inc',
+    'p77-inc',
+    'complete',
+    '2026-09-15 13:00+00',
+    40
+  );
+
+update app.pos_orders
+set
+  order_type = 'hall'
+where
+  id = 'p77-o-inc';
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    options,
+    line_total
+  )
+values
+  (
+    'p77-o-inc',
+    'l1',
+    'pos-inc',
+    'x',
+    1,
+    '[]'::jsonb,
+    40
+  );
+
+select
+  app.capture_pos_order_snapshot ('p77-o-inc', null, 'sync');
+
+select
+  app.append_pos_cost_input ('p77-o-inc', null, 'sync');
+
+update app.pos_orders
+set
+  status = 'canceled',
+  version = version + 1,
+  pos_update_time = '2026-09-15 15:00+00',
+  content_hash = repeat('bb', 32)
+where
+  id = 'p77-o-inc';
+
+select
+  app.capture_pos_order_snapshot ('p77-o-inc', null, 'sync');
+
+select
+  app.append_pos_cost_input ('p77-o-inc', null, 'sync');
+
+select
+  is (
+    pg_temp.account ('p77-o-inc') ->> 'outcome',
+    'incomplete',
+    'the first cancellation pass finishes incomplete instead of blocking'
+  );
+
+select
+  is (
+    (
+      app.set_order_disposition (
+        pg_catalog.gen_random_uuid (),
+        'p77-o-inc',
+        'made',
+        (
+          select
+            queue.token
+          from
+            app.order_decision_queue queue
+          where
+            queue.order_id = 'p77-o-inc'
+        ),
+        null,
+        null
+      ) ->> 'outcome'
+    ),
+    'incomplete',
+    'the owner review applies the same incomplete cancellation'
+  );
+
+select
+  is (
+    pg_temp.account ('p77-o-inc') ->> 'outcome',
+    'incomplete',
+    'a second pass stays incomplete after the decision is reviewed'
+  );
+
+select
+  is (
+    (
+      select
+        state.disposition
+      from
+        app.order_cost_state state
+      where
+        state.order_id = 'p77-o-inc'
+    ),
+    'incomplete',
+    'the latest application disposition stays incomplete'
+  );
+
+select
+  is (
+    (
+      select
+        state.last_outcome
+      from
+        app.accounting_work_state state
+      where
+        state.order_id = 'p77-o-inc'
+    ),
+    'incomplete',
+    'the coordinator recorded the incomplete outcome'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.accounting_work_events event
+      where
+        event.order_id = 'p77-o-inc'
+        and event.processed_at is null
+    ),
+    0::bigint,
+    'the incomplete order has no pending work event'
+  );
+
+select
+  diag (pg_temp.one_causes ('p77-inc')::text);
+
+select
+  ok (
+    pg_temp.one_causes ('p77-inc') @> array['incomplete_application', 'unmapped_base']::text[],
+    'incomplete cancellation accounting blocks the shift with the mapping cause'
+  );
+
+select
+  ok (
+    not (
+      pg_temp.one_causes ('p77-inc') && array[
+        'pending_applications',
+        'unreviewed_decisions',
+        'unresolved_preparation',
+        'order_coverage_incomplete'
+      ]::text[]
+    ),
+    'the incomplete receipt is not hidden by pending, decision, preparation, or order coverage'
+  );
+
+select
+  is (
+    pg_temp.one ('p77-inc') ->> 'status_label',
+    'ناقص',
+    'unknown waste cost keeps the shift unclosed'
+  );
+
+insert into
+  app.pos_sync_coverage (
+    run_id,
+    started_at,
+    finished_at,
+    orders_scope_applied,
+    scope_kind,
+    scope_from,
+    scope_shift_ids,
+    presented_shift_ids,
+    transactions_covered,
+    legacy_direct
+  )
+select
+  coalesce(max(coverage.run_id), 772000) + 1,
+  pg_catalog.clock_timestamp () - interval '1 minute',
+  pg_catalog.clock_timestamp (),
+  true,
+  'shift_ids',
+  null,
+  array[
+    'p77-own-a',
+    'p77-own-b',
+    'p77-xfer-a',
+    'p77-xfer-b',
+    'p77-chrono'
+  ]::text[],
+  array[
+    'p77-own-a',
+    'p77-own-b',
+    'p77-xfer-a',
+    'p77-xfer-b',
+    'p77-chrono'
+  ]::text[],
+  true,
+  false
+from
+  app.pos_sync_coverage coverage;
+
+select
+  is (
+    pg_temp.one ('p77-seal') ->> 'status_label',
+    'مقفول نهائي',
+    'a sealed shift with no unknown tracking is final'
+  );
+
+-- Finding 1. The backfill clock stays honest, and a shift that opened earlier is blocked.
+do $$
+begin
+  execute 'alter table app.stock_items disable trigger trg_stock_items_tracking_history';
+
+  insert into
+    app.stock_items (
+      id,
+      name,
+      kind,
+      base_unit,
+      count_frequency,
+      loss_pct,
+      active,
+      created_at
+    )
+  values
+    (
+      pg_temp.u (9),
+      'p77-hist-fish',
+      'seafood',
+      'kg',
+      'daily',
+      0,
+      true,
+      '2020-01-01 00:00+00'
+    );
+
+  insert into
+    app.item_tracking_history (item_id, active, count_frequency, known_since, basis)
+  values
+    (
+      pg_temp.u (9),
+      true,
+      'daily',
+      '2026-05-01 00:00+00',
+      'backfill'
+    );
+
+  execute 'alter table app.stock_items enable always trigger trg_stock_items_tracking_history';
+exception
+  when others then
+    execute 'alter table app.stock_items enable always trigger trg_stock_items_tracking_history';
+
+    raise;
+end;
+$$;
+
+select
+  pg_temp.seal ('p77-hist', '2026-04-01 12:00+00');
+
+select
+  pg_temp.seal ('p77-hist-later', '2026-05-02 12:00+00');
+
+select
+  is (
+    pg_temp.one ('p77-hist') ->> 'status_label',
+    'ناقص',
+    'a shift opened before the item was known cannot close final'
+  );
+
+select
+  ok (
+    'tracking_unknown' = any (pg_temp.one_causes ('p77-hist')),
+    'unknown historical tracking is its own blocker'
+  );
+
+select
+  is (
+    pg_temp.one ('p77-hist') ->> 'daily_required',
+    '0',
+    'the backfill does not invent a roster row before it was known'
+  );
+
+select
+  is (
+    (
+      select
+        history.basis
+      from
+        app.item_tracking_history history
+      where
+        history.item_id = pg_temp.u (1)
+      order by
+        history.known_since,
+        history.id
+      limit
+        1
+    ),
+    'observed',
+    'an item inserted after the migration is observed, not backfilled'
+  );
+
+select
+  ok (
+    not (
+      'tracking_unknown' = any (pg_temp.one_causes ('p77-hist-later'))
+    ),
+    'a shift opened after the backfill clock is not unknown tracking'
+  );
+
+-- Finding 10. One year of counts, one page. Budget is 2000 ms.
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    active,
+    created_at
+  )
+values
+  (
+    pg_temp.u (6),
+    'p77-year-daily',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    true,
+    '2024-01-01 00:00+00'
+  ),
+  (
+    pg_temp.u (7),
+    'p77-year-weekly',
+    'seafood',
+    'kg',
+    'weekly',
+    0,
+    true,
+    '2024-01-01 00:00+00'
+  );
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+select
+  'p77-y-' || pg_catalog.to_char (day, 'YYYYMMDD'),
+  day + time '12:00',
+  day + time '22:00',
+  false,
+  day + time '12:00'
+from
+  pg_catalog.generate_series (
+    '2024-01-02'::date,
+    '2024-01-02'::date + 364,
+    interval '1 day'
+  ) as day;
+
+with
+  daily as (
+    insert into
+      app.stock_counts (id, request_id, frequency, counted_at)
+    select
+      pg_catalog.gen_random_uuid (),
+      pg_catalog.gen_random_uuid (),
+      'daily',
+      shift.opened_at + interval '6 hours'
+    from
+      app.pos_shifts shift
+    where
+      shift.id like 'p77-y-%'
+    returning
+      id
+  )
+insert into
+  app.stock_count_lines (
+    count_id,
+    line_no,
+    item_id,
+    expected_base_unit,
+    counted_qty,
+    expected_qty,
+    delta_qty,
+    delta_value
+  )
+select
+  daily.id,
+  1,
+  pg_temp.u (6),
+  'kg',
+  0,
+  0,
+  0,
+  0
+from
+  daily;
+
+with
+  weekly as (
+    insert into
+      app.stock_counts (id, request_id, frequency, counted_at)
+    select
+      pg_catalog.gen_random_uuid (),
+      pg_catalog.gen_random_uuid (),
+      'weekly',
+      shift.opened_at + interval '6 hours'
+    from
+      app.pos_shifts shift
+    where
+      shift.id like 'p77-y-%'
+      and (shift.opened_at::date - date '2024-01-02') % 7 = 0
+    returning
+      id
+  )
+insert into
+  app.stock_count_lines (
+    count_id,
+    line_no,
+    item_id,
+    expected_base_unit,
+    counted_qty,
+    expected_qty,
+    delta_qty,
+    delta_value
+  )
+select
+  weekly.id,
+  1,
+  pg_temp.u (7),
+  'kg',
+  0,
+  0,
+  0,
+  0
+from
+  weekly;
+
+create temp table p77_bench (ms numeric);
+
+do $$
+declare
+  v_start timestamptz;
+  v_ms numeric;
+  v_rows integer;
+begin
+  v_start := pg_catalog.clock_timestamp ();
+
+  select
+    count(*)
+  into v_rows
+  from
+    app.list_shift_accounting_status (null, null, 50);
+
+  v_ms := 1000 * pg_catalog.date_part(
+    'epoch',
+    pg_catalog.clock_timestamp () - v_start
+  );
+
+  insert into
+    p77_bench (ms)
+  values
+    (v_ms);
+
+  raise notice 'annual shift status page: % ms (budget 2000), rows %', pg_catalog.round(v_ms, 1), v_rows;
+end;
+$$;
+
+select
+  diag ('annual shift status page ms: ' || ms::text)
+from
+  p77_bench;
+
+select
+  ok (
+    (
+      select
+        ms <= 2000
+      from
+        p77_bench
+    ),
+    'annual status page of 50 shifts over a year of counts finishes within 2000 ms'
+  );
+
 select
   ok (
     not has_table_privilege(
