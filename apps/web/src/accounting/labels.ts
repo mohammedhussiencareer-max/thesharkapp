@@ -5,6 +5,7 @@ import type {
   ReceiptKind,
   ScopeKind,
 } from '@/accounting/types';
+import { issueLabels } from '@/mapping/labels';
 
 export const reasonLabels: Record<FailureReason, string> = {
   error: 'خطأ في الحساب',
@@ -46,6 +47,8 @@ export const causeLabels: Record<string, string> = {
   pending_applications: 'فيه خصم لسه مستني',
   blocked_applications: 'فيه خصم واقف',
   stale_applications: 'الخصم أقدم من المدخلات',
+  tracking_unknown: 'تتبع الصنف قبل الوردية مش معروف',
+  incomplete_application: 'فيه خصم ناقص',
   unreviewed_decisions: 'فيه قرار لسه ما اتراجعش',
   unresolved_preparation: 'أساس التحضير ناقص',
   unresolved_refund_attribution: 'مرتجع من غير طلب',
@@ -53,6 +56,20 @@ export const causeLabels: Record<string, string> = {
   missing_cost_basis: 'سعر التكلفة ناقص',
   order_coverage_incomplete: 'تغطية الطلبات ناقصة',
   count_sync_scope_not_covered: 'مزامنة الجرد ما غطّتش الورديات',
+  missing_preparation_basis: 'أساس التحضير ناقص',
+  missing_shift: 'الوردية مش متسجلة',
+  before_item_opening: 'الطلب قبل رصيد الصنف',
+  before_stock_start: 'قبل بداية المخزون',
+  incomplete: 'الطلب ناقص',
+  not_made: 'الطلب ماتعملش',
+  open: 'الطلب مفتوح',
+  no_stock: 'من غير مخزون',
+  disposition_pending: 'مستني قرار',
+  blocked: 'الخصم واقف',
+  packaging_unreviewed: 'التغليف لسه ما اتراجعش',
+  packaging_kind: 'صنف التغليف مش تغليف',
+  packaging_unit: 'وحدة التغليف مش متحولة',
+  packaging_weight_unit: 'وزن التغليف مش مظبوط',
 };
 
 export const movementLabels: Record<string, string> = {
@@ -78,7 +95,7 @@ export function sqlstateLabel(code: string): string {
 }
 
 export function causeLabel(code: string): string {
-  return causeLabels[code] ?? code;
+  return causeLabels[code] ?? issueLabels[code] ?? code;
 }
 
 export function movementLabel(type: string): string {

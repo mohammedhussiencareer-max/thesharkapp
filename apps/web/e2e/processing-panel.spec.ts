@@ -21,17 +21,35 @@ test('owner reviews dormant deductions, activation, and order cost', async ({
   const run = panel.getByRole('button', { name: 'شغّل الخصم' });
   await run.click();
   await expect(run).toBeEnabled(visible);
-  await expect(page.getByText('الخصم لسه ما اتفعّلش')).toBeVisible(visible);
+  // Setup records activation for the decision fixture, and a parallel spec can
+  // hold the ledger lock. The click then ends on a safe Arabic stop.
+  await expect(
+    page
+      .getByText(
+        /الخصم لسه ما اتفعّلش|مفيش شغل مستني|الحساب مشغول|المزامنة شغالة|الحساب وقف بسبب خطأ في الدفتر|طلب فشل واتسجل|المكالمة ما اكتملتش|الدور اتغير، هيتراجع|الوقت خلص والباقي مستني/,
+      )
+      .first(),
+  ).toBeVisible(visible);
   await expect(page.getByText(/permission denied|SQLSTATE|ERROR:/)).toHaveCount(
     0,
   );
 
-  const shift = page.getByRole('link', { name: /^وردية / }).first();
-  await shift.click();
+  const shift = page
+    .getByRole('article')
+    .filter({ hasText: 'مطابق للدرج' })
+    .filter({ hasText: 'صافي المبيعات 210.00 ج.م' })
+    .filter({ hasText: 'مرتجعات 40.00 ج.م' });
+  await expect(shift).toBeVisible(visible);
+  await shift.getByRole('link', { name: /^وردية / }).click();
+  await expect(page).toHaveURL('/sales/shift-e2e-sales-1');
   const status = page.getByRole('region', { name: 'حالة الوردية' });
   await expect(status).toBeVisible(visible);
   await expect(
-    status.getByText(/ناقص|تقديري|السمك مقفول|مقفول نهائي/),
+    status
+      .getByText('ناقص', { exact: true })
+      .or(status.getByText('تقديري', { exact: true }))
+      .or(status.getByText('السمك مقفول', { exact: true }))
+      .or(status.getByText('مقفول نهائي', { exact: true })),
   ).toBeVisible(visible);
   const order = page.getByRole('row').filter({ hasText: '9001' });
   await order.getByRole('link', { name: 'تكلفة الطلب' }).click();

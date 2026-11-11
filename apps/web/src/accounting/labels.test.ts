@@ -11,6 +11,12 @@ describe('accounting labels', () => {
   it('maps dispositions, causes, movements, and SQLSTATE', () => {
     expect(dispositionLabels.prepared_waste).toBe('فاقد تحضير');
     expect(causeLabel('missing_cost_basis')).toBe('سعر التكلفة ناقص');
+    expect(causeLabel('tracking_unknown')).toBe(
+      'تتبع الصنف قبل الوردية مش معروف',
+    );
+    expect(causeLabel('incomplete_application')).toBe('فيه خصم ناقص');
+    expect(causeLabel('unmapped_base')).toBe('الصنف مش مربوط');
+    expect(causeLabel('packaging_unreviewed')).toBe('التغليف لسه ما اتراجعش');
     expect(causeLabel('custom_cause')).toBe('custom_cause');
     expect(movementLabel('count_compensation')).toBe('تعويض جرد');
     expect(movementLabel('other')).toBe('other');

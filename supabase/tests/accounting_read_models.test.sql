@@ -156,6 +156,7 @@ select
   throws_ok (
     $$select app.accounting_processing_summary()$$,
     '42501',
+    'insufficient_privilege',
     'a session without an owner claim is refused'
   );
 
@@ -166,6 +167,7 @@ select
   throws_ok (
     $$select app.order_cost_detail('o-cost')$$,
     '42501',
+    'insufficient_privilege',
     'a signed-in user who is not the owner is refused'
   );
 
@@ -197,6 +199,7 @@ select
   throws_ok (
     $$select app.opening_activation_review(null, 0)$$,
     '22023',
+    'limit is out of range',
     'a limit outside 1..200 is refused'
   );
 
@@ -204,6 +207,7 @@ select
   throws_ok (
     $$select app.order_cost_detail(' ')$$,
     '22023',
+    'order id is required',
     'a blank order id is refused'
   );
 
@@ -211,6 +215,7 @@ select
   throws_ok (
     $$select app.stock_count_derivation_detail(null)$$,
     '22023',
+    'count id is required',
     'a null count id is refused'
   );
 
@@ -825,8 +830,8 @@ select
 select
   is (
     app.accounting_processing_summary () ->> 'pending_count',
-    '2',
-    'an unclaimed event is pending, including one on a parked order'
+    '3',
+    'an unclaimed event is pending, including one on a parked order and the cost input recorded for the detail fixture'
   );
 
 select
@@ -853,8 +858,8 @@ select
 select
   is (
     app.accounting_processing_summary () ->> 'open_event_count',
-    '3',
-    'open events stay visible while work remains'
+    '5',
+    'open events stay visible while work remains, including the event each cost input appends'
   );
 
 select
