@@ -1,13 +1,24 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { resetHeldWrites } from '@/items/request-id';
+import {
+  hasAction,
+  resetHeldWrites,
+  unknownSaveMessage,
+} from '@/items/request-id';
 import {
   loadQueuePage,
   loadQueueRow,
   loadUnlinkedRefunds,
   setOrderDisposition,
 } from '@/order-decisions/api';
+import { decisionSubject } from '@/order-decisions/format';
 import { queueRow } from '@/order-decisions/test-fixtures';
 import { OrderDecisionsPage } from '@/pages/OrderDecisionsPage';
 
@@ -164,6 +175,88 @@ describe('OrderDecisionsPage', () => {
       await screen.findByText('الطلب ده مبقاش محتاج قرار'),
     ).toBeInTheDocument();
     expect(screen.queryByRole('form')).toBeNull();
+  });
+
+  it('keeps the identical-retry control for a lost closing decision after a refresh', async () => {
+    vi.mocked(loadQueuePage).mockResolvedValueOnce({
+      rows: [queueRow()],
+      next: null,
+    });
+    vi.mocked(setOrderDisposition).mockRejectedValueOnce(new Error('socket'));
+    renderPage();
+    await screen.findByRole('article', { name: 'طلب رقم 41' });
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد القرار' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    const first = vi.mocked(setOrderDisposition).mock.calls[0]?.[0];
+
+    // The closing decision was stored, so neither queue filter lists the order.
+    vi.mocked(loadQueuePage).mockResolvedValueOnce({ rows: [], next: null });
+    fireEvent.click(screen.getByRole('button', { name: 'تحديث' }));
+    await waitFor(() =>
+      expect(screen.queryByRole('article', { name: 'طلب رقم 41' })).toBeNull(),
+    );
+    expect(
+      await screen.findByText('مفيش طلبات محتاجة قرار'),
+    ).toBeInTheDocument();
+    const section = screen.getByRole('region', {
+      name: 'قرارات مش متأكد إنها اتسجلت',
+    });
+    expect(within(section).getByText(/order-1/)).toBeInTheDocument();
+
+    vi.mocked(loadQueuePage).mockResolvedValueOnce({ rows: [], next: null });
+    fireEvent.click(screen.getByRole('button', { name: 'كل الطلبات' }));
+    await screen.findByText('مفيش طلبات ملغية أو مرتجعة');
+    expect(
+      screen.getByRole('region', { name: 'قرارات مش متأكد إنها اتسجلت' }),
+    ).toBeInTheDocument();
+
+    vi.mocked(setOrderDisposition).mockResolvedValueOnce({
+      status: 'ok',
+      orderId: 'order-1',
+      eventId: 12,
+      decision: 'made',
+      decisionClass: 'none',
+      outcome: 'posted',
+      reason: null,
+      differences: {
+        stockQuantity: '-1',
+        stockValue: '-50.00',
+        cogs: '50.00',
+        waste: '0.00',
+        profit: '-50.00',
+      },
+    });
+    vi.mocked(loadQueuePage).mockResolvedValueOnce({ rows: [], next: null });
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(
+      await screen.findByLabelText('نتيجة إعادة المحاولة لطلب order-1'),
+    ).toHaveTextContent('اتسجل القرار');
+    expect(vi.mocked(setOrderDisposition)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(setOrderDisposition).mock.calls[1]?.[0]).toBe(first);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('region', { name: 'قرارات مش متأكد إنها اتسجلت' }),
+      ).toBeNull(),
+    );
+    expect(hasAction(decisionSubject('order-1'))).toBe(false);
+  });
+
+  it('shows the retry control once, on the card, while the order is still listed', async () => {
+    vi.mocked(loadQueuePage).mockResolvedValue({
+      rows: [queueRow()],
+      next: null,
+    });
+    vi.mocked(setOrderDisposition).mockRejectedValueOnce(new Error('socket'));
+    renderPage();
+    await screen.findByRole('article', { name: 'طلب رقم 41' });
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد القرار' }));
+    await screen.findByText(unknownSaveMessage);
+    expect(
+      screen.getAllByRole('button', { name: 'إعادة المحاولة' }),
+    ).toHaveLength(1);
+    expect(
+      screen.queryByRole('region', { name: 'قرارات مش متأكد إنها اتسجلت' }),
+    ).toBeNull();
   });
 
   it('lists refunds that no order owns', async () => {

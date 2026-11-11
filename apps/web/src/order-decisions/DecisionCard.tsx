@@ -49,7 +49,7 @@ function HistoryItem({ entry }: { entry: HistoryEntry }) {
   );
 }
 
-function NoticeView({ notice }: { notice: DecisionNotice }) {
+export function NoticeView({ notice }: { notice: DecisionNotice }) {
   if (notice.kind === 'failed') return <p role="alert">{notice.message}</p>;
   const { result, warning } = notice;
   return (

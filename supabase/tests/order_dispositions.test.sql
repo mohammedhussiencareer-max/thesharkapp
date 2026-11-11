@@ -1289,8 +1289,8 @@ select
   throws_ok (
     $$select pg_temp.decide('d-r1', 'made', null, pg_temp.ret('1', '1'))$$,
     '22023',
-    'returned quantities apply only to a not-made partial refund',
-    'a made decision takes no returned quantities'
+    'returned quantities apply only to a not-made partial refund or a made canceled, missing or fully refunded order',
+    'a made decision on a partial refund takes no returned quantities'
   );
 
 select
@@ -1478,8 +1478,45 @@ select
 select
   results_eq (
     $$select pg_temp.disp('d-r1'), pg_temp.net('d-r1', '1'), pg_temp.net('d-r1', '2')$$,
-    $$values ('prepared_waste', -1::numeric, -0.5::numeric)$$,
-    'made wastes the whole prepared basis, not the kept part'
+    $$values ('prepared_waste', -0.5::numeric, -0.5::numeric)$$,
+    'made wastes the prepared basis less the retained returned quantity (A: 1 - 0.5, B: 0.5)'
+  );
+
+select
+  throws_ok (
+    $$select pg_temp.decide('d-r1', 'made', null, pg_temp.ret('1', '1.5'))$$,
+    '22023',
+    'returned quantities must be listed items and not exceed the prepared quantities',
+    'a made full refund validates the returned quantities against the preparation basis'
+  );
+
+-- The owner rebases R on the full refund; a confirmed zero wastes the whole basis.
+select
+  lives_ok (
+    $$select pg_temp.decide('d-r1', 'made', null, pg_temp.ret('1', '0'))$$,
+    'the owner rebases the returned quantity to a confirmed zero'
+  );
+
+select
+  results_eq (
+    $$select pg_temp.disp('d-r1'), pg_temp.net('d-r1', '1'), pg_temp.net('d-r1', '2'),
+        (pg_temp.ev('d-r1')).returned$$,
+    $$values ('prepared_waste', -1::numeric, -0.5::numeric,
+        '[{"stock_item_id": "a5500000-0000-4000-8000-000000000001", "returned": "0"}]'::jsonb)$$,
+    'a confirmed zero wastes the whole prepared basis and is stored as a zero entry'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-r1', 'made', null, pg_temp.ret('1', '0.5'))$$,
+    'the owner rebases the returned quantity back to 0.5 kg'
+  );
+
+select
+  results_eq (
+    $$select pg_temp.disp('d-r1'), pg_temp.net('d-r1', '1'), pg_temp.net('d-r1', '2')$$,
+    $$values ('prepared_waste', -0.5::numeric, -0.5::numeric)$$,
+    'the rebased 0.5 kg applies to the waste again'
   );
 
 -- Removing the second refund makes it partial again: R applies again.
@@ -1500,8 +1537,8 @@ select
 select
   results_eq (
     $$select pg_temp.disp('d-r1'), pg_temp.net('d-r1', '1')$$,
-    $$values ('prepared_waste', -1::numeric)$$,
-    'the waste stays in force while it waits'
+    $$values ('prepared_waste', -0.5::numeric)$$,
+    'the waste of the kept quantity stays in force while it waits'
   );
 
 select
@@ -1972,6 +2009,529 @@ select
     $$select tx_id, amount from app.unlinked_refunds$$,
     $$values ('u1', '12.00')$$,
     'an unlinked refund is listed'
+  );
+
+-- ---------------------------------------------------------------------------
+-- Review round 1.
+-- ---------------------------------------------------------------------------
+create function pg_temp.reappear (p_id text) returns void language plpgsql as $$
+begin
+  update app.pos_orders
+  set
+    status = 'complete',
+    version = version + 1,
+    pos_update_time = pos_update_time + interval '1 minute',
+    content_hash = rpad(md5(p_id || '-back' || (version + 1)::text), 64, 'd')
+  where
+    id = p_id;
+
+  perform app.capture_pos_order_snapshot(p_id, null, 'sync');
+  perform app.append_pos_cost_input(p_id, null, 'sync');
+end;
+$$;
+
+-- Finding 1: a partial refund that becomes full keeps R; made wastes Q - R.
+select
+  pg_temp.mk_order (
+    'd-q1',
+    '2030-06-12T09:00:00Z',
+    'pos-a',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.refund ('d-q1', 'q1a', 20);
+
+select
+  pg_temp.drain ();
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-q1', 'not_made', 'one kg came back', pg_temp.ret('1', '1'))$$,
+    'f1: Q = 2 kg, R = 1 kg, the partial refund is not made'
+  );
+
+select
+  is (
+    pg_temp.net ('d-q1', '1'),
+    -1::numeric,
+    'f1: the sale keeps 1 kg'
+  );
+
+select
+  pg_temp.refund ('d-q1', 'q1b', 80);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).current_class, pg_temp.net('d-q1', '1')
+      from (select pg_temp.q('d-q1') as q) x$$,
+    $$values ('refund_changed', 'full_refund', -1::numeric)$$,
+    'f1: the partial refund became full and waits for a decision, the 1 kg stays in force'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-q1', 'made', 'prepared and wasted')$$,
+    'f1: the owner decides made on the full refund'
+  );
+
+select
+  results_eq (
+    $$select pg_temp.disp('d-q1'), pg_temp.net('d-q1', '1'), live_waste, (pg_temp.ev('d-q1')).returned -> 0 ->> 'returned'
+      from (select pg_temp.live_waste('d-q1') as live_waste) x$$,
+    $$values ('prepared_waste', -1::numeric, 1::bigint, '1')$$,
+    'f1: the waste consumes Q - R = 1 kg, not the returned kilo again'
+  );
+
+select
+  throws_ok (
+    $$select pg_temp.decide('d-q1', 'not_made', 'no', pg_temp.ret('1', '1'))$$,
+    '22023',
+    'returned quantities apply only to a not-made partial refund or a made canceled, missing or fully refunded order',
+    'f1: a not-made full refund takes no returned quantities'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-q1', 'made', null, '[]'::jsonb)$$,
+    'f1: the owner clears R on the full refund'
+  );
+
+select
+  results_eq (
+    $$select pg_temp.disp('d-q1'), pg_temp.net('d-q1', '1'), jsonb_array_length((pg_temp.ev('d-q1')).returned)$$,
+    $$values ('prepared_waste', -2::numeric, 0)$$,
+    'f1: with R cleared the waste is the whole prepared basis'
+  );
+
+-- Finding 2: the allocation is relative to the retained preparation basis.
+select
+  pg_temp.mk_order (
+    'd-q2',
+    '2030-06-12T09:10:00Z',
+    'pos-a',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.refund ('d-q2', 'q2a', 20);
+
+select
+  pg_temp.drain ();
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-q2', 'not_made', 'one kg came back', pg_temp.ret('1', '1'))$$,
+    'f2: Q = 2 kg, R = 1 kg confirmed'
+  );
+
+delete from app.pos_order_lines
+where
+  order_id = 'd-q2';
+
+select
+  pg_temp.edit_order ('d-q2', null, null);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).basis_status, pg_temp.disp('d-q2'), pg_temp.net('d-q2', '1')
+      from (select pg_temp.q('d-q2') as q) x$$,
+    $$values (null, 'ready', 'sale', -1::numeric)$$,
+    'f2: clearing the current snapshot''s lines keeps the retained basis, so the sale still keeps 1 kg'
+  );
+
+-- Finding 3: a reclassification keeps the previous movement pieces.
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    parent_item_id
+  )
+values
+  (
+    'a5500000-0000-4000-8000-000000000003',
+    'p55-fish-c',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  );
+
+insert into
+  app.item_loss_versions (
+    effective_from,
+    created_change_id,
+    item_id,
+    loss_pct
+  )
+select
+  '2000-01-01 00:00:00+00',
+  (
+    select
+      id
+    from
+      app.costing_changes
+    where
+      request_id = 'a5500000-0000-4000-8000-0000000000c0'
+  ),
+  'a5500000-0000-4000-8000-000000000003',
+  0;
+
+select
+  pg_temp.policies ('pos-e');
+
+select
+  pg_temp.map_stock (
+    'pos-e',
+    'a5500000-0000-4000-8000-000000000003',
+    '1',
+    '2030-01-01T00:00:00Z'
+  );
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(
+      jsonb_build_object('item_id', 'a5500000-0000-4000-8000-000000000003', 'movement_type', 'purchase',
+        'occurred_at', '2030-05-01T00:00:00Z', 'quantity', 1, 'unit_cost', 33.34)
+    ))$$,
+    'f3: 1 kg of fish c is bought at 33.34'
+  );
+
+select
+  pg_temp.mk_order (
+    'd-q3',
+    '2030-06-12T10:00:00Z',
+    'pos-e',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select m.quantity::numeric, m.is_provisional
+      from app.order_cost_movement_links l
+      join app.stock_movements m on m.id = l.movement_id
+      where l.order_id = 'd-q3' and m.movement_type = 'sale'
+      order by l.event_position, l.piece_position, l.movement_id$$,
+    $$values (-1::numeric, false), (-1::numeric, true)$$,
+    'f3: the 2 kg sale splits into a normal and a provisional 1 kg piece'
+  );
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(
+      jsonb_build_object('item_id', 'a5500000-0000-4000-8000-000000000003', 'movement_type', 'purchase',
+        'occurred_at', '2030-05-02T00:00:00Z', 'quantity', 2, 'unit_cost', 33.335)
+    ))$$,
+    'f3: a backdated purchase of 2 kg for 66.67 arrives'
+  );
+
+select
+  results_eq (
+    $$select m.quantity::numeric, m.total_cost::numeric
+      from app.order_cost_movement_links l
+      join app.stock_movements m on m.id = l.movement_id
+      where l.order_id = 'd-q3' and m.movement_type = 'sale'
+      order by l.event_position, l.piece_position, l.movement_id$$,
+    $$values (-1::numeric, -33.34::numeric), (-1::numeric, -33.34::numeric)$$,
+    'f3: after the backdated purchase the two 1 kg pieces are worth 33.34 each, 66.68 in all'
+  );
+
+select
+  pg_temp.cancel ('d-q3', true);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select m.quantity::numeric
+      from app.order_cost_movement_links l
+      join app.stock_movements m on m.id = l.movement_id
+      where l.order_id = 'd-q3' and m.movement_type = 'waste'
+      order by l.event_position, l.piece_position, l.movement_id$$,
+    $$values (-1::numeric), (-1::numeric)$$,
+    'f3: the waste keeps the sale''s two 1 kg pieces'
+  );
+
+select
+  results_eq (
+    $$select a.stock_qty_delta::numeric, a.stock_value_delta::numeric, a.profit_delta::numeric
+      from app.order_disposition_applications a
+      where a.order_id = 'd-q3'$$,
+    $$values (0::numeric, 0::numeric, 0::numeric)$$,
+    'f3: reclassifying the sale as waste changes no stock value and no profit by a piaster'
+  );
+
+-- Finding 4: a refund change is reviewed before an episode closes.
+select
+  pg_temp.mk_order (
+    'd-q4',
+    '2030-06-12T11:00:00Z',
+    'pos-a',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.refund ('d-q4', 'q4a', 20);
+
+select
+  pg_temp.cancel ('d-q4', false);
+
+select
+  pg_temp.drain ();
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-q4', 'not_made', 'never prepared')$$,
+    'f4: the owner reviews the canceled order as not made'
+  );
+
+select
+  results_eq (
+    $$select pg_temp.disp('d-q4'), pg_temp.net('d-q4', '1')$$,
+    $$values ('none', 0::numeric)$$,
+    'f4: not made posts nothing'
+  );
+
+select
+  pg_temp.refund ('d-q4', 'q4a', 20, false);
+
+select
+  pg_temp.reappear ('d-q4');
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).current_class, (q).decision, (q).owner_reviewed,
+        pg_temp.disp('d-q4'), pg_temp.net('d-q4', '1'), pg_temp.ev_count('d-q4')
+      from (select pg_temp.q('d-q4') as q) x$$,
+    $$values ('refund_changed', null, 'not_made', true, 'none', 0::numeric, 2::bigint)$$,
+    'f4: the last refund disappearing holds the reviewed decision for review; no sale replaces it'
+  );
+
+select
+  results_eq (
+    $$select last_outcome, last_reason from app.accounting_work_state where order_id = 'd-q4'$$,
+    $$values ('disposition_pending', 'needs_review')$$,
+    'f4: the work state reports a pending decision'
+  );
+
+-- Finding 5: the closing decision reports the difference it caused.
+select
+  pg_temp.mk_order (
+    'd-q5',
+    '2030-06-12T12:00:00Z',
+    'pos-a',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.refund ('d-q5', 'q5a', 20);
+
+select
+  pg_temp.drain ();
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-q5', 'not_made', 'one kg came back', pg_temp.ret('1', '1'))$$,
+    'f5: Q = 2 kg, R = 1 kg confirmed'
+  );
+
+select
+  pg_temp.refund ('d-q5', 'q5a', 20, false);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).current_class, pg_temp.net('d-q5', '1')
+      from (select pg_temp.q('d-q5') as q) x$$,
+    $$values ('refund_changed', null, -1::numeric)$$,
+    'f5: the last refund disappearing waits for a decision; the 1 kg stays'
+  );
+
+select
+  results_eq (
+    $$select r ->> 'outcome', r -> 'differences' ->> 'stock_quantity', r -> 'differences' ->> 'stock_value',
+        r -> 'differences' ->> 'cogs', r -> 'differences' ->> 'waste', r -> 'differences' ->> 'profit'
+      from (select pg_temp.decide('d-q5', 'made', 'it was prepared after all') as r) x$$,
+    $$values ('applied', '-1', '-50.00', '50.00', '0.00', '-50.00')$$,
+    'f5: confirming made closes the episode and reports the consumption it posted'
+  );
+
+select
+  results_eq (
+    $$select is_open, pg_temp.disp('d-q5'), pg_temp.net('d-q5', '1')
+      from app.order_disposition_state where order_id = 'd-q5'$$,
+    $$values (false, 'sale', -2::numeric)$$,
+    'f5: the episode is closed and the order is an ordinary 2 kg sale'
+  );
+
+select
+  results_eq (
+    $$select (a.stock_qty_delta)::text, (a.profit_delta)::text
+      from app.order_disposition_applications a
+      join app.order_disposition_events e on e.id = a.event_id
+      where a.order_id = 'd-q5' and e.class = 'none'$$,
+    $$values ('-1.000000', '-50.00')$$,
+    'f5: the effect is recorded against the closing decision'
+  );
+
+-- Finding 6: a confirmed zero is an allocation too.
+select
+  pg_temp.mk_order (
+    'd-q6',
+    '2030-06-12T13:00:00Z',
+    'pos-a',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.refund ('d-q6', 'q6a', 20);
+
+select
+  pg_temp.drain ();
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-q6', 'not_made', 'nothing came back', pg_temp.ret('1', '0'))$$,
+    'f6: the owner confirms a returned quantity of zero'
+  );
+
+select
+  results_eq (
+    $$select jsonb_array_length((pg_temp.ev('d-q6')).returned), (pg_temp.ev('d-q6')).returned -> 0 ->> 'returned',
+        pg_temp.net('d-q6', '1')$$,
+    $$values (1, '0', -2::numeric)$$,
+    'f6: the zero is stored as a confirmed entry and the sale keeps all 2 kg'
+  );
+
+select
+  pg_temp.edit_order ('d-q6', 3, null);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, pg_temp.net('d-q6', '1')
+      from (select pg_temp.q('d-q6') as q) x$$,
+    $$values ('quantities_changed', -2::numeric)$$,
+    'f6: a changed quantity needs a review; the 2 kg is not silently replaced'
+  );
+
+select
+  pg_temp.mk_order (
+    'd-q7',
+    '2030-06-12T13:30:00Z',
+    'pos-a',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.refund ('d-q7', 'q7a', 20);
+
+select
+  pg_temp.drain ();
+
+select
+  pg_temp.decide (
+    'd-q7',
+    'not_made',
+    'nothing came back',
+    pg_temp.ret ('1', '0')
+  );
+
+update app.pos_order_lines
+set
+  item_id = 'pos-c'
+where
+  order_id = 'd-q7';
+
+select
+  pg_temp.edit_order ('d-q7', null, null);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, pg_temp.net('d-q7', '1')
+      from (select pg_temp.q('d-q7') as q) x$$,
+    $$values ('items_changed', -2::numeric)$$,
+    'f6: a change of the mapped items needs a review for a confirmed zero as well'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-q6', 'not_made', null, pg_temp.ret('1', '0'))$$,
+    'f6: the owner rebases the confirmed zero'
+  );
+
+select
+  results_eq (
+    $$select (q).review_reason, pg_temp.net('d-q6', '1')
+      from (select pg_temp.q('d-q6') as q) x$$,
+    $$values (null, -3::numeric)$$,
+    'f6: the rebase clears the review and the sale keeps the new 3 kg'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-q6', 'not_made', null, '[]'::jsonb)$$,
+    'f6: the owner clears the allocation with an empty list'
+  );
+
+select
+  pg_temp.edit_order ('d-q6', 4, null);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, jsonb_array_length((pg_temp.ev('d-q6')).returned), pg_temp.net('d-q6', '1')
+      from (select pg_temp.q('d-q6') as q) x$$,
+    $$values (null, 0, -4::numeric)$$,
+    'f6: a cleared allocation follows the order without a review'
   );
 
 -- ---------------------------------------------------------------------------

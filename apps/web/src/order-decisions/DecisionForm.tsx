@@ -10,6 +10,7 @@ import {
 import { UnknownSave } from '@/items/UnknownSave';
 import { primaryButton } from '@/lib/page-style';
 import { setOrderDisposition } from '@/order-decisions/api';
+import { noteDecisionOrder } from '@/order-decisions/held-decisions';
 import {
   decisionLabels,
   decisionSubject,
@@ -53,6 +54,7 @@ export function DecisionForm({
   const [draft, setDraft] = useState<Record<string, string>>(() =>
     draftFromReturned(row.returned),
   );
+  const [clearReturned, setClearReturned] = useState(false);
   const [saving, setSaving] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [heldEpoch, setHeldEpoch] = useState(0);
@@ -67,11 +69,18 @@ export function DecisionForm({
   const unresolved = row.currentClass === 'unresolved_refund';
   const onlyMade = row.currentClass === null;
   const flipping = choice !== row.decision;
+  const terminal =
+    row.currentClass === 'canceled' ||
+    row.currentClass === 'missing' ||
+    row.currentClass === 'full_refund';
   const returnsApply =
-    choice === 'not_made' && row.currentClass === 'partial_refund';
+    (choice === 'not_made' && row.currentClass === 'partial_refund') ||
+    (choice === 'made' && terminal && row.returned.length > 0);
   const basisReady = row.basisStatus === 'ready';
+  const returnsShown = returnsApply && basisReady;
+  const clearing = returnsShown && clearReturned;
   const parsed =
-    returnsApply && basisReady
+    returnsShown && !clearReturned
       ? returnedFromDraft(row.basisItems, draft)
       : null;
   const reasonText = reason.trim();
@@ -137,13 +146,14 @@ export function DecisionForm({
       setProblem(returnedReviewMessage);
       return;
     }
+    noteDecisionOrder(row.orderId);
     const action = beginAction<DecisionWrite>(subject, (requestId) => ({
       requestId,
       orderId: row.orderId,
       decision: choice,
       token: row.token,
       reason: flipping ? reasonText : null,
-      returned: parsed?.ok === true ? parsed.lines : null,
+      returned: clearing ? [] : parsed?.ok === true ? parsed.lines : null,
     }));
     void finish(action);
   }
@@ -201,7 +211,22 @@ export function DecisionForm({
         basisReady ? (
           <fieldset className="flex flex-col gap-2" disabled={blocked}>
             <legend className="font-semibold">الكميات المرتجعة</legend>
-            <p>اكتب إجمالي اللي رجع لكل صنف. المتبقي هو اللي بيتخصم.</p>
+            <p>
+              {choice === 'made'
+                ? 'اكتب إجمالي اللي رجع لكل صنف. المتبقي هو اللي بيتسجل هالك.'
+                : 'اكتب إجمالي اللي رجع لكل صنف. المتبقي هو اللي بيتخصم.'}{' '}
+              الحقل الفاضي معناه صفر مؤكد.
+            </p>
+            {row.returned.length > 0 ? (
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={clearReturned}
+                  onChange={(event) => setClearReturned(event.target.checked)}
+                />
+                امسح الكميات المرتجعة المؤكدة
+              </label>
+            ) : null}
             {row.basisItems.map((item) => {
               const itemProblem =
                 parsed && !parsed.ok ? parsed.errors[item.stockItemId] : null;
@@ -224,6 +249,7 @@ export function DecisionForm({
                       inputMode="decimal"
                       dir="ltr"
                       value={value}
+                      disabled={clearReturned}
                       aria-invalid={itemProblem ? true : undefined}
                       onChange={(event) =>
                         setDraft((current) => ({

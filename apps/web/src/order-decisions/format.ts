@@ -94,10 +94,6 @@ export function trimDecimal(value: string): string {
   return trimmed === '' ? '0' : trimmed;
 }
 
-export function isZeroDecimal(value: string): boolean {
-  return compareDecimal(value, '0') === 0;
-}
-
 /** Null when the text is a valid returned quantity for the item. */
 export function returnedError(text: string, prepared: string): string | null {
   const value = text.trim();
@@ -118,9 +114,10 @@ export function draftFromReturned(
 }
 
 /**
- * The cumulative returned quantities the form would send, in item order, or
- * the first problem. An empty field is zero. Zero lines are left out because
- * the server stores only positive quantities.
+ * The cumulative returned quantities the form would send: one line for every
+ * basis item, in item order, or the first problem. An empty field is a
+ * confirmed zero and goes out as an explicit "0", so it is never mistaken for
+ * the empty list that clears the confirmed quantities.
  */
 export function returnedFromDraft(
   items: readonly BasisItem[],
@@ -137,8 +134,10 @@ export function returnedFromDraft(
       errors[item.stockItemId] = problem;
       continue;
     }
-    if (text === '' || isZeroDecimal(text)) continue;
-    lines.push({ stockItemId: item.stockItemId, returned: trimDecimal(text) });
+    lines.push({
+      stockItemId: item.stockItemId,
+      returned: text === '' ? '0' : trimDecimal(text),
+    });
   }
   if (Object.keys(errors).length > 0) return { ok: false, errors };
   return { ok: true, lines };

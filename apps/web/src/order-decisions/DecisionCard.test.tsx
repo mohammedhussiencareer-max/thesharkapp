@@ -196,10 +196,11 @@ describe('DecisionCard', () => {
     await screen.findByRole('status');
     expect(lastWrite().returned).toEqual([
       { stockItemId: 'item-a', returned: '0.5' },
+      { stockItemId: 'item-b', returned: '0' },
     ]);
   });
 
-  it('sends an empty list when nothing came back, so earlier quantities are cleared', async () => {
+  it('sends explicit zero lines when nothing came back: a confirmed zero, not a cleared set', async () => {
     vi.mocked(setOrderDisposition).mockResolvedValue(saved);
     renderCard(
       partial({
@@ -213,7 +214,79 @@ describe('DecisionCard', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: 'تأكيد القرار' }));
     await screen.findByRole('status');
+    expect(lastWrite().returned).toEqual([
+      { stockItemId: 'item-a', returned: '0' },
+      { stockItemId: 'item-b', returned: '0' },
+    ]);
+  });
+
+  it('sends a confirmed zero for a first decision with every field left empty', async () => {
+    vi.mocked(setOrderDisposition).mockResolvedValue(saved);
+    renderCard(partial());
+    choose('ماتعملش');
+    fireEvent.change(screen.getByLabelText('سبب تغيير القرار'), {
+      target: { value: 'مفيش حاجة رجعت' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ القرار' }));
+    await screen.findByRole('status');
+    expect(lastWrite().returned).toEqual([
+      { stockItemId: 'item-a', returned: '0' },
+      { stockItemId: 'item-b', returned: '0' },
+    ]);
+  });
+
+  it('clears the confirmed quantities only through the explicit control, with an empty list', async () => {
+    vi.mocked(setOrderDisposition).mockResolvedValue(saved);
+    renderCard(
+      partial({
+        decision: 'not_made',
+        returned: [{ stockItemId: 'item-a', returned: '0.5' }],
+      }),
+    );
+    expect(
+      screen.getByRole('checkbox', { name: 'امسح الكميات المرتجعة المؤكدة' }),
+    ).not.toBeChecked();
+    fireEvent.click(
+      screen.getByRole('checkbox', { name: 'امسح الكميات المرتجعة المؤكدة' }),
+    );
+    expect(screen.getByLabelText(/المرتجع من سمك تجريبي/)).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد القرار' }));
+    await screen.findByRole('status');
     expect(lastWrite().returned).toEqual([]);
+  });
+
+  it('offers the retained returned quantities when a terminal order is made, and only then', async () => {
+    vi.mocked(setOrderDisposition).mockResolvedValue(saved);
+    renderCard(
+      queueRow({
+        currentClass: 'full_refund',
+        decidedClass: 'full_refund',
+        decision: 'made',
+        returned: [{ stockItemId: 'item-a', returned: '0.5' }],
+      }),
+    );
+    expect(screen.getByLabelText(/المرتجع من سمك تجريبي/)).toHaveValue('0.5');
+    expect(screen.getByText(/بيتسجل هالك/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/المرتجع من سمك تجريبي/), {
+      target: { value: '0.25' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد القرار' }));
+    await screen.findByRole('status');
+    expect(lastWrite().returned).toEqual([
+      { stockItemId: 'item-a', returned: '0.25' },
+      { stockItemId: 'item-b', returned: '0' },
+    ]);
+  });
+
+  it('does not offer returned quantities for a made terminal order that has none, and carries them', async () => {
+    vi.mocked(setOrderDisposition).mockResolvedValue(saved);
+    renderCard(
+      queueRow({ currentClass: 'full_refund', decidedClass: 'full_refund' }),
+    );
+    expect(screen.queryByLabelText(/المرتجع من/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد القرار' }));
+    await screen.findByRole('status');
+    expect(lastWrite().returned).toBeNull();
   });
 
   it('does not offer returned quantities without a ready preparation basis', () => {

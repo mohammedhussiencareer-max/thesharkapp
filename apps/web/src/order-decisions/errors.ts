@@ -29,8 +29,8 @@ const phrases: ReadonlyArray<readonly [string, string]> = [
     'الطلب ده مش ملغي ولا مرتجع — تقدر تأكده بس',
   ],
   [
-    'returned quantities apply only to a not-made partial refund',
-    'الكميات المرتجعة بتتسجل بس لمرتجع جزئي ماتعملش',
+    'returned quantities apply only to a not-made partial refund or a made canceled, missing or fully refunded order',
+    'الكميات المرتجعة بتتسجل بس لمرتجع جزئي ماتعملش أو لطلب ملغي أو ناقص أو مرتجع كامل اتعمل',
   ],
   ['the preparation basis is not available', 'مفيش أساس تحضير جاهز للطلب ده'],
   [

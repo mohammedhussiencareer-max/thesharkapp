@@ -20,6 +20,11 @@
 -- preparation basis, not_made posts nothing. Partial classes (partial_refund,
 -- unresolved_refund): the sale stays; not_made with returned quantities R
 -- retires the sale and posts the kept quantities Q - R at the order instant.
+-- The same R applies to prepared waste: a made terminal order with a confirmed
+-- R posts waste of Q - R (a partial refund that becomes full keeps R until the
+-- owner rebases it). A confirmed R is any non-empty list, zero entries
+-- included; an empty list is cleared. A repost of the same quantities inside an
+-- episode keeps the previous movement pieces.
 -- ============================================================================
 -- 0. Lock order. The ledger advisory lock is first, then the tables this
 -- migration references by foreign key, NOWAIT, in a fixed order.
@@ -95,9 +100,9 @@ create table app.order_disposition_events (
   )
 );
 
-comment on table app.order_disposition_events is 'Append-only. One row per decision about a canceled, missing or refunded order: the first of an episode is a system default (made, owner_reviewed false), later rows are owner decisions. Each row keeps the basis it was decided on (preparation snapshot and hash, preparation quantities q_items, the linked refund revisions and their value signature, the order total frozen at decision time) and the cumulative returned quantities R per stock item against the preparation basis. returned is applied only for not_made on a partial refund; it is carried, not applied, in other cases. No customer data; reason is owner free text of at most 300 characters.';
+comment on table app.order_disposition_events is 'Append-only. One row per decision about a canceled, missing or refunded order: the first of an episode is a system default (made, owner_reviewed false), later rows are owner decisions. Each row keeps the basis it was decided on (preparation snapshot and hash, preparation quantities q_items, the linked refund revisions and their value signature, the order total frozen at decision time) and the cumulative returned quantities R per stock item against the preparation basis. returned is applied for not_made on a partial refund (the sale) and for made on a canceled, missing or fully refunded order (the prepared waste); it is carried, not applied, in other cases. No customer data; reason is owner free text of at most 300 characters.';
 
-comment on column app.order_disposition_events.returned is 'Cumulative returned quantity per stock item, [{stock_item_id, returned}], decimal text, zero entries dropped, sorted by item. A new owner event replaces it as a whole; a null request keeps the prior value.';
+comment on column app.order_disposition_events.returned is 'Cumulative returned quantity per stock item, [{stock_item_id, returned}], decimal text, zero entries kept, sorted by item. A non-empty list is a confirmed set (all zeros is a confirmed zero); an empty list is cleared. A new owner event replaces it as a whole; a null request keeps the prior value.';
 
 comment on column app.order_disposition_events.order_total is 'The order total the classification used. Frozen while the linked refund set is unchanged, so a total-only edit does not move the order between full and partial.';
 
@@ -735,6 +740,7 @@ declare
   v_target text := 'sale';
   v_open boolean := false;
   v_alloc boolean := false;
+  v_closing boolean := false;
   v_review text;
   v_kept jsonb;
   v_over boolean;
@@ -842,9 +848,34 @@ begin
     v_ctx := app.disposition_effective_context (v_input.id, v_ev.id);
 
     if v_ev.id is not null then
-      if v_ctx ->> 'class' is null
+      -- A confirmed set of returned quantities (zeros included) makes the
+      -- posting the preparation quantities less the returned ones: for a
+      -- not-made partial refund the sale, for a made terminal order the waste.
+      v_alloc := coalesce(
+        pg_catalog.jsonb_array_length(v_ev.returned) > 0
+        and (
+          (
+            v_ev.decision = 'not_made'
+            and app.disposition_family (v_ctx ->> 'class') = 'partial'
+          )
+          or (
+            v_ev.decision = 'made'
+            and app.disposition_family (v_ctx ->> 'class') = 'terminal'
+          )
+        ),
+        false
+      );
+
+      -- A changed refund set is reviewed before anything else, so an order
+      -- that looks ordinary again cannot replace a decision at once.
+      if v_ctx ->> 'refund_signature' is distinct from v_ev.refund_signature then
+        v_review := 'refund_changed';
+      elsif v_ctx ->> 'class' is null
       and v_ev.class in ('canceled', 'missing', 'none') then
         -- The order is an ordinary sale again; the history stays.
+        v_closing := true;
+        v_alloc := false;
+
         update app.order_disposition_state ds
         set
           is_open = false,
@@ -856,85 +887,79 @@ begin
           updated_at = v_now
         where
           ds.order_id = p_order_id;
-      else
-        v_alloc := v_ev.decision = 'not_made'
-        and app.disposition_family (v_ctx ->> 'class') = 'partial'
-        and pg_catalog.jsonb_array_length(v_ev.returned) > 0;
-
-        if v_ctx ->> 'refund_signature' is distinct from v_ev.refund_signature then
-          v_review := 'refund_changed';
-        elsif app.disposition_family (v_ctx ->> 'class') is distinct from app.disposition_family (v_ev.class) then
-          v_review := 'class_changed';
-        elsif v_alloc then
-          if v_ctx ->> 'q_status' is distinct from 'ready' then
-            v_review := 'items_changed';
-          elsif v_ctx ->> 'q_signature' is distinct from v_ev.q_signature then
-            v_review := case
-              when (
-                select
-                  pg_catalog.array_agg(
+      elsif app.disposition_family (v_ctx ->> 'class') is distinct from app.disposition_family (v_ev.class) then
+        v_review := 'class_changed';
+      elsif v_alloc then
+        if v_ctx ->> 'q_status' is distinct from 'ready' then
+          v_review := 'items_changed';
+        elsif v_ctx ->> 'q_signature' is distinct from v_ev.q_signature then
+          v_review := case
+            when (
+              select
+                pg_catalog.array_agg(
+                  e.value ->> 'stock_item_id'
+                  order by
                     e.value ->> 'stock_item_id'
-                    order by
-                      e.value ->> 'stock_item_id'
-                  )
-                from
-                  pg_catalog.jsonb_array_elements(v_ctx -> 'q_items') as e (value)
-              ) is distinct from (
-                select
-                  pg_catalog.array_agg(
+                )
+              from
+                pg_catalog.jsonb_array_elements(v_ctx -> 'q_items') as e (value)
+            ) is distinct from (
+              select
+                pg_catalog.array_agg(
+                  e.value ->> 'stock_item_id'
+                  order by
                     e.value ->> 'stock_item_id'
-                    order by
-                      e.value ->> 'stock_item_id'
-                  )
-                from
-                  pg_catalog.jsonb_array_elements(v_ev.q_items) as e (value)
-              ) then 'items_changed'
-              else 'quantities_changed'
-            end;
-          end if;
+                )
+              from
+                pg_catalog.jsonb_array_elements(v_ev.q_items) as e (value)
+            ) then 'items_changed'
+            else 'quantities_changed'
+          end;
         end if;
+      end if;
 
-        if v_review is not null then
-          -- The application and the allocation stay in force.
-          update app.order_disposition_state ds
-          set
-            class = v_ctx ->> 'class',
-            review_reason = v_review,
-            cost_input_id = v_input.id,
-            context = v_ctx - 'exact' - 'res',
-            token = app.disposition_token (v_ctx, v_ev.id),
-            updated_at = v_now
-          where
-            ds.order_id = p_order_id;
+      if v_review is not null then
+        -- The application and the allocation stay in force.
+        update app.order_disposition_state ds
+        set
+          class = v_ctx ->> 'class',
+          review_reason = v_review,
+          cost_input_id = v_input.id,
+          context = v_ctx - 'exact' - 'res',
+          token = app.disposition_token (v_ctx, v_ev.id),
+          updated_at = v_now
+        where
+          ds.order_id = p_order_id;
 
-          update app.order_cost_state h
-          set
-            latest_input_id = v_input.id,
-            causes = pg_catalog.jsonb_build_array(
-              pg_catalog.jsonb_build_object(
-                'code',
-                'disposition_pending',
-                'reason',
-                'needs_review',
-                'detail',
-                v_review
-              )
-            ),
-            evaluated_at = v_now,
-            updated_at = v_now
-          where
-            h.order_id = p_order_id;
+        update app.order_cost_state h
+        set
+          latest_input_id = v_input.id,
+          causes = pg_catalog.jsonb_build_array(
+            pg_catalog.jsonb_build_object(
+              'code',
+              'disposition_pending',
+              'reason',
+              'needs_review',
+              'detail',
+              v_review
+            )
+          ),
+          evaluated_at = v_now,
+          updated_at = v_now
+        where
+          h.order_id = p_order_id;
 
-          return pg_catalog.jsonb_build_object(
-            'outcome',
-            'disposition_pending',
-            'reason',
-            'needs_review',
-            'review_reason',
-            v_review
-          );
-        end if;
+        return pg_catalog.jsonb_build_object(
+          'outcome',
+          'disposition_pending',
+          'reason',
+          'needs_review',
+          'review_reason',
+          v_review
+        );
+      end if;
 
+      if not v_closing then
         v_open := true;
         v_path := case
           when app.disposition_family (v_ev.class) = 'terminal'
@@ -1045,6 +1070,11 @@ begin
     v_causes := pg_catalog.jsonb_build_array(
       pg_catalog.jsonb_build_object('code', v_reason)
     );
+  elsif v_alloc then
+    -- The returned quantities are relative to the retained preparation basis,
+    -- not to whatever the current snapshot holds.
+    v_exact := v_ctx -> 'exact';
+    v_res := v_ctx -> 'res';
   else
     v_exact := app.resolve_order_snapshot_exact (v_snap.id, false, false);
     v_res := app.round_order_requirements (v_exact);
@@ -1139,9 +1169,11 @@ begin
     end if;
   end if;
 
-  -- Not made, partly returned: the kept quantities are the preparation
-  -- quantities less the returned ones, per stock item. Never a money ratio.
-  if v_disposition = 'sale'
+  -- Returned quantities confirmed: the posted quantities are the preparation
+  -- quantities less the returned ones, per stock item (the sale of a not-made
+  -- partial refund, the prepared waste of a made full refund). Never a money
+  -- ratio.
+  if v_disposition in ('sale', 'prepared_waste')
   and v_alloc then
     if exists (
       select
@@ -1289,17 +1321,46 @@ begin
           else 'waste'
         end;
 
+        -- Inside a decision episode a repost of the same quantity keeps the
+        -- previous movement pieces, one line per piece in the same order, so a
+        -- reclassification never changes the per-piece rounding.
+        with
+          prior as (
+            select
+              l.item_id,
+              pg_catalog.abs(sm.quantity) as qty,
+              pg_catalog.row_number() over (
+                partition by
+                  l.item_id
+                order by
+                  l.event_position,
+                  l.piece_position,
+                  l.movement_id
+              ) as ord,
+              pg_catalog.sum(pg_catalog.abs(sm.quantity)) over (
+                partition by
+                  l.item_id
+              ) as total
+            from
+              app.order_cost_movement_links l
+              join app.stock_movements sm on sm.id = l.movement_id
+            where
+              v_open
+              and v_retire_ids is not null
+              and l.application_id = v_owner_id
+              and sm.movement_type in ('sale', 'waste')
+          )
         select
           pg_catalog.jsonb_agg(
             pg_catalog.jsonb_build_object(
               'item_id',
-              e.value ->> 'stock_item_id',
+              req.item,
               'movement_type',
               v_move,
               'occurred_at',
               v_snap.ordered_at,
               'quantity',
-              (e.value ->> 'quantity')::numeric,
+              coalesce(pr.qty, req.qty),
               'shift_id',
               v_snap.shift_id,
               'source_id',
@@ -1310,11 +1371,20 @@ begin
               v_event
             )
             order by
-              e.value ->> 'stock_item_id'
+              req.item,
+              coalesce(pr.ord, 1)
           )
         into v_lines
         from
-          pg_catalog.jsonb_array_elements(v_reqs) as e (value);
+          (
+            select
+              e.value ->> 'stock_item_id' as item,
+              (e.value ->> 'quantity')::numeric as qty
+            from
+              pg_catalog.jsonb_array_elements(v_reqs) as e (value)
+          ) req
+          left join prior pr on pr.item_id::text = req.item
+          and pr.total = req.qty;
 
         v_batch := app.post_engine_outflows (v_lines);
       end if;
@@ -1497,7 +1567,7 @@ begin
     get diagnostics v_linked = row_count;
 
     select
-      pg_catalog.jsonb_array_length(v_reqs)
+      pg_catalog.jsonb_array_length(v_lines)
     into v_expected;
 
     if v_linked < v_expected then
@@ -1524,7 +1594,13 @@ begin
   where
     h.order_id = p_order_id;
 
-  if v_open then
+  -- The owner's closing decision (class none) is applied by closing the
+  -- episode here, so its effect is still recorded against that decision.
+  if v_open
+  or (
+    v_closing
+    and v_ev.class = 'none'
+  ) then
     -- A default that keeps the sale is the baseline, not a difference.
     if v_kind = 'posting'
     and not (
@@ -1561,19 +1637,21 @@ begin
         );
     end if;
 
-    update app.order_disposition_state ds
-    set
-      class = v_ctx ->> 'class',
-      review_reason = case
-        when v_ctx ->> 'class' = 'unresolved_refund' then 'unresolved_refund'
-        else null
-      end,
-      cost_input_id = v_input.id,
-      context = v_ctx - 'exact' - 'res',
-      token = app.disposition_token (v_ctx, v_ev.id),
-      updated_at = v_now
-    where
-      ds.order_id = p_order_id;
+    if v_open then
+      update app.order_disposition_state ds
+      set
+        class = v_ctx ->> 'class',
+        review_reason = case
+          when v_ctx ->> 'class' = 'unresolved_refund' then 'unresolved_refund'
+          else null
+        end,
+        cost_input_id = v_input.id,
+        context = v_ctx - 'exact' - 'res',
+        token = app.disposition_token (v_ctx, v_ev.id),
+        updated_at = v_now
+      where
+        ds.order_id = p_order_id;
+    end if;
   end if;
 
   return pg_catalog.jsonb_build_object(
@@ -1594,7 +1672,7 @@ begin
 end;
 $$;
 
-comment on function app.process_order_accounting (text, uuid, integer) is 'Evaluates one order against its latest cost input and brings its stock effect to the desired state: retire every movement of the previous application, then post the replacement at the snapshot instant and shift, or record an incomplete or none result. An identical economic signature writes an evaluation receipt only. missing_cost_basis rolls the transition back and returns blocked. Canceled, missing and refunded orders open a decision episode with a system default (made) the first time they appear: canceled, missing and fully refunded orders post prepared waste of the preparation basis when made and nothing when not made; a partial refund stays a sale, and when not made it posts the kept quantities (preparation quantities less the returned ones). Missing takes precedence over the underlying status. A change of the linked refund set, of the class family, or (for a returned allocation) of the preparation quantities leaves the application and allocation in force and returns disposition_pending for an owner decision. Without an episode the path is the PR 4 path. A sale or waste takes its same-instant event position once, from order_cost_state.event_position. Caller holds the ledger lock. Private.';
+comment on function app.process_order_accounting (text, uuid, integer) is 'Evaluates one order against its latest cost input and brings its stock effect to the desired state: retire every movement of the previous application, then post the replacement at the snapshot instant and shift, or record an incomplete or none result. An identical economic signature writes an evaluation receipt only. missing_cost_basis rolls the transition back and returns blocked. Canceled, missing and refunded orders open a decision episode with a system default (made) the first time they appear: canceled, missing and fully refunded orders post prepared waste of the preparation basis when made and nothing when not made; a partial refund stays a sale, and when not made with confirmed returned quantities it posts the kept quantities (preparation quantities of the retained preparation basis less the returned ones); a made terminal order with confirmed returned quantities posts prepared waste of the same kept quantities. A repost of unchanged quantities inside an episode keeps the previous movement pieces (one line per piece). The refund set is compared before an order that looks ordinary again closes its episode, and the owner''s closing decision records its effect before the episode closes. Missing takes precedence over the underlying status. A change of the linked refund set, of the class family, or (for a returned allocation) of the preparation quantities leaves the application and allocation in force and returns disposition_pending for an owner decision. Without an episode the path is the PR 4 path. A sale or waste takes its same-instant event position once, from order_cost_state.event_position. Caller holds the ledger lock. Private.';
 
 revoke all on function app.process_order_accounting (text, uuid, integer)
 from
@@ -1827,9 +1905,6 @@ begin
           )
           order by
             x.item
-        ) filter (
-          where
-            x.ret > 0
         ),
         '[]'::jsonb
       )
@@ -2012,13 +2087,22 @@ begin
       using errcode = '22023';
   end if;
 
-  v_applicable := p_decision = 'not_made'
-  and v_class = 'partial_refund';
+  v_applicable := coalesce(
+    (
+      p_decision = 'not_made'
+      and v_class = 'partial_refund'
+    )
+    or (
+      p_decision = 'made'
+      and app.disposition_family (v_class) = 'terminal'
+    ),
+    false
+  );
 
   if v_ret is not null
   and pg_catalog.jsonb_array_length(v_ret) > 0
   and not v_applicable then
-    raise exception 'returned quantities apply only to a not-made partial refund'
+    raise exception 'returned quantities apply only to a not-made partial refund or a made canceled, missing or fully refunded order'
       using errcode = '22023';
   end if;
 
@@ -2107,7 +2191,7 @@ begin
   update app.order_disposition_state ds
   set
     event_id = v_new,
-    is_open = v_class is not null,
+    is_open = true,
     class = v_class,
     review_reason = null,
     cost_input_id = v_input.id,
@@ -2183,7 +2267,7 @@ begin
 end;
 $$;
 
-comment on function app.set_order_disposition (uuid, text, text, text, text, jsonb) is 'Owner only. Records the owner''s made or not_made decision for the order''s open episode and applies it, in one transaction under the ledger lock, with the worker''s lock order. p_token is the order_decision_queue token; a changed order is 40001. A flip (a decision different from the prior one) needs a non-blank reason of at most 300 characters. p_returned replaces the cumulative returned quantities ([{stock_item_id, returned}], decimal text, only for a not-made partial refund); null keeps the prior ones. The request id makes the call idempotent: the same payload returns the stored result, a different payload is 22023. An unresolved refund (a negative amount) cannot be decided. Returns not_activated, without writing, before inventory activation. A running POS sync is 55P03 and the call can be retried with the same request id. Returns the outcome and the exact resulting differences as decimal text.';
+comment on function app.set_order_disposition (uuid, text, text, text, text, jsonb) is 'Owner only. Records the owner''s made or not_made decision for the order''s open episode and applies it, in one transaction under the ledger lock, with the worker''s lock order. p_token is the order_decision_queue token; a changed order is 40001. A flip (a decision different from the prior one) needs a non-blank reason of at most 300 characters. p_returned replaces the cumulative returned quantities ([{stock_item_id, returned}], decimal text, zeros kept; allowed for a not-made partial refund and for a made canceled, missing or fully refunded order): a non-empty list is a confirmed set (all zeros is a confirmed zero that still needs review when the preparation basis changes), an empty list clears it, null keeps the prior ones. The request id makes the call idempotent: the same payload returns the stored result, a different payload is 22023. An unresolved refund (a negative amount) cannot be decided. Returns not_activated, without writing, before inventory activation. A running POS sync is 55P03 and the call can be retried with the same request id. Returns the outcome and the exact resulting differences as decimal text.';
 
 revoke all on function app.set_order_disposition (uuid, text, text, text, text, jsonb)
 from

@@ -8,15 +8,19 @@ import {
   loadQueueRow,
   loadUnlinkedRefunds,
 } from '@/order-decisions/api';
-import { DecisionCard } from '@/order-decisions/DecisionCard';
+import { DecisionCard, NoticeView } from '@/order-decisions/DecisionCard';
 import { moneyText } from '@/order-decisions/format';
+import { PendingSaves } from '@/order-decisions/PendingSaves';
 import type {
+  DecisionNotice,
   QueueFilter,
   QueueRow,
   UnlinkedRefund,
 } from '@/order-decisions/types';
 
 type Entry = { row: QueueRow; closed: boolean };
+
+type Rescued = { orderId: string; notice: DecisionNotice };
 
 const filters: ReadonlyArray<readonly [QueueFilter, string]> = [
   ['pending', 'محتاجة قرار'],
@@ -34,6 +38,7 @@ export function OrderDecisionsPage() {
   const [unlinked, setUnlinked] = useState<UnlinkedRefund[] | null>(null);
   const [unlinkedError, setUnlinkedError] = useState<string | null>(null);
   const [loadId, setLoadId] = useState(0);
+  const [rescued, setRescued] = useState<Rescued[]>([]);
   const seqRef = useRef(0);
 
   useEffect(() => {
@@ -77,12 +82,25 @@ export function OrderDecisionsPage() {
     };
   }, [loadId]);
 
-  function refresh() {
+  function reload() {
     setLoading(true);
     setLoadError(null);
     setEntries(null);
     setNext(null);
     setLoadId((value) => value + 1);
+  }
+
+  function refresh() {
+    setRescued([]);
+    reload();
+  }
+
+  function settled(orderId: string, notice: DecisionNotice) {
+    setRescued((current) => [
+      ...current.filter((item) => item.orderId !== orderId),
+      { orderId, notice },
+    ]);
+    if (notice.kind === 'saved' && notice.result.status === 'ok') reload();
   }
 
   function chooseFilter(value: QueueFilter) {
@@ -161,6 +179,25 @@ export function OrderDecisionsPage() {
           {loadError ? 'إعادة المحاولة' : 'تحديث'}
         </button>
       </div>
+      <PendingSaves
+        shown={
+          new Set(
+            (entries ?? [])
+              .filter((entry) => !entry.closed)
+              .map((entry) => entry.row.orderId),
+          )
+        }
+        onSettled={settled}
+      />
+      {rescued.map((item) => (
+        <section
+          key={item.orderId}
+          className="flex flex-col gap-1"
+          aria-label={`نتيجة إعادة المحاولة لطلب ${item.orderId}`}
+        >
+          <NoticeView notice={item.notice} />
+        </section>
+      ))}
       {loading && entries === null ? <p>جاري تحميل الطلبات…</p> : null}
       {loadError ? <p role="alert">{loadError}</p> : null}
       {entries && entries.length === 0 ? (

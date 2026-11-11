@@ -67,14 +67,27 @@ describe('returned quantities', () => {
     expect(returnedError('1.500001', '1.5')).toBe(returnedOverMessage);
   });
 
-  it('builds the cumulative list, leaving out empty and zero lines', () => {
+  it('builds one line per item, an empty field being an explicit confirmed zero', () => {
     expect(returnedFromDraft(items, { a: '0.50', b: '' })).toEqual({
       ok: true,
-      lines: [{ stockItemId: 'a', returned: '0.5' }],
+      lines: [
+        { stockItemId: 'a', returned: '0.5' },
+        { stockItemId: 'b', returned: '0' },
+      ],
     });
     expect(returnedFromDraft(items, { a: '0', b: '0.000' })).toEqual({
       ok: true,
-      lines: [],
+      lines: [
+        { stockItemId: 'a', returned: '0' },
+        { stockItemId: 'b', returned: '0' },
+      ],
+    });
+    expect(returnedFromDraft(items, {})).toEqual({
+      ok: true,
+      lines: [
+        { stockItemId: 'a', returned: '0' },
+        { stockItemId: 'b', returned: '0' },
+      ],
     });
   });
 
