@@ -18,6 +18,7 @@ import {
   loadUnlinkedRefunds,
   setOrderDisposition,
 } from '@/order-decisions/api';
+import { reloadFailedMessage } from '@/order-decisions/DecisionForm';
 import { decisionSubject } from '@/order-decisions/format';
 import { queueRow } from '@/order-decisions/test-fixtures';
 import { OrderDecisionsPage } from '@/pages/OrderDecisionsPage';
@@ -226,7 +227,8 @@ describe('OrderDecisionsPage', () => {
         profit: '-50.00',
       },
     });
-    vi.mocked(loadQueuePage).mockResolvedValueOnce({ rows: [], next: null });
+    vi.mocked(loadQueueRow).mockResolvedValueOnce(null);
+    const pageLoads = vi.mocked(loadQueuePage).mock.calls.length;
     fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
     expect(
       await screen.findByLabelText('نتيجة إعادة المحاولة لطلب order-1'),
@@ -239,6 +241,129 @@ describe('OrderDecisionsPage', () => {
       ).toBeNull(),
     );
     expect(hasAction(decisionSubject('order-1'))).toBe(false);
+    expect(loadQueueRow).toHaveBeenCalledWith('order-1');
+    expect(vi.mocked(loadQueuePage).mock.calls.length).toBe(pageLoads);
+  });
+
+  it('recovers one lost save without unmounting the other orders drafts', async () => {
+    vi.mocked(loadQueuePage).mockResolvedValueOnce({
+      rows: [queueRow()],
+      next: null,
+    });
+    vi.mocked(setOrderDisposition).mockRejectedValueOnce(new Error('socket'));
+    renderPage();
+    await screen.findByRole('article', { name: 'طلب رقم 41' });
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد القرار' }));
+    await screen.findByText(unknownSaveMessage);
+
+    // The lost decision was stored and closed order-1; order-2 is still open.
+    vi.mocked(loadQueuePage).mockResolvedValueOnce({
+      rows: [
+        queueRow({
+          orderId: 'order-2',
+          orderNumber: 42,
+          token: 'token-2',
+          eventId: 21,
+          currentClass: 'partial_refund',
+          decidedClass: 'partial_refund',
+        }),
+      ],
+      next: null,
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'تحديث' }));
+    const card = await screen.findByRole('article', { name: 'طلب رقم 42' });
+    const pending = screen.getByRole('region', {
+      name: 'قرارات مش متأكد إنها اتسجلت',
+    });
+
+    fireEvent.click(within(card).getByRole('radio', { name: 'ماتعملش' }));
+    const reason = within(card).getByLabelText('سبب تغيير القرار');
+    fireEvent.change(reason, { target: { value: 'رجع نص الطبق' } });
+    const returned = within(card).getByLabelText(/المرتجع من سمك تجريبي/);
+    fireEvent.change(returned, { target: { value: '0.5' } });
+
+    vi.mocked(setOrderDisposition).mockResolvedValueOnce({
+      status: 'ok',
+      orderId: 'order-1',
+      eventId: 12,
+      decision: 'made',
+      decisionClass: 'none',
+      outcome: 'posted',
+      reason: null,
+      differences: {
+        stockQuantity: '-1',
+        stockValue: '-50.00',
+        cogs: '50.00',
+        waste: '0.00',
+        profit: '-50.00',
+      },
+    });
+    vi.mocked(loadQueueRow).mockResolvedValueOnce(null);
+    const pageLoads = vi.mocked(loadQueuePage).mock.calls.length;
+    const refundLoads = vi.mocked(loadUnlinkedRefunds).mock.calls.length;
+    fireEvent.click(
+      within(pending).getByRole('button', { name: 'إعادة المحاولة' }),
+    );
+    expect(
+      await screen.findByLabelText('نتيجة إعادة المحاولة لطلب order-1'),
+    ).toHaveTextContent('اتسجل القرار');
+    await waitFor(() =>
+      expect(vi.mocked(loadUnlinkedRefunds).mock.calls.length).toBe(
+        refundLoads + 1,
+      ),
+    );
+
+    expect(vi.mocked(loadQueuePage).mock.calls.length).toBe(pageLoads);
+    expect(screen.getByRole('article', { name: 'طلب رقم 42' })).toBe(card);
+    expect(within(card).getByLabelText('سبب تغيير القرار')).toBe(reason);
+    expect(reason).toHaveValue('رجع نص الطبق');
+    expect(within(card).getByLabelText(/المرتجع من سمك تجريبي/)).toBe(returned);
+    expect(returned).toHaveValue('0.5');
+    expect(within(card).getByRole('radio', { name: 'ماتعملش' })).toBeChecked();
+  });
+
+  it('warns on the recovered order when its own refresh fails, and keeps the rest', async () => {
+    vi.mocked(loadQueuePage).mockResolvedValueOnce({
+      rows: [queueRow()],
+      next: null,
+    });
+    vi.mocked(setOrderDisposition).mockRejectedValueOnce(new Error('socket'));
+    renderPage();
+    await screen.findByRole('article', { name: 'طلب رقم 41' });
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد القرار' }));
+    await screen.findByText(unknownSaveMessage);
+    vi.mocked(loadQueuePage).mockResolvedValueOnce({
+      rows: [queueRow({ orderId: 'order-2', orderNumber: 42 })],
+      next: null,
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'تحديث' }));
+    await screen.findByRole('article', { name: 'طلب رقم 42' });
+
+    vi.mocked(setOrderDisposition).mockResolvedValueOnce({
+      status: 'ok',
+      orderId: 'order-1',
+      eventId: 12,
+      decision: 'made',
+      decisionClass: 'none',
+      outcome: 'unchanged',
+      reason: null,
+      differences: {
+        stockQuantity: '0',
+        stockValue: '0.00',
+        cogs: '0.00',
+        waste: '0.00',
+        profit: '0.00',
+      },
+    });
+    vi.mocked(loadQueueRow).mockRejectedValueOnce(new Error('offline'));
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    const result = await screen.findByLabelText(
+      'نتيجة إعادة المحاولة لطلب order-1',
+    );
+    await waitFor(() =>
+      expect(within(result).getByText(reloadFailedMessage)).toBeInTheDocument(),
+    );
+    expect(screen.getByRole('article', { name: 'طلب رقم 42' })).toBeVisible();
   });
 
   it('shows the retry control once, on the card, while the order is still listed', async () => {

@@ -2535,6 +2535,378 @@ select
   );
 
 -- ---------------------------------------------------------------------------
+-- Review round 2.
+-- ---------------------------------------------------------------------------
+-- Finding 1: the pieces of one event keep one global order, so a repost never
+-- changes which provisional piece a later purchase covers first.
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    parent_item_id
+  )
+values
+  (
+    'a5500000-0000-4000-8000-000000000004',
+    'p55-fish-d',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  );
+
+insert into
+  app.item_loss_versions (
+    effective_from,
+    created_change_id,
+    item_id,
+    loss_pct
+  )
+select
+  '2000-01-01 00:00:00+00',
+  (
+    select
+      id
+    from
+      app.costing_changes
+    where
+      request_id = 'a5500000-0000-4000-8000-0000000000c0'
+  ),
+  'a5500000-0000-4000-8000-000000000004',
+  0;
+
+select
+  pg_temp.policies ('pos-f');
+
+select
+  pg_temp.map_stock (
+    'pos-f',
+    'a5500000-0000-4000-8000-000000000004',
+    '1',
+    '2030-01-01T00:00:00Z'
+  );
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(
+      jsonb_build_object('item_id', 'a5500000-0000-4000-8000-000000000004', 'movement_type', 'purchase',
+        'occurred_at', '2030-05-01T00:00:00Z', 'quantity', 1, 'unit_cost', 0.33)
+    ))$$,
+    'g1: 1 kg of fish d is bought at 0.33'
+  );
+
+select
+  pg_temp.mk_order (
+    'd-s1',
+    '2030-06-12T14:00:00Z',
+    'pos-f',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.drain ();
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(
+      jsonb_build_object('item_id', 'a5500000-0000-4000-8000-000000000004', 'movement_type', 'sale',
+        'occurred_at', '2030-06-12T13:00:00Z', 'quantity', 0.25)
+    ))$$,
+    'g1: a 0.25 kg sale is backdated before the order'
+  );
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(
+      jsonb_build_object('item_id', 'a5500000-0000-4000-8000-000000000004', 'movement_type', 'purchase',
+        'occurred_at', '2030-06-13T00:00:00Z', 'quantity', 0.5, 'unit_cost', 0.36)
+    ))$$,
+    'g1: 0.5 kg arrives afterwards for 0.18'
+  );
+
+create function pg_temp.piece_cost (p_id bigint) returns numeric language sql as $$
+  select
+    m.total_cost + coalesce(
+      (
+        select
+          sum(a.total_cost)
+        from
+          app.stock_movements a
+        where
+          a.adjusts_movement_id = m.id
+          and a.movement_type = 'cost_adjustment'
+      ),
+      0
+    )
+  from
+    app.stock_movements m
+  where
+    m.id = p_id;
+$$;
+
+select
+  results_eq (
+    $$select m.quantity::numeric, pg_temp.piece_cost(m.id)
+      from app.order_cost_movement_links l
+      join app.stock_movements m on m.id = l.movement_id
+      where l.order_id = 'd-s1' and m.movement_type = 'sale'
+      order by l.event_position, l.piece_position, l.movement_id$$,
+    $$values (-1::numeric, -0.34::numeric), (-1::numeric, -0.34::numeric)$$,
+    'g1: the 2 kg sale costs 0.68 once the later purchase covered both provisional pieces'
+  );
+
+select
+  pg_temp.cancel ('d-s1', true);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select m.quantity::numeric, m.is_provisional, l.piece_position
+      from app.order_cost_movement_links l
+      join app.stock_movements m on m.id = l.movement_id
+      where l.order_id = 'd-s1' and m.movement_type = 'waste'
+      order by l.event_position, l.piece_position, l.movement_id$$,
+    $$values (-0.75::numeric, false, 1), (-0.25::numeric, true, 2), (-1::numeric, true, 3)$$,
+    'g1: the waste pieces are numbered 1 to 3 across both lines, in line order'
+  );
+
+select
+  results_eq (
+    $$select a.stock_qty_delta::numeric, a.stock_value_delta::numeric, a.profit_delta::numeric
+      from app.order_disposition_applications a
+      where a.order_id = 'd-s1'$$,
+    $$values (0::numeric, 0::numeric, 0::numeric)$$,
+    'g1: reclassifying the sale as waste changes no stock value and no profit'
+  );
+
+select
+  is (
+    (
+      select
+        sum(pg_temp.piece_cost (m.id))
+      from
+        app.order_cost_movement_links l
+        join app.stock_movements m on m.id = l.movement_id
+      where
+        l.order_id = 'd-s1'
+        and m.movement_type = 'waste'
+    ),
+    -0.68::numeric,
+    'g1: the waste costs 0.68 like the sale, not 0.67'
+  );
+
+-- Finding 2: reinstating the canceled order keeps the waste pieces as well.
+insert into
+  kv
+select
+  'q3-value',
+  b.on_hand_value::text
+from
+  app.item_balances b
+where
+  b.item_id = 'a5500000-0000-4000-8000-000000000003';
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    weighted_qty,
+    weighted_unit,
+    options,
+    line_total
+  )
+values
+  (
+    'd-q3',
+    'l1-d-q3',
+    'pos-e',
+    'x',
+    2,
+    null,
+    null,
+    '[]'::jsonb,
+    0
+  );
+
+select
+  pg_temp.reappear ('d-q3');
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select m.quantity::numeric, m.total_cost::numeric
+      from app.order_cost_movement_links l
+      join app.stock_movements m on m.id = l.movement_id
+      where l.order_id = 'd-q3' and m.movement_type = 'sale' and m.quantity < 0
+        and not exists (select 1 from app.stock_movements r where r.reverses_movement_id = m.id)
+      order by l.event_position, l.piece_position, l.movement_id$$,
+    $$values (-1::numeric, -33.34::numeric), (-1::numeric, -33.34::numeric)$$,
+    'g2: the reinstated order sells the waste''s two 1 kg pieces, 66.68 in all, not one piece of 66.67'
+  );
+
+select
+  is (
+    (
+      select
+        b.on_hand_value::text
+      from
+        app.item_balances b
+      where
+        b.item_id = 'a5500000-0000-4000-8000-000000000003'
+    ),
+    (
+      select
+        v
+      from
+        kv
+      where
+        k = 'q3-value'
+    ),
+    'g2: waste to sale again changes the stock value by nothing'
+  );
+
+-- Finding 3: a carried allocation is reviewed when its basis changes.
+select
+  pg_temp.mk_order (
+    'd-t3',
+    '2030-06-12T15:00:00Z',
+    'pos-a',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.refund ('d-t3', 't3a', 20);
+
+select
+  pg_temp.drain ();
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-t3', 'not_made', 'one kg came back', pg_temp.ret('1', '1'))$$,
+    'g3: Q = 2 kg, R = 1 kg is confirmed on the partial refund'
+  );
+
+select
+  pg_temp.refund ('d-t3', 't3b', 80);
+
+select
+  pg_temp.drain ();
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-t3', 'not_made', 'nothing was made', null)$$,
+    'g3: the owner confirms not made on the full refund and R is carried'
+  );
+
+select
+  results_eq (
+    $$select jsonb_array_length((pg_temp.ev('d-t3')).returned), (q).review_reason, pg_temp.net('d-t3', '1')
+      from (select pg_temp.q('d-t3') as q) x$$,
+    $$values (1, null, 0::numeric)$$,
+    'g3: the confirmed R stays on the decision, nothing is posted'
+  );
+
+select
+  pg_temp.edit_order ('d-t3', 3, null);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).owner_reviewed, (q).needs_decision
+      from (select pg_temp.q('d-t3') as q) x$$,
+    $$values ('quantities_changed', true, true)$$,
+    'g3: a changed quantity puts the reviewed row back in the pending queue'
+  );
+
+select
+  lives_ok (
+    $$select pg_temp.decide('d-t3', 'not_made', null, null)$$,
+    'g3: the owner confirms again on the new basis'
+  );
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision
+      from (select pg_temp.q('d-t3') as q) x$$,
+    $$values (null, false)$$,
+    'g3: the confirmation clears the review'
+  );
+
+select
+  pg_temp.mk_order (
+    'd-t4',
+    '2030-06-12T15:30:00Z',
+    'pos-a',
+    2,
+    null,
+    null,
+    100
+  );
+
+select
+  pg_temp.refund ('d-t4', 't4a', 20);
+
+select
+  pg_temp.drain ();
+
+select
+  pg_temp.decide (
+    'd-t4',
+    'not_made',
+    'one kg came back',
+    pg_temp.ret ('1', '1')
+  );
+
+select
+  pg_temp.refund ('d-t4', 't4b', 80);
+
+select
+  pg_temp.drain ();
+
+select
+  pg_temp.decide ('d-t4', 'not_made', 'nothing was made', null);
+
+update app.pos_order_lines
+set
+  item_id = 'pos-c'
+where
+  order_id = 'd-t4';
+
+select
+  pg_temp.edit_order ('d-t4', null, null);
+
+select
+  pg_temp.drain ();
+
+select
+  results_eq (
+    $$select (q).review_reason, (q).needs_decision
+      from (select pg_temp.q('d-t4') as q) x$$,
+    $$values ('items_changed', true)$$,
+    'g3: a change of the mapped items puts the reviewed row back in the pending queue'
+  );
+
+-- ---------------------------------------------------------------------------
 -- Sync in progress.
 -- ---------------------------------------------------------------------------
 insert into

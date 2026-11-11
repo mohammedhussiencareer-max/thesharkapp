@@ -9,6 +9,7 @@ import {
   loadUnlinkedRefunds,
 } from '@/order-decisions/api';
 import { DecisionCard, NoticeView } from '@/order-decisions/DecisionCard';
+import { reloadFailedMessage } from '@/order-decisions/DecisionForm';
 import { moneyText } from '@/order-decisions/format';
 import { PendingSaves } from '@/order-decisions/PendingSaves';
 import type {
@@ -38,6 +39,7 @@ export function OrderDecisionsPage() {
   const [unlinked, setUnlinked] = useState<UnlinkedRefund[] | null>(null);
   const [unlinkedError, setUnlinkedError] = useState<string | null>(null);
   const [loadId, setLoadId] = useState(0);
+  const [unlinkedId, setUnlinkedId] = useState(0);
   const [rescued, setRescued] = useState<Rescued[]>([]);
   const seqRef = useRef(0);
 
@@ -80,7 +82,7 @@ export function OrderDecisionsPage() {
     return () => {
       cancelled = true;
     };
-  }, [loadId]);
+  }, [loadId, unlinkedId]);
 
   function reload() {
     setLoading(true);
@@ -95,12 +97,22 @@ export function OrderDecisionsPage() {
     reload();
   }
 
-  function settled(orderId: string, notice: DecisionNotice) {
+  function showRescued(orderId: string, notice: DecisionNotice) {
     setRescued((current) => [
       ...current.filter((item) => item.orderId !== orderId),
       { orderId, notice },
     ]);
-    if (notice.kind === 'saved' && notice.result.status === 'ok') reload();
+  }
+
+  // A recovered save refreshes only its own order and the refund list, so the
+  // forms and drafts of every other order stay mounted.
+  function settled(orderId: string, notice: DecisionNotice) {
+    showRescued(orderId, notice);
+    if (notice.kind !== 'saved' || notice.result.status !== 'ok') return;
+    setUnlinkedId((value) => value + 1);
+    void reloadRow(orderId).catch(() =>
+      showRescued(orderId, { ...notice, warning: reloadFailedMessage }),
+    );
   }
 
   function chooseFilter(value: QueueFilter) {

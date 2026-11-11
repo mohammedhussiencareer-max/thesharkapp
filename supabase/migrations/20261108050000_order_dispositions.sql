@@ -9,9 +9,14 @@
 -- Replaced functions, each from its latest definition:
 --   app.process_order_accounting(text,uuid,integer)
 --                                        base 20261108040000_order_deduction_engine.sql
--- It keeps its signature, owner, and privileges. Orders that are not canceled,
+--   app.post_engine_outflows(jsonb)      base 20261108040000_order_deduction_engine.sql
+--   app.replay_outflow(...)              base 20261108010000_outflow_reversals.sql
+-- Each keeps its signature, owner, and privileges. Orders that are not canceled,
 -- missing, or refunded, and that have no open decision episode, take exactly
--- the PR 4 path and produce the same signatures.
+-- the PR 4 path and produce the same signatures. post_engine_outflows and
+-- replay_outflow change only the order of the pieces of one event (section 4b);
+-- every other caller of replay_outflow passes a line position of 0 and sees no
+-- change.
 --
 -- Vocabulary. An episode is one spell in which an order is canceled, missing,
 -- or refunded. Its first event is a system default (made); owner events follow.
@@ -24,7 +29,8 @@
 -- R posts waste of Q - R (a partial refund that becomes full keeps R until the
 -- owner rebases it). A confirmed R is any non-empty list, zero entries
 -- included; an empty list is cleared. A repost of the same quantities inside an
--- episode keeps the previous movement pieces.
+-- episode, or when it closes, keeps the previous movement pieces. Any confirmed
+-- R is reviewed when its basis changes, whether or not the decision applies it.
 -- ============================================================================
 -- 0. Lock order. The ledger advisory lock is first, then the tables this
 -- migration references by foreign key, NOWAIT, in a fixed order.
@@ -694,6 +700,661 @@ from
   service_role;
 
 -- ============================================================================
+-- 4b. Piece order. The pieces of one event keep one global order from the
+-- pending replay through the stored rows and every later replay, and a repost
+-- can ask for the previous pieces of an application.
+-- ============================================================================
+-- replay_outflow, based on its latest definition (20261108010000_outflow_reversals).
+-- Only the cover position of a provisional piece of a pending line changes: it
+-- is the line's own piece_position plus the piece number, so the pieces of
+-- several lines of one event stay in line order in the cover queue. Every
+-- other caller passes 0 as the line position, which keeps today's numbers.
+create or replace function app.replay_outflow (
+  p_movement_id bigint,
+  p_item_id uuid,
+  p_type app.movement_type,
+  p_occurred_at timestamptz,
+  p_out_qty numeric,
+  p_forced_total numeric,
+  p_is_pending boolean,
+  p_line_key integer,
+  p_shift_id text,
+  p_source_type text,
+  p_source_id text,
+  p_note text
+) returns void language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_qty numeric(20, 6);
+  v_value numeric(14, 2);
+  v_avg numeric(20, 6);
+  v_known boolean;
+  v_engine boolean;
+  v_prov_unit numeric(20, 6);
+  v_unit numeric(20, 6);
+  v_normal_qty numeric(20, 6);
+  v_prov_qty numeric(20, 6);
+  v_normal_cost numeric(14, 2);
+  v_prov_cost numeric(14, 2);
+  v_base numeric(14, 2);
+  v_piece integer := 0;
+  v_syn bigint;
+  v_ord integer;
+  v_event bigint;
+  v_row_piece integer;
+begin
+  select
+    b.on_hand_qty,
+    b.on_hand_value,
+    b.avg_cost,
+    b.cost_known
+  into
+    v_qty,
+    v_value,
+    v_avg,
+    v_known
+  from
+    ledger_scratch.recompute_bal b
+  where
+    b.item_id = p_item_id;
+
+  select
+    coalesce(q.engine_valued, false),
+    coalesce(q.ord_class, 0),
+    q.event_position,
+    coalesce(q.piece_position, 0)
+  into
+    v_engine,
+    v_ord,
+    v_event,
+    v_row_piece
+  from
+    ledger_scratch.recompute_row q
+  where
+    q.movement_id = p_movement_id;
+
+  v_known := coalesce(v_known, false);
+  v_engine := coalesce(v_engine, false);
+  v_ord := coalesce(v_ord, 0);
+  v_event := coalesce(v_event, p_movement_id);
+  v_row_piece := coalesce(v_row_piece, 0);
+  v_unit := app.assert_recompute_range (v_avg, 6, false);
+  v_prov_unit := v_unit;
+
+  if p_forced_total is not null then
+    v_normal_qty := p_out_qty;
+    v_prov_qty := 0;
+    v_normal_cost := app.assert_recompute_range (p_forced_total, 2, true);
+    v_prov_cost := 0;
+  else
+    v_normal_qty := least(p_out_qty, greatest(v_qty, 0::numeric));
+    v_prov_qty := p_out_qty - v_normal_qty;
+
+    if v_normal_qty > 0 then
+      if v_normal_qty = v_qty then
+        v_normal_cost := -v_value;
+      else
+        v_normal_cost := -pg_catalog.round(v_value * v_normal_qty / v_qty, 2);
+      end if;
+    else
+      v_normal_cost := 0;
+    end if;
+
+    if v_prov_qty > 0
+    and v_engine
+    and not v_known then
+      v_prov_unit := app.ensure_provisional_seed (p_item_id);
+    end if;
+
+    if v_prov_qty > 0 then
+      v_prov_cost := -pg_catalog.round(v_prov_qty * v_prov_unit, 2);
+    else
+      v_prov_cost := 0;
+    end if;
+
+    v_normal_cost := app.assert_recompute_range (v_normal_cost, 2, true);
+    v_prov_cost := app.assert_recompute_range (v_prov_cost, 2, true);
+  end if;
+
+  v_base := app.assert_recompute_range (v_normal_cost + v_prov_cost, 2, true);
+
+  if p_is_pending then
+    if v_normal_qty > 0 then
+      v_piece := v_piece + 1;
+
+      insert into
+        ledger_scratch.recompute_piece (
+          line_key,
+          piece_no,
+          item_id,
+          movement_type,
+          occurred_at,
+          quantity,
+          unit_cost,
+          total_cost,
+          is_provisional,
+          shift_id,
+          source_type,
+          source_id,
+          note
+        )
+      values
+        (
+          p_line_key,
+          v_piece,
+          p_item_id,
+          p_type,
+          p_occurred_at,
+          -v_normal_qty,
+          v_unit,
+          v_normal_cost,
+          false,
+          p_shift_id,
+          p_source_type,
+          p_source_id,
+          p_note
+        );
+    end if;
+
+    if v_prov_qty > 0 then
+      v_piece := v_piece + 1;
+
+      insert into
+        ledger_scratch.recompute_piece (
+          line_key,
+          piece_no,
+          item_id,
+          movement_type,
+          occurred_at,
+          quantity,
+          unit_cost,
+          total_cost,
+          is_provisional,
+          shift_id,
+          source_type,
+          source_id,
+          note
+        )
+      values
+        (
+          p_line_key,
+          v_piece,
+          p_item_id,
+          p_type,
+          p_occurred_at,
+          -v_prov_qty,
+          v_prov_unit,
+          v_prov_cost,
+          true,
+          p_shift_id,
+          p_source_type,
+          p_source_id,
+          p_note
+        );
+
+      update ledger_scratch.recompute_seq
+      set
+        next_id = next_id + 1
+      returning
+        next_id into v_syn;
+
+      insert into
+        ledger_scratch.recompute_def (
+          movement_id,
+          item_id,
+          qty_uncovered,
+          provisional_unit_cost,
+          value_uncovered,
+          occurred_at,
+          ord_class,
+          event_position,
+          piece_position
+        )
+      values
+        (
+          v_syn,
+          p_item_id,
+          v_prov_qty,
+          v_prov_unit,
+          abs(v_prov_cost),
+          p_occurred_at,
+          v_ord,
+          v_event,
+          v_row_piece + v_piece
+        );
+    end if;
+  else
+    insert into
+      ledger_scratch.recompute_effect (
+        movement_id,
+        item_id,
+        movement_type,
+        base_total,
+        unit_cost,
+        cover_total
+      )
+    values
+      (
+        p_movement_id,
+        p_item_id,
+        p_type,
+        v_base,
+        v_unit,
+        0
+      );
+
+    if v_prov_qty > 0 then
+      insert into
+        ledger_scratch.recompute_def (
+          movement_id,
+          item_id,
+          qty_uncovered,
+          provisional_unit_cost,
+          value_uncovered,
+          occurred_at,
+          ord_class,
+          event_position,
+          piece_position
+        )
+      values
+        (
+          p_movement_id,
+          p_item_id,
+          v_prov_qty,
+          v_prov_unit,
+          abs(v_prov_cost),
+          p_occurred_at,
+          v_ord,
+          v_event,
+          v_row_piece
+        );
+    end if;
+  end if;
+
+  update ledger_scratch.recompute_bal
+  set
+    on_hand_qty = on_hand_qty - p_out_qty,
+    on_hand_value = app.assert_recompute_range (on_hand_value + v_base, 2, true)
+  where
+    item_id = p_item_id;
+
+  perform app.replay_touch_deficit_flag (p_item_id);
+end;
+$$;
+
+comment on function app.replay_outflow (
+  bigint,
+  uuid,
+  app.movement_type,
+  timestamptz,
+  numeric,
+  numeric,
+  boolean,
+  integer,
+  text,
+  text,
+  text,
+  text
+) is 'Replays one outflow in scratch. A pending line''s provisional piece joins the cover queue at the line''s own piece_position plus its piece number, so several lines of one event keep their order. Private.';
+
+-- post_engine_outflows, based on its latest definition
+-- (20261108040000_order_deduction_engine). Two changes, nothing else: each
+-- pending line carries its ordinal as its own piece position (two per line, so
+-- its normal and provisional pieces fit), and the stored pieces of an event are
+-- numbered 1.. in line and piece order across all of its lines. The confirming
+-- replay therefore walks the same order the valuation did.
+create or replace function app.post_engine_outflows (p_lines jsonb) returns uuid language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_batch uuid;
+  v_elem jsonb;
+  v_item uuid;
+  v_type text;
+  v_at timestamptz;
+  v_qty numeric;
+  v_shift text;
+  v_source text;
+  v_note text;
+  v_event bigint;
+  v_n integer := 0;
+  v_items uuid[] := '{}'::uuid[];
+  v_times timestamptz[] := '{}'::timestamptz[];
+  v_types text[] := '{}'::text[];
+  v_pending jsonb := '[]'::jsonb;
+  v_line jsonb;
+  v_posted record;
+  v_comp record;
+  v_comp_pending jsonb;
+begin
+  perform app.assert_ledger_lock_held ();
+
+  lock table app.pos_shifts in share mode;
+
+  if p_lines is null
+  or pg_catalog.jsonb_typeof(p_lines) <> 'array'
+  or pg_catalog.jsonb_array_length(p_lines) = 0 then
+    raise exception 'p_lines must be a non-empty jsonb array'
+      using errcode = '22023';
+  end if;
+
+  v_batch := pg_catalog.gen_random_uuid ();
+
+  for v_elem in
+    select
+      elem.value
+    from
+      pg_catalog.jsonb_array_elements(p_lines) as elem (value)
+  loop
+    if pg_catalog.jsonb_typeof(v_elem) <> 'object' then
+      raise exception 'each outflow line must be a jsonb object'
+        using errcode = '22023';
+    end if;
+
+    v_item := (v_elem ->> 'item_id')::uuid;
+    v_type := v_elem ->> 'movement_type';
+    v_at := (v_elem ->> 'occurred_at')::timestamptz;
+    v_qty := (v_elem ->> 'quantity')::numeric;
+    v_shift := v_elem ->> 'shift_id';
+    v_source := v_elem ->> 'source_id';
+    v_note := v_elem ->> 'note';
+
+    if v_item is null
+    or v_type is null
+    or v_at is null
+    or v_qty is null then
+      raise exception 'item_id, movement_type, occurred_at, and quantity are required'
+        using errcode = '22023';
+    end if;
+
+    if not pg_catalog.isfinite(v_at) then
+      raise exception 'occurred_at must be a finite timestamp'
+        using errcode = '22023';
+    end if;
+
+    if v_qty in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+    or v_qty <= 0 then
+      raise exception 'outflow quantity must be a finite number > 0'
+        using errcode = '22023';
+    end if;
+
+    if v_type not in ('sale', 'waste') then
+      raise exception 'engine outflow movement_type must be sale or waste'
+        using errcode = '22023';
+    end if;
+
+    if not exists (
+      select
+        1
+      from
+        app.stock_items si
+      where
+        si.id = v_item
+    ) then
+      raise exception 'unknown stock_item id: %',
+      v_item
+        using errcode = '22023';
+    end if;
+
+    v_event := null;
+
+    if v_elem ? 'event_position'
+    and v_elem ->> 'event_position' is not null then
+      v_event := (v_elem ->> 'event_position')::bigint;
+    end if;
+
+    v_n := v_n + 1;
+    v_items := v_items || v_item;
+    v_times := v_times || v_at;
+    v_types := v_types || v_type;
+    v_line := pg_catalog.jsonb_build_object(
+      'line_key',
+      v_n,
+      'batch_id',
+      v_batch,
+      'item_id',
+      v_item,
+      'movement_type',
+      v_type,
+      'occurred_at',
+      v_at,
+      'quantity',
+      -v_qty,
+      'unit_cost',
+      0,
+      'total_cost',
+      0,
+      'is_input_total',
+      false,
+      'shift_id',
+      v_shift,
+      'source_type',
+      'engine',
+      'source_id',
+      v_source,
+      'note',
+      v_note,
+      'engine_valued',
+      true,
+      'piece_position',
+      2 * (v_n - 1)
+    );
+
+    if v_event is not null then
+      v_line := v_line || pg_catalog.jsonb_build_object('event_position', v_event);
+    end if;
+
+    v_pending := v_pending || pg_catalog.jsonb_build_array(v_line);
+  end loop;
+
+  -- Same helper and error text as post_backdated_batch, before either replay.
+  -- A later opening must not cover a line dated before it.
+  perform app.assert_not_before_opening (v_items, v_times, v_types);
+
+  -- The replay scratch holds one component at a time, so each component is
+  -- valued, inserted and confirmed before the next one starts.
+  for v_comp in
+    select
+      c.member_ids
+    from
+      app.replay_components (v_items) c
+  loop
+    select
+      coalesce(
+        pg_catalog.jsonb_agg(
+          pend.value
+          order by
+            (pend.value ->> 'line_key')::integer
+        ),
+        '[]'::jsonb
+      )
+    into v_comp_pending
+    from
+      pg_catalog.jsonb_array_elements(v_pending) as pend (value)
+    where
+      (pend.value ->> 'item_id')::uuid = any (v_comp.member_ids);
+
+    perform app.replay_component (v_comp.member_ids, v_comp_pending, v_batch, false);
+
+    for v_posted in
+      insert into
+        app.stock_movements (
+          batch_id,
+          item_id,
+          movement_type,
+          occurred_at,
+          quantity,
+          unit_cost,
+          total_cost,
+          is_provisional,
+          shift_id,
+          source_type,
+          source_id,
+          note,
+          engine_valued,
+          event_position,
+          piece_position
+        )
+      select
+        v_batch,
+        piece.item_id,
+        piece.movement_type,
+        piece.occurred_at,
+        piece.quantity,
+        piece.unit_cost,
+        piece.total_cost,
+        piece.is_provisional,
+        piece.shift_id,
+        piece.source_type,
+        piece.source_id,
+        piece.note,
+        true,
+        pending_row.event_position,
+        pg_catalog.row_number() over (
+          partition by
+            pending_row.event_position,
+            piece.occurred_at
+          order by
+            piece.line_key,
+            piece.piece_no
+        )::integer
+      from
+        ledger_scratch.recompute_piece piece
+        join ledger_scratch.recompute_row pending_row on pending_row.line_key = piece.line_key
+        and pending_row.is_pending
+      order by
+        piece.line_key,
+        piece.piece_no
+      returning
+        id,
+        item_id,
+        movement_type,
+        total_cost
+    loop
+      -- One revision for the posted piece. The confirming replay notes only a
+      -- later valuation adjustment, whose source id is the adjustment row.
+      perform app.note_period_revision (
+        v_posted.id,
+        app.shift_for_target (v_posted.id),
+        app.profit_bucket (v_posted.movement_type),
+        v_posted.total_cost,
+        v_posted.item_id,
+        v_batch
+      );
+    end loop;
+
+    perform app.replay_component (v_comp.member_ids, '[]'::jsonb, v_batch, true);
+  end loop;
+
+  return v_batch;
+end;
+$$;
+
+comment on function app.post_engine_outflows (jsonb) is 'Posts sale or waste lines with the engine provisional cost basis, valued by replay so a following replay inserts no adjustment. Notes each inserted piece once. Values, posts and confirms each connected component of the lines'' items on its own, in a stable order, so the replay cap applies per component. The pieces of one event are numbered 1.. in line and piece order across all of its lines, the order the valuation used. Caller holds the ledger lock. Private. Public post_movements does not call this.';
+
+-- The lines that post one order's requirements. With an application to keep,
+-- an item whose requirement equals the quantity that application posted gets
+-- one line per previous movement piece, in the previous order, so a repost
+-- never merges or reorders pieces and never changes the per-piece rounding.
+-- Every other item gets one line. Reused by every repost that must keep pieces.
+create function app.engine_outflow_lines (
+  p_keep_application_id bigint,
+  p_requirements jsonb,
+  p_movement_type text,
+  p_occurred_at timestamptz,
+  p_shift_id text,
+  p_source_id text,
+  p_event_position bigint
+) returns jsonb language sql stable security definer
+set
+  search_path = '' as $$
+  with
+    prior as (
+      select
+        l.item_id,
+        pg_catalog.abs(sm.quantity) as qty,
+        pg_catalog.row_number() over (
+          partition by
+            l.item_id
+          order by
+            l.event_position,
+            l.piece_position,
+            l.movement_id
+        ) as ord,
+        pg_catalog.sum(pg_catalog.abs(sm.quantity)) over (
+          partition by
+            l.item_id
+        ) as total
+      from
+        app.order_cost_movement_links l
+        join app.stock_movements sm on sm.id = l.movement_id
+      where
+        l.application_id = p_keep_application_id
+        and sm.movement_type in ('sale', 'waste')
+    )
+  select
+    pg_catalog.jsonb_agg(
+      pg_catalog.jsonb_build_object(
+        'item_id',
+        req.item,
+        'movement_type',
+        p_movement_type,
+        'occurred_at',
+        p_occurred_at,
+        'quantity',
+        coalesce(pr.qty, req.qty),
+        'shift_id',
+        p_shift_id,
+        'source_id',
+        p_source_id,
+        'note',
+        null,
+        'event_position',
+        p_event_position
+      )
+      order by
+        req.item,
+        coalesce(pr.ord, 1)
+    )
+  from
+    (
+      select
+        e.value ->> 'stock_item_id' as item,
+        (e.value ->> 'quantity')::numeric as qty
+      from
+        pg_catalog.jsonb_array_elements(p_requirements) as e (value)
+    ) req
+    left join prior pr on pr.item_id::text = req.item
+    and pr.total = req.qty;
+$$;
+
+comment on function app.engine_outflow_lines (
+  bigint,
+  jsonb,
+  text,
+  timestamptz,
+  text,
+  text,
+  bigint
+) is 'Builds the engine outflow lines of a repost: one line per previous movement piece of the kept application, in piece order, for every item whose requirement equals the quantity that application posted; one line per requirement otherwise. Private.';
+
+revoke all on function app.engine_outflow_lines (
+  bigint,
+  jsonb,
+  text,
+  timestamptz,
+  text,
+  text,
+  bigint
+)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+-- ============================================================================
 -- 5. Coordinator. Replaces process_order_accounting from
 -- 20261108040000_order_deduction_engine.sql.
 -- ============================================================================
@@ -740,6 +1401,7 @@ declare
   v_target text := 'sale';
   v_open boolean := false;
   v_alloc boolean := false;
+  v_confirmed boolean := false;
   v_closing boolean := false;
   v_review text;
   v_kept jsonb;
@@ -848,11 +1510,16 @@ begin
     v_ctx := app.disposition_effective_context (v_input.id, v_ev.id);
 
     if v_ev.id is not null then
-      -- A confirmed set of returned quantities (zeros included) makes the
-      -- posting the preparation quantities less the returned ones: for a
-      -- not-made partial refund the sale, for a made terminal order the waste.
+      -- A confirmed set of returned quantities (zeros included) is any
+      -- non-empty list on the current event. Whatever the decision, a change of
+      -- its basis is reviewed, because the owner confirmed it against that basis.
+      v_confirmed := coalesce(pg_catalog.jsonb_array_length(v_ev.returned) > 0, false);
+
+      -- It makes the posting the preparation quantities less the returned ones
+      -- only where it applies: for a not-made partial refund the sale, for a
+      -- made terminal order the waste.
       v_alloc := coalesce(
-        pg_catalog.jsonb_array_length(v_ev.returned) > 0
+        v_confirmed
         and (
           (
             v_ev.decision = 'not_made'
@@ -889,7 +1556,7 @@ begin
           ds.order_id = p_order_id;
       elsif app.disposition_family (v_ctx ->> 'class') is distinct from app.disposition_family (v_ev.class) then
         v_review := 'class_changed';
-      elsif v_alloc then
+      elsif v_confirmed then
         if v_ctx ->> 'q_status' is distinct from 'ready' then
           v_review := 'items_changed';
         elsif v_ctx ->> 'q_signature' is distinct from v_ev.q_signature then
@@ -1321,70 +1988,24 @@ begin
           else 'waste'
         end;
 
-        -- Inside a decision episode a repost of the same quantity keeps the
-        -- previous movement pieces, one line per piece in the same order, so a
-        -- reclassification never changes the per-piece rounding.
-        with
-          prior as (
-            select
-              l.item_id,
-              pg_catalog.abs(sm.quantity) as qty,
-              pg_catalog.row_number() over (
-                partition by
-                  l.item_id
-                order by
-                  l.event_position,
-                  l.piece_position,
-                  l.movement_id
-              ) as ord,
-              pg_catalog.sum(pg_catalog.abs(sm.quantity)) over (
-                partition by
-                  l.item_id
-              ) as total
-            from
-              app.order_cost_movement_links l
-              join app.stock_movements sm on sm.id = l.movement_id
-            where
+        -- Inside a decision episode, and when it closes, a repost of the same
+        -- quantity keeps the previous movement pieces, one line per piece in the
+        -- same order, so a reclassification never changes the per-piece rounding.
+        v_lines := app.engine_outflow_lines (
+          case
+            when (
               v_open
-              and v_retire_ids is not null
-              and l.application_id = v_owner_id
-              and sm.movement_type in ('sale', 'waste')
-          )
-        select
-          pg_catalog.jsonb_agg(
-            pg_catalog.jsonb_build_object(
-              'item_id',
-              req.item,
-              'movement_type',
-              v_move,
-              'occurred_at',
-              v_snap.ordered_at,
-              'quantity',
-              coalesce(pr.qty, req.qty),
-              'shift_id',
-              v_snap.shift_id,
-              'source_id',
-              v_id::text,
-              'note',
-              null,
-              'event_position',
-              v_event
+              or v_closing
             )
-            order by
-              req.item,
-              coalesce(pr.ord, 1)
-          )
-        into v_lines
-        from
-          (
-            select
-              e.value ->> 'stock_item_id' as item,
-              (e.value ->> 'quantity')::numeric as qty
-            from
-              pg_catalog.jsonb_array_elements(v_reqs) as e (value)
-          ) req
-          left join prior pr on pr.item_id::text = req.item
-          and pr.total = req.qty;
+            and v_retire_ids is not null then v_owner_id
+          end,
+          v_reqs,
+          v_move,
+          v_snap.ordered_at,
+          v_snap.shift_id,
+          v_id::text,
+          v_event
+        );
 
         v_batch := app.post_engine_outflows (v_lines);
       end if;

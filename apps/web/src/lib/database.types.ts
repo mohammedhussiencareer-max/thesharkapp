@@ -1866,6 +1866,9 @@ isOneToOne: false
 "disposition_token":
 { Args: { "p_ctx": Json,"p_event_id": number }; Returns: string
                            },
+"engine_outflow_lines":
+{ Args: { "p_event_position": number,"p_keep_application_id": number,"p_movement_type": string,"p_occurred_at": string,"p_requirements": Json,"p_shift_id": string,"p_source_id": string }; Returns: Json
+                           },
 "ensure_provisional_seed":
 { Args: { "p_item_id": string }; Returns: number
                            },
