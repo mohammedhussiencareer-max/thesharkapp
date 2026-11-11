@@ -3411,7 +3411,8 @@ insert into
     missing_from_pos,
     refund_revision_ids,
     digest,
-    origin
+    origin,
+    captured_at
   )
 select
   'p77-o-chrono',
@@ -3420,7 +3421,8 @@ select
   false,
   '{}'::bigint[],
   md5('p77-o-chrono:2'),
-  'sync'
+  'sync',
+  '2026-09-07 16:00+00'
 from
   app.pos_order_snapshots snap
 where
@@ -3488,7 +3490,8 @@ insert into
     amount,
     occurred_at,
     present,
-    origin
+    origin,
+    captured_at
   )
 values
   (
@@ -3499,7 +3502,8 @@ values
     10,
     '2026-09-07 10:00+00',
     true,
-    'sync'
+    'sync',
+    '2026-09-07 10:00+00'
   );
 
 select
@@ -4633,6 +4637,40 @@ begin
       'backfill'
     );
 
+  insert into
+    app.stock_items (
+      id,
+      name,
+      kind,
+      base_unit,
+      count_frequency,
+      loss_pct,
+      active,
+      created_at
+    )
+  values
+    (
+      pg_temp.u (10),
+      'p77-later-fish',
+      'seafood',
+      'kg',
+      'daily',
+      0,
+      true,
+      '2026-06-15 00:00+00'
+    );
+
+  insert into
+    app.item_tracking_history (item_id, active, count_frequency, known_since, basis)
+  values
+    (
+      pg_temp.u (10),
+      true,
+      'daily',
+      '2026-07-01 00:00+00',
+      'backfill'
+    );
+
   execute 'alter table app.stock_items enable always trigger trg_stock_items_tracking_history';
 exception
   when others then
@@ -4695,7 +4733,697 @@ select
     'a shift opened after the backfill clock is not unknown tracking'
   );
 
--- Finding 10. One year of counts, one page. Budget is 2000 ms.
+-- Finding 4, round 2. The same backfill item does not block a shift from
+-- before it existed, and does block one opened after creation.
+select
+  pg_temp.seal ('p77-hist-before', '2026-06-01 12:00+00');
+
+select
+  pg_temp.seal ('p77-hist-mid', '2026-06-20 12:00+00');
+
+select
+  ok (
+    not (
+      'tracking_unknown' = any (pg_temp.one_causes ('p77-hist-before'))
+    ),
+    'a shift opened before the item existed is not unknown tracking'
+  );
+
+select
+  ok (
+    'tracking_unknown' = any (pg_temp.one_causes ('p77-hist-mid')),
+    'a shift between item creation and the backfill clock is unknown tracking'
+  );
+
+select
+  ok (
+    not exists (
+      select
+        1
+      from
+        pg_catalog.jsonb_array_elements (pg_temp.one ('p77-hist-before') -> 'daily_roster') elem
+      where
+        elem ->> 'item_id' = pg_temp.u (10)::text
+    )
+    and not exists (
+      select
+        1
+      from
+        pg_catalog.jsonb_array_elements (pg_temp.one ('p77-hist-mid') -> 'daily_roster') elem
+      where
+        elem ->> 'item_id' = pg_temp.u (10)::text
+    ),
+    'the backfill does not put the item on a roster before it was known'
+  );
+
+-- Findings 1 and 2, round 2. Capture time orders a later correction ahead of
+-- an intervening revision. Numeric ids 99 and 100 share one capture time.
+create function pg_temp.ledger_at (p_shift text, p_at timestamptz) returns void language plpgsql as $$
+declare
+  v_id bigint;
+  v_batch uuid := pg_catalog.gen_random_uuid ();
+begin
+  insert into
+    app.stock_movements (
+      batch_id,
+      item_id,
+      movement_type,
+      occurred_at,
+      quantity,
+      unit_cost,
+      total_cost,
+      shift_id
+    )
+  values
+    (v_batch, pg_temp.u (1), 'waste', p_at, -1, 5, -5, p_shift)
+  returning
+    id into v_id;
+
+  insert into
+    app.period_revisions (
+      source_movement_id,
+      shift_id,
+      bucket,
+      amount,
+      item_id,
+      cause_batch_id,
+      created_at
+    )
+  values
+    (v_id, p_shift, 'waste', -5, pg_temp.u (1), v_batch, p_at);
+end;
+$$;
+
+select
+  pg_temp.shift ('p77-cap-amt', '2026-02-01 12:00+00', false);
+
+insert into
+  app.pos_refund_revisions (
+    shift_id,
+    tx_id,
+    order_id,
+    tx_type,
+    amount,
+    occurred_at,
+    present,
+    origin,
+    captured_at
+  )
+values
+  (
+    'p77-cap-amt',
+    'tx-amt',
+    null,
+    3,
+    10,
+    '2026-02-01 08:00+00',
+    true,
+    'sync',
+    '2026-02-01 08:00+00'
+  ),
+  (
+    'p77-cap-amt',
+    'tx-amt',
+    null,
+    3,
+    40,
+    '2026-02-01 08:00+00',
+    true,
+    'sync',
+    '2026-02-01 18:00+00'
+  );
+
+select
+  pg_temp.ledger_at ('p77-cap-amt', '2026-02-01 12:00+00');
+
+select
+  is (
+    (
+      select
+        cause_kind
+      from
+        app.accounting_revision_differences
+      where
+        shift_id = 'p77-cap-amt'
+        and is_latest
+    ),
+    'refund',
+    'a refund amount correction captured later stays latest'
+  );
+
+select
+  results_eq (
+    $$select cause_kind
+      from app.accounting_revision_differences
+      where shift_id = 'p77-cap-amt'
+      order by captured_at, cause_sort nulls last, cause_kind, cause_id$$,
+    $$values ('refund'), ('ledger'), ('refund')$$,
+    'the amount correction sorts by its capture time, not yesterday''s occurred_at'
+  );
+
+select
+  results_eq (
+    $$select captured_at = '2026-02-01 18:00+00'::timestamptz,
+            source_at = '2026-02-01 08:00+00'::timestamptz
+      from app.accounting_revision_differences
+      where shift_id = 'p77-cap-amt' and is_latest$$,
+    $$values (true, true)$$,
+    'the amount correction keeps the economic occurred_at beside the capture clock'
+  );
+
+select
+  pg_temp.shift ('p77-cap-tomb', '2026-02-02 12:00+00', false);
+
+insert into
+  app.pos_refund_revisions (
+    shift_id,
+    tx_id,
+    order_id,
+    tx_type,
+    amount,
+    occurred_at,
+    present,
+    origin,
+    captured_at
+  )
+values
+  (
+    'p77-cap-tomb',
+    'tx-tomb',
+    null,
+    3,
+    10,
+    '2026-02-02 08:00+00',
+    true,
+    'sync',
+    '2026-02-02 08:00+00'
+  ),
+  (
+    'p77-cap-tomb',
+    'tx-tomb',
+    null,
+    3,
+    10,
+    '2026-02-02 08:00+00',
+    false,
+    'sync',
+    '2026-02-02 18:00+00'
+  );
+
+select
+  pg_temp.ledger_at ('p77-cap-tomb', '2026-02-02 12:00+00');
+
+select
+  is (
+    (
+      select
+        cause_kind
+      from
+        app.accounting_revision_differences
+      where
+        shift_id = 'p77-cap-tomb'
+        and is_latest
+    ),
+    'refund',
+    'a refund tombstone captured later stays latest'
+  );
+
+select
+  results_eq (
+    $$select cause_kind
+      from app.accounting_revision_differences
+      where shift_id = 'p77-cap-tomb'
+      order by captured_at, cause_sort nulls last, cause_kind, cause_id$$,
+    $$values ('refund'), ('ledger'), ('refund')$$,
+    'the tombstone sorts by its capture time, not the transaction occurred_at'
+  );
+
+select
+  results_eq (
+    $$select captured_at = '2026-02-02 18:00+00'::timestamptz,
+            source_at = '2026-02-02 08:00+00'::timestamptz
+      from app.accounting_revision_differences
+      where shift_id = 'p77-cap-tomb' and is_latest$$,
+    $$values (true, true)$$,
+    'the tombstone keeps the economic occurred_at beside the capture clock'
+  );
+
+select
+  pg_temp.shift ('p77-cap-miss', '2026-02-03 12:00+00', false);
+
+insert into
+  app.pos_order_snapshots (
+    order_id,
+    version,
+    shift_id,
+    status,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    lines,
+    origin
+  )
+values
+  (
+    'p77-o-cap-miss',
+    1,
+    'p77-cap-miss',
+    'complete',
+    '2026-02-03 08:00+00',
+    100,
+    0,
+    0,
+    0,
+    0,
+    100,
+    '2026-02-03 08:00+00',
+    repeat('ef', 32),
+    '[]'::jsonb,
+    'sync'
+  );
+
+insert into
+  app.pos_cost_inputs (
+    order_id,
+    input_revision,
+    snapshot_id,
+    missing_from_pos,
+    refund_revision_ids,
+    digest,
+    origin,
+    captured_at
+  )
+select
+  'p77-o-cap-miss',
+  1,
+  snap.id,
+  false,
+  '{}'::bigint[],
+  md5('p77-o-cap-miss:1'),
+  'sync',
+  '2026-02-03 08:00+00'
+from
+  app.pos_order_snapshots snap
+where
+  snap.order_id = 'p77-o-cap-miss'
+  and snap.version = 1;
+
+insert into
+  app.pos_cost_inputs (
+    order_id,
+    input_revision,
+    snapshot_id,
+    missing_from_pos,
+    refund_revision_ids,
+    digest,
+    origin,
+    captured_at
+  )
+select
+  'p77-o-cap-miss',
+  2,
+  snap.id,
+  true,
+  '{}'::bigint[],
+  md5('p77-o-cap-miss:2'),
+  'sync',
+  '2026-02-03 18:00+00'
+from
+  app.pos_order_snapshots snap
+where
+  snap.order_id = 'p77-o-cap-miss'
+  and snap.version = 1;
+
+select
+  pg_temp.ledger_at ('p77-cap-miss', '2026-02-03 12:00+00');
+
+select
+  is (
+    (
+      select
+        cause_kind
+      from
+        app.accounting_revision_differences
+      where
+        shift_id = 'p77-cap-miss'
+        and is_latest
+    ),
+    'order_total',
+    'a missing input captured later stays latest'
+  );
+
+select
+  results_eq (
+    $$select captured_at = '2026-02-03 18:00+00'::timestamptz,
+            source_at = '2026-02-03 08:00+00'::timestamptz
+      from app.accounting_revision_differences
+      where shift_id = 'p77-cap-miss' and is_latest$$,
+    $$values (true, true)$$,
+    'the missing input keeps the snapshot economic time beside its own capture clock'
+  );
+
+select
+  pg_temp.shift ('p77-cap-back', '2026-02-04 12:00+00', false);
+
+insert into
+  app.pos_order_snapshots (
+    order_id,
+    version,
+    shift_id,
+    status,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    lines,
+    origin
+  )
+values
+  (
+    'p77-o-cap-back',
+    1,
+    'p77-cap-back',
+    'complete',
+    '2026-02-04 08:00+00',
+    80,
+    0,
+    0,
+    0,
+    0,
+    80,
+    '2026-02-04 08:00+00',
+    repeat('fe', 32),
+    '[]'::jsonb,
+    'sync'
+  );
+
+insert into
+  app.pos_cost_inputs (
+    order_id,
+    input_revision,
+    snapshot_id,
+    missing_from_pos,
+    refund_revision_ids,
+    digest,
+    origin,
+    captured_at
+  )
+select
+  'p77-o-cap-back',
+  1,
+  snap.id,
+  true,
+  '{}'::bigint[],
+  md5('p77-o-cap-back:1'),
+  'sync',
+  '2026-02-04 08:00+00'
+from
+  app.pos_order_snapshots snap
+where
+  snap.order_id = 'p77-o-cap-back'
+  and snap.version = 1;
+
+insert into
+  app.pos_cost_inputs (
+    order_id,
+    input_revision,
+    snapshot_id,
+    missing_from_pos,
+    refund_revision_ids,
+    digest,
+    origin,
+    captured_at
+  )
+select
+  'p77-o-cap-back',
+  2,
+  snap.id,
+  false,
+  '{}'::bigint[],
+  md5('p77-o-cap-back:2'),
+  'sync',
+  '2026-02-04 18:00+00'
+from
+  app.pos_order_snapshots snap
+where
+  snap.order_id = 'p77-o-cap-back'
+  and snap.version = 1;
+
+select
+  pg_temp.ledger_at ('p77-cap-back', '2026-02-04 12:00+00');
+
+select
+  is (
+    (
+      select
+        cause_kind
+      from
+        app.accounting_revision_differences
+      where
+        shift_id = 'p77-cap-back'
+        and is_latest
+    ),
+    'order_total',
+    'a reappearance captured later stays latest'
+  );
+
+select
+  results_eq (
+    $$select captured_at = '2026-02-04 18:00+00'::timestamptz,
+            source_at = '2026-02-04 08:00+00'::timestamptz,
+            net_sales_difference
+      from app.accounting_revision_differences
+      where shift_id = 'p77-cap-back' and is_latest$$,
+    $$values (true, true, '80.00')$$,
+    'the reappearance keeps the snapshot economic time and recognizes the total'
+  );
+
+select
+  pg_temp.shift ('p77-ids', '2026-02-05 12:00+00', false);
+
+insert into
+  app.pos_refund_revisions (
+    id,
+    shift_id,
+    tx_id,
+    order_id,
+    tx_type,
+    amount,
+    occurred_at,
+    present,
+    origin,
+    captured_at
+  )
+overriding system value
+values
+  (
+    100,
+    'p77-ids',
+    'tx-100',
+    null,
+    3,
+    10,
+    '2026-02-05 10:00+00',
+    true,
+    'sync',
+    '2026-02-05 12:00+00'
+  ),
+  (
+    99,
+    'p77-ids',
+    'tx-99',
+    null,
+    3,
+    10,
+    '2026-02-05 10:00+00',
+    true,
+    'sync',
+    '2026-02-05 12:00+00'
+  );
+
+select
+  is (
+    (
+      select
+        cause_id
+      from
+        app.accounting_revision_differences
+      where
+        shift_id = 'p77-ids'
+        and is_latest
+    ),
+    '100',
+    'refund revision 100 is later than 99 when the capture time ties'
+  );
+
+select
+  results_eq (
+    $$select cause_id
+      from app.accounting_revision_differences
+      where shift_id = 'p77-ids'
+      order by captured_at, cause_sort nulls last, cause_kind, cause_id$$,
+    $$values ('99'), ('100')$$,
+    'cumulative order follows the numeric ids, not lexicographic text'
+  );
+
+select
+  results_eq (
+    $$select cause_id, cumulative_net_sales_difference
+      from app.accounting_revision_differences
+      where shift_id = 'p77-ids'
+      order by cause_sort$$,
+    $$values ('99', '-10.00'), ('100', '-20.00')$$,
+    'the cumulative history reaches 99 before 100'
+  );
+
+select
+  results_eq (
+    $$select elem ->> 'cause_id'
+      from pg_catalog.jsonb_array_elements(pg_temp.one('p77-ids') -> 'revisions') elem$$,
+    $$values ('99'), ('100')$$,
+    'the returned history uses the same numeric order'
+  );
+
+-- Finding 3, round 2. A waste cost correction is one document cause.
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    active,
+    created_at
+  )
+values
+  (
+    pg_temp.u (11),
+    'p77-waste-fish',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    true,
+    '2026-09-25 00:00+00'
+  );
+
+select
+  pg_temp.shift ('p77-wcost', '2026-09-25 08:00+00', false);
+
+select
+  app.post_movements (
+    pg_catalog.jsonb_build_array (
+      pg_catalog.jsonb_build_object (
+        'item_id',
+        pg_temp.u (11),
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-09-25 09:00+00',
+        'quantity',
+        10,
+        'unit_cost',
+        40
+      )
+    )
+  );
+
+select
+  app.record_waste (
+    md5('p77-waste-80')::uuid,
+    pg_catalog.jsonb_build_object (
+      'occurred_at',
+      '2026-09-25T10:00:00Z',
+      'reason_code',
+      'spoilage',
+      'lines',
+      pg_catalog.jsonb_build_array (
+        pg_catalog.jsonb_build_object (
+          'item_id',
+          pg_temp.u (11),
+          'quantity',
+          '2',
+          'unit',
+          'kg'
+        )
+      )
+    )
+  );
+
+select
+  app.record_waste (
+    md5('p77-waste-100')::uuid,
+    pg_catalog.jsonb_build_object (
+      'occurred_at',
+      '2026-09-25T10:00:00Z',
+      'reason_code',
+      'spoilage',
+      'predecessor_id',
+      (
+        select
+          document.id::text
+        from
+          app.waste_documents document
+        where
+          document.request_id = md5('p77-waste-80')::uuid
+      ),
+      'lines',
+      pg_catalog.jsonb_build_array (
+        pg_catalog.jsonb_build_object (
+          'item_id',
+          pg_temp.u (11),
+          'quantity',
+          '2.5',
+          'unit',
+          'kg'
+        )
+      )
+    )
+  );
+
+select
+  results_eq (
+    $$select diff.cause_kind, diff.waste_difference, diff.profit_difference, diff.is_latest
+      from app.accounting_revision_differences diff
+      join app.waste_documents document
+        on document.id::text = diff.cause_id
+       and document.request_id = md5('p77-waste-100')::uuid
+      where diff.shift_id = 'p77-wcost'$$,
+    $$values ('waste_document', '20.00', '-20.00', true)$$,
+    'correcting waste cost 80.00 to 100.00 is one -20.00 profit vector'
+  );
+
+select
+  ok (
+    not exists (
+      select
+        1
+      from
+        app.waste_documents document
+        join app.accounting_revision_differences diff on diff.cause_id in (
+          document.batch_id::text,
+          document.retire_batch_id::text
+        )
+      where
+        document.request_id = md5('p77-waste-100')::uuid
+    ),
+    'the waste correction batches are not separate causes'
+  );
+
+-- Round 2, finding 5. One year of counts, one page, with a receipt and a
+-- revision on every day plus a waste correction each week. Budget is 2000 ms.
 insert into
   app.stock_items (
     id,
@@ -4828,6 +5556,380 @@ select
   0
 from
   weekly;
+
+-- One application receipt per annual shift, with a retirement batch and a
+-- replacement batch, and a waste-document correction each week. Both batch
+-- columns are revised so the status page joins through the receipt map.
+insert into
+  app.pos_order_snapshots (
+    order_id,
+    version,
+    shift_id,
+    status,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    lines,
+    origin,
+    captured_at
+  )
+select
+  'p77-y-o-' || pg_catalog.to_char (shift.opened_at, 'YYYYMMDD'),
+  1,
+  shift.id,
+  'canceled',
+  shift.opened_at,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  shift.opened_at,
+  repeat('ab', 32),
+  '[]'::jsonb,
+  'sync',
+  shift.opened_at
+from
+  app.pos_shifts shift
+where
+  shift.id like 'p77-y-%';
+
+insert into
+  app.pos_cost_inputs (
+    order_id,
+    input_revision,
+    snapshot_id,
+    missing_from_pos,
+    refund_revision_ids,
+    digest,
+    origin,
+    captured_at
+  )
+select
+  snap.order_id,
+  1,
+  snap.id,
+  false,
+  '{}'::bigint[],
+  md5(snap.order_id),
+  'sync',
+  snap.captured_at
+from
+  app.pos_order_snapshots snap
+where
+  snap.order_id like 'p77-y-o-%';
+
+update app.accounting_work_events
+set
+  work_generation = 1,
+  processed_at = pg_catalog.clock_timestamp ()
+where
+  order_id like 'p77-y-o-%'
+  and processed_at is null;
+
+insert into
+  app.order_cost_applications (
+    order_id,
+    cost_input_id,
+    snapshot_id,
+    receipt_kind,
+    disposition,
+    occurred_at,
+    shift_id,
+    signature,
+    requirements,
+    retire_batch,
+    posting_batch,
+    work_generation
+  )
+select
+  input.order_id,
+  input.id,
+  input.snapshot_id,
+  'posting',
+  'sale',
+  snap.ordered_at,
+  snap.shift_id,
+  md5(input.order_id),
+  '{}'::jsonb,
+  pg_catalog.gen_random_uuid (),
+  pg_catalog.gen_random_uuid (),
+  1
+from
+  app.pos_cost_inputs input
+  join app.pos_order_snapshots snap on snap.id = input.snapshot_id
+where
+  input.order_id like 'p77-y-o-%';
+
+insert into
+  app.stock_movements (
+    batch_id,
+    item_id,
+    movement_type,
+    occurred_at,
+    quantity,
+    unit_cost,
+    total_cost,
+    shift_id
+  )
+select
+  application.retire_batch,
+  pg_temp.u (6),
+  'waste',
+  application.occurred_at,
+  -1,
+  10,
+  -10,
+  application.shift_id
+from
+  app.order_cost_applications application
+where
+  application.order_id like 'p77-y-o-%'
+union all
+select
+  application.posting_batch,
+  pg_temp.u (6),
+  'waste',
+  application.occurred_at,
+  -1,
+  20,
+  -20,
+  application.shift_id
+from
+  app.order_cost_applications application
+where
+  application.order_id like 'p77-y-o-%';
+
+insert into
+  app.period_revisions (
+    source_movement_id,
+    shift_id,
+    bucket,
+    amount,
+    item_id,
+    cause_batch_id,
+    created_at
+  )
+select
+  movement.id,
+  movement.shift_id,
+  'waste',
+  movement.total_cost,
+  movement.item_id,
+  movement.batch_id,
+  movement.occurred_at
+from
+  app.stock_movements movement
+where
+  movement.batch_id in (
+    select
+      application.retire_batch
+    from
+      app.order_cost_applications application
+    where
+      application.order_id like 'p77-y-o-%'
+    union
+    select
+      application.posting_batch
+    from
+      app.order_cost_applications application
+    where
+      application.order_id like 'p77-y-o-%'
+  );
+
+insert into
+  app.waste_documents (
+    request_id,
+    occurred_at,
+    reason_code,
+    shift_id,
+    is_void,
+    event_position,
+    batch_id,
+    actor,
+    created_at
+  )
+select
+  pg_catalog.gen_random_uuid (),
+  shift.opened_at,
+  'spoilage',
+  shift.id,
+  false,
+  880000 + pg_catalog.row_number () over (
+    order by
+      shift.opened_at
+  ),
+  pg_catalog.gen_random_uuid (),
+  'a7700000-0000-4000-8000-0000000000a1'::uuid,
+  shift.opened_at
+from
+  app.pos_shifts shift
+where
+  shift.id like 'p77-y-%'
+  and (shift.opened_at::date - date '2024-01-02') % 7 = 0;
+
+insert into
+  app.waste_documents (
+    request_id,
+    occurred_at,
+    reason_code,
+    shift_id,
+    predecessor_id,
+    is_void,
+    event_position,
+    batch_id,
+    retire_batch_id,
+    actor,
+    created_at
+  )
+select
+  pg_catalog.gen_random_uuid (),
+  original.occurred_at,
+  'spoilage',
+  original.shift_id,
+  original.id,
+  false,
+  original.event_position,
+  pg_catalog.gen_random_uuid (),
+  pg_catalog.gen_random_uuid (),
+  original.actor,
+  original.created_at + interval '1 hour'
+from
+  app.waste_documents original
+where
+  original.shift_id like 'p77-y-%'
+  and original.predecessor_id is null;
+
+insert into
+  app.stock_movements (
+    batch_id,
+    item_id,
+    movement_type,
+    occurred_at,
+    quantity,
+    unit_cost,
+    total_cost,
+    shift_id
+  )
+select
+  correction.retire_batch_id,
+  pg_temp.u (6),
+  'waste',
+  correction.occurred_at,
+  -1,
+  8,
+  -8,
+  correction.shift_id
+from
+  app.waste_documents correction
+where
+  correction.shift_id like 'p77-y-%'
+  and correction.predecessor_id is not null
+union all
+select
+  correction.batch_id,
+  pg_temp.u (6),
+  'waste',
+  correction.occurred_at,
+  -1,
+  10,
+  -10,
+  correction.shift_id
+from
+  app.waste_documents correction
+where
+  correction.shift_id like 'p77-y-%'
+  and correction.predecessor_id is not null;
+
+insert into
+  app.period_revisions (
+    source_movement_id,
+    shift_id,
+    bucket,
+    amount,
+    item_id,
+    cause_batch_id,
+    created_at
+  )
+select
+  movement.id,
+  movement.shift_id,
+  'waste',
+  movement.total_cost,
+  movement.item_id,
+  movement.batch_id,
+  movement.occurred_at
+from
+  app.stock_movements movement
+where
+  movement.batch_id in (
+    select
+      correction.retire_batch_id
+    from
+      app.waste_documents correction
+    where
+      correction.shift_id like 'p77-y-%'
+      and correction.predecessor_id is not null
+    union
+    select
+      correction.batch_id
+    from
+      app.waste_documents correction
+    where
+      correction.shift_id like 'p77-y-%'
+      and correction.predecessor_id is not null
+  );
+
+select
+  ok (
+    (
+      select
+        count(*)
+      from
+        app.order_cost_applications application
+      where
+        application.order_id like 'p77-y-o-%'
+    ) >= 365,
+    'the annual fixture posts a receipt on every shift'
+  );
+
+select
+  ok (
+    (
+      select
+        count(*)
+      from
+        app.period_revisions revision
+        join app.order_cost_applications application on revision.cause_batch_id in (
+          application.retire_batch,
+          application.posting_batch
+        )
+      where
+        application.order_id like 'p77-y-o-%'
+    ) >= 730,
+    'the annual fixture revises both batches of each receipt'
+  );
+
+select
+  ok (
+    (
+      select
+        count(*)
+      from
+        app.waste_documents document
+      where
+        document.shift_id like 'p77-y-%'
+        and document.predecessor_id is not null
+    ) >= 52,
+    'the annual fixture includes a waste correction each week'
+  );
 
 create temp table p77_bench (ms numeric);
 

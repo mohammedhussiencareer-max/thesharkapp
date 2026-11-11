@@ -40,7 +40,9 @@ begin
   app.order_cost_state,
   app.order_disposition_state,
   app.accounting_work_events,
-  app.accounting_work_state in share row exclusive mode nowait;
+  app.accounting_work_state,
+  app.order_cost_applications,
+  app.waste_documents in share row exclusive mode nowait;
 end;
 $lock_tables$;
 
@@ -61,7 +63,7 @@ create table app.item_tracking_history (
   basis text not null check (basis in ('observed', 'backfill'))
 );
 
-comment on table app.item_tracking_history is 'Append-only. One row each time a stock item is inserted or its active flag or count_frequency changes. known_since is when that pair became known: the item created_at on insert, the change clock on update, and this migration''s clock for the backfill of items that already existed. basis is observed for those trigger rows and backfill for the migration clock. A shift''s required roster reads the latest row with known_since at or before the shift opened. A later edit cannot remove an item from that roster. A backfill row with no history at or before the shift opened is unknown tracking, not an empty roster.';
+comment on table app.item_tracking_history is 'Append-only. One row each time a stock item is inserted or its active flag or count_frequency changes. known_since is when that pair became known: the item created_at on insert, the change clock on update, and this migration''s clock for the backfill of items that already existed. basis is observed for those trigger rows and backfill for the migration clock. A shift''s required roster reads the latest row with known_since at or before the shift opened. A later edit cannot remove an item from that roster. Unknown tracking is a backfill row for an item that already existed when the shift opened and still has no history at or before that open. An item created later is not unknown tracking. An empty roster is not the same cause.';
 
 comment on column app.item_tracking_history.basis is 'observed when a trigger wrote the row from an insert or a real catalog change. backfill when this migration recorded items that already existed, at the migration clock. The clock is not rewritten to created_at.';
 
@@ -194,8 +196,9 @@ service_role;
 -- input on a different shift records the removal on the old shift and the
 -- new total on the new shift, even when the two totals are equal. Every
 -- type-3 refund revision is one fact, keyed by the refund revision,
--- including a change whose net sales difference is zero. source_at is the
--- source document's time. recorded_at is when this row was materialized.
+-- including a change whose net sales difference is zero. captured_at is the
+-- immutable ingest clock and orders revisions. source_at is the economic
+-- time and does not. recorded_at is when this row was materialized.
 -- Re-ingest that inserts no new revision inserts no new fact. These writers
 -- take no ledger lock.
 -- ============================================================================
@@ -209,6 +212,7 @@ create table app.sales_revision_facts (
   ),
   shift_id text not null check (length(pg_catalog.btrim (shift_id)) > 0),
   net_sales_difference numeric(14, 2) not null,
+  captured_at timestamptz not null,
   source_at timestamptz not null,
   recorded_at timestamptz not null default pg_catalog.clock_timestamp (),
   constraint sales_revision_facts_source_key unique (source_kind, source_revision_id, shift_id),
@@ -218,18 +222,21 @@ create table app.sales_revision_facts (
       'Infinity'::numeric,
       '-Infinity'::numeric
     )
+    and pg_catalog.isfinite (captured_at)
     and pg_catalog.isfinite (source_at)
     and pg_catalog.isfinite (recorded_at)
   )
 );
 
-comment on table app.sales_revision_facts is 'Append-only. One row per shift affected by a changed order recognition or a type-3 refund revision. source_kind, source_revision_id and shift_id are the immutable input and the shift the difference belongs to. A shift transfer is two rows for one cost input: the old recognized total removed from the old shift, and the new recognized total added to the new shift. net_sales_difference is the change in recognized sales on that shift. Refunds reduce sales when the refund amount rises. A zero difference is still a row when a refund revision was written. source_at orders revisions by the source document. recorded_at is materialization time and is not the revision order. Replaying the same source and shift writes nothing.';
+comment on table app.sales_revision_facts is 'Append-only. One row per shift affected by a changed order recognition or a type-3 refund revision. source_kind, source_revision_id and shift_id are the immutable input and the shift the difference belongs to. A shift transfer is two rows for one cost input: the old recognized total removed from the old shift, and the new recognized total added to the new shift. net_sales_difference is the change in recognized sales on that shift. Refunds reduce sales when the refund amount rises. A zero difference is still a row when a refund revision was written. captured_at is the ingest clock and orders revisions. source_at is the economic time and does not. recorded_at is materialization time and is not the revision order. Replaying the same source and shift writes nothing.';
 
 comment on column app.sales_revision_facts.net_sales_difference is 'Recognized sales after this source revision, minus recognized sales before it, on this shift. A transfer writes the full removal and the full addition, not only the net of the two totals. Positive means more net sales. Refund amounts use the opposite sign.';
 
-comment on column app.sales_revision_facts.source_at is 'When the source document says the revision happened: the new snapshot pos_update_time (or ordered_at) for an order total, including both legs of a shift transfer, and the refund revision occurred_at for a refund. Revision order uses this, not recorded_at.';
+comment on column app.sales_revision_facts.captured_at is 'Immutable ingest clock of the cost input or refund revision. An amount correction, a tombstone, and a missing or reappearance input keep this later clock even when the economic time does not move. Revision order uses this, not source_at and not recorded_at.';
 
-create index sales_revision_facts_shift_idx on app.sales_revision_facts (shift_id, source_at, id);
+comment on column app.sales_revision_facts.source_at is 'Economic time, kept apart from the ingest clock: the new snapshot pos_update_time (or ordered_at) for an order total, including both legs of a shift transfer, and the refund revision occurred_at for a refund. A later correction can reuse an earlier economic time.';
+
+create index sales_revision_facts_shift_idx on app.sales_revision_facts (shift_id, captured_at, id);
 
 create trigger trg_sales_revision_facts_no_update_delete
 before update or delete on app.sales_revision_facts for each row
@@ -249,6 +256,7 @@ declare
   v_total numeric(14, 2);
   v_status text;
   v_shift text;
+  v_captured_at timestamptz;
   v_source_at timestamptz;
   v_prev_missing boolean;
   v_prev_total numeric(14, 2);
@@ -264,6 +272,7 @@ begin
     snap.total,
     snap.status,
     snap.shift_id,
+    input.captured_at,
     coalesce(snap.pos_update_time, snap.ordered_at)
   into
     v_order,
@@ -272,6 +281,7 @@ begin
     v_total,
     v_status,
     v_shift,
+    v_captured_at,
     v_source_at
   from
     app.pos_cost_inputs input
@@ -330,6 +340,7 @@ begin
         order_id,
         shift_id,
         net_sales_difference,
+        captured_at,
         source_at
       )
     values
@@ -339,6 +350,7 @@ begin
         v_order,
         v_shift,
         (v_new - v_old)::numeric(14, 2),
+        v_captured_at,
         v_source_at
       )
     on conflict (source_kind, source_revision_id, shift_id) do nothing;
@@ -356,6 +368,7 @@ begin
         order_id,
         shift_id,
         net_sales_difference,
+        captured_at,
         source_at
       )
     values
@@ -365,6 +378,7 @@ begin
         v_order,
         v_prev_shift,
         (- v_old)::numeric(14, 2),
+        v_captured_at,
         v_source_at
       )
     on conflict (source_kind, source_revision_id, shift_id) do nothing;
@@ -378,6 +392,7 @@ begin
         order_id,
         shift_id,
         net_sales_difference,
+        captured_at,
         source_at
       )
     values
@@ -387,6 +402,7 @@ begin
         v_order,
         v_shift,
         v_new::numeric(14, 2),
+        v_captured_at,
         v_source_at
       )
     on conflict (source_kind, source_revision_id, shift_id) do nothing;
@@ -394,7 +410,7 @@ begin
 end;
 $$;
 
-comment on function app.note_order_total_sales_revision (bigint) is 'Appends order_total sales facts for a cost input after the first. Recognized total is the snapshot total only while the order is complete and not missing; otherwise it is zero. The same shift records the net change and writes nothing when that net is zero. A different shift records the old total removed from the old shift and the new total added to the new shift, including a move that does not change the total. Both legs use the new snapshot time as source_at. The first input is the baseline and writes nothing. A repeated call for the same input and shift writes nothing. Does not take the ledger lock.';
+comment on function app.note_order_total_sales_revision (bigint) is 'Appends order_total sales facts for a cost input after the first. Recognized total is the snapshot total only while the order is complete and not missing; otherwise it is zero. The same shift records the net change and writes nothing when that net is zero. A different shift records the old total removed from the old shift and the new total added to the new shift, including a move that does not change the total. Both legs use the cost input captured_at as the revision order and the snapshot pos_update_time (or ordered_at) as the economic source_at, including a missing or reappearance input that reuses an older snapshot. The first input is the baseline and writes nothing. A repeated call for the same input and shift writes nothing. Does not take the ledger lock.';
 
 revoke all on function app.note_order_total_sales_revision (bigint)
 from
@@ -470,6 +486,7 @@ begin
       order_id,
       shift_id,
       net_sales_difference,
+      captured_at,
       source_at
     )
   values
@@ -479,13 +496,14 @@ begin
       v_row.order_id,
       v_row.shift_id,
       (v_prev_eff - v_new_eff)::numeric(14, 2),
+      v_row.captured_at,
       v_row.occurred_at
     )
   on conflict (source_kind, source_revision_id, shift_id) do nothing;
 end;
 $$;
 
-comment on function app.note_refund_sales_revision (bigint) is 'Appends one refund sales fact for a type-3 revision, or for a revision that replaces a type-3 row. The difference is the previous effective refund amount minus the new one, so a larger refund reduces net sales. A zero difference is still stored. Keyed by the revision id, so a repeated call writes nothing. Does not take the ledger lock. Drawer types that never were type 3 write nothing.';
+comment on function app.note_refund_sales_revision (bigint) is 'Appends one refund sales fact for a type-3 revision, or for a revision that replaces a type-3 row. The difference is the previous effective refund amount minus the new one, so a larger refund reduces net sales. A zero difference is still stored. captured_at is the revision ingest clock, so an amount correction or tombstone captured later stays later even when occurred_at does not move. source_at keeps that economic occurred_at. Keyed by the revision id, so a repeated call writes nothing. Does not take the ledger lock. Drawer types that never were type 3 write nothing.';
 
 revoke all on function app.note_refund_sales_revision (bigint)
 from
@@ -844,6 +862,24 @@ from
 
 comment on view app.shift_count_coverage is 'One row per shift and item required at that shift''s open. owning_shift_id is the shift pinned on the anchor when the count was recorded. interval_owning_shift_id is the separate policy of the last shift that had opened at or before the count, and a later boundary edit can move it. A daily item is covered only by a daily anchor whose pinned shift is this shift. A weekly item is covered by a weekly anchor whose interval (previous same-item anchor, this count] contains the shift open. Previous anchors and the count scope proof are computed once per count, not once per item line. sync_scope_covered is null when the item has no anchor. A partial count leaves the missing items uncovered. security_invoker so owner RLS applies.';
 
+-- Batch lookups for the revision view. The view also builds one receipt map
+-- per query; these indexes keep a nested lookup off a sequential scan.
+create index order_cost_applications_retire_batch_idx on app.order_cost_applications (retire_batch)
+where
+  retire_batch is not null;
+
+create index order_cost_applications_posting_batch_idx on app.order_cost_applications (posting_batch)
+where
+  posting_batch is not null;
+
+create index waste_documents_batch_idx on app.waste_documents (batch_id)
+where
+  batch_id is not null;
+
+create index waste_documents_retire_batch_idx on app.waste_documents (retire_batch_id)
+where
+  retire_batch_id is not null;
+
 -- ============================================================================
 -- 4. Unified revision differences.
 -- Grouped by cause and shift. Cost columns are the negated ledger total_cost
@@ -853,27 +889,96 @@ comment on view app.shift_count_coverage is 'One row per shift and item required
 -- as app.profit_bucket in 20261108010000_outflow_reversals.sql. Sorting
 -- transfers are left out. A coordinator correction's retirement batch and
 -- replacement batch are one cause, normalized through the application
--- receipt. Each row is one cause. Cumulative columns sum that shift from
--- the earliest source_at through this one. is_latest marks the newest
--- source on the shift, not the row that was materialized last.
--- profit = net sales − cogs − waste − count.
+-- receipt. A manual waste correction's retirement batch and replacement
+-- batch are one waste_document cause. The receipt map is built once per
+-- query. Each row is one cause. Cumulative columns and is_latest follow
+-- captured_at, then the numeric source id, then cause kind and id.
+-- is_latest is not the row that was materialized last. source_at stays the
+-- economic time. profit = net sales − cogs − waste − count.
 -- ============================================================================
 create view app.accounting_revision_differences
 with
   (security_invoker = true) as
 with
+  receipts as materialized (
+    select distinct
+      on (mapped.batch_id) mapped.batch_id,
+      mapped.cause_kind,
+      mapped.cause_id,
+      mapped.cause_sort,
+      mapped.captured_at,
+      mapped.economic_at
+    from
+      (
+        select
+          application.retire_batch as batch_id,
+          'application'::text as cause_kind,
+          application.id::text as cause_id,
+          application.id as cause_sort,
+          application.created_at as captured_at,
+          application.occurred_at as economic_at,
+          0 as preference
+        from
+          app.order_cost_applications application
+        where
+          application.retire_batch is not null
+        union all
+        select
+          application.posting_batch,
+          'application'::text,
+          application.id::text,
+          application.id,
+          application.created_at,
+          application.occurred_at,
+          0
+        from
+          app.order_cost_applications application
+        where
+          application.posting_batch is not null
+        union all
+        select
+          document.retire_batch_id,
+          'waste_document'::text,
+          document.id::text,
+          document.id,
+          document.created_at,
+          document.occurred_at,
+          1
+        from
+          app.waste_documents document
+        where
+          document.retire_batch_id is not null
+        union all
+        select
+          document.batch_id,
+          'waste_document'::text,
+          document.id::text,
+          document.id,
+          document.created_at,
+          document.occurred_at,
+          1
+        from
+          app.waste_documents document
+        where
+          document.batch_id is not null
+      ) mapped
+    order by
+      mapped.batch_id,
+      mapped.preference,
+      mapped.cause_sort
+  ),
   ledger as (
     select
-      case
-        when receipt.application_id is not null then 'application'::text
-        else 'ledger'::text
-      end as cause_kind,
-      coalesce(
-        receipt.application_id::text,
-        revision.cause_batch_id::text
-      ) as cause_id,
+      coalesce(receipt.cause_kind, 'ledger') as cause_kind,
+      coalesce(receipt.cause_id, revision.cause_batch_id::text) as cause_id,
+      receipt.cause_sort,
       revision.shift_id,
-      min(coalesce(receipt.source_at, revision.created_at)) as source_at,
+      min(
+        coalesce(receipt.captured_at, revision.created_at)
+      ) as captured_at,
+      min(
+        coalesce(receipt.economic_at, movement.occurred_at)
+      ) as source_at,
       min(revision.created_at) as recorded_at,
       0::numeric(14, 2) as net_sales_difference,
       coalesce(
@@ -924,25 +1029,13 @@ with
             else null
           end as bucket
       ) bucket
-      left join lateral (
-        select
-          application.id as application_id,
-          application.created_at as source_at
-        from
-          app.order_cost_applications application
-        where
-          application.retire_batch = revision.cause_batch_id
-          or application.posting_batch = revision.cause_batch_id
-        order by
-          application.id
-        limit
-          1
-      ) receipt on true
+      left join receipts receipt on receipt.batch_id = revision.cause_batch_id
     where
       revision.shift_id is not null
     group by
       1,
       2,
+      3,
       revision.shift_id
     having
       count(*) filter (
@@ -954,7 +1047,9 @@ with
     select
       ledger.cause_kind,
       ledger.cause_id,
+      ledger.cause_sort,
       ledger.shift_id,
+      ledger.captured_at,
       ledger.source_at,
       ledger.recorded_at,
       ledger.net_sales_difference,
@@ -967,7 +1062,9 @@ with
     select
       fact.source_kind,
       fact.source_revision_id::text,
+      fact.source_revision_id,
       fact.shift_id,
+      fact.captured_at,
       fact.source_at,
       fact.recorded_at,
       fact.net_sales_difference,
@@ -981,7 +1078,9 @@ with
     select
       events.cause_kind,
       events.cause_id,
+      events.cause_sort,
       events.shift_id,
+      events.captured_at,
       events.source_at,
       events.recorded_at,
       events.net_sales_difference,
@@ -1000,7 +1099,8 @@ with
           partition by
             events.shift_id
           order by
-            events.source_at desc,
+            events.captured_at desc,
+            events.cause_sort desc nulls first,
             events.cause_kind desc,
             events.cause_id desc
         ) = 1
@@ -1012,7 +1112,8 @@ with
         partition by
           events.shift_id
         order by
-          events.source_at,
+          events.captured_at,
+          events.cause_sort nulls last,
           events.cause_kind,
           events.cause_id rows between unbounded preceding
           and current row
@@ -1021,7 +1122,9 @@ with
 select
   rolled.cause_kind,
   rolled.cause_id,
+  rolled.cause_sort,
   rolled.shift_id,
+  rolled.captured_at,
   rolled.source_at,
   rolled.recorded_at,
   rolled.is_latest,
@@ -1040,7 +1143,7 @@ select
 from
   rolled;
 
-comment on view app.accounting_revision_differences is 'One cause on one shift: its own net sales, COGS, waste, count and profit differences, and the cumulative differences of that shift through this cause. Money is decimal text. is_latest follows source_at, then cause kind and id. recorded_at is materialization time and does not order the rows. A retirement batch and its replacement batch that share one application receipt are one application cause, so a reclass from COGS to waste is one zero-profit vector. A zero profit difference is still a row. Sorting transfers are absent. Cost adjustments use the economic target''s bucket. Ledger amounts come from stock_movements.total_cost, not from period_revisions.amount. security_invoker so owner RLS applies.';
+comment on view app.accounting_revision_differences is 'One cause on one shift: its own net sales, COGS, waste, count and profit differences, and the cumulative differences of that shift through this cause. Money is decimal text. captured_at orders the rows, then cause_sort for a numeric source id, then cause kind and id. cause_sort is null for a ledger batch uuid. source_at is the economic time and is not the order. recorded_at is materialization time and does not order the rows. A retirement batch and its replacement batch that share one application receipt are one application cause, so a reclass from COGS to waste is one zero-profit vector. A manual waste correction is one waste_document cause for the same reason. The receipt map is built once per query from indexed batch columns. A zero profit difference is still a row. Sorting transfers are absent. Cost adjustments use the economic target''s bucket. Ledger amounts come from stock_movements.total_cost, not from period_revisions.amount. security_invoker so owner RLS applies.';
 
 -- Shifts that still own an order's unsettled work: the latest cost-input
 -- snapshot, the live application's pinned shift, and, when the latest
@@ -1526,7 +1629,8 @@ begin
     from
       app.stock_items item
     where
-      exists (
+      item.created_at <= v_shift.opened_at
+      and exists (
         select
           1
         from
@@ -1907,6 +2011,10 @@ begin
             diff.cause_kind,
             'cause_id',
             diff.cause_id,
+            'cause_sort',
+            diff.cause_sort::text,
+            'captured_at',
+            app.costing_timestamptz_text (diff.captured_at),
             'source_at',
             app.costing_timestamptz_text (diff.source_at),
             'recorded_at',
@@ -1935,7 +2043,8 @@ begin
             diff.cumulative_profit_difference
           )
           order by
-            diff.source_at,
+            diff.captured_at,
+            diff.cause_sort nulls last,
             diff.cause_kind,
             diff.cause_id
         ),
@@ -2035,7 +2144,7 @@ begin
 end;
 $$;
 
-comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item and uses the anchor''s pinned shift. Weekly settlement names that pinned shift, the separate interval-owning shift, and the covered interval. Count coverage for the page is read once. A partial daily roster is تقديري only when no blocker is set. Unknown backfill tracking, an incomplete application, an unfinished rederive span, and unsettled work on either the latest snapshot shift or the live application shift are ناقص. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Completed-order readiness is atomic. Line coverage counts ready and exception lines on their own. Quantities and money are decimal text. Does not post stock and does not change record_count.';
+comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item and uses the anchor''s pinned shift. Weekly settlement names that pinned shift, the separate interval-owning shift, and the covered interval. Count coverage for the page is read once. A partial daily roster is تقديري only when no blocker is set. Unknown backfill tracking applies only to an item that already existed when the shift opened. An incomplete application, an unfinished rederive span, and unsettled work on either the latest snapshot shift or the live application shift are ناقص. Revision history follows captured_at, then the numeric cause_sort, then cause kind and id. source_at in that history is the economic time. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Completed-order readiness is atomic. Line coverage counts ready and exception lines on their own. Quantities and money are decimal text. Does not post stock and does not change record_count.';
 
 revoke all on function app.list_shift_accounting_status (timestamptz, text, integer)
 from
