@@ -52,7 +52,7 @@ values
   ('a6600000-0000-4000-8000-0000000000a1');
 
 -- ---------------------------------------------------------------------------
--- Helpers. u(n) is a synthetic uuid; items are 1..8, requests are 100 and up.
+-- Helpers. u(n) is a synthetic uuid; items are 1..9, requests are 100 and up.
 -- ---------------------------------------------------------------------------
 create function pg_temp.u (p_n integer) returns uuid language sql immutable as $$
   select ('a6600000-0000-4000-8000-' || lpad(p_n::text, 12, '0'))::uuid;
@@ -2069,6 +2069,192 @@ select
     ),
     1::bigint,
     'a changed time does not reuse the previous pieces'
+  );
+
+-- ---------------------------------------------------------------------------
+-- 20. A backdated outflow and a later valued purchase reorder the provisional
+-- pieces of one waste line; a reason-only correction still changes nothing
+-- (the order disposition scenario d-s1, for one reposted line).
+-- ---------------------------------------------------------------------------
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    parent_item_id
+  )
+values
+  (
+    pg_temp.u (9),
+    'p66-fish-d',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    null
+  );
+
+insert into
+  app.item_loss_versions (
+    effective_from,
+    created_change_id,
+    item_id,
+    loss_pct
+  )
+select
+  '2000-01-01 00:00:00+00',
+  c.id,
+  pg_temp.u (9),
+  0
+from
+  app.costing_changes c
+where
+  c.request_id = pg_temp.u (900);
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(
+      jsonb_build_object('item_id', pg_temp.u(9), 'movement_type', 'purchase',
+        'occurred_at', '2030-05-01T00:00:00Z', 'quantity', 1, 'unit_cost', 0.33)
+    ))$$,
+    'd-s1: 1 kg of fish is bought at 0.33'
+  );
+
+select
+  app.record_waste (
+    pg_temp.u (310),
+    pg_temp.d (
+      '2030-06-12T14:00:00Z',
+      'spoilage',
+      null,
+      null,
+      jsonb_build_array(pg_temp.ln (9, '2', 'kg'))
+    )
+  );
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(
+      jsonb_build_object('item_id', pg_temp.u(9), 'movement_type', 'sale',
+        'occurred_at', '2030-06-12T13:00:00Z', 'quantity', 0.25)
+    ))$$,
+    'd-s1: a 0.25 kg sale is backdated before the waste'
+  );
+
+select
+  lives_ok (
+    $$select app.post_movements(jsonb_build_array(
+      jsonb_build_object('item_id', pg_temp.u(9), 'movement_type', 'purchase',
+        'occurred_at', '2030-06-13T00:00:00Z', 'quantity', 0.5, 'unit_cost', 0.36)
+    ))$$,
+    'd-s1: 0.5 kg arrives afterwards at 0.36'
+  );
+
+create function pg_temp.piece_cost (p_id bigint) returns numeric language sql as $$
+  select
+    m.total_cost + coalesce(
+      (
+        select
+          sum(a.total_cost)
+        from
+          app.stock_movements a
+        where
+          a.adjusts_movement_id = m.id
+          and a.movement_type = 'cost_adjustment'
+      ),
+      0
+    )
+  from
+    app.stock_movements m
+  where
+    m.id = p_id;
+$$;
+
+insert into
+  kv
+select
+  'd1-before',
+  to_jsonb(sum(pg_temp.piece_cost (wm.movement_id)))
+from
+  app.waste_line_movements wm
+where
+  wm.document_id = pg_temp.doc_id (310);
+
+select
+  cmp_ok (
+    (
+      select
+        count(*)
+      from
+        app.waste_line_movements wm
+      where
+        wm.document_id = pg_temp.doc_id (310)
+    ),
+    '>',
+    1::bigint,
+    'd-s1: the reordered shortfall record holds several pieces'
+  );
+
+insert into
+  kv
+select
+  'd1',
+  app.record_waste (
+    pg_temp.u (311),
+    pg_temp.d (
+      '2030-06-12T14:00:00Z',
+      'staff_meal',
+      null,
+      pg_temp.doc_id (310)::text,
+      jsonb_build_array(pg_temp.ln (9, '2', 'kg'))
+    )
+  );
+
+select
+  is (
+    (
+      select
+        v -> 'differences'
+      from
+        kv
+      where
+        k = 'd1'
+    ),
+    '{"cogs": "0.00", "profit": "0.00", "waste": "0.00", "stock_value": "0.00", "stock_quantity": "0"}'::jsonb,
+    'd-s1: a reason-only correction changes no cogs, waste, profit or stock value'
+  );
+
+select
+  results_eq (
+    $$select sm.quantity::text, sm.is_provisional, sm.piece_position from app.waste_line_movements wm
+      join app.stock_movements sm on sm.id = wm.movement_id
+      where wm.document_id = pg_temp.doc_id (311) order by sm.piece_position, sm.id$$,
+    $$values ('-0.750000', false, 1), ('-0.250000', true, 2), ('-1.000000', true, 3)$$,
+    'd-s1: the correction numbers its pieces 1 to 3 in the order the valuation used'
+  );
+
+select
+  is (
+    (
+      select
+        sum(pg_temp.piece_cost (wm.movement_id))
+      from
+        app.waste_line_movements wm
+      where
+        wm.document_id = pg_temp.doc_id (311)
+    ),
+    (
+      select
+        (v #>> '{}')::numeric
+      from
+        kv
+      where
+        k = 'd1-before'
+    ),
+    'd-s1: the pieces cost exactly what they cost before'
   );
 
 select
