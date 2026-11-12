@@ -4598,6 +4598,271 @@ select
     'a sealed shift with no unknown tracking is final'
   );
 
+-- A sale on A moves to B and stays incomplete across a second evaluation.
+-- The item is created after A opens, so it is not on A's roster.
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    active,
+    created_at
+  )
+values
+  (
+    pg_temp.u (12),
+    'p77-chain-fish',
+    'seafood',
+    'kg',
+    'daily',
+    0,
+    true,
+    '2026-09-25 13:30+00'
+  );
+
+select
+  app.set_item_loss (
+    md5('loss|p77-u12')::uuid,
+    pg_temp.u (12),
+    0,
+    '2026-09-25 13:30+00',
+    null,
+    (
+      select
+        app.schedule_token ('loss', pg_temp.u (12), null)
+    ),
+    'fixture'
+  );
+
+select
+  app.post_movements (
+    pg_catalog.jsonb_build_array (
+      pg_catalog.jsonb_build_object (
+        'item_id',
+        pg_temp.u (12),
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        '2026-09-25 13:40+00',
+        'quantity',
+        100,
+        'unit_cost',
+        40
+      )
+    )
+  );
+
+select
+  pg_temp.policies ('pos-chain');
+
+select
+  pg_temp.map_stock (
+    'pos-chain',
+    pg_temp.u (12),
+    '1',
+    '2026-09-25 13:00+00'
+  );
+
+select
+  pg_temp.seal ('p77-chain-a', '2026-09-25 12:00+00');
+
+select
+  pg_temp.daily_count (
+    pg_catalog.gen_random_uuid (),
+    '2026-09-25 18:00+00',
+    array[pg_temp.u (8)]
+  );
+
+select
+  pg_temp.seal ('p77-chain-b', '2026-09-26 12:00+00');
+
+select
+  pg_temp.ord (
+    'p77-o-chain',
+    'p77-chain-a',
+    'complete',
+    '2026-09-25 14:00+00',
+    80
+  );
+
+update app.pos_orders
+set
+  order_type = 'hall'
+where
+  id = 'p77-o-chain';
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    options,
+    line_total
+  )
+values
+  (
+    'p77-o-chain',
+    'l1',
+    'pos-chain',
+    'x',
+    1,
+    '[]'::jsonb,
+    80
+  );
+
+select
+  app.capture_pos_order_snapshot ('p77-o-chain', null, 'sync');
+
+select
+  app.append_pos_cost_input ('p77-o-chain', null, 'sync');
+
+select
+  is (
+    pg_temp.account ('p77-o-chain') ->> 'outcome',
+    'applied',
+    'the mapped sale posts on shift A before the move'
+  );
+
+update app.pos_orders
+set
+  shift_id = 'p77-chain-b',
+  version = version + 1,
+  pos_update_time = '2026-09-26 15:00+00',
+  content_hash = repeat('cc', 32)
+where
+  id = 'p77-o-chain';
+
+update app.pos_order_lines
+set
+  item_id = 'pos-chain-gap'
+where
+  order_id = 'p77-o-chain';
+
+select
+  app.capture_pos_order_snapshot ('p77-o-chain', null, 'sync');
+
+select
+  app.append_pos_cost_input ('p77-o-chain', null, 'sync');
+
+select
+  is (
+    pg_temp.account ('p77-o-chain') ->> 'outcome',
+    'incomplete',
+    'the move to B retires the sale and stays incomplete'
+  );
+
+select
+  is (
+    pg_temp.account ('p77-o-chain') ->> 'outcome',
+    'incomplete',
+    'a second evaluation stays incomplete'
+  );
+
+select
+  ok (
+    (
+      select
+        latest.receipt_kind = 'evaluation'
+        and latest.retired_application_id is null
+        and latest.disposition = 'incomplete'
+        and prior.disposition = 'incomplete'
+        and prior.retired_application_id is not null
+        and retired.shift_id = 'p77-chain-a'
+      from
+        app.order_cost_state state
+        join app.order_cost_applications latest on latest.id = state.latest_application_id
+        join app.order_cost_applications prior on prior.id = latest.predecessor_id
+        join app.order_cost_applications retired on retired.id = prior.retired_application_id
+      where
+        state.order_id = 'p77-o-chain'
+    ),
+    'the second incomplete receipt retires nothing and its predecessor retired shift A'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.order_settlement_shifts ('p77-o-chain') settled
+      where
+        settled.shift_id = 'p77-chain-a'
+    ),
+    'settlement attribution still names shift A after the second incomplete evaluation'
+  );
+
+select
+  diag (pg_temp.one_causes ('p77-chain-a')::text);
+
+select
+  ok (
+    pg_temp.one_causes ('p77-chain-a') @> array['incomplete_application']::text[],
+    'shift A stays blocked while the moved order is still incomplete'
+  );
+
+select
+  is (
+    pg_temp.one ('p77-chain-a') ->> 'status_label',
+    'ناقص',
+    'the unresolved transition keeps shift A unclosed'
+  );
+
+update app.pos_order_lines
+set
+  item_id = 'pos-chain'
+where
+  order_id = 'p77-o-chain';
+
+update app.pos_orders
+set
+  version = version + 1,
+  pos_update_time = '2026-09-26 16:00+00',
+  content_hash = repeat('dd', 32)
+where
+  id = 'p77-o-chain';
+
+select
+  app.capture_pos_order_snapshot ('p77-o-chain', null, 'sync');
+
+select
+  app.append_pos_cost_input ('p77-o-chain', null, 'sync');
+
+select
+  is (
+    pg_temp.account ('p77-o-chain') ->> 'outcome',
+    'applied',
+    'restoring the mapping settles the order on shift B'
+  );
+
+select
+  ok (
+    not exists (
+      select
+        1
+      from
+        app.order_settlement_shifts ('p77-o-chain') settled
+      where
+        settled.shift_id = 'p77-chain-a'
+    ),
+    'settlement drops shift A once the order is no longer incomplete'
+  );
+
+select
+  diag (pg_temp.one_causes ('p77-chain-a')::text);
+
+select
+  is (
+    pg_temp.one ('p77-chain-a') ->> 'status_label',
+    'مقفول نهائي',
+    'shift A can close finally once the transition is settled'
+  );
+
 -- Finding 1. The backfill clock stays honest, and a shift that opened earlier is blocked.
 do $$
 begin
@@ -5577,9 +5842,171 @@ select
 from
   weekly;
 
--- One application receipt per annual shift, with a retirement batch and a
--- replacement batch, and a waste-document correction each week. Both batch
--- columns are revised so the status page joins through the receipt map.
+-- Opening before the fixture period, then 100 completed mapped orders a day
+-- for 365 shifts. Each order has a line, a cost input, and an application
+-- receipt with a retirement batch and a replacement batch. A waste-document
+-- correction still lands each week. Both batch columns are revised so the
+-- status page joins through the receipt map.
+insert into
+  app.opening_stocks (id, request_id, occurred_at)
+values
+  (
+    pg_temp.u (72),
+    pg_temp.u (73),
+    '2024-01-01 00:00+00'
+  );
+
+select
+  app.set_pos_option_policy (
+    md5('opt|p77-year-pos')::uuid,
+    'p77-year-pos',
+    '["none"]'::jsonb,
+    '2024-01-01 00:00+00',
+    null,
+    'none_expected',
+    (
+      select
+        app.pos_base_schedule ('p77-year-pos', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  app.set_base_packaging (
+    md5('bpk|p77-year-pos')::uuid,
+    'p77-year-pos',
+    '["none"]'::jsonb,
+    '2024-01-01 00:00+00',
+    null,
+    '{"none": true}'::jsonb,
+    (
+      select
+        app.packaging_base_schedule ('p77-year-pos', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  app.set_pos_base_mapping (
+    md5('map|p77-year-pos|2024')::uuid,
+    'p77-year-pos',
+    '["none"]'::jsonb,
+    '2024-01-01 00:00+00',
+    null,
+    pg_catalog.jsonb_build_object (
+      'stock_item_id',
+      pg_temp.u (6),
+      'quantity_per_basis',
+      '1',
+      'unit',
+      'kg'
+    ),
+    (
+      select
+        app.pos_base_schedule ('p77-year-pos', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  app.set_item_loss (
+    md5('loss|p77-u6')::uuid,
+    pg_temp.u (6),
+    0,
+    '2024-01-01 00:00+00',
+    null,
+    (
+      select
+        app.schedule_token ('loss', pg_temp.u (6), null)
+    ),
+    'fixture'
+  );
+
+select
+  app.set_order_type_packaging (
+    md5('ot|hall|p77-year')::uuid,
+    'hall',
+    '2024-01-01 00:00+00',
+    '2026-01-01 00:00+00',
+    '{"none": true}'::jsonb,
+    (
+      select
+        app.packaging_order_type_schedule ('hall') ->> 'token'
+    ),
+    'fixture'
+  );
+
+update app.accounting_rederive_spans
+set
+  completed_at = pg_catalog.clock_timestamp ()
+where
+  completed_at is null;
+
+create temp table p77_year_orders as
+select
+  'p77-y-o-' || pg_catalog.to_char (shift.opened_at, 'YYYYMMDD') || '-' || pg_catalog.lpad (n::text, 3, '0') as order_id,
+  shift.id as shift_id,
+  shift.opened_at + (n * interval '1 minute') as ordered_at
+from
+  app.pos_shifts shift
+  cross join pg_catalog.generate_series (1, 100) as n (n)
+where
+  shift.id like 'p77-y-%';
+
+insert into
+  app.pos_orders (
+    id,
+    shift_id,
+    status,
+    order_type,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash
+  )
+select
+  year_order.order_id,
+  year_order.shift_id,
+  'complete',
+  'hall',
+  year_order.ordered_at,
+  25,
+  0,
+  0,
+  0,
+  0,
+  25,
+  year_order.ordered_at,
+  repeat('ab', 32)
+from
+  p77_year_orders year_order;
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    options,
+    line_total
+  )
+select
+  year_order.order_id,
+  'l1',
+  'p77-year-pos',
+  'x',
+  1,
+  '[]'::jsonb,
+  25
+from
+  p77_year_orders year_order;
+
 insert into
   app.pos_order_snapshots (
     order_id,
@@ -5600,26 +6027,24 @@ insert into
     captured_at
   )
 select
-  'p77-y-o-' || pg_catalog.to_char (shift.opened_at, 'YYYYMMDD'),
+  year_order.order_id,
   1,
-  shift.id,
-  'canceled',
-  shift.opened_at,
+  year_order.shift_id,
+  'complete',
+  year_order.ordered_at,
+  25,
   0,
   0,
   0,
   0,
-  0,
-  0,
-  shift.opened_at,
+  25,
+  year_order.ordered_at,
   repeat('ab', 32),
   '[]'::jsonb,
   'sync',
-  shift.opened_at
+  year_order.ordered_at
 from
-  app.pos_shifts shift
-where
-  shift.id like 'p77-y-%';
+  p77_year_orders year_order;
 
 insert into
   app.pos_cost_inputs (
@@ -5911,29 +6336,125 @@ select
   ok (
     (
       select
+        min(opening.occurred_at)
+      from
+        app.opening_stocks opening
+    ) < (
+      select
+        min(shift.opened_at)
+      from
+        app.pos_shifts shift
+      where
+        shift.id like 'p77-y-%'
+    ),
+    'an opening exists before the annual fixture period'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.pos_orders orders
+      where
+        orders.id like 'p77-y-o-%'
+        and orders.status = 'complete'
+        and not orders.missing_from_pos
+    ),
+    36500::bigint,
+    'the annual fixture posts 100 completed orders on each of 365 shifts'
+  );
+
+select
+  is (
+    (
+      select
+        min(counted.orders)
+      from
+        (
+          select
+            count(*) as orders
+          from
+            app.pos_orders orders
+          where
+            orders.id like 'p77-y-o-%'
+            and orders.status = 'complete'
+          group by
+            orders.shift_id
+        ) counted
+    ),
+    100::bigint,
+    'every annual shift has at least 100 completed orders'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.pos_order_lines line
+      where
+        line.order_id like 'p77-y-o-%'
+        and line.item_id = 'p77-year-pos'
+        and line.quantity > 0
+    ),
+    36500::bigint,
+    'every annual order has one mapped line'
+  );
+
+select
+  is (
+    (
+      select
         count(*)
       from
         app.order_cost_applications application
       where
         application.order_id like 'p77-y-o-%'
-    ) >= 365,
-    'the annual fixture posts a receipt on every shift'
+    ),
+    36500::bigint,
+    'application volume matches the completed orders'
   );
+
+analyze app.order_cost_applications;
+
+analyze app.period_revisions;
 
 select
   ok (
     (
+      with
+        batches as materialized (
+          select
+            application.retire_batch as batch_id
+          from
+            app.order_cost_applications application
+          where
+            application.order_id like 'p77-y-o-%'
+            and application.retire_batch is not null
+          union
+          select
+            application.posting_batch
+          from
+            app.order_cost_applications application
+          where
+            application.order_id like 'p77-y-o-%'
+            and application.posting_batch is not null
+        )
       select
         count(*)
       from
         app.period_revisions revision
-        join app.order_cost_applications application on revision.cause_batch_id in (
-          application.retire_batch,
-          application.posting_batch
-        )
       where
-        application.order_id like 'p77-y-o-%'
-    ) >= 730,
+        revision.cause_batch_id in (
+          select
+            batches.batch_id
+          from
+            batches
+        )
+    ) >= 73000,
     'the annual fixture revises both batches of each receipt'
   );
 
@@ -5951,21 +6472,90 @@ select
     'the annual fixture includes a waste correction each week'
   );
 
-create temp table p77_bench (ms numeric);
+analyze app.pos_orders;
+
+analyze app.pos_order_lines;
+
+analyze app.pos_order_snapshots;
+
+analyze app.pos_cost_inputs;
+
+analyze app.order_cost_applications;
+
+analyze app.stock_movements;
+
+analyze app.period_revisions;
+
+analyze app.accounting_work_events;
+
+analyze app.waste_documents;
+
+analyze app.sales_revision_facts;
+
+create temp table p77_bench (
+  ms numeric,
+  rows integer,
+  first_shift text,
+  orders_denom text,
+  orders_covered text,
+  lines_denom text,
+  lines_covered text
+);
 
 do $$
 declare
   v_start timestamptz;
   v_ms numeric;
   v_rows integer;
+  v_shift text;
+  v_orders_denom text;
+  v_orders_covered text;
+  v_lines_denom text;
+  v_lines_covered text;
 begin
   v_start := pg_catalog.clock_timestamp ();
 
   select
-    count(*)
-  into v_rows
+    count(*),
+    (pg_catalog.array_agg(
+      row ->> 'shift_id'
+      order by
+        row ->> 'opened_at',
+        row ->> 'shift_id'
+    ))[1],
+    (pg_catalog.array_agg(
+      row ->> 'completed_orders_denominator'
+      order by
+        row ->> 'opened_at',
+        row ->> 'shift_id'
+    ))[1],
+    (pg_catalog.array_agg(
+      row ->> 'completed_orders_covered'
+      order by
+        row ->> 'opened_at',
+        row ->> 'shift_id'
+    ))[1],
+    (pg_catalog.array_agg(
+      row ->> 'completed_lines_denominator'
+      order by
+        row ->> 'opened_at',
+        row ->> 'shift_id'
+    ))[1],
+    (pg_catalog.array_agg(
+      row ->> 'completed_lines_covered'
+      order by
+        row ->> 'opened_at',
+        row ->> 'shift_id'
+    ))[1]
+  into
+    v_rows,
+    v_shift,
+    v_orders_denom,
+    v_orders_covered,
+    v_lines_denom,
+    v_lines_covered
   from
-    app.list_shift_accounting_status (null, null, 50);
+    app.list_shift_accounting_status (null, null, 50) row;
 
   v_ms := 1000 * pg_catalog.date_part(
     'epoch',
@@ -5973,18 +6563,103 @@ begin
   );
 
   insert into
-    p77_bench (ms)
+    p77_bench (
+      ms,
+      rows,
+      first_shift,
+      orders_denom,
+      orders_covered,
+      lines_denom,
+      lines_covered
+    )
   values
-    (v_ms);
+    (
+      v_ms,
+      v_rows,
+      v_shift,
+      v_orders_denom,
+      v_orders_covered,
+      v_lines_denom,
+      v_lines_covered
+    );
 
-  raise notice 'annual shift status page: % ms (budget 2000), rows %', pg_catalog.round(v_ms, 1), v_rows;
+  raise notice 'annual shift status page: % ms (budget 2000), rows %, shift %, orders %/%, lines %/%',
+    pg_catalog.round(v_ms, 1),
+    v_rows,
+    v_shift,
+    v_orders_covered,
+    v_orders_denom,
+    v_lines_covered,
+    v_lines_denom;
 end;
 $$;
 
 select
-  diag ('annual shift status page ms: ' || ms::text)
+  diag (
+    'annual shift status page ms: ' || ms::text || ', shift ' || first_shift || ', orders ' || orders_covered || '/' || orders_denom || ', lines ' || lines_covered || '/' || lines_denom
+  )
 from
   p77_bench;
+
+select
+  is (
+    (
+      select
+        first_shift
+      from
+        p77_bench
+    ),
+    'p77-y-20240102',
+    'the timed page starts on the first annual shift'
+  );
+
+select
+  is (
+    (
+      select
+        orders_denom
+      from
+        p77_bench
+    ),
+    '100',
+    'the timed shift counts its 100 completed orders'
+  );
+
+select
+  is (
+    (
+      select
+        lines_denom
+      from
+        p77_bench
+    ),
+    '100',
+    'the timed shift counts one line on each completed order'
+  );
+
+select
+  is (
+    (
+      select
+        lines_covered
+      from
+        p77_bench
+    ),
+    '100',
+    'the mapped lines are resolved on the timed shift'
+  );
+
+select
+  is (
+    (
+      select
+        orders_covered
+      from
+        p77_bench
+    ),
+    '100',
+    'the mapped orders are resolved on the timed shift'
+  );
 
 select
   ok (
@@ -5994,7 +6669,7 @@ select
       from
         p77_bench
     ),
-    'annual status page of 50 shifts over a year of counts finishes within 2000 ms'
+    'annual status page of 50 shifts over a year of orders finishes within 2000 ms'
   );
 
 select

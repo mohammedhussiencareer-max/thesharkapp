@@ -1146,8 +1146,8 @@ from
 comment on view app.accounting_revision_differences is 'One cause on one shift: its own net sales, COGS, waste, count and profit differences, and the cumulative differences of that shift through this cause. Money is decimal text. captured_at orders the rows, then cause_sort for a numeric source id, then cause kind and id. cause_sort is null for a ledger batch uuid. source_at is the economic time and is not the order. recorded_at is materialization time and does not order the rows. A retirement batch and its replacement batch that share one application receipt are one application cause, so a reclass from COGS to waste is one zero-profit vector. A manual waste correction is one waste_document cause for the same reason. The receipt map is built once per query from indexed batch columns. A zero profit difference is still a row. Sorting transfers are absent. Cost adjustments use the economic target''s bucket. Ledger amounts come from stock_movements.total_cost, not from period_revisions.amount. security_invoker so owner RLS applies.';
 
 -- Shifts that still own an order's unsettled work: the latest cost-input
--- snapshot, the live application's pinned shift, and, when the latest
--- receipt is incomplete, the shift of the application it retired.
+-- snapshot, the live application's pinned shift, and, while the latest
+-- receipts stay incomplete, the shift of the application that chain retired.
 create function app.order_settlement_shifts (p_order_id text) returns table (shift_id text) language sql stable
 set
   search_path = '' as $$
@@ -1177,22 +1177,111 @@ set
   )
   union
   (
+    -- A later evaluation that stays incomplete has a null
+    -- retired_application_id and no movement owner. Walk predecessor_id
+    -- through that consecutive incomplete chain until the receipt that
+    -- retired the previous application. Settlement (a latest receipt that
+    -- is no longer incomplete) drops this arm.
+    with recursive
+      incomplete_chain as (
+        select
+          latest.id,
+          latest.predecessor_id,
+          latest.retired_application_id,
+          array[latest.id]::bigint[] as seen
+        from
+          app.order_cost_state state
+          join app.order_cost_applications latest on latest.id = state.latest_application_id
+        where
+          state.order_id = p_order_id
+          and latest.disposition = 'incomplete'
+        union all
+        select
+          earlier.id,
+          earlier.predecessor_id,
+          earlier.retired_application_id,
+          chain.seen || earlier.id
+        from
+          incomplete_chain chain
+          join app.order_cost_applications earlier on earlier.id = chain.predecessor_id
+        where
+          chain.retired_application_id is null
+          and earlier.disposition = 'incomplete'
+          and earlier.id <> all (chain.seen)
+      )
     select
       retired.shift_id
     from
-      app.order_cost_state state
-      join app.order_cost_applications latest on latest.id = state.latest_application_id
-      join app.order_cost_applications retired on retired.id = latest.retired_application_id
+      incomplete_chain chain
+      join app.order_cost_applications retired on retired.id = chain.retired_application_id
     where
-      state.order_id = p_order_id
-      and latest.disposition = 'incomplete'
-      and retired.shift_id is not null
+      retired.shift_id is not null
   );
 $$;
 
-comment on function app.order_settlement_shifts (text) is 'Shifts that still carry one order''s unsettled accounting: the latest cost-input snapshot shift, the live owner application shift, and the retired application shift when the latest receipt is incomplete. Does not follow a mutable pos_orders.shift_id on its own. Private.';
+comment on function app.order_settlement_shifts (text) is 'Shifts that still carry one order''s unsettled accounting: the latest cost-input snapshot shift, the live owner application shift, and the shift of the application retired by a consecutive run of incomplete receipts. A later incomplete evaluation with a null retired_application_id keeps that shift through predecessor_id until a receipt settles the order. Does not follow a mutable pos_orders.shift_id on its own. Private.';
 
 revoke all on function app.order_settlement_shifts (text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+-- One order's coverage counters. Parallel safe so a page aggregate can gather
+-- workers: a call costs far more than a comparison, which is what the planner
+-- uses to decide. An error while resolving leaves the order unready and
+-- covers none of its lines. Private.
+create function app.order_coverage_counts (p_order_id text) returns table (
+  ready integer,
+  lines_denom integer,
+  lines_covered integer
+) language plpgsql stable parallel safe cost 100000
+set
+  search_path = '' as $$
+declare
+  v_resolved jsonb;
+begin
+  begin
+    v_resolved := app.resolve_order_requirements (p_order_id, null);
+  exception
+    when others then
+      v_resolved := pg_catalog.jsonb_build_object('status', 'incomplete');
+  end;
+
+  return query
+  select
+    case
+      when v_resolved ->> 'status' = 'ready' then 1
+      else 0
+    end,
+    count(*)::integer,
+    count(*) filter (
+      where
+        exists (
+          select
+            1
+          from
+            pg_catalog.jsonb_array_elements(coalesce(v_resolved -> 'lines', '[]'::jsonb)) elem
+          where
+            elem.value ->> 'line_id' = line.line_id
+            and elem.value ->> 'status' in ('ready', 'exception')
+        )
+    )::integer
+  from
+    app.pos_order_lines line
+  where
+    line.order_id = p_order_id
+    and (
+      line.quantity > 0
+      or line.weighted_qty > 0
+    );
+end;
+$$;
+
+comment on function app.order_coverage_counts (text) is 'Private. ready is 1 when resolve_order_requirements reports the order ready. lines_denom counts positive lines. lines_covered counts those lines whose own status is ready or exception. A resolver error counts as not ready and covers no lines.';
+
+revoke all on function app.order_coverage_counts (text)
 from
   public,
   anon,
@@ -1204,7 +1293,8 @@ from
 -- Owner only. Keyset by (opened_at, id). Quantities and money are decimal text.
 -- Completed-order coverage counts only complete, present orders at or after
 -- the first opening. With no opening the denominator is zero: those orders
--- stay sales-only and are not an incomplete-mapping blocker.
+-- stay sales-only and are not an incomplete-mapping blocker. The page's
+-- orders are resolved once per call.
 -- ============================================================================
 create function app.list_shift_accounting_status (
   p_after_opened_at timestamptz default null,
@@ -1246,9 +1336,6 @@ declare
   v_incomplete integer;
   v_incomplete_codes text[];
   v_extra text[];
-  v_order record;
-  v_resolved jsonb;
-  v_line_count integer;
   v_expenses boolean;
   v_month date;
   v_causes text[];
@@ -1257,6 +1344,27 @@ declare
   v_latest jsonb;
   v_cumulative jsonb;
   v_history jsonb;
+  v_page_ids text[];
+  v_page_revisions jsonb;
+  v_order_coverage jsonb;
+  v_saved_parallel_table text;
+  v_saved_parallel_index text;
+  v_saved_parallel_gather text;
+  v_saved_parallel_setup text;
+  v_saved_parallel_tuple text;
+  v_sync_by_shift jsonb;
+  v_open_by_shift jsonb;
+  v_pending_by_shift jsonb;
+  v_blocked_by_shift jsonb;
+  v_stale_by_shift jsonb;
+  v_incomplete_by_shift jsonb;
+  v_tracking_by_shift jsonb;
+  v_unreviewed_by_shift jsonb;
+  v_preparation_by_shift jsonb;
+  v_refunds_by_shift jsonb;
+  v_deficit_by_shift jsonb;
+  v_missing_by_shift jsonb;
+  v_expenses_by_month jsonb;
   v_daily jsonb;
   v_weekly jsonb;
   v_zero jsonb := pg_catalog.jsonb_build_object(
@@ -1302,8 +1410,38 @@ begin
   from
     app.opening_stocks opening;
 
-  -- One read of the coverage view for this page. The view already computes
-  -- previous anchors once and the scope proof once per count.
+  select
+    coalesce(
+      pg_catalog.array_agg(
+        page.id
+        order by
+          page.opened_at,
+          page.id
+      ),
+      '{}'::text[]
+    )
+  into v_page_ids
+  from
+    (
+      select
+        shift.id,
+        shift.opened_at
+      from
+        app.pos_shifts shift
+      where
+        p_after_opened_at is null
+        or (shift.opened_at, shift.id) > (p_after_opened_at, p_after_id)
+      order by
+        shift.opened_at,
+        shift.id
+      limit
+        v_limit
+    ) page;
+
+  -- Same rows as shift_count_coverage for this page. The view proves every
+  -- count in the database before the shift filter applies, so a year of
+  -- orders makes each proof scan the order table. Anchors are lagged once,
+  -- and the scope proof runs only for a count that covers a shift on the page.
   select
     coalesce(
       pg_catalog.jsonb_object_agg(page.shift_id, page.payload),
@@ -1401,25 +1539,966 @@ begin
           )
         ) as payload
       from
-        app.shift_count_coverage coverage
-      where
-        coverage.shift_id in (
+        (
+          with
+            anchors as materialized (
+              select
+                anchor.count_id,
+                anchor.line_no,
+                anchor.item_id,
+                anchor.counted_at,
+                anchor.shift_id as owning_shift_id,
+                counted.frequency,
+                lag(anchor.counted_at) over (
+                  partition by
+                    anchor.item_id,
+                    counted.frequency
+                  order by
+                    anchor.counted_at,
+                    anchor.count_id,
+                    anchor.line_no
+                ) as interval_start
+              from
+                app.stock_count_anchors anchor
+                join app.stock_counts counted on counted.id = anchor.count_id
+            ),
+            roster as (
+              select
+                shift.id as shift_id,
+                shift.opened_at,
+                hist.item_id,
+                hist.count_frequency,
+                hist.known_since
+              from
+                app.pos_shifts shift
+                join lateral (
+                  select distinct
+                    on (row.item_id) row.item_id,
+                    row.count_frequency,
+                    row.known_since,
+                    row.active
+                  from
+                    app.item_tracking_history row
+                  where
+                    row.known_since <= shift.opened_at
+                  order by
+                    row.item_id,
+                    row.known_since desc,
+                    row.id desc
+                ) hist on hist.active
+              where
+                shift.id = any (v_page_ids)
+            ),
+            chosen as materialized (
+              select
+                roster.shift_id,
+                roster.item_id,
+                roster.count_frequency,
+                roster.known_since,
+                cover.count_id,
+                cover.counted_at,
+                cover.interval_start,
+                cover.owning_shift_id
+              from
+                roster
+                left join lateral (
+                  select
+                    anchor.count_id,
+                    anchor.counted_at,
+                    anchor.interval_start,
+                    anchor.owning_shift_id
+                  from
+                    anchors anchor
+                  where
+                    anchor.item_id = roster.item_id
+                    and anchor.frequency = roster.count_frequency
+                    and (
+                      (
+                        roster.count_frequency = 'daily'
+                        and anchor.owning_shift_id = roster.shift_id
+                      )
+                      or (
+                        roster.count_frequency = 'weekly'
+                        and roster.opened_at > coalesce(
+                          anchor.interval_start,
+                          '-infinity'::timestamptz
+                        )
+                        and roster.opened_at <= anchor.counted_at
+                      )
+                    )
+                  order by
+                    anchor.counted_at desc,
+                    anchor.count_id desc,
+                    anchor.line_no desc
+                  limit
+                    1
+                ) cover on true
+            ),
+            scope as materialized (
+              select
+                times.counted_at,
+                app.count_sync_scope_covered (times.counted_at) as sync_scope_covered,
+                (
+                  select
+                    shift.id
+                  from
+                    app.pos_shifts shift
+                  where
+                    shift.opened_at <= times.counted_at
+                  order by
+                    shift.opened_at desc,
+                    shift.id desc
+                  limit
+                    1
+                ) as interval_owning_shift_id
+              from
+                (
+                  select distinct
+                    chosen.counted_at
+                  from
+                    chosen
+                  where
+                    chosen.count_id is not null
+                ) times
+            )
           select
-            shift.id
+            chosen.shift_id,
+            chosen.item_id,
+            chosen.count_frequency,
+            chosen.known_since,
+            chosen.count_id as anchor_count_id,
+            chosen.counted_at as anchor_counted_at,
+            chosen.interval_start,
+            chosen.counted_at as interval_end,
+            chosen.owning_shift_id,
+            scope.interval_owning_shift_id,
+            scope.sync_scope_covered,
+            (chosen.count_id is not null) as covered
           from
-            app.pos_shifts shift
-          where
-            p_after_opened_at is null
-            or (shift.opened_at, shift.id) > (p_after_opened_at, p_after_id)
-          order by
-            shift.opened_at,
-            shift.id
-          limit
-            v_limit
-        )
+            chosen
+            left join scope on scope.counted_at = chosen.counted_at
+        ) coverage
       group by
         coverage.shift_id
     ) page;
+
+  -- One read of this page's revision rows. The difference view builds a
+  -- receipt map for every batch before its shift filter can apply, so this
+  -- copy keeps the same cause shape and only the shifts on the page.
+  select
+    coalesce(
+      pg_catalog.jsonb_object_agg(grouped.shift_id, grouped.history),
+      '{}'::jsonb
+    )
+  into v_page_revisions
+  from
+    (
+      select
+        diff.shift_id,
+        pg_catalog.jsonb_agg(
+          pg_catalog.jsonb_build_object(
+            'cause_kind',
+            diff.cause_kind,
+            'cause_id',
+            diff.cause_id,
+            'cause_sort',
+            diff.cause_sort::text,
+            'captured_at',
+            app.costing_timestamptz_text (diff.captured_at),
+            'source_at',
+            app.costing_timestamptz_text (diff.source_at),
+            'recorded_at',
+            app.costing_timestamptz_text (diff.recorded_at),
+            'is_latest',
+            diff.is_latest,
+            'net_sales_difference',
+            diff.net_sales_difference,
+            'cogs_difference',
+            diff.cogs_difference,
+            'waste_difference',
+            diff.waste_difference,
+            'count_difference',
+            diff.count_difference,
+            'profit_difference',
+            diff.profit_difference,
+            'cumulative_net_sales_difference',
+            diff.cumulative_net_sales_difference,
+            'cumulative_cogs_difference',
+            diff.cumulative_cogs_difference,
+            'cumulative_waste_difference',
+            diff.cumulative_waste_difference,
+            'cumulative_count_difference',
+            diff.cumulative_count_difference,
+            'cumulative_profit_difference',
+            diff.cumulative_profit_difference
+          )
+          order by
+            diff.captured_at,
+            diff.cause_sort nulls last,
+            diff.cause_kind,
+            diff.cause_id
+        ) as history
+      from
+        (
+          with
+            page_batches as (
+              select distinct
+                revision.cause_batch_id as batch_id
+              from
+                app.period_revisions revision
+              where
+                revision.shift_id = any (v_page_ids)
+            ),
+            receipts as materialized (
+              select distinct
+                on (mapped.batch_id) mapped.batch_id,
+                mapped.cause_kind,
+                mapped.cause_id,
+                mapped.cause_sort,
+                mapped.captured_at,
+                mapped.economic_at
+              from
+                (
+                  select
+                    application.retire_batch as batch_id,
+                    'application'::text as cause_kind,
+                    application.id::text as cause_id,
+                    application.id as cause_sort,
+                    application.created_at as captured_at,
+                    application.occurred_at as economic_at,
+                    0 as preference
+                  from
+                    app.order_cost_applications application
+                  where
+                    application.retire_batch in (
+                      select
+                        page_batches.batch_id
+                      from
+                        page_batches
+                    )
+                  union all
+                  select
+                    application.posting_batch,
+                    'application'::text,
+                    application.id::text,
+                    application.id,
+                    application.created_at,
+                    application.occurred_at,
+                    0
+                  from
+                    app.order_cost_applications application
+                  where
+                    application.posting_batch in (
+                      select
+                        page_batches.batch_id
+                      from
+                        page_batches
+                    )
+                  union all
+                  select
+                    document.retire_batch_id,
+                    'waste_document'::text,
+                    document.id::text,
+                    document.id,
+                    document.created_at,
+                    document.occurred_at,
+                    1
+                  from
+                    app.waste_documents document
+                  where
+                    document.retire_batch_id in (
+                      select
+                        page_batches.batch_id
+                      from
+                        page_batches
+                    )
+                  union all
+                  select
+                    document.batch_id,
+                    'waste_document'::text,
+                    document.id::text,
+                    document.id,
+                    document.created_at,
+                    document.occurred_at,
+                    1
+                  from
+                    app.waste_documents document
+                  where
+                    document.batch_id in (
+                      select
+                        page_batches.batch_id
+                      from
+                        page_batches
+                    )
+                ) mapped
+              order by
+                mapped.batch_id,
+                mapped.preference,
+                mapped.cause_sort
+            ),
+            ledger as (
+              select
+                coalesce(receipt.cause_kind, 'ledger') as cause_kind,
+                coalesce(receipt.cause_id, revision.cause_batch_id::text) as cause_id,
+                receipt.cause_sort,
+                revision.shift_id,
+                min(coalesce(receipt.captured_at, revision.created_at)) as captured_at,
+                min(coalesce(receipt.economic_at, movement.occurred_at)) as source_at,
+                min(revision.created_at) as recorded_at,
+                0::numeric(14, 2) as net_sales_difference,
+                coalesce(
+                  - sum(movement.total_cost) filter (
+                    where
+                      bucket.bucket = 'cogs'
+                  ),
+                  0
+                )::numeric(14, 2) as cogs_difference,
+                coalesce(
+                  - sum(movement.total_cost) filter (
+                    where
+                      bucket.bucket = 'waste'
+                  ),
+                  0
+                )::numeric(14, 2) as waste_difference,
+                coalesce(
+                  - sum(movement.total_cost) filter (
+                    where
+                      bucket.bucket = 'count'
+                  ),
+                  0
+                )::numeric(14, 2) as count_difference
+              from
+                app.period_revisions revision
+                join app.stock_movements movement on movement.id = revision.source_movement_id
+                left join app.stock_movements target on target.id = movement.adjusts_movement_id
+                cross join lateral (
+                  select
+                    case
+                      when movement.movement_type = 'cost_adjustment'::app.movement_type then case target.movement_type
+                        when 'sale'::app.movement_type then 'cogs'
+                        when 'sale_reversal'::app.movement_type then 'cogs'
+                        when 'waste'::app.movement_type then 'waste'
+                        when 'waste_reversal'::app.movement_type then 'waste'
+                        when 'sort_loss'::app.movement_type then 'waste'
+                        when 'count_adjustment'::app.movement_type then 'count'
+                        when 'count_compensation'::app.movement_type then 'count'
+                        else null
+                      end
+                      when movement.movement_type = 'sale'::app.movement_type then 'cogs'
+                      when movement.movement_type = 'sale_reversal'::app.movement_type then 'cogs'
+                      when movement.movement_type = 'waste'::app.movement_type then 'waste'
+                      when movement.movement_type = 'waste_reversal'::app.movement_type then 'waste'
+                      when movement.movement_type = 'sort_loss'::app.movement_type then 'waste'
+                      when movement.movement_type = 'count_adjustment'::app.movement_type then 'count'
+                      when movement.movement_type = 'count_compensation'::app.movement_type then 'count'
+                      else null
+                    end as bucket
+                ) bucket
+                left join receipts receipt on receipt.batch_id = revision.cause_batch_id
+              where
+                revision.shift_id = any (v_page_ids)
+              group by
+                1,
+                2,
+                3,
+                revision.shift_id
+              having
+                count(*) filter (
+                  where
+                    bucket.bucket in ('cogs', 'waste', 'count')
+                ) > 0
+            ),
+            events as (
+              select
+                ledger.cause_kind,
+                ledger.cause_id,
+                ledger.cause_sort,
+                ledger.shift_id,
+                ledger.captured_at,
+                ledger.source_at,
+                ledger.recorded_at,
+                ledger.net_sales_difference,
+                ledger.cogs_difference,
+                ledger.waste_difference,
+                ledger.count_difference
+              from
+                ledger
+              union all
+              select
+                fact.source_kind,
+                fact.source_revision_id::text,
+                fact.source_revision_id,
+                fact.shift_id,
+                fact.captured_at,
+                fact.source_at,
+                fact.recorded_at,
+                fact.net_sales_difference,
+                0::numeric(14, 2),
+                0::numeric(14, 2),
+                0::numeric(14, 2)
+              from
+                app.sales_revision_facts fact
+              where
+                fact.shift_id = any (v_page_ids)
+            ),
+            rolled as (
+              select
+                events.cause_kind,
+                events.cause_id,
+                events.cause_sort,
+                events.shift_id,
+                events.captured_at,
+                events.source_at,
+                events.recorded_at,
+                events.net_sales_difference,
+                events.cogs_difference,
+                events.waste_difference,
+                events.count_difference,
+                (
+                  events.net_sales_difference - events.cogs_difference - events.waste_difference - events.count_difference
+                )::numeric(14, 2) as profit_difference,
+                sum(events.net_sales_difference) over shift_order as cumulative_net_sales_difference,
+                sum(events.cogs_difference) over shift_order as cumulative_cogs_difference,
+                sum(events.waste_difference) over shift_order as cumulative_waste_difference,
+                sum(events.count_difference) over shift_order as cumulative_count_difference,
+                (
+                  row_number() over (
+                    partition by
+                      events.shift_id
+                    order by
+                      events.captured_at desc,
+                      events.cause_sort desc nulls first,
+                      events.cause_kind desc,
+                      events.cause_id desc
+                  ) = 1
+                ) as is_latest
+              from
+                events
+              window
+                shift_order as (
+                  partition by
+                    events.shift_id
+                  order by
+                    events.captured_at,
+                    events.cause_sort nulls last,
+                    events.cause_kind,
+                    events.cause_id rows between unbounded preceding
+                    and current row
+                )
+            )
+          select
+            rolled.cause_kind,
+            rolled.cause_id,
+            rolled.cause_sort,
+            rolled.shift_id,
+            rolled.captured_at,
+            rolled.source_at,
+            rolled.recorded_at,
+            rolled.is_latest,
+            rolled.net_sales_difference::numeric(14, 2)::text as net_sales_difference,
+            rolled.cogs_difference::numeric(14, 2)::text as cogs_difference,
+            rolled.waste_difference::numeric(14, 2)::text as waste_difference,
+            rolled.count_difference::numeric(14, 2)::text as count_difference,
+            rolled.profit_difference::text as profit_difference,
+            rolled.cumulative_net_sales_difference::numeric(14, 2)::text as cumulative_net_sales_difference,
+            rolled.cumulative_cogs_difference::numeric(14, 2)::text as cumulative_cogs_difference,
+            rolled.cumulative_waste_difference::numeric(14, 2)::text as cumulative_waste_difference,
+            rolled.cumulative_count_difference::numeric(14, 2)::text as cumulative_count_difference,
+            (
+              rolled.cumulative_net_sales_difference - rolled.cumulative_cogs_difference - rolled.cumulative_waste_difference - rolled.cumulative_count_difference
+            )::numeric(14, 2)::text as cumulative_profit_difference
+          from
+            rolled
+        ) diff
+      group by
+        diff.shift_id
+    ) grouped;
+
+  -- SELECT INTO asks for one row and will not run a parallel plan. EXECUTE
+  -- fetches the whole aggregate, so the resolver can run on the workers.
+  -- The thresholds are restored before the shift loop and on failure.
+  v_saved_parallel_table := pg_catalog.current_setting ('min_parallel_table_scan_size');
+  v_saved_parallel_index := pg_catalog.current_setting ('min_parallel_index_scan_size');
+  v_saved_parallel_gather := pg_catalog.current_setting ('max_parallel_workers_per_gather');
+  v_saved_parallel_setup := pg_catalog.current_setting ('parallel_setup_cost');
+  v_saved_parallel_tuple := pg_catalog.current_setting ('parallel_tuple_cost');
+
+  begin
+    perform pg_catalog.set_config ('min_parallel_table_scan_size', '0', true);
+
+    perform pg_catalog.set_config ('min_parallel_index_scan_size', '0', true);
+
+    perform pg_catalog.set_config ('max_parallel_workers_per_gather', '8', true);
+
+    perform pg_catalog.set_config ('parallel_setup_cost', '0', true);
+
+    perform pg_catalog.set_config ('parallel_tuple_cost', '0', true);
+
+    execute $coverage$
+      select
+        coalesce(
+          pg_catalog.jsonb_object_agg(
+            hit.shift_id,
+            pg_catalog.jsonb_build_object(
+              'orders_denom',
+              hit.orders_denom,
+              'orders_covered',
+              hit.orders_covered,
+              'lines_denom',
+              hit.lines_denom,
+              'lines_covered',
+              hit.lines_covered
+            )
+          ),
+          '{}'::jsonb
+        )
+      from
+        (
+          select
+            o.shift_id,
+            count(*) as orders_denom,
+            coalesce(sum(c.ready), 0) as orders_covered,
+            coalesce(sum(c.lines_denom), 0) as lines_denom,
+            coalesce(sum(c.lines_covered), 0) as lines_covered
+          from
+            app.pos_orders o
+            cross join lateral app.order_coverage_counts (o.id) c
+          where
+            o.shift_id = any ($1)
+            and $2::timestamptz is not null
+            and o.ordered_at >= $2
+            and o.status = 'complete'
+            and not o.missing_from_pos
+          group by
+            o.shift_id
+        ) hit
+    $coverage$
+    using
+      v_page_ids,
+      v_opening
+    into
+      v_order_coverage;
+
+    perform pg_catalog.set_config ('min_parallel_table_scan_size', v_saved_parallel_table, true);
+
+    perform pg_catalog.set_config ('min_parallel_index_scan_size', v_saved_parallel_index, true);
+
+    perform pg_catalog.set_config ('max_parallel_workers_per_gather', v_saved_parallel_gather, true);
+
+    perform pg_catalog.set_config ('parallel_setup_cost', v_saved_parallel_setup, true);
+
+    perform pg_catalog.set_config ('parallel_tuple_cost', v_saved_parallel_tuple, true);
+  exception
+    when others then
+      perform pg_catalog.set_config ('min_parallel_table_scan_size', v_saved_parallel_table, true);
+
+      perform pg_catalog.set_config ('min_parallel_index_scan_size', v_saved_parallel_index, true);
+
+      perform pg_catalog.set_config ('max_parallel_workers_per_gather', v_saved_parallel_gather, true);
+
+      perform pg_catalog.set_config ('parallel_setup_cost', v_saved_parallel_setup, true);
+
+      perform pg_catalog.set_config ('parallel_tuple_cost', v_saved_parallel_tuple, true);
+
+      raise;
+  end;
+
+  v_order_coverage := coalesce(v_order_coverage, '{}'::jsonb);
+
+  -- One pass over the page. The shift loop used to repeat each of these scans.
+  select
+    coalesce(
+      pg_catalog.jsonb_object_agg(
+        hit.shift_id,
+        pg_catalog.jsonb_build_object('covered', hit.covered, 'finished', hit.finished)
+      ),
+      '{}'::jsonb
+    )
+  into v_sync_by_shift
+  from
+    (
+      select
+        shift.id as shift_id,
+        coalesce(pg_catalog.bool_or(probe.covers), false) as covered,
+        max(probe.finished_at) filter (
+          where
+            probe.covers
+        ) as finished
+      from
+        app.pos_shifts shift
+        left join lateral (
+          select
+            cov.finished_at,
+            app.sync_coverage_covers_shift (
+              cov.orders_scope_applied,
+              cov.scope_kind,
+              cov.scope_from,
+              cov.scope_shift_ids,
+              cov.presented_shift_ids,
+              cov.legacy_direct,
+              shift.id,
+              shift.opened_at
+            ) as covers
+          from
+            app.pos_sync_coverage cov
+        ) probe on true
+      where
+        shift.id = any (v_page_ids)
+      group by
+        shift.id
+    ) hit;
+
+  select
+    coalesce(
+      pg_catalog.jsonb_object_agg(counted.shift_id, counted.n),
+      '{}'::jsonb
+    )
+  into v_open_by_shift
+  from
+    (
+      select
+        o.shift_id,
+        count(*) as n
+      from
+        app.pos_orders o
+      where
+        o.shift_id = any (v_page_ids)
+        and o.status = 'active'
+        and not o.missing_from_pos
+      group by
+        o.shift_id
+    ) counted;
+
+  select
+    coalesce(pg_catalog.jsonb_object_agg(hit.shift_id, hit.n), '{}'::jsonb)
+  into v_pending_by_shift
+  from
+    (
+      select
+        settled.shift_id,
+        count(distinct candidate.order_id) as n
+      from
+        (
+          select
+            event.order_id
+          from
+            app.accounting_work_events event
+          where
+            event.processed_at is null
+          union
+          select
+            snap.order_id
+          from
+            app.accounting_rederive_spans span
+            join app.pos_order_snapshots snap on snap.ordered_at >= span.effective_from
+            and (
+              span.effective_to is null
+              or snap.ordered_at < span.effective_to
+            )
+            and (
+              span.cursor_ordered_at is null
+              or (snap.ordered_at, snap.order_id) > (span.cursor_ordered_at, span.cursor_order_id)
+            )
+            and snap.id = (
+              select
+                input.snapshot_id
+              from
+                app.pos_cost_inputs input
+              where
+                input.order_id = snap.order_id
+              order by
+                input.input_revision desc
+              limit
+                1
+            )
+          where
+            span.completed_at is null
+        ) candidate
+        cross join lateral app.order_settlement_shifts (candidate.order_id) settled
+      where
+        settled.shift_id = any (v_page_ids)
+      group by
+        settled.shift_id
+    ) hit;
+
+  select
+    coalesce(pg_catalog.jsonb_object_agg(hit.shift_id, hit.n), '{}'::jsonb)
+  into v_blocked_by_shift
+  from
+    (
+      select
+        settled.shift_id,
+        count(*) as n
+      from
+        app.accounting_work_state state
+        cross join lateral app.order_settlement_shifts (state.order_id) settled
+      where
+        (
+          state.last_outcome = 'blocked'
+          or state.failed_at is not null
+        )
+        and settled.shift_id = any (v_page_ids)
+      group by
+        settled.shift_id
+    ) hit;
+
+  select
+    coalesce(pg_catalog.jsonb_object_agg(hit.shift_id, hit.n), '{}'::jsonb)
+  into v_stale_by_shift
+  from
+    (
+      select
+        settled.shift_id,
+        count(*) as n
+      from
+        app.order_cost_state state
+        join app.order_cost_applications application on application.id = state.latest_application_id
+        cross join lateral app.order_settlement_shifts (state.order_id) settled
+      where
+        state.latest_input_id is not null
+        and application.cost_input_id is distinct from state.latest_input_id
+        and settled.shift_id = any (v_page_ids)
+      group by
+        settled.shift_id
+    ) hit;
+
+  select
+    coalesce(pg_catalog.jsonb_object_agg(hit.shift_id, hit.payload), '{}'::jsonb)
+  into v_incomplete_by_shift
+  from
+    (
+      select
+        settled.shift_id,
+        pg_catalog.jsonb_build_object(
+          'n',
+          count(distinct state.order_id),
+          'codes',
+          coalesce(
+            pg_catalog.jsonb_agg(distinct cause.value ->> 'code') filter (
+              where
+                cause.value ->> 'code' is not null
+            ),
+            '[]'::jsonb
+          )
+        ) as payload
+      from
+        app.order_cost_state state
+        join app.order_cost_applications application on application.id = state.latest_application_id
+        cross join lateral app.order_settlement_shifts (state.order_id) settled
+        left join lateral pg_catalog.jsonb_array_elements(application.causes) as cause (value) on true
+      where
+        application.disposition = 'incomplete'
+        and settled.shift_id = any (v_page_ids)
+      group by
+        settled.shift_id
+    ) hit;
+
+  select
+    coalesce(pg_catalog.jsonb_object_agg(hit.shift_id, hit.n), '{}'::jsonb)
+  into v_tracking_by_shift
+  from
+    (
+      select
+        shift.id as shift_id,
+        count(*) as n
+      from
+        app.pos_shifts shift
+        join app.stock_items item on item.created_at <= shift.opened_at
+      where
+        shift.id = any (v_page_ids)
+        and exists (
+          select
+            1
+          from
+            app.item_tracking_history backfill
+          where
+            backfill.item_id = item.id
+            and backfill.basis = 'backfill'
+            and backfill.known_since > shift.opened_at
+        )
+        and not exists (
+          select
+            1
+          from
+            app.item_tracking_history earlier
+          where
+            earlier.item_id = item.id
+            and earlier.known_since <= shift.opened_at
+        )
+      group by
+        shift.id
+    ) hit;
+
+  select
+    coalesce(pg_catalog.jsonb_object_agg(hit.shift_id, hit.n), '{}'::jsonb)
+  into v_unreviewed_by_shift
+  from
+    (
+      select
+        o.shift_id,
+        count(*) as n
+      from
+        app.order_disposition_state state
+        join app.pos_orders o on o.id = state.order_id
+        left join app.order_disposition_events event on event.id = state.event_id
+      where
+        o.shift_id = any (v_page_ids)
+        and state.is_open
+        and (
+          state.review_reason is not null
+          or event.owner_reviewed is not true
+        )
+      group by
+        o.shift_id
+    ) hit;
+
+  select
+    coalesce(pg_catalog.jsonb_object_agg(hit.shift_id, hit.n), '{}'::jsonb)
+  into v_preparation_by_shift
+  from
+    (
+      select
+        o.shift_id,
+        count(*) as n
+      from
+        app.order_cost_state state
+        join app.pos_orders o on o.id = state.order_id
+      where
+        o.shift_id = any (v_page_ids)
+        and exists (
+          select
+            1
+          from
+            pg_catalog.jsonb_array_elements(state.causes) as cause (value)
+          where
+            cause.value ->> 'code' = 'missing_preparation_basis'
+        )
+      group by
+        o.shift_id
+    ) hit;
+
+  select
+    coalesce(pg_catalog.jsonb_object_agg(hit.shift_id, hit.n), '{}'::jsonb)
+  into v_refunds_by_shift
+  from
+    (
+      select
+        counted.shift_id,
+        count(*) as n
+      from
+        (
+          select
+            latest.shift_id
+          from
+            (
+              select distinct
+                on (revision.shift_id, revision.tx_id) revision.shift_id,
+                revision.present,
+                revision.tx_type,
+                revision.order_id,
+                revision.amount
+              from
+                app.pos_refund_revisions revision
+              where
+                revision.shift_id = any (v_page_ids)
+              order by
+                revision.shift_id,
+                revision.tx_id,
+                revision.id desc
+            ) latest
+          where
+            latest.present
+            and latest.tx_type = 3
+            and (
+              latest.order_id is null
+              or latest.amount < 0
+            )
+          union all
+          select
+            o.shift_id
+          from
+            app.order_disposition_state state
+            join app.pos_orders o on o.id = state.order_id
+          where
+            o.shift_id = any (v_page_ids)
+            and (
+              state.class = 'unresolved_refund'
+              or state.review_reason = 'unresolved_refund'
+            )
+        ) counted
+      group by
+        counted.shift_id
+    ) hit;
+
+  select
+    coalesce(pg_catalog.jsonb_object_agg(hit.shift_id, hit.payload), '{}'::jsonb)
+  into v_deficit_by_shift
+  from
+    (
+      select
+        coalesce(movement.shift_id, attribution.shift_id) as shift_id,
+        pg_catalog.jsonb_build_object(
+          'n',
+          count(*),
+          'qty',
+          coalesce(sum(deficit.qty_uncovered), 0)
+        ) as payload
+      from
+        app.provisional_deficits deficit
+        join app.stock_movements movement on movement.id = deficit.movement_id
+        left join app.movement_attributions attribution on attribution.movement_id = movement.id
+      where
+        deficit.qty_uncovered > 0
+        and coalesce(movement.shift_id, attribution.shift_id) = any (v_page_ids)
+      group by
+        coalesce(movement.shift_id, attribution.shift_id)
+    ) hit;
+
+  select
+    coalesce(pg_catalog.jsonb_object_agg(hit.shift_id, hit.n), '{}'::jsonb)
+  into v_missing_by_shift
+  from
+    (
+      select
+        o.shift_id,
+        count(*) as n
+      from
+        app.pos_orders o
+      where
+        o.shift_id = any (v_page_ids)
+        and (
+          exists (
+            select
+              1
+            from
+              app.order_cost_state state
+              cross join lateral pg_catalog.jsonb_array_elements(state.causes) as cause (value)
+            where
+              state.order_id = o.id
+              and cause.value ->> 'code' = 'missing_cost_basis'
+          )
+          or exists (
+            select
+              1
+            from
+              app.accounting_work_state state
+            where
+              state.order_id = o.id
+              and state.last_reason = 'missing_cost_basis'
+          )
+        )
+      group by
+        o.shift_id
+    ) hit;
+
+  select
+    coalesce(
+      pg_catalog.jsonb_object_agg(status.month::text, status.complete),
+      '{}'::jsonb
+    )
+  into v_expenses_by_month
+  from
+    app.month_expense_status status;
 
   for v_shift in
     select
@@ -1430,13 +2509,10 @@ begin
     from
       app.pos_shifts shift
     where
-      p_after_opened_at is null
-      or (shift.opened_at, shift.id) > (p_after_opened_at, p_after_id)
+      shift.id = any (v_page_ids)
     order by
       shift.opened_at,
       shift.id
-    limit
-      v_limit
   loop
     v_pack := v_coverage -> v_shift.id;
     v_daily_required := coalesce((v_pack ->> 'daily_required')::integer, 0);
@@ -1447,42 +2523,11 @@ begin
     v_daily := coalesce(v_pack -> 'daily', '[]'::jsonb);
     v_weekly := coalesce(v_pack -> 'weekly', '[]'::jsonb);
 
-    select
-      exists (
-        select
-          1
-        from
-          app.pos_sync_coverage cov
-        where
-          app.sync_coverage_covers_shift (
-            cov.orders_scope_applied,
-            cov.scope_kind,
-            cov.scope_from,
-            cov.scope_shift_ids,
-            cov.presented_shift_ids,
-            cov.legacy_direct,
-            v_shift.id,
-            v_shift.opened_at
-          )
-      ),
-      max(cov.finished_at) filter (
-        where
-          app.sync_coverage_covers_shift (
-            cov.orders_scope_applied,
-            cov.scope_kind,
-            cov.scope_from,
-            cov.scope_shift_ids,
-            cov.presented_shift_ids,
-            cov.legacy_direct,
-            v_shift.id,
-            v_shift.opened_at
-          )
-      )
-    into
-      v_scope_covered,
-      v_finished
-    from
-      app.pos_sync_coverage cov;
+    v_scope_covered := coalesce(
+      (v_sync_by_shift -> v_shift.id ->> 'covered')::boolean,
+      false
+    );
+    v_finished := (v_sync_by_shift -> v_shift.id ->> 'finished')::timestamptz;
 
     v_budget := case
       when v_shift.opened_at >= pg_catalog.now() - interval '35 days' then interval '1 day'
@@ -1492,372 +2537,46 @@ begin
     v_fresh := v_finished is not null
     and v_finished >= pg_catalog.now() - v_budget;
 
-    select
-      count(*)
-    into v_open_orders
-    from
-      app.pos_orders o
-    where
-      o.shift_id = v_shift.id
-      and o.status = 'active'
-      and not o.missing_from_pos;
+    v_open_orders := coalesce((v_open_by_shift ->> v_shift.id)::integer, 0);
+
+    v_pending := coalesce((v_pending_by_shift ->> v_shift.id)::integer, 0);
+
+    v_blocked := coalesce((v_blocked_by_shift ->> v_shift.id)::integer, 0);
+    v_stale := coalesce((v_stale_by_shift ->> v_shift.id)::integer, 0);
+    v_incomplete := coalesce((v_incomplete_by_shift -> v_shift.id ->> 'n')::integer, 0);
 
     select
-      count(distinct hit.order_id)
-    into v_pending
+      coalesce(pg_catalog.array_agg(code.value), '{}'::text[])
+    into v_incomplete_codes
     from
-      (
-        select
-          event.order_id
-        from
-          app.accounting_work_events event
-        where
-          event.processed_at is null
-          and exists (
-            select
-              1
-            from
-              app.order_settlement_shifts (event.order_id) settled
-            where
-              settled.shift_id = v_shift.id
-          )
-        union
-        select
-          snap.order_id
-        from
-          app.accounting_rederive_spans span
-          join app.pos_order_snapshots snap on snap.ordered_at >= span.effective_from
-          and (
-            span.effective_to is null
-            or snap.ordered_at < span.effective_to
-          )
-          and (
-            span.cursor_ordered_at is null
-            or (snap.ordered_at, snap.order_id) > (span.cursor_ordered_at, span.cursor_order_id)
-          )
-          and snap.id = (
-            select
-              input.snapshot_id
-            from
-              app.pos_cost_inputs input
-            where
-              input.order_id = snap.order_id
-            order by
-              input.input_revision desc
-            limit
-              1
-          )
-        where
-          span.completed_at is null
-          and exists (
-            select
-              1
-            from
-              app.order_settlement_shifts (snap.order_id) settled
-            where
-              settled.shift_id = v_shift.id
-          )
-      ) hit;
+      pg_catalog.jsonb_array_elements_text(
+        coalesce(v_incomplete_by_shift -> v_shift.id -> 'codes', '[]'::jsonb)
+      ) as code (value);
 
-    select
-      count(*)
-    into v_blocked
-    from
-      app.accounting_work_state state
-    where
-      (
-        state.last_outcome = 'blocked'
-        or state.failed_at is not null
-      )
-      and exists (
-        select
-          1
-        from
-          app.order_settlement_shifts (state.order_id) settled
-        where
-          settled.shift_id = v_shift.id
-      );
+    v_tracking := coalesce((v_tracking_by_shift ->> v_shift.id)::integer, 0);
+    v_unreviewed := coalesce((v_unreviewed_by_shift ->> v_shift.id)::integer, 0);
+    v_preparation := coalesce((v_preparation_by_shift ->> v_shift.id)::integer, 0);
+    v_refunds := coalesce((v_refunds_by_shift ->> v_shift.id)::integer, 0);
+    v_deficit_count := coalesce((v_deficit_by_shift -> v_shift.id ->> 'n')::integer, 0);
+    v_deficit_qty := coalesce((v_deficit_by_shift -> v_shift.id ->> 'qty')::numeric, 0);
+    v_missing_cost := coalesce((v_missing_by_shift ->> v_shift.id)::integer, 0);
 
-    select
-      count(*)
-    into v_stale
-    from
-      app.order_cost_state state
-      join app.order_cost_applications application on application.id = state.latest_application_id
-    where
-      state.latest_input_id is not null
-      and application.cost_input_id is distinct from state.latest_input_id
-      and exists (
-        select
-          1
-        from
-          app.order_settlement_shifts (state.order_id) settled
-        where
-          settled.shift_id = v_shift.id
-      );
-
-    select
-      count(distinct state.order_id),
-      coalesce(
-        pg_catalog.array_agg(distinct cause.value ->> 'code') filter (
-          where
-            cause.value ->> 'code' is not null
-        ),
-        '{}'::text[]
-      )
-    into
-      v_incomplete,
-      v_incomplete_codes
-    from
-      app.order_cost_state state
-      join app.order_cost_applications application on application.id = state.latest_application_id
-      left join lateral pg_catalog.jsonb_array_elements(application.causes) as cause (value) on true
-    where
-      application.disposition = 'incomplete'
-      and exists (
-        select
-          1
-        from
-          app.order_settlement_shifts (state.order_id) settled
-        where
-          settled.shift_id = v_shift.id
-      );
-
-    select
-      count(*)
-    into v_tracking
-    from
-      app.stock_items item
-    where
-      item.created_at <= v_shift.opened_at
-      and exists (
-        select
-          1
-        from
-          app.item_tracking_history backfill
-        where
-          backfill.item_id = item.id
-          and backfill.basis = 'backfill'
-          and backfill.known_since > v_shift.opened_at
-      )
-      and not exists (
-        select
-          1
-        from
-          app.item_tracking_history earlier
-        where
-          earlier.item_id = item.id
-          and earlier.known_since <= v_shift.opened_at
-      );
-
-    select
-      count(*)
-    into v_unreviewed
-    from
-      app.order_disposition_state state
-      join app.pos_orders o on o.id = state.order_id
-      left join app.order_disposition_events event on event.id = state.event_id
-    where
-      o.shift_id = v_shift.id
-      and state.is_open
-      and (
-        state.review_reason is not null
-        or event.owner_reviewed is not true
-      );
-
-    select
-      count(*)
-    into v_preparation
-    from
-      app.order_cost_state state
-      join app.pos_orders o on o.id = state.order_id
-    where
-      o.shift_id = v_shift.id
-      and exists (
-        select
-          1
-        from
-          pg_catalog.jsonb_array_elements(state.causes) as cause (value)
-        where
-          cause.value ->> 'code' = 'missing_preparation_basis'
-      );
-
-    select
-      count(*)
-    into v_refunds
-    from
-      (
-        select
-          1
-        from
-          (
-            select distinct
-              on (revision.tx_id) revision.present,
-              revision.tx_type,
-              revision.order_id,
-              revision.amount
-            from
-              app.pos_refund_revisions revision
-            where
-              revision.shift_id = v_shift.id
-            order by
-              revision.tx_id,
-              revision.id desc
-          ) as latest
-        where
-          latest.present
-          and latest.tx_type = 3
-          and (
-            latest.order_id is null
-            or latest.amount < 0
-          )
-        union all
-        select
-          1
-        from
-          app.order_disposition_state state
-          join app.pos_orders o on o.id = state.order_id
-        where
-          o.shift_id = v_shift.id
-          and (
-            state.class = 'unresolved_refund'
-            or state.review_reason = 'unresolved_refund'
-          )
-      ) as hit;
-
-    select
-      count(*),
-      coalesce(sum(deficit.qty_uncovered), 0)
-    into
-      v_deficit_count,
-      v_deficit_qty
-    from
-      app.provisional_deficits deficit
-      join app.stock_movements movement on movement.id = deficit.movement_id
-      left join app.movement_attributions attribution on attribution.movement_id = movement.id
-    where
-      deficit.qty_uncovered > 0
-      and coalesce(movement.shift_id, attribution.shift_id) = v_shift.id;
-
-    select
-      count(*)
-    into v_missing_cost
-    from
-      app.pos_orders o
-    where
-      o.shift_id = v_shift.id
-      and (
-        exists (
-          select
-            1
-          from
-            app.order_cost_state state
-            cross join lateral pg_catalog.jsonb_array_elements(state.causes) as cause (value)
-          where
-            state.order_id = o.id
-            and cause.value ->> 'code' = 'missing_cost_basis'
-        )
-        or exists (
-          select
-            1
-          from
-            app.accounting_work_state state
-          where
-            state.order_id = o.id
-            and state.last_reason = 'missing_cost_basis'
-        )
-      );
-
-    v_orders_denom := 0;
-    v_orders_covered := 0;
-    v_lines_denom := 0;
-    v_lines_covered := 0;
-
-    for v_order in
-      select
-        o.id
-      from
-        app.pos_orders o
-      where
-        o.shift_id = v_shift.id
-        and o.status = 'complete'
-        and not o.missing_from_pos
-        and v_opening is not null
-        and o.ordered_at >= v_opening
-      order by
-        o.id
-    loop
-      select
-        count(*)
-      into v_line_count
-      from
-        app.pos_order_lines line
-      where
-        line.order_id = v_order.id
-        and (
-          line.quantity > 0
-          or line.weighted_qty > 0
-        );
-
-      v_orders_denom := v_orders_denom + 1;
-      v_lines_denom := v_lines_denom + v_line_count;
-
-      begin
-        v_resolved := app.resolve_order_requirements (v_order.id, null);
-      exception
-        when others then
-          v_resolved := pg_catalog.jsonb_build_object('status', 'incomplete');
-      end;
-
-      if v_resolved ->> 'status' = 'ready' then
-        v_orders_covered := v_orders_covered + 1;
-      end if;
-
-      -- Line coverage follows each line's own ready or exception status.
-      -- An unresolved order (packaging, another line) does not zero the lines
-      -- that are already eligible.
-      select
-        count(*)
-      into v_line_count
-      from
-        app.pos_order_lines line
-      where
-        line.order_id = v_order.id
-        and (
-          line.quantity > 0
-          or line.weighted_qty > 0
-        )
-        and exists (
-          select
-            1
-          from
-            pg_catalog.jsonb_array_elements(coalesce(v_resolved -> 'lines', '[]'::jsonb)) as resolved (value)
-          where
-            resolved.value ->> 'line_id' = line.line_id
-            and resolved.value ->> 'status' in ('ready', 'exception')
-        );
-
-      v_lines_covered := v_lines_covered + v_line_count;
-    end loop;
+    -- Line coverage follows each line's own ready or exception status.
+    -- An unresolved order does not zero the lines that are already eligible.
+    v_orders_denom := coalesce((v_order_coverage -> v_shift.id ->> 'orders_denom')::integer, 0);
+    v_orders_covered := coalesce((v_order_coverage -> v_shift.id ->> 'orders_covered')::integer, 0);
+    v_lines_denom := coalesce((v_order_coverage -> v_shift.id ->> 'lines_denom')::integer, 0);
+    v_lines_covered := coalesce((v_order_coverage -> v_shift.id ->> 'lines_covered')::integer, 0);
 
     v_month := pg_catalog.date_trunc(
       'month',
       (v_shift.opened_at at time zone 'Africa/Cairo')
     )::date;
 
-    select
-      coalesce(
-        (
-          select
-            status.complete
-          from
-            app.month_expense_status status
-          where
-            status.month = v_month
-        ),
-        false
-      )
-    into v_expenses;
+    v_expenses := coalesce(
+      (v_expenses_by_month ->> v_month::text)::boolean,
+      false
+    );
 
     v_causes := '{}'::text[];
 
@@ -1955,106 +2674,54 @@ begin
       v_label := 'مقفول نهائي';
     end if;
 
-    select
-      exists (
-        select
-          1
-        from
-          app.accounting_revision_differences diff
-        where
-          diff.shift_id = v_shift.id
-      )
-    into v_revised;
+    v_history := coalesce(v_page_revisions -> v_shift.id, '[]'::jsonb);
+    v_revised := pg_catalog.jsonb_typeof (v_history) = 'array'
+    and pg_catalog.jsonb_array_length (v_history) > 0;
+    v_latest := null;
+    v_cumulative := null;
 
     select
       pg_catalog.jsonb_build_object(
         'net_sales_difference',
-        diff.net_sales_difference,
+        picked.value ->> 'net_sales_difference',
         'cogs_difference',
-        diff.cogs_difference,
+        picked.value ->> 'cogs_difference',
         'waste_difference',
-        diff.waste_difference,
+        picked.value ->> 'waste_difference',
         'count_difference',
-        diff.count_difference,
+        picked.value ->> 'count_difference',
         'profit_difference',
-        diff.profit_difference
+        picked.value ->> 'profit_difference'
       ),
       pg_catalog.jsonb_build_object(
         'net_sales_difference',
-        diff.cumulative_net_sales_difference,
+        picked.value ->> 'cumulative_net_sales_difference',
         'cogs_difference',
-        diff.cumulative_cogs_difference,
+        picked.value ->> 'cumulative_cogs_difference',
         'waste_difference',
-        diff.cumulative_waste_difference,
+        picked.value ->> 'cumulative_waste_difference',
         'count_difference',
-        diff.cumulative_count_difference,
+        picked.value ->> 'cumulative_count_difference',
         'profit_difference',
-        diff.cumulative_profit_difference
+        picked.value ->> 'cumulative_profit_difference'
       )
     into
       v_latest,
       v_cumulative
     from
-      app.accounting_revision_differences diff
-    where
-      diff.shift_id = v_shift.id
-      and diff.is_latest;
+      (
+        select
+          elem.value
+        from
+          pg_catalog.jsonb_array_elements(v_history) as elem (value)
+        where
+          (elem.value ->> 'is_latest')::boolean
+        limit
+          1
+      ) picked;
 
     v_latest := coalesce(v_latest, v_zero);
     v_cumulative := coalesce(v_cumulative, v_zero);
-
-    select
-      coalesce(
-        pg_catalog.jsonb_agg(
-          pg_catalog.jsonb_build_object(
-            'cause_kind',
-            diff.cause_kind,
-            'cause_id',
-            diff.cause_id,
-            'cause_sort',
-            diff.cause_sort::text,
-            'captured_at',
-            app.costing_timestamptz_text (diff.captured_at),
-            'source_at',
-            app.costing_timestamptz_text (diff.source_at),
-            'recorded_at',
-            app.costing_timestamptz_text (diff.recorded_at),
-            'is_latest',
-            diff.is_latest,
-            'net_sales_difference',
-            diff.net_sales_difference,
-            'cogs_difference',
-            diff.cogs_difference,
-            'waste_difference',
-            diff.waste_difference,
-            'count_difference',
-            diff.count_difference,
-            'profit_difference',
-            diff.profit_difference,
-            'cumulative_net_sales_difference',
-            diff.cumulative_net_sales_difference,
-            'cumulative_cogs_difference',
-            diff.cumulative_cogs_difference,
-            'cumulative_waste_difference',
-            diff.cumulative_waste_difference,
-            'cumulative_count_difference',
-            diff.cumulative_count_difference,
-            'cumulative_profit_difference',
-            diff.cumulative_profit_difference
-          )
-          order by
-            diff.captured_at,
-            diff.cause_sort nulls last,
-            diff.cause_kind,
-            diff.cause_id
-        ),
-        '[]'::jsonb
-      )
-    into v_history
-    from
-      app.accounting_revision_differences diff
-    where
-      diff.shift_id = v_shift.id;
 
     return next pg_catalog.jsonb_build_object(
       'shift_id',
@@ -2144,7 +2811,7 @@ begin
 end;
 $$;
 
-comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item and uses the anchor''s pinned shift. Weekly settlement names that pinned shift, the separate interval-owning shift, and the covered interval. Count coverage for the page is read once. A partial daily roster is تقديري only when no blocker is set. Unknown backfill tracking applies only to an item that already existed when the shift opened. An incomplete application, an unfinished rederive span, and unsettled work on either the latest snapshot shift or the live application shift are ناقص. Revision history follows captured_at, then the numeric cause_sort, then cause kind and id. source_at in that history is the economic time. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Completed-order readiness is atomic. Line coverage counts ready and exception lines on their own. Quantities and money are decimal text. Does not post stock and does not change record_count.';
+comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item and uses the anchor''s pinned shift. Weekly settlement names that pinned shift, the separate interval-owning shift, and the covered interval. Count coverage for the page is read once, and the scope proof runs only for anchors that cover those shifts. Blocker counts for the page are read once. Revision rows for the page are aggregated once per call, from the batches of that page only. Completed-order coverage for the page is resolved once per call. A partial daily roster is تقديري only when no blocker is set. Unknown backfill tracking applies only to an item that already existed when the shift opened. An incomplete application, an unfinished rederive span, and unsettled work on either the latest snapshot shift or the live application shift are ناقص. Consecutive incomplete receipts keep the retired application shift until the order is settled. Revision history follows captured_at, then the numeric cause_sort, then cause kind and id. source_at in that history is the economic time. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Completed-order readiness is atomic. Line coverage counts ready and exception lines on their own. Quantities and money are decimal text. Does not post stock and does not change record_count.';
 
 revoke all on function app.list_shift_accounting_status (timestamptz, text, integer)
 from

@@ -2246,6 +2246,11 @@ isOneToOne: true
 "note_refund_sales_revision":
 { Args: { "p_revision_id": number }; Returns: undefined
                            },
+"order_coverage_counts":
+{ Args: { "p_order_id": string }; Returns: {
+              "lines_covered": number,"lines_denom": number,"ready": number
+            }[]
+                           },
 "order_settlement_shifts":
 { Args: { "p_order_id": string }; Returns: {
               "shift_id": string
