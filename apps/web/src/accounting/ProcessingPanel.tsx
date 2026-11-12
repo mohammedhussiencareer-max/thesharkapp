@@ -19,6 +19,11 @@ import {
   type RunHeld,
   type RunOutcome,
 } from '@/accounting/run';
+import {
+  noteRetryOrder,
+  unknownRetries,
+  type RetryHeld,
+} from '@/accounting/held-retries';
 import type { ParkedOrder, ProcessingSummary } from '@/accounting/types';
 import { ConfirmedRefusalError, messageFrom } from '@/items/errors';
 import {
@@ -31,11 +36,6 @@ import {
 import { UnknownSave } from '@/items/UnknownSave';
 import { isDefiniteRefusal } from '@/lib/write-outcome';
 import { primaryButton, secondaryButton } from '@/lib/page-style';
-
-type RetryHeld = {
-  requestId: string;
-  orderId: string;
-};
 
 const recordedNotice = 'اتسجل إن المكالمة اتقطعت';
 const busyNotice = 'الحساب مشغول، حاول تاني';
@@ -78,7 +78,8 @@ function retireRefusal(
  * `onShiftDataStale` runs only after an acknowledged run or retry settles.
  * The page handler must change `refreshKey`; that change is this panel's
  * reload. Busy, unreported, and refused outcomes stay retryable and do not
- * notify the page.
+ * notify the page. A lost parked-order retry stays on screen after تحديث
+ * drops that order, until the same retry returns retried or not_failed.
  */
 export function ProcessingPanel({
   refreshKey = 0,
@@ -267,8 +268,17 @@ export function ProcessingPanel({
       requestId,
       orderId: order.orderId,
     }));
+    noteRetryOrder(order.orderId);
     void finishRetry(action);
   }
+
+  const unresolvedRetries =
+    heldEpoch < 0 || summary === null
+      ? []
+      : unknownRetries().filter(
+          (held) =>
+            !summary.parked.some((order) => order.orderId === held.orderId),
+        );
 
   function retryHeldOrder(orderId: string): void {
     const held = unknownAction<RetryHeld>(accountingRetrySubject(orderId));
@@ -359,6 +369,19 @@ export function ProcessingPanel({
                   </li>
                 );
               })}
+            </ul>
+          ) : null}
+          {unresolvedRetries.length > 0 ? (
+            <ul className="flex flex-col gap-2" aria-label="رجوع مش متأكد">
+              {unresolvedRetries.map((held) => (
+                <li key={held.orderId} className="flex flex-col gap-1">
+                  <p dir="ltr">{held.orderId}</p>
+                  <UnknownSave
+                    disabled={running}
+                    onRetry={() => retryHeldOrder(held.orderId)}
+                  />
+                </li>
+              ))}
             </ul>
           ) : null}
         </>

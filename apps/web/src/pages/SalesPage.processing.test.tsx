@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -9,6 +15,7 @@ import {
   runDeductions,
 } from '@/accounting/api';
 import {
+  accountingRetrySubject,
   accountingRunSubject,
   zeroAccountingCounts,
   type RunOutcome,
@@ -465,5 +472,71 @@ describe('SalesPage processing refresh', () => {
     expect(loadSalesHome).toHaveBeenCalledTimes(3);
     expect(loadShiftStatuses).toHaveBeenCalledTimes(2);
     expect(loadProcessingSummary).toHaveBeenCalledTimes(4);
+  });
+
+  it('keeps a lost parked retry visible after refresh until not_failed', async () => {
+    installHome('210.00');
+    installStatuses(shiftStatus('ناقص'));
+    installSummary(
+      summary({
+        activated: true,
+        parked: [
+          {
+            orderId: 'order-parked',
+            attempts: '5',
+            workGeneration: '2',
+            failedAt: '2026-02-01T00:00:00.000Z',
+            sqlstate: '57014',
+            reason: 'escaped',
+          },
+        ],
+        parkedCount: '1',
+      }),
+    );
+    renderPage();
+    expect(
+      await screen.findByRole('button', { name: 'رجّع الطلب' }),
+    ).toBeInTheDocument();
+    vi.mocked(retryParkedOrder).mockRejectedValueOnce(new Error('socket'));
+    fireEvent.click(screen.getByRole('button', { name: 'رجّع الطلب' }));
+    expect(await screen.findByText('socket')).toBeInTheDocument();
+    expect(screen.getByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(
+      screen.getAllByRole('button', { name: 'إعادة المحاولة' }),
+    ).toHaveLength(1);
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(true);
+    expect(
+      screen.getByRole('list', { name: 'طلبات متوقفة' }),
+    ).toBeInTheDocument();
+
+    installSummary(summary({ activated: true, parked: [], parkedCount: '0' }));
+    fireEvent.click(screen.getByRole('button', { name: 'تحديث' }));
+    const unresolved = await screen.findByRole('list', {
+      name: 'رجوع مش متأكد',
+    });
+    expect(within(unresolved).getByText('order-parked')).toBeInTheDocument();
+    expect(
+      within(unresolved).getByRole('button', { name: 'إعادة المحاولة' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(screen.queryByRole('list', { name: 'طلبات متوقفة' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'رجّع الطلب' })).toBeNull();
+    expect(screen.queryByText('المكالمة اتقطعت (الوقت خلص)')).toBeNull();
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(true);
+    expect(loadProcessingSummary).toHaveBeenCalledTimes(2);
+
+    vi.mocked(retryParkedOrder).mockResolvedValueOnce('not_failed');
+    fireEvent.click(
+      within(unresolved).getByRole('button', { name: 'إعادة المحاولة' }),
+    );
+    expect(await screen.findByText('الطلب مش متوقف')).toBeInTheDocument();
+    expect(screen.queryByText(unknownSaveMessage)).toBeNull();
+    expect(screen.queryByRole('list', { name: 'رجوع مش متأكد' })).toBeNull();
+    expect(screen.queryByText('order-parked')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'إعادة المحاولة' })).toBeNull();
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(1, 'order-parked');
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(2, 'order-parked');
+    expect(retryParkedOrder).toHaveBeenCalledTimes(2);
   });
 });
