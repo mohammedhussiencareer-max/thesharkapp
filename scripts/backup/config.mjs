@@ -28,6 +28,7 @@ export const OWNER_FK_COLUMNS = [
   'app.item_opening_prices.approved_by',
   'app.order_disposition_events.actor',
   'app.owner.user_id',
+  'app.waste_documents.actor',
 ];
 
 // Owner audit columns that are not foreign keys. Add a column here when a new

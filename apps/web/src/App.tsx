@@ -19,6 +19,7 @@ import { RecipesPage } from '@/pages/RecipesPage';
 import { SalesPage } from '@/pages/SalesPage';
 import { SortingPage } from '@/pages/SortingPage';
 import { SalesShiftPage } from '@/pages/SalesShiftPage';
+import { WastePage } from '@/pages/WastePage';
 import { MissingEnvScreen } from '@/pages/MissingEnvScreen';
 import { NotFoundPage } from '@/pages/NotFoundPage';
 
@@ -148,6 +149,14 @@ export function AppRoutes() {
         element={
           <RequireOwner>
             <OrderDecisionsPage />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/waste"
+        element={
+          <RequireOwner>
+            <WastePage />
           </RequireOwner>
         }
       />

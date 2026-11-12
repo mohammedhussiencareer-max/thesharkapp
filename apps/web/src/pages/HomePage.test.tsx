@@ -59,6 +59,10 @@ describe('HomePage', () => {
     expect(
       screen.getByRole('link', { name: 'قرارات الطلبات' }),
     ).toHaveAttribute('href', '/order-decisions');
+    expect(screen.getByRole('link', { name: 'الهالك' })).toHaveAttribute(
+      'href',
+      '/waste',
+    );
 
     fireEvent.click(screen.getByRole('button', { name: 'تسجيل الخروج' }));
     expect(onSignOut).toHaveBeenCalledOnce();
