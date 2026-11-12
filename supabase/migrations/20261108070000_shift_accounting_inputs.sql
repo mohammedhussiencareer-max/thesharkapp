@@ -1230,8 +1230,9 @@ from
 
 -- One order's coverage counters. Parallel safe so a page aggregate can gather
 -- workers: a call costs far more than a comparison, which is what the planner
--- uses to decide. An error while resolving leaves the order unready and
--- covers none of its lines. Private.
+-- uses to decide. resolve_order_requirements and every function it calls only
+-- read. An error while resolving leaves the order unready and covers none of
+-- its lines. Private.
 create function app.order_coverage_counts (p_order_id text) returns table (
   ready integer,
   lines_denom integer,
@@ -1302,7 +1303,17 @@ create function app.list_shift_accounting_status (
   p_limit integer default null
 ) returns setof jsonb language plpgsql stable security definer
 set
-  search_path = '' as $$
+  search_path = ''
+set
+  min_parallel_table_scan_size = 0
+set
+  min_parallel_index_scan_size = 0
+set
+  max_parallel_workers_per_gather = 2
+set
+  parallel_setup_cost = 0
+set
+  parallel_tuple_cost = 0 as $$
 declare
   v_limit integer;
   v_opening timestamptz;
@@ -1347,11 +1358,6 @@ declare
   v_page_ids text[];
   v_page_revisions jsonb;
   v_order_coverage jsonb;
-  v_saved_parallel_table text;
-  v_saved_parallel_index text;
-  v_saved_parallel_gather text;
-  v_saved_parallel_setup text;
-  v_saved_parallel_tuple text;
   v_sync_by_shift jsonb;
   v_open_by_shift jsonb;
   v_pending_by_shift jsonb;
@@ -2016,25 +2022,9 @@ begin
 
   -- SELECT INTO asks for one row and will not run a parallel plan. EXECUTE
   -- fetches the whole aggregate, so the resolver can run on the workers.
-  -- The thresholds are restored before the shift loop and on failure.
-  v_saved_parallel_table := pg_catalog.current_setting ('min_parallel_table_scan_size');
-  v_saved_parallel_index := pg_catalog.current_setting ('min_parallel_index_scan_size');
-  v_saved_parallel_gather := pg_catalog.current_setting ('max_parallel_workers_per_gather');
-  v_saved_parallel_setup := pg_catalog.current_setting ('parallel_setup_cost');
-  v_saved_parallel_tuple := pg_catalog.current_setting ('parallel_tuple_cost');
-
-  begin
-    perform pg_catalog.set_config ('min_parallel_table_scan_size', '0', true);
-
-    perform pg_catalog.set_config ('min_parallel_index_scan_size', '0', true);
-
-    perform pg_catalog.set_config ('max_parallel_workers_per_gather', '8', true);
-
-    perform pg_catalog.set_config ('parallel_setup_cost', '0', true);
-
-    perform pg_catalog.set_config ('parallel_tuple_cost', '0', true);
-
-    execute $coverage$
+  -- The gather cap and the scan thresholds are function SET clauses, which
+  -- Postgres restores on exit and on error.
+  execute $coverage$
       select
         coalesce(
           pg_catalog.jsonb_object_agg(
@@ -2078,30 +2068,6 @@ begin
       v_opening
     into
       v_order_coverage;
-
-    perform pg_catalog.set_config ('min_parallel_table_scan_size', v_saved_parallel_table, true);
-
-    perform pg_catalog.set_config ('min_parallel_index_scan_size', v_saved_parallel_index, true);
-
-    perform pg_catalog.set_config ('max_parallel_workers_per_gather', v_saved_parallel_gather, true);
-
-    perform pg_catalog.set_config ('parallel_setup_cost', v_saved_parallel_setup, true);
-
-    perform pg_catalog.set_config ('parallel_tuple_cost', v_saved_parallel_tuple, true);
-  exception
-    when others then
-      perform pg_catalog.set_config ('min_parallel_table_scan_size', v_saved_parallel_table, true);
-
-      perform pg_catalog.set_config ('min_parallel_index_scan_size', v_saved_parallel_index, true);
-
-      perform pg_catalog.set_config ('max_parallel_workers_per_gather', v_saved_parallel_gather, true);
-
-      perform pg_catalog.set_config ('parallel_setup_cost', v_saved_parallel_setup, true);
-
-      perform pg_catalog.set_config ('parallel_tuple_cost', v_saved_parallel_tuple, true);
-
-      raise;
-  end;
 
   v_order_coverage := coalesce(v_order_coverage, '{}'::jsonb);
 
