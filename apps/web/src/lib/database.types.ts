@@ -2008,6 +2008,18 @@ isOneToOne: true
               "eff_generation": number,"has_new": boolean,"order_id": string
             }[]
                            },
+"accounting_processing_summary":
+{ Args: Record<PropertyKey, never>; Returns: Json
+                           },
+"accounting_read_conversion_versions":
+{ Args: { "p_value": Json }; Returns: Json
+                           },
+"accounting_read_loss_versions":
+{ Args: { "p_value": Json }; Returns: Json
+                           },
+"accounting_read_uuid_list":
+{ Args: { "p_value": Json }; Returns: Json
+                           },
 "add_custom_unit":
 { Args: { "p_code": string,"p_label_ar": string,"p_request_id": string }; Returns: string
                            },
@@ -2251,6 +2263,12 @@ isOneToOne: true
                            },
 "note_refund_sales_revision":
 { Args: { "p_revision_id": number }; Returns: undefined
+                           },
+"opening_activation_review":
+{ Args: { "p_after_id"?: string,"p_limit"?: number }; Returns: Json
+                           },
+"order_cost_detail":
+{ Args: { "p_order_id": string }; Returns: Json
                            },
 "order_coverage_counts":
 { Args: { "p_order_id": string }; Returns: {
@@ -2642,6 +2660,9 @@ isOneToOne: true
                            },
 "start_pos_sync_run":
 { Args: { "p_mode": string }; Returns: number
+                           },
+"stock_count_derivation_detail":
+{ Args: { "p_count_id": string }; Returns: Json
                            },
 "suggest_pos_mappings":
 { Args: { "p_name": string }; Returns: Json

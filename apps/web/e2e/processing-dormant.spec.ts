@@ -64,7 +64,8 @@ test('owner reviews dormant deductions, activation, and order cost', async ({
   await expect(
     page
       .getByRole('heading', { name: 'تكلفة الطلب' })
-      .or(page.getByText('لسه مفيش تكلفة محفوظة')),
+      .or(page.getByText('لسه مفيش تكلفة محفوظة'))
+      .first(),
   ).toBeVisible(visible);
 
   await page.getByRole('link', { name: 'المبيعات' }).click();
