@@ -1,4 +1,10 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   loadProcessingSummary,
@@ -262,5 +268,144 @@ describe('ProcessingPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
     expect(await screen.findByText('الطلب رجع للشغل')).toBeInTheDocument();
     expect(retryParkedOrder).toHaveBeenCalledTimes(5);
+  });
+
+  it('reloads the summary when refreshKey changes and does not notify the page', async () => {
+    const onShiftDataStale = vi.fn();
+    const view = render(
+      <ProcessingPanel refreshKey={0} onShiftDataStale={onShiftDataStale} />,
+    );
+    const panel = () => screen.getByRole('region', { name: 'معالجة الخصم' });
+    await waitFor(() => {
+      expect(panel()).toHaveTextContent('مستني 2');
+    });
+    expect(loadProcessingSummary).toHaveBeenCalledTimes(1);
+    expect(onShiftDataStale).not.toHaveBeenCalled();
+
+    vi.mocked(loadProcessingSummary).mockResolvedValueOnce({
+      ...summary,
+      pendingCount: '8',
+    });
+    view.rerender(
+      <ProcessingPanel refreshKey={1} onShiftDataStale={onShiftDataStale} />,
+    );
+    await waitFor(() => {
+      expect(panel()).toHaveTextContent('مستني 8');
+    });
+    expect(loadProcessingSummary).toHaveBeenCalledTimes(2);
+    expect(onShiftDataStale).not.toHaveBeenCalled();
+
+    view.rerender(
+      <ProcessingPanel refreshKey={1} onShiftDataStale={onShiftDataStale} />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(loadProcessingSummary).toHaveBeenCalledTimes(2);
+    expect(panel()).toHaveTextContent('مستني 8');
+  });
+
+  it('notifies the page only after an acknowledged run or retry', async () => {
+    const onShiftDataStale = vi.fn();
+    render(<ProcessingPanel onShiftDataStale={onShiftDataStale} />);
+    const runButton = async () =>
+      screen.findByRole('button', { name: 'شغّل الخصم' });
+    expect(await runButton()).toBeInTheDocument();
+    expect(loadProcessingSummary).toHaveBeenCalledTimes(1);
+
+    vi.mocked(runDeductions).mockRejectedValueOnce(new Error('socket'));
+    fireEvent.click(await runButton());
+    expect(await screen.findByText('socket')).toBeInTheDocument();
+    expect(screen.getByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(hasAction(accountingRunSubject)).toBe(true);
+    expect(onShiftDataStale).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(await screen.findByText('المكالمة ما اكتملتش')).toBeInTheDocument();
+    expect(screen.queryByText(unknownSaveMessage)).toBeNull();
+    expect(hasAction(accountingRunSubject)).toBe(false);
+    expect(recordRunFailure).not.toHaveBeenCalled();
+    expect(onShiftDataStale).not.toHaveBeenCalled();
+
+    vi.mocked(runDeductions).mockResolvedValueOnce(
+      outcome({
+        stop: 'call_failed',
+        report: 'not_needed',
+        cause: writeError({ code: '42501', message: 'permission denied raw' }),
+      }),
+    );
+    fireEvent.click(await runButton());
+    expect(
+      await screen.findByText('المالك بس يقدر يشغّل الحساب'),
+    ).toBeInTheDocument();
+    expect(hasAction(accountingRunSubject)).toBe(false);
+    expect(onShiftDataStale).not.toHaveBeenCalled();
+
+    vi.mocked(runDeductions).mockImplementationOnce((onBound) => {
+      onBound?.({
+        attemptId: 'attempt-1',
+        orderId: 'order-9',
+        workGeneration: 4,
+      });
+      return Promise.resolve(
+        outcome({
+          stop: 'call_failed',
+          report: 'unreported',
+          cause: new Error('network'),
+        }),
+      );
+    });
+    fireEvent.click(await runButton());
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(hasAction(accountingRunSubject)).toBe(true);
+    expect(onShiftDataStale).not.toHaveBeenCalled();
+
+    vi.mocked(recordRunFailure).mockResolvedValueOnce('busy');
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(
+      await screen.findByText('الحساب مشغول، حاول تاني'),
+    ).toBeInTheDocument();
+    expect(hasAction(accountingRunSubject)).toBe(true);
+    expect(onShiftDataStale).not.toHaveBeenCalled();
+
+    vi.mocked(recordRunFailure).mockRejectedValueOnce(new Error('socket'));
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(await screen.findByText('socket')).toBeInTheDocument();
+    expect(hasAction(accountingRunSubject)).toBe(true);
+    expect(onShiftDataStale).not.toHaveBeenCalled();
+
+    vi.mocked(recordRunFailure).mockResolvedValueOnce('recorded');
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(
+      await screen.findByText('اتسجل إن المكالمة اتقطعت'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(unknownSaveMessage)).toBeNull();
+    expect(hasAction(accountingRunSubject)).toBe(false);
+    expect(onShiftDataStale).toHaveBeenCalledTimes(1);
+    expect(loadProcessingSummary).toHaveBeenCalledTimes(1);
+
+    vi.mocked(runDeductions).mockResolvedValueOnce(outcome({ stop: 'empty' }));
+    fireEvent.click(await runButton());
+    expect(await screen.findByText('مفيش شغل مستني')).toBeInTheDocument();
+    expect(onShiftDataStale).toHaveBeenCalledTimes(2);
+
+    vi.mocked(retryParkedOrder).mockResolvedValueOnce('busy');
+    fireEvent.click(screen.getByRole('button', { name: 'رجّع الطلب' }));
+    expect(
+      await screen.findByText('الحساب مشغول، حاول تاني'),
+    ).toBeInTheDocument();
+    expect(onShiftDataStale).toHaveBeenCalledTimes(2);
+
+    vi.mocked(retryParkedOrder).mockResolvedValueOnce('not_failed');
+    fireEvent.click(screen.getByRole('button', { name: 'رجّع الطلب' }));
+    expect(await screen.findByText('الطلب مش متوقف')).toBeInTheDocument();
+    expect(onShiftDataStale).toHaveBeenCalledTimes(3);
+
+    vi.mocked(retryParkedOrder).mockResolvedValueOnce('retried');
+    fireEvent.click(screen.getByRole('button', { name: 'رجّع الطلب' }));
+    expect(await screen.findByText('الطلب رجع للشغل')).toBeInTheDocument();
+    expect(onShiftDataStale).toHaveBeenCalledTimes(4);
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
+    expect(loadProcessingSummary).toHaveBeenCalledTimes(1);
   });
 });

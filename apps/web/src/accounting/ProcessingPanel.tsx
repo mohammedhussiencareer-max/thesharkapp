@@ -72,8 +72,21 @@ function retireRefusal(
 /**
  * Sales-page processing panel. One in-flight accounting action at a time.
  * A reload failure never settles the action that just finished.
+ *
+ * `refreshKey` reloads pending counts, coverage, and parked orders. The load
+ * effect lists `loadId` only, so a same-key parent render does not read again.
+ * `onShiftDataStale` runs only after an acknowledged run or retry settles.
+ * The page handler must change `refreshKey`; that change is this panel's
+ * reload. Busy, unreported, and refused outcomes stay retryable and do not
+ * notify the page.
  */
-export function ProcessingPanel() {
+export function ProcessingPanel({
+  refreshKey = 0,
+  onShiftDataStale,
+}: {
+  refreshKey?: number;
+  onShiftDataStale?: () => void;
+}) {
   const [summary, setSummary] = useState<ProcessingSummary | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -81,8 +94,13 @@ export function ProcessingPanel() {
   const [running, setRunning] = useState(false);
   const [loadId, setLoadId] = useState(0);
   const [heldEpoch, setHeldEpoch] = useState(0);
+  const [seenRefresh, setSeenRefresh] = useState(refreshKey);
   const flight = useRef(false);
   const seqRef = useRef(0);
+  if (seenRefresh !== refreshKey) {
+    setSeenRefresh(refreshKey);
+    setLoadId((value) => value + 1);
+  }
   const heldRun =
     heldEpoch < 0 ? null : unknownAction<RunHeld>(accountingRunSubject);
 
@@ -114,6 +132,14 @@ export function ProcessingPanel() {
 
   function requestReload(): void {
     setLoadId((value) => value + 1);
+  }
+
+  function publishAcknowledged(): void {
+    if (onShiftDataStale) {
+      onShiftDataStale();
+      return;
+    }
+    requestReload();
   }
 
   async function finishFresh(action: RunHeld): Promise<void> {
@@ -151,7 +177,7 @@ export function ProcessingPanel() {
       }
       settleAction(accountingRunSubject, action.requestId);
       setNotice(runStopLabel(outcome.stop));
-      requestReload();
+      publishAcknowledged();
     } finally {
       flight.current = false;
       setRunning(false);
@@ -177,7 +203,7 @@ export function ProcessingPanel() {
         }
         settleAction(accountingRunSubject, action.requestId);
         setNotice(recordedNotice);
-        requestReload();
+        publishAcknowledged();
       } catch (error) {
         // The attempt stays until recording acknowledges a terminal status.
         setNotice(messageFrom(error));
@@ -213,7 +239,7 @@ export function ProcessingPanel() {
         return;
       }
       setNotice(status === 'not_failed' ? notFailedNotice : retriedNotice);
-      requestReload();
+      publishAcknowledged();
     } finally {
       flight.current = false;
       setRunning(false);

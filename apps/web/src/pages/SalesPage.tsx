@@ -83,7 +83,7 @@ export function SalesPage() {
       </p>
       <h1 className="text-2xl font-semibold">المبيعات</h1>
       {lastSyncAt ? <p>آخر مزامنة {formatCairo(lastSyncAt)}</p> : null}
-      <ProcessingPanel />
+      <ProcessingPanel refreshKey={loadId} onShiftDataStale={reload} />
       {statusError ? <p>{statusError}</p> : null}
       <button className={secondaryButton} type="button" onClick={reload}>
         {loadError ? 'إعادة المحاولة' : 'تحديث'}
