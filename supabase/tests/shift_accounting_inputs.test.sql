@@ -4142,6 +4142,365 @@ select
     'order readiness stays atomic when some lines are already covered'
   );
 
+-- A mapping change after the receipt must be resolved again. The stored
+-- receipt stays a sale; serving it would still report the line covered.
+select
+  pg_temp.policies ('p77-remap-pos');
+
+select
+  pg_temp.map_stock (
+    'p77-remap-pos',
+    pg_temp.u (1),
+    '1',
+    '2026-01-01 00:00+00'
+  );
+
+select
+  pg_temp.type_ok ('p77-remap');
+
+select
+  pg_temp.shift ('p77-remap', '2026-12-22 12:00+00', false);
+
+select
+  pg_temp.ord (
+    'p77-o-remap',
+    'p77-remap',
+    'complete',
+    '2026-12-22 13:00+00',
+    20
+  );
+
+update app.pos_orders
+set
+  order_type = 'p77-remap'
+where
+  id = 'p77-o-remap';
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    options,
+    line_total
+  )
+values
+  (
+    'p77-o-remap',
+    'l1',
+    'p77-remap-pos',
+    'x',
+    1,
+    '[]'::jsonb,
+    20
+  );
+
+insert into
+  app.pos_order_snapshots (
+    order_id,
+    version,
+    shift_id,
+    status,
+    order_type,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    lines,
+    origin
+  )
+select
+  orders.id,
+  1,
+  orders.shift_id,
+  orders.status,
+  orders.order_type,
+  orders.ordered_at,
+  orders.subtotal,
+  orders.discount,
+  orders.tax,
+  orders.service_tax,
+  orders.delivery_fee,
+  orders.total,
+  orders.pos_update_time,
+  orders.content_hash,
+  coalesce(
+    (
+      select
+        pg_catalog.jsonb_agg (
+          pg_catalog.jsonb_build_object (
+            'line_id',
+            line.line_id,
+            'item_id',
+            line.item_id,
+            'item_name',
+            line.item_name,
+            'size_name',
+            line.size_name,
+            'quantity',
+            line.quantity,
+            'weighted_qty',
+            line.weighted_qty,
+            'weighted_unit',
+            line.weighted_unit,
+            'options',
+            line.options
+          )
+          order by
+            line.line_id
+        )
+      from
+        app.pos_order_lines line
+      where
+        line.order_id = orders.id
+    ),
+    '[]'::jsonb
+  ),
+  'sync'
+from
+  app.pos_orders orders
+where
+  orders.id = 'p77-o-remap';
+
+insert into
+  app.pos_cost_inputs (
+    order_id,
+    input_revision,
+    snapshot_id,
+    missing_from_pos,
+    refund_revision_ids,
+    digest,
+    origin
+  )
+select
+  snap.order_id,
+  1,
+  snap.id,
+  false,
+  '{}'::bigint[],
+  md5('p77-o-remap'),
+  'sync'
+from
+  app.pos_order_snapshots snap
+where
+  snap.order_id = 'p77-o-remap';
+
+update app.accounting_work_events
+set
+  work_generation = 1,
+  processed_at = pg_catalog.clock_timestamp ()
+where
+  order_id = 'p77-o-remap'
+  and processed_at is null;
+
+insert into
+  app.order_cost_applications (
+    order_id,
+    cost_input_id,
+    snapshot_id,
+    receipt_kind,
+    disposition,
+    occurred_at,
+    shift_id,
+    signature,
+    requirements,
+    provenance,
+    work_generation
+  )
+select
+  input.order_id,
+  input.id,
+  input.snapshot_id,
+  'posting',
+  'sale',
+  snap.ordered_at,
+  snap.shift_id,
+  md5('p77-o-remap'),
+  '[]'::jsonb,
+  pg_catalog.jsonb_build_object (
+    'at',
+    app.costing_timestamptz_text (snap.ordered_at),
+    'algorithm_version',
+    1,
+    'mapping_versions',
+    coalesce(
+      (
+        select
+          pg_catalog.jsonb_agg (
+            version.id
+            order by
+              version.id::text
+          )
+        from
+          app.pos_map_versions version
+          join app.pos_map_subjects subject on subject.id = version.subject_id
+        where
+          subject.kind = 'base'
+          and subject.pos_item_id = 'p77-remap-pos'
+          and subject.size_key = app.pos_size_key (null)
+          and version.superseded_change_id is null
+          and version.valid_during @> snap.ordered_at
+      ),
+      '[]'::jsonb
+    ),
+    'packaging_versions',
+    coalesce(
+      (
+        select
+          pg_catalog.jsonb_agg (
+            version.id
+            order by
+              version.id::text
+          )
+        from
+          app.packaging_versions version
+          join app.packaging_subjects subject on subject.id = version.subject_id
+        where
+          version.superseded_change_id is null
+          and version.valid_during @> snap.ordered_at
+          and (
+            (
+              subject.kind = 'base'
+              and subject.pos_item_id = 'p77-remap-pos'
+              and subject.size_key = app.pos_size_key (null)
+            )
+            or (
+              subject.kind = 'order_type'
+              and subject.order_type_key = app.packaging_order_type_key ('p77-remap')
+            )
+          )
+      ),
+      '[]'::jsonb
+    ),
+    'recipe_versions',
+    '[]'::jsonb,
+    'loss_versions',
+    coalesce(
+      (
+        select
+          pg_catalog.jsonb_agg (
+            pg_catalog.jsonb_build_object (
+              'item_id',
+              version.item_id,
+              'version_id',
+              version.id,
+              'loss_pct',
+              pg_catalog.trim_scale (version.loss_pct)::text
+            )
+            order by
+              version.item_id
+          )
+        from
+          app.item_loss_versions version
+        where
+          version.item_id = pg_temp.u (1)
+          and version.superseded_change_id is null
+          and version.valid_during @> snap.ordered_at
+      ),
+      '[]'::jsonb
+    ),
+    'conversion_versions',
+    '[]'::jsonb
+  ),
+  1
+from
+  app.pos_cost_inputs input
+  join app.pos_order_snapshots snap on snap.id = input.snapshot_id
+where
+  input.order_id = 'p77-o-remap';
+
+select
+  is (
+    (
+      select
+        row ->> 'completed_orders_covered'
+      from
+        app.list_shift_accounting_status ('2026-12-22 11:59:59+00', '', 20) row
+      where
+        row ->> 'shift_id' = 'p77-remap'
+    ),
+    '1',
+    'the mapped order is covered from its current evaluation'
+  );
+
+select
+  is (
+    (
+      select
+        row ->> 'completed_lines_covered'
+      from
+        app.list_shift_accounting_status ('2026-12-22 11:59:59+00', '', 20) row
+      where
+        row ->> 'shift_id' = 'p77-remap'
+    ),
+    '1',
+    'the mapped line is covered from its current evaluation'
+  );
+
+select
+  app.set_pos_base_mapping (
+    md5('map|p77-remap-pos|gap')::uuid,
+    'p77-remap-pos',
+    '["none"]'::jsonb,
+    '2026-01-01 00:00+00',
+    null,
+    null,
+    (
+      select
+        app.pos_base_schedule ('p77-remap-pos', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  is (
+    (
+      select
+        application.disposition
+      from
+        app.order_cost_applications application
+      where
+        application.order_id = 'p77-o-remap'
+    ),
+    'sale',
+    'the mapping change does not rewrite the stored receipt'
+  );
+
+select
+  is (
+    (
+      select
+        row ->> 'completed_orders_covered'
+      from
+        app.list_shift_accounting_status ('2026-12-22 11:59:59+00', '', 20) row
+      where
+        row ->> 'shift_id' = 'p77-remap'
+    ),
+    '0',
+    'a mapping change after the last evaluation is re-resolved'
+  );
+
+select
+  is (
+    (
+      select
+        row ->> 'completed_lines_covered'
+      from
+        app.list_shift_accounting_status ('2026-12-22 11:59:59+00', '', 20) row
+      where
+        row ->> 'shift_id' = 'p77-remap'
+    ),
+    '0',
+    'the re-resolved line is not served from the stale receipt'
+  );
+
 -- Findings 2 and 6 go through the coordinator. The sealed control is judged
 -- before the pre-migration item exists, because that item blocks every earlier shift.
 select
@@ -5936,6 +6295,31 @@ select
     'fixture'
   );
 
+-- A second mapping of the same target supersedes the first. One order on
+-- each shift keeps the superseded version in its receipt, so the page
+-- re-resolves that share and reads the rest from the current receipt.
+select
+  app.set_pos_base_mapping (
+    md5('map|p77-year-pos|2024-b')::uuid,
+    'p77-year-pos',
+    '["none"]'::jsonb,
+    '2024-01-01 00:00+00',
+    null,
+    pg_catalog.jsonb_build_object (
+      'stock_item_id',
+      pg_temp.u (6),
+      'quantity_per_basis',
+      '1',
+      'unit',
+      'kg'
+    ),
+    (
+      select
+        app.pos_base_schedule ('p77-year-pos', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
 update app.accounting_rederive_spans
 set
   completed_at = pg_catalog.clock_timestamp ()
@@ -6013,6 +6397,7 @@ insert into
     version,
     shift_id,
     status,
+    order_type,
     ordered_at,
     subtotal,
     discount,
@@ -6031,6 +6416,7 @@ select
   1,
   year_order.shift_id,
   'complete',
+  'hall',
   year_order.ordered_at,
   25,
   0,
@@ -6040,11 +6426,43 @@ select
   25,
   year_order.ordered_at,
   repeat('ab', 32),
-  '[]'::jsonb,
+  coalesce(line_json.lines, '[]'::jsonb),
   'sync',
   year_order.ordered_at
 from
-  p77_year_orders year_order;
+  p77_year_orders year_order
+  left join (
+    select
+      line.order_id,
+      pg_catalog.jsonb_agg (
+        pg_catalog.jsonb_build_object (
+          'line_id',
+          line.line_id,
+          'item_id',
+          line.item_id,
+          'item_name',
+          line.item_name,
+          'size_name',
+          line.size_name,
+          'quantity',
+          line.quantity,
+          'weighted_qty',
+          line.weighted_qty,
+          'weighted_unit',
+          line.weighted_unit,
+          'options',
+          line.options
+        )
+        order by
+          line.line_id
+      ) as lines
+    from
+      app.pos_order_lines line
+    where
+      line.order_id like 'p77-y-o-%'
+    group by
+      line.order_id
+  ) line_json on line_json.order_id = year_order.order_id;
 
 insert into
   app.pos_cost_inputs (
@@ -6090,6 +6508,7 @@ insert into
     shift_id,
     signature,
     requirements,
+    provenance,
     retire_batch,
     posting_batch,
     work_generation
@@ -6104,12 +6523,160 @@ select
   snap.shift_id,
   md5(input.order_id),
   '{}'::jsonb,
+  pg_catalog.jsonb_build_object (
+    'at',
+    app.costing_timestamptz_text (snap.ordered_at),
+    'algorithm_version',
+    1,
+    'mapping_versions',
+    case
+      when pg_catalog.right (input.order_id, 3) = '100' then basis.stale_mapping_versions
+      else basis.mapping_versions
+    end,
+    'packaging_versions',
+    basis.packaging_versions,
+    'recipe_versions',
+    '[]'::jsonb,
+    'loss_versions',
+    basis.loss_versions,
+    'conversion_versions',
+    '[]'::jsonb
+  ),
   pg_catalog.gen_random_uuid (),
   pg_catalog.gen_random_uuid (),
   1
 from
   app.pos_cost_inputs input
   join app.pos_order_snapshots snap on snap.id = input.snapshot_id
+  cross join (
+    select
+      current_basis.mapping_versions,
+      (
+        select
+          coalesce(
+            pg_catalog.jsonb_agg (
+              version_id
+              order by
+                version_id::text
+            ),
+            '[]'::jsonb
+          )
+        from
+          (
+            select
+              version.id as version_id
+            from
+              app.pos_map_versions version
+              join app.pos_map_subjects subject on subject.id = version.subject_id
+            where
+              subject.kind = 'base'
+              and subject.pos_item_id = 'p77-year-pos'
+              and subject.size_key = app.pos_size_key (null)
+              and version.family <> 'mapping'
+              and version.superseded_change_id is null
+              and version.valid_during @> '2024-06-01 00:00+00'::timestamptz
+            union all
+            select
+              old_mapping.id
+            from
+              (
+                select
+                  version.id
+                from
+                  app.pos_map_versions version
+                  join app.pos_map_subjects subject on subject.id = version.subject_id
+                where
+                  subject.kind = 'base'
+                  and subject.pos_item_id = 'p77-year-pos'
+                  and subject.size_key = app.pos_size_key (null)
+                  and version.family = 'mapping'
+                  and version.superseded_change_id is not null
+                order by
+                  version.id
+                limit
+                  1
+              ) old_mapping
+          ) stale_version
+      ) as stale_mapping_versions,
+      current_basis.packaging_versions,
+      current_basis.loss_versions
+    from
+      (
+        select
+          coalesce(
+            (
+              select
+                pg_catalog.jsonb_agg (
+                  version.id
+                  order by
+                    version.id::text
+                )
+              from
+                app.pos_map_versions version
+                join app.pos_map_subjects subject on subject.id = version.subject_id
+              where
+                subject.kind = 'base'
+                and subject.pos_item_id = 'p77-year-pos'
+                and subject.size_key = app.pos_size_key (null)
+                and version.superseded_change_id is null
+                and version.valid_during @> '2024-06-01 00:00+00'::timestamptz
+            ),
+            '[]'::jsonb
+          ) as mapping_versions,
+          coalesce(
+            (
+              select
+                pg_catalog.jsonb_agg (
+                  version.id
+                  order by
+                    version.id::text
+                )
+              from
+                app.packaging_versions version
+                join app.packaging_subjects subject on subject.id = version.subject_id
+              where
+                version.superseded_change_id is null
+                and version.valid_during @> '2024-06-01 00:00+00'::timestamptz
+                and (
+                  (
+                    subject.kind = 'base'
+                    and subject.pos_item_id = 'p77-year-pos'
+                    and subject.size_key = app.pos_size_key (null)
+                  )
+                  or (
+                    subject.kind = 'order_type'
+                    and subject.order_type_key = app.packaging_order_type_key ('hall')
+                  )
+                )
+            ),
+            '[]'::jsonb
+          ) as packaging_versions,
+          coalesce(
+            (
+              select
+                pg_catalog.jsonb_agg (
+                  pg_catalog.jsonb_build_object (
+                    'item_id',
+                    version.item_id,
+                    'version_id',
+                    version.id,
+                    'loss_pct',
+                    pg_catalog.trim_scale (version.loss_pct)::text
+                  )
+                  order by
+                    version.item_id
+                )
+              from
+                app.item_loss_versions version
+              where
+                version.item_id = pg_temp.u (6)
+                and version.superseded_change_id is null
+                and version.valid_during @> '2024-06-01 00:00+00'::timestamptz
+            ),
+            '[]'::jsonb
+          ) as loss_versions
+      ) current_basis
+  ) basis
 where
   input.order_id like 'p77-y-o-%';
 
@@ -6416,6 +6983,30 @@ select
     ),
     36500::bigint,
     'application volume matches the completed orders'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.order_cost_applications application
+      where
+        application.order_id like 'p77-y-o-%'
+        and exists (
+          select
+            1
+          from
+            pg_catalog.jsonb_array_elements_text (application.provenance -> 'mapping_versions') version_id (value)
+            join app.pos_map_versions version on version.id = version_id.value::uuid
+          where
+            version.family = 'mapping'
+            and version.superseded_change_id is not null
+        )
+    ),
+    365::bigint,
+    'one percent of the annual receipts cite a mapping that has since changed'
   );
 
 analyze app.order_cost_applications;

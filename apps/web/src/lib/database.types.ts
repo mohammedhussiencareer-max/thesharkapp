@@ -2628,6 +2628,9 @@ isOneToOne: true
 "shift_for_target":
 { Args: { "p_movement_id": number }; Returns: string
                            },
+"shift_page_order_coverage":
+{ Args: { "p_opening": string,"p_shift_ids": (string)[] }; Returns: Json
+                           },
 "start_pos_sync_run":
 { Args: { "p_mode": string }; Returns: number
                            },

@@ -666,51 +666,68 @@ service_role;
 create function app.count_sync_scope_covered (p_counted_at timestamptz) returns boolean language sql stable
 set
   search_path = '' as $$
+  -- Shifts that had already opened are the common case. Prove those first
+  -- and only then look for an order that sits on a shift opened later, so a
+  -- year of orders is not read once per count on the page.
   select
-    not exists (
-      select
-        1
-      from
-        (
-          select
-            shift.id,
-            shift.opened_at
-          from
-            app.pos_shifts shift
-          where
-            shift.opened_at <= p_counted_at
-          union
-          select
-            o.shift_id,
-            shift.opened_at
-          from
-            app.pos_orders o
-            join app.pos_shifts shift on shift.id = o.shift_id
-          where
-            o.ordered_at <= p_counted_at
-        ) as required (id, opened_at)
-      where
-        not exists (
-          select
-            1
-          from
-            app.pos_sync_coverage cov
-          where
-            app.sync_coverage_covers_shift (
-              cov.orders_scope_applied,
-              cov.scope_kind,
-              cov.scope_from,
-              cov.scope_shift_ids,
-              cov.presented_shift_ids,
-              cov.legacy_direct,
-              required.id,
-              required.opened_at
-            )
-        )
-    );
+    case
+      when exists (
+        select
+          1
+        from
+          app.pos_shifts shift
+        where
+          shift.opened_at <= p_counted_at
+          and not exists (
+            select
+              1
+            from
+              app.pos_sync_coverage cov
+            where
+              app.sync_coverage_covers_shift (
+                cov.orders_scope_applied,
+                cov.scope_kind,
+                cov.scope_from,
+                cov.scope_shift_ids,
+                cov.presented_shift_ids,
+                cov.legacy_direct,
+                shift.id,
+                shift.opened_at
+              )
+          )
+      ) then false
+      when exists (
+        select
+          1
+        from
+          app.pos_orders o
+          join app.pos_shifts shift on shift.id = o.shift_id
+        where
+          o.ordered_at <= p_counted_at
+          and shift.opened_at > p_counted_at
+          and not exists (
+            select
+              1
+            from
+              app.pos_sync_coverage cov
+            where
+              app.sync_coverage_covers_shift (
+                cov.orders_scope_applied,
+                cov.scope_kind,
+                cov.scope_from,
+                cov.scope_shift_ids,
+                cov.presented_shift_ids,
+                cov.legacy_direct,
+                shift.id,
+                shift.opened_at
+              )
+          )
+      ) then false
+      else true
+    end;
 $$;
 
-comment on function app.count_sync_scope_covered (timestamptz) is 'True when every shift opened at or before p_counted_at, and every shift of an order at or before p_counted_at, is covered by some non-legacy pos_sync_coverage row. No such shift is covered. Does not change whether record_count accepts a count.';
+comment on function app.count_sync_scope_covered (timestamptz) is 'True when every shift opened at or before p_counted_at, and every shift of an order at or before p_counted_at, is covered by some non-legacy pos_sync_coverage row. A shift that opened later is required only when one of its orders is at or before the count. No such shift is covered. Does not change whether record_count accepts a count.';
 
 revoke all on function app.count_sync_scope_covered (timestamptz)
 from
@@ -1228,18 +1245,19 @@ from
   authenticated,
   service_role;
 
--- One order's coverage counters. Parallel safe so a page aggregate can gather
--- workers: a call costs far more than a comparison, which is what the planner
--- uses to decide. resolve_order_requirements and every function it calls only
--- read. An error while resolving leaves the order unready and covers none of
--- its lines. Private.
+-- One order's coverage counters, used when no current evaluation is stored.
+-- resolve_order_requirements and every function it calls only read. An error
+-- while resolving leaves the order unready and covers none of its lines.
+-- Private.
 create function app.order_coverage_counts (p_order_id text) returns table (
   ready integer,
   lines_denom integer,
   lines_covered integer
 ) language plpgsql stable parallel safe cost 100000
 set
-  search_path = '' as $$
+  search_path = ''
+set
+  enable_nestloop = on as $$
 declare
   v_resolved jsonb;
 begin
@@ -1280,9 +1298,613 @@ begin
 end;
 $$;
 
-comment on function app.order_coverage_counts (text) is 'Private. ready is 1 when resolve_order_requirements reports the order ready. lines_denom counts positive lines. lines_covered counts those lines whose own status is ready or exception. A resolver error counts as not ready and covers no lines.';
+comment on function app.order_coverage_counts (text) is 'Private. ready is 1 when resolve_order_requirements reports the order ready. lines_denom counts positive lines. lines_covered counts those lines whose own status is ready or exception. A resolver error counts as not ready and covers no lines. The shift page calls this only for an order with no current evaluation. Nested loops are pinned on so the page coverage statement, which disables them, does not change the resolver plan.';
 
 revoke all on function app.order_coverage_counts (text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+-- Page coverage from the latest evaluation receipt when that receipt is still
+-- the current basis. A sale, a no-stock evaluation, or an incomplete receipt
+-- whose only causes are missing_shift or before_item_opening was resolver-ready,
+-- so every positive line is covered. The receipt is current when it is the
+-- latest application of the latest cost input, the live order still matches
+-- that snapshot, every version id in the receipt provenance is still in force
+-- at ordered_at, and no later costing change touches the order's mapping,
+-- packaging, recipe, loss, or conversion subjects. Anything else, including an
+-- order that was never evaluated, is resolved by order_coverage_counts.
+-- Nested loops stay off for this statement. It is planned once per session,
+-- often while the order table is still small, and a one-row estimate makes
+-- the receipt joins a cartesian filter. Hash joins stay correct when the
+-- page later holds thousands of orders. order_coverage_counts turns nested
+-- loops back on so the resolver is not planned under this setting.
+create function app.shift_page_order_coverage (p_shift_ids text[], p_opening timestamptz) returns jsonb language sql stable
+set
+  search_path = ''
+set
+  join_collapse_limit = 1
+set
+  from_collapse_limit = 1
+set
+  enable_seqscan = off
+set
+  enable_nestloop = off as $$
+  select
+    case
+      when p_opening is null
+      or coalesce(pg_catalog.cardinality (p_shift_ids), 0) = 0 then '{}'::jsonb
+      else (
+        with
+          page as materialized (
+            select
+              o.id,
+              o.shift_id,
+              o.status,
+              o.order_type,
+              o.ordered_at,
+              o.missing_from_pos
+            from
+              app.pos_orders o
+            where
+              o.shift_id = any (p_shift_ids)
+              and o.ordered_at >= p_opening
+              and o.status = 'complete'
+              and not o.missing_from_pos
+          ),
+          latest_app as materialized (
+            select distinct
+              on (application.order_id) application.id,
+              application.order_id,
+              application.cost_input_id,
+              application.snapshot_id,
+              application.disposition,
+              application.provenance,
+              application.algorithm_version,
+              application.causes,
+              application.created_at
+            from
+              app.order_cost_applications application
+              join page on page.id = application.order_id
+            order by
+              application.order_id,
+              application.id desc
+          ),
+          latest_input as materialized (
+            select distinct
+              on (input.order_id) input.id,
+              input.order_id,
+              input.missing_from_pos,
+              input.snapshot_id
+            from
+              app.pos_cost_inputs input
+              join page on page.id = input.order_id
+            order by
+              input.order_id,
+              input.input_revision desc,
+              input.id desc
+          ),
+          line_counts as materialized (
+            select
+              page.id as order_id,
+              count(line.line_id) filter (
+                where
+                  line.quantity > 0
+                  or line.weighted_qty > 0
+              )::integer as lines_denom
+            from
+              page
+              left join app.pos_order_lines line on line.order_id = page.id
+            group by
+              page.id
+          ),
+          line_mismatch as materialized (
+            select
+              latest_app.order_id
+            from
+              latest_app
+              join app.pos_order_snapshots snap on snap.id = latest_app.snapshot_id
+            where
+              exists (
+                select
+                  1
+                from
+                  (
+                    select
+                      line.line_id,
+                      line.item_id,
+                      line.item_name,
+                      line.size_name,
+                      line.quantity,
+                      line.weighted_qty,
+                      line.weighted_unit,
+                      line.options
+                    from
+                      app.pos_order_lines line
+                    where
+                      line.order_id = latest_app.order_id
+                  ) live
+                  full join (
+                    select
+                      snap_line.line_id,
+                      snap_line.item_id,
+                      snap_line.item_name,
+                      snap_line.size_name,
+                      snap_line.quantity,
+                      snap_line.weighted_qty,
+                      snap_line.weighted_unit,
+                      snap_line.options
+                    from
+                      pg_catalog.jsonb_to_recordset (coalesce(snap.lines, '[]'::jsonb)) as snap_line (
+                        line_id text,
+                        item_id text,
+                        item_name text,
+                        size_name text,
+                        quantity numeric,
+                        weighted_qty numeric,
+                        weighted_unit text,
+                        options jsonb
+                      )
+                  ) snap_line on snap_line.line_id = live.line_id
+                where
+                  live.line_id is null
+                  or snap_line.line_id is null
+                  or live.item_id is distinct from snap_line.item_id
+                  or live.item_name is distinct from snap_line.item_name
+                  or live.size_name is distinct from snap_line.size_name
+                  or pg_catalog.trim_scale (live.quantity) is distinct from pg_catalog.trim_scale (snap_line.quantity)
+                  or pg_catalog.trim_scale (live.weighted_qty) is distinct from pg_catalog.trim_scale (snap_line.weighted_qty)
+                  or live.weighted_unit is distinct from snap_line.weighted_unit
+                  or live.options is distinct from coalesce(snap_line.options, '[]'::jsonb)
+              )
+          ),
+          ready_receipt as materialized (
+            select
+              page.id as order_id,
+              page.shift_id,
+              latest_app.id as application_id,
+              latest_app.created_at,
+              latest_app.provenance,
+              line_counts.lines_denom
+            from
+              page
+              join latest_app on latest_app.order_id = page.id
+              join latest_input on latest_input.id = latest_app.cost_input_id
+              join app.pos_order_snapshots snap on snap.id = latest_app.snapshot_id
+              join line_counts on line_counts.order_id = page.id
+            where
+              latest_app.algorithm_version = 1
+              and latest_app.provenance is not null
+              and coalesce(
+                (latest_app.provenance ->> 'algorithm_version')::integer,
+                1
+              ) = 1
+              and (
+                latest_app.disposition = 'sale'
+                or (
+                  latest_app.disposition = 'none'
+                  and pg_catalog.jsonb_array_length(coalesce(latest_app.causes, '[]'::jsonb)) > 0
+                  and not exists (
+                    select
+                      1
+                    from
+                      pg_catalog.jsonb_array_elements(latest_app.causes) cause (value)
+                    where
+                      coalesce(cause.value ->> 'code', '') <> 'no_stock'
+                  )
+                )
+                or (
+                  latest_app.disposition = 'incomplete'
+                  and pg_catalog.jsonb_array_length(coalesce(latest_app.causes, '[]'::jsonb)) > 0
+                  and not exists (
+                    select
+                      1
+                    from
+                      pg_catalog.jsonb_array_elements(latest_app.causes) cause (value)
+                    where
+                      coalesce(cause.value ->> 'code', '') not in ('missing_shift', 'before_item_opening')
+                  )
+                )
+              )
+              and page.status is not distinct from snap.status
+              and page.ordered_at is not distinct from snap.ordered_at
+              and page.order_type is not distinct from snap.order_type
+              and page.missing_from_pos is not distinct from latest_input.missing_from_pos
+              and not exists (
+                select
+                  1
+                from
+                  line_mismatch
+                where
+                  line_mismatch.order_id = page.id
+              )
+          ),
+          cited as materialized (
+            select
+              ready_receipt.application_id,
+              ready_receipt.order_id,
+              page.ordered_at,
+              'pos_map'::text as family,
+              version_id.value::uuid as version_id
+            from
+              ready_receipt
+              join page on page.id = ready_receipt.order_id
+              cross join lateral pg_catalog.jsonb_array_elements_text(
+                coalesce(ready_receipt.provenance -> 'mapping_versions', '[]'::jsonb)
+              ) as version_id (value)
+            where
+              version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+            union all
+            select
+              ready_receipt.application_id,
+              ready_receipt.order_id,
+              page.ordered_at,
+              'packaging'::text,
+              version_id.value::uuid
+            from
+              ready_receipt
+              join page on page.id = ready_receipt.order_id
+              cross join lateral pg_catalog.jsonb_array_elements_text(
+                coalesce(ready_receipt.provenance -> 'packaging_versions', '[]'::jsonb)
+              ) as version_id (value)
+            where
+              version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+            union all
+            select
+              ready_receipt.application_id,
+              ready_receipt.order_id,
+              page.ordered_at,
+              'recipe'::text,
+              version_id.value::uuid
+            from
+              ready_receipt
+              join page on page.id = ready_receipt.order_id
+              cross join lateral pg_catalog.jsonb_array_elements_text(
+                coalesce(ready_receipt.provenance -> 'recipe_versions', '[]'::jsonb)
+              ) as version_id (value)
+            where
+              version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+            union all
+            select
+              ready_receipt.application_id,
+              ready_receipt.order_id,
+              page.ordered_at,
+              'loss'::text,
+              (version_row.value ->> 'version_id')::uuid
+            from
+              ready_receipt
+              join page on page.id = ready_receipt.order_id
+              cross join lateral pg_catalog.jsonb_array_elements(
+                coalesce(ready_receipt.provenance -> 'loss_versions', '[]'::jsonb)
+              ) as version_row (value)
+            where
+              coalesce(version_row.value ->> 'version_id', '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+            union all
+            select
+              ready_receipt.application_id,
+              ready_receipt.order_id,
+              page.ordered_at,
+              'conversion'::text,
+              (version_row.value ->> 'version_id')::uuid
+            from
+              ready_receipt
+              join page on page.id = ready_receipt.order_id
+              cross join lateral pg_catalog.jsonb_array_elements(
+                coalesce(ready_receipt.provenance -> 'conversion_versions', '[]'::jsonb)
+              ) as version_row (value)
+            where
+              coalesce(version_row.value ->> 'version_id', '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          ),
+          -- A receipt written after every costing change cannot have been touched.
+          -- The subject walk runs only for the receipts a later change could affect.
+          touched_candidate as materialized (
+            select
+              ready_receipt.application_id,
+              ready_receipt.order_id,
+              ready_receipt.created_at,
+              ready_receipt.provenance
+            from
+              ready_receipt
+            where
+              ready_receipt.created_at < (
+                select
+                  pg_catalog.max(change.recorded_at)
+                from
+                  app.costing_changes change
+              )
+          ),
+          stale_receipt as materialized (
+            select
+              cited.application_id
+            from
+              cited
+              left join app.pos_map_versions map_version on cited.family = 'pos_map'
+              and map_version.id = cited.version_id
+              left join app.packaging_versions packaging_version on cited.family = 'packaging'
+              and packaging_version.id = cited.version_id
+              left join app.recipe_versions recipe_version on cited.family = 'recipe'
+              and recipe_version.id = cited.version_id
+              left join app.item_loss_versions loss_version on cited.family = 'loss'
+              and loss_version.id = cited.version_id
+              left join app.item_conversion_versions conversion_version on cited.family = 'conversion'
+              and conversion_version.id = cited.version_id
+            where
+              (
+                cited.family = 'pos_map'
+                and (
+                  map_version.id is null
+                  or map_version.superseded_change_id is not null
+                  or not map_version.valid_during @> cited.ordered_at
+                )
+              )
+              or (
+                cited.family = 'packaging'
+                and (
+                  packaging_version.id is null
+                  or packaging_version.superseded_change_id is not null
+                  or not packaging_version.valid_during @> cited.ordered_at
+                )
+              )
+              or (
+                cited.family = 'recipe'
+                and (
+                  recipe_version.id is null
+                  or recipe_version.superseded_change_id is not null
+                  or not recipe_version.valid_during @> cited.ordered_at
+                )
+              )
+              or (
+                cited.family = 'loss'
+                and (
+                  loss_version.id is null
+                  or loss_version.superseded_change_id is not null
+                  or not loss_version.valid_during @> cited.ordered_at
+                )
+              )
+              or (
+                cited.family = 'conversion'
+                and (
+                  conversion_version.id is null
+                  or conversion_version.superseded_change_id is not null
+                  or not conversion_version.valid_during @> cited.ordered_at
+                )
+              )
+            union
+            select
+              touched_candidate.application_id
+            from
+              touched_candidate
+            where
+              exists (
+                select
+                  1
+                from
+                  app.costing_changes change
+                where
+                  change.recorded_at > touched_candidate.created_at
+                  and (
+                    exists (
+                      select
+                        1
+                      from
+                        app.pos_map_versions version
+                        join app.pos_map_subjects subject on subject.id = version.subject_id
+                        join app.pos_order_lines line on line.order_id = touched_candidate.order_id
+                        and subject.kind = 'base'
+                        and subject.pos_item_id = line.item_id
+                        and subject.size_key = app.pos_size_key (line.size_name)
+                      where
+                        version.created_change_id = change.id
+                        or version.superseded_change_id = change.id
+                    )
+                    or exists (
+                      select
+                        1
+                      from
+                        app.packaging_versions version
+                        join app.packaging_subjects subject on subject.id = version.subject_id
+                      where
+                        (
+                          version.created_change_id = change.id
+                          or version.superseded_change_id = change.id
+                        )
+                        and (
+                          (
+                            subject.kind = 'base'
+                            and exists (
+                              select
+                                1
+                              from
+                                app.pos_order_lines line
+                              where
+                                line.order_id = touched_candidate.order_id
+                                and subject.pos_item_id = line.item_id
+                                and subject.size_key = app.pos_size_key (line.size_name)
+                            )
+                          )
+                          or (
+                            subject.kind = 'order_type'
+                            and subject.order_type_key = app.packaging_order_type_key (
+                              (
+                                select
+                                  page.order_type
+                                from
+                                  page
+                                where
+                                  page.id = touched_candidate.order_id
+                              )
+                            )
+                          )
+                        )
+                    )
+                    or exists (
+                      select
+                        1
+                      from
+                        app.recipe_versions version
+                        join app.pos_map_versions map_version on map_version.recipe_id = version.recipe_id
+                        join cited on cited.application_id = touched_candidate.application_id
+                        and cited.family = 'pos_map'
+                        and cited.version_id = map_version.id
+                      where
+                        version.created_change_id = change.id
+                        or version.superseded_change_id = change.id
+                    )
+                    or exists (
+                      select
+                        1
+                      from
+                        app.item_loss_versions version
+                      where
+                        (
+                          version.created_change_id = change.id
+                          or version.superseded_change_id = change.id
+                        )
+                        and (
+                          version.item_id in (
+                            select
+                              map_version.stock_item_id
+                            from
+                              cited
+                              join app.pos_map_versions map_version on map_version.id = cited.version_id
+                            where
+                              cited.application_id = touched_candidate.application_id
+                              and cited.family = 'pos_map'
+                              and map_version.stock_item_id is not null
+                          )
+                          or version.item_id::text in (
+                            select
+                              loss_row.value ->> 'item_id'
+                            from
+                              pg_catalog.jsonb_array_elements(
+                                coalesce(
+                                  touched_candidate.provenance -> 'loss_versions',
+                                  '[]'::jsonb
+                                )
+                              ) as loss_row (value)
+                          )
+                        )
+                    )
+                    or exists (
+                      select
+                        1
+                      from
+                        app.item_conversion_versions version
+                      where
+                        (
+                          version.created_change_id = change.id
+                          or version.superseded_change_id = change.id
+                        )
+                        and version.item_id in (
+                          select
+                            map_version.stock_item_id
+                          from
+                            cited
+                            join app.pos_map_versions map_version on map_version.id = cited.version_id
+                          where
+                            cited.application_id = touched_candidate.application_id
+                            and cited.family = 'pos_map'
+                            and map_version.stock_item_id is not null
+                        )
+                    )
+                  )
+              )
+          ),
+          fresh as materialized (
+            select
+              ready_receipt.order_id,
+              ready_receipt.shift_id,
+              ready_receipt.lines_denom
+            from
+              ready_receipt
+            where
+              not exists (
+                select
+                  1
+                from
+                  stale_receipt
+                where
+                  stale_receipt.application_id = ready_receipt.application_id
+              )
+          )
+        select
+          coalesce(
+            pg_catalog.jsonb_object_agg(
+              hit.shift_id,
+              pg_catalog.jsonb_build_object(
+                'orders_denom',
+                hit.orders_denom,
+                'orders_covered',
+                hit.orders_covered,
+                'lines_denom',
+                hit.lines_denom,
+                'lines_covered',
+                hit.lines_covered
+              )
+            ),
+            '{}'::jsonb
+          )
+        from
+          (
+            select
+              page.shift_id,
+              count(*) as orders_denom,
+              coalesce(
+                sum((coverage.value ->> 'ready')::integer),
+                0
+              ) as orders_covered,
+              coalesce(
+                sum((coverage.value ->> 'lines_denom')::integer),
+                0
+              ) as lines_denom,
+              coalesce(
+                sum((coverage.value ->> 'lines_covered')::integer),
+                0
+              ) as lines_covered
+            from
+              page
+              join line_counts on line_counts.order_id = page.id
+              left join fresh on fresh.order_id = page.id
+              cross join lateral (
+                select
+                  coalesce(
+                    case
+                      when fresh.order_id is not null then pg_catalog.jsonb_build_object(
+                        'ready',
+                        1,
+                        'lines_denom',
+                        fresh.lines_denom,
+                        'lines_covered',
+                        fresh.lines_denom
+                      )
+                    end,
+                    (
+                      select
+                        pg_catalog.jsonb_build_object(
+                          'ready',
+                          counted.ready,
+                          'lines_denom',
+                          counted.lines_denom,
+                          'lines_covered',
+                          counted.lines_covered
+                        )
+                      from
+                        app.order_coverage_counts (page.id) counted
+                    )
+                  ) as value
+              ) coverage
+            group by
+              page.shift_id
+          ) hit
+      )
+    end;
+$$;
+
+comment on function app.shift_page_order_coverage (text[], timestamptz) is 'Private. Coverage counters for the completed, present orders of one shift page at or after the opening. A latest evaluation receipt whose basis is still current supplies the counts: a resolver-ready receipt covers the order and every positive line. resolve_order_requirements runs only for an order that was never evaluated or whose basis changed, including a mapping change after the receipt. With no opening the result is empty and the denominator stays zero.';
+
+revoke all on function app.shift_page_order_coverage (text[], timestamptz)
 from
   public,
   anon,
@@ -1294,8 +1916,9 @@ from
 -- Owner only. Keyset by (opened_at, id). Quantities and money are decimal text.
 -- Completed-order coverage counts only complete, present orders at or after
 -- the first opening. With no opening the denominator is zero: those orders
--- stay sales-only and are not an incomplete-mapping blocker. The page's
--- orders are resolved once per call.
+-- stay sales-only and are not an incomplete-mapping blocker. A current
+-- evaluation receipt supplies that coverage. The resolver runs only for an
+-- order with no current evaluation.
 -- ============================================================================
 create function app.list_shift_accounting_status (
   p_after_opened_at timestamptz default null,
@@ -1303,17 +1926,7 @@ create function app.list_shift_accounting_status (
   p_limit integer default null
 ) returns setof jsonb language plpgsql stable security definer
 set
-  search_path = ''
-set
-  min_parallel_table_scan_size = 0
-set
-  min_parallel_index_scan_size = 0
-set
-  max_parallel_workers_per_gather = 2
-set
-  parallel_setup_cost = 0
-set
-  parallel_tuple_cost = 0 as $$
+  search_path = '' as $$
 declare
   v_limit integer;
   v_opening timestamptz;
@@ -2020,56 +2633,12 @@ begin
         diff.shift_id
     ) grouped;
 
-  -- SELECT INTO asks for one row and will not run a parallel plan. EXECUTE
-  -- fetches the whole aggregate, so the resolver can run on the workers.
-  -- The gather cap and the scan thresholds are function SET clauses, which
-  -- Postgres restores on exit and on error.
-  execute $coverage$
-      select
-        coalesce(
-          pg_catalog.jsonb_object_agg(
-            hit.shift_id,
-            pg_catalog.jsonb_build_object(
-              'orders_denom',
-              hit.orders_denom,
-              'orders_covered',
-              hit.orders_covered,
-              'lines_denom',
-              hit.lines_denom,
-              'lines_covered',
-              hit.lines_covered
-            )
-          ),
-          '{}'::jsonb
-        )
-      from
-        (
-          select
-            o.shift_id,
-            count(*) as orders_denom,
-            coalesce(sum(c.ready), 0) as orders_covered,
-            coalesce(sum(c.lines_denom), 0) as lines_denom,
-            coalesce(sum(c.lines_covered), 0) as lines_covered
-          from
-            app.pos_orders o
-            cross join lateral app.order_coverage_counts (o.id) c
-          where
-            o.shift_id = any ($1)
-            and $2::timestamptz is not null
-            and o.ordered_at >= $2
-            and o.status = 'complete'
-            and not o.missing_from_pos
-          group by
-            o.shift_id
-        ) hit
-    $coverage$
-    using
-      v_page_ids,
-      v_opening
-    into
-      v_order_coverage;
-
-  v_order_coverage := coalesce(v_order_coverage, '{}'::jsonb);
+  -- Current receipts answer from provenance. The resolver runs only for an
+  -- order that has no current evaluation.
+  v_order_coverage := coalesce(
+    app.shift_page_order_coverage (v_page_ids, v_opening),
+    '{}'::jsonb
+  );
 
   -- One pass over the page. The shift loop used to repeat each of these scans.
   select
@@ -2777,7 +3346,7 @@ begin
 end;
 $$;
 
-comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item and uses the anchor''s pinned shift. Weekly settlement names that pinned shift, the separate interval-owning shift, and the covered interval. Count coverage for the page is read once, and the scope proof runs only for anchors that cover those shifts. Blocker counts for the page are read once. Revision rows for the page are aggregated once per call, from the batches of that page only. Completed-order coverage for the page is resolved once per call. A partial daily roster is تقديري only when no blocker is set. Unknown backfill tracking applies only to an item that already existed when the shift opened. An incomplete application, an unfinished rederive span, and unsettled work on either the latest snapshot shift or the live application shift are ناقص. Consecutive incomplete receipts keep the retired application shift until the order is settled. Revision history follows captured_at, then the numeric cause_sort, then cause kind and id. source_at in that history is the economic time. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Completed-order readiness is atomic. Line coverage counts ready and exception lines on their own. Quantities and money are decimal text. Does not post stock and does not change record_count.';
+comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item and uses the anchor''s pinned shift. Weekly settlement names that pinned shift, the separate interval-owning shift, and the covered interval. Count coverage for the page is read once, and the scope proof runs only for anchors that cover those shifts. Blocker counts for the page are read once. Revision rows for the page are aggregated once per call, from the batches of that page only. Completed-order coverage for the page is read from the current evaluation receipt. resolve_order_requirements runs only for an order with no current evaluation. A partial daily roster is تقديري only when no blocker is set. Unknown backfill tracking applies only to an item that already existed when the shift opened. An incomplete application, an unfinished rederive span, and unsettled work on either the latest snapshot shift or the live application shift are ناقص. Consecutive incomplete receipts keep the retired application shift until the order is settled. Revision history follows captured_at, then the numeric cause_sort, then cause kind and id. source_at in that history is the economic time. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Completed-order readiness is atomic. Line coverage counts ready and exception lines on their own. Quantities and money are decimal text. Does not post stock and does not change record_count.';
 
 revoke all on function app.list_shift_accounting_status (timestamptz, text, integer)
 from
