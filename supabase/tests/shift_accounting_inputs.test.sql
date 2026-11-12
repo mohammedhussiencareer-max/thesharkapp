@@ -7063,6 +7063,12 @@ select
     'the annual fixture includes a waste correction each week'
   );
 
+-- The year was bulk-loaded in this transaction, so the planner still sees the
+-- pre-load statistics until ANALYZE. Autovacuum would have published these.
+-- shift_page_order_coverage is plpgsql, so this ANALYZE drops the plan cached
+-- by the earlier page calls. The timed call below is the next call.
+analyze app.pos_shifts;
+
 analyze app.pos_orders;
 
 analyze app.pos_order_lines;
@@ -7073,15 +7079,43 @@ analyze app.pos_cost_inputs;
 
 analyze app.order_cost_applications;
 
+analyze app.opening_stocks;
+
+analyze app.stock_items;
+
+analyze app.stock_counts;
+
+analyze app.stock_count_lines;
+
+analyze app.stock_count_anchors;
+
 analyze app.stock_movements;
 
 analyze app.period_revisions;
 
-analyze app.accounting_work_events;
-
 analyze app.waste_documents;
 
 analyze app.sales_revision_facts;
+
+analyze app.accounting_work_events;
+
+analyze app.pos_map_subjects;
+
+analyze app.pos_map_versions;
+
+analyze app.packaging_subjects;
+
+analyze app.packaging_versions;
+
+analyze app.recipe_versions;
+
+analyze app.item_loss_versions;
+
+analyze app.item_conversion_versions;
+
+analyze app.costing_changes;
+
+analyze app.item_tracking_history;
 
 create temp table p77_bench (
   ms numeric,

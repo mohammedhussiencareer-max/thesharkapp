@@ -1255,9 +1255,7 @@ create function app.order_coverage_counts (p_order_id text) returns table (
   lines_covered integer
 ) language plpgsql stable parallel safe cost 100000
 set
-  search_path = ''
-set
-  enable_nestloop = on as $$
+  search_path = '' as $$
 declare
   v_resolved jsonb;
 begin
@@ -1298,7 +1296,7 @@ begin
 end;
 $$;
 
-comment on function app.order_coverage_counts (text) is 'Private. ready is 1 when resolve_order_requirements reports the order ready. lines_denom counts positive lines. lines_covered counts those lines whose own status is ready or exception. A resolver error counts as not ready and covers no lines. The shift page calls this only for an order with no current evaluation. Nested loops are pinned on so the page coverage statement, which disables them, does not change the resolver plan.';
+comment on function app.order_coverage_counts (text) is 'Private. ready is 1 when resolve_order_requirements reports the order ready. lines_denom counts positive lines. lines_covered counts those lines whose own status is ready or exception. A resolver error counts as not ready and covers no lines. The shift page calls this only for an order with no current evaluation.';
 
 revoke all on function app.order_coverage_counts (text)
 from
@@ -1316,590 +1314,518 @@ from
 -- at ordered_at, and no later costing change touches the order's mapping,
 -- packaging, recipe, loss, or conversion subjects. Anything else, including an
 -- order that was never evaluated, is resolved by order_coverage_counts.
--- Nested loops stay off for this statement. It is planned once per session,
--- often while the order table is still small, and a one-row estimate makes
--- the receipt joins a cartesian filter. Hash joins stay correct when the
--- page later holds thousands of orders. order_coverage_counts turns nested
--- loops back on so the resolver is not planned under this setting.
-create function app.shift_page_order_coverage (p_shift_ids text[], p_opening timestamptz) returns jsonb language sql stable
+-- plpgsql so the statement is in the plan cache. A SQL function keeps its plan
+-- for the transaction, and ANALYZE does not drop that cache. ANALYZE, including
+-- autovacuum, invalidates this plan; the next call uses the published statistics.
+-- Each page order is fetched by index. The subject walk runs only when a costing
+-- change was recorded after the receipt. The per-order result is materialized
+-- once: the aggregate reads that value, so the lookups are not repeated for
+-- each counter.
+create function app.shift_page_order_coverage (p_shift_ids text[], p_opening timestamptz) returns jsonb language plpgsql stable
 set
-  search_path = ''
-set
-  join_collapse_limit = 1
-set
-  from_collapse_limit = 1
-set
-  enable_seqscan = off
-set
-  enable_nestloop = off as $$
-  select
-    case
-      when p_opening is null
-      or coalesce(pg_catalog.cardinality (p_shift_ids), 0) = 0 then '{}'::jsonb
-      else (
-        with
-          page as materialized (
-            select
-              o.id,
-              o.shift_id,
-              o.status,
-              o.order_type,
-              o.ordered_at,
-              o.missing_from_pos
-            from
-              app.pos_orders o
-            where
-              o.shift_id = any (p_shift_ids)
-              and o.ordered_at >= p_opening
-              and o.status = 'complete'
-              and not o.missing_from_pos
-          ),
-          latest_app as materialized (
-            select distinct
-              on (application.order_id) application.id,
-              application.order_id,
-              application.cost_input_id,
-              application.snapshot_id,
-              application.disposition,
-              application.provenance,
-              application.algorithm_version,
-              application.causes,
-              application.created_at
-            from
-              app.order_cost_applications application
-              join page on page.id = application.order_id
-            order by
-              application.order_id,
-              application.id desc
-          ),
-          latest_input as materialized (
-            select distinct
-              on (input.order_id) input.id,
-              input.order_id,
-              input.missing_from_pos,
-              input.snapshot_id
-            from
-              app.pos_cost_inputs input
-              join page on page.id = input.order_id
-            order by
-              input.order_id,
-              input.input_revision desc,
-              input.id desc
-          ),
-          line_counts as materialized (
-            select
-              page.id as order_id,
-              count(line.line_id) filter (
-                where
-                  line.quantity > 0
-                  or line.weighted_qty > 0
-              )::integer as lines_denom
-            from
-              page
-              left join app.pos_order_lines line on line.order_id = page.id
-            group by
-              page.id
-          ),
-          line_mismatch as materialized (
-            select
-              latest_app.order_id
-            from
-              latest_app
-              join app.pos_order_snapshots snap on snap.id = latest_app.snapshot_id
-            where
-              exists (
+  search_path = '' as $$
+declare
+  v_coverage jsonb;
+begin
+  if p_opening is null
+  or coalesce(pg_catalog.cardinality (p_shift_ids), 0) = 0 then
+    return '{}'::jsonb;
+  end if;
+
+  with
+    page as materialized (
+      select
+        placed.id,
+        placed.shift_id,
+        placed.status,
+        placed.order_type,
+        placed.ordered_at,
+        placed.missing_from_pos
+      from
+        app.pos_orders placed
+      where
+        placed.shift_id = any (p_shift_ids)
+        and placed.ordered_at >= p_opening
+        and placed.status = 'complete'
+        and not placed.missing_from_pos
+    ),
+    per_order as materialized (
+      select
+        page.shift_id,
+        coverage.value
+      from
+        page
+        cross join lateral (
+          select
+            coalesce(
+              (
                 select
-                  1
+                  pg_catalog.jsonb_build_object(
+                    'ready',
+                    1,
+                    'lines_denom',
+                    fresh_row.lines_denom,
+                    'lines_covered',
+                    fresh_row.lines_denom
+                  )
                 from
                   (
                     select
-                      line.line_id,
-                      line.item_id,
-                      line.item_name,
-                      line.size_name,
-                      line.quantity,
-                      line.weighted_qty,
-                      line.weighted_unit,
-                      line.options
+                      (
+                        select
+                          count(*) filter (
+                            where
+                              line.quantity > 0
+                              or line.weighted_qty > 0
+                          )::integer
+                        from
+                          app.pos_order_lines line
+                        where
+                          line.order_id = page.id
+                      ) as lines_denom
                     from
-                      app.pos_order_lines line
+                      lateral (
+                        select
+                          receipt.id,
+                          receipt.cost_input_id,
+                          receipt.snapshot_id,
+                          receipt.disposition,
+                          receipt.provenance,
+                          receipt.algorithm_version,
+                          receipt.causes,
+                          receipt.created_at
+                        from
+                          app.order_cost_applications receipt
+                        where
+                          receipt.order_id = page.id
+                        order by
+                          receipt.id desc
+                        limit
+                          1
+                      ) receipt
+                      join lateral (
+                        select
+                          input.id,
+                          input.missing_from_pos
+                        from
+                          app.pos_cost_inputs input
+                        where
+                          input.order_id = page.id
+                        order by
+                          input.input_revision desc,
+                          input.id desc
+                        limit
+                          1
+                      ) inp on inp.id = receipt.cost_input_id
+                      join app.pos_order_snapshots snap on snap.id = receipt.snapshot_id
                     where
-                      line.order_id = latest_app.order_id
-                  ) live
-                  full join (
-                    select
-                      snap_line.line_id,
-                      snap_line.item_id,
-                      snap_line.item_name,
-                      snap_line.size_name,
-                      snap_line.quantity,
-                      snap_line.weighted_qty,
-                      snap_line.weighted_unit,
-                      snap_line.options
-                    from
-                      pg_catalog.jsonb_to_recordset (coalesce(snap.lines, '[]'::jsonb)) as snap_line (
-                        line_id text,
-                        item_id text,
-                        item_name text,
-                        size_name text,
-                        quantity numeric,
-                        weighted_qty numeric,
-                        weighted_unit text,
-                        options jsonb
-                      )
-                  ) snap_line on snap_line.line_id = live.line_id
-                where
-                  live.line_id is null
-                  or snap_line.line_id is null
-                  or live.item_id is distinct from snap_line.item_id
-                  or live.item_name is distinct from snap_line.item_name
-                  or live.size_name is distinct from snap_line.size_name
-                  or pg_catalog.trim_scale (live.quantity) is distinct from pg_catalog.trim_scale (snap_line.quantity)
-                  or pg_catalog.trim_scale (live.weighted_qty) is distinct from pg_catalog.trim_scale (snap_line.weighted_qty)
-                  or live.weighted_unit is distinct from snap_line.weighted_unit
-                  or live.options is distinct from coalesce(snap_line.options, '[]'::jsonb)
-              )
-          ),
-          ready_receipt as materialized (
-            select
-              page.id as order_id,
-              page.shift_id,
-              latest_app.id as application_id,
-              latest_app.created_at,
-              latest_app.provenance,
-              line_counts.lines_denom
-            from
-              page
-              join latest_app on latest_app.order_id = page.id
-              join latest_input on latest_input.id = latest_app.cost_input_id
-              join app.pos_order_snapshots snap on snap.id = latest_app.snapshot_id
-              join line_counts on line_counts.order_id = page.id
-            where
-              latest_app.algorithm_version = 1
-              and latest_app.provenance is not null
-              and coalesce(
-                (latest_app.provenance ->> 'algorithm_version')::integer,
-                1
-              ) = 1
-              and (
-                latest_app.disposition = 'sale'
-                or (
-                  latest_app.disposition = 'none'
-                  and pg_catalog.jsonb_array_length(coalesce(latest_app.causes, '[]'::jsonb)) > 0
-                  and not exists (
-                    select
-                      1
-                    from
-                      pg_catalog.jsonb_array_elements(latest_app.causes) cause (value)
-                    where
-                      coalesce(cause.value ->> 'code', '') <> 'no_stock'
-                  )
-                )
-                or (
-                  latest_app.disposition = 'incomplete'
-                  and pg_catalog.jsonb_array_length(coalesce(latest_app.causes, '[]'::jsonb)) > 0
-                  and not exists (
-                    select
-                      1
-                    from
-                      pg_catalog.jsonb_array_elements(latest_app.causes) cause (value)
-                    where
-                      coalesce(cause.value ->> 'code', '') not in ('missing_shift', 'before_item_opening')
-                  )
-                )
-              )
-              and page.status is not distinct from snap.status
-              and page.ordered_at is not distinct from snap.ordered_at
-              and page.order_type is not distinct from snap.order_type
-              and page.missing_from_pos is not distinct from latest_input.missing_from_pos
-              and not exists (
-                select
-                  1
-                from
-                  line_mismatch
-                where
-                  line_mismatch.order_id = page.id
-              )
-          ),
-          cited as materialized (
-            select
-              ready_receipt.application_id,
-              ready_receipt.order_id,
-              page.ordered_at,
-              'pos_map'::text as family,
-              version_id.value::uuid as version_id
-            from
-              ready_receipt
-              join page on page.id = ready_receipt.order_id
-              cross join lateral pg_catalog.jsonb_array_elements_text(
-                coalesce(ready_receipt.provenance -> 'mapping_versions', '[]'::jsonb)
-              ) as version_id (value)
-            where
-              version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-            union all
-            select
-              ready_receipt.application_id,
-              ready_receipt.order_id,
-              page.ordered_at,
-              'packaging'::text,
-              version_id.value::uuid
-            from
-              ready_receipt
-              join page on page.id = ready_receipt.order_id
-              cross join lateral pg_catalog.jsonb_array_elements_text(
-                coalesce(ready_receipt.provenance -> 'packaging_versions', '[]'::jsonb)
-              ) as version_id (value)
-            where
-              version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-            union all
-            select
-              ready_receipt.application_id,
-              ready_receipt.order_id,
-              page.ordered_at,
-              'recipe'::text,
-              version_id.value::uuid
-            from
-              ready_receipt
-              join page on page.id = ready_receipt.order_id
-              cross join lateral pg_catalog.jsonb_array_elements_text(
-                coalesce(ready_receipt.provenance -> 'recipe_versions', '[]'::jsonb)
-              ) as version_id (value)
-            where
-              version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-            union all
-            select
-              ready_receipt.application_id,
-              ready_receipt.order_id,
-              page.ordered_at,
-              'loss'::text,
-              (version_row.value ->> 'version_id')::uuid
-            from
-              ready_receipt
-              join page on page.id = ready_receipt.order_id
-              cross join lateral pg_catalog.jsonb_array_elements(
-                coalesce(ready_receipt.provenance -> 'loss_versions', '[]'::jsonb)
-              ) as version_row (value)
-            where
-              coalesce(version_row.value ->> 'version_id', '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-            union all
-            select
-              ready_receipt.application_id,
-              ready_receipt.order_id,
-              page.ordered_at,
-              'conversion'::text,
-              (version_row.value ->> 'version_id')::uuid
-            from
-              ready_receipt
-              join page on page.id = ready_receipt.order_id
-              cross join lateral pg_catalog.jsonb_array_elements(
-                coalesce(ready_receipt.provenance -> 'conversion_versions', '[]'::jsonb)
-              ) as version_row (value)
-            where
-              coalesce(version_row.value ->> 'version_id', '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-          ),
-          -- A receipt written after every costing change cannot have been touched.
-          -- The subject walk runs only for the receipts a later change could affect.
-          touched_candidate as materialized (
-            select
-              ready_receipt.application_id,
-              ready_receipt.order_id,
-              ready_receipt.created_at,
-              ready_receipt.provenance
-            from
-              ready_receipt
-            where
-              ready_receipt.created_at < (
-                select
-                  pg_catalog.max(change.recorded_at)
-                from
-                  app.costing_changes change
-              )
-          ),
-          stale_receipt as materialized (
-            select
-              cited.application_id
-            from
-              cited
-              left join app.pos_map_versions map_version on cited.family = 'pos_map'
-              and map_version.id = cited.version_id
-              left join app.packaging_versions packaging_version on cited.family = 'packaging'
-              and packaging_version.id = cited.version_id
-              left join app.recipe_versions recipe_version on cited.family = 'recipe'
-              and recipe_version.id = cited.version_id
-              left join app.item_loss_versions loss_version on cited.family = 'loss'
-              and loss_version.id = cited.version_id
-              left join app.item_conversion_versions conversion_version on cited.family = 'conversion'
-              and conversion_version.id = cited.version_id
-            where
-              (
-                cited.family = 'pos_map'
-                and (
-                  map_version.id is null
-                  or map_version.superseded_change_id is not null
-                  or not map_version.valid_during @> cited.ordered_at
-                )
-              )
-              or (
-                cited.family = 'packaging'
-                and (
-                  packaging_version.id is null
-                  or packaging_version.superseded_change_id is not null
-                  or not packaging_version.valid_during @> cited.ordered_at
-                )
-              )
-              or (
-                cited.family = 'recipe'
-                and (
-                  recipe_version.id is null
-                  or recipe_version.superseded_change_id is not null
-                  or not recipe_version.valid_during @> cited.ordered_at
-                )
-              )
-              or (
-                cited.family = 'loss'
-                and (
-                  loss_version.id is null
-                  or loss_version.superseded_change_id is not null
-                  or not loss_version.valid_during @> cited.ordered_at
-                )
-              )
-              or (
-                cited.family = 'conversion'
-                and (
-                  conversion_version.id is null
-                  or conversion_version.superseded_change_id is not null
-                  or not conversion_version.valid_during @> cited.ordered_at
-                )
-              )
-            union
-            select
-              touched_candidate.application_id
-            from
-              touched_candidate
-            where
-              exists (
-                select
-                  1
-                from
-                  app.costing_changes change
-                where
-                  change.recorded_at > touched_candidate.created_at
-                  and (
-                    exists (
-                      select
+                      receipt.algorithm_version = 1
+                      and receipt.provenance is not null
+                      and coalesce(
+                        (receipt.provenance ->> 'algorithm_version')::integer,
                         1
-                      from
-                        app.pos_map_versions version
-                        join app.pos_map_subjects subject on subject.id = version.subject_id
-                        join app.pos_order_lines line on line.order_id = touched_candidate.order_id
-                        and subject.kind = 'base'
-                        and subject.pos_item_id = line.item_id
-                        and subject.size_key = app.pos_size_key (line.size_name)
-                      where
-                        version.created_change_id = change.id
-                        or version.superseded_change_id = change.id
-                    )
-                    or exists (
-                      select
-                        1
-                      from
-                        app.packaging_versions version
-                        join app.packaging_subjects subject on subject.id = version.subject_id
-                      where
-                        (
-                          version.created_change_id = change.id
-                          or version.superseded_change_id = change.id
-                        )
-                        and (
-                          (
-                            subject.kind = 'base'
-                            and exists (
-                              select
-                                1
-                              from
-                                app.pos_order_lines line
-                              where
-                                line.order_id = touched_candidate.order_id
-                                and subject.pos_item_id = line.item_id
-                                and subject.size_key = app.pos_size_key (line.size_name)
-                            )
+                      ) = 1
+                      and (
+                        receipt.disposition = 'sale'
+                        or (
+                          receipt.disposition = 'none'
+                          and pg_catalog.jsonb_array_length(coalesce(receipt.causes, '[]'::jsonb)) > 0
+                          and not exists (
+                            select
+                              1
+                            from
+                              pg_catalog.jsonb_array_elements(receipt.causes) cause (value)
+                            where
+                              coalesce(cause.value ->> 'code', '') <> 'no_stock'
                           )
-                          or (
-                            subject.kind = 'order_type'
-                            and subject.order_type_key = app.packaging_order_type_key (
-                              (
+                        )
+                        or (
+                          receipt.disposition = 'incomplete'
+                          and pg_catalog.jsonb_array_length(coalesce(receipt.causes, '[]'::jsonb)) > 0
+                          and not exists (
+                            select
+                              1
+                            from
+                              pg_catalog.jsonb_array_elements(receipt.causes) cause (value)
+                            where
+                              coalesce(cause.value ->> 'code', '') not in ('missing_shift', 'before_item_opening')
+                          )
+                        )
+                      )
+                      and page.status is not distinct from snap.status
+                      and page.ordered_at is not distinct from snap.ordered_at
+                      and page.order_type is not distinct from snap.order_type
+                      and page.missing_from_pos is not distinct from inp.missing_from_pos
+                      and not exists (
+                        select
+                          1
+                        from
+                          (
+                            select
+                              line.line_id,
+                              line.item_id,
+                              line.item_name,
+                              line.size_name,
+                              line.quantity,
+                              line.weighted_qty,
+                              line.weighted_unit,
+                              line.options
+                            from
+                              app.pos_order_lines line
+                            where
+                              line.order_id = page.id
+                          ) live
+                          full join (
+                            select
+                              snap_line.line_id,
+                              snap_line.item_id,
+                              snap_line.item_name,
+                              snap_line.size_name,
+                              snap_line.quantity,
+                              snap_line.weighted_qty,
+                              snap_line.weighted_unit,
+                              snap_line.options
+                            from
+                              pg_catalog.jsonb_to_recordset (coalesce(snap.lines, '[]'::jsonb)) as snap_line (
+                                line_id text,
+                                item_id text,
+                                item_name text,
+                                size_name text,
+                                quantity numeric,
+                                weighted_qty numeric,
+                                weighted_unit text,
+                                options jsonb
+                              )
+                          ) snap_line on snap_line.line_id = live.line_id
+                        where
+                          live.line_id is null
+                          or snap_line.line_id is null
+                          or live.item_id is distinct from snap_line.item_id
+                          or live.item_name is distinct from snap_line.item_name
+                          or live.size_name is distinct from snap_line.size_name
+                          or pg_catalog.trim_scale (live.quantity) is distinct from pg_catalog.trim_scale (snap_line.quantity)
+                          or pg_catalog.trim_scale (live.weighted_qty) is distinct from pg_catalog.trim_scale (snap_line.weighted_qty)
+                          or live.weighted_unit is distinct from snap_line.weighted_unit
+                          or live.options is distinct from coalesce(snap_line.options, '[]'::jsonb)
+                      )
+                      and not exists (
+                        select
+                          1
+                        from
+                          pg_catalog.jsonb_array_elements_text(
+                            coalesce(receipt.provenance -> 'mapping_versions', '[]'::jsonb)
+                          ) as version_id (value)
+                        where
+                          version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                          and not exists (
+                            select
+                              1
+                            from
+                              app.pos_map_versions map_version
+                            where
+                              map_version.id = version_id.value::uuid
+                              and map_version.superseded_change_id is null
+                              and map_version.valid_during @> page.ordered_at
+                          )
+                      )
+                      and not exists (
+                        select
+                          1
+                        from
+                          pg_catalog.jsonb_array_elements_text(
+                            coalesce(receipt.provenance -> 'packaging_versions', '[]'::jsonb)
+                          ) as version_id (value)
+                        where
+                          version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                          and not exists (
+                            select
+                              1
+                            from
+                              app.packaging_versions packaging_version
+                            where
+                              packaging_version.id = version_id.value::uuid
+                              and packaging_version.superseded_change_id is null
+                              and packaging_version.valid_during @> page.ordered_at
+                          )
+                      )
+                      and not exists (
+                        select
+                          1
+                        from
+                          pg_catalog.jsonb_array_elements_text(
+                            coalesce(receipt.provenance -> 'recipe_versions', '[]'::jsonb)
+                          ) as version_id (value)
+                        where
+                          version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                          and not exists (
+                            select
+                              1
+                            from
+                              app.recipe_versions recipe_version
+                            where
+                              recipe_version.id = version_id.value::uuid
+                              and recipe_version.superseded_change_id is null
+                              and recipe_version.valid_during @> page.ordered_at
+                          )
+                      )
+                      and not exists (
+                        select
+                          1
+                        from
+                          pg_catalog.jsonb_array_elements(
+                            coalesce(receipt.provenance -> 'loss_versions', '[]'::jsonb)
+                          ) as version_row (value)
+                        where
+                          coalesce(version_row.value ->> 'version_id', '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                          and not exists (
+                            select
+                              1
+                            from
+                              app.item_loss_versions loss_version
+                            where
+                              loss_version.id = (version_row.value ->> 'version_id')::uuid
+                              and loss_version.superseded_change_id is null
+                              and loss_version.valid_during @> page.ordered_at
+                          )
+                      )
+                      and not exists (
+                        select
+                          1
+                        from
+                          pg_catalog.jsonb_array_elements(
+                            coalesce(receipt.provenance -> 'conversion_versions', '[]'::jsonb)
+                          ) as version_row (value)
+                        where
+                          coalesce(version_row.value ->> 'version_id', '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                          and not exists (
+                            select
+                              1
+                            from
+                              app.item_conversion_versions conversion_version
+                            where
+                              conversion_version.id = (version_row.value ->> 'version_id')::uuid
+                              and conversion_version.superseded_change_id is null
+                              and conversion_version.valid_during @> page.ordered_at
+                          )
+                      )
+                      and not case
+                        when receipt.created_at < (
+                          select
+                            pg_catalog.max(change.recorded_at)
+                          from
+                            app.costing_changes change
+                        ) then exists (
+                          select
+                            1
+                          from
+                            app.costing_changes change
+                          where
+                            change.recorded_at > receipt.created_at
+                            and (
+                              exists (
                                 select
-                                  page.order_type
+                                  1
                                 from
-                                  page
+                                  app.pos_map_versions version
+                                  join app.pos_map_subjects subject on subject.id = version.subject_id
+                                  join app.pos_order_lines line on line.order_id = page.id
+                                  and subject.kind = 'base'
+                                  and subject.pos_item_id = line.item_id
+                                  and subject.size_key = app.pos_size_key (line.size_name)
                                 where
-                                  page.id = touched_candidate.order_id
+                                  version.created_change_id = change.id
+                                  or version.superseded_change_id = change.id
+                              )
+                              or exists (
+                                select
+                                  1
+                                from
+                                  app.packaging_versions version
+                                  join app.packaging_subjects subject on subject.id = version.subject_id
+                                where
+                                  (
+                                    version.created_change_id = change.id
+                                    or version.superseded_change_id = change.id
+                                  )
+                                  and (
+                                    (
+                                      subject.kind = 'base'
+                                      and exists (
+                                        select
+                                          1
+                                        from
+                                          app.pos_order_lines line
+                                        where
+                                          line.order_id = page.id
+                                          and subject.pos_item_id = line.item_id
+                                          and subject.size_key = app.pos_size_key (line.size_name)
+                                      )
+                                    )
+                                    or (
+                                      subject.kind = 'order_type'
+                                      and subject.order_type_key = app.packaging_order_type_key (page.order_type)
+                                    )
+                                  )
+                              )
+                              or exists (
+                                select
+                                  1
+                                from
+                                  app.recipe_versions version
+                                  join app.pos_map_versions map_version on map_version.recipe_id = version.recipe_id
+                                where
+                                  (
+                                    version.created_change_id = change.id
+                                    or version.superseded_change_id = change.id
+                                  )
+                                  and exists (
+                                    select
+                                      1
+                                    from
+                                      pg_catalog.jsonb_array_elements_text(
+                                        coalesce(
+                                          receipt.provenance -> 'mapping_versions',
+                                          '[]'::jsonb
+                                        )
+                                      ) as version_id (value)
+                                    where
+                                      version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                                      and version_id.value::uuid = map_version.id
+                                  )
+                              )
+                              or exists (
+                                select
+                                  1
+                                from
+                                  app.item_loss_versions version
+                                where
+                                  (
+                                    version.created_change_id = change.id
+                                    or version.superseded_change_id = change.id
+                                  )
+                                  and (
+                                    version.item_id in (
+                                      select
+                                        map_version.stock_item_id
+                                      from
+                                        pg_catalog.jsonb_array_elements_text(
+                                          coalesce(
+                                            receipt.provenance -> 'mapping_versions',
+                                            '[]'::jsonb
+                                          )
+                                        ) as version_id (value)
+                                        join app.pos_map_versions map_version on map_version.id = version_id.value::uuid
+                                      where
+                                        version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                                        and map_version.stock_item_id is not null
+                                    )
+                                    or version.item_id::text in (
+                                      select
+                                        loss_row.value ->> 'item_id'
+                                      from
+                                        pg_catalog.jsonb_array_elements(
+                                          coalesce(
+                                            receipt.provenance -> 'loss_versions',
+                                            '[]'::jsonb
+                                          )
+                                        ) as loss_row (value)
+                                    )
+                                  )
+                              )
+                              or exists (
+                                select
+                                  1
+                                from
+                                  app.item_conversion_versions version
+                                where
+                                  (
+                                    version.created_change_id = change.id
+                                    or version.superseded_change_id = change.id
+                                  )
+                                  and version.item_id in (
+                                    select
+                                      map_version.stock_item_id
+                                    from
+                                      pg_catalog.jsonb_array_elements_text(
+                                        coalesce(
+                                          receipt.provenance -> 'mapping_versions',
+                                          '[]'::jsonb
+                                        )
+                                      ) as version_id (value)
+                                      join app.pos_map_versions map_version on map_version.id = version_id.value::uuid
+                                    where
+                                      version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                                      and map_version.stock_item_id is not null
+                                  )
                               )
                             )
-                          )
                         )
-                    )
-                    or exists (
-                      select
-                        1
-                      from
-                        app.recipe_versions version
-                        join app.pos_map_versions map_version on map_version.recipe_id = version.recipe_id
-                        join cited on cited.application_id = touched_candidate.application_id
-                        and cited.family = 'pos_map'
-                        and cited.version_id = map_version.id
-                      where
-                        version.created_change_id = change.id
-                        or version.superseded_change_id = change.id
-                    )
-                    or exists (
-                      select
-                        1
-                      from
-                        app.item_loss_versions version
-                      where
-                        (
-                          version.created_change_id = change.id
-                          or version.superseded_change_id = change.id
-                        )
-                        and (
-                          version.item_id in (
-                            select
-                              map_version.stock_item_id
-                            from
-                              cited
-                              join app.pos_map_versions map_version on map_version.id = cited.version_id
-                            where
-                              cited.application_id = touched_candidate.application_id
-                              and cited.family = 'pos_map'
-                              and map_version.stock_item_id is not null
-                          )
-                          or version.item_id::text in (
-                            select
-                              loss_row.value ->> 'item_id'
-                            from
-                              pg_catalog.jsonb_array_elements(
-                                coalesce(
-                                  touched_candidate.provenance -> 'loss_versions',
-                                  '[]'::jsonb
-                                )
-                              ) as loss_row (value)
-                          )
-                        )
-                    )
-                    or exists (
-                      select
-                        1
-                      from
-                        app.item_conversion_versions version
-                      where
-                        (
-                          version.created_change_id = change.id
-                          or version.superseded_change_id = change.id
-                        )
-                        and version.item_id in (
-                          select
-                            map_version.stock_item_id
-                          from
-                            cited
-                            join app.pos_map_versions map_version on map_version.id = cited.version_id
-                          where
-                            cited.application_id = touched_candidate.application_id
-                            and cited.family = 'pos_map'
-                            and map_version.stock_item_id is not null
-                        )
-                    )
+                        else false
+                      end
+                    offset
+                      0
+                  ) fresh_row
+              ),
+              (
+                select
+                  pg_catalog.jsonb_build_object(
+                    'ready',
+                    counted.ready,
+                    'lines_denom',
+                    counted.lines_denom,
+                    'lines_covered',
+                    counted.lines_covered
                   )
-              )
-          ),
-          fresh as materialized (
-            select
-              ready_receipt.order_id,
-              ready_receipt.shift_id,
-              ready_receipt.lines_denom
-            from
-              ready_receipt
-            where
-              not exists (
-                select
-                  1
                 from
-                  stale_receipt
-                where
-                  stale_receipt.application_id = ready_receipt.application_id
+                  app.order_coverage_counts (page.id) counted
               )
-          )
-        select
-          coalesce(
-            pg_catalog.jsonb_object_agg(
-              hit.shift_id,
-              pg_catalog.jsonb_build_object(
-                'orders_denom',
-                hit.orders_denom,
-                'orders_covered',
-                hit.orders_covered,
-                'lines_denom',
-                hit.lines_denom,
-                'lines_covered',
-                hit.lines_covered
-              )
-            ),
-            '{}'::jsonb
-          )
-        from
-          (
-            select
-              page.shift_id,
-              count(*) as orders_denom,
-              coalesce(
-                sum((coverage.value ->> 'ready')::integer),
-                0
-              ) as orders_covered,
-              coalesce(
-                sum((coverage.value ->> 'lines_denom')::integer),
-                0
-              ) as lines_denom,
-              coalesce(
-                sum((coverage.value ->> 'lines_covered')::integer),
-                0
-              ) as lines_covered
-            from
-              page
-              join line_counts on line_counts.order_id = page.id
-              left join fresh on fresh.order_id = page.id
-              cross join lateral (
-                select
-                  coalesce(
-                    case
-                      when fresh.order_id is not null then pg_catalog.jsonb_build_object(
-                        'ready',
-                        1,
-                        'lines_denom',
-                        fresh.lines_denom,
-                        'lines_covered',
-                        fresh.lines_denom
-                      )
-                    end,
-                    (
-                      select
-                        pg_catalog.jsonb_build_object(
-                          'ready',
-                          counted.ready,
-                          'lines_denom',
-                          counted.lines_denom,
-                          'lines_covered',
-                          counted.lines_covered
-                        )
-                      from
-                        app.order_coverage_counts (page.id) counted
-                    )
-                  ) as value
-              ) coverage
-            group by
-              page.shift_id
-          ) hit
-      )
-    end;
+            ) as value
+        ) coverage
+    )
+  select
+    coalesce(
+      pg_catalog.jsonb_object_agg(
+        hit.shift_id,
+        pg_catalog.jsonb_build_object(
+          'orders_denom',
+          hit.orders_denom,
+          'orders_covered',
+          hit.orders_covered,
+          'lines_denom',
+          hit.lines_denom,
+          'lines_covered',
+          hit.lines_covered
+        )
+      ),
+      '{}'::jsonb
+    )
+  into
+    v_coverage
+  from
+    (
+      select
+        per_order.shift_id,
+        count(*) as orders_denom,
+        coalesce(
+          sum((per_order.value ->> 'ready')::integer),
+          0
+        ) as orders_covered,
+        coalesce(
+          sum((per_order.value ->> 'lines_denom')::integer),
+          0
+        ) as lines_denom,
+        coalesce(
+          sum((per_order.value ->> 'lines_covered')::integer),
+          0
+        ) as lines_covered
+      from
+        per_order
+      group by
+        per_order.shift_id
+    ) hit;
+
+  return coalesce(v_coverage, '{}'::jsonb);
+end;
 $$;
 
 comment on function app.shift_page_order_coverage (text[], timestamptz) is 'Private. Coverage counters for the completed, present orders of one shift page at or after the opening. A latest evaluation receipt whose basis is still current supplies the counts: a resolver-ready receipt covers the order and every positive line. resolve_order_requirements runs only for an order that was never evaluated or whose basis changed, including a mapping change after the receipt. With no opening the result is empty and the denominator stays zero.';
