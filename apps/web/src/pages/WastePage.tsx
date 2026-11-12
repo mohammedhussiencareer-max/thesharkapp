@@ -24,9 +24,12 @@ export function WastePage() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [loadId, setLoadId] = useState(0);
   const [formKey, setFormKey] = useState(0);
+  const [reloading, setReloading] = useState(0);
   const loadSeqRef = useRef(0);
   const historySeqRef = useRef(0);
   const loadedRef = useRef(0);
+  // The cursor only belongs to the list on screen while no refresh or reload is replacing that list.
+  const pagingBlocked = loading || reloading > 0;
 
   useEffect(() => {
     const seq = ++loadSeqRef.current;
@@ -66,7 +69,7 @@ export function WastePage() {
   }
 
   async function loadMore() {
-    if (next === null || loadingMore) return;
+    if (next === null || loadingMore || pagingBlocked) return;
     const seq = historySeqRef.current;
     setLoadingMore(true);
     setMoreError(null);
@@ -93,14 +96,19 @@ export function WastePage() {
   // Re-reads everything already on screen plus the new document, so a corrected row refreshes too.
   const reload = useCallback(async (): Promise<void> => {
     const seq = ++historySeqRef.current;
-    const page = await reloadHistory(
-      Math.max(historyPageSize, loadedRef.current + 1),
-    );
-    if (seq !== historySeqRef.current) return;
-    setEntries(page.entries);
-    setNext(page.next);
-    loadedRef.current = page.entries.length;
-    setMoreError(null);
+    setReloading((count) => count + 1);
+    try {
+      const page = await reloadHistory(
+        Math.max(historyPageSize, loadedRef.current + 1),
+      );
+      if (seq !== historySeqRef.current) return;
+      setEntries(page.entries);
+      setNext(page.next);
+      loadedRef.current = page.entries.length;
+      setMoreError(null);
+    } finally {
+      setReloading((count) => count - 1);
+    }
   }, []);
 
   const record = useWasteAction(newWasteSubject, {
@@ -179,7 +187,7 @@ export function WastePage() {
           <button
             className={secondaryButton}
             type="button"
-            disabled={loadingMore}
+            disabled={loadingMore || pagingBlocked}
             onClick={() => void loadMore()}
           >
             عرض المزيد

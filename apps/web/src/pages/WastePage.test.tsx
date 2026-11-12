@@ -1,4 +1,5 @@
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -83,6 +84,52 @@ async function fillNew(quantity = '2', reason = 'spoilage') {
   return { form, submit };
 }
 
+type Page = Awaited<ReturnType<typeof loadHistoryPage>>;
+
+function slice(from: number, to: number, next: string | null): Page {
+  const entries = [];
+  for (let id = from; id >= to; id -= 1) {
+    entries.push(historyEntry({ id: String(id) }));
+  }
+  return { entries, next };
+}
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+/** Resolves a deferred response inside act, so its effects are flushed before the next step. */
+function settle<T>(pending: { resolve: (value: T) => void }, value: T) {
+  return act(() => {
+    pending.resolve(value);
+    return Promise.resolve();
+  });
+}
+
+const moreButton = () => screen.getByRole('button', { name: 'عرض المزيد' });
+const refreshButton = () => screen.getByRole('button', { name: 'تحديث' });
+
+/** Entries 60 down to 21 on screen; the cursor now points at 21. */
+async function showSixtyDownToTwentyOne() {
+  vi.mocked(loadHistoryPage).mockImplementation((after) => {
+    if (after === null) return Promise.resolve(slice(60, 41, '41'));
+    if (after === '41') return Promise.resolve(slice(40, 21, '21'));
+    return Promise.reject(new Error(`unexpected cursor ${after}`));
+  });
+  renderPage();
+  await screen.findByRole('article', { name: 'سجل رقم 60' });
+  fireEvent.click(moreButton());
+  await screen.findByRole('article', { name: 'سجل رقم 21' });
+  expect(screen.getAllByRole('article')).toHaveLength(40);
+}
+
+const cursorsAsked = () =>
+  vi.mocked(loadHistoryPage).mock.calls.map((call) => call[0]);
+
 describe('WastePage', () => {
   beforeEach(() => {
     resetHeldWrites();
@@ -152,15 +199,6 @@ describe('WastePage', () => {
   });
 
   it('reloads a long history through bounded keyset pages and keeps paging after a save', async () => {
-    const ids = (from: number, to: number) => {
-      const out: string[] = [];
-      for (let id = from; id >= to; id -= 1) out.push(String(id));
-      return out;
-    };
-    const slice = (from: number, to: number, next: string | null) => ({
-      entries: ids(from, to).map((id) => historyEntry({ id })),
-      next,
-    });
     vi.mocked(loadHistoryPage).mockImplementation((after) => {
       if (after === null) return Promise.resolve(slice(60, 41, '41'));
       if (after === '41') return Promise.resolve(slice(40, 21, '21'));
@@ -190,6 +228,109 @@ describe('WastePage', () => {
     expect(vi.mocked(loadHistoryPage)).toHaveBeenLastCalledWith('20');
     expect(screen.getAllByRole('article')).toHaveLength(60);
     expect(screen.queryByRole('button', { name: 'عرض المزيد' })).toBeNull();
+  });
+
+  it('does not page from the old cursor while a refresh is pending', async () => {
+    await showSixtyDownToTwentyOne();
+    const refreshed = deferred<Page>();
+    vi.mocked(loadHistoryPage).mockImplementation(async (after) => {
+      if (after === null) return refreshed.promise;
+      if (after === '41') return slice(40, 21, '21');
+      if (after === '21') return slice(20, 1, null);
+      throw new Error(`unexpected cursor ${after}`);
+    });
+    fireEvent.click(refreshButton());
+    await waitFor(() => expect(moreButton()).toBeDisabled());
+    fireEvent.click(moreButton());
+    expect(cursorsAsked()).not.toContain('21');
+
+    refreshed.resolve(slice(60, 41, '41'));
+    await waitFor(() => expect(moreButton()).toBeEnabled());
+    expect(screen.getAllByRole('article')).toHaveLength(20);
+    fireEvent.click(moreButton());
+    await screen.findByRole('article', { name: 'سجل رقم 21' });
+    expect(screen.getAllByRole('article')).toHaveLength(40);
+    expect(screen.queryByRole('article', { name: 'سجل رقم 1' })).toBeNull();
+    expect(cursorsAsked()).not.toContain('21');
+    expect(moreButton()).toBeEnabled();
+  });
+
+  it('drops a paging response that arrives after the refresh replaced the list', async () => {
+    await showSixtyDownToTwentyOne();
+    const paging = deferred<Page>();
+    const refreshed = deferred<Page>();
+    vi.mocked(loadHistoryPage).mockImplementation(async (after) => {
+      if (after === null) return refreshed.promise;
+      if (after === '21') return paging.promise;
+      if (after === '41') return slice(40, 21, '21');
+      throw new Error(`unexpected cursor ${after}`);
+    });
+    fireEvent.click(moreButton());
+    await waitFor(() => expect(moreButton()).toBeDisabled());
+    fireEvent.click(refreshButton());
+    await settle(refreshed, slice(60, 41, '41'));
+    await waitFor(() => expect(refreshButton()).toBeEnabled());
+    expect(screen.getAllByRole('article')).toHaveLength(20);
+
+    await settle(paging, slice(20, 1, null));
+    await waitFor(() => expect(moreButton()).toBeEnabled());
+    expect(screen.getAllByRole('article')).toHaveLength(20);
+    expect(screen.queryByRole('article', { name: 'سجل رقم 1' })).toBeNull();
+    fireEvent.click(moreButton());
+    await screen.findByRole('article', { name: 'سجل رقم 21' });
+    expect(screen.getAllByRole('article')).toHaveLength(40);
+  });
+
+  it('drops a paging response that arrives before the refresh replaced the list', async () => {
+    await showSixtyDownToTwentyOne();
+    const paging = deferred<Page>();
+    const refreshed = deferred<Page>();
+    vi.mocked(loadHistoryPage).mockImplementation(async (after) => {
+      if (after === null) return refreshed.promise;
+      if (after === '21') return paging.promise;
+      if (after === '41') return slice(40, 21, '21');
+      throw new Error(`unexpected cursor ${after}`);
+    });
+    fireEvent.click(moreButton());
+    await waitFor(() => expect(moreButton()).toBeDisabled());
+    fireEvent.click(refreshButton());
+    await settle(paging, slice(20, 1, null));
+    expect(screen.queryByRole('article', { name: 'سجل رقم 1' })).toBeNull();
+    expect(screen.getAllByRole('article')).toHaveLength(40);
+
+    await settle(refreshed, slice(60, 41, '41'));
+    await waitFor(() => expect(moreButton()).toBeEnabled());
+    expect(screen.getAllByRole('article')).toHaveLength(20);
+    fireEvent.click(moreButton());
+    await screen.findByRole('article', { name: 'سجل رقم 21' });
+    expect(screen.getAllByRole('article')).toHaveLength(40);
+    expect(screen.queryByRole('article', { name: 'سجل رقم 1' })).toBeNull();
+  });
+
+  it('does not page from the old cursor while a save reloads the history', async () => {
+    await showSixtyDownToTwentyOne();
+    const reloaded = deferred<Page>();
+    let reloads = 0;
+    vi.mocked(loadHistoryPage).mockImplementation(async (after) => {
+      if (after === null) {
+        reloads += 1;
+        return reloaded.promise;
+      }
+      if (after === '41') return slice(40, 21, '21');
+      if (after === '21') return slice(20, 1, null);
+      throw new Error(`unexpected cursor ${after}`);
+    });
+    vi.mocked(recordWaste).mockResolvedValue(wasteResult());
+    const { submit } = await fillNew();
+    fireEvent.click(submit);
+    await waitFor(() => expect(reloads).toBe(1));
+    await waitFor(() => expect(moreButton()).toBeDisabled());
+    fireEvent.click(moreButton());
+    expect(cursorsAsked()).not.toContain('21');
+
+    reloaded.resolve(slice(60, 41, '41'));
+    await waitFor(() => expect(moreButton()).toBeEnabled());
+    expect(screen.getAllByRole('article')).toHaveLength(41);
   });
 
   it('keeps Refresh usable when a save reloads the history while a refresh is pending', async () => {
