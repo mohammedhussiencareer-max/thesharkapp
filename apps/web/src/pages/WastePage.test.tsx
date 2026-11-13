@@ -36,8 +36,15 @@ import {
 } from '@/waste/test-fixtures';
 import { reloadFailedMessage } from '@/waste/useWasteAction';
 
+// Production pages are 20 rows. These tests use 2: each row mounts a card and
+// an action subscription, and the paging cases re-render that list on refresh,
+// save and every extra page. At 20 rows those five cases took about half a
+// second each and hit the 5s timeout under load. Reload still asks for one
+// more row than is showing, so a 2-row page still crosses a boundary and trims.
+const pageSize = vi.hoisted(() => 2);
+
 vi.mock('@/waste/api', () => ({
-  historyPageSize: 20,
+  historyPageSize: pageSize,
   loadHistoryPage: vi.fn(),
   recordWaste: vi.fn(),
 }));
@@ -113,18 +120,18 @@ function settle<T>(pending: { resolve: (value: T) => void }, value: T) {
 const moreButton = () => screen.getByRole('button', { name: 'عرض المزيد' });
 const refreshButton = () => screen.getByRole('button', { name: 'تحديث' });
 
-/** Entries 60 down to 21 on screen; the cursor now points at 21. */
-async function showSixtyDownToTwentyOne() {
+/** Ids 6 down to 3 on screen; the next page starts after 3. */
+async function showTwoPages() {
   vi.mocked(loadHistoryPage).mockImplementation((after) => {
-    if (after === null) return Promise.resolve(slice(60, 41, '41'));
-    if (after === '41') return Promise.resolve(slice(40, 21, '21'));
+    if (after === null) return Promise.resolve(slice(6, 5, '5'));
+    if (after === '5') return Promise.resolve(slice(4, 3, '3'));
     return Promise.reject(new Error(`unexpected cursor ${after}`));
   });
   renderPage();
-  await screen.findByRole('article', { name: 'سجل رقم 60' });
+  await screen.findByRole('article', { name: 'سجل رقم 6' });
   fireEvent.click(moreButton());
-  await screen.findByRole('article', { name: 'سجل رقم 21' });
-  expect(screen.getAllByRole('article')).toHaveLength(40);
+  await screen.findByRole('article', { name: 'سجل رقم 3' });
+  expect(screen.getAllByRole('article')).toHaveLength(pageSize * 2);
 }
 
 const cursorsAsked = () =>
@@ -200,115 +207,116 @@ describe('WastePage', () => {
 
   it('reloads a long history through bounded keyset pages and keeps paging after a save', async () => {
     vi.mocked(loadHistoryPage).mockImplementation((after) => {
-      if (after === null) return Promise.resolve(slice(60, 41, '41'));
-      if (after === '41') return Promise.resolve(slice(40, 21, '21'));
-      if (after === '21') return Promise.resolve(slice(20, 1, null));
-      if (after === '20') return Promise.resolve(slice(19, 1, null));
+      if (after === null) return Promise.resolve(slice(6, 5, '5'));
+      if (after === '5') return Promise.resolve(slice(4, 3, '3'));
+      if (after === '3') return Promise.resolve(slice(2, 1, null));
+      if (after === '2') return Promise.resolve(slice(1, 1, null));
       return Promise.reject(new Error(`unexpected cursor ${after}`));
     });
     vi.mocked(recordWaste).mockResolvedValue(wasteResult());
     renderPage();
-    await screen.findByRole('article', { name: 'سجل رقم 60' });
-    fireEvent.click(screen.getByRole('button', { name: 'عرض المزيد' }));
-    await screen.findByRole('article', { name: 'سجل رقم 21' });
-    expect(screen.getAllByRole('article')).toHaveLength(40);
+    await screen.findByRole('article', { name: 'سجل رقم 6' });
+    fireEvent.click(moreButton());
+    await screen.findByRole('article', { name: 'سجل رقم 3' });
+    expect(screen.getAllByRole('article')).toHaveLength(pageSize * 2);
 
     const { submit } = await fillNew();
     fireEvent.click(submit);
     await screen.findByRole('status');
 
     const calls = vi.mocked(loadHistoryPage).mock.calls;
-    expect(calls.slice(2)).toEqual([[null], ['41'], ['21']]);
+    // Two pages were on screen, so the reload reads one more row than that:
+    // the first two pages again, then one trimmed row of the third page.
+    expect(calls.slice(2)).toEqual([[null], ['5'], ['3']]);
     await waitFor(() =>
-      expect(screen.getAllByRole('article')).toHaveLength(41),
+      expect(screen.getAllByRole('article')).toHaveLength(pageSize * 2 + 1),
     );
-    const more = screen.getByRole('button', { name: 'عرض المزيد' });
-    fireEvent.click(more);
+    fireEvent.click(moreButton());
     await screen.findByRole('article', { name: 'سجل رقم 1' });
-    expect(vi.mocked(loadHistoryPage)).toHaveBeenLastCalledWith('20');
-    expect(screen.getAllByRole('article')).toHaveLength(60);
+    expect(vi.mocked(loadHistoryPage)).toHaveBeenLastCalledWith('2');
+    expect(screen.getAllByRole('article')).toHaveLength(pageSize * 3);
     expect(screen.queryByRole('button', { name: 'عرض المزيد' })).toBeNull();
   });
 
   it('does not page from the old cursor while a refresh is pending', async () => {
-    await showSixtyDownToTwentyOne();
+    await showTwoPages();
     const refreshed = deferred<Page>();
     vi.mocked(loadHistoryPage).mockImplementation(async (after) => {
       if (after === null) return refreshed.promise;
-      if (after === '41') return slice(40, 21, '21');
-      if (after === '21') return slice(20, 1, null);
+      if (after === '5') return slice(4, 3, '3');
+      if (after === '3') return slice(2, 1, null);
       throw new Error(`unexpected cursor ${after}`);
     });
     fireEvent.click(refreshButton());
     await waitFor(() => expect(moreButton()).toBeDisabled());
     fireEvent.click(moreButton());
-    expect(cursorsAsked()).not.toContain('21');
+    expect(cursorsAsked()).not.toContain('3');
 
-    refreshed.resolve(slice(60, 41, '41'));
+    refreshed.resolve(slice(6, 5, '5'));
     await waitFor(() => expect(moreButton()).toBeEnabled());
-    expect(screen.getAllByRole('article')).toHaveLength(20);
+    expect(screen.getAllByRole('article')).toHaveLength(pageSize);
     fireEvent.click(moreButton());
-    await screen.findByRole('article', { name: 'سجل رقم 21' });
-    expect(screen.getAllByRole('article')).toHaveLength(40);
+    await screen.findByRole('article', { name: 'سجل رقم 3' });
+    expect(screen.getAllByRole('article')).toHaveLength(pageSize * 2);
     expect(screen.queryByRole('article', { name: 'سجل رقم 1' })).toBeNull();
-    expect(cursorsAsked()).not.toContain('21');
+    expect(cursorsAsked()).not.toContain('3');
     expect(moreButton()).toBeEnabled();
   });
 
   it('drops a paging response that arrives after the refresh replaced the list', async () => {
-    await showSixtyDownToTwentyOne();
+    await showTwoPages();
     const paging = deferred<Page>();
     const refreshed = deferred<Page>();
     vi.mocked(loadHistoryPage).mockImplementation(async (after) => {
       if (after === null) return refreshed.promise;
-      if (after === '21') return paging.promise;
-      if (after === '41') return slice(40, 21, '21');
+      if (after === '3') return paging.promise;
+      if (after === '5') return slice(4, 3, '3');
       throw new Error(`unexpected cursor ${after}`);
     });
     fireEvent.click(moreButton());
     await waitFor(() => expect(moreButton()).toBeDisabled());
     fireEvent.click(refreshButton());
-    await settle(refreshed, slice(60, 41, '41'));
+    await settle(refreshed, slice(6, 5, '5'));
     await waitFor(() => expect(refreshButton()).toBeEnabled());
-    expect(screen.getAllByRole('article')).toHaveLength(20);
+    expect(screen.getAllByRole('article')).toHaveLength(pageSize);
 
-    await settle(paging, slice(20, 1, null));
+    await settle(paging, slice(2, 1, null));
     await waitFor(() => expect(moreButton()).toBeEnabled());
-    expect(screen.getAllByRole('article')).toHaveLength(20);
+    expect(screen.getAllByRole('article')).toHaveLength(pageSize);
     expect(screen.queryByRole('article', { name: 'سجل رقم 1' })).toBeNull();
     fireEvent.click(moreButton());
-    await screen.findByRole('article', { name: 'سجل رقم 21' });
-    expect(screen.getAllByRole('article')).toHaveLength(40);
+    await screen.findByRole('article', { name: 'سجل رقم 3' });
+    expect(screen.getAllByRole('article')).toHaveLength(pageSize * 2);
   });
 
   it('drops a paging response that arrives before the refresh replaced the list', async () => {
-    await showSixtyDownToTwentyOne();
+    await showTwoPages();
     const paging = deferred<Page>();
     const refreshed = deferred<Page>();
     vi.mocked(loadHistoryPage).mockImplementation(async (after) => {
       if (after === null) return refreshed.promise;
-      if (after === '21') return paging.promise;
-      if (after === '41') return slice(40, 21, '21');
+      if (after === '3') return paging.promise;
+      if (after === '5') return slice(4, 3, '3');
       throw new Error(`unexpected cursor ${after}`);
     });
     fireEvent.click(moreButton());
     await waitFor(() => expect(moreButton()).toBeDisabled());
     fireEvent.click(refreshButton());
-    await settle(paging, slice(20, 1, null));
+    await settle(paging, slice(2, 1, null));
     expect(screen.queryByRole('article', { name: 'سجل رقم 1' })).toBeNull();
-    expect(screen.getAllByRole('article')).toHaveLength(40);
+    expect(screen.getAllByRole('article')).toHaveLength(pageSize * 2);
 
-    await settle(refreshed, slice(60, 41, '41'));
+    await settle(refreshed, slice(6, 5, '5'));
     await waitFor(() => expect(moreButton()).toBeEnabled());
-    expect(screen.getAllByRole('article')).toHaveLength(20);
+    expect(screen.getAllByRole('article')).toHaveLength(pageSize);
     fireEvent.click(moreButton());
-    await screen.findByRole('article', { name: 'سجل رقم 21' });
-    expect(screen.getAllByRole('article')).toHaveLength(40);
+    await screen.findByRole('article', { name: 'سجل رقم 3' });
+    expect(screen.getAllByRole('article')).toHaveLength(pageSize * 2);
     expect(screen.queryByRole('article', { name: 'سجل رقم 1' })).toBeNull();
   });
 
   it('does not page from the old cursor while a save reloads the history', async () => {
-    await showSixtyDownToTwentyOne();
+    await showTwoPages();
     const reloaded = deferred<Page>();
     let reloads = 0;
     vi.mocked(loadHistoryPage).mockImplementation(async (after) => {
@@ -316,8 +324,8 @@ describe('WastePage', () => {
         reloads += 1;
         return reloaded.promise;
       }
-      if (after === '41') return slice(40, 21, '21');
-      if (after === '21') return slice(20, 1, null);
+      if (after === '5') return slice(4, 3, '3');
+      if (after === '3') return slice(2, 1, null);
       throw new Error(`unexpected cursor ${after}`);
     });
     vi.mocked(recordWaste).mockResolvedValue(wasteResult());
@@ -326,11 +334,11 @@ describe('WastePage', () => {
     await waitFor(() => expect(reloads).toBe(1));
     await waitFor(() => expect(moreButton()).toBeDisabled());
     fireEvent.click(moreButton());
-    expect(cursorsAsked()).not.toContain('21');
+    expect(cursorsAsked()).not.toContain('3');
 
-    reloaded.resolve(slice(60, 41, '41'));
+    reloaded.resolve(slice(6, 5, '5'));
     await waitFor(() => expect(moreButton()).toBeEnabled());
-    expect(screen.getAllByRole('article')).toHaveLength(41);
+    expect(screen.getAllByRole('article')).toHaveLength(pageSize * 2 + 1);
   });
 
   it('keeps Refresh usable when a save reloads the history while a refresh is pending', async () => {
