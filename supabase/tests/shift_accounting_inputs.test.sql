@@ -6690,8 +6690,316 @@ select
     'the retained preparation receipt is not served as current'
   );
 
+-- Zero-quantity packaging. packaging_expand validates the line's conversion
+-- even when the scaled requirement is zero, and that item is then absent
+-- from the receipt's conversion provenance. Removing it must not stay cached.
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    loss_pct,
+    active,
+    created_at
+  )
+values
+  (
+    pg_temp.u (13),
+    'p77-pack-piece',
+    'packaging',
+    'piece',
+    'weekly',
+    0,
+    true,
+    '2026-01-01 00:00+00'
+  );
+
+select
+  app.set_item_conversion (
+    md5('p77-zero-conv')::uuid,
+    pg_temp.u (13),
+    'g',
+    1,
+    '2026-01-01 00:00+00',
+    null,
+    (
+      select
+        app.schedule_token ('conversion', pg_temp.u (13), 'g')
+    ),
+    'fixture'
+  );
+
+select
+  app.set_pos_option_policy (
+    md5('p77-zero-policy')::uuid,
+    'p77-zero-pos',
+    '["none"]'::jsonb,
+    '2026-01-01 00:00+00',
+    null,
+    'none_expected',
+    (
+      select
+        app.pos_base_schedule ('p77-zero-pos', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  pg_temp.map_stock (
+    'p77-zero-pos',
+    pg_temp.u (1),
+    '1',
+    '2026-01-01 00:00+00'
+  );
+
+select
+  app.set_base_packaging (
+    md5('p77-zero-pack')::uuid,
+    'p77-zero-pos',
+    '["none"]'::jsonb,
+    '2026-01-01 00:00+00',
+    null,
+    pg_catalog.jsonb_build_object (
+      'lines',
+      pg_catalog.jsonb_build_array (
+        pg_catalog.jsonb_build_object (
+          'stock_item_id',
+          pg_temp.u (13),
+          'quantity',
+          '1',
+          'unit',
+          'g'
+        )
+      )
+    ),
+    (
+      select
+        app.packaging_base_schedule ('p77-zero-pos', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  pg_temp.type_ok ('p77-zero-type');
+
+select
+  pg_temp.shift ('p77-zero', '2026-12-26 12:00+00', false);
+
+select
+  pg_temp.ord (
+    'p77-o-zero',
+    'p77-zero',
+    'complete',
+    '2026-12-26 13:00+00',
+    20
+  );
+
+update app.pos_orders
+set
+  order_type = 'p77-zero-type'
+where
+  id = 'p77-o-zero';
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    options,
+    line_total
+  )
+values
+  (
+    'p77-o-zero',
+    'l1',
+    'pos-ready',
+    'x',
+    1,
+    '[]'::jsonb,
+    20
+  ),
+  (
+    'p77-o-zero',
+    'l0',
+    'p77-zero-pos',
+    'x',
+    0,
+    '[]'::jsonb,
+    0
+  );
+
+select
+  pg_temp.capture ('p77-o-zero', 1);
+
+select
+  is (
+    (
+      select
+        app.resolve_order_snapshot_exact (snap.id, false, false) ->> 'status'
+      from
+        app.pos_order_snapshots snap
+      where
+        snap.order_id = 'p77-o-zero'
+    ),
+    'ready',
+    'the zero-quantity packaging order resolves ready while the conversion exists'
+  );
+
+insert into
+  app.order_cost_applications (
+    order_id,
+    cost_input_id,
+    snapshot_id,
+    receipt_kind,
+    disposition,
+    occurred_at,
+    shift_id,
+    signature,
+    requirements,
+    provenance,
+    work_generation
+  )
+select
+  input.order_id,
+  input.id,
+  input.snapshot_id,
+  'posting',
+  'sale',
+  snap.ordered_at,
+  snap.shift_id,
+  md5('p77-o-zero'),
+  '[]'::jsonb,
+  app.resolve_order_snapshot_exact (snap.id, false, false) -> 'provenance',
+  1
+from
+  app.pos_cost_inputs input
+  join app.pos_order_snapshots snap on snap.id = input.snapshot_id
+where
+  input.order_id = 'p77-o-zero';
+
+select
+  is (
+    pg_temp.cov ('p77-zero') ->> 'orders_covered',
+    '1',
+    'the zero-quantity packaging order is covered from its current receipt'
+  );
+
+select
+  ok (
+    not exists (
+      select
+        1
+      from
+        app.order_cost_applications receipt
+        cross join lateral pg_catalog.jsonb_array_elements (receipt.provenance -> 'conversion_versions') as conv_row (value)
+      where
+        receipt.order_id = 'p77-o-zero'
+        and conv_row.value ->> 'item_id' = pg_temp.u (13)::text
+    ),
+    'the zero-quantity packaging item is absent from conversion provenance'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.order_cost_applications receipt
+        cross join lateral pg_catalog.jsonb_array_elements_text (receipt.provenance -> 'packaging_versions') as version_id (value)
+        join app.packaging_versions version on version.id = version_id.value::uuid
+        join app.packaging_lines line on line.version_id = version.id
+      where
+        receipt.order_id = 'p77-o-zero'
+        and line.stock_item_id = pg_temp.u (13)
+        and version.superseded_change_id is null
+        and version.valid_during @> (
+          select
+            orders.ordered_at
+          from
+            app.pos_orders orders
+          where
+            orders.id = 'p77-o-zero'
+        )
+    ),
+    'the cited packaging version that names the zero-quantity item stays in force'
+  );
+
+select
+  app.set_item_conversion (
+    md5('p77-zero-gap')::uuid,
+    pg_temp.u (13),
+    'g',
+    null,
+    '2026-01-01 00:00+00',
+    null,
+    (
+      select
+        app.schedule_token ('conversion', pg_temp.u (13), 'g')
+    ),
+    'fixture'
+  );
+
+select
+  is (
+    app.resolve_order_requirements ('p77-o-zero', null) ->> 'status',
+    'incomplete',
+    'removing the zero-quantity packaging conversion makes the resolver incomplete'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        pg_catalog.jsonb_array_elements (
+          app.resolve_order_requirements ('p77-o-zero', null) -> 'issues'
+        ) as issue (value)
+      where
+        issue.value ->> 'code' = 'packaging_unit'
+    ),
+    'the resolver issue is packaging_unit'
+  );
+
+select
+  is (
+    pg_temp.cov ('p77-zero') ->> 'orders_covered',
+    (
+      select
+        counted.ready::text
+      from
+        app.order_coverage_counts ('p77-o-zero') counted
+    ),
+    'page coverage matches the resolver after the zero-quantity conversion is removed'
+  );
+
+select
+  is (
+    pg_temp.cov ('p77-zero') ->> 'lines_covered',
+    (
+      select
+        counted.lines_covered::text
+      from
+        app.order_coverage_counts ('p77-o-zero') counted
+    ),
+    'line coverage matches the resolver after the zero-quantity conversion is removed'
+  );
+
+select
+  is (
+    pg_temp.cov ('p77-zero') ->> 'orders_covered',
+    '0',
+    'the removed zero-quantity packaging conversion is not served from the receipt'
+  );
+
 -- Every completed present order in the main fixtures, one at a time, so a
 -- shift total cannot hide one order over-covered and another under-covered.
+-- The zero-quantity packaging order is one of them.
 create temp table p77_cov_gap (
   order_id text,
   fast_ready text,
@@ -6864,7 +7172,7 @@ set
   work_generation = 1,
   processed_at = pg_catalog.clock_timestamp ()
 where
-  event.order_id in ('p77-o-opt', 'p77-o-keep')
+  event.order_id in ('p77-o-opt', 'p77-o-keep', 'p77-o-zero')
   and event.processed_at is null;
 
 -- Round 2, finding 5. One year of counts, one page, with a receipt and a

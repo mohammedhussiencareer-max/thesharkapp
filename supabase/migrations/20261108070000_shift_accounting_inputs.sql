@@ -1359,6 +1359,72 @@ from
   authenticated,
   service_role;
 
+-- Stock items a ready receipt validated for loss or conversion. Final
+-- requirement items are in the loss and conversion provenance. A packaging
+-- line or recipe line is validated even when its quantity contributes nothing,
+-- and then it is absent from that provenance. Mapping stock targets are the
+-- direct stock_item_id. Private.
+create function app.coverage_dependency_items (p_provenance jsonb) returns setof uuid language sql stable parallel safe
+set
+  search_path = '' as $$
+  select
+    map_version.stock_item_id
+  from
+    pg_catalog.jsonb_array_elements_text(
+      coalesce(p_provenance -> 'mapping_versions', '[]'::jsonb)
+    ) as version_id (value)
+    join app.pos_map_versions map_version on map_version.id = version_id.value::uuid
+  where
+    version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    and map_version.stock_item_id is not null
+  union
+  select
+    (loss_row.value ->> 'item_id')::uuid
+  from
+    pg_catalog.jsonb_array_elements(coalesce(p_provenance -> 'loss_versions', '[]'::jsonb)) as loss_row (value)
+  where
+    coalesce(loss_row.value ->> 'item_id', '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+  union
+  select
+    (conv_row.value ->> 'item_id')::uuid
+  from
+    pg_catalog.jsonb_array_elements(
+      coalesce(p_provenance -> 'conversion_versions', '[]'::jsonb)
+    ) as conv_row (value)
+  where
+    coalesce(conv_row.value ->> 'item_id', '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+  union
+  select
+    line.stock_item_id
+  from
+    pg_catalog.jsonb_array_elements_text(
+      coalesce(p_provenance -> 'packaging_versions', '[]'::jsonb)
+    ) as version_id (value)
+    join app.packaging_lines line on line.version_id = version_id.value::uuid
+  where
+    version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+  union
+  select
+    line.stock_item_id
+  from
+    pg_catalog.jsonb_array_elements_text(
+      coalesce(p_provenance -> 'recipe_versions', '[]'::jsonb)
+    ) as version_id (value)
+    join app.recipe_lines line on line.version_id = version_id.value::uuid
+  where
+    version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    and line.stock_item_id is not null;
+$$;
+
+comment on function app.coverage_dependency_items (jsonb) is 'Private. Stock items whose loss or conversion a ready receipt validated: mapping stock targets, loss and conversion provenance, and every stock item on a cited packaging line or recipe line, including items that contributed no requirement.';
+
+revoke all on function app.coverage_dependency_items (jsonb)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 -- Page coverage from the latest evaluation receipt only when that receipt
 -- proves the same result as resolve_order_requirements. A sale, a no-stock
 -- evaluation, or an incomplete receipt whose only causes are missing_shift or
@@ -1371,7 +1437,8 @@ from
 -- global or item option mapping (including a new item override that leaves the
 -- cited global version in force), an order-type or base packaging policy, a
 -- recipe of a cited mapping or cited recipe version, and a loss or conversion
--- of a cited requirement item all send the order back to the resolver. Item
+-- of a mapping target, a recipe line, or a packaging line (including an item
+-- that contributed no requirement) all send the order back to the resolver. Item
 -- opening prices and opening-stock instants are not resolver inputs, so they
 -- do not invalidate coverage. Anything else, including an order that was never
 -- evaluated, is resolved by order_coverage_counts.
@@ -1860,44 +1927,9 @@ begin
                                     version.created_change_id = change.id
                                     or version.superseded_change_id = change.id
                                   )
-                                  and (
-                                    version.item_id in (
-                                      select
-                                        map_version.stock_item_id
-                                      from
-                                        pg_catalog.jsonb_array_elements_text(
-                                          coalesce(
-                                            receipt.provenance -> 'mapping_versions',
-                                            '[]'::jsonb
-                                          )
-                                        ) as version_id (value)
-                                        join app.pos_map_versions map_version on map_version.id = version_id.value::uuid
-                                      where
-                                        version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-                                        and map_version.stock_item_id is not null
-                                    )
-                                    or version.item_id::text in (
-                                      select
-                                        loss_row.value ->> 'item_id'
-                                      from
-                                        pg_catalog.jsonb_array_elements(
-                                          coalesce(
-                                            receipt.provenance -> 'loss_versions',
-                                            '[]'::jsonb
-                                          )
-                                        ) as loss_row (value)
-                                    )
-                                    or version.item_id::text in (
-                                      select
-                                        conv_row.value ->> 'item_id'
-                                      from
-                                        pg_catalog.jsonb_array_elements(
-                                          coalesce(
-                                            receipt.provenance -> 'conversion_versions',
-                                            '[]'::jsonb
-                                          )
-                                        ) as conv_row (value)
-                                    )
+                                  and version.item_id in (
+                                    select
+                                      app.coverage_dependency_items (receipt.provenance)
                                   )
                               )
                               or exists (
@@ -1910,44 +1942,9 @@ begin
                                     version.created_change_id = change.id
                                     or version.superseded_change_id = change.id
                                   )
-                                  and (
-                                    version.item_id in (
-                                      select
-                                        map_version.stock_item_id
-                                      from
-                                        pg_catalog.jsonb_array_elements_text(
-                                          coalesce(
-                                            receipt.provenance -> 'mapping_versions',
-                                            '[]'::jsonb
-                                          )
-                                        ) as version_id (value)
-                                        join app.pos_map_versions map_version on map_version.id = version_id.value::uuid
-                                      where
-                                        version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-                                        and map_version.stock_item_id is not null
-                                    )
-                                    or version.item_id::text in (
-                                      select
-                                        conv_row.value ->> 'item_id'
-                                      from
-                                        pg_catalog.jsonb_array_elements(
-                                          coalesce(
-                                            receipt.provenance -> 'conversion_versions',
-                                            '[]'::jsonb
-                                          )
-                                        ) as conv_row (value)
-                                    )
-                                    or version.item_id::text in (
-                                      select
-                                        loss_row.value ->> 'item_id'
-                                      from
-                                        pg_catalog.jsonb_array_elements(
-                                          coalesce(
-                                            receipt.provenance -> 'loss_versions',
-                                            '[]'::jsonb
-                                          )
-                                        ) as loss_row (value)
-                                    )
+                                  and version.item_id in (
+                                    select
+                                      app.coverage_dependency_items (receipt.provenance)
                                   )
                               )
                             )
@@ -2020,7 +2017,7 @@ begin
 end;
 $$;
 
-comment on function app.shift_page_order_coverage (text[], timestamptz) is 'Private. Coverage counters for the completed, present orders of one shift page at or after the opening. A latest evaluation receipt supplies the counts only when it proves the same result as resolve_order_requirements: the snapshot is the preparation basis, the live order matches it, cited versions are still in force, and no later mapping, option, packaging, recipe, loss, or conversion change could touch the order. A new item option override counts even when the cited global version stays in force. A resolver-ready receipt covers the order and every positive line. Anything else is resolved again. Item opening prices and opening-stock instants are not resolver inputs. With no opening the result is empty and the denominator stays zero.';
+comment on function app.shift_page_order_coverage (text[], timestamptz) is 'Private. Coverage counters for the completed, present orders of one shift page at or after the opening. A latest evaluation receipt supplies the counts only when it proves the same result as resolve_order_requirements: the snapshot is the preparation basis, the live order matches it, cited versions are still in force, and no later mapping, option, packaging, recipe, loss, or conversion change could touch the order. A new item option override counts even when the cited global version stays in force. A loss or conversion change on a cited packaging line, recipe line, or mapping target counts even when that item contributed no requirement. A resolver-ready receipt covers the order and every positive line. Anything else is resolved again. Item opening prices and opening-stock instants are not resolver inputs. With no opening the result is empty and the denominator stays zero.';
 
 revoke all on function app.shift_page_order_coverage (text[], timestamptz)
 from
@@ -3480,7 +3477,7 @@ begin
 end;
 $$;
 
-comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item and uses the anchor''s pinned shift. Weekly settlement names that pinned shift, the separate interval-owning shift, and the covered interval. Count coverage for the page is read once, and the scope proof runs only for anchors that cover those shifts. Blocker counts for the page are read once. Revision rows for the page are aggregated once per call, from the batches of that page only. Completed-order coverage for the page is read from the latest evaluation receipt only when that receipt proves the same result as resolve_order_requirements: the snapshot is the preparation basis, cited versions are still in force, and no later mapping, option, packaging, recipe, loss, or conversion change could touch the order. A new item option override counts even when the cited global version stays in force. Anything else is resolved again. Item opening prices and opening-stock instants are not resolver inputs. A partial daily roster is تقديري only when no blocker is set. Unknown backfill tracking applies only to an item that already existed when the shift opened. An incomplete application, an unfinished rederive span, and unsettled work on either the latest snapshot shift or the live application shift are ناقص. Consecutive incomplete receipts keep the retired application shift until the order is settled. Revision history follows captured_at, then the numeric cause_sort, then cause kind and id. source_at in that history is the economic time. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Completed-order readiness is atomic. Line coverage counts ready and exception lines on their own. Quantities and money are decimal text. Does not post stock and does not change record_count.';
+comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item and uses the anchor''s pinned shift. Weekly settlement names that pinned shift, the separate interval-owning shift, and the covered interval. Count coverage for the page is read once, and the scope proof runs only for anchors that cover those shifts. Blocker counts for the page are read once. Revision rows for the page are aggregated once per call, from the batches of that page only. Completed-order coverage for the page is read from the latest evaluation receipt only when that receipt proves the same result as resolve_order_requirements: the snapshot is the preparation basis, cited versions are still in force, and no later mapping, option, packaging, recipe, loss, or conversion change could touch the order. A new item option override counts even when the cited global version stays in force. A loss or conversion change on a cited packaging line, recipe line, or mapping target counts even when that item contributed no requirement. Anything else is resolved again. Item opening prices and opening-stock instants are not resolver inputs. A partial daily roster is تقديري only when no blocker is set. Unknown backfill tracking applies only to an item that already existed when the shift opened. An incomplete application, an unfinished rederive span, and unsettled work on either the latest snapshot shift or the live application shift are ناقص. Consecutive incomplete receipts keep the retired application shift until the order is settled. Revision history follows captured_at, then the numeric cause_sort, then cause kind and id. source_at in that history is the economic time. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Completed-order readiness is atomic. Line coverage counts ready and exception lines on their own. Quantities and money are decimal text. Does not post stock and does not change record_count.';
 
 revoke all on function app.list_shift_accounting_status (timestamptz, text, integer)
 from
