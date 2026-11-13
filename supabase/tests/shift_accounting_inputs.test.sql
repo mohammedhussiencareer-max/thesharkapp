@@ -8150,6 +8150,44 @@ select
 
 select
   ok (
+    not has_function_privilege('anon', 'app.coverage_stock_start()', 'EXECUTE'),
+    'anon cannot execute the coverage stock start'
+  );
+
+select
+  ok (
+    not has_function_privilege(
+      'authenticated',
+      'app.coverage_stock_start()',
+      'EXECUTE'
+    ),
+    'authenticated cannot execute the coverage stock start'
+  );
+
+select
+  ok (
+    not has_function_privilege(
+      'service_role',
+      'app.coverage_stock_start()',
+      'EXECUTE'
+    ),
+    'service_role cannot execute the coverage stock start'
+  );
+
+select
+  is (
+    app.coverage_stock_start (),
+    (
+      select
+        min(opening.occurred_at)
+      from
+        app.opening_stocks opening
+    ),
+    'coverage stock start is the earliest opening'
+  );
+
+select
+  ok (
     has_function_privilege(
       'authenticated',
       'app.list_shift_accounting_status(timestamptz, text, integer)',

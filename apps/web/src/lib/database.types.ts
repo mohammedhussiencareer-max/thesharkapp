@@ -2089,6 +2089,9 @@ isOneToOne: true
 "count_sync_scope_covered":
 { Args: { "p_counted_at": string }; Returns: boolean
                            },
+"coverage_stock_start":
+{ Args: Record<PropertyKey, never>; Returns: string
+                           },
 "create_recipe":
 { Args: { "p_kind": string,"p_name": string,"p_request_id": string }; Returns: Json
                            },

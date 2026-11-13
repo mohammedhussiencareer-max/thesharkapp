@@ -2029,14 +2029,34 @@ from
   authenticated,
   service_role;
 
+-- The stock start used by coverage. PR 9 replaces the body to return
+-- inventory_activation.stock_started_at once activation exists. Private.
+create function app.coverage_stock_start () returns timestamptz language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    min(opening.occurred_at)
+  from
+    app.opening_stocks opening;
+$$;
+
+comment on function app.coverage_stock_start () is 'Private. The stock start used by coverage. PR 9 replaces it to return inventory_activation.stock_started_at once activation exists.';
+
+revoke all on function app.coverage_stock_start ()
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 -- ============================================================================
 -- 5. Shift status. Independent causes, a derived label, and the revised badge.
 -- Owner only. Keyset by (opened_at, id). Quantities and money are decimal text.
 -- Completed-order coverage counts only complete, present orders at or after
--- the first opening. With no opening the denominator is zero: those orders
--- stay sales-only and are not an incomplete-mapping blocker. A receipt
--- supplies that coverage only when it proves the same result as the resolver.
--- Any other order is resolved again.
+-- app.coverage_stock_start() (the earliest opening). With no opening the
+-- denominator is zero: those orders stay sales-only and are not an
+-- incomplete-mapping blocker. A receipt supplies that coverage only when it
+-- proves the same result as the resolver. Any other order is resolved again.
 -- ============================================================================
 create function app.list_shift_accounting_status (
   p_after_opened_at timestamptz default null,
@@ -2141,11 +2161,7 @@ begin
       using errcode = '22023';
   end if;
 
-  select
-    min(opening.occurred_at)
-  into v_opening
-  from
-    app.opening_stocks opening;
+  v_opening := app.coverage_stock_start ();
 
   select
     coalesce(
