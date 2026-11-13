@@ -333,6 +333,26 @@ isOneToOne: true
       referencedColumns: ["id"]
     }
                   ]
+                },"item_tracking_history": {
+                  Row: {
+                    "active": boolean,"basis": string,"count_frequency": string,"id": number,"item_id": string,"known_since": string,"recorded_at": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "active": boolean,"basis": string,"count_frequency": string,"id"?: never,"item_id": string,"known_since": string,"recorded_at"?: string
+                  }
+                  Update: {
+                    "active"?: boolean,"basis"?: string,"count_frequency"?: string,"id"?: never,"item_id"?: string,"known_since"?: string,"recorded_at"?: string
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "item_tracking_history_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"item_unit_conversions": {
                   Row: {
                     "factor_to_base": number,"item_id": string,"unit": string
@@ -963,6 +983,12 @@ isOneToOne: false
 isOneToOne: false
       referencedRelation: "pos_shifts"
       referencedColumns: ["id"]
+    },{
+      foreignKeyName: "pos_shift_transactions_shift_id_fkey"
+      columns: ["shift_id"]
+isOneToOne: false
+      referencedRelation: "shift_count_coverage"
+      referencedColumns: ["shift_id"]
     }
                   ]
                 },"pos_shifts": {
@@ -1246,6 +1272,20 @@ isOneToOne: false
       referencedRelation: "costing_changes"
       referencedColumns: ["id"]
     }
+                  ]
+                },"sales_revision_facts": {
+                  Row: {
+                    "captured_at": string,"id": number,"net_sales_difference": number,"order_id": string | null,"recorded_at": string,"shift_id": string,"source_at": string,"source_kind": string,"source_revision_id": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "captured_at": string,"id"?: never,"net_sales_difference": number,"order_id"?: string | null,"recorded_at"?: string,"shift_id": string,"source_at": string,"source_kind": string,"source_revision_id": number
+                  }
+                  Update: {
+                    "captured_at"?: string,"id"?: never,"net_sales_difference"?: number,"order_id"?: string | null,"recorded_at"?: string,"shift_id"?: string,"source_at"?: string,"source_kind"?: string,"source_revision_id"?: number
+                  }
+                  Relationships: [
+                    
                   ]
                 },"shift_report_flags": {
                   Row: {
@@ -1728,7 +1768,15 @@ isOneToOne: false
                 }
           }
           Views: {
-            "expense_lines": {
+            "accounting_revision_differences": {
+                  Row: {
+                    "captured_at": string | null,"cause_id": string | null,"cause_kind": string | null,"cause_sort": number | null,"cogs_difference": string | null,"count_difference": string | null,"cumulative_cogs_difference": string | null,"cumulative_count_difference": string | null,"cumulative_net_sales_difference": string | null,"cumulative_profit_difference": string | null,"cumulative_waste_difference": string | null,"is_latest": boolean | null,"net_sales_difference": string | null,"profit_difference": string | null,"recorded_at": string | null,"shift_id": string | null,"source_at": string | null,"waste_difference": string | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    
+                  ]
+                },"expense_lines": {
                   Row: {
                     "amount": number | null,"category_id": string | null,"category_kind": string | null,"category_name": string | null,"created_at": string | null,"driver_label": string | null,"expense_date": string | null,"hourly_rate": number | null,"hours": number | null,"id": string | null,"is_estimate": boolean | null,"note": string | null,"paid_on": string | null,"period_month": string | null,"void_id": string | null,"void_reason": string | null,"voided_at": string | null
                   }
@@ -1821,6 +1869,32 @@ isOneToOne: false
                   ComputedFields: never
                   Relationships: [
                     
+                  ]
+                },"shift_count_coverage": {
+                  Row: {
+                    "anchor_count_id": string | null,"anchor_counted_at": string | null,"anchor_line_no": number | null,"count_frequency": string | null,"covered": boolean | null,"interval_end": string | null,"interval_owning_shift_id": string | null,"interval_start": string | null,"item_id": string | null,"known_since": string | null,"owning_shift_id": string | null,"shift_id": string | null,"sync_scope_covered": boolean | null
+                  }
+                  ComputedFields: never
+                  Relationships: [
+                    {
+      foreignKeyName: "item_tracking_history_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: false
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "stock_count_anchors_count_id_line_no_fkey"
+      columns: ["anchor_count_id","anchor_line_no"]
+isOneToOne: true
+      referencedRelation: "stock_count_line_current"
+      referencedColumns: ["count_id","line_no"]
+    },{
+      foreignKeyName: "stock_count_anchors_count_id_line_no_fkey"
+      columns: ["anchor_count_id","anchor_line_no"]
+isOneToOne: true
+      referencedRelation: "stock_count_lines"
+      referencedColumns: ["count_id","line_no"]
+    }
                   ]
                 },"sort_history": {
                   Row: {
@@ -2012,6 +2086,15 @@ isOneToOne: true
 "costing_timestamptz_text":
 { Args: { "p_at": string }; Returns: string
                            },
+"count_sync_scope_covered":
+{ Args: { "p_counted_at": string }; Returns: boolean
+                           },
+"coverage_dependency_items":
+{ Args: { "p_provenance": Json }; Returns: string[]
+                           },
+"coverage_stock_start":
+{ Args: Record<PropertyKey, never>; Returns: string
+                           },
 "create_recipe":
 { Args: { "p_kind": string,"p_name": string,"p_request_id": string }; Returns: Json
                            },
@@ -2131,11 +2214,19 @@ isOneToOne: true
 "item_loss_at":
 { Args: { "p_at": string,"p_item_id": string }; Returns: number
                            },
+"item_roster_as_of":
+{ Args: { "p_at": string }; Returns: {
+              "count_frequency": string,"item_id": string,"known_since": string
+            }[]
+                           },
 "item_units_at":
 { Args: { "p_at": string,"p_item_ids": (string)[] }; Returns: Json
                            },
 "legacy_costing_snapshot_work":
 { Args: { "p_at": string,"p_change_id": number }; Returns: Json
+                           },
+"list_shift_accounting_status":
+{ Args: { "p_after_id"?: string,"p_after_opened_at"?: string,"p_limit"?: number }; Returns: Json[]
                            },
 "lock_and_validate_item_balance":
 { Args: { "p_item_id": string,"p_occurred_at": string }; Returns: {
@@ -2152,8 +2243,24 @@ isOneToOne: true
         isOneToOne: true
         isSetofReturn: false
       } },
+"note_order_total_sales_revision":
+{ Args: { "p_input_id": number }; Returns: undefined
+                           },
 "note_period_revision":
 { Args: { "p_amount": number,"p_bucket": string,"p_cause": string,"p_item_id": string,"p_shift_id": string,"p_source_id": number }; Returns: undefined
+                           },
+"note_refund_sales_revision":
+{ Args: { "p_revision_id": number }; Returns: undefined
+                           },
+"order_coverage_counts":
+{ Args: { "p_order_id": string }; Returns: {
+              "lines_covered": number,"lines_denom": number,"ready": number
+            }[]
+                           },
+"order_settlement_shifts":
+{ Args: { "p_order_id": string }; Returns: {
+              "shift_id": string
+            }[]
                            },
 "packaging_apply":
 { Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_fn": string,"p_kind": string,"p_order_type": string,"p_order_type_key": Json,"p_policy": Json,"p_pos_item_id": string,"p_reason": string,"p_request_id": string,"p_size_key": Json }; Returns: Json
@@ -2333,6 +2440,9 @@ isOneToOne: true
                            },
 "post_sort":
 { Args: { "p_mixed_item": string,"p_occurred_at": string,"p_qty_taken": number,"p_shift_id"?: string,"p_sizes": Json }; Returns: string
+                           },
+"preparation_basis_hash":
+{ Args: { "p_lines": Json,"p_order_type": string,"p_ordered_at": string }; Returns: string
                            },
 "prepare_balance_locks":
 { Args: { "p_item_ids": (string)[] }; Returns: undefined
@@ -2527,11 +2637,17 @@ isOneToOne: true
 "shift_for_target":
 { Args: { "p_movement_id": number }; Returns: string
                            },
+"shift_page_order_coverage":
+{ Args: { "p_opening": string,"p_shift_ids": (string)[] }; Returns: Json
+                           },
 "start_pos_sync_run":
 { Args: { "p_mode": string }; Returns: number
                            },
 "suggest_pos_mappings":
 { Args: { "p_name": string }; Returns: Json
+                           },
+"sync_coverage_covers_shift":
+{ Args: { "p_applied": boolean,"p_from": string,"p_kind": string,"p_legacy": boolean,"p_opened_at": string,"p_presented": (string)[],"p_scope_shifts": (string)[],"p_shift_id": string }; Returns: boolean
                            },
 "text_has_long_digit_run":
 { Args: { "p_text": string }; Returns: boolean
