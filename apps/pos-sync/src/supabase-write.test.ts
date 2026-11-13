@@ -249,11 +249,15 @@ describe('accounting RPCs', () => {
     await expect(
       db.recordAccountingCallFailure(ATTEMPT, 'order-test-9', 2),
     ).resolves.toBe('recorded');
+    await expect(
+      db.recordAccountingRecomputeTimeout(ATTEMPT, 'order-test-9', 2),
+    ).resolves.toBe('recorded');
     expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
       '/rest/v1/rpc/accounting_next_work',
       '/rest/v1/rpc/run_accounting_work',
       '/rest/v1/rpc/run_accounting_work',
       '/rest/v1/rpc/record_accounting_call_failure',
+      '/rest/v1/rpc/record_accounting_recompute_timeout',
     ]);
     expect(sentBody(calls[0])).toEqual({});
     expect(sentBody(calls[1])).toEqual({
@@ -269,6 +273,11 @@ describe('accounting RPCs', () => {
       p_work_generation: null,
     });
     expect(sentBody(calls[3])).toEqual({
+      p_attempt_id: ATTEMPT,
+      p_order_id: 'order-test-9',
+      p_work_generation: 2,
+    });
+    expect(sentBody(calls[4])).toEqual({
       p_attempt_id: ATTEMPT,
       p_order_id: 'order-test-9',
       p_work_generation: 2,
@@ -618,6 +627,7 @@ describe('accounting RPCs', () => {
       'getNextWork',
       'ingest',
       'recordAccountingCallFailure',
+      'recordAccountingRecomputeTimeout',
       'runAccountingWork',
       'startRun',
     ]);

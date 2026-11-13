@@ -2464,7 +2464,7 @@ select
 -- A count before the deduction is compensated.
 -- ---------------------------------------------------------------------------
 select
-  app.post_movements (
+  app.post_movements_internal (
     jsonb_build_array(
       jsonb_build_object(
         'item_id',
@@ -2930,7 +2930,68 @@ select
   );
 
 select
+  is (
+    (
+      select
+        failed_at is not null
+      from
+        app.accounting_work_state
+      where
+        order_id = 'o-fail-limit'
+    ),
+    true,
+    'a caught recompute_limit parks the order on the first attempt'
+  );
+
+select
+  pg_temp.mk_order (
+    'o-next',
+    'shift-e1',
+    'complete',
+    'hall',
+    '2030-06-23T11:00:00Z',
+    'pos-a',
+    1
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.order_cost_applications
+      where
+        order_id = 'o-next'
+        and receipt_kind = 'posting'
+    ),
+    0::bigint,
+    'the later order has no receipt before the worker runs'
+  );
+
+select
+  pg_temp.work ();
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.order_cost_applications
+      where
+        order_id = 'o-next'
+        and receipt_kind = 'posting'
+    ),
+    1::bigint,
+    'a later order still posts while the capped order is parked'
+  );
+
+select
   set_config('p54.boom', 'off', true);
+
+select
+  app.retry_accounting_work ('o-fail-limit');
 
 select
   is (
@@ -3169,6 +3230,146 @@ select
     (pg_temp.work () ->> 'applied')::integer,
     1,
     'the order recovers after the retry'
+  );
+
+-- A statement timeout is recorded on its own path and parks immediately.
+select
+  set_config('p54.boom', 'sleep', true);
+
+select
+  pg_temp.mk_order (
+    'o-slow-park',
+    'shift-e1',
+    'complete',
+    'hall',
+    '2030-06-25T12:00:00Z',
+    'pos-a',
+    1
+  );
+
+select
+  is (
+    (
+      app.accounting_next_work () -> 'head' ->> 'order_id'
+    ),
+    'o-slow-park',
+    'the timeout order is the head'
+  );
+
+create temp table park_gen as
+select
+  (
+    app.accounting_next_work () -> 'head' ->> 'work_generation'
+  )::integer as g;
+
+set
+  local statement_timeout = '400ms';
+
+select
+  is (
+    pg_temp.run_with_timeout (
+      'a5400000-0000-4000-8000-0000000000f5',
+      'o-slow-park',
+      (
+        select
+          g
+        from
+          park_gen
+      )
+    ),
+    'canceled',
+    'the timeout order is cancelled before a reply'
+  );
+
+set
+  local statement_timeout = 0;
+
+select
+  is (
+    app.record_accounting_recompute_timeout (
+      'a5400000-0000-4000-8000-0000000000f5',
+      'o-slow-park',
+      (
+        select
+          g
+        from
+          park_gen
+      )
+    ) ->> 'status',
+    'recorded',
+    'a statement timeout is recorded as recompute_limit'
+  );
+
+select
+  is (
+    app.record_accounting_recompute_timeout (
+      'a5400000-0000-4000-8000-0000000000f5',
+      'o-slow-park',
+      (
+        select
+          g
+        from
+          park_gen
+      )
+    ) ->> 'status',
+    'duplicate',
+    'a repeated timeout report is not charged again'
+  );
+
+select
+  results_eq (
+    $$select t.reason, t.sqlstate, ws.failed_at is not null, ws.attempts
+      from app.accounting_work_attempts t
+      join app.accounting_work_state ws on ws.order_id = t.order_id
+      where t.order_id = 'o-slow-park'$$,
+    $$values ('recompute_limit', '57014', true, 1)$$,
+    'the first timeout charge parks the order'
+  );
+
+select
+  set_config('p54.boom', 'off', true);
+
+select
+  pg_temp.mk_order (
+    'o-park-next',
+    'shift-e1',
+    'complete',
+    'hall',
+    '2030-06-25T13:00:00Z',
+    'pos-a',
+    1
+  );
+
+select
+  pg_temp.work ();
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.order_cost_applications
+      where
+        order_id = 'o-park-next'
+        and receipt_kind = 'posting'
+    ),
+    1::bigint,
+    'another order still posts after a timeout park'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.order_cost_applications
+      where
+        order_id = 'o-slow-park'
+    ),
+    0::bigint,
+    'the parked timeout order was not posted'
   );
 
 -- ---------------------------------------------------------------------------

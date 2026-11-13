@@ -110,6 +110,33 @@ export function unknownAction<T>(subject: string): T | null {
 }
 
 /**
+ * The payload of an in-flight or replaced action. Null when the outcome is
+ * unknown, so a retry of an unknown write cannot pick up a newer payload.
+ */
+export function heldAction<T>(subject: string): T | null {
+  const current = held.get(subject);
+  if (!current || current.unknown) return null;
+  return current.payload as T;
+}
+
+/**
+ * Keeps the request id, replaces the payload, and clears unknown.
+ * Used after `opening manifest changed`, which proved this id stored nothing.
+ */
+export function replaceActivationPayload<T extends { requestId: string }>(
+  subject: string,
+  requestId: string,
+  next: T,
+): void {
+  const current = held.get(subject);
+  if (!current || current.requestId !== requestId) return;
+  if (next.requestId !== requestId) return;
+  current.payload = next;
+  current.unknown = false;
+  emitHeldWrites();
+}
+
+/**
  * At most one outstanding action per subject. A second begin returns the
  * payload already held, including its request id.
  */

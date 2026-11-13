@@ -1995,6 +1995,9 @@ isOneToOne: true
                 }
           }
           Functions: {
+            "activate_inventory":
+{ Args: { "p_explicit_zero_item_ids": string[],"p_manifest_hash": string,"p_request_id": string }; Returns: Json
+                           },
             "accounting_next_work":
 { Args: Record<PropertyKey, never>; Returns: Json
                            },
@@ -2517,6 +2520,9 @@ isOneToOne: true
 { Args: { "p_item_ids": (string)[] }; Returns: (string)[]
                            },
 "record_accounting_call_failure":
+{ Args: { "p_attempt_id": string,"p_order_id": string,"p_work_generation": number }; Returns: Json
+                           },
+"record_accounting_recompute_timeout":
 { Args: { "p_attempt_id": string,"p_order_id": string,"p_work_generation": number }; Returns: Json
                            },
 "record_count":

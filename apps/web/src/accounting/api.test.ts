@@ -460,6 +460,103 @@ describe('accounting mappers', () => {
     });
   });
 
+  it('restarts once when a later page carries a different manifest token', async () => {
+    const page = (hash: string, next: string | null) =>
+      ok({
+        activated: false,
+        stock_started_at: null,
+        opening_manifest_hash: hash,
+        can_activate: false,
+        checklist: [],
+        roster: [
+          {
+            item_id: itemA,
+            name: 'أ',
+            base_unit: 'kg',
+            active: true,
+            missing: true,
+            opening_line_count: '0',
+            observation: null,
+          },
+        ],
+        next_item_id: next,
+      });
+    const first = 'a'.repeat(32);
+    const second = 'b'.repeat(32);
+    const settled = 'c'.repeat(32);
+    mocks.rpc
+      .mockResolvedValueOnce(page(first, itemB))
+      .mockResolvedValueOnce(page(second, null))
+      .mockResolvedValueOnce(page(settled, null));
+    const review = await loadOpeningReview();
+    expect(review.openingManifestHash).toBe(settled);
+    expect(mocks.rpc).toHaveBeenCalledTimes(3);
+  });
+
+  it('stops when the restarted pages still disagree', async () => {
+    const page = (hash: string, next: string | null) =>
+      ok({
+        activated: false,
+        stock_started_at: null,
+        opening_manifest_hash: hash,
+        can_activate: false,
+        checklist: [],
+        roster: [],
+        next_item_id: next,
+      });
+    mocks.rpc
+      .mockResolvedValueOnce(page('a'.repeat(32), itemB))
+      .mockResolvedValueOnce(page('b'.repeat(32), null))
+      .mockResolvedValueOnce(page('c'.repeat(32), itemB))
+      .mockResolvedValueOnce(page('d'.repeat(32), null));
+    await expect(loadOpeningReview()).rejects.toThrow(
+      'قائمة الافتتاح اتغيرت — راجعها وفعّل تاني',
+    );
+    expect(mocks.rpc).toHaveBeenCalledTimes(4);
+  });
+
+  it('reads a stored explicit zero', async () => {
+    mocks.rpc.mockResolvedValueOnce(
+      ok({
+        activated: true,
+        stock_started_at: '2026-03-01T08:00:00.000Z',
+        opening_manifest_hash: 'd'.repeat(32),
+        can_activate: false,
+        checklist: [],
+        roster: [
+          {
+            item_id: itemA,
+            name: 'صفر',
+            base_unit: 'kg',
+            active: true,
+            missing: false,
+            opening_line_count: '0',
+            observation: {
+              opening_id: null,
+              line_no: null,
+              quantity: '0',
+              unit: 'kg',
+              unit_cost: '0',
+              occurred_at: '2026-03-01T08:00:00.000Z',
+              explicit_zero: true,
+            },
+          },
+        ],
+        next_item_id: null,
+      }),
+    );
+    const review = await loadOpeningReview();
+    expect(review.roster[0]?.observation).toEqual({
+      openingId: null,
+      lineNo: null,
+      quantity: '0',
+      unit: 'kg',
+      unitCost: '0',
+      occurredAt: '2026-03-01T08:00:00.000Z',
+      explicitZero: true,
+    });
+  });
+
   it('passes both shift cursors or neither', async () => {
     const row = (id: string) => ({
       shift_id: id,

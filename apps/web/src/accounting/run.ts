@@ -56,10 +56,14 @@ export type NextWork = {
   head: AccountingOrderRef | null;
 };
 
+export type AttemptFailureKind = 'recompute_timeout' | 'escaped';
+
 export type AttemptReport = {
   attemptId: string;
   orderId: string;
   workGeneration: number;
+  /** Null until the bound call fails. A missing kind is never recorded as escaped. */
+  failureKind: AttemptFailureKind | null;
 };
 
 export type RunHeld = {
@@ -75,6 +79,11 @@ export type AccountingDb = {
     binding: AccountingOrderRef | null,
   ): Promise<AccountingRun>;
   recordAccountingCallFailure(
+    attemptId: string,
+    orderId: string,
+    workGeneration: number,
+  ): Promise<FailureReport>;
+  recordAccountingRecomputeTimeout(
     attemptId: string,
     orderId: string,
     workGeneration: number,
@@ -171,20 +180,27 @@ export async function runAccountingWork(
     }
     const attemptId = newAttemptId();
     calls += 1;
-    if (binding !== null) {
-      onBoundAttempt?.({
-        attemptId,
-        orderId: binding.orderId,
-        workGeneration: binding.workGeneration,
-      });
-    }
+    const held: AttemptReport | null =
+      binding === null
+        ? null
+        : {
+            attemptId,
+            orderId: binding.orderId,
+            workGeneration: binding.workGeneration,
+            failureKind: null,
+          };
+    if (held) onBoundAttempt?.(held);
     let run: AccountingRun;
     try {
       run = await db.runAccountingWork(attemptId, RUN_BATCH_LIMIT, binding);
     } catch (error) {
+      if (held && isUnknownOutcome(error)) {
+        held.failureKind =
+          failureCode(error) === '57014' ? 'recompute_timeout' : 'escaped';
+      }
       return failedCall(
         db,
-        attemptId,
+        held,
         binding,
         error,
         { budgetMs, clock, sleep, started },
@@ -217,9 +233,15 @@ export async function runAccountingWork(
   }
 }
 
+function failureCode(error: unknown): string {
+  if (typeof error !== 'object' || error === null) return '';
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' ? code : '';
+}
+
 async function failedCall(
   db: AccountingDb,
-  attemptId: string,
+  held: AttemptReport | null,
   binding: AccountingOrderRef | null,
   error: unknown,
   pacing: {
@@ -234,15 +256,34 @@ async function failedCall(
     cause?: unknown,
   ) => RunOutcome,
 ): Promise<RunOutcome> {
-  if (binding === null || !isUnknownOutcome(error)) {
-    return done('call_failed', 'not_needed', error);
-  }
-  try {
-    let report = await db.recordAccountingCallFailure(
-      attemptId,
-      binding.orderId,
-      binding.workGeneration,
+  if (
+    binding === null ||
+    held === null ||
+    held.failureKind === null ||
+    !isUnknownOutcome(error)
+  ) {
+    return done(
+      'call_failed',
+      held?.failureKind === null && binding !== null && isUnknownOutcome(error)
+        ? 'unreported'
+        : 'not_needed',
+      error,
     );
+  }
+  const record = () =>
+    held.failureKind === 'recompute_timeout'
+      ? db.recordAccountingRecomputeTimeout(
+          held.attemptId,
+          held.orderId,
+          held.workGeneration,
+        )
+      : db.recordAccountingCallFailure(
+          held.attemptId,
+          held.orderId,
+          held.workGeneration,
+        );
+  try {
+    let report = await record();
     const { clock, started, budgetMs, sleep } = pacing;
     let waited = 0;
     for (let repeat = 0; report === 'busy'; repeat += 1) {
@@ -252,11 +293,7 @@ async function failedCall(
       if (Math.max(clock() - started, waited) + pause > budgetMs) break;
       await sleep(pause);
       waited += pause;
-      report = await db.recordAccountingCallFailure(
-        attemptId,
-        binding.orderId,
-        binding.workGeneration,
-      );
+      report = await record();
     }
     return done('call_failed', report, error);
   } catch {

@@ -1643,7 +1643,7 @@ select
   );
 
 select
-  app.post_movements (
+  app.post_movements_internal (
     jsonb_build_array(
       jsonb_build_object(
         'item_id',
@@ -2137,7 +2137,7 @@ select
 
 select
   lives_ok (
-    $$select app.post_movements(jsonb_build_array(
+    $$select app.post_movements_internal(jsonb_build_array(
       jsonb_build_object('item_id', pg_temp.u(9), 'movement_type', 'sale',
         'occurred_at', '2030-06-12T13:00:00Z', 'quantity', 0.25)
     ))$$,

@@ -52,7 +52,18 @@ function fakeDb(
     orderId: string;
     generation: number;
   }> = [];
+  const timeouts: Array<{
+    attemptId: string;
+    orderId: string;
+    generation: number;
+  }> = [];
   const queue = [...script];
+  function takeReply(): FailureReport {
+    const reply = replies === null ? report : (replies.shift() ?? 'busy');
+    if (reply instanceof Error) throw reply;
+    if (Array.isArray(reply)) throw new Error('unexpected report script');
+    return reply;
+  }
   const db: AccountingDb = {
     async getNextWork() {
       if (peek instanceof Error) {
@@ -73,17 +84,14 @@ function fakeDb(
     },
     async recordAccountingCallFailure(attemptId, orderId, generation) {
       reports.push({ attemptId, orderId, generation });
-      const reply = replies === null ? report : (replies.shift() ?? 'busy');
-      if (reply instanceof Error) {
-        throw reply;
-      }
-      if (Array.isArray(reply)) {
-        throw new Error('unexpected report script');
-      }
-      return reply;
+      return takeReply();
+    },
+    async recordAccountingRecomputeTimeout(attemptId, orderId, generation) {
+      timeouts.push({ attemptId, orderId, generation });
+      return takeReply();
     },
   };
-  return { db, runs, reports };
+  return { db, runs, reports, timeouts };
 }
 
 function ids() {
@@ -337,7 +345,7 @@ describe('drainAccountingWork', () => {
   });
 
   it('reports a server error on the first call against the order the peek named', async () => {
-    const { db, runs, reports } = fakeDb(
+    const { db, runs, reports, timeouts } = fakeDb(
       [
         new SupabaseRpcError(
           'Supabase RPC failed: HTTP 500',
@@ -350,13 +358,37 @@ describe('drainAccountingWork', () => {
     );
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.report).toBe('committed');
-    expect(reports).toEqual([
+    expect(reports).toEqual([]);
+    expect(timeouts).toEqual([
       {
         attemptId: runs[0]?.attemptId,
         orderId: 'order-a',
         generation: 1,
       },
     ]);
+  });
+
+  it('retries a statement timeout on the timeout recorder only', async () => {
+    const { db, reports, timeouts } = fakeDb(
+      [
+        new SupabaseRpcError(
+          'Supabase RPC failed: HTTP 500',
+          'http',
+          500,
+          '57014',
+        ),
+      ],
+      ['busy', 'recorded'],
+    );
+    const outcome = await drainAccountingWork(db, {
+      newAttemptId: ids(),
+      clock: () => 0,
+      sleep: () => Promise.resolve(),
+    });
+    expect(outcome.report).toBe('recorded');
+    expect(reports).toEqual([]);
+    expect(timeouts).toHaveLength(2);
+    expect(timeouts[0]).toEqual(timeouts[1]);
   });
 
   it('makes no report when an unbound (maintenance) call fails, as it processed no order', async () => {

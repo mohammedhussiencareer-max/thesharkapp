@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { useActivationAction } from '@/accounting/activation-action';
 import { loadOpeningReview } from '@/accounting/api';
 import { ActivationReview } from '@/accounting/ActivationReview';
 import type { OpeningReview } from '@/accounting/types';
@@ -34,6 +35,8 @@ export function ActivationPage() {
     };
   }, [loadId]);
 
+  const activation = useActivationAction(review, setReview);
+
   return (
     <main className={pageShell}>
       <p>
@@ -55,7 +58,19 @@ export function ActivationPage() {
           </button>
         </>
       ) : null}
-      {review ? <ActivationReview review={review} /> : null}
+      {review ? (
+        <ActivationReview
+          review={review}
+          checkedZeroIds={activation.checkedZeroIds}
+          checksLocked={activation.checksLocked}
+          onToggleZero={activation.toggleZero}
+          notice={activation.notice}
+          showActivate={activation.showActivate}
+          activateLabel={activation.activateLabel}
+          activateDisabled={activation.activateDisabled}
+          onActivate={() => void activation.activate()}
+        />
+      ) : null}
     </main>
   );
 }
