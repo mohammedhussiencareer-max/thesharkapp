@@ -1,7 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from '../src/lib/database.types';
 import { assertLocalSupabaseUrl, developmentSupabaseUrl } from './local-guard';
-import { seedOrderDecisions } from './seed-order-decisions';
 import { seedSales } from './seed-sales';
 import { localServiceRoleKey, ownerEmail, ownerPassword } from './.test-owner';
 
@@ -48,8 +47,9 @@ export default async function globalSetup(): Promise<void> {
     .from('owner')
     .upsert({ id: true, user_id: userId }, { onConflict: 'id' });
   if (saved.error) throw saved.error;
+  // Activation is append-only. The dormant project must see the database
+  // before seed-order-decisions.sql records it, so that seed runs later.
   await seedSales(client, localApiUrl);
-  await seedOrderDecisions(client, localApiUrl);
 }
 
 async function findOwnerId(

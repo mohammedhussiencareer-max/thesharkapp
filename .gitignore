@@ -23,6 +23,7 @@ supabase/.branches/
 supabase/.temp/
 test-results/
 playwright-report/
+apps/web/e2e/.seeded-orders.json
 src-tauri/target/
 .DS_Store
 Thumbs.db

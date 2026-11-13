@@ -4,6 +4,7 @@ import { RequireOwner } from '@/auth/RequireOwner';
 import { useAuth } from '@/lib/auth-context';
 import { supabase } from '@/lib/supabase';
 import { ExpensesPage } from '@/pages/ExpensesPage';
+import { ActivationPage } from '@/pages/ActivationPage';
 import { CountsPage } from '@/pages/CountsPage';
 import { HomePage } from '@/pages/HomePage';
 import { MappingPage } from '@/pages/MappingPage';
@@ -16,6 +17,7 @@ import { PurchasesPage } from '@/pages/PurchasesPage';
 import { RecipeImportPage } from '@/pages/RecipeImportPage';
 import { RecipePage } from '@/pages/RecipePage';
 import { RecipesPage } from '@/pages/RecipesPage';
+import { OrderCostPage } from '@/pages/OrderCostPage';
 import { SalesPage } from '@/pages/SalesPage';
 import { SortingPage } from '@/pages/SortingPage';
 import { SalesShiftPage } from '@/pages/SalesShiftPage';
@@ -109,6 +111,22 @@ export function AppRoutes() {
         element={
           <RequireOwner>
             <SalesShiftPage />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/orders/:orderId"
+        element={
+          <RequireOwner>
+            <OrderCostPage />
+          </RequireOwner>
+        }
+      />
+      <Route
+        path="/activation"
+        element={
+          <RequireOwner>
+            <ActivationPage />
           </RequireOwner>
         }
       />

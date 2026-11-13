@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { loadShiftStatuses } from '@/accounting/api';
+import type { ShiftAccountingStatus } from '@/accounting/types';
 import { messageFrom } from '@/items/errors';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { loadShiftDetail } from '@/sales/api';
@@ -13,6 +15,11 @@ export function ShiftDetailLoader({ shiftId }: { shiftId: string }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadId, setLoadId] = useState(0);
+  const [status, setStatus] = useState<ShiftAccountingStatus | null>(null);
+  const [statusCapped, setStatusCapped] = useState(false);
+  const [statusMissing, setStatusMissing] = useState(false);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [showStatus, setShowStatus] = useState(false);
   const requestKey = `${shiftId}\n${loadId.toString()}`;
   const [seenKey, setSeenKey] = useState(requestKey);
   if (seenKey !== requestKey) {
@@ -20,6 +27,10 @@ export function ShiftDetailLoader({ shiftId }: { shiftId: string }) {
     setDetail(undefined);
     setLoading(true);
     setLoadError(null);
+    setStatus(null);
+    setStatusMissing(false);
+    setStatusError(null);
+    setShowStatus(false);
   }
   const seqRef = useRef(0);
 
@@ -43,6 +54,33 @@ export function ShiftDetailLoader({ shiftId }: { shiftId: string }) {
       cancelled = true;
     };
   }, [loadId, shiftId]);
+
+  useEffect(() => {
+    if (!detail) return;
+    let cancelled = false;
+    const id = detail.summary.shiftId;
+    void (async () => {
+      try {
+        const loaded = await loadShiftStatuses([id]);
+        if (cancelled) return;
+        const row = loaded.byId.get(id) ?? null;
+        setStatus(row);
+        setStatusCapped(loaded.capped);
+        setStatusMissing(row === null);
+        setStatusError(null);
+        setShowStatus(true);
+      } catch (error) {
+        if (cancelled) return;
+        setStatus(null);
+        setStatusMissing(false);
+        setShowStatus(false);
+        setStatusError(messageFrom(error));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [detail]);
 
   function reload() {
     setLoading(true);
@@ -80,5 +118,18 @@ export function ShiftDetailLoader({ shiftId }: { shiftId: string }) {
     );
   }
 
-  return <ShiftDetailView detail={detail} />;
+  return (
+    <>
+      {statusError ? (
+        <p className="mx-auto w-full max-w-3xl px-4">{statusError}</p>
+      ) : null}
+      <ShiftDetailView
+        detail={detail}
+        status={status}
+        statusCapped={statusCapped}
+        statusMissing={statusMissing}
+        showStatus={showStatus}
+      />
+    </>
+  );
 }

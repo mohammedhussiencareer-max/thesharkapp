@@ -50,6 +50,12 @@ export function HomePage({
       </Link>
       <Link
         className="inline-flex w-fit rounded bg-neutral-900 px-3 py-2 text-white"
+        to="/activation"
+      >
+        تفعيل المخزون
+      </Link>
+      <Link
+        className="inline-flex w-fit rounded bg-neutral-900 px-3 py-2 text-white"
         to="/purchases"
       >
         المشتريات

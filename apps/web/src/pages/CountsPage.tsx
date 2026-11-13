@@ -367,7 +367,7 @@ export function CountsPage() {
             disabled={busy}
             onResend={(payload) => void handleStored(payload)}
           />
-          <CountList counts={snapshot.counts} />
+          <CountList counts={snapshot.counts} refreshKey={loadId} />
         </>
       ) : null}
     </main>

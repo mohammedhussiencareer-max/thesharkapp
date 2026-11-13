@@ -5,6 +5,7 @@ import {
   waitFor,
   within,
 } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   hasAction,
@@ -71,7 +72,9 @@ function renderCard(
   onChanged = vi.fn().mockResolvedValue(undefined),
 ) {
   const view = render(
-    <DecisionCard row={row} closed={false} onChanged={onChanged} />,
+    <MemoryRouter>
+      <DecisionCard row={row} closed={false} onChanged={onChanged} />
+    </MemoryRouter>,
   );
   return { onChanged, ...view };
 }
@@ -423,11 +426,13 @@ describe('DecisionCard', () => {
 
   it('shows no form once the episode has closed', () => {
     render(
-      <DecisionCard
-        row={queueRow()}
-        closed
-        onChanged={vi.fn().mockResolvedValue(undefined)}
-      />,
+      <MemoryRouter>
+        <DecisionCard
+          row={queueRow()}
+          closed
+          onChanged={vi.fn().mockResolvedValue(undefined)}
+        />
+      </MemoryRouter>,
     );
     expect(screen.queryByRole('form')).toBeNull();
     expect(screen.getByText('الطلب ده مبقاش محتاج قرار')).toBeInTheDocument();

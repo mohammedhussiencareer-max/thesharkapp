@@ -1,5 +1,25 @@
 import { defineConfig, devices } from '@playwright/test';
 
+const browser = { ...devices['Desktop Chrome'] };
+
+// Ledger writers and the accounting worker share advisory lock
+// 7342750000000000001. Activation is append-only, so dormancy runs before
+// the activate project records it. Processing then seeds one order.
+// Ledger files run one at a time after that queue is empty. Expenses and
+// the read-only specs do not take the lock, so they stay parallel.
+const ledgerSpecs = [
+  '**/items.spec.ts',
+  '**/purchases.spec.ts',
+  '**/counts.spec.ts',
+  '**/sorting.spec.ts',
+  '**/waste.spec.ts',
+  '**/recipes.spec.ts',
+  '**/recipe-import.spec.ts',
+  '**/mapping.spec.ts',
+  '**/packaging.spec.ts',
+  '**/order-decisions.spec.ts',
+];
+
 export default defineConfig({
   testDir: './e2e',
   testMatch: '**/*.spec.ts',
@@ -13,8 +33,42 @@ export default defineConfig({
   },
   projects: [
     {
+      name: 'dormant',
+      testMatch: '**/processing-dormant.spec.ts',
+      workers: 1,
+      use: browser,
+    },
+    {
+      name: 'activate',
+      testMatch: '**/activate-accounting.spec.ts',
+      dependencies: ['dormant'],
+      workers: 1,
+      use: browser,
+    },
+    {
+      name: 'processing',
+      testMatch: '**/processing-panel.spec.ts',
+      dependencies: ['activate'],
+      workers: 1,
+      use: browser,
+    },
+    {
+      name: 'ledger',
+      testMatch: ledgerSpecs,
+      dependencies: ['processing'],
+      fullyParallel: false,
+      workers: 1,
+      use: browser,
+    },
+    {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      testIgnore: [
+        '**/processing-dormant.spec.ts',
+        '**/activate-accounting.spec.ts',
+        '**/processing-panel.spec.ts',
+        ...ledgerSpecs,
+      ],
+      use: browser,
     },
   ],
   webServer: {

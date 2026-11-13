@@ -1,4 +1,6 @@
 import { Link } from 'react-router-dom';
+import { ShiftStatus } from '@/accounting/ShiftStatus';
+import type { ShiftAccountingStatus } from '@/accounting/types';
 import { formatCairo } from '@/lib/cairo';
 import { formatEgpText } from '@/lib/money';
 import { reconciliationBadge, unknownTxLabel } from '@/sales/badges';
@@ -8,7 +10,15 @@ function countLine(shift: ShiftSummary): string {
   return `ملغي ${shift.ordersCanceled.toString()} · مفتوح ${shift.ordersOpen.toString()} · ناقص ${shift.ordersMissing.toString()}`;
 }
 
-export function ShiftList({ shifts }: { shifts: readonly ShiftSummary[] }) {
+export function ShiftList({
+  shifts,
+  statuses,
+  statusCapped = false,
+}: {
+  shifts: readonly ShiftSummary[];
+  statuses?: ReadonlyMap<string, ShiftAccountingStatus>;
+  statusCapped?: boolean;
+}) {
   return (
     <ul className="flex flex-col gap-3">
       {shifts.map((shift) => {
@@ -33,6 +43,13 @@ export function ShiftList({ shifts }: { shifts: readonly ShiftSummary[] }) {
               <p>{countLine(shift)}</p>
               <p>{reconciliationBadge(shift)}</p>
               {unknown ? <p>{unknown}</p> : null}
+              {statuses ? (
+                <ShiftStatus
+                  status={statuses.get(shift.shiftId) ?? null}
+                  capped={statusCapped}
+                  missing={!statuses.has(shift.shiftId)}
+                />
+              ) : null}
             </article>
           </li>
         );
