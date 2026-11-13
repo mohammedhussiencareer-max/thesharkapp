@@ -6066,6 +6066,807 @@ select
     'the waste correction batches are not separate causes'
   );
 
+-- A receipt is coverage only when it proves the resolver's result. A new
+-- item option override leaves the cited global version in force. A sale
+-- receipt that cites a later empty snapshot but was resolved from the
+-- retained non-empty preparation basis does not prove that snapshot.
+create temp table p77_span_mark as
+select
+  coalesce(max(span.id), 0) as id
+from
+  app.accounting_rederive_spans span;
+
+create function pg_temp.cov (p_shift text) returns jsonb language sql as $$
+  select
+    app.shift_page_order_coverage (
+      array[p_shift],
+      (
+        select
+          min(opening.occurred_at)
+        from
+          app.opening_stocks opening
+      )
+    ) -> p_shift;
+$$;
+
+create function pg_temp.capture (p_order text, p_version integer) returns bigint language plpgsql as $$
+declare
+  v_id bigint;
+begin
+  insert into
+    app.pos_order_snapshots (
+      order_id,
+      version,
+      shift_id,
+      status,
+      order_type,
+      ordered_at,
+      subtotal,
+      discount,
+      tax,
+      service_tax,
+      delivery_fee,
+      total,
+      pos_update_time,
+      content_hash,
+      lines,
+      origin
+    )
+  select
+    orders.id,
+    p_version,
+    orders.shift_id,
+    orders.status,
+    orders.order_type,
+    orders.ordered_at,
+    orders.subtotal,
+    orders.discount,
+    orders.tax,
+    orders.service_tax,
+    orders.delivery_fee,
+    orders.total,
+    orders.pos_update_time,
+    repeat('cd', 32),
+    coalesce(
+      (
+        select
+          pg_catalog.jsonb_agg (
+            pg_catalog.jsonb_build_object (
+              'line_id',
+              line.line_id,
+              'item_id',
+              line.item_id,
+              'item_name',
+              line.item_name,
+              'size_name',
+              line.size_name,
+              'quantity',
+              line.quantity,
+              'weighted_qty',
+              line.weighted_qty,
+              'weighted_unit',
+              line.weighted_unit,
+              'options',
+              line.options
+            )
+            order by
+              line.line_id
+          )
+        from
+          app.pos_order_lines line
+        where
+          line.order_id = orders.id
+      ),
+      '[]'::jsonb
+    ),
+    'sync'
+  from
+    app.pos_orders orders
+  where
+    orders.id = p_order
+  returning
+    id into v_id;
+
+  insert into
+    app.pos_cost_inputs (
+      order_id,
+      input_revision,
+      snapshot_id,
+      missing_from_pos,
+      refund_revision_ids,
+      digest,
+      origin
+    )
+  values
+    (
+      p_order,
+      p_version,
+      v_id,
+      false,
+      '{}'::bigint[],
+      md5(p_order || ':' || p_version::text),
+      'sync'
+    );
+
+  return v_id;
+end;
+$$;
+
+select
+  app.set_pos_option_policy (
+    md5('p77-opt-policy')::uuid,
+    'p77-opt-pos',
+    '["none"]'::jsonb,
+    '2026-01-01 00:00+00',
+    null,
+    'exactly_one',
+    (
+      select
+        app.pos_base_schedule ('p77-opt-pos', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  app.set_base_packaging (
+    md5('p77-opt-pack')::uuid,
+    'p77-opt-pos',
+    '["none"]'::jsonb,
+    '2026-01-01 00:00+00',
+    null,
+    '{"none": true}'::jsonb,
+    (
+      select
+        app.packaging_base_schedule ('p77-opt-pos', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  pg_temp.map_stock (
+    'p77-opt-pos',
+    pg_temp.u (1),
+    '1',
+    '2026-01-01 00:00+00'
+  );
+
+select
+  pg_temp.type_ok ('p77-opt-type');
+
+select
+  app.set_pos_option_mapping (
+    md5('p77-opt-global')::uuid,
+    'global',
+    null,
+    null,
+    'p77-spicy',
+    '2026-01-01 00:00+00',
+    null,
+    '{"disposition":"no_stock"}'::jsonb,
+    (
+      select
+        app.pos_option_schedule ('global', null, null, 'p77-spicy') ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  pg_temp.shift ('p77-opt', '2026-12-24 12:00+00', false);
+
+select
+  pg_temp.ord (
+    'p77-o-opt',
+    'p77-opt',
+    'complete',
+    '2026-12-24 13:00+00',
+    20
+  );
+
+update app.pos_orders
+set
+  order_type = 'p77-opt-type'
+where
+  id = 'p77-o-opt';
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    options,
+    line_total
+  )
+values
+  (
+    'p77-o-opt',
+    'l1',
+    'p77-opt-pos',
+    'x',
+    1,
+    '[{"value":"p77-spicy"}]'::jsonb,
+    20
+  );
+
+select
+  pg_temp.capture ('p77-o-opt', 1);
+
+select
+  is (
+    (
+      select
+        app.resolve_order_snapshot_exact (snap.id, false, false) ->> 'status'
+      from
+        app.pos_order_snapshots snap
+      where
+        snap.order_id = 'p77-o-opt'
+    ),
+    'ready',
+    'the global option order resolves ready before the item override'
+  );
+
+insert into
+  app.order_cost_applications (
+    order_id,
+    cost_input_id,
+    snapshot_id,
+    receipt_kind,
+    disposition,
+    occurred_at,
+    shift_id,
+    signature,
+    requirements,
+    provenance,
+    work_generation
+  )
+select
+  input.order_id,
+  input.id,
+  input.snapshot_id,
+  'posting',
+  'sale',
+  snap.ordered_at,
+  snap.shift_id,
+  md5('p77-o-opt'),
+  '[]'::jsonb,
+  app.resolve_order_snapshot_exact (snap.id, false, false) -> 'provenance',
+  1
+from
+  app.pos_cost_inputs input
+  join app.pos_order_snapshots snap on snap.id = input.snapshot_id
+where
+  input.order_id = 'p77-o-opt';
+
+select
+  is (
+    pg_temp.cov ('p77-opt') ->> 'orders_covered',
+    '1',
+    'the global option order is covered from its current receipt'
+  );
+
+select
+  is (
+    pg_temp.cov ('p77-opt') ->> 'lines_covered',
+    '1',
+    'the global option line is covered from its current receipt'
+  );
+
+select
+  app.set_pos_option_mapping (
+    md5('p77-opt-item')::uuid,
+    'item',
+    'p77-opt-pos',
+    '["none"]'::jsonb,
+    'p77-spicy',
+    '2026-01-01 00:00+00',
+    null,
+    '{"disposition":"unmapped"}'::jsonb,
+    (
+      select
+        app.pos_option_schedule (
+          'item',
+          'p77-opt-pos',
+          '["none"]'::jsonb,
+          'p77-spicy'
+        ) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.order_cost_applications receipt
+        cross join lateral pg_catalog.jsonb_array_elements_text (receipt.provenance -> 'mapping_versions') as version_id (value)
+        join app.pos_map_versions version on version.id = version_id.value::uuid
+        join app.pos_map_subjects subject on subject.id = version.subject_id
+      where
+        receipt.order_id = 'p77-o-opt'
+        and subject.kind = 'option'
+        and subject.option_scope = 'global'
+        and subject.option_value = 'p77-spicy'
+        and version.superseded_change_id is null
+        and version.valid_during @> (
+          select
+            orders.ordered_at
+          from
+            app.pos_orders orders
+          where
+            orders.id = 'p77-o-opt'
+        )
+    ),
+    'the cited global option version stays in force after the item override'
+  );
+
+select
+  is (
+    app.resolve_order_requirements ('p77-o-opt', null) ->> 'status',
+    'incomplete',
+    'the item unmapped override makes the resolver report incomplete'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        pg_catalog.jsonb_array_elements (
+          app.resolve_order_requirements ('p77-o-opt', null) -> 'issues'
+        ) as issue (value)
+      where
+        issue.value ->> 'code' = 'unmapped_option'
+    ),
+    'the resolver issue is unmapped_option'
+  );
+
+select
+  is (
+    pg_temp.cov ('p77-opt') ->> 'orders_covered',
+    (
+      select
+        counted.ready::text
+      from
+        app.order_coverage_counts ('p77-o-opt') counted
+    ),
+    'page coverage matches the resolver after the item override'
+  );
+
+select
+  is (
+    pg_temp.cov ('p77-opt') ->> 'lines_covered',
+    (
+      select
+        counted.lines_covered::text
+      from
+        app.order_coverage_counts ('p77-o-opt') counted
+    ),
+    'line coverage matches the resolver after the item override'
+  );
+
+select
+  is (
+    pg_temp.cov ('p77-opt') ->> 'orders_covered',
+    '0',
+    'the item override is not served from the stale receipt'
+  );
+
+-- Retained preparation. The second receipt cites the empty snapshot and
+-- keeps the provenance of the non-empty preparation basis.
+select
+  pg_temp.type_ok ('p77-keep-type');
+
+select
+  pg_temp.shift ('p77-keep', '2026-12-25 12:00+00', false);
+
+select
+  pg_temp.ord (
+    'p77-o-keep',
+    'p77-keep',
+    'complete',
+    '2026-12-25 13:00+00',
+    20
+  );
+
+update app.pos_orders
+set
+  order_type = 'p77-keep-type'
+where
+  id = 'p77-o-keep';
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    options,
+    line_total
+  )
+values
+  (
+    'p77-o-keep',
+    'l1',
+    'pos-ready',
+    'x',
+    1,
+    '[]'::jsonb,
+    20
+  );
+
+select
+  pg_temp.capture ('p77-o-keep', 1);
+
+select
+  is (
+    (
+      select
+        app.resolve_order_snapshot_exact (snap.id, false, false) ->> 'status'
+      from
+        app.pos_order_snapshots snap
+      where
+        snap.order_id = 'p77-o-keep'
+        and snap.version = 1
+    ),
+    'ready',
+    'the preparation snapshot resolves ready'
+  );
+
+insert into
+  app.order_cost_applications (
+    order_id,
+    cost_input_id,
+    snapshot_id,
+    receipt_kind,
+    disposition,
+    occurred_at,
+    shift_id,
+    signature,
+    requirements,
+    provenance,
+    work_generation
+  )
+select
+  input.order_id,
+  input.id,
+  input.snapshot_id,
+  'posting',
+  'sale',
+  snap.ordered_at,
+  snap.shift_id,
+  md5('p77-o-prep-v1'),
+  '[]'::jsonb,
+  app.resolve_order_snapshot_exact (snap.id, false, false) -> 'provenance',
+  1
+from
+  app.pos_cost_inputs input
+  join app.pos_order_snapshots snap on snap.id = input.snapshot_id
+where
+  input.order_id = 'p77-o-keep'
+  and input.input_revision = 1;
+
+select
+  is (
+    pg_temp.cov ('p77-keep') ->> 'orders_covered',
+    '1',
+    'the preparation sale is covered while the snapshot is its own basis'
+  );
+
+delete from app.pos_order_lines
+where
+  order_id = 'p77-o-keep';
+
+update app.pos_orders
+set
+  order_type = 'p77-bare-type'
+where
+  id = 'p77-o-keep';
+
+select
+  pg_temp.capture ('p77-o-keep', 2);
+
+insert into
+  app.order_cost_applications (
+    order_id,
+    cost_input_id,
+    snapshot_id,
+    receipt_kind,
+    disposition,
+    occurred_at,
+    shift_id,
+    signature,
+    requirements,
+    provenance,
+    work_generation
+  )
+select
+  input.order_id,
+  input.id,
+  input.snapshot_id,
+  'posting',
+  'sale',
+  snap.ordered_at,
+  snap.shift_id,
+  md5('p77-o-prep-v2'),
+  '[]'::jsonb,
+  prior.provenance,
+  1
+from
+  app.pos_cost_inputs input
+  join app.pos_order_snapshots snap on snap.id = input.snapshot_id
+  cross join (
+    select
+      application.provenance
+    from
+      app.order_cost_applications application
+    where
+      application.order_id = 'p77-o-keep'
+    order by
+      application.id
+    limit
+      1
+  ) prior
+where
+  input.order_id = 'p77-o-keep'
+  and input.input_revision = 2;
+
+select
+  ok (
+    (
+      select
+        app.preparation_basis_hash (older.order_type, older.ordered_at, older.lines) is distinct from app.preparation_basis_hash (newer.order_type, newer.ordered_at, newer.lines)
+      from
+        app.pos_order_snapshots older
+        join app.pos_order_snapshots newer on newer.order_id = older.order_id
+      where
+        older.order_id = 'p77-o-keep'
+        and older.version = 1
+        and newer.version = 2
+    ),
+    'the empty snapshot is not the retained preparation basis'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.order_cost_applications receipt
+        cross join lateral pg_catalog.jsonb_array_elements_text (receipt.provenance -> 'packaging_versions') as version_id (value)
+        join app.packaging_versions version on version.id = version_id.value::uuid
+      where
+        receipt.order_id = 'p77-o-keep'
+        and receipt.snapshot_id = (
+          select
+            snap.id
+          from
+            app.pos_order_snapshots snap
+          where
+            snap.order_id = 'p77-o-keep'
+            and snap.version = 2
+        )
+        and version.superseded_change_id is null
+        and version.valid_during @> (
+          select
+            orders.ordered_at
+          from
+            app.pos_orders orders
+          where
+            orders.id = 'p77-o-keep'
+        )
+    ),
+    'the retained receipt still cites a packaging version that is in force'
+  );
+
+select
+  is (
+    app.resolve_order_requirements ('p77-o-keep', null) ->> 'status',
+    'incomplete',
+    'the empty order without a packaging policy is incomplete'
+  );
+
+select
+  is (
+    pg_temp.cov ('p77-keep') ->> 'orders_covered',
+    (
+      select
+        counted.ready::text
+      from
+        app.order_coverage_counts ('p77-o-keep') counted
+    ),
+    'page coverage matches the resolver when the receipt kept the old basis'
+  );
+
+select
+  is (
+    pg_temp.cov ('p77-keep') ->> 'orders_covered',
+    '0',
+    'the retained preparation receipt is not served as current'
+  );
+
+-- Every completed present order in the main fixtures, one at a time, so a
+-- shift total cannot hide one order over-covered and another under-covered.
+create temp table p77_cov_gap (
+  order_id text,
+  fast_ready text,
+  resolver_ready text,
+  fast_lines text,
+  resolver_lines text,
+  fast_denom text,
+  resolver_denom text
+);
+
+create temp table p77_cov_seen (n integer);
+
+create temp table p77_hold (id text primary key, status text);
+
+do $$
+declare
+  v_opening timestamptz;
+  v_order record;
+  v_cov jsonb;
+  v_ready integer;
+  v_denom integer;
+  v_lines integer;
+  v_n integer := 0;
+begin
+  select
+    min(opening.occurred_at)
+  into v_opening
+  from
+    app.opening_stocks opening;
+
+  for v_order in
+  select
+    orders.id,
+    orders.shift_id
+  from
+    app.pos_orders orders
+  where
+    orders.status = 'complete'
+    and not orders.missing_from_pos
+    and orders.ordered_at >= v_opening
+    and orders.id not like 'p77-y-%'
+  order by
+    orders.id
+  loop
+    insert into
+      p77_hold (id, status)
+    select
+      held.id,
+      held.status
+    from
+      app.pos_orders held
+    where
+      held.shift_id = v_order.shift_id
+      and held.id <> v_order.id
+      and held.status = 'complete';
+
+    update app.pos_orders orders
+    set
+      status = 'canceled'
+    from
+      p77_hold held
+    where
+      orders.id = held.id;
+
+    v_cov := app.shift_page_order_coverage (array[v_order.shift_id], v_opening) -> v_order.shift_id;
+
+    select
+      counted.ready,
+      counted.lines_denom,
+      counted.lines_covered
+    into
+      v_ready,
+      v_denom,
+      v_lines
+    from
+      app.order_coverage_counts (v_order.id) counted;
+
+    if coalesce(v_cov ->> 'orders_covered', '0') is distinct from v_ready::text
+    or coalesce(v_cov ->> 'lines_covered', '0') is distinct from v_lines::text
+    or coalesce(v_cov ->> 'lines_denom', '0') is distinct from v_denom::text
+    or coalesce(v_cov ->> 'orders_denom', '0') is distinct from '1' then
+      insert into
+        p77_cov_gap (
+          order_id,
+          fast_ready,
+          resolver_ready,
+          fast_lines,
+          resolver_lines,
+          fast_denom,
+          resolver_denom
+        )
+      values
+        (
+          v_order.id,
+          v_cov ->> 'orders_covered',
+          v_ready::text,
+          v_cov ->> 'lines_covered',
+          v_lines::text,
+          v_cov ->> 'lines_denom',
+          v_denom::text
+        );
+    end if;
+
+    update app.pos_orders orders
+    set
+      status = held.status
+    from
+      p77_hold held
+    where
+      orders.id = held.id;
+
+    delete from p77_hold;
+
+    v_n := v_n + 1;
+  end loop;
+
+  insert into
+    p77_cov_seen (n)
+  values
+    (v_n);
+end;
+$$;
+
+select
+  diag (
+    gap.order_id || ' page ' || coalesce(gap.fast_ready, 'null') || '/' || coalesce(gap.fast_lines, 'null') || ' resolver ' || gap.resolver_ready || '/' || gap.resolver_lines
+  )
+from
+  p77_cov_gap gap;
+
+select
+  cmp_ok (
+    (
+      select
+        seen.n
+      from
+        p77_cov_seen seen
+    ),
+    '>=',
+    1,
+    'the coverage property saw the main fixtures'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        p77_cov_gap
+    ),
+    0::bigint,
+    'fast-path coverage equals resolver coverage for every completed main-fixture order'
+  );
+
+update app.accounting_rederive_spans span
+set
+  completed_at = pg_catalog.clock_timestamp ()
+where
+  span.completed_at is null
+  and span.id > (
+    select
+      mark.id
+    from
+      p77_span_mark mark
+  );
+
+update app.accounting_work_events event
+set
+  work_generation = 1,
+  processed_at = pg_catalog.clock_timestamp ()
+where
+  event.order_id in ('p77-o-opt', 'p77-o-keep')
+  and event.processed_at is null;
+
 -- Round 2, finding 5. One year of counts, one page, with a receipt and a
 -- revision on every day plus a waste correction each week. Budget is 2000 ms.
 insert into

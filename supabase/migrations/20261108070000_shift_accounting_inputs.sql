@@ -1245,7 +1245,7 @@ from
   authenticated,
   service_role;
 
--- One order's coverage counters, used when no current evaluation is stored.
+-- One order's coverage counters, used when no receipt proves the same result.
 -- resolve_order_requirements and every function it calls only read. An error
 -- while resolving leaves the order unready and covers none of its lines.
 -- Private.
@@ -1296,7 +1296,7 @@ begin
 end;
 $$;
 
-comment on function app.order_coverage_counts (text) is 'Private. ready is 1 when resolve_order_requirements reports the order ready. lines_denom counts positive lines. lines_covered counts those lines whose own status is ready or exception. A resolver error counts as not ready and covers no lines. The shift page calls this only for an order with no current evaluation.';
+comment on function app.order_coverage_counts (text) is 'Private. ready is 1 when resolve_order_requirements reports the order ready. lines_denom counts positive lines. lines_covered counts those lines whose own status is ready or exception. A resolver error counts as not ready and covers no lines. The shift page calls this when no receipt proves the same result.';
 
 revoke all on function app.order_coverage_counts (text)
 from
@@ -1305,20 +1305,83 @@ from
   authenticated,
   service_role;
 
--- Page coverage from the latest evaluation receipt when that receipt is still
--- the current basis. A sale, a no-stock evaluation, or an incomplete receipt
--- whose only causes are missing_shift or before_item_opening was resolver-ready,
--- so every positive line is covered. The receipt is current when it is the
--- latest application of the latest cost input, the live order still matches
--- that snapshot, every version id in the receipt provenance is still in force
--- at ordered_at, and no later costing change touches the order's mapping,
--- packaging, recipe, loss, or conversion subjects. Anything else, including an
--- order that was never evaluated, is resolved by order_coverage_counts.
+-- Same physical basis app.disposition_context hashes for a preparation
+-- snapshot: order type, UTC ordered_at, and the ordered line identity. Equal
+-- hashes are the same resolver input. Private.
+create function app.preparation_basis_hash (
+  p_order_type text,
+  p_ordered_at timestamptz,
+  p_lines jsonb
+) returns text language sql stable parallel safe
+set
+  search_path = '' as $$
+  select
+    pg_catalog.md5(
+      pg_catalog.concat_ws(
+        '|',
+        coalesce(p_order_type, ''),
+        app.costing_timestamptz_text (p_ordered_at),
+        (
+          select
+            coalesce(
+              pg_catalog.string_agg(
+                pg_catalog.concat_ws(
+                  '~',
+                  coalesce(l.value ->> 'line_id', ''),
+                  coalesce(l.value ->> 'item_id', ''),
+                  coalesce(l.value ->> 'item_name', ''),
+                  coalesce(l.value ->> 'size_name', ''),
+                  coalesce(l.value ->> 'quantity', ''),
+                  coalesce(l.value ->> 'weighted_qty', ''),
+                  coalesce(l.value ->> 'weighted_unit', ''),
+                  coalesce((l.value -> 'options')::text, '')
+                ),
+                ';'
+                order by
+                  l.value ->> 'line_id',
+                  l.value ->> 'item_id'
+              ),
+              ''
+            )
+          from
+            pg_catalog.jsonb_array_elements(coalesce(p_lines, '[]'::jsonb)) as l (value)
+        )
+      )
+    );
+$$;
+
+comment on function app.preparation_basis_hash (text, timestamptz, jsonb) is 'Private. md5 of order type, UTC ordered_at, and the ordered physical lines. The same formula as the preparation hash in disposition_context. Equal hashes are the same resolver input.';
+
+revoke all on function app.preparation_basis_hash (text, timestamptz, jsonb)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+-- Page coverage from the latest evaluation receipt only when that receipt
+-- proves the same result as resolve_order_requirements. A sale, a no-stock
+-- evaluation, or an incomplete receipt whose only causes are missing_shift or
+-- before_item_opening was resolver-ready, so every positive line is covered.
+-- The proof is: latest application of the latest cost input, the live order
+-- still matches that snapshot, the snapshot is the preparation basis (it is
+-- the latest non-empty snapshot, or its preparation-basis hash equals that
+-- basis), every version id in the provenance is still in force at ordered_at,
+-- and no later costing change could touch the order. A later base mapping, a
+-- global or item option mapping (including a new item override that leaves the
+-- cited global version in force), an order-type or base packaging policy, a
+-- recipe of a cited mapping or cited recipe version, and a loss or conversion
+-- of a cited requirement item all send the order back to the resolver. Item
+-- opening prices and opening-stock instants are not resolver inputs, so they
+-- do not invalidate coverage. Anything else, including an order that was never
+-- evaluated, is resolved by order_coverage_counts.
 -- plpgsql so the statement is in the plan cache. A SQL function keeps its plan
 -- for the transaction, and ANALYZE does not drop that cache. ANALYZE, including
 -- autovacuum, invalidates this plan; the next call uses the published statistics.
 -- Each page order is fetched by index. The subject walk runs only when a costing
--- change was recorded after the receipt. The per-order result is materialized
+-- change was recorded after the receipt. The preparation-basis probe is an
+-- index lookup on (order_id, version) and hashes only when that snapshot is
+-- not already the latest non-empty one. The per-order result is materialized
 -- once: the aggregate reads that value, so the lookups are not repeated for
 -- each counter.
 create function app.shift_page_order_coverage (p_shift_ids text[], p_opening timestamptz) returns jsonb language plpgsql stable
@@ -1508,6 +1571,47 @@ begin
                           or live.weighted_unit is distinct from snap_line.weighted_unit
                           or live.options is distinct from coalesce(snap_line.options, '[]'::jsonb)
                       )
+                      and case
+                        -- The receipt resolved this snapshot, not a retained
+                        -- earlier preparation. pos_preparation_input is the
+                        -- latest non-empty snapshot. When this snapshot is
+                        -- that row, both engine paths resolved it. Otherwise
+                        -- the physical hashes must match; a hash is not
+                        -- computed on the common path.
+                        when coalesce(pg_catalog.jsonb_array_length(snap.lines), 0) > 0
+                        and not exists (
+                          select
+                            1
+                          from
+                            app.pos_order_snapshots later
+                          where
+                            later.order_id = page.id
+                            and later.version > snap.version
+                            and pg_catalog.jsonb_typeof (later.lines) = 'array'
+                            and pg_catalog.jsonb_array_length (later.lines) > 0
+                        ) then true
+                        else coalesce(
+                          (
+                            select
+                              app.preparation_basis_hash (
+                                basis.order_type,
+                                basis.ordered_at,
+                                basis.lines
+                              ) = app.preparation_basis_hash (snap.order_type, snap.ordered_at, snap.lines)
+                            from
+                              app.pos_order_snapshots basis
+                            where
+                              basis.order_id = page.id
+                              and pg_catalog.jsonb_typeof (basis.lines) = 'array'
+                              and pg_catalog.jsonb_array_length (basis.lines) > 0
+                            order by
+                              basis.version desc
+                            limit
+                              1
+                          ),
+                          false
+                        )
+                      end
                       and not exists (
                         select
                           1
@@ -1628,13 +1732,49 @@ begin
                                 from
                                   app.pos_map_versions version
                                   join app.pos_map_subjects subject on subject.id = version.subject_id
-                                  join app.pos_order_lines line on line.order_id = page.id
-                                  and subject.kind = 'base'
-                                  and subject.pos_item_id = line.item_id
-                                  and subject.size_key = app.pos_size_key (line.size_name)
                                 where
-                                  version.created_change_id = change.id
-                                  or version.superseded_change_id = change.id
+                                  (
+                                    version.created_change_id = change.id
+                                    or version.superseded_change_id = change.id
+                                  )
+                                  and (
+                                    (
+                                      subject.kind = 'base'
+                                      and exists (
+                                        select
+                                          1
+                                        from
+                                          app.pos_order_lines line
+                                        where
+                                          line.order_id = page.id
+                                          and subject.pos_item_id = line.item_id
+                                          and subject.size_key = app.pos_size_key (line.size_name)
+                                      )
+                                    )
+                                    or (
+                                      subject.kind = 'option'
+                                      and exists (
+                                        select
+                                          1
+                                        from
+                                          app.pos_order_lines line
+                                          cross join lateral pg_catalog.jsonb_array_elements(
+                                            coalesce(line.options, '[]'::jsonb)
+                                          ) as opt (value)
+                                        where
+                                          line.order_id = page.id
+                                          and subject.option_value = nullif(pg_catalog.btrim(opt.value ->> 'value'), '')
+                                          and (
+                                            subject.option_scope = 'global'
+                                            or (
+                                              subject.option_scope = 'item'
+                                              and subject.pos_item_id = line.item_id
+                                              and subject.size_key = app.pos_size_key (line.size_name)
+                                            )
+                                          )
+                                      )
+                                    )
+                                  )
                               )
                               or exists (
                                 select
@@ -1672,25 +1812,42 @@ begin
                                   1
                                 from
                                   app.recipe_versions version
-                                  join app.pos_map_versions map_version on map_version.recipe_id = version.recipe_id
                                 where
                                   (
                                     version.created_change_id = change.id
                                     or version.superseded_change_id = change.id
                                   )
-                                  and exists (
-                                    select
-                                      1
-                                    from
-                                      pg_catalog.jsonb_array_elements_text(
-                                        coalesce(
-                                          receipt.provenance -> 'mapping_versions',
-                                          '[]'::jsonb
-                                        )
-                                      ) as version_id (value)
-                                    where
-                                      version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-                                      and version_id.value::uuid = map_version.id
+                                  and (
+                                    exists (
+                                      select
+                                        1
+                                      from
+                                        pg_catalog.jsonb_array_elements_text(
+                                          coalesce(
+                                            receipt.provenance -> 'mapping_versions',
+                                            '[]'::jsonb
+                                          )
+                                        ) as version_id (value)
+                                        join app.pos_map_versions map_version on map_version.id = version_id.value::uuid
+                                      where
+                                        version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                                        and map_version.recipe_id = version.recipe_id
+                                    )
+                                    or exists (
+                                      select
+                                        1
+                                      from
+                                        pg_catalog.jsonb_array_elements_text(
+                                          coalesce(
+                                            receipt.provenance -> 'recipe_versions',
+                                            '[]'::jsonb
+                                          )
+                                        ) as version_id (value)
+                                        join app.recipe_versions cited on cited.id = version_id.value::uuid
+                                      where
+                                        version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                                        and cited.recipe_id = version.recipe_id
+                                    )
                                   )
                               )
                               or exists (
@@ -1730,6 +1887,17 @@ begin
                                           )
                                         ) as loss_row (value)
                                     )
+                                    or version.item_id::text in (
+                                      select
+                                        conv_row.value ->> 'item_id'
+                                      from
+                                        pg_catalog.jsonb_array_elements(
+                                          coalesce(
+                                            receipt.provenance -> 'conversion_versions',
+                                            '[]'::jsonb
+                                          )
+                                        ) as conv_row (value)
+                                    )
                                   )
                               )
                               or exists (
@@ -1742,20 +1910,44 @@ begin
                                     version.created_change_id = change.id
                                     or version.superseded_change_id = change.id
                                   )
-                                  and version.item_id in (
-                                    select
-                                      map_version.stock_item_id
-                                    from
-                                      pg_catalog.jsonb_array_elements_text(
-                                        coalesce(
-                                          receipt.provenance -> 'mapping_versions',
-                                          '[]'::jsonb
-                                        )
-                                      ) as version_id (value)
-                                      join app.pos_map_versions map_version on map_version.id = version_id.value::uuid
-                                    where
-                                      version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-                                      and map_version.stock_item_id is not null
+                                  and (
+                                    version.item_id in (
+                                      select
+                                        map_version.stock_item_id
+                                      from
+                                        pg_catalog.jsonb_array_elements_text(
+                                          coalesce(
+                                            receipt.provenance -> 'mapping_versions',
+                                            '[]'::jsonb
+                                          )
+                                        ) as version_id (value)
+                                        join app.pos_map_versions map_version on map_version.id = version_id.value::uuid
+                                      where
+                                        version_id.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                                        and map_version.stock_item_id is not null
+                                    )
+                                    or version.item_id::text in (
+                                      select
+                                        conv_row.value ->> 'item_id'
+                                      from
+                                        pg_catalog.jsonb_array_elements(
+                                          coalesce(
+                                            receipt.provenance -> 'conversion_versions',
+                                            '[]'::jsonb
+                                          )
+                                        ) as conv_row (value)
+                                    )
+                                    or version.item_id::text in (
+                                      select
+                                        loss_row.value ->> 'item_id'
+                                      from
+                                        pg_catalog.jsonb_array_elements(
+                                          coalesce(
+                                            receipt.provenance -> 'loss_versions',
+                                            '[]'::jsonb
+                                          )
+                                        ) as loss_row (value)
+                                    )
                                   )
                               )
                             )
@@ -1828,7 +2020,7 @@ begin
 end;
 $$;
 
-comment on function app.shift_page_order_coverage (text[], timestamptz) is 'Private. Coverage counters for the completed, present orders of one shift page at or after the opening. A latest evaluation receipt whose basis is still current supplies the counts: a resolver-ready receipt covers the order and every positive line. resolve_order_requirements runs only for an order that was never evaluated or whose basis changed, including a mapping change after the receipt. With no opening the result is empty and the denominator stays zero.';
+comment on function app.shift_page_order_coverage (text[], timestamptz) is 'Private. Coverage counters for the completed, present orders of one shift page at or after the opening. A latest evaluation receipt supplies the counts only when it proves the same result as resolve_order_requirements: the snapshot is the preparation basis, the live order matches it, cited versions are still in force, and no later mapping, option, packaging, recipe, loss, or conversion change could touch the order. A new item option override counts even when the cited global version stays in force. A resolver-ready receipt covers the order and every positive line. Anything else is resolved again. Item opening prices and opening-stock instants are not resolver inputs. With no opening the result is empty and the denominator stays zero.';
 
 revoke all on function app.shift_page_order_coverage (text[], timestamptz)
 from
@@ -1842,9 +2034,9 @@ from
 -- Owner only. Keyset by (opened_at, id). Quantities and money are decimal text.
 -- Completed-order coverage counts only complete, present orders at or after
 -- the first opening. With no opening the denominator is zero: those orders
--- stay sales-only and are not an incomplete-mapping blocker. A current
--- evaluation receipt supplies that coverage. The resolver runs only for an
--- order with no current evaluation.
+-- stay sales-only and are not an incomplete-mapping blocker. A receipt
+-- supplies that coverage only when it proves the same result as the resolver.
+-- Any other order is resolved again.
 -- ============================================================================
 create function app.list_shift_accounting_status (
   p_after_opened_at timestamptz default null,
@@ -2559,8 +2751,8 @@ begin
         diff.shift_id
     ) grouped;
 
-  -- Current receipts answer from provenance. The resolver runs only for an
-  -- order that has no current evaluation.
+  -- A receipt answers only when it proves the resolver's current result.
+  -- Every other order on the page is resolved again.
   v_order_coverage := coalesce(
     app.shift_page_order_coverage (v_page_ids, v_opening),
     '{}'::jsonb
@@ -3272,7 +3464,7 @@ begin
 end;
 $$;
 
-comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item and uses the anchor''s pinned shift. Weekly settlement names that pinned shift, the separate interval-owning shift, and the covered interval. Count coverage for the page is read once, and the scope proof runs only for anchors that cover those shifts. Blocker counts for the page are read once. Revision rows for the page are aggregated once per call, from the batches of that page only. Completed-order coverage for the page is read from the current evaluation receipt. resolve_order_requirements runs only for an order with no current evaluation. A partial daily roster is تقديري only when no blocker is set. Unknown backfill tracking applies only to an item that already existed when the shift opened. An incomplete application, an unfinished rederive span, and unsettled work on either the latest snapshot shift or the live application shift are ناقص. Consecutive incomplete receipts keep the retired application shift until the order is settled. Revision history follows captured_at, then the numeric cause_sort, then cause kind and id. source_at in that history is the economic time. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Completed-order readiness is atomic. Line coverage counts ready and exception lines on their own. Quantities and money are decimal text. Does not post stock and does not change record_count.';
+comment on function app.list_shift_accounting_status (timestamptz, text, integer) is 'Owner only. One page of shifts after the (opened_at, id) cursor, at most 100, default 50. Each object lists independent causes, the derived label (ناقص, تقديري, السمك مقفول, مقفول نهائي), and the separate revised badge. Daily coverage is per required item and uses the anchor''s pinned shift. Weekly settlement names that pinned shift, the separate interval-owning shift, and the covered interval. Count coverage for the page is read once, and the scope proof runs only for anchors that cover those shifts. Blocker counts for the page are read once. Revision rows for the page are aggregated once per call, from the batches of that page only. Completed-order coverage for the page is read from the latest evaluation receipt only when that receipt proves the same result as resolve_order_requirements: the snapshot is the preparation basis, cited versions are still in force, and no later mapping, option, packaging, recipe, loss, or conversion change could touch the order. A new item option override counts even when the cited global version stays in force. Anything else is resolved again. Item opening prices and opening-stock instants are not resolver inputs. A partial daily roster is تقديري only when no blocker is set. Unknown backfill tracking applies only to an item that already existed when the shift opened. An incomplete application, an unfinished rederive span, and unsettled work on either the latest snapshot shift or the live application shift are ناقص. Consecutive incomplete receipts keep the retired application shift until the order is settled. Revision history follows captured_at, then the numeric cause_sort, then cause kind and id. source_at in that history is the economic time. Final closure also needs weekly coverage and the existing month_expense_status confirmation for the shift''s Cairo month. Completed-order readiness is atomic. Line coverage counts ready and exception lines on their own. Quantities and money are decimal text. Does not post stock and does not change record_count.';
 
 revoke all on function app.list_shift_accounting_status (timestamptz, text, integer)
 from

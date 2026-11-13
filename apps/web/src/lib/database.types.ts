@@ -2435,6 +2435,9 @@ isOneToOne: true
 "post_sort":
 { Args: { "p_mixed_item": string,"p_occurred_at": string,"p_qty_taken": number,"p_shift_id"?: string,"p_sizes": Json }; Returns: string
                            },
+"preparation_basis_hash":
+{ Args: { "p_lines": Json,"p_order_type": string,"p_ordered_at": string }; Returns: string
+                           },
 "prepare_balance_locks":
 { Args: { "p_item_ids": (string)[] }; Returns: undefined
                            },
