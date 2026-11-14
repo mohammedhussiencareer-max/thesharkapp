@@ -279,6 +279,7 @@ export type DifferenceVector = {
   cogsDifference: string;
   wasteDifference: string;
   countDifference: string;
+  inventoryDifference: string;
   profitDifference: string;
 };
 

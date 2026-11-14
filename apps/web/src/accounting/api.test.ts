@@ -31,6 +31,7 @@ const zeroDifference = {
   cogs_difference: '0.00',
   waste_difference: '0.00',
   count_difference: '0.00',
+  inventory_difference: '0.00',
   profit_difference: '0.00',
 };
 
@@ -310,6 +311,7 @@ describe('accounting mappers', () => {
       },
       { causeKind: 'order_total', sourceAt: null, isLatest: true },
     ]);
+    expect(status.latestDifference.inventoryDifference).toBe('0.00');
     expect(status.revised).toBe(true);
     expect(JSON.stringify(status)).not.toContain('SECRETID');
     expect(JSON.stringify(status)).not.toContain('leak');

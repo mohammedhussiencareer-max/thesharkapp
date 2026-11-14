@@ -103,8 +103,8 @@ select
 select
   is (
     app.accounting_scaling_ready (),
-    false,
-    'scaling stays unready until the checkpoint migration replaces the function'
+    true,
+    'the checkpoint migration makes scaling ready'
   );
 
 select
@@ -476,6 +476,15 @@ select
 rollback to savepoint unreceipted_sale;
 
 savepoint scaling_not_ready;
+
+-- The shipped function returns true. Install the old false body so this
+-- block still proves the refusal gate, then the stored-result path.
+create or replace function app.accounting_scaling_ready () returns boolean language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    false;
+$$;
 
 select
   throws_ok (

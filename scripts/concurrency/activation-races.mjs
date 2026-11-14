@@ -40,10 +40,15 @@ async function containerName() {
     return process.env.E2E_SUPABASE_DB_CONTAINER;
   }
   const names = await dockerText(['ps', '--format', '{{.Names}}']);
-  const found = names
+  const lines = names
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .find((line) => line.startsWith('supabase_db_'));
+    .filter((line) => line.length > 0);
+  const found =
+    lines.find((line) => line === 'supabase_db_thesharkapp') ??
+    (lines.filter((line) => line.startsWith('supabase_db_')).length === 1
+      ? lines.find((line) => line.startsWith('supabase_db_'))
+      : undefined);
   if (!found)
     throw new Error('the local supabase database container is not running');
   return found;
@@ -444,7 +449,8 @@ insert into auth.users (
   'authenticated', 'authenticated', 'owner-race@theshark.test', '',
   '2026-01-01 00:00:00+00', '', '', '', ''
 ) on conflict (id) do nothing;
-insert into app.owner (user_id) values ('${owner}') on conflict (user_id) do nothing;
+insert into app.owner (user_id) values ('${owner}')
+on conflict (id) do update set user_id = excluded.user_id;
 create or replace function app.accounting_scaling_ready() returns boolean
 language sql stable security definer set search_path = '' as $$ select true; $$;
 ${claims()}

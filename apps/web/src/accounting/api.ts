@@ -548,6 +548,7 @@ function differenceOf(value: unknown): DifferenceVector {
     cogsDifference: decimal(row.cogs_difference),
     wasteDifference: decimal(row.waste_difference),
     countDifference: decimal(row.count_difference),
+    inventoryDifference: decimal(row.inventory_difference),
     profitDifference: decimal(row.profit_difference),
   };
 }

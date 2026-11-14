@@ -1,37 +1,77 @@
 # Accounting history benchmark
 
-Preliminary single-item measurement. The catalog is one stock item with a direct cashier mapping. It has no recipes, no sorting, no stock counts, and no waste. `stock_count_anchors: 0` is that fixture, not the restaurant's load. The full gate, with those components and count anchors, runs in the checkpoint PR that rebuilds this benchmark.
-
-Historical orders were posted with `app.run_accounting_work`. The measured order was the queue head and was timed in a fresh session with `statement_timeout` of 6 seconds. Crossing 2 seconds is recorded and does not fail. No checkpoint was built.
+Synthetic catalog. Historical orders were posted with `app.run_accounting_work`. The measured order is a new queue head, timed by a top-level statement after the session statement timeout is set to 6 seconds. The soft gate is 2 seconds and the hard gate is 6 seconds. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.
 
 ## 35-day
-
-Preliminary only. One item, direct mapping, no recipes, sorting, counts, or waste.
 
 - orders: 3500
 - days: 35
 - posted historical orders with a posting receipt and movements: 3500
-- build elapsed: 01:44:55.534346
-- eligible replay rows before the measured call: 3501
-- stock_count_anchors: 0
-- events plus anchors: 3501
+- eligible replay rows before the measured call: 3503
+- stock_count_anchors: 35
+- weekly anchors: 5
+- events plus anchors: 3538
+- queue depth 1 ms: 0.237
+- queue depth 50000 ms: 0.313
+- suffix index range: true
+- suffix rows: 0
+- deficit restore rows: 1
 - measured status: processed
 - failed: 0
 - completion outcome: applied
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 1.949
+- wall clock seconds: 0.081
 - crossed 2s: false
-- gate: preliminary PASS for this single-item history. The full gate runs with the checkpoint PR
+- gate: PASS
 
 ## 1-year
 
-- orders in the catalog: 36500
+- orders: 36500
 - days: 365
-- posted with a posting receipt before the failing call: 3171
-- the next call was cancelled with `statement timeout` inside `app.accounting_pending_orders(1001)`, called from `app.run_accounting_work` while counting the remaining queue
-- the late order was not inserted and was not measured
-- gate: FAIL
+- posted historical orders with a posting receipt and movements: 36500
+- eligible replay rows before the measured call: 36503
+- stock_count_anchors: 365
+- weekly anchors: 52
+- events plus anchors: 36868
+- queue depth 1 ms: 0.228
+- queue depth 50000 ms: 0.19
+- suffix index range: true
+- suffix rows: 0
+- deficit restore rows: 1
+- measured status: processed
+- failed: 0
+- completion outcome: applied
+- receipt_kind: posting
+- per-item movement links match negated requirements: true
+- split normal and provisional: true
+- wall clock seconds: 0.146
+- crossed 2s: false
+- gate: PASS
 
-Stopped after a failing history. No checkpoint was built.
+## 2-year
+
+- orders: 73000
+- days: 730
+- posted historical orders with a posting receipt and movements: 73000
+- eligible replay rows before the measured call: 73003
+- stock_count_anchors: 730
+- weekly anchors: 104
+- events plus anchors: 73733
+- queue depth 1 ms: 0.7
+- queue depth 50000 ms: 7.722
+- suffix index range: true
+- suffix rows: 0
+- deficit restore rows: 1
+- measured status: processed
+- failed: 0
+- completion outcome: applied
+- receipt_kind: posting
+- per-item movement links match negated requirements: true
+- split normal and provisional: true
+- wall clock seconds: 0.785
+- crossed 2s: false
+- gate: PASS
+
+The 35-day, 1-year, and 2-year histories passed the gate.
