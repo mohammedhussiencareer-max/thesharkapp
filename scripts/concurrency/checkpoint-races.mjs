@@ -224,7 +224,52 @@ commit;
     `\ninstall exclusive waits for a share holder\n  blocked: ${installWaits.waiter.ms >= minWaitMs}\n  pass: ${installOk}\n  waiter: ${installWaits.waiter.out.replace(/\s+/g, ' ').slice(0, 300)}\n`,
   );
 
-  if (!monotonicOk || !purchaseOk || !installOk) {
+  const shift = JSON.stringify({
+    id: 'c-pause-shift',
+    opened_at: '2026-10-23T08:00:00Z',
+    closed_at: '2026-10-23T20:00:00Z',
+    is_active: false,
+    pos_update_time: '2026-10-23T20:00:00Z',
+    transactions: [],
+  }).replaceAll("'", "''");
+  const pauseRace = await race(
+    `
+begin;
+${claims()}
+select set_config('app.ingest_pause_after_shifts', '1', true);
+select app.start_pos_sync_run('recent') as run_id \\gset
+select app.ingest_pos_batch(
+  :run_id,
+  jsonb_build_array('${shift}'::jsonb),
+  '[]'::jsonb,
+  '{"shift_ids":["c-pause-shift"]}'::jsonb
+);
+select app.finish_pos_sync_run(:run_id, 'ok', '{}'::jsonb, '');
+select 'ingest_committed';
+commit;
+`,
+    `
+begin;
+${claims()}
+select ${purchase('2026-10-23 09:00:00+00')};
+select 'purchase_committed';
+commit;
+`,
+    800,
+  );
+  const pauseOk =
+    pauseRace.holder.ok &&
+    pauseRace.waiter.ok &&
+    pauseRace.holder.out.includes('ingest_committed') &&
+    pauseRace.waiter.out.includes('purchase_committed') &&
+    !pauseRace.holder.out.includes('deadlock') &&
+    !pauseRace.waiter.out.includes('deadlock') &&
+    pauseRace.waiter.ms >= minWaitMs;
+  process.stdout.write(
+    `\ningest paused after the shifts upsert, purchase waits\n  blocked: ${pauseRace.waiter.ms >= minWaitMs}\n  pass: ${pauseOk}\n  holder: ${pauseRace.holder.out.replace(/\s+/g, ' ').slice(0, 300)}\n  waiter: ${pauseRace.waiter.out.replace(/\s+/g, ' ').slice(0, 300)}\n`,
+  );
+
+  if (!monotonicOk || !purchaseOk || !installOk || !pauseOk) {
     process.exitCode = 1;
   }
 }

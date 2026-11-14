@@ -278,6 +278,16 @@ create table app.activation_history_loaded (
 
 comment on table app.activation_history_loaded is 'Written under the ledger lock once every frozen input has a posting receipt. Absent when the bound set was empty. After it exists, a newly discovered order before the window is a closed cause.';
 
+create table app.closed_span_orders (
+  span_id bigint not null references app.accounting_rederive_spans (id) on delete restrict,
+  order_id text not null,
+  ordered_at timestamptz not null,
+  cause_id uuid null,
+  primary key (span_id, order_id)
+);
+
+comment on table app.closed_span_orders is 'Orders of one configuration span that fall before the restatement window. They share one closed cause, posted when the cursor reaches the window. In-window orders are not stored here.';
+
 create table app.accounting_attempt_progress (
   attempt_id uuid primary key,
   status text not null,
@@ -363,6 +373,8 @@ alter table app.activation_history_input enable row level security;
 
 alter table app.activation_history_loaded enable row level security;
 
+alter table app.closed_span_orders enable row level security;
+
 alter table app.accounting_attempt_progress enable row level security;
 
 alter table app.accounting_accrual_versions enable row level security;
@@ -378,6 +390,7 @@ app.accounting_work_queue,
 app.activation_history_bound,
 app.activation_history_input,
 app.activation_history_loaded,
+app.closed_span_orders,
 app.accounting_attempt_progress,
 app.accounting_accrual_versions
 from
@@ -1220,6 +1233,42 @@ declare
 begin
   v_cause := coalesce(p_cause, pg_catalog.gen_random_uuid ());
 
+  -- A pair this walk no longer requires posts its negation. P0 inserted
+  -- before P1 leaves the old P1 cover at zero and posts the new cover at P0.
+  insert into
+    ledger_scratch.recompute_cover_pair (
+      inflow_movement_id,
+      deficit_movement_id,
+      covered_qty,
+      value_adj
+    )
+  select
+    posted.cover_inflow_movement_id,
+    posted.cover_deficit_movement_id,
+    0,
+    0
+  from
+    (
+      select distinct
+        sm.cover_inflow_movement_id,
+        sm.cover_deficit_movement_id
+      from
+        app.stock_movements sm
+      where
+        sm.movement_type = 'closed_period'::app.movement_type
+        and sm.cover_inflow_movement_id is not null
+        and exists (
+          select
+            1
+          from
+            ledger_scratch.recompute_row walked
+          where
+            walked.movement_id = sm.cover_inflow_movement_id
+            and not walked.is_pending
+        )
+    ) as posted
+  on conflict (inflow_movement_id, deficit_movement_id) do nothing;
+
   for v_pair in
     select
       pair.inflow_movement_id,
@@ -1721,7 +1770,6 @@ declare
   v_n integer := coalesce(pg_catalog.cardinality (p_weights), 0);
   v_sum numeric := 0;
   v_out numeric[] := '{}'::numeric[];
-  v_i integer;
   v_acc numeric := 0;
   v_last integer := 0;
   v_piece numeric;
@@ -1870,7 +1918,10 @@ set
                 'sale_reversal'::app.movement_type,
                 'waste_reversal'::app.movement_type
               )
-              or sm.movement_type = 'closed_period'::app.movement_type
+              or (
+                sm.movement_type = 'closed_period'::app.movement_type
+                and sm.closed_bucket in ('cogs', 'waste', 'count')
+              )
             ) then -sm.quantity
             else 0
           end
@@ -1888,7 +1939,7 @@ set
     and sm.movement_type <> 'cost_adjustment'::app.movement_type;
 $$;
 
-comment on function app.closed_net_outflow_qty (uuid, timestamptz, timestamptz) is 'Outflow quantity minus returns in the open interval after the document through the change. Positive closed_period rows count as returns. Quantity 0 adds nothing.';
+comment on function app.closed_net_outflow_qty (uuid, timestamptz, timestamptz) is 'Outflow quantity minus returns in the open interval after the document through the change. Returns are sale_reversal, waste_reversal, and a positive closed_period row in cogs, waste, or count. A positive inventory or sort_transfer row is an inflow, not a return. Quantity 0 adds nothing.';
 
 revoke all on function app.closed_net_outflow_qty (uuid, timestamptz, timestamptz)
 from
@@ -2084,7 +2135,9 @@ begin
     'on_hand_qty',
     v_on_qty,
     'on_hand_value',
-    v_on_value
+    v_on_value,
+    'qty_delta',
+    p_qty_delta
   );
 end;
 $$;
@@ -2143,19 +2196,15 @@ declare
   v_out record;
   v_group_value numeric(14, 2);
   v_group_qty numeric(20, 6);
-  v_shares numeric[];
   v_weights numeric[];
   v_i integer;
   v_share numeric(14, 2);
   v_child jsonb;
-  v_ids bigint[] := '{}'::bigint[];
-  v_n integer;
   v_j integer;
   v_piece numeric(14, 2);
-  v_out_id bigint;
-  v_out_at timestamptz;
   v_batch_shares numeric[];
   v_out_shares numeric[];
+  v_doc_at timestamptz;
 begin
   if p_depth > 8
   or p_item_id = any (p_visited) then
@@ -2301,61 +2350,15 @@ begin
     return;
   end if;
 
-  -- Batches that took this item after the document, oldest first.
-  for v_batch in
-    select
-      sm.batch_id,
-      coalesce(
-        (
-          select
-            sum(incoming.total_cost)
-          from
-            app.stock_movements incoming
-          where
-            incoming.batch_id = sm.batch_id
-            and incoming.movement_type = 'sort_in'::app.movement_type
-        ),
-        0
-      ) as transferred,
-      coalesce(
-        (
-          select
-            sum(incoming.quantity)
-          from
-            app.stock_movements incoming
-          where
-            incoming.batch_id = sm.batch_id
-            and incoming.movement_type = 'sort_in'::app.movement_type
-        ),
-        0
-      ) as qty
-    from
-      app.stock_movements sm
-    where
-      sm.item_id = p_item_id
-      and sm.movement_type = 'sort_out'::app.movement_type
-      and sm.occurred_at > coalesce(
-        (
-          select
-            doc.occurred_at
-          from
-            app.stock_movements doc
-          where
-            doc.id::text = p_source_id
-        ),
-        '-infinity'::timestamptz
-      )
-      and sm.occurred_at <= p_at
-    group by
-      sm.batch_id
-    order by
-      min(sm.id)
-  loop
-    v_ids := v_ids || 0;
-    -- placeholder so the array length matches; real weights are collected below
-  end loop;
+  select
+    doc.occurred_at
+  into v_doc_at
+  from
+    app.stock_movements doc
+  where
+    doc.id::text = p_source_id;
 
-  v_n := 0;
+  v_doc_at := coalesce(v_doc_at, '-infinity'::timestamptz);
   v_weights := '{}'::numeric[];
   v_group_value := 0;
   v_group_qty := 0;
@@ -2392,13 +2395,13 @@ begin
     where
       sm.item_id = p_item_id
       and sm.movement_type = 'sort_out'::app.movement_type
+      and sm.occurred_at > v_doc_at
       and sm.occurred_at <= p_at
     group by
       sm.batch_id
     order by
       min(sm.id)
   loop
-    v_n := v_n + 1;
     v_group_value := v_group_value + v_batch.transferred;
     v_group_qty := v_group_qty + v_batch.qty;
 
@@ -2445,6 +2448,7 @@ begin
     where
       sm.item_id = p_item_id
       and sm.movement_type = 'sort_out'::app.movement_type
+      and sm.occurred_at > v_doc_at
       and sm.occurred_at <= p_at
     group by
       sm.batch_id
@@ -2474,6 +2478,7 @@ begin
     where
       sm.item_id = p_item_id
       and sm.movement_type = 'sort_out'::app.movement_type
+      and sm.occurred_at > v_doc_at
       and sm.occurred_at <= p_at
     group by
       sm.batch_id
@@ -3220,7 +3225,6 @@ declare
   v_change timestamptz;
   v_shift text;
   v_app bigint;
-  v_id bigint;
   v_items uuid[] := '{}'::uuid[];
   v_snap_id bigint;
   v_ordered timestamptz;
@@ -4682,6 +4686,7 @@ declare
   v_value_after numeric(14, 2);
   v_new_avg numeric(20, 6);
   r_def record;
+  v_own bigint;
 begin
   if p_type = 'closed_period'::app.movement_type then
     declare
@@ -4730,6 +4735,71 @@ begin
   v_delta := v_total;
   v_remaining_qty := p_in_qty;
   v_remaining_value := v_total;
+
+  -- Q6. A return cancels its own sale's deficit before FIFO. The agreed value
+  -- is already this row's total, so that slice does not post another adjustment.
+  -- Only the quantity still remaining enters the ordinary cover loop.
+  select
+    src.source_id::bigint
+  into v_own
+  from
+    app.closed_period_sources src
+  where
+    src.movement_id = p_movement_id
+    and src.source_kind = 'return'
+    and src.source_id ~ '^[0-9]+$';
+
+  if v_own is not null
+  and v_remaining_qty > 0 then
+    select
+      d.movement_id,
+      d.qty_uncovered,
+      d.value_uncovered,
+      d.provisional_unit_cost,
+      d.occurred_at
+    into r_def
+    from
+      ledger_scratch.recompute_def d
+    where
+      d.movement_id = v_own
+      and d.item_id = p_item_id
+      and d.qty_uncovered > 0;
+
+    if found then
+      v_covered_qty := least(v_remaining_qty, r_def.qty_uncovered);
+
+      if v_covered_qty = v_remaining_qty then
+        v_covered_inflow := v_remaining_value;
+      else
+        v_covered_inflow := pg_catalog.round(
+          v_remaining_value * v_covered_qty / v_remaining_qty,
+          2
+        );
+      end if;
+
+      if v_covered_qty = r_def.qty_uncovered then
+        v_covered_prov := r_def.value_uncovered;
+      else
+        v_covered_prov := pg_catalog.round(
+          r_def.value_uncovered * v_covered_qty / r_def.qty_uncovered,
+          2
+        );
+      end if;
+
+      v_covered_inflow := app.assert_recompute_range (v_covered_inflow, 2, true);
+      v_covered_prov := app.assert_recompute_range (v_covered_prov, 2, true);
+
+      update ledger_scratch.recompute_def
+      set
+        qty_uncovered = qty_uncovered - v_covered_qty,
+        value_uncovered = value_uncovered - v_covered_prov
+      where
+        movement_id = r_def.movement_id;
+
+      v_remaining_qty := v_remaining_qty - v_covered_qty;
+      v_remaining_value := v_remaining_value - v_covered_inflow;
+    end if;
+  end if;
 
   for r_def in
     select
@@ -4973,6 +5043,188 @@ begin
 end;
 $$;
 
+create function app.post_accumulated_closed_span (p_span_id bigint) returns void language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_order record;
+  v_cause uuid;
+  v_change timestamptz;
+  v_res jsonb;
+  v_elem jsonb;
+  v_item uuid;
+  v_qty numeric(20, 6);
+  v_unit numeric(20, 6);
+  v_total numeric(14, 2);
+  v_items uuid[] := '{}'::uuid[];
+  v_posted boolean := false;
+begin
+  perform app.assert_ledger_lock_held ();
+
+  if exists (
+    select
+      1
+    from
+      app.closed_span_orders accumulated
+    where
+      accumulated.span_id = p_span_id
+      and accumulated.cause_id is not null
+  )
+  or not exists (
+    select
+      1
+    from
+      app.closed_span_orders accumulated
+    where
+      accumulated.span_id = p_span_id
+      and accumulated.cause_id is null
+  ) then
+    return;
+  end if;
+
+  v_cause := pg_catalog.gen_random_uuid ();
+  v_change := app.note_change_instant ();
+
+  for v_order in
+    select
+      accumulated.order_id
+    from
+      app.closed_span_orders accumulated
+    where
+      accumulated.span_id = p_span_id
+      and accumulated.cause_id is null
+    order by
+      accumulated.ordered_at,
+      accumulated.order_id
+  loop
+    v_item := null;
+    v_res := app.resolve_order_requirements (v_order.order_id, null);
+
+    if v_res ->> 'status' is distinct from 'ready' then
+      perform app.enqueue_accounting_event (
+        v_order.order_id,
+        'config_span',
+        'span:' || p_span_id::text || ':' || v_order.order_id,
+        null,
+        p_span_id
+      );
+      continue;
+    end if;
+
+    for v_elem in
+      select
+        elem.value
+      from
+        pg_catalog.jsonb_array_elements(coalesce(v_res -> 'requirements', '[]'::jsonb)) as elem (value)
+    loop
+      v_item := (v_elem ->> 'stock_item_id')::uuid;
+      v_qty := (v_elem ->> 'quantity')::numeric;
+
+      if v_qty is null or v_qty = 0 then
+        continue;
+      end if;
+
+      select
+        balance.avg_cost
+      into v_unit
+      from
+        app.item_balances balance
+      where
+        balance.item_id = v_item
+        and balance.avg_cost > 0;
+
+      if v_unit is null then
+        select
+          seed.unit_cost
+        into v_unit
+        from
+          app.item_provisional_seeds seed
+        where
+          seed.item_id = v_item;
+      end if;
+
+      if v_unit is null then
+        select
+          price.unit_cost
+        into v_unit
+        from
+          app.item_opening_prices price
+        where
+          price.item_id = v_item
+          and price.superseded_change_id is null;
+      end if;
+
+      if v_unit is null then
+        perform app.enqueue_accounting_event (
+          v_order.order_id,
+          'config_span',
+          'span:' || p_span_id::text || ':' || v_order.order_id,
+          null,
+          p_span_id
+        );
+        v_item := null;
+        exit;
+      end if;
+
+      v_total := -pg_catalog.round(v_qty * v_unit, 2);
+      v_items := v_items || v_item;
+
+      perform app.insert_closed_movement (
+        v_cause,
+        v_item,
+        v_change,
+        -v_qty,
+        v_total,
+        'cogs',
+        'sale',
+        app.closed_containing_shift (v_change),
+        'order',
+        v_order.order_id,
+        null,
+        null,
+        null,
+        null,
+        null,
+        0,
+        0
+      );
+
+      v_posted := true;
+    end loop;
+
+    if v_item is not null then
+      update app.closed_span_orders accumulated
+      set
+        cause_id = v_cause
+      where
+        accumulated.span_id = p_span_id
+        and accumulated.order_id = v_order.order_id;
+    end if;
+  end loop;
+
+  if v_posted then
+    perform app.finish_closed_cause (
+      v_cause,
+      (
+        select
+          coalesce(pg_catalog.array_agg(distinct item_id), '{}'::uuid[])
+        from
+          pg_catalog.unnest(v_items) as item (item_id)
+      )
+    );
+  end if;
+end;
+$$;
+
+comment on function app.post_accumulated_closed_span (bigint) is 'Post every pre-window order of one configuration span as a single closed cause. An order that is not ready stays on the ordinary queue.';
+
+revoke all on function app.post_accumulated_closed_span (bigint)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 create or replace function app.run_accounting_work (
   p_attempt_id uuid,
   p_limit integer,
@@ -5191,17 +5443,43 @@ begin
 
     v_n := coalesce(pg_catalog.cardinality (v_span_orders), 0);
 
+    insert into
+      app.closed_span_orders (span_id, order_id, ordered_at)
+    select
+      v_span.id,
+      v_span_orders[slice.idx],
+      v_span_times[slice.idx]
+    from
+      pg_catalog.generate_subscripts(v_span_orders, 1) as slice (idx)
+    where
+      v_span_times[slice.idx] < app.restatement_window_start ()
+    on conflict (span_id, order_id) do nothing;
+
     perform app.enqueue_accounting_event (
-      u.order_id,
+      v_span_orders[slice.idx],
       'config_span',
-      'span:' || v_span.id::text || ':' || u.order_id,
+      'span:' || v_span.id::text || ':' || v_span_orders[slice.idx],
       null,
       v_span.id
     )
     from
-      pg_catalog.unnest(v_span_orders) as u (order_id)
+      pg_catalog.generate_subscripts(v_span_orders, 1) as slice (idx)
+    where
+      v_span_times[slice.idx] >= app.restatement_window_start ()
     order by
-      u.order_id;
+      v_span_orders[slice.idx];
+
+    if v_n < 100
+    or exists (
+      select
+        1
+      from
+        pg_catalog.unnest(v_span_times) as reached (ordered_at)
+      where
+        reached.ordered_at >= app.restatement_window_start ()
+    ) then
+      perform app.post_accumulated_closed_span (v_span.id);
+    end if;
 
     update app.accounting_rederive_spans sp
     set
@@ -7493,6 +7771,15 @@ begin
       )
     );
 
+    -- Test hook. A purchase can take its share locks while this batch still
+    -- holds row exclusive and has not yet updated the run.
+    if coalesce(
+      pg_catalog.current_setting('app.ingest_pause_after_shifts', true),
+      ''
+    ) = '1' then
+      perform pg_catalog.pg_sleep(2.5);
+    end if;
+
     update app.pos_sync_runs as run
     set
       presented_shift_ids = (
@@ -7877,6 +8164,7 @@ declare
   v_shift text;
   v_bucket text;
   v_at timestamptz;
+  v_has_cover boolean := false;
 begin
   perform app.assert_ledger_write_allowed ();
 
@@ -7920,6 +8208,15 @@ begin
 
   -- Count lines are anchors inside replay_execute. There is no count barrier.
   perform app.replay_execute (v_set, p_pending, p_batch_id, false);
+
+  select
+    exists (
+      select
+        1
+      from
+        ledger_scratch.recompute_cover_pair
+    )
+  into v_has_cover;
 
   for r in
     select
@@ -7983,7 +8280,13 @@ begin
     end if;
   end loop;
 
-  perform app.rebuild_derived_balances (v_seed, p_batch_id);
+  if v_has_cover then
+    -- The dry walk valued the cover against synthetic ids. Replay the posted
+    -- rows so the carrier and any later in-window sale land on the ledger.
+    perform app.replay_execute (v_set, '[]'::jsonb, p_batch_id, true);
+  else
+    perform app.rebuild_derived_balances (v_seed, p_batch_id);
+  end if;
 
   return v_ids;
 end;

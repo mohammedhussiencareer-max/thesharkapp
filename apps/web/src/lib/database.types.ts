@@ -223,6 +223,26 @@ isOneToOne: true
       referencedColumns: ["id"]
     }
                   ]
+                },"closed_span_orders": {
+                  Row: {
+                    "cause_id": string | null,"order_id": string,"ordered_at": string,"span_id": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "cause_id"?: string | null,"order_id": string,"ordered_at": string,"span_id": number
+                  }
+                  Update: {
+                    "cause_id"?: string | null,"order_id"?: string,"ordered_at"?: string,"span_id"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "closed_span_orders_span_id_fkey"
+      columns: ["span_id"]
+isOneToOne: false
+      referencedRelation: "accounting_rederive_spans"
+      referencedColumns: ["id"]
+    }
+                  ]
                 },"costing_changes": {
                   Row: {
                     "actor_id": string | null,"id": number,"kind": string,"payload": NonNullable<Json>,"reason": string | null,"recorded_at": string,"request_id": string,"result": NonNullable<Json>
@@ -2788,6 +2808,9 @@ isOneToOne: true
                            },
 "pos_text_id":
 { Args: { "p_value": string,"p_what": string }; Returns: string
+                           },
+"post_accumulated_closed_span":
+{ Args: { "p_span_id": number }; Returns: undefined
                            },
 "post_backdated_batch":
 { Args: { "p_batch_id": string,"p_pending": Json }; Returns: (number)[]

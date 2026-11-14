@@ -1,5 +1,6 @@
 -- Amendment cases the first two checkpoint files do not cover.
--- Synthetic ids only. Q6 is not a special case and is not asserted here.
+-- Synthetic ids only. Q6, M, P, N, Q(b), Q(c), J, and the span live in
+-- replay_checkpoint_remaining.test.sql.
 begin;
 
 select

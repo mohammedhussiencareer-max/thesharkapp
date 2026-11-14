@@ -35,8 +35,8 @@ Synthetic catalog. Historical orders were posted with `app.run_accounting_work`.
 - stock_count_anchors: 365
 - weekly anchors: 52
 - events plus anchors: 36868
-- queue depth 1 ms: 0.228
-- queue depth 50000 ms: 0.19
+- queue depth 1 ms: 0.332
+- queue depth 50000 ms: 0.194
 - suffix index range: true
 - suffix rows: 0
 - deficit restore rows: 1
@@ -46,7 +46,7 @@ Synthetic catalog. Historical orders were posted with `app.run_accounting_work`.
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.146
+- wall clock seconds: 0.156
 - crossed 2s: false
 - gate: PASS
 
@@ -59,8 +59,8 @@ Synthetic catalog. Historical orders were posted with `app.run_accounting_work`.
 - stock_count_anchors: 730
 - weekly anchors: 104
 - events plus anchors: 73733
-- queue depth 1 ms: 0.7
-- queue depth 50000 ms: 7.722
+- queue depth 1 ms: 0.316
+- queue depth 50000 ms: 0.208
 - suffix index range: true
 - suffix rows: 0
 - deficit restore rows: 1
@@ -70,7 +70,7 @@ Synthetic catalog. Historical orders were posted with `app.run_accounting_work`.
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.785
+- wall clock seconds: 1.603
 - crossed 2s: false
 - gate: PASS
 

@@ -6,7 +6,7 @@
 // either one fails the run. Checkpoints are published by the confirming walk.
 
 import { spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -718,18 +718,83 @@ function formatResult(row) {
   return lines.join('\n');
 }
 
+function existingResultRows() {
+  const path = join(here, 'RESULTS.md');
+  if (!existsSync(path)) return [];
+  const text = readFileSync(path, 'utf8');
+  const parts = text.split(/^## /m).slice(1);
+  return parts
+    .map((part) => {
+      const name = part.slice(0, part.indexOf('\n')).trim();
+      const body = part.slice(part.indexOf('\n') + 1).trim();
+      if (!name || body.startsWith('gate: FAIL')) return null;
+      const value = (label) => {
+        const match = body.match(new RegExp(`^- ${label}: (.+)$`, 'm'));
+        return match ? match[1].trim() : null;
+      };
+      const seconds = Number(value('wall clock seconds'));
+      if (!Number.isFinite(seconds)) return null;
+      return {
+        name,
+        orders: Number(value('orders')),
+        days: Number(value('days')),
+        posted_orders: Number(
+          value(
+            'posted historical orders with a posting receipt and movements',
+          ),
+        ),
+        eligible_events: Number(
+          value('eligible replay rows before the measured call'),
+        ),
+        anchors: Number(value('stock_count_anchors')),
+        weekly_anchors: Number(value('weekly anchors')),
+        events_plus_anchors: Number(value('events plus anchors')),
+        queue_depth_1_ms: Number(value('queue depth 1 ms')),
+        queue_depth_50000_ms: Number(value('queue depth 50000 ms')),
+        suffix_index: value('suffix index range') === 'true',
+        suffix_rows: Number(value('suffix rows')),
+        deficit_rows: Number(value('deficit restore rows')),
+        status: value('measured status'),
+        failed: Number(value('failed')),
+        outcome: value('completion outcome'),
+        receipt_kind: value('receipt_kind'),
+        links_match:
+          value('per-item movement links match negated requirements') ===
+          'true',
+        split: value('split normal and provisional') === 'true',
+        seconds,
+        crossed_2s: value('crossed 2s') === 'true',
+        pass: value('gate') === 'PASS',
+      };
+    })
+    .filter(Boolean);
+}
+
 function writeResults(rows, note) {
+  const byName = new Map(existingResultRows().map((row) => [row.name, row]));
+  for (const row of rows) byName.set(row.name, row);
+  const order = ['35-day', '1-year', '2-year'];
+  const merged = [
+    ...order.filter((name) => byName.has(name)).map((name) => byName.get(name)),
+    ...[...byName.values()].filter((row) => !order.includes(row.name)),
+  ];
+  const passed = ['35-day', '1-year', '2-year'].every(
+    (name) => byName.get(name)?.pass === true,
+  );
+  const closing =
+    note ??
+    (passed ? 'The 35-day, 1-year, and 2-year histories passed the gate.' : '');
   const body = [
     '# Accounting history benchmark',
     '',
     'Synthetic catalog. Historical orders were posted with `app.run_accounting_work`. The measured order is a new queue head, timed by a top-level statement after the session statement timeout is set to 6 seconds. The soft gate is 2 seconds and the hard gate is 6 seconds. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.',
     '',
-    ...rows.map((row) =>
+    ...merged.map((row) =>
       row.error
         ? `## ${row.name}\n\n- gate: FAIL\n- error: ${row.error}\n`
         : formatResult(row),
     ),
-    note ? `${note}\n` : '',
+    closing ? `${closing}\n` : '',
   ].join('\n');
   writeFileSync(join(here, 'RESULTS.md'), body);
 }
@@ -775,56 +840,6 @@ function psqlCaptured(sql) {
   });
 }
 
-const measured35Day = {
-  name: '35-day',
-  orders: 3500,
-  days: 35,
-  posted_orders: 3500,
-  eligible_events: 3503,
-  anchors: 35,
-  weekly_anchors: 5,
-  events_plus_anchors: 3538,
-  queue_depth_1_ms: 0.237,
-  queue_depth_50000_ms: 0.313,
-  suffix_index: true,
-  suffix_rows: 0,
-  deficit_rows: 1,
-  status: 'processed',
-  failed: 0,
-  outcome: 'applied',
-  receipt_kind: 'posting',
-  links_match: true,
-  split: true,
-  seconds: 0.081,
-  crossed_2s: false,
-  pass: true,
-};
-
-const measured1Year = {
-  name: '1-year',
-  orders: 36500,
-  days: 365,
-  posted_orders: 36500,
-  eligible_events: 36503,
-  anchors: 365,
-  weekly_anchors: 52,
-  events_plus_anchors: 36868,
-  queue_depth_1_ms: 0.228,
-  queue_depth_50000_ms: 0.19,
-  suffix_index: true,
-  suffix_rows: 0,
-  deficit_rows: 1,
-  status: 'processed',
-  failed: 0,
-  outcome: 'applied',
-  receipt_kind: 'posting',
-  links_match: true,
-  split: true,
-  seconds: 0.146,
-  crossed_2s: false,
-  pass: true,
-};
-
 function firstInteger(text) {
   const match = String(text).match(/\d+/);
   return match ? Number(match[0]) : Number.NaN;
@@ -863,8 +878,6 @@ async function run() {
   const skipBuild = process.argv.includes('--skip-build') ? startName : null;
   const resume = process.argv.includes('--resume');
   let started = startName === null;
-  if (startName === '1-year') rows.push(measured35Day);
-  if (startName === '2-year') rows.push(measured35Day, measured1Year);
   await psqlCaptured(setupSql());
   for (const history of histories) {
     if (!started) {
