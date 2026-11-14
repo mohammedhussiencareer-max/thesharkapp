@@ -13,7 +13,9 @@ import { messageFrom } from '@/items/errors';
 import {
   beginAction,
   hasAction,
+  activationReviewReloadPending,
   heldAction,
+  pinActivationReviewReload,
   replaceActivationPayload,
   settleAction,
   subscribeHeldWrites,
@@ -58,6 +60,9 @@ export function useActivationAction(
 
   const unknown =
     heldEpoch < 0 ? null : unknownAction<ActivationWrite>(ACTIVATION_SUBJECT);
+  const reloadPending =
+    reloadBlocked ||
+    (heldEpoch >= 0 && activationReviewReloadPending(ACTIVATION_SUBJECT));
 
   function toggleZero(itemId: string) {
     if (unknownAction<ActivationWrite>(ACTIVATION_SUBJECT)) return;
@@ -75,15 +80,15 @@ export function useActivationAction(
   const allChecked = missing.every((id) => checked.has(id));
   const showActivate =
     unknown !== null ||
-    reloadBlocked ||
+    reloadPending ||
     (review !== null && showActivationButton(review));
-  const activateLabel = reloadBlocked
+  const activateLabel = reloadPending
     ? 'إعادة تحميل المراجعة'
     : unknown
       ? 'إعادة المحاولة'
       : 'تفعيل الخصم';
   const activateDisabled =
-    saving || (!reloadBlocked && unknown === null && !allChecked);
+    saving || (!reloadPending && unknown === null && !allChecked);
 
   async function reloadReview(): Promise<OpeningReview | null> {
     try {
@@ -124,7 +129,7 @@ export function useActivationAction(
     if (!review || flight.current) return;
     const current = heldAction<ActivationWrite>(ACTIVATION_SUBJECT);
     const unknownHeld = unknownAction<ActivationWrite>(ACTIVATION_SUBJECT);
-    if (reloadBlocked) {
+    if (reloadPending) {
       const requestId = (unknownHeld ?? current)?.requestId;
       if (!requestId) return;
       flight.current = true;
@@ -142,7 +147,7 @@ export function useActivationAction(
     let action: ActivationWrite;
     if (unknownHeld) {
       action = unknownHeld;
-    } else if (current) {
+    } else if (current && !activationReviewReloadPending(ACTIVATION_SUBJECT)) {
       action = { ...current, explicitZeroItemIds: zerosOf(checked) };
       replaceActivationPayload(ACTIVATION_SUBJECT, action.requestId, action);
     } else {
@@ -173,6 +178,8 @@ export function useActivationAction(
         });
       } catch (failure) {
         if (isOpeningManifestChange(failure)) {
+          pinActivationReviewReload(ACTIVATION_SUBJECT, action.requestId);
+          setReloadBlocked(true);
           const next = await reloadReview();
           if (next) acceptReloaded(action.requestId, next);
           return;

@@ -8226,6 +8226,19 @@ analyze app.costing_changes;
 
 analyze app.item_tracking_history;
 
+-- The annual orders stay in 2024. Move the append-only activation start to
+-- the day before that fixture so the timed page still resolves them, then
+-- put the 2026-09-01 start back for the exclusion check.
+alter table app.inventory_activation disable trigger trg_inventory_activation_no_update_delete;
+
+update app.inventory_activation
+set
+  stock_started_at = '2024-01-01 00:00+00'
+where
+  id = 1;
+
+alter table app.inventory_activation enable trigger trg_inventory_activation_no_update_delete;
+
 create temp table p77_bench (
   ms numeric,
   rows integer,
@@ -8355,8 +8368,8 @@ select
       from
         p77_bench
     ),
-    '0',
-    'the 2024 shift is before the activation stock start, so it counts no completed orders'
+    '100',
+    'the timed shift counts its 100 completed orders'
   );
 
 select
@@ -8367,8 +8380,8 @@ select
       from
         p77_bench
     ),
-    '0',
-    'the 2024 shift is before the activation stock start, so it counts no lines'
+    '100',
+    'the timed shift counts one line on each completed order'
   );
 
 select
@@ -8379,8 +8392,8 @@ select
       from
         p77_bench
     ),
-    '0',
-    'the 2024 shift is before the activation stock start, so no lines are resolved'
+    '100',
+    'the mapped lines are resolved on the timed shift'
   );
 
 select
@@ -8391,8 +8404,8 @@ select
       from
         p77_bench
     ),
-    '0',
-    'the 2024 shift is before the activation stock start, so no orders are resolved'
+    '100',
+    'the mapped orders are resolved on the timed shift'
   );
 
 select
@@ -8404,6 +8417,60 @@ select
         p77_bench
     ),
     'annual status page of 50 shifts over a year of orders finishes within 2000 ms'
+  );
+
+alter table app.inventory_activation disable trigger trg_inventory_activation_no_update_delete;
+
+update app.inventory_activation
+set
+  stock_started_at = '2026-09-01 00:00+00'
+where
+  id = 1;
+
+alter table app.inventory_activation enable trigger trg_inventory_activation_no_update_delete;
+
+create temp table p77_before_start as
+select
+  row ->> 'shift_id' as shift_id,
+  row ->> 'completed_orders_denominator' as orders_denom,
+  row ->> 'completed_orders_covered' as orders_covered
+from
+  app.list_shift_accounting_status (null, null, 1) row;
+
+select
+  is (
+    (
+      select
+        shift_id
+      from
+        p77_before_start
+    ),
+    'p77-y-20240102',
+    'the exclusion check reads the first annual shift'
+  );
+
+select
+  is (
+    (
+      select
+        orders_denom
+      from
+        p77_before_start
+    ),
+    '0',
+    'a shift before the activation start counts no completed orders'
+  );
+
+select
+  is (
+    (
+      select
+        orders_covered
+      from
+        p77_before_start
+    ),
+    '0',
+    'orders before the activation start are excluded from coverage'
   );
 
 select

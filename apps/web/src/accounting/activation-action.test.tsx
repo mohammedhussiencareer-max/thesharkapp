@@ -251,4 +251,61 @@ describe('activation action', () => {
     await waitFor(() => expect(activateInventory).toHaveBeenCalledTimes(3));
     expect(activateInventory).toHaveBeenLastCalledWith(sent);
   });
+
+  it('reloads after remount when a retry confirms the manifest changed', async () => {
+    vi.mocked(loadOpeningReview)
+      .mockResolvedValueOnce(opening(hashA))
+      .mockRejectedValueOnce(new Error('down'))
+      .mockResolvedValueOnce(opening(hashA))
+      .mockResolvedValue(opening(hashB));
+    vi.mocked(activateInventory)
+      .mockRejectedValueOnce(
+        writeError({
+          code: '57014',
+          message: 'canceling statement due to statement timeout',
+        }),
+      )
+      .mockRejectedValueOnce(new OpeningManifestChangedError());
+    const firstView = render(
+      <MemoryRouter>
+        <ActivationPage />
+      </MemoryRouter>,
+    );
+    await checkAndActivate();
+    expect(await screen.findByText('المكالمة ما اكتملتش')).toBeInTheDocument();
+    const sent = vi.mocked(activateInventory).mock.calls[0]?.[0];
+    expect(unknownAction('activation')).toEqual(sent);
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(await screen.findByText(reloadFailedMessage)).toBeInTheDocument();
+    expect(unknownAction('activation')).toBeNull();
+    expect(
+      screen.getByRole('button', { name: 'إعادة تحميل المراجعة' }),
+    ).toBeInTheDocument();
+    expect(activateInventory).toHaveBeenCalledTimes(2);
+    firstView.unmount();
+    renderPage();
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'إعادة تحميل المراجعة' }),
+    );
+    expect(
+      await screen.findByText('قائمة الافتتاح اتغيرت — راجعها وفعّل تاني'),
+    ).toBeInTheDocument();
+    expect(activateInventory).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('button', { name: 'إعادة المحاولة' })).toBeNull();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'صفر صريح' }));
+    vi.mocked(activateInventory).mockResolvedValue({
+      activated: true,
+      stockStartedAt: '2026-03-01T08:00:00.000Z',
+      openingManifestHash: hashB,
+    });
+    const again = await screen.findByRole('button', { name: 'تفعيل الخصم' });
+    await waitFor(() => expect(again).toBeEnabled());
+    fireEvent.click(again);
+    await waitFor(() => expect(activateInventory).toHaveBeenCalledTimes(3));
+    expect(activateInventory).toHaveBeenLastCalledWith({
+      requestId: sent?.requestId,
+      manifestHash: hashB,
+      explicitZeroItemIds: [item],
+    });
+  });
 });
