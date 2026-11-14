@@ -1,6 +1,8 @@
 -- Inventory activation. The public poster keeps its grants and, once the
 -- singleton exists, refuses sale, waste, and count_adjustment. Typed writers
 -- call app.post_movements_internal. No checkpoint is built here.
+-- app.accounting_scaling_ready() stays false until
+-- 20261108090000_replay_checkpoint.sql replaces it.
 -- ============================================================================
 -- 1. Stored opening observations and the activation request row.
 -- ============================================================================
@@ -3635,7 +3637,24 @@ execute function app.trg_stock_items_insert_lock ();
 -- ============================================================================
 -- 9. Owner activation. Does not post stock and does not call the worker.
 -- An all-zero catalog is refused: this restaurant always has opening stock.
+-- A new activation also waits until accounting_scaling_ready is replaced.
 -- ============================================================================
+create function app.accounting_scaling_ready () returns boolean language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    false;
+$$;
+
+comment on function app.accounting_scaling_ready () is 'Private. False in this migration. 20261108090000_replay_checkpoint.sql replaces this function atomically once its checkpoint components exist and its benchmark gates pass. No API role can execute it.';
+
+revoke all on function app.accounting_scaling_ready ()
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 create function app.activate_inventory (
   p_request_id uuid,
   p_manifest_hash text,
@@ -3973,6 +3992,13 @@ begin
       using errcode = '22023';
   end if;
 
+  -- After both request replays, still holding the ledger lock, and before
+  -- any insert. A stored request already returned above.
+  if not app.accounting_scaling_ready () then
+    raise exception 'scaling is not ready'
+      using errcode = '55000';
+  end if;
+
   select
     min(os.occurred_at)
   into v_start
@@ -4076,7 +4102,7 @@ begin
 end;
 $$;
 
-comment on function app.activate_inventory (uuid, text, uuid[]) is 'Owner only. Confirms the catalog token and the explicit-zero set, then stores inventory_activation and one observation per current item. stock_started_at is the earliest referenced positive opening. Differing opening instants stay legal. An empty roster and an all-zero catalog are refused. Does not post a stock movement and does not call the worker. service_role is not granted.';
+comment on function app.activate_inventory (uuid, text, uuid[]) is 'Owner only. Confirms the catalog token and the explicit-zero set, then stores inventory_activation and one observation per current item. stock_started_at is the earliest referenced positive opening. Differing opening instants stay legal. An empty roster and an all-zero catalog are refused. A stored request is returned before the scaling check. A new activation raises 55000 scaling is not ready while app.accounting_scaling_ready() is false. Does not post a stock movement and does not call the worker. service_role is not granted.';
 
 revoke all on function app.activate_inventory (uuid, text, uuid[])
 from

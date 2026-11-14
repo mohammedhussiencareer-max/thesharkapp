@@ -46,6 +46,8 @@ export const syncRunningMessage = 'المزامنة شغالة — نفس الط
 
 export const activationOwnerMessage = 'المالك بس يقدر يفعّل الخصم';
 
+export const scalingNotReadyMessage = 'الحساب لسه مش جاهز للتفعيل';
+
 export class OpeningManifestChangedError extends Error {
   readonly code = '40001';
 
@@ -130,6 +132,9 @@ export function mapActivationError(error: unknown): Error {
   }
   if (code === '42501') {
     return Object.assign(new Error(activationOwnerMessage), { code });
+  }
+  if (code === '55000' && serverMessage === 'scaling is not ready') {
+    return Object.assign(new Error(scalingNotReadyMessage), { code });
   }
   if (code === '22023') {
     return new ConfirmedRefusalError(activationMessage(serverMessage));

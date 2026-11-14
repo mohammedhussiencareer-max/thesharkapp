@@ -170,6 +170,8 @@ insert into auth.users (
   '2026-01-01 00:00:00+00', '', '', '', ''
 ) on conflict (id) do nothing;
 insert into app.owner (user_id) values ('${owner}') on conflict (user_id) do nothing;
+create or replace function app.accounting_scaling_ready() returns boolean
+language sql stable security definer set search_path = '' as $$ select true; $$;
 ${claims()}
 insert into app.stock_items (id, name, kind, base_unit, count_frequency)
 values ('${itemA}', 'race fish a', 'seafood', 'kg', 'daily');

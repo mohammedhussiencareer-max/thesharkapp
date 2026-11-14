@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 import {
   badOrderMessage,
   callFailedMessage,
+  mapActivationError,
   ownerReadMessage,
   ownerRunMessage,
   readError,
+  scalingNotReadyMessage,
   writeError,
 } from '@/accounting/errors';
 import { genericCatalogError } from '@/items/errors';
@@ -35,6 +37,16 @@ describe('accounting errors', () => {
     expect(error.message).toBe(callFailedMessage);
     expect(isUnknownOutcome(error)).toBe(true);
     expect((error as { code?: string }).code).toBe('57014');
+  });
+
+  it('maps the scaling gate to Arabic and keeps 55000', () => {
+    const error = mapActivationError({
+      code: '55000',
+      message: 'scaling is not ready',
+    });
+    expect(error.message).toBe(scalingNotReadyMessage);
+    expect((error as { code?: string }).code).toBe('55000');
+    expect(error.message).not.toContain('scaling');
   });
 
   it('treats 42501 and 22023 as definite Arabic refusals', () => {

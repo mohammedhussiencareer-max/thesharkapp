@@ -2,6 +2,15 @@
 -- only. Run by seed-order-decisions.ts as the local postgres role. This
 -- prepares the two items, their mappings, and one positive opening. The owner
 -- records activation from the screen. Running it again does nothing.
+-- The migration leaves accounting_scaling_ready false. This local fixture
+-- replaces it so the owner click can store the activation row.
+create or replace function app.accounting_scaling_ready () returns boolean language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    true;
+$$;
+
 do $seed$
 declare
   v_owner uuid;

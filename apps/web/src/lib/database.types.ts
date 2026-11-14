@@ -2060,6 +2060,9 @@ isOneToOne: true
 "accounting_read_uuid_list":
 { Args: { "p_value": Json }; Returns: Json
                            },
+"accounting_scaling_ready":
+{ Args: Record<PropertyKey, never>; Returns: boolean
+                           },
 "activate_inventory":
 { Args: { "p_explicit_zero_item_ids": (string)[],"p_manifest_hash": string,"p_request_id": string }; Returns: Json
                            },

@@ -93,6 +93,22 @@ select
 
 select
   results_eq (
+    $$select r.role, has_function_privilege(r.role, 'app.accounting_scaling_ready()', 'execute')
+      from unnest(array['public', 'anon', 'authenticated', 'service_role']) as r (role)
+      order by 1$$,
+    $$values ('anon', false), ('authenticated', false), ('public', false), ('service_role', false)$$,
+    'no API role can call accounting_scaling_ready'
+  );
+
+select
+  is (
+    app.accounting_scaling_ready (),
+    false,
+    'scaling stays unready until the checkpoint migration replaces the function'
+  );
+
+select
+  results_eq (
     $$select r.role, has_function_privilege(r.role, 'app.record_accounting_recompute_timeout(uuid,text,integer)', 'execute')
       from unnest(array['anon', 'authenticated', 'service_role']) as r (role)
       order by 1$$,
@@ -458,6 +474,97 @@ select
   );
 
 rollback to savepoint unreceipted_sale;
+
+savepoint scaling_not_ready;
+
+select
+  throws_ok (
+    $$select app.activate_inventory(
+      'a7900000-0000-4000-8000-000000000018',
+      app.opening_manifest_token(),
+      array['a7900000-0000-4000-8000-000000000003']::uuid[]
+    )$$,
+    '55000',
+    'scaling is not ready',
+    'a new activation is refused while scaling is not ready'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.inventory_activation
+    ),
+    0::bigint,
+    'a readiness refusal writes no activation row'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.inventory_opening_observations
+    ),
+    0::bigint,
+    'a readiness refusal writes no observation'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.inventory_activation_requests
+    ),
+    0::bigint,
+    'a readiness refusal writes no request'
+  );
+
+create or replace function app.accounting_scaling_ready () returns boolean language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    true;
+$$;
+
+select
+  app.activate_inventory (
+    'a7900000-0000-4000-8000-000000000018',
+    app.opening_manifest_token (),
+    array['a7900000-0000-4000-8000-000000000003']::uuid[]
+  );
+
+create or replace function app.accounting_scaling_ready () returns boolean language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    false;
+$$;
+
+select
+  is (
+    app.activate_inventory (
+      'a7900000-0000-4000-8000-000000000018',
+      app.opening_manifest_token (),
+      array['a7900000-0000-4000-8000-000000000003']::uuid[]
+    ) ->> 'activated',
+    'true',
+    'a stored activation is returned while scaling is not ready'
+  );
+
+rollback to savepoint scaling_not_ready;
+
+create or replace function app.accounting_scaling_ready () returns boolean language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    true;
+$$;
 
 select
   app.activate_inventory (
