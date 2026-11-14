@@ -566,6 +566,10 @@ set
 declare
   v_type text;
 begin
+  -- The ledger lock is taken before the activation read. A sale that
+  -- waits while activation commits then sees the row and is refused.
+  perform app.assert_ledger_write_allowed ();
+
   if pg_catalog.jsonb_typeof (p_movements) = 'array'
   and exists (
     select
@@ -599,7 +603,7 @@ begin
 end;
 $$;
 
-comment on function app.post_movements (jsonb) is 'Public poster. Opening and purchase stay allowed. Always rejects sale_reversal, waste_reversal, and count_compensation through the private implementation. Once inventory_activation exists, also rejects sale, waste, and count_adjustment regardless of source.';
+comment on function app.post_movements (jsonb) is 'Public poster. Opening and purchase stay allowed. Always rejects sale_reversal, waste_reversal, and count_compensation through the private implementation. Takes the ledger lock before reading inventory_activation, then rejects sale, waste, and count_adjustment once that row exists, regardless of source.';
 
 revoke all on function app.post_movements (jsonb)
 from
@@ -1902,7 +1906,7 @@ begin
               'unit',
               stored.base_unit,
               'unit_cost',
-              pg_catalog.trim_scale (coalesce(obs.unit_cost, 0))::text,
+              pg_catalog.trim_scale (coalesce(opening_move.unit_cost, 0))::text,
               'occurred_at',
               app.costing_timestamptz_text (stored.observed_at),
               'explicit_zero',
@@ -1975,6 +1979,21 @@ begin
         v_limit
     ) page
     left join app.inventory_opening_observations stored on stored.item_id = page.id
+    left join lateral (
+      select
+        sm.unit_cost
+      from
+        app.stock_movements sm
+      where
+        sm.batch_id = stored.opening_id
+        and sm.item_id = stored.item_id
+        and sm.movement_type = 'opening'
+        and sm.occurred_at = stored.observed_at
+      order by
+        sm.id
+      limit
+        1
+    ) opening_move on true
     left join lateral (
       select
         line.opening_id,

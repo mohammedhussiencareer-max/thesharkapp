@@ -1,8 +1,12 @@
 # Accounting history benchmark
 
-Synthetic catalog, one component. Historical orders were posted with `app.run_accounting_work`. The measured order was the queue head and was timed in a fresh session with `statement_timeout` of 6 seconds. Crossing 2 seconds is recorded and does not fail. No checkpoint was built.
+Preliminary single-item measurement. The catalog is one stock item with a direct cashier mapping. It has no recipes, no sorting, no stock counts, and no waste. `stock_count_anchors: 0` is that fixture, not the restaurant's load. The full gate, with those components and count anchors, runs in the checkpoint PR that rebuilds this benchmark.
+
+Historical orders were posted with `app.run_accounting_work`. The measured order was the queue head and was timed in a fresh session with `statement_timeout` of 6 seconds. Crossing 2 seconds is recorded and does not fail. No checkpoint was built.
 
 ## 35-day
+
+Preliminary only. One item, direct mapping, no recipes, sorting, counts, or waste.
 
 - orders: 3500
 - days: 35
@@ -19,7 +23,7 @@ Synthetic catalog, one component. Historical orders were posted with `app.run_ac
 - split normal and provisional: true
 - wall clock seconds: 1.949
 - crossed 2s: false
-- gate: PASS
+- gate: preliminary PASS for this single-item history. The full gate runs with the checkpoint PR
 
 ## 1-year
 

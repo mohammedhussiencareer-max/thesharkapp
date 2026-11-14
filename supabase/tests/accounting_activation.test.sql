@@ -603,6 +603,22 @@ select
   is (
     (
       select
+        item #>> '{observation,unit_cost}'
+      from
+        jsonb_array_elements(
+          app.opening_activation_review (null, 100) -> 'roster'
+        ) item
+      where
+        item ->> 'item_id' = 'a7900000-0000-4000-8000-000000000002'
+    ),
+    '1',
+    'a converted opening shows the movement unit cost next to the base quantity'
+  );
+
+select
+  is (
+    (
+      select
         item #>> '{observation,explicit_zero}'
       from
         jsonb_array_elements(

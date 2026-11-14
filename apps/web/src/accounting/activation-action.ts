@@ -144,6 +144,7 @@ export function useActivationAction(
       action = unknownHeld;
     } else if (current) {
       action = { ...current, explicitZeroItemIds: zerosOf(checked) };
+      replaceActivationPayload(ACTIVATION_SUBJECT, action.requestId, action);
     } else {
       if (hasAction(ACTIVATION_SUBJECT) || !review.openingManifestHash) return;
       const manifestHash = review.openingManifestHash;
