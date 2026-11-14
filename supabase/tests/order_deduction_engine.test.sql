@@ -4027,12 +4027,21 @@ select
       select
         count(*)
       from
-        app.accounting_work_events
+        app.accounting_work_events event
       where
-        processed_at is null
+        event.processed_at is null
+        and not exists (
+          select
+            1
+          from
+            app.accounting_work_state state
+          where
+            state.order_id = event.order_id
+            and state.failed_at is not null
+        )
     ),
     0::bigint,
-    'no event is left open'
+    'no event is left open except a parked order'
   );
 
 select

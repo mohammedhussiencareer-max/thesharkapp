@@ -608,6 +608,286 @@ select
     'the private poster can still post a count adjustment'
   );
 
+-- An order posted after the stock start, then corrected to before it. The
+-- count keeps waiting while the posted effect is still after the start, and
+-- stops only after the worker reverses that effect.
+select
+  app.set_item_loss (
+    md5('loss|p79-fish')::uuid,
+    'a7900000-0000-4000-8000-000000000001',
+    0,
+    '2026-01-01 00:00:00+00',
+    null,
+    (
+      select
+        app.schedule_token (
+          'loss',
+          'a7900000-0000-4000-8000-000000000001',
+          null
+        )
+    ),
+    'fixture'
+  );
+
+select
+  app.set_pos_option_policy (
+    md5('opt|p79-fish')::uuid,
+    'p79-fish',
+    '["none"]'::jsonb,
+    '2026-01-01 00:00:00+00',
+    null,
+    'none_expected',
+    (
+      select
+        app.pos_base_schedule ('p79-fish', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  app.set_base_packaging (
+    md5('bpk|p79-fish')::uuid,
+    'p79-fish',
+    '["none"]'::jsonb,
+    '2026-01-01 00:00:00+00',
+    null,
+    '{"none": true}'::jsonb,
+    (
+      select
+        app.packaging_base_schedule ('p79-fish', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  app.set_pos_base_mapping (
+    md5('map|p79-fish')::uuid,
+    'p79-fish',
+    '["none"]'::jsonb,
+    '2026-01-01 00:00:00+00',
+    null,
+    jsonb_build_object(
+      'stock_item_id',
+      'a7900000-0000-4000-8000-000000000001',
+      'quantity_per_basis',
+      '1',
+      'unit',
+      'kg'
+    ),
+    (
+      select
+        app.pos_base_schedule ('p79-fish', '["none"]'::jsonb) ->> 'token'
+    ),
+    'fixture'
+  );
+
+select
+  app.set_order_type_packaging (
+    md5('ot|hall-p79')::uuid,
+    'hall',
+    '2026-01-01 00:00:00+00',
+    null,
+    '{"none": true}'::jsonb,
+    (
+      select
+        app.packaging_order_type_schedule ('hall') ->> 'token'
+    ),
+    'fixture'
+  );
+
+update app.accounting_rederive_spans
+set
+  completed_at = pg_catalog.clock_timestamp ()
+where
+  completed_at is null;
+
+insert into
+  app.pos_shifts (id, opened_at, is_active, pos_update_time)
+values
+  (
+    'p79-shift',
+    '2026-05-01 08:00:00+00',
+    false,
+    '2026-05-01 08:00:00+00'
+  );
+
+insert into
+  app.pos_orders (
+    id,
+    shift_id,
+    status,
+    order_type,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    missing_from_pos
+  )
+values
+  (
+    'p79-cross',
+    'p79-shift',
+    'complete',
+    'hall',
+    '2026-05-02 10:00:00+00',
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    '2026-05-02 10:00:00+00',
+    rpad(md5('p79-cross'), 64, 'a'),
+    false
+  );
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    options,
+    line_total
+  )
+values
+  (
+    'p79-cross',
+    'l1',
+    'p79-fish',
+    'x',
+    1,
+    '[]'::jsonb,
+    0
+  );
+
+select
+  app.append_pos_cost_input ('p79-cross', null, 'sync');
+
+select
+  is (
+    (
+      app.run_accounting_work (
+        gen_random_uuid (),
+        1,
+        app.accounting_next_work () -> 'head' ->> 'order_id',
+        (app.accounting_next_work () -> 'head' ->> 'work_generation')::integer
+      ) ->> 'applied'
+    )::integer,
+    1,
+    'the order posts after the stock start'
+  );
+
+insert into
+  app.stock_counts (id, request_id, frequency, counted_at)
+values
+  (
+    'a7900000-0000-4000-8000-000000000030',
+    'a7900000-0000-4000-8000-000000000031',
+    'daily',
+    '2026-05-10 08:00:00+00'
+  );
+
+select
+  is (
+    app.stock_count_derivation_detail (
+      'a7900000-0000-4000-8000-000000000030'
+    ) ->> 'waiting_for_processing',
+    'false',
+    'a processed order after the start does not keep the count waiting'
+  );
+
+update app.pos_orders
+set
+  version = version + 1,
+  ordered_at = '2026-02-01 10:00:00+00',
+  pos_update_time = pos_update_time + interval '1 minute',
+  content_hash = rpad(md5('p79-cross-2'), 64, 'b')
+where
+  id = 'p79-cross';
+
+select
+  app.capture_pos_order_snapshot ('p79-cross', null, 'sync');
+
+select
+  app.append_pos_cost_input ('p79-cross', null, 'sync');
+
+select
+  is (
+    app.stock_count_derivation_detail (
+      'a7900000-0000-4000-8000-000000000030'
+    ) ->> 'waiting_for_processing',
+    'true',
+    'the count still waits while the posted effect is after the stock start'
+  );
+
+select
+  ok (
+    (
+      select
+        application.occurred_at
+      from
+        app.order_cost_state head
+        join app.order_cost_applications application on application.id = head.owner_application_id
+      where
+        head.order_id = 'p79-cross'
+    ) >= '2026-03-01 08:00:00+00',
+    'the owner application has not yet moved before the stock start'
+  );
+
+select
+  is (
+    (
+      app.run_accounting_work (
+        gen_random_uuid (),
+        1,
+        app.accounting_next_work () -> 'head' ->> 'order_id',
+        (app.accounting_next_work () -> 'head' ->> 'work_generation')::integer
+      ) ->> 'none'
+    )::integer,
+    1,
+    'the worker reverses the sale once the order is before the stock start'
+  );
+
+select
+  is (
+    app.stock_count_derivation_detail (
+      'a7900000-0000-4000-8000-000000000030'
+    ) ->> 'waiting_for_processing',
+    'false',
+    'the count stops waiting after the old effect is reversed'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements movement
+      where
+        movement.item_id = 'a7900000-0000-4000-8000-000000000001'
+        and movement.movement_type = 'sale'
+        and movement.reverses_movement_id is null
+        and not exists (
+          select
+            1
+          from
+            app.stock_movements reversal
+          where
+            reversal.reverses_movement_id = movement.id
+        )
+    ),
+    0::bigint,
+    'no live sale remains for the order that moved before the stock start'
+  );
+
 select
   finish ();
 

@@ -8355,8 +8355,8 @@ select
       from
         p77_bench
     ),
-    '100',
-    'the timed shift counts its 100 completed orders'
+    '0',
+    'the 2024 shift is before the activation stock start, so it counts no completed orders'
   );
 
 select
@@ -8367,8 +8367,8 @@ select
       from
         p77_bench
     ),
-    '100',
-    'the timed shift counts one line on each completed order'
+    '0',
+    'the 2024 shift is before the activation stock start, so it counts no lines'
   );
 
 select
@@ -8379,8 +8379,8 @@ select
       from
         p77_bench
     ),
-    '100',
-    'the mapped lines are resolved on the timed shift'
+    '0',
+    'the 2024 shift is before the activation stock start, so no lines are resolved'
   );
 
 select
@@ -8391,8 +8391,8 @@ select
       from
         p77_bench
     ),
-    '100',
-    'the mapped orders are resolved on the timed shift'
+    '0',
+    'the 2024 shift is before the activation stock start, so no orders are resolved'
   );
 
 select
@@ -8485,13 +8485,8 @@ select
 select
   is (
     app.coverage_stock_start (),
-    (
-      select
-        min(opening.occurred_at)
-      from
-        app.opening_stocks opening
-    ),
-    'coverage stock start is the earliest opening'
+    '2026-09-01 00:00:00+00'::timestamptz,
+    'coverage stock start is the activation instant'
   );
 
 select

@@ -55,6 +55,42 @@ select
     true
   );
 
+-- A catalog insert takes the ledger lock for the rest of the transaction, so
+-- these run first.
+select
+  throws_ok (
+    $$select app.retire_movements(array[1]::bigint[], 'e5100000-0000-4000-8000-0000000000c0')$$,
+    '55000',
+    'ledger lock is required',
+    'retire_movements refuses a caller that does not hold the ledger lock'
+  );
+
+select
+  throws_ok (
+    $$select app.post_engine_outflows(jsonb_build_array(jsonb_build_object(
+      'item_id', 'e5100000-0000-4000-8000-000000000001',
+      'movement_type', 'sale',
+      'occurred_at', '2026-11-08T10:00:00Z',
+      'quantity', 1
+    )))$$,
+    '55000',
+    'ledger lock is required',
+    'post_engine_outflows refuses a caller that does not hold the ledger lock'
+  );
+
+select
+  throws_ok (
+    $$select app.replay_component(
+      array['e5100000-0000-4000-8000-000000000001']::uuid[],
+      '[]'::jsonb,
+      'e5100000-0000-4000-8000-0000000000c0',
+      false
+    )$$,
+    '55000',
+    'ledger lock is required',
+    'replay_component refuses a caller that does not hold the ledger lock'
+  );
+
 insert into
   app.stock_items (
     id,
@@ -322,41 +358,8 @@ begin
 end;
 $$;
 
--- Lock is not held yet. These must fail before any poster takes it.
-select
-  throws_ok (
-    $$select app.retire_movements(array[1]::bigint[], 'e5100000-0000-4000-8000-0000000000c0')$$,
-    '55000',
-    'ledger lock is required',
-    'retire_movements refuses a caller that does not hold the ledger lock'
-  );
-
-select
-  throws_ok (
-    $$select app.post_engine_outflows(jsonb_build_array(jsonb_build_object(
-      'item_id', 'e5100000-0000-4000-8000-000000000001',
-      'movement_type', 'sale',
-      'occurred_at', '2026-11-08T10:00:00Z',
-      'quantity', 1
-    )))$$,
-    '55000',
-    'ledger lock is required',
-    'post_engine_outflows refuses a caller that does not hold the ledger lock'
-  );
-
-select
-  throws_ok (
-    $$select app.replay_component(
-      array['e5100000-0000-4000-8000-000000000001']::uuid[],
-      '[]'::jsonb,
-      'e5100000-0000-4000-8000-0000000000c0',
-      false
-    )$$,
-    '55000',
-    'ledger lock is required',
-    'replay_component refuses a caller that does not hold the ledger lock'
-  );
-
+-- The catalog insert above already holds the ledger lock. Take it again so
+-- this test still names the lock the posters require.
 select
   pg_advisory_xact_lock(7342750000000000001);
 
