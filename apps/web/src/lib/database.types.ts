@@ -179,6 +179,46 @@ isOneToOne: true
                   Relationships: [
                     
                   ]
+                },"inventory_activation_requests": {
+                  Row: {
+                    "created_at": string,"payload_hash": string,"request_id": string,"result": NonNullable<Json>
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "created_at"?: string,"payload_hash": string,"request_id": string,"result": NonNullable<Json>
+                  }
+                  Update: {
+                    "created_at"?: string,"payload_hash"?: string,"request_id"?: string,"result"?: NonNullable<Json>
+                  }
+                  Relationships: [
+                    
+                  ]
+                },"inventory_opening_observations": {
+                  Row: {
+                    "base_unit": string,"explicit_zero": boolean,"item_id": string,"line_no": number | null,"observed_at": string,"opening_id": string | null,"quantity": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "base_unit": string,"explicit_zero": boolean,"item_id": string,"line_no"?: number | null,"observed_at": string,"opening_id"?: string | null,"quantity": number
+                  }
+                  Update: {
+                    "base_unit"?: string,"explicit_zero"?: boolean,"item_id"?: string,"line_no"?: number | null,"observed_at"?: string,"opening_id"?: string | null,"quantity"?: number
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "inventory_opening_observations_item_id_fkey"
+      columns: ["item_id"]
+isOneToOne: true
+      referencedRelation: "stock_items"
+      referencedColumns: ["id"]
+    },{
+      foreignKeyName: "inventory_opening_observations_line_fk"
+      columns: ["opening_id","line_no"]
+isOneToOne: false
+      referencedRelation: "opening_stock_lines"
+      referencedColumns: ["opening_id","line_no"]
+    }
+                  ]
                 },"item_balances": {
                   Row: {
                     "avg_cost": number,"has_uncovered_deficit": boolean,"item_id": string,"last_occurred_at": string | null,"on_hand_qty": number,"on_hand_value": number
@@ -1995,9 +2035,6 @@ isOneToOne: true
                 }
           }
           Functions: {
-            "activate_inventory":
-{ Args: { "p_explicit_zero_item_ids": string[],"p_manifest_hash": string,"p_request_id": string }; Returns: Json
-                           },
             "accounting_next_work":
 { Args: Record<PropertyKey, never>; Returns: Json
                            },
@@ -2022,6 +2059,9 @@ isOneToOne: true
                            },
 "accounting_read_uuid_list":
 { Args: { "p_value": Json }; Returns: Json
+                           },
+"activate_inventory":
+{ Args: { "p_explicit_zero_item_ids": (string)[],"p_manifest_hash": string,"p_request_id": string }; Returns: Json
                            },
 "add_custom_unit":
 { Args: { "p_code": string,"p_label_ar": string,"p_request_id": string }; Returns: string
@@ -2270,6 +2310,12 @@ isOneToOne: true
 "opening_activation_review":
 { Args: { "p_after_id"?: string,"p_limit"?: number }; Returns: Json
                            },
+"opening_manifest_digest":
+{ Args: { "p_confirmed": boolean }; Returns: string
+                           },
+"opening_manifest_token":
+{ Args: Record<PropertyKey, never>; Returns: string
+                           },
 "order_cost_detail":
 { Args: { "p_order_id": string }; Returns: Json
                            },
@@ -2457,6 +2503,9 @@ isOneToOne: true
 { Args: { "p_lines": Json }; Returns: string
                            },
 "post_movements":
+{ Args: { "p_movements": Json }; Returns: string
+                           },
+"post_movements_internal":
 { Args: { "p_movements": Json }; Returns: string
                            },
 "post_sort":

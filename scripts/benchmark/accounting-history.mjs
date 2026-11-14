@@ -564,7 +564,11 @@ function writeResults(rows, note) {
     '',
     'Synthetic catalog, one component. Historical orders were posted with `app.run_accounting_work`. The measured order was the queue head and was timed in a fresh session with `statement_timeout` of 6 seconds. Crossing 2 seconds is recorded and does not fail. No checkpoint was built.',
     '',
-    ...rows.map((row) => (row.error ? `## ${row.name}\n\n- gate: FAIL\n- error: ${row.error}\n` : formatResult(row))),
+    ...rows.map((row) =>
+      row.error
+        ? `## ${row.name}\n\n- gate: FAIL\n- error: ${row.error}\n`
+        : formatResult(row),
+    ),
     note ? `${note}\n` : '',
   ].join('\n');
   writeFileSync(join(here, 'RESULTS.md'), body);
@@ -644,7 +648,10 @@ async function postedCount(historyName) {
 async function run() {
   containerNameCached = await containerName();
   const rows = [];
-  const startName = process.argv[2] && !process.argv[2].startsWith('--') ? process.argv[2] : null;
+  const startName =
+    process.argv[2] && !process.argv[2].startsWith('--')
+      ? process.argv[2]
+      : null;
   const skipBuild = process.argv.includes('--skip-build') ? startName : null;
   const resume = process.argv.includes('--resume');
   let started = startName === null;
@@ -675,7 +682,10 @@ async function run() {
       rows.push(row);
       writeResults(rows);
       if (!row.pass) {
-        writeResults(rows, 'Stopped after a failing history. No checkpoint was built.');
+        writeResults(
+          rows,
+          'Stopped after a failing history. No checkpoint was built.',
+        );
         process.exitCode = 1;
         return;
       }
@@ -683,9 +693,16 @@ async function run() {
       const posted = await postedCount(history.name);
       rows.push({
         name: history.name,
-        error: `posted ${posted} before failure. ${String(error.message ?? error).replace(/\s+/g, ' ').slice(0, 500)}`,
+        error: `posted ${posted} before failure. ${String(
+          error.message ?? error,
+        )
+          .replace(/\s+/g, ' ')
+          .slice(0, 500)}`,
       });
-      writeResults(rows, 'Stopped after a failing history. No checkpoint was built.');
+      writeResults(
+        rows,
+        'Stopped after a failing history. No checkpoint was built.',
+      );
       process.exitCode = 1;
       return;
     }

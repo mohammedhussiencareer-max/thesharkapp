@@ -44,7 +44,8 @@ async function containerName() {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find((line) => line.startsWith('supabase_db_'));
-  if (!found) throw new Error('the local supabase database container is not running');
+  if (!found)
+    throw new Error('the local supabase database container is not running');
   return found;
 }
 
@@ -104,11 +105,23 @@ function line(result) {
 
 const report = [];
 
-function add(name, holder, waiter, note) {
+function add(name, holder, waiter, note, expectHolder, expectWaiter) {
   const blocked = waiter.ms >= minWaitMs;
-  report.push({ name, blocked, note, holder: line(holder), waiter: line(waiter) });
+  const holderOk =
+    expectHolder == null ? holder.ok : holder.out.includes(expectHolder);
+  const waiterOk =
+    expectWaiter == null ? waiter.ok : waiter.out.includes(expectWaiter);
+  report.push({
+    name,
+    blocked,
+    holderOk,
+    waiterOk,
+    note,
+    holder: line(holder),
+    waiter: line(waiter),
+  });
   process.stdout.write(
-    `\n${name}\n  blocked: ${blocked}\n  ${note}\n  holder: ${line(holder)}\n  waiter: ${line(waiter)}\n`,
+    `\n${name}\n  blocked: ${blocked}\n  holder outcome: ${holderOk}\n  waiter outcome: ${waiterOk}\n  ${note}\n  holder: ${line(holder)}\n  waiter: ${line(waiter)}\n`,
   );
 }
 
@@ -129,11 +142,11 @@ function shiftJson(stamp) {
   }).replaceAll("'", "''");
 }
 
-function countPayload(requestId, qty) {
+function countPayload(requestId, qty, countedAt) {
   return `jsonb_build_object(
     'request_id', '${requestId}',
     'frequency', 'daily',
-    'counted_at', '2026-08-03T10:00:00Z',
+    'counted_at', '${countedAt}',
     'lines', jsonb_build_array(jsonb_build_object(
       'item_id', '${itemA}',
       'counted_qty', '${qty}',
@@ -198,6 +211,8 @@ commit;
     insertHolds.holder,
     insertHolds.waiter,
     'activate should wait, then refuse the stale token with 40001',
+    null,
+    'opening manifest changed',
   );
 
   await execOk(`
@@ -249,13 +264,21 @@ commit;
     activateHolds.holder,
     activateHolds.waiter,
     'the insert should wait, then commit after activation',
+    '"activated": true',
+    null,
   );
   add(
     'activate holds, sync start waits',
     activateHolds.holder,
     activateHolds.second,
     'the sync should wait for SHARE on pos_sync_runs, then finish',
+    '"activated": true',
+    null,
   );
+
+  const tokenNow = (
+    await execOk(`select app.opening_manifest_token();`)
+  ).trim();
 
   const syncHolds = await race(
     `
@@ -273,7 +296,7 @@ begin;
 ${claims()}
 select app.activate_inventory(
   'c9e00000-0000-4000-8000-000000000014',
-  '${tokenAB}',
+  '${tokenNow}',
   '{}'::uuid[]
 );
 commit;
@@ -283,7 +306,9 @@ commit;
     'sync holds, activate waits',
     syncHolds.holder,
     syncHolds.waiter,
-    'activate should wait on SHARE, then continue and refuse because inventory is already activated',
+    'activate should wait on SHARE, then refuse because inventory is already activated',
+    null,
+    'inventory is already activated',
   );
 
   await execOk(`
@@ -297,7 +322,7 @@ values (
   false,
   '2026-08-02 20:00:00+00'
 );
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000021', '19')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000021', '19', '2026-08-03T10:00:00Z')});
 commit;
 `);
   await execOk(`
@@ -320,7 +345,7 @@ commit;
 \\set VERBOSITY verbose
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000021', '19')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000021', '19', '2026-08-03T10:00:00Z')});
 select pg_sleep(${holdMs});
 commit;
 `,
@@ -344,12 +369,14 @@ commit;
     countHolds.holder,
     countHolds.waiter,
     'the posting call holds SHARE on pos_shifts; ingest should wait, then finish',
+    '"status": "posted"',
+    '"shifts_upserted": 1',
   );
 
   await execOk(`
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000022', '18')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000022', '18', '2026-08-04T10:00:00Z')});
 commit;
 `);
   await execOk(`
@@ -387,7 +414,7 @@ commit;
 \\set VERBOSITY verbose
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000022', '18')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000022', '18', '2026-08-04T10:00:00Z')});
 commit;
 `,
   );
@@ -396,9 +423,13 @@ commit;
     ingestHolds.holder,
     ingestHolds.waiter,
     'record_count should wait on SHARE, then post the non-zero count',
+    '"shifts_upserted": 1',
+    '"status": "posted"',
   );
 
-  const failed = report.filter((row) => !row.blocked);
+  const failed = report.filter(
+    (row) => !row.blocked || !row.holderOk || !row.waiterOk,
+  );
   if (failed.length > 0) process.exitCode = 1;
 }
 

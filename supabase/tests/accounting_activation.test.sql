@@ -774,10 +774,12 @@ select
   is (
     (
       app.run_accounting_work (
-        gen_random_uuid (),
+        gen_random_uuid(),
         1,
         app.accounting_next_work () -> 'head' ->> 'order_id',
-        (app.accounting_next_work () -> 'head' ->> 'work_generation')::integer
+        (
+          app.accounting_next_work () -> 'head' ->> 'work_generation'
+        )::integer
       ) ->> 'applied'
     )::integer,
     1,
@@ -796,9 +798,7 @@ values
 
 select
   is (
-    app.stock_count_derivation_detail (
-      'a7900000-0000-4000-8000-000000000030'
-    ) ->> 'waiting_for_processing',
+    app.stock_count_derivation_detail ('a7900000-0000-4000-8000-000000000030') ->> 'waiting_for_processing',
     'false',
     'a processed order after the start does not keep the count waiting'
   );
@@ -820,9 +820,7 @@ select
 
 select
   is (
-    app.stock_count_derivation_detail (
-      'a7900000-0000-4000-8000-000000000030'
-    ) ->> 'waiting_for_processing',
+    app.stock_count_derivation_detail ('a7900000-0000-4000-8000-000000000030') ->> 'waiting_for_processing',
     'true',
     'the count still waits while the posted effect is after the stock start'
   );
@@ -845,10 +843,12 @@ select
   is (
     (
       app.run_accounting_work (
-        gen_random_uuid (),
+        gen_random_uuid(),
         1,
         app.accounting_next_work () -> 'head' ->> 'order_id',
-        (app.accounting_next_work () -> 'head' ->> 'work_generation')::integer
+        (
+          app.accounting_next_work () -> 'head' ->> 'work_generation'
+        )::integer
       ) ->> 'none'
     )::integer,
     1,
@@ -857,9 +857,7 @@ select
 
 select
   is (
-    app.stock_count_derivation_detail (
-      'a7900000-0000-4000-8000-000000000030'
-    ) ->> 'waiting_for_processing',
+    app.stock_count_derivation_detail ('a7900000-0000-4000-8000-000000000030') ->> 'waiting_for_processing',
     'false',
     'the count stops waiting after the old effect is reversed'
   );
