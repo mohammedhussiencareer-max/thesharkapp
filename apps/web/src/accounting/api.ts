@@ -1,4 +1,9 @@
-import { readError, writeError } from '@/accounting/errors';
+import {
+  callFailedMessage,
+  mapActivationError,
+  readError,
+  writeError,
+} from '@/accounting/errors';
 import {
   runAccountingWork,
   RUN_BUDGET_MS,
@@ -31,6 +36,8 @@ import {
   type CountPosting,
   type DifferenceVector,
   type LossVersion,
+  type ActivationResult,
+  type ActivationWrite,
   type OpeningObservation,
   type OpeningReview,
   type OrderCostDetail,
@@ -408,6 +415,19 @@ export function orderCostOf(value: unknown): OrderCostDetail {
 function observationOf(value: unknown): OpeningObservation | null {
   if (value === null) return null;
   const row = record(value);
+  if (row.explicit_zero === true) {
+    if (row.opening_id !== null || row.line_no !== null) bad();
+    if (decimal(row.quantity) !== '0') bad();
+    return {
+      openingId: null,
+      lineNo: null,
+      quantity: '0',
+      unit: text(row.unit),
+      unitCost: decimal(row.unit_cost),
+      occurredAt: text(row.occurred_at),
+      explicitZero: true,
+    };
+  }
   if (row.explicit_zero !== false) bad();
   return {
     openingId: uuidText(row.opening_id),
@@ -659,9 +679,17 @@ export async function loadOrderCost(orderId: string): Promise<OrderCostDetail> {
   );
 }
 
-export async function loadOpeningReview(): Promise<OpeningReview> {
+class ManifestPagesDisagree extends Error {
+  constructor() {
+    super('manifest pages disagree');
+    this.name = 'ManifestPagesDisagree';
+  }
+}
+
+async function loadOpeningReviewPass(): Promise<OpeningReview> {
   const roster: OpeningReview['roster'] = [];
   let after: string | undefined;
+  let token: string | null | undefined;
   for (let index = 0; index < openingMaxPages; index += 1) {
     const page = openingReviewOf(
       await readRpc('opening_activation_review', {
@@ -669,6 +697,9 @@ export async function loadOpeningReview(): Promise<OpeningReview> {
         p_limit: openingPageSize,
       }),
     );
+    if (token === undefined) token = page.openingManifestHash;
+    else if (page.openingManifestHash !== token)
+      throw new ManifestPagesDisagree();
     roster.push(...page.roster);
     if (!page.nextItemId) {
       return {
@@ -681,6 +712,24 @@ export async function loadOpeningReview(): Promise<OpeningReview> {
     after = page.nextItemId;
   }
   throw new Error('القائمة أكبر من اللي ينفع نعرضه');
+}
+
+export async function loadOpeningReview(): Promise<OpeningReview> {
+  try {
+    return await loadOpeningReviewPass();
+  } catch (error) {
+    if (!(error instanceof ManifestPagesDisagree)) throw error;
+  }
+  try {
+    return await loadOpeningReviewPass();
+  } catch (error) {
+    if (error instanceof ManifestPagesDisagree) {
+      throw new Error('قائمة الافتتاح اتغيرت — راجعها وفعّل تاني', {
+        cause: error,
+      });
+    }
+    throw error;
+  }
 }
 
 export async function loadCountDerivation(
@@ -737,7 +786,9 @@ async function writeRpc(
     | 'accounting_next_work'
     | 'run_accounting_work'
     | 'record_accounting_call_failure'
-    | 'retry_accounting_work',
+    | 'record_accounting_recompute_timeout'
+    | 'retry_accounting_work'
+    | 'activate_inventory',
   args?: Record<string, unknown>,
 ): Promise<unknown> {
   const { data, error } = await appDb().rpc(name, args as never);
@@ -773,6 +824,15 @@ export function webAccountingDb(): AccountingDb {
         }),
       );
     },
+    async recordAccountingRecomputeTimeout(attemptId, orderId, workGeneration) {
+      return failureReportOf(
+        await writeRpc('record_accounting_recompute_timeout', {
+          p_attempt_id: attemptId,
+          p_order_id: orderId,
+          p_work_generation: workGeneration,
+        }),
+      );
+    },
   };
 }
 
@@ -791,13 +851,43 @@ export async function runDeductions(
 export async function recordRunFailure(
   report: AttemptReport,
 ): Promise<FailureReport> {
+  if (report.failureKind === null) {
+    throw new Error(callFailedMessage);
+  }
   return failureReportOf(
-    await writeRpc('record_accounting_call_failure', {
-      p_attempt_id: report.attemptId,
-      p_order_id: report.orderId,
-      p_work_generation: report.workGeneration,
-    }),
+    await writeRpc(
+      report.failureKind === 'recompute_timeout'
+        ? 'record_accounting_recompute_timeout'
+        : 'record_accounting_call_failure',
+      {
+        p_attempt_id: report.attemptId,
+        p_order_id: report.orderId,
+        p_work_generation: report.workGeneration,
+      },
+    ),
   );
+}
+
+function activationResultOf(value: unknown): ActivationResult {
+  const row = record(value);
+  if (!flag(row.activated)) bad();
+  return {
+    activated: true,
+    stockStartedAt: looseText(row.stock_started_at),
+    openingManifestHash: looseText(row.opening_manifest_hash),
+  };
+}
+
+export async function activateInventory(
+  action: ActivationWrite,
+): Promise<ActivationResult> {
+  const { data, error } = await appDb().rpc('activate_inventory', {
+    p_request_id: action.requestId,
+    p_manifest_hash: action.manifestHash,
+    p_explicit_zero_item_ids: action.explicitZeroItemIds,
+  });
+  if (error) throw mapActivationError(error);
+  return activationResultOf(data);
 }
 
 export async function retryParkedOrder(

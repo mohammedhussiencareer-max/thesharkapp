@@ -17,6 +17,11 @@ type Held = {
    * locked and the only send is a retry of this payload.
    */
   unknown: boolean;
+  /**
+   * The server refused this activation token as a changed manifest. The
+   * request stays pinned, but nothing sends until a review reload replaces it.
+   */
+  awaitingReviewReload: boolean;
 };
 
 const held = new Map<string, Held>();
@@ -110,6 +115,54 @@ export function unknownAction<T>(subject: string): T | null {
 }
 
 /**
+ * The payload of an in-flight or replaced action. Null when the outcome is
+ * unknown, so a retry of an unknown write cannot pick up a newer payload.
+ */
+export function heldAction<T>(subject: string): T | null {
+  const current = held.get(subject);
+  if (!current || current.unknown) return null;
+  return current.payload as T;
+}
+
+/** True while this request must reload the review before it can send again. */
+export function activationReviewReloadPending(subject: string): boolean {
+  return held.get(subject)?.awaitingReviewReload === true;
+}
+
+/**
+ * A confirmed `opening manifest changed` stored nothing. Keep the request id,
+ * clear the unknown outcome, and refuse to send the rejected token again.
+ */
+export function pinActivationReviewReload(
+  subject: string,
+  requestId: string,
+): void {
+  const current = held.get(subject);
+  if (!current || current.requestId !== requestId) return;
+  current.unknown = false;
+  current.awaitingReviewReload = true;
+  emitHeldWrites();
+}
+
+/**
+ * Keeps the request id, replaces the payload, and clears unknown.
+ * Used after `opening manifest changed`, which proved this id stored nothing.
+ */
+export function replaceActivationPayload<T extends { requestId: string }>(
+  subject: string,
+  requestId: string,
+  next: T,
+): void {
+  const current = held.get(subject);
+  if (!current || current.requestId !== requestId) return;
+  if (next.requestId !== requestId) return;
+  current.payload = next;
+  current.unknown = false;
+  current.awaitingReviewReload = false;
+  emitHeldWrites();
+}
+
+/**
  * At most one outstanding action per subject. A second begin returns the
  * payload already held, including its request id.
  */
@@ -121,7 +174,12 @@ export function beginAction<T>(
   if (existing) return existing.payload as T;
   const requestId = crypto.randomUUID();
   const payload = create(requestId);
-  held.set(subject, { requestId, payload, unknown: false });
+  held.set(subject, {
+    requestId,
+    payload,
+    unknown: false,
+    awaitingReviewReload: false,
+  });
   emitHeldWrites();
   return payload;
 }

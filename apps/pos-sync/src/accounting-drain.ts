@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { safeErrorMessage } from './safe-error.ts';
 import {
   isUnknownOutcome,
+  SupabaseRpcError,
   zeroAccountingCounts,
   type AccountingCounts,
   type AccountingDb,
@@ -169,12 +170,24 @@ async function failedCall(
   if (binding === null || !isUnknownOutcome(error)) {
     return done('call_failed', 'not_needed', message);
   }
+  const kind =
+    error instanceof SupabaseRpcError && error.sqlstate === '57014'
+      ? 'recompute_timeout'
+      : 'escaped';
+  const record = () =>
+    kind === 'recompute_timeout'
+      ? db.recordAccountingRecomputeTimeout(
+          attemptId,
+          binding.orderId,
+          binding.workGeneration,
+        )
+      : db.recordAccountingCallFailure(
+          attemptId,
+          binding.orderId,
+          binding.workGeneration,
+        );
   try {
-    let report = await db.recordAccountingCallFailure(
-      attemptId,
-      binding.orderId,
-      binding.workGeneration,
-    );
+    let report = await record();
     const { clock, started, budgetMs, sleep } = pacing;
     let waited = 0;
     for (let repeat = 0; report === 'busy'; repeat += 1) {
@@ -187,11 +200,7 @@ async function failedCall(
       }
       await sleep(pause);
       waited += pause;
-      report = await db.recordAccountingCallFailure(
-        attemptId,
-        binding.orderId,
-        binding.workGeneration,
-      );
+      report = await record();
     }
     return done('call_failed', report, message);
   } catch (reportError) {

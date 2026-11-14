@@ -127,6 +127,7 @@ describe('ProcessingPanel', () => {
         attemptId: 'attempt-1',
         orderId: 'order-9',
         workGeneration: 4,
+        failureKind: 'escaped',
       });
       return Promise.resolve(
         outcome({
@@ -148,6 +149,7 @@ describe('ProcessingPanel', () => {
       attemptId: 'attempt-1',
       orderId: 'order-9',
       workGeneration: 4,
+      failureKind: 'escaped',
     });
     expect(hasAction(accountingRunSubject)).toBe(true);
   });
@@ -158,6 +160,7 @@ describe('ProcessingPanel', () => {
         attemptId: 'attempt-rec',
         orderId: 'order-9',
         workGeneration: 3,
+        failureKind: 'escaped',
       });
       return Promise.resolve(
         outcome({
@@ -184,6 +187,7 @@ describe('ProcessingPanel', () => {
         attemptId: 'attempt-3',
         orderId: 'order-9',
         workGeneration: 2,
+        failureKind: 'recompute_timeout',
       });
       return Promise.resolve(
         outcome({
@@ -207,6 +211,7 @@ describe('ProcessingPanel', () => {
       attemptId: 'attempt-3',
       orderId: 'order-9',
       workGeneration: 2,
+      failureKind: 'recompute_timeout',
     });
   });
 
@@ -219,6 +224,7 @@ describe('ProcessingPanel', () => {
         attemptId: 'attempt-2',
         orderId: 'order-9',
         workGeneration: 1,
+        failureKind: 'escaped',
       });
       return Promise.resolve(
         outcome({
@@ -346,6 +352,7 @@ describe('ProcessingPanel', () => {
         attemptId: 'attempt-1',
         orderId: 'order-9',
         workGeneration: 4,
+        failureKind: 'escaped',
       });
       return Promise.resolve(
         outcome({

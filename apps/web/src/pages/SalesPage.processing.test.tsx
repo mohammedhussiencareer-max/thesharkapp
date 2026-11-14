@@ -390,6 +390,7 @@ describe('SalesPage processing refresh', () => {
         attemptId: 'attempt-1',
         orderId: 'order-9',
         workGeneration: 4,
+        failureKind: 'escaped',
       });
       return Promise.resolve(
         outcome({

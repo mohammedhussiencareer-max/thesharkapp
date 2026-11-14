@@ -181,13 +181,25 @@ export type ChecklistItem = {
 };
 
 export type OpeningObservation = {
-  openingId: string;
-  lineNo: string;
+  openingId: string | null;
+  lineNo: string | null;
   quantity: string;
   unit: string;
   unitCost: string;
   occurredAt: string;
-  explicitZero: false;
+  explicitZero: boolean;
+};
+
+export type ActivationWrite = {
+  requestId: string;
+  manifestHash: string;
+  explicitZeroItemIds: string[];
+};
+
+export type ActivationResult = {
+  activated: true;
+  stockStartedAt: string | null;
+  openingManifestHash: string | null;
 };
 
 export type RosterItem = {

@@ -338,6 +338,61 @@ values
     repeat('a', 32)
   );
 
+-- One confirmed opening and the activation request that names the same id.
+-- The line id is the one record_opening_stock wrote, not a guessed batch.
+insert into
+  app.inventory_opening_observations (
+    item_id,
+    base_unit,
+    quantity,
+    explicit_zero,
+    opening_id,
+    line_no,
+    observed_at
+  )
+select
+  line.item_id,
+  'kg',
+  movement.quantity,
+  false,
+  line.opening_id,
+  line.line_no,
+  '2026-08-01T08:00:00Z'
+from
+  app.opening_stock_lines line
+  join app.stock_movements movement on movement.batch_id = line.opening_id
+  and movement.item_id = line.item_id
+  and movement.movement_type = 'opening'
+where
+  line.item_id = 'b4c00000-0000-4000-8000-000000000001';
+
+do $$
+begin
+  if (
+    select
+      count(*)
+    from
+      app.inventory_opening_observations
+  ) <> 1 then
+    raise exception 'seed observation was not written';
+  end if;
+end;
+$$;
+
+insert into
+  app.inventory_activation_requests (request_id, payload_hash, result)
+values
+  (
+    'b4c00000-0000-4000-8000-000000000401',
+    repeat('a', 32),
+    jsonb_build_object(
+      'status',
+      'activated',
+      'stock_started_at',
+      '2026-08-01T00:00:00Z'
+    )
+  );
+
 -- A call that names no order only expands the rederive spans and returns the
 -- head, so each order is processed by a call bound to the head just named.
 do $$

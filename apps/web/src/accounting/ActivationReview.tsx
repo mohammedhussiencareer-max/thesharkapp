@@ -1,8 +1,10 @@
-import { activationAction } from '@/accounting/activation-action';
 import { checklistLabels } from '@/accounting/labels';
 import type { OpeningReview, RosterItem } from '@/accounting/types';
 import { unitLabels } from '@/items/labels';
 import { formatCairo } from '@/lib/cairo';
+import { primaryButton } from '@/lib/page-style';
+
+const noChecks = new Set<string>();
 
 function Num({ value }: { value: string }) {
   return <span dir="ltr">{value}</span>;
@@ -15,10 +17,21 @@ function unitName(unit: string): string {
   return unit;
 }
 
-function RosterRow({ item }: { item: RosterItem }) {
+function RosterRow({
+  item,
+  checked,
+  checksLocked,
+  onToggleZero,
+}: {
+  item: RosterItem;
+  checked: boolean;
+  checksLocked: boolean;
+  onToggleZero?: (itemId: string) => void;
+}) {
   const observation = item.observation;
   const repeated =
     observation !== null &&
+    !observation.explicitZero &&
     item.openingLineCount !== '0' &&
     item.openingLineCount !== '1';
   return (
@@ -26,8 +39,23 @@ function RosterRow({ item }: { item: RosterItem }) {
       <h2 className="text-lg font-semibold">{item.name}</h2>
       <p>{unitName(item.baseUnit)}</p>
       {item.active ? null : <p>موقوف</p>}
-      {item.missing || observation === null ? (
-        <p>مفيش رصد — الصفر لازم يتسجل صراحة</p>
+      {observation?.explicitZero ? (
+        <p>رصيد صفر مسجّل</p>
+      ) : item.missing || observation === null ? (
+        <>
+          <p>مفيش رصد — الصفر لازم يتسجل صراحة</p>
+          {onToggleZero ? (
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={checked}
+                disabled={checksLocked}
+                onChange={() => onToggleZero(item.itemId)}
+              />
+              صفر صريح
+            </label>
+          ) : null}
+        </>
       ) : (
         <>
           <p>
@@ -44,7 +72,27 @@ function RosterRow({ item }: { item: RosterItem }) {
   );
 }
 
-export function ActivationReview({ review }: { review: OpeningReview }) {
+export function ActivationReview({
+  review,
+  checkedZeroIds = noChecks,
+  checksLocked = false,
+  onToggleZero,
+  notice = null,
+  showActivate = false,
+  activateLabel = 'تفعيل الخصم',
+  activateDisabled = true,
+  onActivate,
+}: {
+  review: OpeningReview;
+  checkedZeroIds?: ReadonlySet<string>;
+  checksLocked?: boolean;
+  onToggleZero?: (itemId: string) => void;
+  notice?: string | null;
+  showActivate?: boolean;
+  activateLabel?: string;
+  activateDisabled?: boolean;
+  onActivate?: () => void;
+}) {
   return (
     <div className="flex flex-col gap-4">
       {review.activated ? (
@@ -56,7 +104,17 @@ export function ActivationReview({ review }: { review: OpeningReview }) {
         </p>
       ) : null}
       {review.canActivate ? <p>الرصيد جاهز للتفعيل</p> : null}
-      {activationAction(review)}
+      {notice ? <p>{notice}</p> : null}
+      {showActivate ? (
+        <button
+          className={primaryButton}
+          type="button"
+          disabled={activateDisabled}
+          onClick={onActivate}
+        >
+          {activateLabel}
+        </button>
+      ) : null}
       <section aria-label="جاهزية التفعيل" className="flex flex-col gap-1">
         <h2 className="text-lg font-semibold">جاهزية التفعيل</h2>
         <ul>
@@ -77,7 +135,13 @@ export function ActivationReview({ review }: { review: OpeningReview }) {
         <h2 className="text-lg font-semibold">قائمة الافتتاح</h2>
         {review.roster.length === 0 ? <p>مفيش أصناف</p> : null}
         {review.roster.map((item) => (
-          <RosterRow key={item.itemId} item={item} />
+          <RosterRow
+            key={item.itemId}
+            item={item}
+            checked={checkedZeroIds.has(item.itemId)}
+            checksLocked={checksLocked}
+            onToggleZero={onToggleZero}
+          />
         ))}
       </section>
     </div>

@@ -34,6 +34,9 @@ function harness(overrides: Partial<AccountingDb> = {}): AccountingDb {
     recordAccountingCallFailure: vi.fn(() =>
       Promise.resolve('recorded' as const),
     ),
+    recordAccountingRecomputeTimeout: vi.fn(() =>
+      Promise.resolve('recorded' as const),
+    ),
     ...overrides,
   };
 }
@@ -132,11 +135,13 @@ describe('runAccountingWork', () => {
     expect(result.calls).toBe(4);
   });
 
-  it('reports a bound unknown outcome with the same attempt id and backs off while busy', async () => {
+  it('reports a statement timeout on the timeout recorder and reuses that kind while busy', async () => {
     const seen: string[] = [];
     let reports = 0;
     const sleeps: number[] = [];
     let phase = 'before';
+    const held: Array<{ failureKind: string | null }> = [];
+    const escaped = vi.fn(() => Promise.resolve('recorded' as const));
     const db = harness({
       runAccountingWork: vi.fn(() => {
         phase = 'inside';
@@ -144,7 +149,9 @@ describe('runAccountingWork', () => {
           Object.assign(new Error('timeout'), { code: '57014' }),
         );
       }),
-      recordAccountingCallFailure: vi.fn((attemptId: string) => {
+      recordAccountingCallFailure: escaped,
+      recordAccountingRecomputeTimeout: vi.fn((attemptId: string) => {
+        expect(held.at(-1)?.failureKind).toBe('recompute_timeout');
         seen.push(attemptId);
         reports += 1;
         return Promise.resolve(
@@ -160,8 +167,10 @@ describe('runAccountingWork', () => {
         sleeps.push(ms);
         return Promise.resolve();
       },
-      onBoundAttempt: () => {
+      onBoundAttempt: (report) => {
         expect(phase).toBe('before');
+        expect(report.failureKind).toBeNull();
+        held.push(report);
       },
     });
     expect(result.stop).toBe('call_failed');
@@ -169,6 +178,25 @@ describe('runAccountingWork', () => {
     expect(seen).toEqual(['attempt-fixed', 'attempt-fixed']);
     expect(sleeps).toEqual([250]);
     expect(phase).toBe('inside');
+    expect(held.at(-1)?.failureKind).toBe('recompute_timeout');
+    expect(escaped).not.toHaveBeenCalled();
+  });
+
+  it('records a lost reply as escaped', async () => {
+    const escaped = vi.fn(() => Promise.resolve('recorded' as const));
+    const timeout = vi.fn(() => Promise.resolve('recorded' as const));
+    const db = harness({
+      runAccountingWork: vi.fn(() => Promise.reject(new Error('network'))),
+      recordAccountingCallFailure: escaped,
+      recordAccountingRecomputeTimeout: timeout,
+    });
+    const result = await runAccountingWork(db, {
+      clock: () => 0,
+      sleep: noSleep,
+    });
+    expect(result.report).toBe('recorded');
+    expect(escaped).toHaveBeenCalledTimes(1);
+    expect(timeout).not.toHaveBeenCalled();
   });
 
   it('does not record an unbound unknown outcome', async () => {
@@ -209,7 +237,7 @@ describe('runAccountingWork', () => {
     const recorder = Object.assign(new Error('denied'), { code: '42501' });
     const db = harness({
       runAccountingWork: vi.fn(() => Promise.reject(worker)),
-      recordAccountingCallFailure: vi.fn(() => Promise.reject(recorder)),
+      recordAccountingRecomputeTimeout: vi.fn(() => Promise.reject(recorder)),
     });
     const result = await runAccountingWork(db, {
       clock: () => 0,

@@ -94,12 +94,19 @@ function lineJson(orderId: string, index: number, line: Line) {
 }
 
 /**
- * Switches deductions on locally, then ingests three synthetic orders the way
- * a sync would and lets the worker post them. Activation is test-only: it goes
- * through the local database container because no API role can write it.
- * Each run adds new orders, so a previous run's decisions never interfere.
- * Their ids sort newest first, so they stay on the first page of the queue.
- * Item a costs 50 per kilo and item b costs 20.
+ * Prepares the two stock items, their mappings, and a positive opening.
+ * Does not record activation. The owner does that from the screen.
+ */
+export function prepareOrderDecisionCatalog(apiUrl: string): void {
+  runLocalSql(apiUrl);
+}
+
+/**
+ * Ingests three synthetic orders the way a sync would and lets the worker post
+ * them. The catalog and the activation row already exist. Each run adds new
+ * orders, so a previous run's decisions never interfere. Their ids sort newest
+ * first, so they stay on the first page of the queue. Item a costs 50 per kilo
+ * and item b costs 20.
  */
 export async function seedOrderDecisions(
   client: SupabaseClient<Database>,

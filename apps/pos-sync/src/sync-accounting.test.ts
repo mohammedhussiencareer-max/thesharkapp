@@ -98,6 +98,9 @@ describe('runPosSync accounting drain', () => {
           events.push('record');
           return 'recorded';
         },
+        async recordAccountingRecomputeTimeout() {
+          throw new Error('must not be called');
+        },
       },
     });
     expect(events).toEqual(['start', 'ingest', 'finish:ok', 'drain']);
@@ -125,6 +128,9 @@ describe('runPosSync accounting drain', () => {
         async recordAccountingCallFailure() {
           throw new Error('must not be called');
         },
+        async recordAccountingRecomputeTimeout() {
+          throw new Error('must not be called');
+        },
       },
     });
     expect(events).toEqual(['start', 'ingest', 'finish:ok']);
@@ -148,7 +154,10 @@ describe('runPosSync accounting drain', () => {
             '57014',
           );
         },
-        async recordAccountingCallFailure(attemptId, orderId, generation) {
+        async recordAccountingCallFailure() {
+          throw new Error('escaped recorder');
+        },
+        async recordAccountingRecomputeTimeout(attemptId, orderId, generation) {
           reported.push([attemptId, orderId, generation]);
           return 'recorded';
         },
@@ -182,6 +191,9 @@ describe('runPosSync accounting drain', () => {
         },
         async recordAccountingCallFailure() {
           throw new SupabaseRpcError('Supabase RPC failed: network', 'network');
+        },
+        async recordAccountingRecomputeTimeout() {
+          throw new Error('must not be called');
         },
       },
       logger: (line) => {
@@ -234,6 +246,9 @@ describe('runPosSync accounting drain', () => {
           },
           async recordAccountingCallFailure() {
             return 'recorded';
+          },
+          async recordAccountingRecomputeTimeout() {
+            throw new Error('must not be called');
           },
         },
       }),

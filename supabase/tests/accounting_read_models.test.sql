@@ -136,7 +136,7 @@ select
 
 select
   ok (
-    not exists (
+    exists (
       select
         1
       from
@@ -144,12 +144,19 @@ select
         join pg_catalog.pg_namespace n on n.oid = p.pronamespace
       where
         n.nspname = 'app'
-        and p.proname in (
-          'activate_inventory',
-          'record_inventory_activation'
-        )
+        and p.proname = 'activate_inventory'
+    )
+    and not exists (
+      select
+        1
+      from
+        pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+      where
+        n.nspname = 'app'
+        and p.proname = 'record_inventory_activation'
     ),
-    'this migration does not add an activation writer'
+    'activation is written by activate_inventory'
   );
 
 select

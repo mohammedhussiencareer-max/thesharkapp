@@ -16,6 +16,7 @@ const RPC_NAMES = new Set([
   'finish_pos_sync_run',
   'run_accounting_work',
   'record_accounting_call_failure',
+  'record_accounting_recompute_timeout',
   'accounting_next_work',
 ]);
 
@@ -127,6 +128,11 @@ export type AccountingDb = {
     binding: AccountingOrderRef | null,
   ): Promise<AccountingRun>;
   recordAccountingCallFailure(
+    attemptId: string,
+    orderId: string,
+    workGeneration: number,
+  ): Promise<FailureReport>;
+  recordAccountingRecomputeTimeout(
     attemptId: string,
     orderId: string,
     workGeneration: number,
@@ -246,6 +252,19 @@ export function createSupabaseDb(
       return parseFailureReport(
         await rpc(
           'record_accounting_call_failure',
+          {
+            p_attempt_id: attemptId,
+            p_order_id: orderId,
+            p_work_generation: workGeneration,
+          },
+          ACCOUNTING_CALL_TIMEOUT_MS,
+        ),
+      );
+    },
+    async recordAccountingRecomputeTimeout(attemptId, orderId, workGeneration) {
+      return parseFailureReport(
+        await rpc(
+          'record_accounting_recompute_timeout',
           {
             p_attempt_id: attemptId,
             p_order_id: orderId,

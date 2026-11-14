@@ -7,6 +7,7 @@ import { ActivationPage } from '@/pages/ActivationPage';
 
 vi.mock('@/accounting/api', () => ({
   loadOpeningReview: vi.fn(),
+  activateInventory: vi.fn(),
 }));
 
 const review: OpeningReview = {

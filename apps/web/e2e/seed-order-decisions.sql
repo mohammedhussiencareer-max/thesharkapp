@@ -1,7 +1,16 @@
 -- Local e2e fixture for the order decision screen. Synthetic ids and names
--- only. Run by seed-order-decisions.ts as the local postgres role. The
--- activation row can only be written by that role, so this is the only way to
--- switch deductions on in a local database. Running it again does nothing.
+-- only. Run by seed-order-decisions.ts as the local postgres role. This
+-- prepares the two items, their mappings, and one positive opening. The owner
+-- records activation from the screen. Running it again does nothing.
+-- The migration leaves accounting_scaling_ready false. This local fixture
+-- replaces it so the owner click can store the activation row.
+create or replace function app.accounting_scaling_ready () returns boolean language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    true;
+$$;
+
 do $seed$
 declare
   v_owner uuid;
@@ -12,7 +21,9 @@ declare
     'e2e0d000-0000-4000-8000-000000000002'
   ]::uuid[];
 begin
-  if exists (select 1 from app.inventory_activation) then
+  if exists (
+    select 1 from app.stock_items where id = v_item[1]
+  ) then
     return;
   end if;
 
@@ -42,7 +53,24 @@ begin
     effective_from, created_change_id, item_id, loss_pct
   ) select '2000-01-01 00:00:00+00', v_change, i, 0 from unnest(v_item) as i;
 
-  -- Item a costs 50 and item b costs 20, bought before the stock start.
+  -- Openings before any purchase. The click uses these as the positive roster.
+  perform app.record_opening_stock(
+    now() - interval '32 days',
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id', v_item[1], 'quantity', '100', 'unit', 'kg',
+        'unit_cost', '50', 'expected_base_unit', 'kg', 'expected_factor', '1'
+      ),
+      jsonb_build_object(
+        'item_id', v_item[2], 'quantity', '100', 'unit', 'kg',
+        'unit_cost', '20', 'expected_base_unit', 'kg', 'expected_factor', '1'
+      )
+    ),
+    'e2e0d000-0000-4000-8000-0000000000e2'
+  );
+
+  -- Item a costs 50 and item b costs 20. Purchases stay on the public poster
+  -- and remain before the owner records activation.
   perform app.post_movements(jsonb_build_array(
     jsonb_build_object(
       'item_id', v_item[1], 'movement_type', 'purchase',
@@ -84,13 +112,6 @@ begin
     md5('ot|e2e-od-hall')::uuid, 'e2e-od-hall', '2020-01-01T00:00:00Z', null,
     '{"none": true}'::jsonb,
     (app.packaging_order_type_schedule('e2e-od-hall') ->> 'token'), 'e2e fixture'
-  );
-
-  insert into app.inventory_activation (
-    stock_started_at, approved_by, request_id, opening_manifest_hash
-  ) values (
-    now() - interval '30 days', v_owner,
-    'e2e0d000-0000-4000-8000-0000000000e1', repeat('e', 32)
   );
 end;
 $seed$;

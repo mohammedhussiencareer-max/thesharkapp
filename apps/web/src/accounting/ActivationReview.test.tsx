@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
-import { activationAction } from '@/accounting/activation-action';
+import { describe, expect, it, vi } from 'vitest';
+import { showActivationButton } from '@/accounting/activation-action';
 import { ActivationReview } from '@/accounting/ActivationReview';
 import type { OpeningReview } from '@/accounting/types';
 
@@ -66,11 +66,63 @@ describe('ActivationReview', () => {
     expect(screen.queryByRole('button', { name: 'تفعيل الخصم' })).toBeNull();
   });
 
-  it('shows readiness without an enable button', () => {
+  it('shows readiness without an enable button when the roster is empty', () => {
     const ready = review({ canActivate: true, roster: [] });
-    render(<ActivationReview review={ready} />);
+    render(<ActivationReview review={ready} showActivate={false} />);
     expect(screen.getByText('الرصيد جاهز للتفعيل')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'تفعيل الخصم' })).toBeNull();
-    expect(activationAction(ready)).toBeNull();
+    expect(showActivationButton(ready)).toBe(false);
+  });
+
+  it('shows a stored explicit zero and enables activation once it is checked', () => {
+    const onActivate = vi.fn();
+    const stored = review({
+      roster: [
+        {
+          itemId: itemA,
+          name: 'سمك',
+          baseUnit: 'kg',
+          active: true,
+          missing: false,
+          openingLineCount: '0',
+          observation: {
+            openingId: null,
+            lineNo: null,
+            quantity: '0',
+            unit: 'كجم',
+            unitCost: '0',
+            occurredAt: '2026-03-01T08:00:00.000Z',
+            explicitZero: true,
+          },
+        },
+        review().roster[1]!,
+      ],
+    });
+    const { rerender } = render(
+      <ActivationReview
+        review={stored}
+        showActivate
+        activateDisabled
+        onToggleZero={() => undefined}
+        onActivate={onActivate}
+      />,
+    );
+    expect(screen.getByText('رصيد صفر مسجّل')).toBeInTheDocument();
+    expect(
+      screen.getByText('مفيش رصد — الصفر لازم يتسجل صراحة'),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'تفعيل الخصم' })).toBeDisabled();
+    rerender(
+      <ActivationReview
+        review={stored}
+        showActivate
+        checkedZeroIds={new Set([itemB])}
+        activateDisabled={false}
+        onToggleZero={() => undefined}
+        onActivate={onActivate}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'تفعيل الخصم' })).toBeEnabled();
+    expect(showActivationButton(stored)).toBe(true);
   });
 });
