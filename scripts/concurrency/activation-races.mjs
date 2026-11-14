@@ -329,6 +329,107 @@ select
   }
 }
 
+async function queueDeductible(orderId, at) {
+  await execOk(`
+begin;
+${claims()}
+insert into app.pos_orders (
+  id, shift_id, status, order_type, ordered_at, subtotal, discount, tax,
+  service_tax, delivery_fee, total, pos_update_time, content_hash, missing_from_pos
+) values (
+  '${orderId}', 'race-w-shift', 'complete', 'hall-race', '${at}',
+  0, 0, 0, 0, 0, 0, '${at}', rpad(md5('${orderId}'), 64, 'a'), false
+);
+insert into app.pos_order_lines (
+  order_id, line_id, item_id, item_name, quantity, options, line_total
+) values (
+  '${orderId}', 'l1', 'race-pos', 'x', 1, '[]'::jsonb, 0
+);
+select app.append_pos_cost_input('${orderId}', null, 'sync');
+commit;
+`);
+  const queued = await head();
+  if (queued.orderId !== orderId || !queued.generation) {
+    throw new Error(
+      `expected ${orderId} at the head, got ${queued.orderId}|${queued.generation}`,
+    );
+  }
+  return queued;
+}
+
+async function countedTarget() {
+  const text = (
+    await execOk(`
+select trim_scale(on_hand_qty - 2)::text
+from app.item_balances
+where item_id = '${itemA}';
+`)
+  ).trim();
+  if (!text || text.startsWith('-')) {
+    throw new Error(`counted target is not usable: ${text}`);
+  }
+  return text;
+}
+
+function workerSkipped(result) {
+  const out = result?.out ?? '';
+  return (
+    !result?.ok ||
+    out.includes('"status": "busy"') ||
+    out.includes('"status": "sync_running"')
+  );
+}
+
+async function retryDeduction(result, orderId, generation) {
+  const out = result?.out ?? '';
+  if (out.includes('"status": "stale"')) {
+    throw new Error(`worker missed ${orderId}: ${out.slice(0, 400)}`);
+  }
+  if (!workerSkipped(result)) return;
+  const again = await execOk(workerSql(orderId, generation, false));
+  if (!again.includes('"status": "processed"')) {
+    throw new Error(
+      `worker retry did not deduct ${orderId}: ${again.slice(0, 400)}`,
+    );
+  }
+}
+
+async function assertCountRace(tag, orderId, requestId, counted) {
+  await checkLedger(tag, orderId, true, true);
+  const facts = (
+    await execOk(`
+select
+  (select trim_scale(coalesce(sum(sm.quantity), 0))::text
+    from app.stock_movements sm
+    join app.order_cost_movement_links l on l.movement_id = sm.id
+    where l.order_id = '${orderId}' and sm.movement_type = 'sale')
+  || '|' ||
+  (select count(*)::text from app.stock_count_postings p
+    join app.stock_counts c on c.id = p.count_id
+    where c.request_id = '${requestId}'::uuid)
+  || '|' ||
+  (select (on_hand_qty = '${counted}'::numeric)::text
+    from app.item_balances where item_id = '${itemA}')
+  || '|' ||
+  (select trim_scale(on_hand_qty)::text
+    from app.item_balances where item_id = '${itemA}');
+`)
+  ).trim();
+  const [sold, postings, matches, onHand] = facts.split('|');
+  process.stdout.write(
+    `\n${tag} sale_qty=${sold} count_postings=${postings} on_hand=${onHand} expected=${counted}\n`,
+  );
+  if (sold !== '-1') {
+    throw new Error(`${tag}: ${orderId} sale quantity ${sold}`);
+  }
+  if (postings === '0') {
+    throw new Error(`${tag}: count ${requestId} has no posting receipt`);
+  }
+  if (matches !== 'true') {
+    throw new Error(`${tag}: on_hand ${onHand} != counted ${counted}`);
+  }
+}
+
 async function main() {
   container = await containerName();
   await execOk(`
@@ -800,10 +901,11 @@ commit;
   }
   await checkLedger('ingest holds, worker waits', secondHead.orderId);
 
+  const countedFirst = await countedTarget();
   await execOk(`
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000023', '16', '2026-08-11T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000023', countedFirst, '2026-08-11T10:00:00Z')});
 commit;
 `);
   await execOk(`
@@ -829,13 +931,14 @@ select app.ingest_pos_batch(
 select app.finish_pos_sync_run(:run_id, 'ok', '{}'::jsonb, '');
 commit;
 `);
+  const countOrder = await queueDeductible('race-c1', '2026-08-10 09:30:00+00');
   const workerHoldsCount = await race(
-    workerSql(null, null, true),
+    workerSql(countOrder.orderId, countOrder.generation, true),
     `
 \\set VERBOSITY verbose
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000023', '16', '2026-08-11T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000023', countedFirst, '2026-08-11T10:00:00Z')});
 commit;
 `,
   );
@@ -843,16 +946,22 @@ commit;
     'worker holds, record_count posting waits',
     workerHoldsCount.holder,
     workerHoldsCount.waiter,
-    'the posting count waits for the worker lock, then posts',
-    ['"status": "processed"', '"status": "empty"'],
+    'the worker deducts the bound order, then the count posts',
+    '"status": "processed"',
     '"status": "posted"',
   );
-  await checkLedger('worker holds, record_count posting waits');
+  await assertCountRace(
+    'worker holds, record_count posting waits',
+    countOrder.orderId,
+    'c9e00000-0000-4000-8000-000000000023',
+    countedFirst,
+  );
 
+  const countedSecond = await countedTarget();
   await execOk(`
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000024', '15', '2026-08-12T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000024', countedSecond, '2026-08-12T10:00:00Z')});
 commit;
 `);
   await execOk(`
@@ -878,27 +987,41 @@ select app.ingest_pos_batch(
 select app.finish_pos_sync_run(:run_id, 'ok', '{}'::jsonb, '');
 commit;
 `);
+  const reverseOrder = await queueDeductible(
+    'race-c2',
+    '2026-08-10 09:15:00+00',
+  );
   const countHoldsWorker = await race(
     `
 \\set VERBOSITY verbose
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000024', '15', '2026-08-12T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000024', countedSecond, '2026-08-12T10:00:00Z')});
 select pg_sleep(${holdMs});
 commit;
 `,
-    workerSql(null, null, false),
+    workerSql(reverseOrder.orderId, reverseOrder.generation, false),
   );
   add(
     'record_count posting holds, worker waits',
     countHoldsWorker.holder,
     countHoldsWorker.waiter,
-    'the worker returns busy while the count holds the ledger lock',
+    'the bound worker returns busy while the count holds the ledger lock',
     '"status": "posted"',
     ['"status": "busy"', '"status": "sync_running"'],
     false,
   );
-  await checkLedger('record_count posting holds, worker waits');
+  await retryDeduction(
+    countHoldsWorker.waiter,
+    reverseOrder.orderId,
+    reverseOrder.generation,
+  );
+  await assertCountRace(
+    'record_count posting holds, worker waits',
+    reverseOrder.orderId,
+    'c9e00000-0000-4000-8000-000000000024',
+    countedSecond,
+  );
 
   const lossHoldsWorker = await race(
     lossSql(
