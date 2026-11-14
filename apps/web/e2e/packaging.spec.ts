@@ -1,7 +1,11 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { type Page } from '@playwright/test';
+import { type Page, type Request, type Response } from '@playwright/test';
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from '../src/lib/database.types';
+import {
+  cairoDateStartIso,
+  cairoNextDateStartIso,
+} from '../src/purchases/time';
 import { localServiceRoleKey, ownerEmail, ownerPassword } from './.test-owner';
 import { expect, test } from './fixtures';
 import { assertLocalSupabaseUrl, developmentPublicEnv } from './local-guard';
@@ -182,57 +186,126 @@ function unreviewedCount(text: string | null): number {
   return Number(match[1]);
 }
 
+function previousIsoDate(day: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!match) throw new Error(`coverage day is ${day}`);
+  const yearText = match[1];
+  const monthText = match[2];
+  const dateText = match[3];
+  if (
+    yearText === undefined ||
+    monthText === undefined ||
+    dateText === undefined
+  ) {
+    throw new Error(`coverage day is ${day}`);
+  }
+  const utc = new Date(
+    Date.UTC(Number(yearText), Number(monthText) - 1, Number(dateText) - 1),
+  );
+  const year = utc.getUTCFullYear();
+  const month = String(utc.getUTCMonth() + 1).padStart(2, '0');
+  const date = String(utc.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${date}`;
+}
+
+/**
+ * One Cairo day is the start of that day through the start of the next day.
+ * Both bounds have to be present and equal that day.
+ */
+function coverageResponseIsDay(
+  response: Response,
+  fromIso: string,
+  toIso: string,
+): boolean {
+  if (!response.url().includes('pos_mapping_coverage') || !response.ok()) {
+    return false;
+  }
+  try {
+    const body = JSON.parse(response.request().postData() ?? '') as {
+      p_from?: unknown;
+      p_to?: unknown;
+    };
+    return body.p_from === fromIso && body.p_to === toIso;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Show one Cairo day. The end date moves first, then the start, and the
  * summary has to match the coverage response for that day before we read it.
+ *
+ * The listener is registered before either date moves onto the day. Inputs
+ * that already show the day do not fire a change, and the request from mount
+ * has already left, so the start steps to the previous day first.
  */
 async function showDay(page: Page, day: string): Promise<void> {
   const to = page.getByLabel('إلى تاريخ');
   const from = page.getByLabel('من تاريخ');
-  // A re-render during fill can drop the end date and leave start after end,
-  // which never requests coverage. Confirm the end date before moving the start.
-  await expect(async () => {
-    if ((await to.inputValue()) !== day) await to.fill(day);
-    await expect(to).toHaveValue(day);
-  }).toPass({ timeout: 20_000 });
-  const loaded = page.waitForResponse(
-    (response) => {
-      if (!response.url().includes('pos_mapping_coverage') || !response.ok()) {
-        return false;
-      }
-      try {
-        const body = JSON.parse(response.request().postData() ?? '') as {
-          p_from?: string;
-        };
-        return (
-          typeof body.p_from === 'string' && body.p_from.startsWith('2030-')
-        );
-      } catch {
-        return false;
-      }
-    },
-    { timeout: 20_000 },
-  );
-  await expect(async () => {
-    if ((await from.inputValue()) !== day) await from.fill(day);
-    await expect(from).toHaveValue(day);
-  }).toPass({ timeout: 20_000 });
-  const response = await loaded;
-  const payload = (await response.json()) as {
-    orders?: { ready?: number; eligible?: number; coverage?: number | null };
+  const fromIso = cairoDateStartIso(day);
+  const toIso = cairoNextDateStartIso(day);
+  if (!fromIso || !toIso) throw new Error(`coverage day is ${day}`);
+
+  const showedDay =
+    (await from.inputValue()) === day && (await to.inputValue()) === day;
+  const eligible = new WeakSet<Request>();
+  let armed = false;
+  const watch = (request: Request) => {
+    if (armed && request.url().includes('pos_mapping_coverage')) {
+      eligible.add(request);
+    }
   };
-  const orders = payload.orders;
-  const summary =
-    orders === undefined ||
-    orders.eligible === 0 ||
-    orders.coverage === null ||
-    orders.ready === undefined ||
-    orders.eligible === undefined
-      ? 'تغطية الطلبات —'
-      : `تغطية الطلبات ${orders.ready} من ${orders.eligible}`;
-  await expect(page.getByText(summary, { exact: true })).toBeVisible({
-    timeout: 20_000,
-  });
+  page.on('request', watch);
+  try {
+    if (showedDay) {
+      const previous = previousIsoDate(day);
+      await expect(async () => {
+        if ((await to.inputValue()) !== day) await to.fill(day);
+        if ((await from.inputValue()) !== previous) await from.fill(previous);
+        await expect(to).toHaveValue(day);
+        await expect(from).toHaveValue(previous);
+      }).toPass({ timeout: 20_000 });
+    }
+
+    // Mount, and the step off a day the inputs already show, are not the
+    // request we wait for. Only a coverage call issued after this can match.
+    armed = true;
+    const loaded = page.waitForResponse(
+      (response) =>
+        eligible.has(response.request()) &&
+        coverageResponseIsDay(response, fromIso, toIso),
+      { timeout: 20_000 },
+    );
+    void loaded.catch(() => undefined);
+
+    // A re-render during fill can drop the end date and leave start after end,
+    // which never requests coverage. Confirm the end date before moving the start.
+    await expect(async () => {
+      if ((await to.inputValue()) !== day) await to.fill(day);
+      await expect(to).toHaveValue(day);
+      if ((await from.inputValue()) !== day) await from.fill(day);
+      await expect(from).toHaveValue(day);
+      await expect(to).toHaveValue(day);
+    }).toPass({ timeout: 20_000 });
+    const response = await loaded;
+    const payload = (await response.json()) as {
+      orders?: { ready?: number; eligible?: number; coverage?: number | null };
+    };
+    const orders = payload.orders;
+    const summary =
+      orders === undefined ||
+      orders.eligible === 0 ||
+      orders.coverage === null ||
+      orders.ready === undefined ||
+      orders.eligible === undefined
+        ? 'تغطية الطلبات —'
+        : `تغطية الطلبات ${orders.ready} من ${orders.eligible}`;
+    await expect(page.getByText(summary, { exact: true })).toBeVisible({
+      timeout: 20_000,
+    });
+  } finally {
+    page.off('request', watch);
+  }
 }
 
 test('owner approves packaging and order coverage counts the order', async ({
