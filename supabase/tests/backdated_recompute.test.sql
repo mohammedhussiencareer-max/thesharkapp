@@ -3329,8 +3329,8 @@ select
         n.nspname = 'ledger_scratch'
         and c.relkind = 'r'
     ),
-    10::bigint,
-    'ledger_scratch has the ten replay tables'
+    11::bigint,
+    'ledger_scratch has the eleven replay tables'
   );
 
 select

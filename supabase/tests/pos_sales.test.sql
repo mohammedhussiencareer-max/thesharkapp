@@ -424,8 +424,8 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-bad-status', 'shift-test-x', 'nope', now(),
-        1, 0, 0, 0, 0, 1, now(), repeat('ab', 32)
+        'order-test-bad-status', 'shift-test-x', 'nope', app.test_clock_pin(),
+        1, 0, 0, 0, 0, 1, app.test_clock_pin(), repeat('ab', 32)
       )$$,
     '23514'::char(5),
     null::text,
@@ -439,8 +439,8 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-nan', 'shift-test-x', 'complete', now(),
-        1, 0, 0, 0, 0, 'NaN', now(), repeat('ab', 32)
+        'order-test-nan', 'shift-test-x', 'complete', app.test_clock_pin(),
+        1, 0, 0, 0, 0, 'NaN', app.test_clock_pin(), repeat('ab', 32)
       )$$,
     '23514'::char(5),
     null::text,
@@ -454,8 +454,8 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-bad-hash', 'shift-test-x', 'complete', now(),
-        1, 0, 0, 0, 0, 1, now(), 'not-a-hash'
+        'order-test-bad-hash', 'shift-test-x', 'complete', app.test_clock_pin(),
+        1, 0, 0, 0, 0, 1, app.test_clock_pin(), 'not-a-hash'
       )$$,
     '23514'::char(5),
     null::text,
@@ -498,14 +498,14 @@ values
     'order-test-constraint',
     'shift-test-x',
     'complete',
-    now(),
+    app.test_clock_pin (),
     1,
     0,
     0,
     0,
     0,
     1,
-    now(),
+    app.test_clock_pin (),
     repeat('ab', 32)
   );
 
@@ -624,8 +624,8 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-anon', 'shift-test-x', 'complete', now(),
-        1, 0, 0, 0, 0, 1, now(), repeat('ab', 32)
+        'order-test-anon', 'shift-test-x', 'complete', app.test_clock_pin(),
+        1, 0, 0, 0, 0, 1, app.test_clock_pin(), repeat('ab', 32)
       )$$,
     '42501'::char(5),
     null::text,
@@ -664,8 +664,8 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-owner-direct', 'shift-test-x', 'complete', now(),
-        1, 0, 0, 0, 0, 1, now(), repeat('ab', 32)
+        'order-test-owner-direct', 'shift-test-x', 'complete', app.test_clock_pin(),
+        1, 0, 0, 0, 0, 1, app.test_clock_pin(), repeat('ab', 32)
       )$$,
     '42501'::char(5),
     null::text,
@@ -691,7 +691,7 @@ select
 select
   throws_ok (
     $$insert into app.pos_shifts (id, opened_at, is_active, pos_update_time)
-      values ('shift-test-direct', now(), true, now())$$,
+      values ('shift-test-direct', app.test_clock_pin(), true, app.test_clock_pin())$$,
     '42501'::char(5),
     null::text,
     'owner cannot insert pos_shifts directly'
@@ -2689,7 +2689,7 @@ select
 select
   throws_ok (
     $$insert into app.pos_shifts (id, opened_at, is_active, pos_update_time)
-      values ('shift-test-intruder', now(), true, now())$$,
+      values ('shift-test-intruder', app.test_clock_pin(), true, app.test_clock_pin())$$,
     '42501'::char(5),
     null::text,
     'non-owner cannot insert pos_shifts'
@@ -2735,8 +2735,8 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-service-direct', 'shift-test-x', 'complete', now(),
-        1, 0, 0, 0, 0, 1, now(), repeat('ab', 32)
+        'order-test-service-direct', 'shift-test-x', 'complete', app.test_clock_pin(),
+        1, 0, 0, 0, 0, 1, app.test_clock_pin(), repeat('ab', 32)
       )$$,
     '42501'::char(5),
     null::text,

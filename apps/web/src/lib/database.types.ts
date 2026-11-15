@@ -1585,14 +1585,14 @@ isOneToOne: false
                   ]
                 },"replay_read_probe": {
                   Row: {
-                    "captured_at": string,"deficit_index": boolean,"deficit_plan": string,"deficit_rows": number,"id": number,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"replay_ms": number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
+                    "captured_at": string,"deficit_buffers": number,"deficit_index": boolean,"deficit_plan": string,"deficit_rows": number,"id": number,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"prefix_rows": number,"replay_ms": number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
                   }
                   ComputedFields: never
                   Insert: {
-                    "captured_at"?: string,"deficit_index": boolean,"deficit_plan": string,"deficit_rows": number,"id"?: never,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"replay_ms"?: number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
+                    "captured_at"?: string,"deficit_buffers"?: number,"deficit_index": boolean,"deficit_plan": string,"deficit_rows": number,"id"?: never,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"prefix_rows"?: number,"replay_ms"?: number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
                   }
                   Update: {
-                    "captured_at"?: string,"deficit_index"?: boolean,"deficit_plan"?: string,"deficit_rows"?: number,"id"?: never,"id_arm_index"?: boolean,"id_arm_plan"?: string,"id_arm_rows"?: number,"replay_ms"?: number,"time_arm_index"?: boolean,"time_arm_plan"?: string,"time_arm_rows"?: number
+                    "captured_at"?: string,"deficit_buffers"?: number,"deficit_index"?: boolean,"deficit_plan"?: string,"deficit_rows"?: number,"id"?: never,"id_arm_index"?: boolean,"id_arm_plan"?: string,"id_arm_rows"?: number,"prefix_rows"?: number,"replay_ms"?: number,"time_arm_index"?: boolean,"time_arm_plan"?: string,"time_arm_rows"?: number
                   }
                   Relationships: [
                     
@@ -2651,6 +2651,9 @@ isOneToOne: true
 "note_period_revision":
 { Args: { "p_amount": number,"p_bucket": string,"p_cause": string,"p_item_id": string,"p_shift_id": string,"p_source_id": number }; Returns: undefined
                            },
+"note_recognized_cover":
+{ Args: { "p_consumption_delta": number,"p_movement_id": number }; Returns: undefined
+                           },
 "note_refund_sales_revision":
 { Args: { "p_revision_id": number }; Returns: undefined
                            },
@@ -2880,7 +2883,7 @@ isOneToOne: true
 { Args: { "p_movements": Json }; Returns: string
                            },
 "post_recognized_delta":
-{ Args: { "p_bucket": string,"p_cause": string,"p_economic": string,"p_item_id": string,"p_piece": number,"p_reason": string,"p_report": string,"p_required_qty": number,"p_required_value": number,"p_return_movement": number,"p_shift": string,"p_source_id": string,"p_source_kind": string,"p_span_id": number,"p_waste_chain": string }; Returns: number
+{ Args: { "p_bucket": string,"p_cause": string,"p_economic": string,"p_item_id": string,"p_piece": number,"p_reason": string,"p_report": string,"p_required_qty": number,"p_required_value": number,"p_return_movement": number,"p_source_id": string,"p_source_kind": string,"p_span_id": number,"p_waste_chain": string }; Returns: number
                            },
 "post_sort":
 { Args: { "p_mixed_item": string,"p_occurred_at": string,"p_qty_taken": number,"p_shift_id"?: string,"p_sizes": Json }; Returns: string
@@ -3018,6 +3021,9 @@ isOneToOne: true
                            },
 "replay_outflow":
 { Args: { "p_forced_total": number,"p_is_pending": boolean,"p_item_id": string,"p_line_key": number,"p_movement_id": number,"p_note": string,"p_occurred_at": string,"p_out_qty": number,"p_shift_id": string,"p_source_id": string,"p_source_type": string,"p_type": Database["app"]['Enums']["movement_type"] }; Returns: undefined
+                           },
+"replay_plan_shared_buffers":
+{ Args: { "p_plan": string }; Returns: number
                            },
 "replay_plan_uses_deficit_index":
 { Args: { "p_plan": string }; Returns: boolean

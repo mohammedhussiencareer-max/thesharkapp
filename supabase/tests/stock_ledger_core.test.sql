@@ -2257,7 +2257,7 @@ select
 -- 75
 select
   throws_ok (
-    $$select app.post_sort('10000000-0000-4000-8000-000000000005', now(), 1, '[]'::jsonb, null)$$,
+    $$select app.post_sort('10000000-0000-4000-8000-000000000005', app.test_clock_pin(), 1, '[]'::jsonb, null)$$,
     '42501'::char(5),
     null::text,
     'Auth: anon cannot execute app.post_sort'

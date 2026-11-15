@@ -203,7 +203,7 @@ select
   throws_ok (
     $$insert into app.pos_shift_transactions (
         shift_id, tx_id, tx_type, amount, occurred_at
-      ) values ('shift-x', 'tx-x', 3, 1, now())$$,
+      ) values ('shift-x', 'tx-x', 3, 1, app.test_clock_pin())$$,
     '42501'::char(5),
     null::text,
     'non-owner cannot insert pos_shift_transactions'
@@ -230,7 +230,7 @@ select
   throws_ok (
     $$insert into app.pos_shift_transactions (
         shift_id, tx_id, tx_type, amount, occurred_at
-      ) values ('shift-x', 'tx-x', 3, 1, now())$$,
+      ) values ('shift-x', 'tx-x', 3, 1, app.test_clock_pin())$$,
     '42501'::char(5),
     null::text,
     'owner cannot insert pos_shift_transactions directly'
@@ -252,7 +252,7 @@ select
   throws_ok (
     $$insert into app.pos_shift_transactions (
         shift_id, tx_id, tx_type, amount, occurred_at
-      ) values ('shift-x', 'tx-x', 3, 1, now())$$,
+      ) values ('shift-x', 'tx-x', 3, 1, app.test_clock_pin())$$,
     '42501'::char(5),
     null::text,
     'service_role cannot insert pos_shift_transactions directly'

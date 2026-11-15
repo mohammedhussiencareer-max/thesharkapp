@@ -909,7 +909,7 @@ select
     pg_temp.state_of (
       $$insert into app.inventory_activation (
           id, stock_started_at, request_id, opening_manifest_hash
-        ) values (2, now(), 'a5400000-0000-4000-8000-0000000000e2', repeat('a', 32))$$
+        ) values (2, app.test_clock_pin(), 'a5400000-0000-4000-8000-0000000000e2', repeat('a', 32))$$
     ),
     '23514',
     'only the singleton id is allowed'
@@ -920,7 +920,7 @@ select
     pg_temp.state_of (
       $$insert into app.inventory_activation (
           stock_started_at, request_id, opening_manifest_hash
-        ) values (now(), 'a5400000-0000-4000-8000-0000000000e2', repeat('a', 32))$$
+        ) values (app.test_clock_pin(), 'a5400000-0000-4000-8000-0000000000e2', repeat('a', 32))$$
     ),
     '23505',
     'a second activation row is refused'
@@ -929,7 +929,7 @@ select
 select
   is (
     pg_temp.state_of (
-      $$update app.inventory_activation set stock_started_at = now()$$
+      $$update app.inventory_activation set stock_started_at = app.test_clock_pin()$$
     ),
     '55000',
     'the activation row cannot be updated'
@@ -4387,7 +4387,7 @@ select
 select
   is (
     pg_temp.state_of (
-      $$update app.accounting_work_events set processed_at = now() where processed_at is not null$$
+      $$update app.accounting_work_events set processed_at = app.test_clock_pin() where processed_at is not null$$
     ),
     '55000',
     'a processed event keeps its processed time'
@@ -4917,7 +4917,7 @@ select
 select
   throws_ok (
     $$insert into app.inventory_activation (stock_started_at, request_id, opening_manifest_hash)
-      values (now(), gen_random_uuid(), repeat('a', 32))$$,
+      values (app.test_clock_pin(), gen_random_uuid(), repeat('a', 32))$$,
     '42501',
     null::text,
     'no API role can write the activation row'

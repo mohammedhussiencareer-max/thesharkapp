@@ -2957,29 +2957,32 @@ select
   is (
     (
       select
-        count(distinct movement.closed_cause_id)
+        count(*)
       from
-        app.stock_movements movement
-        join app.closed_period_sources source on source.movement_id = movement.id
+        app.closed_period_sources source
       where
         source.source_id in ('c54-old-a', 'c54-old-b')
     ),
-    1::bigint,
-    'orders before the window accumulate into one closed cause'
+    0::bigint,
+    'a span does not close an unposted frozen activation input'
   );
 
 select
   is (
     (
       select
-        count(distinct source.source_id)
+        count(*)
       from
-        app.closed_period_sources source
+        app.order_cost_movement_links link
+        join app.stock_movements movement on movement.id = link.movement_id
+        join app.pos_orders orders on orders.id = link.order_id
       where
-        source.source_id in ('c54-old-a', 'c54-old-b')
+        link.order_id in ('c54-old-a', 'c54-old-b')
+        and movement.movement_type = 'sale'
+        and movement.occurred_at = orders.ordered_at
     ),
     2::bigint,
-    'both pre-window orders are in that one cause'
+    'a span posts an unposted frozen input at its original instant'
   );
 
 select
@@ -3009,6 +3012,163 @@ select
     ),
     1::bigint,
     'the in-window order is expanded on its own'
+  );
+
+-- Orders created after activation are not frozen. A span over two of them
+-- that are already outside the window still shares one closed cause.
+insert into
+  app.pos_orders (
+    id,
+    shift_id,
+    status,
+    order_type,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    missing_from_pos
+  )
+values
+  (
+    'c54-aged-a',
+    'c54-shift',
+    'complete',
+    'hall',
+    '2026-09-03T10:00:00Z',
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    '2026-09-03T10:00:00Z',
+    rpad(md5('c54-aged-a'), 64, 'a'),
+    false
+  ),
+  (
+    'c54-aged-b',
+    'c54-shift',
+    'complete',
+    'hall',
+    '2026-09-04T10:00:00Z',
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    '2026-09-04T10:00:00Z',
+    rpad(md5('c54-aged-b'), 64, 'a'),
+    false
+  );
+
+insert into
+  app.pos_order_lines (
+    order_id,
+    line_id,
+    item_id,
+    item_name,
+    quantity,
+    options,
+    line_total
+  )
+values
+  (
+    'c54-aged-a',
+    'l1',
+    'c54-pos',
+    'x',
+    1,
+    '[]'::jsonb,
+    0
+  ),
+  (
+    'c54-aged-b',
+    'l1',
+    'c54-pos',
+    'x',
+    1,
+    '[]'::jsonb,
+    0
+  );
+
+select
+  app.append_pos_cost_input ('c54-aged-a', null, 'sync');
+
+select
+  app.append_pos_cost_input ('c54-aged-b', null, 'sync');
+
+insert into
+  app.costing_changes (request_id, kind, payload, result)
+values
+  (
+    'c5400000-0000-4000-8000-0000000000c1',
+    'owner',
+    '{}'::jsonb,
+    '{}'::jsonb
+  );
+
+insert into
+  app.accounting_rederive_spans (
+    family,
+    version_id,
+    cause,
+    change_id,
+    effective_from,
+    effective_to
+  )
+select
+  'pos_map',
+  'c5400000-0000-4000-8000-000000000332',
+  'insert',
+  change.id,
+  '2026-09-03T00:00:00Z',
+  '2026-09-05T00:00:00Z'
+from
+  app.costing_changes change
+where
+  change.request_id = 'c5400000-0000-4000-8000-0000000000c1';
+
+select
+  app.run_accounting_work (
+    'c5400000-0000-4000-8000-0000000000f2',
+    1,
+    null,
+    null
+  );
+
+select
+  is (
+    (
+      select
+        count(distinct movement.closed_cause_id)
+      from
+        app.stock_movements movement
+        join app.closed_period_sources source on source.movement_id = movement.id
+      where
+        source.source_id in ('c54-aged-a', 'c54-aged-b')
+    ),
+    1::bigint,
+    'orders before the window accumulate into one closed cause'
+  );
+
+select
+  is (
+    (
+      select
+        count(distinct source.source_id)
+      from
+        app.closed_period_sources source
+      where
+        source.source_id in ('c54-aged-a', 'c54-aged-b')
+    ),
+    2::bigint,
+    'both pre-window orders are in that one cause'
   );
 
 select

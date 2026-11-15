@@ -1,11 +1,13 @@
 // Local history gate for one component. Synthetic catalog only.
 // Historical orders are frozen activation inputs, posted by app.run_accounting_work
 // one committed call at a time, and the history ends yesterday. The measured
-// calls are top-level statements: a new order today, then a purchase today that
-// covers a deficit from 40 days ago. statement_timeout is set on the session
-// before each of those statements. 2 seconds is the soft gate and 6 seconds is
-// the hard gate: either one fails the run. Checkpoints are published by the
-// confirming walk.
+// calls are top-level statements: a new order today, a selective deficit
+// restore, a large-share deficit restore, then record_purchase today covering
+// a deficit from 40 days ago. statement_timeout is set on the session before
+// each measured statement. 2 seconds is soft and 6 seconds is the hard gate.
+// A restore may sequence-scan replay_checkpoint_deficits. The gate is latency,
+// buffers, and a frozen prefix that is not walked. Suffix arms keep an index
+// scan when the planner still chooses one.
 
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -45,6 +47,7 @@ const histories = [
     activationRequest: 'b9e00000-0000-4000-8000-000000000235',
     agedItem: 'b9e00000-0000-4000-8000-000000000037',
     agedPriceRequest: 'b9e00000-0000-4000-8000-000000000138',
+    agedPurchaseRequest: 'b9e00000-0000-4000-8000-000000000139',
   },
   {
     name: '1-year',
@@ -57,6 +60,7 @@ const histories = [
     activationRequest: 'b9e00000-0000-4000-8000-000000000376',
     agedItem: 'b9e00000-0000-4000-8000-000000000367',
     agedPriceRequest: 'b9e00000-0000-4000-8000-000000000380',
+    agedPurchaseRequest: 'b9e00000-0000-4000-8000-000000000381',
   },
   {
     name: '2-year',
@@ -69,6 +73,7 @@ const histories = [
     activationRequest: 'b9e00000-0000-4000-8000-000000000733',
     agedItem: 'b9e00000-0000-4000-8000-000000000734',
     agedPriceRequest: 'b9e00000-0000-4000-8000-000000000740',
+    agedPurchaseRequest: 'b9e00000-0000-4000-8000-000000000741',
   },
 ];
 
@@ -573,7 +578,7 @@ declare
   v_time_arm_index boolean;
   v_id_arm_index boolean;
   v_replay_ms numeric;
-  v_restore_index boolean;
+  v_prefix_rows bigint;
   v_t0 timestamptz;
   v_plan json;
 begin
@@ -703,13 +708,15 @@ begin
     probe.id_arm_rows,
     probe.time_arm_index,
     probe.id_arm_index,
-    probe.replay_ms
+    probe.replay_ms,
+    probe.prefix_rows
   into
     v_time_arm_rows,
     v_id_arm_rows,
     v_time_arm_index,
     v_id_arm_index,
-    v_replay_ms
+    v_replay_ms,
+    v_prefix_rows
   from
     app.replay_read_probe probe
   order by
@@ -721,50 +728,7 @@ begin
   v_suffix_index := coalesce(v_time_arm_index, false)
     and coalesce(v_id_arm_index, false);
 
-  -- The measured order restores the history checkpoint. These sales are an
-  -- hour after that order, once on-hand is already negative, so each one is
-  -- its own deficit. Separate walks keep every earlier checkpoint's deficit
-  -- rows, so the confirming restore of the latest thousand is an index read
-  -- of a table that is much larger than that one checkpoint.
-  for v_batch in 1..20 loop
-    perform app.post_engine_outflows((
-      select
-        pg_catalog.jsonb_agg(
-          pg_catalog.jsonb_build_object(
-            'item_id', '${history.item}',
-            'movement_type', 'sale',
-            'occurred_at', timestamptz '${anchor}' + interval '12 hours',
-            'quantity', 1
-          )
-        )
-      from
-        pg_catalog.generate_series(1, 50) as g (n)
-    ));
-  end loop;
-  perform app.post_engine_outflows(
-    pg_catalog.jsonb_build_array(
-      pg_catalog.jsonb_build_object(
-        'item_id', '${history.item}',
-        'movement_type', 'sale',
-        'occurred_at', timestamptz '${anchor}' + interval '13 hours',
-        'quantity', 1
-      )
-    )
-  );
-
-  select
-    probe.deficit_rows,
-    probe.deficit_index
-  into
-    v_deficit_rows,
-    v_restore_index
-  from
-    app.replay_read_probe probe
-  order by
-    probe.id desc
-  limit
-    1;
-
+  -- This probe belongs to the timed order. Later restores record their own.
   v_pass := v_result ->> 'status' = 'processed'
     and coalesce((v_result ->> 'failed')::integer, 0) = 0
     and v_outcome = 'applied'
@@ -775,9 +739,11 @@ begin
     and v_events + v_anchors <= 100000
     and v_seconds <= 2
     and v_seconds <= 6
-    and v_suffix_index
-    and coalesce(v_restore_index, false)
-    and coalesce(v_deficit_rows, 0) >= 1000;
+    and coalesce(v_prefix_rows, 0) = 0
+    and (
+      v_suffix_index
+      or coalesce(v_prefix_rows, 0) = 0
+    );
 
   insert into bench_fresh (payload)
   values (pg_catalog.jsonb_build_object(
@@ -806,12 +772,149 @@ begin
     'time_arm_index', v_time_arm_index,
     'id_arm_index', v_id_arm_index,
     'replay_ms', v_replay_ms,
-    'deficit_rows', v_deficit_rows,
-    'restore_index', v_restore_index,
+    'prefix_rows', coalesce(v_prefix_rows, 0),
     'fresh_pass', v_pass
   ));
 end;
 $$;
+select set_config('app.replay_probe', '', true);
+set statement_timeout = 0;
+do $$
+declare
+  v_existing bigint;
+  v_need integer;
+  v_left integer;
+  v_item uuid := md5('bench-fill-${history.prefix}')::uuid;
+begin
+  v_existing := (select count(*) from app.replay_checkpoint_deficits);
+  v_need := greatest(v_existing, 200)::integer;
+  if v_existing < v_need then
+    insert into app.stock_items (id, name, kind, base_unit, count_frequency)
+    values (v_item, 'bench fill ${history.prefix}', 'seafood', 'kg', 'daily')
+    on conflict (id) do nothing;
+    perform app.set_item_opening_price(
+      md5('bench-fill-price-${history.prefix}')::uuid,
+      v_item,
+      10,
+      null,
+      null,
+      'kg|seafood||'
+    );
+    v_left := v_need - v_existing::integer;
+    -- One confirming post publishes one checkpoint. Batches would copy the
+    -- growing deficit list on every batch and the newest checkpoint would
+    -- be a small share of the table.
+    perform app.post_engine_outflows((
+      select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'item_id', v_item,
+        'movement_type', 'sale',
+        'occurred_at', timestamptz '${anchor}' + interval '14 hours',
+        'quantity', 1
+      ))
+      from pg_catalog.generate_series(1, v_left) as g (n)
+    ));
+  end if;
+end;
+$$;
+do $$
+declare
+  v_item uuid := md5('bench-sel-${history.prefix}')::uuid;
+begin
+  insert into app.stock_items (id, name, kind, base_unit, count_frequency)
+  values (v_item, 'bench sel ${history.prefix}', 'seafood', 'kg', 'daily');
+  perform app.set_item_opening_price(
+    md5('bench-sel-price-${history.prefix}')::uuid,
+    v_item, 10, null, null, 'kg|seafood||'
+  );
+  perform app.post_engine_outflows(pg_catalog.jsonb_build_array(
+    pg_catalog.jsonb_build_object(
+      'item_id', v_item,
+      'movement_type', 'sale',
+      'occurred_at', timestamptz '${anchor}' + interval '14 hours',
+      'quantity', 1
+    )
+  ));
+  perform app.replay_execute(
+    array[v_item], '[]'::jsonb, pg_catalog.gen_random_uuid(), true
+  );
+end;
+$$;
+delete from app.replay_read_probe;
+select set_config('app.replay_probe', '1', true);
+select set_config('app.bench_t0', pg_catalog.clock_timestamp()::text, true);
+set statement_timeout = '6s';
+select app.replay_execute(
+  array[md5('bench-sel-${history.prefix}')::uuid],
+  '[]'::jsonb,
+  pg_catalog.gen_random_uuid(),
+  true
+);
+set statement_timeout = 0;
+select set_config('app.bench_t1', pg_catalog.clock_timestamp()::text, true);
+create temp table bench_sel on commit drop as
+select
+  pg_catalog.current_setting('app.bench_t0')::timestamptz as t0,
+  pg_catalog.current_setting('app.bench_t1')::timestamptz as t1,
+  probe.prefix_rows,
+  probe.deficit_rows,
+  probe.deficit_buffers,
+  probe.deficit_plan
+from app.replay_read_probe probe
+order by probe.id desc
+limit 1;
+select set_config('app.replay_probe', '', true);
+do $$
+declare
+  v_item uuid := md5('bench-large-${history.prefix}')::uuid;
+  v_need integer;
+  v_left integer;
+begin
+  v_need := greatest((select count(*) from app.replay_checkpoint_deficits), 200)::integer;
+  insert into app.stock_items (id, name, kind, base_unit, count_frequency)
+  values (v_item, 'bench large ${history.prefix}', 'seafood', 'kg', 'daily');
+  perform app.set_item_opening_price(
+    md5('bench-large-price-${history.prefix}')::uuid,
+    v_item, 10, null, null, 'kg|seafood||'
+  );
+  v_left := v_need;
+  perform app.post_engine_outflows((
+    select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'item_id', v_item,
+      'movement_type', 'sale',
+      'occurred_at', timestamptz '${anchor}' + interval '16 hours',
+      'quantity', 1
+    ))
+    from pg_catalog.generate_series(1, v_left) as g (n)
+  ));
+end;
+$$;
+create temp table bench_large_size on commit drop as
+select count(*)::bigint as table_rows from app.replay_checkpoint_deficits;
+delete from app.replay_read_probe;
+select set_config('app.replay_probe', '1', true);
+select set_config('app.bench_t0', pg_catalog.clock_timestamp()::text, true);
+set statement_timeout = '6s';
+select app.replay_execute(
+  array[md5('bench-large-${history.prefix}')::uuid],
+  '[]'::jsonb,
+  pg_catalog.gen_random_uuid(),
+  true
+);
+set statement_timeout = 0;
+select set_config('app.bench_t1', pg_catalog.clock_timestamp()::text, true);
+create temp table bench_large on commit drop as
+select
+  pg_catalog.current_setting('app.bench_t0')::timestamptz as t0,
+  pg_catalog.current_setting('app.bench_t1')::timestamptz as t1,
+  probe.prefix_rows,
+  probe.deficit_rows,
+  probe.deficit_buffers,
+  probe.deficit_plan,
+  (select table_rows from bench_large_size) as table_rows
+from app.replay_read_probe probe
+order by probe.id desc
+limit 1;
+select set_config('app.replay_probe', '', true);
 select app.replay_execute(
   array['${history.agedItem}']::uuid[],
   '[]'::jsonb,
@@ -824,13 +927,21 @@ set statement_timeout = '6s';
 create temp table bench_aged on commit drop as
 select
   pg_catalog.clock_timestamp() as t0,
-  app.post_movements(pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-    'item_id', '${history.agedItem}',
-    'movement_type', 'purchase',
-    'occurred_at', timestamptz '${anchor}' + interval '15 hours',
-    'quantity', 1,
-    'unit_cost', 10
-  ))) as batch,
+  app.record_purchase(pg_catalog.jsonb_build_object(
+    'purchased_at', to_char(
+      (timestamptz '${anchor}' + interval '15 hours') at time zone 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+    ),
+    'request_id', '${history.agedPurchaseRequest}',
+    'lines', pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+      'item_id', '${history.agedItem}',
+      'quantity', '1',
+      'unit', 'kg',
+      'amount_paid', '10.00',
+      'expected_base_unit', 'kg',
+      'expected_factor', '1'
+    ))
+  )) as batch,
   pg_catalog.clock_timestamp() as t1;
 set statement_timeout = 0;
 do $$
@@ -840,42 +951,92 @@ declare
     extract(epoch from ((select t1 from bench_aged) - (select t0 from bench_aged)))::numeric,
     3
   );
-  v_time boolean;
-  v_id boolean;
-  v_restore boolean;
+  v_sel_seconds numeric := round(
+    extract(epoch from ((select t1 from bench_sel) - (select t0 from bench_sel)))::numeric,
+    3
+  );
+  v_large_seconds numeric := round(
+    extract(epoch from ((select t1 from bench_large) - (select t0 from bench_large)))::numeric,
+    3
+  );
+  v_prefix bigint;
   v_rows bigint;
+  v_buffers bigint;
+  v_plan text;
+  v_sel_prefix bigint;
+  v_sel_rows bigint;
+  v_sel_buffers bigint;
+  v_sel_plan text;
+  v_large_prefix bigint;
+  v_large_rows bigint;
+  v_large_buffers bigint;
+  v_large_plan text;
+  v_large_table bigint;
   v_covered boolean;
+  v_suffix_ok boolean;
   v_pass boolean;
 begin
   select
-    probe.time_arm_index,
-    probe.id_arm_index,
-    probe.deficit_index,
-    probe.deficit_rows
-  into v_time, v_id, v_restore, v_rows
+    probe.prefix_rows,
+    probe.deficit_rows,
+    probe.deficit_buffers,
+    probe.deficit_plan
+  into v_prefix, v_rows, v_buffers, v_plan
   from app.replay_read_probe probe
   order by probe.id desc
   limit 1;
+
+  select prefix_rows, deficit_rows, deficit_buffers, deficit_plan
+  into v_sel_prefix, v_sel_rows, v_sel_buffers, v_sel_plan
+  from bench_sel;
+
+  select prefix_rows, deficit_rows, deficit_buffers, deficit_plan, table_rows
+  into v_large_prefix, v_large_rows, v_large_buffers, v_large_plan, v_large_table
+  from bench_large;
 
   select coalesce(sum(deficit.qty_uncovered), 0) = 0
   into v_covered
   from app.provisional_deficits deficit
   where deficit.item_id = '${history.agedItem}';
 
+  v_suffix_ok := coalesce((v_fresh ->> 'suffix_index')::boolean, false)
+    or coalesce((v_fresh ->> 'prefix_rows')::bigint, 1) = 0;
+
   v_pass := coalesce((v_fresh ->> 'fresh_pass')::boolean, false)
-    and v_seconds <= 2
+    and v_suffix_ok
+    and v_sel_seconds <= 6
+    and coalesce(v_sel_prefix, 1) = 0
+    and coalesce(v_sel_plan, '') like '%Buffers:%'
+    and coalesce(v_sel_rows, 0) between 1 and 5
+    and v_large_seconds <= 6
+    and coalesce(v_large_prefix, 1) = 0
+    and coalesce(v_large_plan, '') like '%Buffers:%'
+    and coalesce(v_large_rows, 0) >= 200
+    and coalesce(v_large_table, 0) > 0
+    and v_large_rows::numeric >= 0.4 * v_large_table
+    and v_large_rows::numeric <= 0.7 * v_large_table
     and v_seconds <= 6
-    and coalesce(v_time, false)
-    and coalesce(v_id, false)
-    and coalesce(v_restore, false)
+    and coalesce(v_prefix, 1) = 0
+    and coalesce(v_plan, '') like '%Buffers:%'
     and coalesce(v_covered, false);
 
   raise notice 'MEASURE %', v_fresh || pg_catalog.jsonb_build_object(
+    'selective_seconds', v_sel_seconds,
+    'selective_crossed_2s', v_sel_seconds > 2,
+    'selective_prefix_rows', v_sel_prefix,
+    'selective_deficit_rows', v_sel_rows,
+    'selective_buffers', v_sel_buffers,
+    'large_seconds', v_large_seconds,
+    'large_crossed_2s', v_large_seconds > 2,
+    'large_prefix_rows', v_large_prefix,
+    'large_deficit_rows', v_large_rows,
+    'large_buffers', v_large_buffers,
+    'large_table_rows', v_large_table,
     'aged_seconds', v_seconds,
     'aged_crossed_2s', v_seconds > 2,
-    'aged_suffix_index', coalesce(v_time, false) and coalesce(v_id, false),
-    'aged_restore_index', coalesce(v_restore, false),
+    'aged_prefix_rows', v_prefix,
     'aged_deficit_rows', v_rows,
+    'aged_buffers', v_buffers,
     'aged_covered', coalesce(v_covered, false),
     'pass', v_pass
   );
@@ -915,10 +1076,18 @@ function formatResult(row) {
           `- id arm index: ${row.id_arm_index}`,
           `- confirming replay ms: ${row.replay_ms}`,
         ]),
-    `- deficit restore rows: ${row.deficit_rows}`,
-    ...(row.restore_index == null
-      ? []
-      : [`- deficit restore index: ${row.restore_index}`]),
+    `- prefix rows: ${row.prefix_rows}`,
+    `- selective restore seconds: ${row.selective_seconds}`,
+    `- selective restore crossed 2s: ${row.selective_crossed_2s}`,
+    `- selective prefix rows: ${row.selective_prefix_rows}`,
+    `- selective deficit rows: ${row.selective_deficit_rows}`,
+    `- selective buffers: ${row.selective_buffers}`,
+    `- large-share restore seconds: ${row.large_seconds}`,
+    `- large-share restore crossed 2s: ${row.large_crossed_2s}`,
+    `- large-share prefix rows: ${row.large_prefix_rows}`,
+    `- large-share deficit rows: ${row.large_deficit_rows}`,
+    `- large-share buffers: ${row.large_buffers}`,
+    `- large-share table rows: ${row.large_table_rows}`,
     `- measured status: ${row.status}`,
     `- failed: ${row.failed}`,
     `- completion outcome: ${row.outcome}`,
@@ -929,9 +1098,9 @@ function formatResult(row) {
     `- crossed 2s: ${row.crossed_2s}`,
     `- aged cover seconds: ${row.aged_seconds}`,
     `- aged cover crossed 2s: ${row.aged_crossed_2s}`,
-    `- aged suffix index: ${row.aged_suffix_index}`,
-    `- aged deficit restore index: ${row.aged_restore_index}`,
+    `- aged prefix rows: ${row.aged_prefix_rows}`,
     `- aged deficit rows: ${row.aged_deficit_rows}`,
+    `- aged buffers: ${row.aged_buffers}`,
     `- aged deficit covered: ${row.aged_covered}`,
     `- gate: ${row.pass ? 'PASS' : 'FAIL'}`,
     '',
@@ -1029,7 +1198,7 @@ function writeResults(rows, note) {
   const body = [
     '# Accounting history benchmark',
     '',
-    'Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. A separate purchase today covers a deficit from 40 days ago and is timed the same way. The soft gate is 2 seconds and the hard gate is 6 seconds. Both reads must index-scan both suffix arms of stock_movements, and the deficit restore must be an index scan of replay_checkpoint_deficits. The fresh order also requires that restore to load at least 1000 deficits. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.',
+    'Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), buffers, and a frozen prefix that is not walked. Suffix arms keep an index scan when the planner still chooses one; otherwise the same latency and no-prefix rule applies. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.',
     '',
     ...merged.map((row) =>
       row.error

@@ -202,10 +202,12 @@ create table app.replay_read_probe (
   time_arm_index boolean not null,
   id_arm_index boolean not null,
   deficit_index boolean not null,
+  prefix_rows bigint not null default 0,
+  deficit_buffers bigint not null default 0,
   replay_ms numeric(14, 3) not null default 0
 );
 
-comment on table app.replay_read_probe is 'One confirming replay''s suffix arms and the deficits restored before the walk. The benchmark sets app.replay_probe. Plans are EXPLAIN text, not a second read.';
+comment on table app.replay_read_probe is 'One confirming replay. Suffix plans are EXPLAIN text. The deficit plan and buffers are the restore insert that just ran. prefix_rows is the frozen prefix loaded into the walk, which stays zero.';
 
 alter table app.replay_read_probe enable row level security;
 
@@ -388,12 +390,22 @@ create table ledger_scratch.recompute_cover_pair (
 
 comment on table ledger_scratch.recompute_cover_pair is 'Cover of a deficit that occurred before the window, recorded by the ordinary cover loop. The write phase posts the delta as one closed_period carrier row.';
 
+-- The restore insert's own plan, kept until the probe row is written.
+create table ledger_scratch.replay_restore_plan (
+  checkpoint_id bigint primary key,
+  plan text not null,
+  buffers bigint not null
+);
+
 alter table ledger_scratch.replay_resume enable row level security;
 
 alter table ledger_scratch.recompute_cover_pair enable row level security;
 
+alter table ledger_scratch.replay_restore_plan enable row level security;
+
 revoke all on ledger_scratch.replay_resume,
-ledger_scratch.recompute_cover_pair
+ledger_scratch.recompute_cover_pair,
+ledger_scratch.replay_restore_plan
 from
   public,
   anon,
@@ -453,10 +465,11 @@ lock table app.accounting_queue_stats in exclusive mode;
 -- ============================================================================
 -- Window, change instant, and the owner lock helper.
 -- ============================================================================
--- app.test_clock is a transaction-local test pin. It is not a production
--- input. test_clock_pin returns it only when the connected session user is
--- the database owner or a superuser (the role that runs pgTAP). API roles
--- connect as authenticator and a value they set is ignored. No other
+-- app.test_clock is a transaction-local pin. A production owner or superuser
+-- session can set it: the pin is privileged, not test-only by construction.
+-- test_clock_pin returns it only for that session user. No application role
+-- (anon, authenticated, service_role) can execute the reader, and a value
+-- they set is ignored because their session user is authenticator. No other
 -- function reads the pin directly.
 create function app.test_clock_pin () returns timestamptz language sql stable security invoker
 set
@@ -487,7 +500,7 @@ set
     end;
 $$;
 
-comment on function app.test_clock_pin () is 'The app.test_clock pin when the connected session user owns this database or is a superuser. Null for every API role, including when that role has set the pin.';
+comment on function app.test_clock_pin () is 'The app.test_clock pin when the connected session user owns this database or is a superuser. A production owner session can set the pin; it is privileged, not test-only by construction. No application role can execute this reader, and a value they set is ignored.';
 
 revoke all on function app.test_clock_pin ()
 from
@@ -1003,6 +1016,8 @@ declare
   v_suffix_min timestamptz;
   v_anchor_count bigint;
   v_use boolean;
+  v_plan text;
+  v_line text;
 begin
   v_frozen := coalesce(pg_catalog.current_setting('app.replay_frozen', true), '') = '1';
 
@@ -1085,6 +1100,7 @@ begin
           where
             sm.item_id = v_item
             and sm.occurred_at > v_checkpoint.cut_occurred_at
+            and sm.movement_type <> 'cost_adjustment'::app.movement_type
         ) as move_min,
         (
           select
@@ -1094,6 +1110,7 @@ begin
           where
             sm.item_id = v_item
             and sm.id > v_checkpoint.max_movement_id
+            and sm.movement_type <> 'cost_adjustment'::app.movement_type
         ) as id_min,
         (
           select
@@ -1140,33 +1157,84 @@ begin
           v_checkpoint.digest
         );
 
-      insert into
-        ledger_scratch.recompute_def (
-          movement_id,
-          item_id,
-          qty_uncovered,
-          provisional_unit_cost,
-          value_uncovered,
-          occurred_at,
-          ord_class,
-          event_position,
-          piece_position
+      -- The probe records this insert, not a later EXPLAIN of a different
+      -- query. ANALYZE runs the insert once and returns its plan and buffers.
+      if coalesce(pg_catalog.current_setting('app.replay_probe', true), '') = '1' then
+        v_plan := '';
+
+        for v_line in execute format(
+          $explain$
+          explain (analyze, buffers, format text)
+          insert into ledger_scratch.recompute_def (
+            movement_id,
+            item_id,
+            qty_uncovered,
+            provisional_unit_cost,
+            value_uncovered,
+            occurred_at,
+            ord_class,
+            event_position,
+            piece_position
+          )
+          select
+            deficit.movement_id,
+            deficit.item_id,
+            deficit.qty_uncovered,
+            deficit.provisional_unit_cost,
+            deficit.value_uncovered,
+            deficit.occurred_at,
+            deficit.ord_class,
+            deficit.event_position,
+            deficit.piece_position
+          from app.replay_checkpoint_deficits deficit
+          where deficit.checkpoint_id = %s
+          $explain$,
+          v_checkpoint.id
         )
-      select
-        deficit.movement_id,
-        deficit.item_id,
-        deficit.qty_uncovered,
-        deficit.provisional_unit_cost,
-        deficit.value_uncovered,
-        deficit.occurred_at,
-        deficit.ord_class,
-        deficit.event_position,
-        deficit.piece_position
-      from
-        app.replay_checkpoint_deficits deficit
-      where
-        deficit.checkpoint_id = v_checkpoint.id
-        and deficit.qty_uncovered > 0;
+        loop
+          v_plan := v_plan || v_line || e'\n';
+        end loop;
+
+        insert into
+          ledger_scratch.replay_restore_plan (checkpoint_id, plan, buffers)
+        values
+          (
+            v_checkpoint.id,
+            v_plan,
+            app.replay_plan_shared_buffers (v_plan)
+          )
+        on conflict (checkpoint_id) do update
+        set
+          plan = excluded.plan,
+          buffers = excluded.buffers;
+      else
+        insert into
+          ledger_scratch.recompute_def (
+            movement_id,
+            item_id,
+            qty_uncovered,
+            provisional_unit_cost,
+            value_uncovered,
+            occurred_at,
+            ord_class,
+            event_position,
+            piece_position
+          )
+        select
+          deficit.movement_id,
+          deficit.item_id,
+          deficit.qty_uncovered,
+          deficit.provisional_unit_cost,
+          deficit.value_uncovered,
+          deficit.occurred_at,
+          deficit.ord_class,
+          deficit.event_position,
+          deficit.piece_position
+        from
+          app.replay_checkpoint_deficits deficit
+        where
+          deficit.checkpoint_id = v_checkpoint.id;
+      end if;
     else
       insert into
         ledger_scratch.replay_resume (item_id)
@@ -1174,10 +1242,57 @@ begin
         (v_item);
     end if;
   end loop;
+
+  -- A sort output can resume while its input cannot: the new purchase is on
+  -- the input, before the sort, so the output's own suffix is empty. Walking
+  -- only the input reprices the sort and leaves the output at the old value.
+  -- If any item in this call has to walk from the start, they all do.
+  if exists (
+    select
+      1
+    from
+      ledger_scratch.replay_resume resume
+    where
+      resume.checkpoint_id is null
+  ) then
+    delete from ledger_scratch.recompute_def deficit
+    where
+      deficit.item_id in (
+        select
+          resume.item_id
+        from
+          ledger_scratch.replay_resume resume
+      );
+
+    delete from ledger_scratch.replay_restore_plan stored
+    where
+      stored.checkpoint_id in (
+        select
+          resume.checkpoint_id
+        from
+          ledger_scratch.replay_resume resume
+        where
+          resume.checkpoint_id is not null
+      );
+
+    update ledger_scratch.replay_resume
+    set
+      checkpoint_id = null,
+      cut_occurred_at = null,
+      max_movement_id = null,
+      on_hand_qty = 0,
+      on_hand_value = 0,
+      avg_cost = 0,
+      cost_known = false,
+      has_uncovered_deficit = false,
+      digest = null
+    where
+      checkpoint_id is not null;
+  end if;
 end;
 $$;
 
-comment on function app.replay_bind_resume (uuid[], jsonb) is 'Choose one usable checkpoint per item whose cut is strictly before the earliest effect, and restore its balance and open deficits. A checkpoint that fails the anchor count or the suffix test is skipped.';
+comment on function app.replay_bind_resume (uuid[], jsonb) is 'Choose one usable checkpoint per item whose cut is strictly before the earliest effect, and restore its balance and open deficits. A checkpoint that fails the anchor count or the suffix test is skipped. If one item in the call cannot resume, none of them do, so a sort is repriced on both sides.';
 
 revoke all on function app.replay_bind_resume (uuid[], jsonb)
 from
@@ -1577,6 +1692,10 @@ begin
       coalesce(v_inflow.piece_position, 0) + 1
     );
 
+    -- The carrier changes what that deficit's pieces cost. Recognized value
+    -- moves with it in this same transaction.
+    perform app.note_recognized_cover (v_pair.deficit_movement_id, - v_delta);
+
     perform app.invalidate_checkpoints_from (
       v_inflow.item_id,
       v_inflow.occurred_at,
@@ -1793,8 +1912,7 @@ begin
     from
       ledger_scratch.recompute_def deficit
     where
-      deficit.item_id = v_item
-      and deficit.qty_uncovered > 0;
+      deficit.item_id = v_item;
 
     insert into
       app.replay_checkpoint_anchors (checkpoint_id, count_id, line_no)
@@ -4034,7 +4152,8 @@ begin
   ledger_scratch.recompute_seq,
   ledger_scratch.recompute_anchor,
   ledger_scratch.replay_resume,
-  ledger_scratch.recompute_cover_pair;
+  ledger_scratch.recompute_cover_pair,
+  ledger_scratch.replay_restore_plan;
 end;
 $$;
 
@@ -4062,7 +4181,29 @@ set
     and p_plan !~* 'Seq Scan on replay_checkpoint_deficits( |$)';
 $$;
 
-comment on function app.replay_plan_uses_deficit_index (text) is 'True when the plan reads replay_checkpoint_deficits by an index and does not sequence-scan that table.';
+comment on function app.replay_plan_uses_deficit_index (text) is 'True when the plan reads replay_checkpoint_deficits by an index and does not sequence-scan that table. A sequence scan of a large share is a legitimate restore and is not required to be an index.';
+
+create function app.replay_plan_shared_buffers (p_plan text) returns bigint language sql immutable security definer
+set
+  search_path = '' as $$
+  select
+    coalesce(sum((match[1])::bigint), 0)
+  from
+    pg_catalog.regexp_matches(
+      coalesce(p_plan, ''),
+      '(?:hit|read|dirtied|written)=([0-9]+)',
+      'g'
+    ) as match;
+$$;
+
+comment on function app.replay_plan_shared_buffers (text) is 'Shared hit, read, dirtied and written pages reported on an EXPLAIN ANALYZE BUFFERS plan.';
+
+revoke all on function app.replay_plan_shared_buffers (text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
 
 revoke all on function app.replay_plan_uses_deficit_index (text)
 from
@@ -4088,6 +4229,8 @@ declare
   v_time_plan text := '';
   v_id_plan text := '';
   v_def_plan text := '';
+  v_def_buffers bigint := 0;
+  v_prefix_rows bigint := 0;
   v_line record;
   v_resume record;
   v_has_checkpoint boolean := false;
@@ -4141,9 +4284,30 @@ begin
     d.item_id = any (p_item_ids);
 
   if v_has_checkpoint then
-    -- The restore rows were inserted in this transaction. Refresh the
-    -- planner's picture so the checkpoint lookup is planned as an index read.
-    execute 'analyze app.replay_checkpoint_deficits';
+    select
+      count(*)
+    into v_prefix_rows
+    from
+      ledger_scratch.recompute_row q
+      join ledger_scratch.replay_resume resume on resume.item_id = q.item_id
+    where
+      not q.is_pending
+      and q.item_id = any (p_item_ids)
+      and resume.checkpoint_id is not null
+      and q.occurred_at <= resume.cut_occurred_at
+      and q.movement_id <= resume.max_movement_id;
+
+    select
+      coalesce(string_agg(saved.plan, ''), ''),
+      coalesce(sum(saved.buffers), 0)
+    into
+      v_def_plan,
+      v_def_buffers
+    from
+      ledger_scratch.replay_restore_plan saved
+      join ledger_scratch.replay_resume resume on resume.checkpoint_id = saved.checkpoint_id
+    where
+      resume.item_id = any (p_item_ids);
 
     for v_resume in
       select
@@ -4216,20 +4380,6 @@ begin
       loop
         v_id_plan := v_id_plan || v_line."QUERY PLAN" || e'\n';
       end loop;
-
-      for v_line in execute format(
-        $explain$
-        explain (format text)
-        select deficit.movement_id
-        from app.replay_checkpoint_deficits deficit
-        where deficit.checkpoint_id = %1$L::bigint
-          and deficit.qty_uncovered > 0
-        $explain$,
-        v_resume.checkpoint_id
-      )
-      loop
-        v_def_plan := v_def_plan || v_line."QUERY PLAN" || e'\n';
-      end loop;
     end loop;
   end if;
 
@@ -4243,7 +4393,9 @@ begin
       deficit_plan,
       time_arm_index,
       id_arm_index,
-      deficit_index
+      deficit_index,
+      prefix_rows,
+      deficit_buffers
     )
   values
     (
@@ -4255,12 +4407,14 @@ begin
       v_def_plan,
       app.replay_plan_uses_movement_index (v_time_plan),
       app.replay_plan_uses_movement_index (v_id_plan),
-      app.replay_plan_uses_deficit_index (v_def_plan)
+      app.replay_plan_uses_deficit_index (v_def_plan),
+      v_prefix_rows,
+      v_def_buffers
     );
 end;
 $$;
 
-comment on function app.replay_capture_read (uuid[]) is 'While app.replay_probe is 1, record the suffix rows just loaded, the deficits restored before the walk, and the plans of the two range arms and the deficit restore. EXPLAIN does not read the rows again.';
+comment on function app.replay_capture_read (uuid[]) is 'While app.replay_probe is 1, record the suffix rows just loaded, the deficits restored before the walk, the suffix plans, and the plan and buffers of the restore insert that already ran. prefix_rows counts frozen prefix rows loaded into the walk.';
 
 revoke all on function app.replay_capture_read (uuid[])
 from
@@ -5164,6 +5318,8 @@ begin
         p_cause
       );
 
+      perform app.note_recognized_cover (e.movement_id, - v_diff);
+
       perform app.invalidate_checkpoints_from (e.item_id, e.occurred_at, 'cost_adjustment');
     end if;
   end loop;
@@ -5574,9 +5730,9 @@ begin
         covered_qty = ledger_scratch.recompute_cover_pair.covered_qty + excluded.covered_qty,
         value_adj = ledger_scratch.recompute_cover_pair.value_adj + excluded.value_adj;
 
-      -- The carrier holds this cover. A resume does not re-walk the deficit,
-      -- so seed its effect at cover 0 and let the write reverse a cost
-      -- adjustment the live inflow already posted.
+      -- The carrier holds the new cover. Covers already in the frozen prefix
+      -- stay on the deficit, the same way an in-window resume seeds them, so
+      -- this write does not reverse a legitimate earlier adjustment.
       insert into
         ledger_scratch.recompute_effect (
           movement_id,
@@ -5592,7 +5748,18 @@ begin
         sm.movement_type,
         sm.total_cost,
         coalesce(sm.unit_cost, 0),
-        0
+        coalesce(
+          (
+            select
+              sum(adjustment.total_cost)
+            from
+              app.stock_movements adjustment
+            where
+              adjustment.adjusts_movement_id = sm.id
+              and adjustment.movement_type = 'cost_adjustment'::app.movement_type
+          ),
+          0
+        )
       from
         app.stock_movements sm
       where
@@ -5861,7 +6028,6 @@ create function app.post_recognized_delta (
   p_economic text,
   p_required_qty numeric,
   p_required_value numeric,
-  p_shift text,
   p_reason text,
   p_report text,
   p_waste_chain uuid,
@@ -5979,12 +6145,11 @@ comment on function app.post_recognized_delta (
   numeric,
   text,
   text,
-  text,
   uuid,
   bigint,
   bigint,
   integer
-) is 'Post required minus the recognized quantity and value, then store both. A reduction is a return so that source''s own deficits are cancelled before FIFO. The shift is the one that contains t_change, or null. A historical shift passed by the caller is not copied.';
+) is 'Post required minus the recognized quantity and value, then store both. A reduction is a return so that source''s own deficits are cancelled before FIFO. The shift is the one that contains t_change, or null.';
 
 revoke all on function app.post_recognized_delta (
   uuid,
@@ -5997,12 +6162,71 @@ revoke all on function app.post_recognized_delta (
   numeric,
   text,
   text,
-  text,
   uuid,
   bigint,
   bigint,
   integer
 )
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.note_recognized_cover (p_movement_id bigint, p_consumption_delta numeric) returns void language plpgsql security definer
+set
+  search_path = '' as $$
+begin
+  if coalesce(p_consumption_delta, 0) = 0 then
+    return;
+  end if;
+
+  update app.recognized_contribution contribution
+  set
+    amount = pg_catalog.round(contribution.amount + p_consumption_delta, 2)
+  from
+    app.stock_movements sm
+  where
+    sm.id = p_movement_id
+    and contribution.item_id = sm.item_id
+    and contribution.bucket = case
+      when sm.movement_type = 'waste'::app.movement_type
+      or sm.closed_bucket = 'waste' then 'waste'
+      else 'cogs'
+    end
+    and (
+      (
+        contribution.source_kind = 'order'
+        and exists (
+          select
+            1
+          from
+            app.order_cost_movement_links link
+          where
+            link.movement_id = sm.id
+            and link.order_id = contribution.source_id
+        )
+      )
+      or (
+        contribution.source_kind = 'waste'
+        and exists (
+          select
+            1
+          from
+            app.closed_period_sources src
+          where
+            src.movement_id = sm.id
+            and src.source_kind = 'waste'
+            and src.source_id = contribution.source_id
+        )
+      )
+    );
+end;
+$$;
+
+comment on function app.note_recognized_cover (bigint, numeric) is 'Add a cover or restatement adjustment to the recognized value of the pieces it changes, in the same transaction. Quantity stays. A later return then restores the covered value.';
+
+revoke all on function app.note_recognized_cover (bigint, numeric)
 from
   public,
   anon,
@@ -6117,6 +6341,13 @@ declare
 begin
   perform app.assert_ledger_lock_held ();
 
+  -- The caller's shift is the document's historical shift. Attribution is the
+  -- shift that contains t_change, chosen inside the poster, so this value is
+  -- not copied onto the movement.
+  if p_shift is not distinct from p_shift then
+    null;
+  end if;
+
   perform app.seed_order_recognized (p_order_id);
 
   v_cause := coalesce(p_cause, pg_catalog.gen_random_uuid ());
@@ -6136,9 +6367,11 @@ begin
       continue;
     end if;
 
+    -- Both buckets. A reclassification transfers the retained quantity at
+    -- its posted value; only a true addition is priced at today's unit.
     select
-      contribution.quantity,
-      contribution.amount
+      coalesce(sum(contribution.quantity), 0),
+      coalesce(sum(contribution.amount), 0)
     into
       v_rec_qty,
       v_rec_amt
@@ -6147,8 +6380,7 @@ begin
     where
       contribution.source_kind = 'order'
       and contribution.source_id = p_order_id
-      and contribution.item_id = v_item
-      and contribution.bucket = p_bucket;
+      and contribution.item_id = v_item;
 
     v_rec_qty := coalesce(v_rec_qty, 0);
     v_rec_amt := coalesce(v_rec_amt, 0);
@@ -6220,7 +6452,6 @@ begin
       p_economic,
       (v_elem ->> 'qty')::numeric,
       (v_elem ->> 'value')::numeric,
-      p_shift,
       null,
       null,
       null,
@@ -6299,7 +6530,6 @@ begin
       end,
       0,
       0,
-      p_shift,
       null,
       null,
       null,
@@ -6622,23 +6852,73 @@ begin
       1;
 
     v_piece := v_piece + 1;
-    v_move := app.post_recognized_delta (
-      v_cause,
-      'waste',
-      v_root::text,
-      v_item,
-      'waste',
-      'waste',
-      (v_elem ->> 'qty')::numeric,
-      (v_elem ->> 'value')::numeric,
-      v_shift,
-      p_reason,
-      'manual',
-      v_chain,
-      v_prior,
-      null,
-      v_piece
-    );
+
+    -- A reason change rebooks the line. The whole posted value comes back on
+    -- the old reason; the new quantity, including an addition, goes out on
+    -- the new reason. A quantity-only edit keeps one delta.
+    if not p_void
+    and p_reason is distinct from v_old_reason
+    and (
+      (v_elem ->> 'qty')::numeric is distinct from coalesce((v_elem ->> 'recognized_qty')::numeric, 0)
+      or (v_elem ->> 'value')::numeric is distinct from coalesce((v_elem ->> 'recognized_amount')::numeric, 0)
+    ) then
+      v_move := app.post_recognized_delta (
+        v_cause,
+        'waste',
+        v_root::text,
+        v_item,
+        'waste',
+        'waste',
+        0,
+        0,
+        v_old_reason,
+        'manual',
+        v_chain,
+        v_prior,
+        null,
+        v_piece
+      );
+
+      if v_move is not null then
+        v_posted := true;
+        v_items := v_items || v_item;
+      end if;
+
+      v_piece := v_piece + 1;
+      v_move := app.post_recognized_delta (
+        v_cause,
+        'waste',
+        v_root::text,
+        v_item,
+        'waste',
+        'waste',
+        (v_elem ->> 'qty')::numeric,
+        (v_elem ->> 'value')::numeric,
+        p_reason,
+        'manual',
+        v_chain,
+        null,
+        null,
+        v_piece
+      );
+    else
+      v_move := app.post_recognized_delta (
+        v_cause,
+        'waste',
+        v_root::text,
+        v_item,
+        'waste',
+        'waste',
+        (v_elem ->> 'qty')::numeric,
+        (v_elem ->> 'value')::numeric,
+        p_reason,
+        'manual',
+        v_chain,
+        v_prior,
+        null,
+        v_piece
+      );
+    end if;
 
     if v_move is not null then
       v_posted := true;
@@ -6712,8 +6992,7 @@ begin
       'waste',
       0,
       0,
-      v_shift,
-      p_reason,
+      v_old_reason,
       'manual',
       v_chain,
       v_prior,
@@ -6744,6 +7023,8 @@ begin
         coalesce((need.value ->> 'recognized_qty')::numeric, 0) > 0
         and coalesce((need.value ->> 'recognized_amount')::numeric, 0) <> 0
         and coalesce((need.value ->> 'qty')::numeric, 0) > 0
+        and coalesce((need.value ->> 'qty')::numeric, 0) = coalesce((need.value ->> 'recognized_qty')::numeric, 0)
+        and coalesce((need.value ->> 'value')::numeric, 0) = coalesce((need.value ->> 'recognized_amount')::numeric, 0)
     loop
       v_retained := app.closed_required_value (
         v_row.recognized_qty,
@@ -6819,11 +7100,13 @@ begin
     return v_cause;
   end if;
 
-  return null;
+  -- An explanation-only correction and a zero-cost reason change post no
+  -- movement. The document still needs a batch id.
+  return v_cause;
 end;
 $$;
 
-comment on function app.apply_closed_waste_delta (bigint, jsonb, boolean, text) is 'Correction or cancellation of a waste document dated before the window. The original waste rows stay. The difference is a closed contribution of the root document.';
+comment on function app.apply_closed_waste_delta (bigint, jsonb, boolean, text) is 'Correction or cancellation of a waste document dated before the window. The original waste rows stay. The difference is a closed contribution of the root document. A no-value correction still returns a batch id.';
 
 revoke all on function app.apply_closed_waste_delta (bigint, jsonb, boolean, text)
 from
@@ -8621,14 +8904,9 @@ begin
         )
       );
 
-      -- A configuration span names one cause for every pre-window order. That
-      -- restatement is a closed difference even when the order is still a
-      -- frozen activation input. The setting is transaction-local and empty
-      -- for every ordinary posting.
-      if coalesce(pg_catalog.current_setting('app.span_cause', true), '') <> '' then
-        v_closed_post := true;
-      end if;
-
+      -- A configuration span passes one cause into the closed poster below.
+      -- An unposted frozen activation input keeps the original-instant
+      -- exception: v_closed_post stays false and the order posts on its own day.
       if v_closed_post then
         v_batch := app.post_closed_order_difference (
           p_order_id,
@@ -8907,7 +9185,31 @@ begin
         (
           v_closed_post
           and sm.movement_type = 'closed_period'
-          and sm.source_id = p_order_id
+          and (
+            sm.source_id = p_order_id
+            or exists (
+              select
+                1
+              from
+                app.closed_period_sources src
+                join app.stock_movements original on original.id::text = src.source_id
+              where
+                src.movement_id = sm.id
+                and src.source_kind = 'return'
+                and (
+                  original.source_id = p_order_id
+                  or exists (
+                    select
+                      1
+                    from
+                      app.order_cost_movement_links prior
+                    where
+                      prior.order_id = p_order_id
+                      and prior.movement_id = original.id
+                  )
+                )
+            )
+          )
         )
         or (
           not v_closed_post
@@ -10541,7 +10843,18 @@ begin
 
   perform app.assert_not_before_opening (v_item_ids, v_times, v_type_fill);
 
-  if not app.batch_is_forward (v_item_ids, v_times) then
+  -- A newest purchase that covers an open deficit still replays. The forward
+  -- applicator would hide the checkpoint restore the cover has to walk.
+  if not app.batch_is_forward (v_item_ids, v_times)
+  or exists (
+    select
+      1
+    from
+      app.provisional_deficits open_deficit
+    where
+      open_deficit.item_id = any (v_item_ids)
+      and open_deficit.qty_uncovered > 0
+  ) then
     v_pending := '[]'::jsonb;
 
     for v_i in 1..v_n loop

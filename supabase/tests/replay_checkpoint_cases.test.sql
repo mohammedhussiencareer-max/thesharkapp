@@ -553,10 +553,10 @@ insert into
 values
   (
     'c52-open',
-    pg_catalog.clock_timestamp () - interval '1 hour',
+    app.test_clock_pin () - interval '1 hour',
     null,
     true,
-    pg_catalog.clock_timestamp ()
+    app.test_clock_pin ()
   );
 
 select

@@ -359,7 +359,8 @@ select
       checkpoint on checkpoint.id = invalidation.checkpoint_id
       where
         checkpoint.item_id = 'c5500000-0000-4000-8000-000000000003'
-        and invalidation.reason = 'cover'
+        and invalidation.reason in ('cover', 'cost_adjustment')
+        and checkpoint.cut_occurred_at >= '2026-11-01T08:00:00Z'
     ),
     'an in-window cover invalidates checkpoints from the deficit'
   );
@@ -554,7 +555,7 @@ select
           0,
           10,
           '2026-11-01T08:00:00Z',
-          pg_catalog.clock_timestamp ()
+          app.test_clock_pin ()
         ) allocation
     ),
     '-249.75',
