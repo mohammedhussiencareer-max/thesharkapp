@@ -501,8 +501,7 @@ select
       )
     ),
     'cogs',
-    'sale',
-    null
+    'sale'
   );
 
 select
@@ -571,7 +570,7 @@ select
         'stock_item_id', 'f6e00000-0000-4000-8000-000000000003',
         'quantity', 9
       )),
-      'cogs', 'sale', null
+      'cogs', 'sale'
     )$$,
     'returning one posted unit is not rejected'
   );
@@ -1533,8 +1532,7 @@ select
       )
     ),
     'cogs',
-    'sale',
-    null
+    'sale'
   );
 
 insert into
@@ -2146,8 +2144,7 @@ select
       )
     ),
     'waste',
-    'waste',
-    null
+    'waste'
   );
 
 select
@@ -2670,7 +2667,7 @@ select
   );
 
 select
-  app.post_closed_order_difference ('f6-n1', '[]'::jsonb, 'cogs', 'sale', null);
+  app.post_closed_order_difference ('f6-n1', '[]'::jsonb, 'cogs', 'sale');
 
 select
   is (

@@ -2463,9 +2463,9 @@ select
 select
   throws_ok (
     $$insert into app.opening_stocks (id, request_id, occurred_at)
-      values (gen_random_uuid(), gen_random_uuid(), app.test_clock_pin())$$,
+      values (gen_random_uuid(), gen_random_uuid(), now())$$,
     '42501',
-    null::text,
+    'permission denied for table opening_stocks',
     'owner cannot insert an opening batch directly'
   );
 

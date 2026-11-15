@@ -2871,7 +2871,7 @@ isOneToOne: true
 { Args: { "p_cause": string,"p_legs": Json }; Returns: string
                            },
 "post_closed_order_difference":
-{ Args: { "p_bucket": string,"p_cause"?: string,"p_economic": string,"p_order_id": string,"p_requirements": Json,"p_shift": string }; Returns: string
+{ Args: { "p_bucket": string,"p_cause"?: string,"p_economic": string,"p_order_id": string,"p_requirements": Json }; Returns: string
                            },
 "post_engine_outflows":
 { Args: { "p_lines": Json }; Returns: string

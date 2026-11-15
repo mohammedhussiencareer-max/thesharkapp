@@ -1803,9 +1803,9 @@ select
 select
   throws_ok (
     $$insert into app.waste_documents (request_id, occurred_at, reason_code, event_position, actor)
-      values (gen_random_uuid(), app.test_clock_pin(), 'spoilage', 1, 'a6600000-0000-4000-8000-0000000000a1')$$,
+      values (gen_random_uuid(), now(), 'spoilage', 1, 'a6600000-0000-4000-8000-0000000000a1')$$,
     '42501',
-    null::text,
+    'permission denied for table waste_documents',
     'authenticated cannot insert a waste document directly'
   );
 

@@ -554,13 +554,24 @@ select
 select
   pg_temp.shift ('p77-cover', '2026-12-16 12:00+00', false);
 
--- Inside the one-day freshness budget however old the suite clock is,
--- and after every fixed count so it cannot own one.
-select
-  pg_temp.shift (
+-- Freshness compares coverage with pg_catalog.now(), not the pin. Keep this
+-- shift inside the one-day budget of that clock. Close it after one second so
+-- its span does not contain the pin or a fixed count.
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+values
+  (
     'p77-stale',
-    app.test_clock_pin () - interval '2 days',
-    false
+    pg_catalog.now () - interval '2 days',
+    pg_catalog.now () - interval '2 days' + interval '1 second',
+    false,
+    pg_catalog.now () - interval '2 days'
   );
 
 select
@@ -1267,7 +1278,8 @@ select
     )
   );
 
--- Coverage. The stale shift and the scope gap are not in the fresh row.
+-- Coverage. Freshness is pg_catalog.now() minus a budget, so a current run is
+-- stamped from that clock. The stale shift and the scope gap are not in it.
 -- A legacy row presents the gap and still does not cover it.
 insert into
   app.pos_sync_coverage (
@@ -1284,8 +1296,8 @@ insert into
   )
 select
   770001,
-  app.test_clock_pin () - interval '1 hour',
-  app.test_clock_pin (),
+  pg_catalog.now () - interval '1 hour',
+  pg_catalog.now (),
   true,
   'all',
   null,
@@ -1322,8 +1334,8 @@ insert into
 values
   (
     770002,
-    app.test_clock_pin () - interval '3 days 1 minute',
-    app.test_clock_pin () - interval '3 days',
+    pg_catalog.now () - interval '3 days 1 minute',
+    pg_catalog.now () - interval '3 days',
     true,
     'shift_ids',
     null,
@@ -1334,8 +1346,8 @@ values
   ),
   (
     770003,
-    app.test_clock_pin () - interval '1 hour',
-    app.test_clock_pin (),
+    pg_catalog.now () - interval '1 hour',
+    pg_catalog.now (),
     true,
     'all',
     null,
@@ -2807,7 +2819,20 @@ where
 select
   pg_temp.shift (
     'p77-after',
-    app.test_clock_pin () + interval '1 hour',
+    (
+      select
+        history.known_since + interval '1 hour'
+      from
+        app.item_tracking_history history
+      where
+        history.item_id = pg_temp.u (3)
+        and not history.active
+      order by
+        history.known_since desc,
+        history.id desc
+      limit
+        1
+    ),
     false
   );
 
@@ -2886,7 +2911,20 @@ where
 select
   pg_temp.shift (
     'p77-freq-after',
-    app.test_clock_pin () + interval '2 hours',
+    (
+      select
+        history.known_since + interval '1 hour'
+      from
+        app.item_tracking_history history
+      where
+        history.item_id = pg_temp.u (5)
+        and history.count_frequency = 'weekly'
+      order by
+        history.known_since desc,
+        history.id desc
+      limit
+        1
+    ),
     false
   );
 
@@ -3120,8 +3158,8 @@ begin
   values
     (
       v_run,
-      app.test_clock_pin () - interval '1 minute',
-      app.test_clock_pin (),
+      pg_catalog.now () - interval '1 minute',
+      pg_catalog.now (),
       true,
       'shift_ids',
       null,
@@ -5004,8 +5042,8 @@ insert into
   )
 select
   coalesce(max(coverage.run_id), 772000) + 1,
-  app.test_clock_pin () - interval '1 minute',
-  app.test_clock_pin (),
+  pg_catalog.now () - interval '1 minute',
+  pg_catalog.now (),
   true,
   'shift_ids',
   null,

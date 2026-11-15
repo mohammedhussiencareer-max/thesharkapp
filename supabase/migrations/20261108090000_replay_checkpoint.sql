@@ -6315,7 +6315,6 @@ create function app.post_closed_order_difference (
   p_requirements jsonb,
   p_bucket text,
   p_economic text,
-  p_shift text,
   p_cause uuid default null
 ) returns uuid language plpgsql security definer
 set
@@ -6340,13 +6339,6 @@ declare
   v_other text;
 begin
   perform app.assert_ledger_lock_held ();
-
-  -- The caller's shift is the document's historical shift. Attribution is the
-  -- shift that contains t_change, chosen inside the poster, so this value is
-  -- not copied onto the movement.
-  if p_shift is not distinct from p_shift then
-    null;
-  end if;
 
   perform app.seed_order_recognized (p_order_id);
 
@@ -6564,9 +6556,9 @@ begin
 end;
 $$;
 
-comment on function app.post_closed_order_difference (text, jsonb, text, text, text, uuid) is 'Post the difference between an order''s required contribution and the contribution already recognized. The original rows stay. A full return uses an empty requirement list. A span passes one cause and finishes that cause once after every order has posted.';
+comment on function app.post_closed_order_difference (text, jsonb, text, text, uuid) is 'Post the difference between an order''s required contribution and the contribution already recognized. The original rows stay. A full return uses an empty requirement list. A span passes one cause and finishes that cause once after every order has posted.';
 
-revoke all on function app.post_closed_order_difference (text, jsonb, text, text, text, uuid)
+revoke all on function app.post_closed_order_difference (text, jsonb, text, text, uuid)
 from
   public,
   anon,
@@ -8922,7 +8914,6 @@ begin
             when v_disposition = 'prepared_waste' then 'waste'
             else 'sale'
           end,
-          v_snap.shift_id,
           nullif(pg_catalog.current_setting('app.span_cause', true), '')::uuid
         );
 

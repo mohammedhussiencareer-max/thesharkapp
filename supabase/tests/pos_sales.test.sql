@@ -624,11 +624,11 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-anon', 'shift-test-x', 'complete', app.test_clock_pin(),
-        1, 0, 0, 0, 0, 1, app.test_clock_pin(), repeat('ab', 32)
+        'order-test-anon', 'shift-test-x', 'complete', now(),
+        1, 0, 0, 0, 0, 1, now(), repeat('ab', 32)
       )$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for schema app',
     'anon cannot insert pos_orders'
   );
 
@@ -664,11 +664,11 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-owner-direct', 'shift-test-x', 'complete', app.test_clock_pin(),
-        1, 0, 0, 0, 0, 1, app.test_clock_pin(), repeat('ab', 32)
+        'order-test-owner-direct', 'shift-test-x', 'complete', now(),
+        1, 0, 0, 0, 0, 1, now(), repeat('ab', 32)
       )$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for table pos_orders',
     'owner cannot insert pos_orders directly'
   );
 
@@ -691,9 +691,9 @@ select
 select
   throws_ok (
     $$insert into app.pos_shifts (id, opened_at, is_active, pos_update_time)
-      values ('shift-test-direct', app.test_clock_pin(), true, app.test_clock_pin())$$,
+      values ('shift-test-direct', now(), true, now())$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for table pos_shifts',
     'owner cannot insert pos_shifts directly'
   );
 
@@ -2689,9 +2689,9 @@ select
 select
   throws_ok (
     $$insert into app.pos_shifts (id, opened_at, is_active, pos_update_time)
-      values ('shift-test-intruder', app.test_clock_pin(), true, app.test_clock_pin())$$,
+      values ('shift-test-intruder', now(), true, now())$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for table pos_shifts',
     'non-owner cannot insert pos_shifts'
   );
 
@@ -2735,11 +2735,11 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-service-direct', 'shift-test-x', 'complete', app.test_clock_pin(),
-        1, 0, 0, 0, 0, 1, app.test_clock_pin(), repeat('ab', 32)
+        'order-test-service-direct', 'shift-test-x', 'complete', now(),
+        1, 0, 0, 0, 0, 1, now(), repeat('ab', 32)
       )$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for table pos_orders',
     'service_role cannot insert pos_orders directly'
   );
 

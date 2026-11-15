@@ -537,11 +537,11 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash, lines, origin
       ) values (
-        'x', 1, 's', 'complete', app.test_clock_pin(),
-        1, 0, 0, 0, 0, 1, app.test_clock_pin(), repeat('ab', 32), '[]', 'sync'
+        'x', 1, 's', 'complete', now(),
+        1, 0, 0, 0, 0, 1, now(), repeat('ab', 32), '[]', 'sync'
       )$$,
     '42501',
-    null::text,
+    'permission denied for table pos_order_snapshots',
     'non-owner cannot insert a snapshot'
   );
 
@@ -567,9 +567,9 @@ select
   throws_ok (
     $$insert into app.pos_refund_revisions (
         shift_id, tx_id, tx_type, amount, occurred_at, present, origin
-      ) values ('s', 't', 3, 1, app.test_clock_pin(), true, 'sync')$$,
+      ) values ('s', 't', 3, 1, now(), true, 'sync')$$,
     '42501',
-    null::text,
+    'permission denied for table pos_refund_revisions',
     'service_role cannot insert a refund revision'
   );
 
