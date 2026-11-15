@@ -179,11 +179,12 @@ function movementSql(type, at) {
   )));`;
 }
 
-function countPayload(requestId, qty, countedAt) {
+function countPayload(requestId, qty, countedAt, raw = false) {
+  const at = raw ? countedAt : `'${countedAt}'`;
   return `jsonb_build_object(
     'request_id', '${requestId}',
     'frequency', 'daily',
-    'counted_at', '${countedAt}',
+    'counted_at', ${at},
     'lines', jsonb_build_array(jsonb_build_object(
       'item_id', '${itemA}',
       'counted_qty', '${qty}',
@@ -342,8 +343,8 @@ insert into app.pos_orders (
   id, shift_id, status, order_type, ordered_at, subtotal, discount, tax,
   service_tax, delivery_fee, total, pos_update_time, content_hash, missing_from_pos
 ) values (
-  '${orderId}', 'race-w-shift', 'complete', 'hall-race', '${at}',
-  0, 0, 0, 0, 0, 0, '${at}', rpad(md5('${orderId}'), 64, 'a'), false
+  '${orderId}', 'race-w-shift', 'complete', 'hall-race', ${at},
+  0, 0, 0, 0, 0, 0, ${at}, rpad(md5('${orderId}'), 64, 'a'), false
 );
 insert into app.pos_order_lines (
   order_id, line_id, item_id, item_name, quantity, options, line_total
@@ -908,10 +909,15 @@ commit;
   await checkLedger('ingest holds, worker waits', secondHead.orderId);
 
   const countedFirst = await countedTarget();
+  const countedAtFirst = (
+    await execOk(
+      `select (pg_catalog.clock_timestamp() + interval '2 minutes')::text;`,
+    )
+  ).trim();
   await execOk(`
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000023', countedFirst, '2026-08-11T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000025', countedFirst, countedAtFirst)});
 commit;
 `);
   await execOk(`
@@ -937,14 +943,18 @@ select app.ingest_pos_batch(
 select app.finish_pos_sync_run(:run_id, 'ok', '{}'::jsonb, '');
 commit;
 `);
-  const countOrder = await queueDeductible('race-c1', '2026-08-10 09:30:00+00');
+  await drain();
+  const countOrder = await queueDeductible(
+    'race-c1',
+    'pg_catalog.clock_timestamp()',
+  );
   const workerHoldsCount = await race(
     workerSql(countOrder.orderId, countOrder.generation, true),
     `
 \\set VERBOSITY verbose
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000023', countedFirst, '2026-08-11T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000025', countedFirst, countedAtFirst)});
 commit;
 `,
   );
@@ -959,15 +969,20 @@ commit;
   await assertCountRace(
     'worker holds, record_count posting waits',
     countOrder.orderId,
-    'c9e00000-0000-4000-8000-000000000023',
+    'c9e00000-0000-4000-8000-000000000025',
     countedFirst,
   );
 
   const countedSecond = await countedTarget();
+  const countedAtSecond = (
+    await execOk(
+      `select (pg_catalog.clock_timestamp() + interval '2 minutes')::text;`,
+    )
+  ).trim();
   await execOk(`
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000024', countedSecond, '2026-08-12T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000026', countedSecond, countedAtSecond)});
 commit;
 `);
   await execOk(`
@@ -993,16 +1008,17 @@ select app.ingest_pos_batch(
 select app.finish_pos_sync_run(:run_id, 'ok', '{}'::jsonb, '');
 commit;
 `);
+  await drain();
   const reverseOrder = await queueDeductible(
     'race-c2',
-    '2026-08-10 09:15:00+00',
+    'pg_catalog.clock_timestamp()',
   );
   const countHoldsWorker = await race(
     `
 \\set VERBOSITY verbose
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000024', countedSecond, '2026-08-12T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000026', countedSecond, countedAtSecond)});
 select pg_sleep(${holdMs});
 commit;
 `,
@@ -1025,7 +1041,7 @@ commit;
   await assertCountRace(
     'record_count posting holds, worker waits',
     reverseOrder.orderId,
-    'c9e00000-0000-4000-8000-000000000024',
+    'c9e00000-0000-4000-8000-000000000026',
     countedSecond,
   );
 

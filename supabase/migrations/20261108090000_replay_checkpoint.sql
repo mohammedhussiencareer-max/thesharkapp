@@ -189,6 +189,31 @@ create trigger trg_replay_checkpoint_invalidations_no_truncate
 before truncate on app.replay_checkpoint_invalidations for each statement
 execute function app.prevent_append_only_mutation ();
 
+-- Written only while app.replay_probe is 1. Production replays do not explain themselves.
+create table app.replay_read_probe (
+  id bigint generated always as identity primary key,
+  captured_at timestamptz not null default pg_catalog.clock_timestamp (),
+  time_arm_rows bigint not null,
+  id_arm_rows bigint not null,
+  deficit_rows bigint not null,
+  time_arm_plan text not null,
+  id_arm_plan text not null,
+  time_arm_index boolean not null,
+  id_arm_index boolean not null,
+  replay_ms numeric(14, 3) not null default 0
+);
+
+comment on table app.replay_read_probe is 'One confirming replay''s suffix arms and the deficits restored before the walk. The benchmark sets app.replay_probe. Plans are EXPLAIN text, not a second read.';
+
+alter table app.replay_read_probe enable row level security;
+
+revoke all on app.replay_read_probe
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 -- ============================================================================
 -- Closed-period sources and the contribution already posted for a source.
 -- ============================================================================
@@ -211,12 +236,16 @@ create table app.recognized_contribution (
   source_id text not null,
   item_id uuid not null references app.stock_items (id) on delete restrict,
   bucket text not null,
+  quantity numeric(20, 6) not null default 0,
   amount numeric(14, 2) not null,
   primary key (source_kind, source_id, item_id, bucket),
-  constraint recognized_contribution_finite_chk check (amount <> 'NaN'::numeric)
+  constraint recognized_contribution_finite_chk check (
+    quantity <> 'NaN'::numeric
+    and amount <> 'NaN'::numeric
+  )
 );
 
-comment on table app.recognized_contribution is 'Contribution already posted for one source, item, and bucket. The next posting of that source writes required minus this amount.';
+comment on table app.recognized_contribution is 'Quantity and value already posted for one source, item, and bucket. The next posting of that source writes required minus this contribution.';
 
 -- ============================================================================
 -- Queue. One row per order. eligible_count is maintained per order, not by
@@ -250,9 +279,9 @@ where
 
 -- ============================================================================
 -- Activation history. The bound is the set of inputs that existed when
--- activation was inserted. The loaded marker is written only after that set
--- is non-empty and every frozen input has a posting receipt. An empty bound
--- does not set the marker: historical orders then stay ordinary first postings.
+-- activation was inserted. The loaded marker is written once that bound
+-- exists and every frozen input has a durable posting proof. An empty bound
+-- completes immediately. A bound row that was never inserted does not.
 -- ============================================================================
 create table app.activation_history_bound (
   id smallint primary key default 1 check (id = 1),
@@ -276,7 +305,25 @@ create table app.activation_history_loaded (
   loaded_at timestamptz not null
 );
 
-comment on table app.activation_history_loaded is 'Written under the ledger lock once every frozen input has a posting receipt. Absent when the bound set was empty. After it exists, a newly discovered order before the window is a closed cause.';
+comment on table app.activation_history_loaded is 'Written once the activation bound exists and every frozen input has a posting proof. An empty bound sets it. After it exists, a newly discovered order before the window is a closed cause.';
+
+create table app.activation_history_posted (
+  order_id text primary key,
+  cost_input_id bigint not null,
+  application_id bigint not null,
+  posted_at timestamptz not null default pg_catalog.clock_timestamp ()
+);
+
+comment on table app.activation_history_posted is 'Durable proof that a frozen input was posted. The current owner can move to a later edit; this row stays, and that edit is no longer held back.';
+
+alter table app.activation_history_posted enable row level security;
+
+revoke all on app.activation_history_posted
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
 
 create table app.closed_span_orders (
   span_id bigint not null references app.accounting_rederive_spans (id) on delete restrict,
@@ -1101,6 +1148,15 @@ declare
   v_qty numeric(20, 6);
   v_value numeric(14, 2);
   v_avg numeric(20, 6);
+  v_out numeric(20, 6);
+  v_normal_qty numeric(20, 6);
+  v_prov_qty numeric(20, 6);
+  v_normal_cost numeric(14, 2);
+  v_prov_cost numeric(14, 2);
+  v_prov_unit numeric(20, 6);
+  v_ord integer;
+  v_event bigint;
+  v_piece integer;
 begin
   if exists (
     select
@@ -1131,20 +1187,125 @@ begin
       p_note
     );
   elsif p_quantity < 0 then
-    perform app.replay_outflow (
-      p_movement_id,
-      p_item_id,
-      'closed_period'::app.movement_type,
-      p_occurred_at,
-      -p_quantity,
-      null,
-      p_is_pending,
-      p_line_key,
-      p_shift_id,
-      p_source_type,
-      p_source_id,
-      p_note
-    );
+    -- A stored total has to stay the effect base. The ordinary forced-total
+    -- path would consume the whole quantity and skip the deficit.
+    if p_is_pending then
+      perform app.replay_outflow (
+        p_movement_id,
+        p_item_id,
+        'closed_period'::app.movement_type,
+        p_occurred_at,
+        -p_quantity,
+        null,
+        p_is_pending,
+        p_line_key,
+        p_shift_id,
+        p_source_type,
+        p_source_id,
+        p_note
+      );
+    else
+      select
+        b.on_hand_qty
+      into v_qty
+      from
+        ledger_scratch.recompute_bal b
+      where
+        b.item_id = p_item_id;
+
+      v_qty := coalesce(v_qty, 0);
+      v_out := -p_quantity;
+      v_normal_qty := least(v_out, greatest(v_qty, 0::numeric));
+      v_prov_qty := v_out - v_normal_qty;
+
+      if v_prov_qty > 0
+      and v_out > 0 then
+        v_prov_cost := pg_catalog.round(p_total_cost * v_prov_qty / v_out, 2);
+      else
+        v_prov_cost := 0;
+      end if;
+
+      v_normal_cost := p_total_cost - v_prov_cost;
+      v_prov_cost := app.assert_recompute_range (v_prov_cost, 2, true);
+      v_normal_cost := app.assert_recompute_range (v_normal_cost, 2, true);
+
+      select
+        coalesce(q.ord_class, 0),
+        q.event_position,
+        coalesce(q.piece_position, 0)
+      into
+        v_ord,
+        v_event,
+        v_piece
+      from
+        ledger_scratch.recompute_row q
+      where
+        q.movement_id = p_movement_id;
+
+      v_ord := coalesce(v_ord, 0);
+      v_event := coalesce(v_event, p_movement_id);
+      v_piece := coalesce(v_piece, 0);
+
+      insert into
+        ledger_scratch.recompute_effect (
+          movement_id,
+          item_id,
+          movement_type,
+          base_total,
+          unit_cost,
+          cover_total
+        )
+      values
+        (
+          p_movement_id,
+          p_item_id,
+          'closed_period'::app.movement_type,
+          v_normal_cost + v_prov_cost,
+          case
+            when p_quantity = 0 then 0
+            else app.assert_recompute_range (abs(pg_catalog.round(p_total_cost / p_quantity, 6)), 6, false)
+          end,
+          0
+        );
+
+      if v_prov_qty > 0 then
+        v_prov_unit := app.assert_recompute_range (abs(v_prov_cost) / v_prov_qty, 6, false);
+
+        insert into
+          ledger_scratch.recompute_def (
+            movement_id,
+            item_id,
+            qty_uncovered,
+            provisional_unit_cost,
+            value_uncovered,
+            occurred_at,
+            ord_class,
+            event_position,
+            piece_position
+          )
+        values
+          (
+            p_movement_id,
+            p_item_id,
+            v_prov_qty,
+            v_prov_unit,
+            abs(v_prov_cost),
+            p_occurred_at,
+            v_ord,
+            v_event,
+            v_piece
+          );
+      end if;
+
+      update ledger_scratch.recompute_bal
+      set
+        on_hand_qty = on_hand_qty - v_out,
+        on_hand_value = app.assert_recompute_range (on_hand_value + p_total_cost, 2, true)
+      where
+        item_id = p_item_id;
+
+      perform app.replay_touch_deficit_flag (p_item_id);
+    end if;
   else
     update ledger_scratch.recompute_bal balance
     set
@@ -1196,7 +1357,7 @@ comment on function app.replay_apply_closed_period (
   text,
   text,
   text
-) is 'Apply one closed_period row. A cover-pair carrier is skipped because the cover loop already added its value. A positive quantity uses the economic kind. A zero quantity adds the value only.';
+) is 'Apply one closed_period row. A cover-pair carrier is skipped because the cover loop already added its value. A positive quantity uses the economic kind. A negative quantity keeps the stored total as the effect base and still opens a deficit for the uncovered quantity. A zero quantity adds the value only.';
 
 revoke all on function app.replay_apply_closed_period (
   bigint,
@@ -2057,9 +2218,14 @@ declare
   v_raw numeric(14, 2);
   v_held numeric(14, 2);
   v_consumed numeric(14, 2);
+  v_natural numeric(14, 2);
+  v_overflow numeric(14, 2);
   v_weights numeric[];
   v_parts numeric[];
+  v_natural_parts numeric[];
+  v_overflow_parts numeric[];
   v_weight_sum numeric;
+  v_consume_sum numeric;
 begin
   select
     balance.on_hand_qty,
@@ -2097,21 +2263,45 @@ begin
   if v_on_qty > 0
   and v_raw < -v_on_value then
     v_held := -v_on_value;
+    v_overflow := pg_catalog.round(v_raw - v_held, 2);
   else
     v_held := v_raw;
+    v_overflow := 0;
   end if;
 
-  v_consumed := pg_catalog.round(p_value_delta - v_held, 2);
+  -- The cap overflow is not a share of the original layer. It follows only
+  -- this item's own consumption, never a sort that moved the layer onward.
+  v_natural := pg_catalog.round(p_value_delta - v_raw, 2);
+  v_consumed := pg_catalog.round(v_natural + v_overflow, 2);
   v_weights := app.closed_bucket_weights (p_item_id, p_doc_at, p_change);
   v_weight_sum := v_weights[1] + v_weights[2] + v_weights[3] + v_weights[4];
+  v_consume_sum := v_weights[1] + v_weights[2] + v_weights[3];
 
-  if v_consumed = 0 then
-    v_parts := array[0, 0, 0, 0]::numeric[];
+  if v_natural = 0 then
+    v_natural_parts := array[0, 0, 0, 0]::numeric[];
   elsif v_weight_sum = 0 then
-    v_parts := array[v_consumed, 0, 0, 0]::numeric[];
+    v_natural_parts := array[v_natural, 0, 0, 0]::numeric[];
   else
-    v_parts := app.split_money (v_consumed, v_weights);
+    v_natural_parts := app.split_money (v_natural, v_weights);
   end if;
+
+  if v_overflow = 0 then
+    v_overflow_parts := array[0, 0, 0]::numeric[];
+  elsif v_consume_sum = 0 then
+    v_overflow_parts := array[v_overflow, 0, 0]::numeric[];
+  else
+    v_overflow_parts := app.split_money (
+      v_overflow,
+      array[v_weights[1], v_weights[2], v_weights[3]]
+    );
+  end if;
+
+  v_parts := array[
+    v_natural_parts[1] + v_overflow_parts[1],
+    v_natural_parts[2] + v_overflow_parts[2],
+    v_natural_parts[3] + v_overflow_parts[3],
+    v_natural_parts[4]
+  ]::numeric[];
 
   return pg_catalog.jsonb_build_object(
     'known',
@@ -2584,8 +2774,11 @@ begin
         p_waste_chain,
         null,
         null,
-        null,
-        0
+        0,
+        case
+          when v_piece < 0 then 8
+          else 0
+        end
       );
 
       v_child := app.closed_allocation (
@@ -3045,13 +3238,7 @@ set
   search_path = '' as $$
   select
     case
-      when not exists (
-        select
-          1
-        from
-          app.activation_history_loaded
-      )
-      and exists (
+      when exists (
         select
           1
         from
@@ -3062,12 +3249,10 @@ set
             select
               1
             from
-              app.order_cost_state head
-              join app.order_cost_applications application on application.id = head.owner_application_id
+              app.activation_history_posted posted
             where
-              head.order_id = p_order_id
-              and application.cost_input_id = frozen.cost_input_id
-              and application.receipt_kind = 'posting'
+              posted.order_id = frozen.order_id
+              and posted.cost_input_id = frozen.cost_input_id
           )
       ) then (
         select
@@ -3092,7 +3277,7 @@ set
     end;
 $$;
 
-comment on function app.order_processing_input_id (text) is 'The frozen cost input while the loaded marker is absent and that input is not yet posted. Otherwise the latest input.';
+comment on function app.order_processing_input_id (text) is 'The frozen cost input until that input has a durable posting proof. After the proof, the latest input, including an edit that arrived while the input was frozen.';
 
 revoke all on function app.order_processing_input_id (text)
 from
@@ -3118,7 +3303,7 @@ begin
     select
       1
     from
-      app.activation_history_input
+      app.activation_history_bound
   ) then
     return;
   end if;
@@ -3133,12 +3318,10 @@ begin
         select
           1
         from
-          app.order_cost_state head
-          join app.order_cost_applications application on application.id = head.owner_application_id
+          app.activation_history_posted posted
         where
-          head.order_id = frozen.order_id
-          and application.cost_input_id = frozen.cost_input_id
-          and application.receipt_kind = 'posting'
+          posted.order_id = frozen.order_id
+          and posted.cost_input_id = frozen.cost_input_id
       )
   ) then
     return;
@@ -3151,7 +3334,7 @@ begin
 end;
 $$;
 
-comment on function app.maybe_mark_activation_loaded () is 'Set the loaded marker only when the bound set is non-empty and every frozen input has a posting receipt. An empty bound leaves the marker unset. Blocked and disposition_pending do not count.';
+comment on function app.maybe_mark_activation_loaded () is 'Set the loaded marker once an activation bound exists and every frozen input has a posting receipt. A bound with no inputs completes. A bound that was never inserted leaves the marker unset. Blocked and disposition_pending do not count.';
 
 revoke all on function app.maybe_mark_activation_loaded ()
 from
@@ -3189,11 +3372,23 @@ begin
     event.order_id,
     input.input_revision desc;
 
+  if not exists (
+    select
+      1
+    from
+      app.activation_history_input
+  ) then
+    insert into
+      app.activation_history_loaded (loaded_at)
+    values
+      (pg_catalog.clock_timestamp ());
+  end if;
+
   return null;
 end;
 $$;
 
-comment on function app.trg_activation_history_bound () is 'On activation insert, freeze the latest cost input of every order whose event already existed. Later orders are not part of the bound.';
+comment on function app.trg_activation_history_bound () is 'On activation insert, freeze the latest cost input of every order whose event already existed. An empty copy completes the bound. Later orders are not part of it.';
 
 revoke all on function app.trg_activation_history_bound ()
 from
@@ -3205,6 +3400,42 @@ from
 create trigger trg_inventory_activation_history
 after insert on app.inventory_activation for each row
 execute function app.trg_activation_history_bound ();
+
+create function app.note_activation_history_posted () returns trigger language plpgsql security definer
+set
+  search_path = '' as $$
+begin
+  if new.receipt_kind = 'posting' then
+    insert into
+      app.activation_history_posted (order_id, cost_input_id, application_id)
+    select
+      new.order_id,
+      new.cost_input_id,
+      new.id
+    from
+      app.activation_history_input frozen
+    where
+      frozen.order_id = new.order_id
+      and frozen.cost_input_id = new.cost_input_id
+    on conflict (order_id) do nothing;
+  end if;
+
+  return new;
+end;
+$$;
+
+comment on function app.note_activation_history_posted () is 'Record the frozen input the first time a posting receipt is written for it. A later owner does not erase the proof.';
+
+revoke all on function app.note_activation_history_posted ()
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create trigger trg_activation_history_posted
+after insert on app.order_cost_applications for each row
+execute function app.note_activation_history_posted ();
 
 create function app.post_closed_historical_order (
   p_order_id text,
@@ -3706,6 +3937,234 @@ begin
 end;
 $$;
 
+create function app.replay_plan_uses_movement_index (p_plan text) returns boolean language sql immutable security definer
+set
+  search_path = '' as $$
+  select
+    (
+      p_plan ~* 'Index (Only )?Scan using \S+ on stock_movements( |$)'
+      or p_plan ~* 'Bitmap Index Scan on stock_movements'
+    )
+    and p_plan !~* 'Seq Scan on stock_movements( |$)';
+$$;
+
+comment on function app.replay_plan_uses_movement_index (text) is 'True when the plan reads stock_movements by an index range and does not sequence-scan that table.';
+
+revoke all on function app.replay_plan_uses_movement_index (text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.replay_capture_read (p_item_ids uuid[]) returns void language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_time_rows bigint := 0;
+  v_id_rows bigint := 0;
+  v_def_rows bigint := 0;
+  v_time_plan text := '';
+  v_id_plan text := '';
+  v_line record;
+  v_resume record;
+  v_has_checkpoint boolean := false;
+begin
+  if coalesce(pg_catalog.current_setting('app.replay_probe', true), '') <> '1' then
+    return;
+  end if;
+
+  select
+    exists (
+      select
+        1
+      from
+        ledger_scratch.replay_resume resume
+      where
+        resume.item_id = any (p_item_ids)
+        and resume.checkpoint_id is not null
+    )
+  into v_has_checkpoint;
+
+  select
+    count(*)
+  into v_time_rows
+  from
+    ledger_scratch.recompute_row q
+    join ledger_scratch.replay_resume resume on resume.item_id = q.item_id
+  where
+    not q.is_pending
+    and q.item_id = any (p_item_ids)
+    and resume.checkpoint_id is not null
+    and q.occurred_at > resume.cut_occurred_at;
+
+  select
+    count(*)
+  into v_id_rows
+  from
+    ledger_scratch.recompute_row q
+    join ledger_scratch.replay_resume resume on resume.item_id = q.item_id
+  where
+    not q.is_pending
+    and q.item_id = any (p_item_ids)
+    and resume.checkpoint_id is not null
+    and q.movement_id > resume.max_movement_id;
+
+  select
+    count(*)
+  into v_def_rows
+  from
+    ledger_scratch.recompute_def d
+  where
+    d.item_id = any (p_item_ids);
+
+  if v_has_checkpoint then
+    for v_resume in
+      select
+        resume.item_id,
+        resume.cut_occurred_at,
+        resume.max_movement_id
+      from
+        ledger_scratch.replay_resume resume
+      where
+        resume.item_id = any (p_item_ids)
+        and resume.checkpoint_id is not null
+    loop
+      for v_line in execute format(
+        $explain$
+        explain (format text)
+        select sm.id
+        from app.stock_movements sm
+        where sm.item_id = %1$L
+          and sm.occurred_at > %2$L::timestamptz
+          and sm.movement_type <> 'cost_adjustment'
+          and sm.reverses_movement_id is null
+          and sm.movement_type not in ('sale_reversal', 'waste_reversal')
+          and not exists (
+            select 1 from app.stock_movements rev
+            where rev.reverses_movement_id = sm.id
+          )
+          and not exists (
+            select 1 from app.stock_count_lines linked
+            where linked.movement_id = sm.id
+          )
+          and not exists (
+            select 1 from app.stock_count_postings posting
+            where posting.movement_id = sm.id
+          )
+        $explain$,
+        v_resume.item_id,
+        v_resume.cut_occurred_at
+      )
+      loop
+        v_time_plan := v_time_plan || v_line."QUERY PLAN" || e'\n';
+      end loop;
+
+      for v_line in execute format(
+        $explain$
+        explain (format text)
+        select sm.id
+        from app.stock_movements sm
+        where sm.item_id = %1$L
+          and sm.id > %2$L::bigint
+          and sm.movement_type <> 'cost_adjustment'
+          and sm.reverses_movement_id is null
+          and sm.movement_type not in ('sale_reversal', 'waste_reversal')
+          and not exists (
+            select 1 from app.stock_movements rev
+            where rev.reverses_movement_id = sm.id
+          )
+          and not exists (
+            select 1 from app.stock_count_lines linked
+            where linked.movement_id = sm.id
+          )
+          and not exists (
+            select 1 from app.stock_count_postings posting
+            where posting.movement_id = sm.id
+          )
+        $explain$,
+        v_resume.item_id,
+        v_resume.max_movement_id
+      )
+      loop
+        v_id_plan := v_id_plan || v_line."QUERY PLAN" || e'\n';
+      end loop;
+    end loop;
+  end if;
+
+  insert into
+    app.replay_read_probe (
+      time_arm_rows,
+      id_arm_rows,
+      deficit_rows,
+      time_arm_plan,
+      id_arm_plan,
+      time_arm_index,
+      id_arm_index
+    )
+  values
+    (
+      v_time_rows,
+      v_id_rows,
+      v_def_rows,
+      v_time_plan,
+      v_id_plan,
+      app.replay_plan_uses_movement_index (v_time_plan),
+      app.replay_plan_uses_movement_index (v_id_plan)
+    );
+end;
+$$;
+
+comment on function app.replay_capture_read (uuid[]) is 'While app.replay_probe is 1, record the suffix rows just loaded, the deficits restored before the walk, and the plans of the two range arms. EXPLAIN does not read the rows again.';
+
+revoke all on function app.replay_capture_read (uuid[])
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.replay_note_probe_ms () returns void language plpgsql security definer
+set
+  search_path = '' as $$
+begin
+  if coalesce(pg_catalog.current_setting('app.replay_probe', true), '') <> '1' then
+    return;
+  end if;
+
+  if coalesce(pg_catalog.current_setting('app.replay_probe_t0', true), '') = '' then
+    return;
+  end if;
+
+  update app.replay_read_probe probe
+  set
+    replay_ms = pg_catalog.round(
+      extract(
+        epoch
+        from
+          pg_catalog.clock_timestamp() - pg_catalog.current_setting('app.replay_probe_t0', true)::timestamptz
+      ) * 1000,
+      3
+    )
+  where
+    probe.id = (
+      select
+        max(latest.id)
+      from
+        app.replay_read_probe latest
+    );
+end;
+$$;
+
+comment on function app.replay_note_probe_ms () is 'Stamp the latest probe row with the confirming replay''s elapsed milliseconds.';
+
+revoke all on function app.replay_note_probe_ms ()
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 create or replace function app.replay_execute (
   p_item_ids uuid[],
   p_pending jsonb,
@@ -3752,6 +4211,10 @@ begin
     p_pending := '[]'::jsonb;
   end if;
 
+  if coalesce(pg_catalog.current_setting('app.replay_probe', true), '') = '1' then
+    perform pg_catalog.set_config('app.replay_probe_t0', pg_catalog.clock_timestamp()::text, true);
+  end if;
+
   perform app.replay_prepare_tables ();
 
   perform app.replay_note_window ();
@@ -3780,32 +4243,43 @@ begin
   where
     t.item_id is not null;
 
-  insert into
-    ledger_scratch.recompute_row (
-      movement_id,
-      is_pending,
-      batch_id,
-      item_id,
-      movement_type,
-      occurred_at,
-      quantity,
-      unit_cost,
-      total_cost,
-      is_input_total,
-      shift_id,
-      source_type,
-      source_id,
-      note,
-      ord_class,
-      line_key,
-      consumed,
-      event_position,
-      piece_position,
-      engine_valued
-    )
-  select
-    sm.id,
-    false,
+  -- The join below cannot see that a checkpoint already covers the item, so
+  -- it would hash the whole ledger and throw the rows away. Skip it then.
+  if exists (
+    select
+      1
+    from
+      ledger_scratch.replay_resume resume
+    where
+      resume.checkpoint_id is null
+      and resume.item_id = any (p_item_ids)
+  ) then
+    insert into
+      ledger_scratch.recompute_row (
+        movement_id,
+        is_pending,
+        batch_id,
+        item_id,
+        movement_type,
+        occurred_at,
+        quantity,
+        unit_cost,
+        total_cost,
+        is_input_total,
+        shift_id,
+        source_type,
+        source_id,
+        note,
+        ord_class,
+        line_key,
+        consumed,
+        event_position,
+        piece_position,
+        engine_valued
+      )
+    select
+      sm.id,
+      false,
     sm.batch_id,
     sm.item_id,
     sm.movement_type,
@@ -3872,79 +4346,105 @@ begin
           where
             posting.movement_id = sm.id
         )
-      union
-      select
-        sm.*
-      from
-        app.stock_movements sm
-        join ledger_scratch.replay_resume resume on resume.item_id = sm.item_id
-      where
-        resume.checkpoint_id is not null
-        and sm.occurred_at > resume.cut_occurred_at
-        and sm.movement_type <> 'cost_adjustment'
-        and sm.reverses_movement_id is null
-        and sm.movement_type not in ('sale_reversal', 'waste_reversal')
-        and not exists (
-          select
-            1
-          from
-            app.stock_movements rev
-          where
-            rev.reverses_movement_id = sm.id
-        )
-        and not exists (
-          select
-            1
-          from
-            app.stock_count_lines linked
-          where
-            linked.movement_id = sm.id
-        )
-        and not exists (
-          select
-            1
-          from
-            app.stock_count_postings posting
-          where
-            posting.movement_id = sm.id
-        )
-      union
-      select
-        sm.*
-      from
-        app.stock_movements sm
-        join ledger_scratch.replay_resume resume on resume.item_id = sm.item_id
-      where
-        resume.checkpoint_id is not null
-        and sm.id > resume.max_movement_id
-        and sm.movement_type <> 'cost_adjustment'
-        and sm.reverses_movement_id is null
-        and sm.movement_type not in ('sale_reversal', 'waste_reversal')
-        and not exists (
-          select
-            1
-          from
-            app.stock_movements rev
-          where
-            rev.reverses_movement_id = sm.id
-        )
-        and not exists (
-          select
-            1
-          from
-            app.stock_count_lines linked
-          where
-            linked.movement_id = sm.id
-        )
-        and not exists (
-          select
-            1
-          from
-            app.stock_count_postings posting
-          where
-            posting.movement_id = sm.id
-        )
     ) sm;
+  end if;
+
+  -- A joined cut is a runtime column, so the planner hashes the whole ledger.
+  -- Literals let each arm range-scan stock_movements. UNION keeps a row that
+  -- is past the cut by time or by id exactly once.
+  for r in
+    select
+      resume.item_id,
+      resume.cut_occurred_at,
+      resume.max_movement_id
+    from
+      ledger_scratch.replay_resume resume
+    where
+      resume.checkpoint_id is not null
+      and resume.item_id = any (p_item_ids)
+  loop
+    execute format(
+      $load$
+      insert into ledger_scratch.recompute_row (
+        movement_id, is_pending, batch_id, item_id, movement_type, occurred_at,
+        quantity, unit_cost, total_cost, is_input_total, shift_id, source_type,
+        source_id, note, ord_class, line_key, consumed, event_position,
+        piece_position, engine_valued
+      )
+      select
+        sm.id,
+        false,
+        sm.batch_id,
+        sm.item_id,
+        sm.movement_type,
+        sm.occurred_at,
+        sm.quantity,
+        sm.unit_cost,
+        sm.total_cost,
+        sm.movement_type in ('purchase', 'opening'),
+        sm.shift_id,
+        sm.source_type,
+        sm.source_id,
+        sm.note,
+        case
+          when sm.movement_type = 'count_adjustment'
+          and exists (
+            select 1 from app.stock_count_lines scl where scl.movement_id = sm.id
+          ) then 1
+          else 0
+        end,
+        0,
+        false,
+        coalesce(sm.event_position, sm.id),
+        coalesce(sm.piece_position, 0),
+        coalesce(sm.engine_valued, false)
+      from (
+        select sm.*
+        from app.stock_movements sm
+        where sm.item_id = %1$L
+          and sm.occurred_at > %2$L::timestamptz
+          and sm.movement_type <> 'cost_adjustment'
+          and sm.reverses_movement_id is null
+          and sm.movement_type not in ('sale_reversal', 'waste_reversal')
+          and not exists (
+            select 1 from app.stock_movements rev
+            where rev.reverses_movement_id = sm.id
+          )
+          and not exists (
+            select 1 from app.stock_count_lines linked
+            where linked.movement_id = sm.id
+          )
+          and not exists (
+            select 1 from app.stock_count_postings posting
+            where posting.movement_id = sm.id
+          )
+        union
+        select sm.*
+        from app.stock_movements sm
+        where sm.item_id = %1$L
+          and sm.id > %3$L::bigint
+          and sm.movement_type <> 'cost_adjustment'
+          and sm.reverses_movement_id is null
+          and sm.movement_type not in ('sale_reversal', 'waste_reversal')
+          and not exists (
+            select 1 from app.stock_movements rev
+            where rev.reverses_movement_id = sm.id
+          )
+          and not exists (
+            select 1 from app.stock_count_lines linked
+            where linked.movement_id = sm.id
+          )
+          and not exists (
+            select 1 from app.stock_count_postings posting
+            where posting.movement_id = sm.id
+          )
+      ) sm
+      $load$,
+      r.item_id,
+      r.cut_occurred_at,
+      r.max_movement_id
+    );
+  end loop;
 
   select
     coalesce(max(sm.id), 0)
@@ -4009,7 +4509,8 @@ begin
   from
     ledger_scratch.recompute_row q;
 
-  -- Anchors are replay events too, so they count against the same cap.
+  -- The cap is the suffix this call loads. Anchors already inside the
+  -- checkpoint are not read and do not count.
   if (
     select
       count(*)
@@ -4020,8 +4521,13 @@ begin
       count(*)
     from
       app.stock_count_anchors anchor
+      join ledger_scratch.replay_resume resume on resume.item_id = anchor.item_id
     where
       anchor.item_id = any (p_item_ids)
+      and (
+        resume.checkpoint_id is null
+        or anchor.counted_at > resume.cut_occurred_at
+      )
   ) > 100000
   and not app.replay_cap_waived (p_item_ids) then
     perform app.raise_recompute_failure ('recompute_limit');
@@ -4059,6 +4565,8 @@ begin
       resume.checkpoint_id is null
       or anchor.counted_at > resume.cut_occurred_at
     );
+
+  perform app.replay_capture_read (p_item_ids);
 
   for r in
     select
@@ -4645,6 +5153,8 @@ begin
   end if;
 
   perform app.replay_publish_checkpoints (p_item_ids);
+
+  perform app.replay_note_probe_ms ();
 exception
   when numeric_value_out_of_range then
     perform app.raise_recompute_failure ('critical');
@@ -5043,6 +5553,765 @@ begin
 end;
 $$;
 
+create function app.closed_unit_cost (p_item_id uuid) returns numeric language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    coalesce(
+      (
+        select
+          balance.avg_cost
+        from
+          app.item_balances balance
+        where
+          balance.item_id = p_item_id
+          and balance.avg_cost > 0
+      ),
+      (
+        select
+          seed.unit_cost
+        from
+          app.item_provisional_seeds seed
+        where
+          seed.item_id = p_item_id
+      ),
+      (
+        select
+          price.unit_cost
+        from
+          app.item_opening_prices price
+        where
+          price.item_id = p_item_id
+          and price.superseded_change_id is null
+      )
+    );
+$$;
+
+comment on function app.closed_unit_cost (uuid) is 'Average when it is positive, otherwise the provisional seed, otherwise the opening price. Null when this item has no cost basis.';
+
+revoke all on function app.closed_unit_cost (uuid)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.post_recognized_delta (
+  p_cause uuid,
+  p_source_kind text,
+  p_source_id text,
+  p_item_id uuid,
+  p_bucket text,
+  p_economic text,
+  p_required_qty numeric,
+  p_required_value numeric,
+  p_shift text,
+  p_reason text,
+  p_report text,
+  p_waste_chain uuid,
+  p_return_movement bigint,
+  p_span_id bigint,
+  p_piece integer
+) returns bigint language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_qty numeric(20, 6);
+  v_amount numeric(14, 2);
+  v_delta_qty numeric(20, 6);
+  v_delta_value numeric(14, 2);
+  v_change timestamptz;
+  v_kind text;
+  v_source text;
+  v_id bigint;
+begin
+  v_change := app.note_change_instant ();
+
+  select
+    contribution.quantity,
+    contribution.amount
+  into
+    v_qty,
+    v_amount
+  from
+    app.recognized_contribution contribution
+  where
+    contribution.source_kind = p_source_kind
+    and contribution.source_id = p_source_id
+    and contribution.item_id = p_item_id
+    and contribution.bucket = p_bucket
+  for update;
+
+  v_qty := coalesce(v_qty, 0);
+  v_amount := coalesce(v_amount, 0);
+  v_delta_qty := p_required_qty - v_qty;
+  v_delta_value := pg_catalog.round(p_required_value - v_amount, 2);
+
+  if v_delta_qty <> 0
+  or v_delta_value <> 0 then
+    if v_delta_qty < 0
+    and p_return_movement is not null then
+      v_kind := 'return';
+      v_source := p_return_movement::text;
+    else
+      v_kind := p_source_kind;
+      v_source := p_source_id;
+    end if;
+
+    v_id := app.insert_closed_movement (
+      p_cause,
+      p_item_id,
+      v_change,
+      -v_delta_qty,
+      -v_delta_value,
+      p_bucket,
+      p_economic,
+      coalesce(p_shift, app.closed_containing_shift (v_change)),
+      v_kind,
+      v_source,
+      p_reason,
+      p_report,
+      p_waste_chain,
+      null,
+      null,
+      0,
+      coalesce(p_piece, 0)
+    );
+  end if;
+
+  insert into
+    app.recognized_contribution (source_kind, source_id, item_id, bucket, quantity, amount)
+  values
+    (
+      p_source_kind,
+      p_source_id,
+      p_item_id,
+      p_bucket,
+      p_required_qty,
+      pg_catalog.round(p_required_value, 2)
+    )
+  on conflict (source_kind, source_id, item_id, bucket) do update
+  set
+    quantity = excluded.quantity,
+    amount = excluded.amount;
+
+  perform app.record_accrual_version (
+    p_span_id,
+    null,
+    app.restatement_window_start (),
+    null,
+    null,
+    p_source_kind,
+    p_source_id,
+    p_item_id,
+    p_required_qty,
+    pg_catalog.round(p_required_value, 2)
+  );
+
+  return v_id;
+end;
+$$;
+
+comment on function app.post_recognized_delta (
+  uuid,
+  text,
+  text,
+  uuid,
+  text,
+  text,
+  numeric,
+  numeric,
+  text,
+  text,
+  text,
+  uuid,
+  bigint,
+  bigint,
+  integer
+) is 'Post required minus the recognized quantity and value, then store both. A reduction is a return of the earlier movement so that deficit is cancelled on its own row.';
+
+revoke all on function app.post_recognized_delta (
+  uuid,
+  text,
+  text,
+  uuid,
+  text,
+  text,
+  numeric,
+  numeric,
+  text,
+  text,
+  text,
+  uuid,
+  bigint,
+  bigint,
+  integer
+)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.seed_order_recognized (p_order_id text) returns void language plpgsql security definer
+set
+  search_path = '' as $$
+begin
+  insert into
+    app.recognized_contribution (source_kind, source_id, item_id, bucket, quantity, amount)
+  select
+    'order',
+    p_order_id,
+    priced.item_id,
+    priced.bucket,
+    priced.quantity,
+    priced.amount
+  from
+    (
+      select
+        sm.item_id,
+        case
+          when sm.movement_type = 'waste'::app.movement_type
+          or sm.closed_bucket = 'waste' then 'waste'
+          else 'cogs'
+        end as bucket,
+        coalesce(sum(-sm.quantity), 0) as quantity,
+        coalesce(sum(-sm.total_cost), 0) as amount
+      from
+        app.order_cost_movement_links link
+        join app.order_cost_state head on head.order_id = link.order_id
+        and head.owner_application_id = link.application_id
+        join app.stock_movements sm on sm.id = link.movement_id
+      where
+        link.order_id = p_order_id
+        and sm.movement_type <> 'cost_adjustment'::app.movement_type
+      group by
+        sm.item_id,
+        2
+    ) priced
+  on conflict (source_kind, source_id, item_id, bucket) do nothing;
+end;
+$$;
+
+comment on function app.seed_order_recognized (text) is 'The live owner posting is the recognized contribution when this order has no row yet. A later edit posts only the difference.';
+
+revoke all on function app.seed_order_recognized (text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.post_closed_order_difference (
+  p_order_id text,
+  p_requirements jsonb,
+  p_bucket text,
+  p_economic text,
+  p_shift text
+) returns uuid language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_cause uuid;
+  v_elem jsonb;
+  v_item uuid;
+  v_qty numeric(20, 6);
+  v_unit numeric(20, 6);
+  v_needs jsonb := '[]'::jsonb;
+  v_missing boolean := false;
+  v_piece integer := 0;
+  v_posted boolean := false;
+  v_move bigint;
+  v_prior bigint;
+  v_row record;
+  v_items uuid[] := '{}'::uuid[];
+  v_other text;
+begin
+  perform app.assert_ledger_lock_held ();
+
+  perform app.seed_order_recognized (p_order_id);
+
+  v_cause := pg_catalog.gen_random_uuid ();
+
+  for v_elem in
+    select
+      elem.value
+    from
+      pg_catalog.jsonb_array_elements(coalesce(p_requirements, '[]'::jsonb)) as elem (value)
+  loop
+    v_item := (v_elem ->> 'stock_item_id')::uuid;
+    v_qty := (v_elem ->> 'quantity')::numeric;
+
+    if v_item is null
+    or v_qty is null
+    or v_qty = 0 then
+      continue;
+    end if;
+
+    v_unit := app.closed_unit_cost (v_item);
+
+    if v_unit is null then
+      v_missing := true;
+      exit;
+    end if;
+
+    v_needs := v_needs || pg_catalog.jsonb_build_array(
+      pg_catalog.jsonb_build_object(
+        'item_id',
+        v_item,
+        'qty',
+        v_qty,
+        'value',
+        pg_catalog.round(v_qty * v_unit, 2)
+      )
+    );
+  end loop;
+
+  if v_missing then
+    raise exception 'missing_cost_basis'
+      using errcode = 'P0001',
+      detail = 'missing_cost_basis';
+  end if;
+
+  for v_elem in
+    select
+      elem.value
+    from
+      pg_catalog.jsonb_array_elements(v_needs) as elem (value)
+  loop
+    v_item := (v_elem ->> 'item_id')::uuid;
+
+    select
+      sm.id
+    into v_prior
+    from
+      app.order_cost_movement_links link
+      join app.stock_movements sm on sm.id = link.movement_id
+    where
+      link.order_id = p_order_id
+      and sm.item_id = v_item
+      and sm.quantity < 0
+    order by
+      sm.id
+    limit
+      1;
+
+    v_piece := v_piece + 1;
+    v_move := app.post_recognized_delta (
+      v_cause,
+      'order',
+      p_order_id,
+      v_item,
+      p_bucket,
+      p_economic,
+      (v_elem ->> 'qty')::numeric,
+      (v_elem ->> 'value')::numeric,
+      p_shift,
+      null,
+      null,
+      null,
+      v_prior,
+      null,
+      v_piece
+    );
+
+    if v_move is not null then
+      v_posted := true;
+      v_items := v_items || v_item;
+    end if;
+  end loop;
+
+  v_other := case
+    when p_bucket = 'waste' then 'cogs'
+    else 'waste'
+  end;
+
+  for v_row in
+    select
+      contribution.item_id,
+      contribution.bucket
+    from
+      app.recognized_contribution contribution
+    where
+      contribution.source_kind = 'order'
+      and contribution.source_id = p_order_id
+      and (
+        contribution.quantity <> 0
+        or contribution.amount <> 0
+      )
+      and (
+        contribution.bucket = v_other
+        or (
+          contribution.bucket = p_bucket
+          and not exists (
+            select
+              1
+            from
+              pg_catalog.jsonb_array_elements(v_needs) as need (value)
+            where
+              (need.value ->> 'item_id')::uuid = contribution.item_id
+          )
+        )
+      )
+  loop
+    select
+      sm.id
+    into v_prior
+    from
+      app.order_cost_movement_links link
+      join app.stock_movements sm on sm.id = link.movement_id
+    where
+      link.order_id = p_order_id
+      and sm.item_id = v_row.item_id
+      and sm.quantity < 0
+    order by
+      sm.id
+    limit
+      1;
+
+    v_piece := v_piece + 1;
+    v_move := app.post_recognized_delta (
+      v_cause,
+      'order',
+      p_order_id,
+      v_row.item_id,
+      v_row.bucket,
+      case
+        when v_row.bucket = 'waste' then 'waste'
+        else 'sale'
+      end,
+      0,
+      0,
+      p_shift,
+      null,
+      null,
+      null,
+      v_prior,
+      null,
+      v_piece
+    );
+
+    if v_move is not null then
+      v_posted := true;
+      v_items := v_items || v_row.item_id;
+    end if;
+  end loop;
+
+  if v_posted then
+    perform app.finish_closed_cause (
+      v_cause,
+      (
+        select
+          coalesce(pg_catalog.array_agg(distinct item_id), '{}'::uuid[])
+        from
+          pg_catalog.unnest(v_items) as item (item_id)
+      )
+    );
+
+    return v_cause;
+  end if;
+
+  return null;
+end;
+$$;
+
+comment on function app.post_closed_order_difference (text, jsonb, text, text, text) is 'Post the difference between an order''s required contribution and the contribution already recognized. The original rows stay. A full return uses an empty requirement list.';
+
+revoke all on function app.post_closed_order_difference (text, jsonb, text, text, text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.apply_closed_waste_delta (
+  p_predecessor bigint,
+  p_lines jsonb,
+  p_void boolean,
+  p_reason text
+) returns uuid language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_root bigint;
+  v_next bigint;
+  v_cause uuid;
+  v_elem jsonb;
+  v_item uuid;
+  v_qty numeric(20, 6);
+  v_unit numeric(20, 6);
+  v_needs jsonb := '[]'::jsonb;
+  v_piece integer := 0;
+  v_posted boolean := false;
+  v_move bigint;
+  v_prior bigint;
+  v_row record;
+  v_items uuid[] := '{}'::uuid[];
+  v_change timestamptz;
+  v_shift text;
+begin
+  perform app.assert_ledger_write_allowed ();
+
+  v_root := p_predecessor;
+
+  loop
+    select
+      document.predecessor_id
+    into v_next
+    from
+      app.waste_documents document
+    where
+      document.id = v_root;
+
+    exit when v_next is null;
+
+    v_root := v_next;
+  end loop;
+
+  insert into
+    app.recognized_contribution (source_kind, source_id, item_id, bucket, quantity, amount)
+  select
+    'waste',
+    v_root::text,
+    sm.item_id,
+    'waste',
+    coalesce(sum(-sm.quantity), 0),
+    coalesce(sum(-sm.total_cost), 0)
+  from
+    app.waste_line_movements link
+    join app.stock_movements sm on sm.id = link.movement_id
+  where
+    link.document_id = v_root
+    and sm.movement_type <> 'cost_adjustment'::app.movement_type
+  group by
+    sm.item_id
+  on conflict (source_kind, source_id, item_id, bucket) do nothing;
+
+  if not p_void then
+    for v_elem in
+      select
+        elem.value
+      from
+        pg_catalog.jsonb_array_elements(coalesce(p_lines, '[]'::jsonb)) as elem (value)
+    loop
+      v_item := (v_elem ->> 'item_id')::uuid;
+      v_qty := (v_elem ->> 'base_quantity')::numeric;
+
+      if v_item is null
+      or v_qty is null
+      or v_qty = 0 then
+        continue;
+      end if;
+
+      v_unit := app.closed_unit_cost (v_item);
+
+      if v_unit is null then
+        raise exception 'missing_cost_basis'
+          using errcode = 'P0001',
+          detail = 'missing_cost_basis';
+      end if;
+
+      v_needs := v_needs || pg_catalog.jsonb_build_array(
+        pg_catalog.jsonb_build_object(
+          'item_id',
+          v_item,
+          'qty',
+          v_qty,
+          'value',
+          pg_catalog.round(v_qty * v_unit, 2)
+        )
+      );
+    end loop;
+  end if;
+
+  v_cause := pg_catalog.gen_random_uuid ();
+  v_change := app.note_change_instant ();
+
+  select
+    document.shift_id
+  into v_shift
+  from
+    app.waste_documents document
+  where
+    document.id = v_root;
+
+  v_shift := coalesce(v_shift, app.closed_containing_shift (v_change));
+
+  for v_elem in
+    select
+      elem.value
+    from
+      pg_catalog.jsonb_array_elements(v_needs) as elem (value)
+  loop
+    v_item := (v_elem ->> 'item_id')::uuid;
+
+    select
+      sm.id
+    into v_prior
+    from
+      app.stock_movements sm
+    where
+      sm.item_id = v_item
+      and sm.quantity < 0
+      and (
+        exists (
+          select
+            1
+          from
+            app.waste_line_movements link
+          where
+            link.movement_id = sm.id
+            and link.document_id = v_root
+        )
+        or exists (
+          select
+            1
+          from
+            app.closed_period_sources src
+          where
+            src.movement_id = sm.id
+            and src.source_kind = 'waste'
+            and src.source_id = v_root::text
+        )
+      )
+    order by
+      sm.id
+    limit
+      1;
+
+    v_piece := v_piece + 1;
+    v_move := app.post_recognized_delta (
+      v_cause,
+      'waste',
+      v_root::text,
+      v_item,
+      'waste',
+      'waste',
+      (v_elem ->> 'qty')::numeric,
+      (v_elem ->> 'value')::numeric,
+      v_shift,
+      p_reason,
+      null,
+      null,
+      v_prior,
+      null,
+      v_piece
+    );
+
+    if v_move is not null then
+      v_posted := true;
+      v_items := v_items || v_item;
+    end if;
+  end loop;
+
+  for v_row in
+    select
+      contribution.item_id
+    from
+      app.recognized_contribution contribution
+    where
+      contribution.source_kind = 'waste'
+      and contribution.source_id = v_root::text
+      and contribution.bucket = 'waste'
+      and (
+        contribution.quantity <> 0
+        or contribution.amount <> 0
+      )
+      and not exists (
+        select
+          1
+        from
+          pg_catalog.jsonb_array_elements(v_needs) as need (value)
+        where
+          (need.value ->> 'item_id')::uuid = contribution.item_id
+      )
+  loop
+    select
+      sm.id
+    into v_prior
+    from
+      app.stock_movements sm
+    where
+      sm.item_id = v_row.item_id
+      and sm.quantity < 0
+      and (
+        exists (
+          select
+            1
+          from
+            app.waste_line_movements link
+          where
+            link.movement_id = sm.id
+            and link.document_id = v_root
+        )
+        or exists (
+          select
+            1
+          from
+            app.closed_period_sources src
+          where
+            src.movement_id = sm.id
+            and src.source_kind = 'waste'
+            and src.source_id = v_root::text
+        )
+      )
+    order by
+      sm.id
+    limit
+      1;
+
+    v_piece := v_piece + 1;
+    v_move := app.post_recognized_delta (
+      v_cause,
+      'waste',
+      v_root::text,
+      v_row.item_id,
+      'waste',
+      'waste',
+      0,
+      0,
+      v_shift,
+      p_reason,
+      null,
+      null,
+      v_prior,
+      null,
+      v_piece
+    );
+
+    if v_move is not null then
+      v_posted := true;
+      v_items := v_items || v_row.item_id;
+    end if;
+  end loop;
+
+  if v_posted then
+    perform app.finish_closed_cause (
+      v_cause,
+      (
+        select
+          coalesce(pg_catalog.array_agg(distinct item_id), '{}'::uuid[])
+        from
+          pg_catalog.unnest(v_items) as item (item_id)
+      )
+    );
+
+    return v_cause;
+  end if;
+
+  return null;
+end;
+$$;
+
+comment on function app.apply_closed_waste_delta (bigint, jsonb, boolean, text) is 'Correction or cancellation of a waste document dated before the window. The original waste rows stay. The difference is a closed contribution of the root document.';
+
+revoke all on function app.apply_closed_waste_delta (bigint, jsonb, boolean, text)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 create function app.post_accumulated_closed_span (p_span_id bigint) returns void language plpgsql security definer
 set
   search_path = '' as $$
@@ -5055,9 +6324,13 @@ declare
   v_item uuid;
   v_qty numeric(20, 6);
   v_unit numeric(20, 6);
-  v_total numeric(14, 2);
   v_items uuid[] := '{}'::uuid[];
   v_posted boolean := false;
+  v_needs jsonb;
+  v_missing boolean;
+  v_piece integer;
+  v_move bigint;
+  v_prior bigint;
 begin
   perform app.assert_ledger_lock_held ();
 
@@ -5097,7 +6370,6 @@ begin
       accumulated.ordered_at,
       accumulated.order_id
   loop
-    v_item := null;
     v_res := app.resolve_order_requirements (v_order.order_id, null);
 
     if v_res ->> 'status' is distinct from 'ready' then
@@ -5111,6 +6383,10 @@ begin
       continue;
     end if;
 
+    -- Price every line before the first write. One missing basis posts nothing.
+    v_needs := '[]'::jsonb;
+    v_missing := false;
+
     for v_elem in
       select
         elem.value
@@ -5120,86 +6396,99 @@ begin
       v_item := (v_elem ->> 'stock_item_id')::uuid;
       v_qty := (v_elem ->> 'quantity')::numeric;
 
-      if v_qty is null or v_qty = 0 then
+      if v_qty is null
+      or v_qty = 0 then
         continue;
       end if;
 
-      select
-        balance.avg_cost
-      into v_unit
-      from
-        app.item_balances balance
-      where
-        balance.item_id = v_item
-        and balance.avg_cost > 0;
+      v_unit := app.closed_unit_cost (v_item);
 
       if v_unit is null then
-        select
-          seed.unit_cost
-        into v_unit
-        from
-          app.item_provisional_seeds seed
-        where
-          seed.item_id = v_item;
-      end if;
-
-      if v_unit is null then
-        select
-          price.unit_cost
-        into v_unit
-        from
-          app.item_opening_prices price
-        where
-          price.item_id = v_item
-          and price.superseded_change_id is null;
-      end if;
-
-      if v_unit is null then
-        perform app.enqueue_accounting_event (
-          v_order.order_id,
-          'config_span',
-          'span:' || p_span_id::text || ':' || v_order.order_id,
-          null,
-          p_span_id
-        );
-        v_item := null;
+        v_missing := true;
         exit;
       end if;
 
-      v_total := -pg_catalog.round(v_qty * v_unit, 2);
-      v_items := v_items || v_item;
-
-      perform app.insert_closed_movement (
-        v_cause,
-        v_item,
-        v_change,
-        -v_qty,
-        v_total,
-        'cogs',
-        'sale',
-        app.closed_containing_shift (v_change),
-        'order',
-        v_order.order_id,
-        null,
-        null,
-        null,
-        null,
-        null,
-        0,
-        0
+      v_needs := v_needs || pg_catalog.jsonb_build_array(
+        pg_catalog.jsonb_build_object(
+          'item_id',
+          v_item,
+          'qty',
+          v_qty,
+          'value',
+          pg_catalog.round(v_qty * v_unit, 2)
+        )
       );
-
-      v_posted := true;
     end loop;
 
-    if v_item is not null then
-      update app.closed_span_orders accumulated
-      set
-        cause_id = v_cause
-      where
-        accumulated.span_id = p_span_id
-        and accumulated.order_id = v_order.order_id;
+    if v_missing then
+      perform app.enqueue_accounting_event (
+        v_order.order_id,
+        'config_span',
+        'span:' || p_span_id::text || ':' || v_order.order_id,
+        null,
+        p_span_id
+      );
+      continue;
     end if;
+
+    perform app.seed_order_recognized (v_order.order_id);
+
+    v_piece := 0;
+
+    for v_elem in
+      select
+        elem.value
+      from
+        pg_catalog.jsonb_array_elements(v_needs) as elem (value)
+    loop
+      v_item := (v_elem ->> 'item_id')::uuid;
+
+      select
+        sm.id
+      into v_prior
+      from
+        app.order_cost_movement_links link
+        join app.stock_movements sm on sm.id = link.movement_id
+      where
+        link.order_id = v_order.order_id
+        and sm.item_id = v_item
+        and sm.quantity < 0
+      order by
+        sm.id
+      limit
+        1;
+
+      v_piece := v_piece + 1;
+      v_move := app.post_recognized_delta (
+        v_cause,
+        'order',
+        v_order.order_id,
+        v_item,
+        'cogs',
+        'sale',
+        (v_elem ->> 'qty')::numeric,
+        (v_elem ->> 'value')::numeric,
+        app.closed_containing_shift (v_change),
+        null,
+        null,
+        null,
+        v_prior,
+        p_span_id,
+        v_piece
+      );
+
+      if v_move is not null then
+        v_posted := true;
+        v_items := v_items || v_item;
+      end if;
+    end loop;
+
+    update app.closed_span_orders accumulated
+    set
+      cause_id = v_cause
+    where
+      accumulated.span_id = p_span_id
+      and accumulated.order_id = v_order.order_id;
   end loop;
 
   if v_posted then
@@ -5553,6 +6842,14 @@ begin
               1
             from
               app.activation_history_loaded
+          )
+          or exists (
+            select
+              1
+            from
+              app.activation_history_posted posted
+            where
+              posted.order_id = v_order
           )
           or not exists (
             select
@@ -6153,6 +7450,7 @@ declare
   v_episode integer;
   v_eff record;
   v_move text;
+  v_closed_post boolean := false;
 begin
   perform app.assert_ledger_lock_held ();
 
@@ -6205,13 +7503,7 @@ begin
 
   v_now := pg_catalog.clock_timestamp ();
 
-  if not exists (
-    select
-      1
-    from
-      app.activation_history_loaded
-  )
-  and exists (
+  if exists (
     select
       1
     from
@@ -6219,28 +7511,20 @@ begin
     where
       frozen.order_id = p_order_id
       and frozen.cost_input_id = v_input.id
+      and not exists (
+        select
+          1
+        from
+          app.activation_history_posted posted
+        where
+          posted.order_id = frozen.order_id
+          and posted.cost_input_id = frozen.cost_input_id
+      )
   ) then
     perform pg_catalog.set_config('app.replay_frozen', '1', true);
     perform pg_catalog.set_config('app.replay_order_at', v_snap.ordered_at::text, true);
   else
     perform pg_catalog.set_config('app.replay_frozen', '', true);
-  end if;
-
-  if exists (
-    select
-      1
-    from
-      app.activation_history_loaded
-  )
-  and v_snap.ordered_at >= v_start
-  and v_snap.ordered_at < app.restatement_window_start ()
-  and v_head.owner_application_id is null then
-    return app.post_closed_historical_order (
-      p_order_id,
-      v_input.id,
-      p_attempt_id,
-      p_work_generation
-    );
   end if;
 
   -- Does this order take part in a decision episode?
@@ -6847,7 +8131,68 @@ begin
     v_kind := 'posting';
 
     begin
-      if v_owner_id is not null then
+      v_closed_post := not exists (
+        select
+          1
+        from
+          app.activation_history_input frozen
+        where
+          frozen.order_id = p_order_id
+          and not exists (
+            select
+              1
+            from
+              app.activation_history_posted posted
+            where
+              posted.order_id = frozen.order_id
+              and posted.cost_input_id = frozen.cost_input_id
+          )
+      )
+      and (
+        (
+          v_snap.ordered_at >= v_start
+          and v_snap.ordered_at < app.restatement_window_start ()
+        )
+        or exists (
+          select
+            1
+          from
+            app.order_cost_movement_links link
+            join app.stock_movements posted_move on posted_move.id = link.movement_id
+          where
+            link.application_id = v_owner_id
+            and posted_move.movement_type = 'closed_period'::app.movement_type
+        )
+      );
+
+      if v_closed_post then
+        v_batch := app.post_closed_order_difference (
+          p_order_id,
+          case
+            when v_disposition in ('sale', 'prepared_waste') then coalesce(v_reqs, '[]'::jsonb)
+            else '[]'::jsonb
+          end,
+          case
+            when v_disposition = 'prepared_waste' then 'waste'
+            else 'cogs'
+          end,
+          case
+            when v_disposition = 'prepared_waste' then 'waste'
+            else 'sale'
+          end,
+          v_snap.shift_id
+        );
+
+        -- The original rows stay. The receipt still names the posting it
+        -- replaced so the old shift can see the supersession.
+        if v_owner_id is not null
+        and v_batch is not null then
+          v_retire_batch := v_batch;
+        end if;
+      end if;
+
+      if not v_closed_post
+      and v_owner_id is not null then
         select
           pg_catalog.array_agg(
             l.movement_id
@@ -6866,7 +8211,8 @@ begin
         end if;
       end if;
 
-      if v_disposition in ('sale', 'prepared_waste') then
+      if not v_closed_post
+      and v_disposition in ('sale', 'prepared_waste') then
         if v_event is null then
           v_event := pg_catalog.nextval(
             pg_catalog.pg_get_serial_sequence('app.stock_movements', 'id')
@@ -7092,9 +8438,18 @@ begin
       app.stock_movements sm
     where
       sm.batch_id = v_batch
-      and sm.source_type = 'engine'
-      and sm.source_id = v_id::text
-      and sm.movement_type in ('sale', 'waste');
+      and (
+        (
+          v_closed_post
+          and sm.movement_type = 'closed_period'
+        )
+        or (
+          not v_closed_post
+          and sm.source_type = 'engine'
+          and sm.source_id = v_id::text
+          and sm.movement_type in ('sale', 'waste')
+        )
+      );
 
     get diagnostics v_linked = row_count;
 
@@ -7771,15 +9126,6 @@ begin
       )
     );
 
-    -- Test hook. A purchase can take its share locks while this batch still
-    -- holds row exclusive and has not yet updated the run.
-    if coalesce(
-      pg_catalog.current_setting('app.ingest_pause_after_shifts', true),
-      ''
-    ) = '1' then
-      perform pg_catalog.pg_sleep(2.5);
-    end if;
-
     update app.pos_sync_runs as run
     set
       presented_shift_ids = (
@@ -8165,14 +9511,52 @@ declare
   v_bucket text;
   v_at timestamptz;
   v_has_cover boolean := false;
+  v_window timestamptz;
+  v_closed_pending jsonb := '[]'::jsonb;
+  v_open_pending jsonb := '[]'::jsonb;
 begin
   perform app.assert_ledger_write_allowed ();
 
   perform app.lock_owner_sync_shares ();
 
-  if app.backdated_batch_is_closed (p_pending) then
-    return app.post_closed_backdated_batch (p_batch_id, p_pending);
+  if p_pending is null
+  or pg_catalog.jsonb_typeof(p_pending) <> 'array' then
+    raise exception 'recompute result is out of range'
+      using errcode = '22023';
   end if;
+
+  v_window := app.restatement_window_start (app.note_change_instant ());
+
+  select
+    coalesce(
+      pg_catalog.jsonb_agg(elem.value) filter (
+        where
+          (elem.value ->> 'occurred_at')::timestamptz < v_window
+      ),
+      '[]'::jsonb
+    ),
+    coalesce(
+      pg_catalog.jsonb_agg(elem.value) filter (
+        where
+          (elem.value ->> 'occurred_at')::timestamptz >= v_window
+      ),
+      '[]'::jsonb
+    )
+  into
+    v_closed_pending,
+    v_open_pending
+  from
+    pg_catalog.jsonb_array_elements(p_pending) as elem (value);
+
+  if pg_catalog.jsonb_array_length(v_closed_pending) > 0 then
+    v_ids := app.post_closed_backdated_batch (p_batch_id, v_closed_pending);
+  end if;
+
+  if pg_catalog.jsonb_array_length(v_open_pending) = 0 then
+    return v_ids;
+  end if;
+
+  p_pending := v_open_pending;
 
   lock table app.pos_shifts in share mode;
 
@@ -13830,7 +15214,7 @@ begin
           p_batch_id,
           p_item_id,
           'cost_adjustment',
-          p_occurred_at,
+          r_def.prov_at,
           0,
           v_adj_unit_cost,
           v_adj_total_cost,
@@ -13852,6 +15236,10 @@ begin
         p_item_id,
         p_batch_id
       );
+
+      -- An open cover is dated on the deficit, so a later inflow cannot resume
+      -- from a cut that sits between the deficit and the cover.
+      perform app.invalidate_checkpoints_from (p_item_id, r_def.prov_at, 'cover');
     end if;
 
     update app.provisional_deficits
@@ -13915,6 +15303,827 @@ begin
     item_id = p_item_id;
 end;
 $$;
+
+-- A closed correction keeps the predecessor and posts the difference. It has a
+-- posting batch and no reversal batch. A closed void keeps batch_id null and
+-- stores the return batch in retire_batch_id.
+alter table app.waste_documents
+drop constraint waste_documents_retire_chk;
+
+alter table app.waste_documents
+add constraint waste_documents_retire_chk check (
+  (
+    predecessor_id is null
+    and retire_batch_id is null
+  )
+  or (
+    predecessor_id is not null
+    and retire_batch_id is not null
+  )
+  or (
+    predecessor_id is not null
+    and retire_batch_id is null
+    and batch_id is not null
+    and not is_void
+  )
+);
+
+comment on column app.waste_documents.retire_batch_id is 'Batch that removed the predecessor''s effect. An in-window correction stores the reversal batch. A closed void stores the return batch. A closed correction that still posts a replacement leaves this null. Null for a first document.';
+
+create or replace function app.record_waste (p_request_id uuid, p_document jsonb) returns jsonb language plpgsql volatile security definer
+set
+  search_path = ''
+set
+  lock_timeout = '2s'
+set
+  statement_timeout = '15s' as $$
+declare
+  c_uuid constant text := '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+  v_pred_text text;
+  v_pred bigint;
+  v_n integer;
+  v_void boolean;
+  v_at_text text;
+  v_at timestamptz;
+  v_reason text;
+  v_expl text;
+  v_elem jsonb;
+  v_ord bigint;
+  v_item uuid;
+  v_qty numeric;
+  v_unit text;
+  v_code text;
+  v_base text;
+  v_factor numeric;
+  v_source text;
+  v_ver uuid;
+  v_base_qty numeric;
+  v_norm jsonb := '[]'::jsonb;
+  v_res jsonb := '[]'::jsonb;
+  v_seen uuid[] := '{}'::uuid[];
+  v_hash text;
+  v_req record;
+  v_prev app.waste_documents%rowtype;
+  v_shift text;
+  v_event bigint;
+  v_items uuid[];
+  v_old_ids bigint[];
+  v_retire_batch uuid := null;
+  v_batch uuid := null;
+  v_lines jsonb;
+  v_detail text;
+  v_blocked uuid[];
+  v_doc bigint;
+  v_diff record;
+  v_kind text;
+  v_result jsonb;
+  v_closed_waste boolean := false;
+begin
+  if coalesce(app.is_owner (), false) is not true then
+    raise exception 'insufficient_privilege'
+      using errcode = '42501';
+  end if;
+
+  if p_request_id is null
+  or p_document is null
+  or pg_catalog.jsonb_typeof (p_document) <> 'object'
+  or exists (
+    select
+      1
+    from
+      pg_catalog.jsonb_object_keys(p_document) k
+    where
+      k not in (
+        'occurred_at',
+        'reason_code',
+        'explanation',
+        'predecessor_id',
+        'lines'
+      )
+  )
+  or pg_catalog.jsonb_typeof (p_document -> 'lines') is distinct from 'array'
+  or pg_catalog.jsonb_typeof (p_document -> 'predecessor_id') not in ('string', 'null')
+  or pg_catalog.jsonb_typeof (p_document -> 'occurred_at') not in ('string', 'null')
+  or pg_catalog.jsonb_typeof (p_document -> 'reason_code') not in ('string', 'null')
+  or pg_catalog.jsonb_typeof (p_document -> 'explanation') not in ('string', 'null') then
+    raise exception 'invalid waste document'
+      using errcode = '22023';
+  end if;
+
+  v_pred_text := p_document ->> 'predecessor_id';
+
+  if v_pred_text is not null
+  and v_pred_text !~ '^[1-9][0-9]{0,17}$' then
+    raise exception 'invalid predecessor id'
+      using errcode = '22023';
+  end if;
+
+  v_pred := v_pred_text::bigint;
+  v_n := pg_catalog.jsonb_array_length(p_document -> 'lines');
+
+  if v_n > 50 then
+    raise exception 'a waste document has at most 50 lines'
+      using errcode = '22023';
+  end if;
+
+  if v_n = 0
+  and v_pred is null then
+    raise exception 'a waste document needs at least one line'
+      using errcode = '22023';
+  end if;
+
+  v_void := v_n = 0;
+
+  if v_void then
+    if (p_document ->> 'occurred_at') is not null
+    or (p_document ->> 'reason_code') is not null
+    or (p_document ->> 'explanation') is not null then
+      raise exception 'a void carries no time, reason or explanation'
+        using errcode = '22023';
+    end if;
+  else
+    v_at_text := p_document ->> 'occurred_at';
+    v_reason := p_document ->> 'reason_code';
+    v_expl := nullif(pg_catalog.btrim (p_document ->> 'explanation'), '');
+
+    if v_at_text is null
+    or v_at_text !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]{1,6})?)?(Z|[+-][0-9]{2}:[0-9]{2})$' then
+      raise exception 'occurred_at must be an ISO timestamp with an offset'
+        using errcode = '22023';
+    end if;
+
+    begin
+      v_at := v_at_text::timestamptz;
+    exception
+      when others then
+        raise exception 'occurred_at is not a valid timestamp'
+          using errcode = '22023';
+    end;
+
+    if v_reason = 'cancel_after_preparation' then
+      raise exception 'cancel_after_preparation is recorded by the system only'
+        using errcode = '22023';
+    end if;
+
+    if v_reason is null
+    or v_reason not in ('staff_meal', 'spoilage', 'other') then
+      raise exception 'unknown waste reason'
+        using errcode = '22023';
+    end if;
+
+    if v_expl is not null
+    and length(v_expl) > 300 then
+      raise exception 'explanation is longer than 300 characters'
+        using errcode = '22023';
+    end if;
+
+    if v_reason = 'other'
+    and v_expl is null then
+      raise exception 'an explanation is required for the reason other'
+        using errcode = '22023';
+    end if;
+
+    for v_elem in
+      select
+        e.value
+      from
+        pg_catalog.jsonb_array_elements(p_document -> 'lines') as e (value)
+    loop
+      if pg_catalog.jsonb_typeof (v_elem) <> 'object'
+      or (
+        select
+          count(*)
+        from
+          pg_catalog.jsonb_object_keys(v_elem)
+      ) <> 3
+      or pg_catalog.jsonb_typeof (v_elem -> 'item_id') is distinct from 'string'
+      or pg_catalog.jsonb_typeof (v_elem -> 'quantity') is distinct from 'string'
+      or pg_catalog.jsonb_typeof (v_elem -> 'unit') is distinct from 'string'
+      or pg_catalog.lower (v_elem ->> 'item_id') !~ c_uuid
+      or v_elem ->> 'quantity' !~ '^[0-9]{1,14}(\.[0-9]{1,6})?$' then
+        raise exception 'each line is {item_id, quantity, unit} with decimal text'
+          using errcode = '22023';
+      end if;
+
+      v_item := pg_catalog.lower (v_elem ->> 'item_id')::uuid;
+      v_qty := (v_elem ->> 'quantity')::numeric;
+      v_unit := pg_catalog.btrim (v_elem ->> 'unit');
+
+      if v_qty <= 0 then
+        raise exception 'quantity must be greater than zero'
+          using errcode = '22023';
+      end if;
+
+      if v_unit = ''
+      or length(v_unit) > 20 then
+        raise exception 'invalid unit'
+          using errcode = '22023';
+      end if;
+
+      if v_item = any (v_seen) then
+        raise exception 'a stock item is listed twice'
+          using errcode = '22023';
+      end if;
+
+      v_seen := v_seen || v_item;
+      v_norm := v_norm || pg_catalog.jsonb_build_array(
+        pg_catalog.jsonb_build_object(
+          'item_id',
+          v_item,
+          'quantity',
+          pg_catalog.trim_scale (v_qty)::text,
+          'unit',
+          v_unit
+        )
+      );
+    end loop;
+  end if;
+
+  v_hash := pg_catalog.md5(
+    pg_catalog.jsonb_build_object(
+      'predecessor_id',
+      v_pred_text,
+      'occurred_at',
+      app.costing_timestamptz_text (v_at),
+      'reason_code',
+      v_reason,
+      'explanation',
+      v_expl,
+      'lines',
+      v_norm
+    )::text
+  );
+
+  -- Replay: the stored result, before any mutable state is read.
+  select
+    r.*
+  into v_req
+  from
+    app.waste_requests r
+  where
+    r.request_id = p_request_id;
+
+  if found then
+    if v_req.payload_hash <> v_hash then
+      raise exception 'request id was used for a different waste document'
+        using errcode = '22023';
+    end if;
+
+    return v_req.result;
+  end if;
+
+  if not exists (
+    select
+      1
+    from
+      app.inventory_activation
+  ) then
+    raise exception 'inventory is not activated'
+      using errcode = '55000';
+  end if;
+
+  perform pg_catalog.pg_advisory_xact_lock(7342750000000000001::bigint);
+
+  select
+    r.*
+  into v_req
+  from
+    app.waste_requests r
+  where
+    r.request_id = p_request_id;
+
+  if found then
+    if v_req.payload_hash <> v_hash then
+      raise exception 'request id was used for a different waste document'
+        using errcode = '22023';
+    end if;
+
+    return v_req.result;
+  end if;
+
+  lock table app.pos_sync_runs in share mode;
+
+  if exists (
+    select
+      1
+    from
+      app.pos_sync_runs r
+    where
+      r.status = 'running'
+  ) then
+    raise exception 'a POS sync is running'
+      using errcode = '55P03';
+  end if;
+
+  lock table app.pos_shifts in share mode;
+
+  if v_pred is not null then
+    select
+      d.*
+    into v_prev
+    from
+      app.waste_documents d
+    where
+      d.id = v_pred;
+
+    if not found then
+      raise exception 'unknown waste document'
+        using errcode = '22023';
+    end if;
+
+    if exists (
+      select
+        1
+      from
+        app.waste_documents s
+      where
+        s.predecessor_id = v_pred
+    ) then
+      raise exception 'the waste document was already corrected'
+        using errcode = '40001';
+    end if;
+
+    if v_prev.is_void then
+      raise exception 'a voided waste document cannot be corrected'
+        using errcode = '22023';
+    end if;
+
+    select
+      pg_catalog.array_agg(
+        wm.movement_id
+        order by
+          wm.movement_id
+      )
+    into v_old_ids
+    from
+      app.waste_line_movements wm
+    where
+      wm.document_id = v_pred;
+  end if;
+
+  if v_void then
+    v_at := v_prev.occurred_at;
+    v_reason := v_prev.reason_code;
+    v_expl := v_prev.explanation;
+    v_shift := v_prev.shift_id;
+  else
+    v_shift := app.resolve_shift_id (v_at);
+
+    for v_elem, v_ord in
+      select
+        e.value,
+        e.ordinality
+      from
+        pg_catalog.jsonb_array_elements(v_norm) with ordinality as e (value, ordinality)
+    loop
+      v_item := (v_elem ->> 'item_id')::uuid;
+      v_qty := (v_elem ->> 'quantity')::numeric;
+
+      select
+        si.base_unit
+      into v_base
+      from
+        app.stock_items si
+      where
+        si.id = v_item;
+
+      if not found then
+        raise exception 'unknown stock item'
+          using errcode = '22023';
+      end if;
+
+      v_code := app.resolve_unit_code (v_elem ->> 'unit');
+
+      if v_code is null then
+        raise exception 'unknown unit'
+          using errcode = '22023';
+      end if;
+
+      v_factor := app.item_factor_at (v_item, v_code, v_at);
+      v_ver := null;
+
+      if v_code = v_base then
+        v_source := 'base';
+      else
+        select
+          v.id
+        into v_ver
+        from
+          app.item_conversion_versions v
+        where
+          v.item_id = v_item
+          and v.unit_code = v_code
+          and v.superseded_change_id is null
+          and v.valid_during @> v_at;
+
+        v_source := case
+          when found then 'explicit'
+          else 'metric'
+        end;
+      end if;
+
+      if v_qty * v_factor >= 100000000000000::numeric then
+        raise exception 'quantity is too large'
+          using errcode = '22023';
+      end if;
+
+      v_base_qty := pg_catalog.round(v_qty * v_factor, 6);
+
+      if v_base_qty <= 0 then
+        raise exception 'quantity is too small in the base unit'
+          using errcode = '22023';
+      end if;
+
+      v_res := v_res || pg_catalog.jsonb_build_array(
+        pg_catalog.jsonb_build_object(
+          'line_no',
+          v_ord,
+          'item_id',
+          v_item,
+          'input_quantity',
+          v_qty,
+          'input_unit',
+          v_code,
+          'factor',
+          v_factor,
+          'factor_source',
+          v_source,
+          'conversion_version_id',
+          v_ver,
+          'base_unit',
+          v_base,
+          'base_quantity',
+          v_base_qty
+        )
+      );
+    end loop;
+  end if;
+
+  select
+    coalesce(
+      pg_catalog.array_agg(
+        x.id
+        order by
+          x.id
+      ),
+      '{}'::uuid[]
+    )
+  into v_items
+  from
+    (
+      select
+        (r.value ->> 'item_id')::uuid as id
+      from
+        pg_catalog.jsonb_array_elements(v_res) as r (value)
+      union
+      select
+        sm.item_id
+      from
+        app.stock_movements sm
+      where
+        sm.id = any (coalesce(v_old_ids, '{}'::bigint[]))
+    ) x;
+
+  perform app.prepare_balance_locks (app.recompute_item_set (v_items));
+
+  v_event := coalesce(
+    v_prev.event_position,
+    pg_catalog.nextval(
+      pg_catalog.pg_get_serial_sequence('app.stock_movements', 'id')
+    )
+  );
+
+  if v_pred is not null
+  and v_prev.occurred_at < app.restatement_window_start () then
+    v_batch := app.apply_closed_waste_delta (v_pred, v_res, v_void, v_reason);
+    v_closed_waste := true;
+
+    -- A void has no posting batch. The return batch is the removal of the
+    -- predecessor, which is what retire_batch_id records.
+    if v_void then
+      v_retire_batch := v_batch;
+      v_batch := null;
+    end if;
+  elsif v_pred is not null then
+    v_retire_batch := pg_catalog.gen_random_uuid ();
+    perform app.retire_movements (v_old_ids, v_retire_batch);
+  end if;
+
+  if not v_void
+  and not v_closed_waste then
+    -- A line with the same item, time and base quantity as before reposts each previous piece, in order.
+    with
+      prior as (
+        select
+          pl.item_id,
+          pl.base_quantity,
+          pg_catalog.abs(sm.quantity) as qty,
+          pg_catalog.row_number() over (
+            partition by
+              pl.id
+            order by
+              sm.event_position,
+              coalesce(sm.piece_position, 0),
+              sm.id
+          ) as ord,
+          pg_catalog.sum(pg_catalog.abs(sm.quantity)) over (
+            partition by
+              pl.id
+          ) as total
+        from
+          app.waste_lines pl
+          join app.waste_line_movements wm on wm.line_id = pl.id
+          join app.stock_movements sm on sm.id = wm.movement_id
+        where
+          v_pred is not null
+          and v_prev.occurred_at = v_at
+          and pl.document_id = v_pred
+      )
+    select
+      pg_catalog.jsonb_agg(
+        pg_catalog.jsonb_build_object(
+          'item_id',
+          req.item_id,
+          'movement_type',
+          'waste',
+          'occurred_at',
+          v_at,
+          'quantity',
+          coalesce(pr.qty, req.base_quantity),
+          'shift_id',
+          v_shift,
+          'source_id',
+          'waste:' || p_request_id::text || ':' || req.line_no::text,
+          'note',
+          null,
+          'event_position',
+          v_event
+        )
+        order by
+          req.line_no,
+          coalesce(pr.ord, 1)
+      )
+    into v_lines
+    from
+      (
+        select
+          (r.value ->> 'line_no')::integer as line_no,
+          r.value ->> 'item_id' as item_id,
+          (r.value ->> 'base_quantity')::numeric as base_quantity
+        from
+          pg_catalog.jsonb_array_elements(v_res) as r (value)
+      ) req
+      left join prior pr on pr.item_id::text = req.item_id
+      and pr.base_quantity = req.base_quantity
+      and pr.total = req.base_quantity;
+
+    begin
+      v_batch := app.post_engine_outflows (v_lines);
+    exception
+      when sqlstate 'P0001' then
+        get stacked diagnostics v_detail = pg_exception_detail;
+
+        if v_detail is distinct from 'missing_cost_basis' then
+          raise;
+        end if;
+
+        select
+          coalesce(
+            pg_catalog.array_agg(
+              (r.value ->> 'item_id')::uuid
+              order by
+                r.value ->> 'item_id'
+            ),
+            '{}'::uuid[]
+          )
+        into v_blocked
+        from
+          pg_catalog.jsonb_array_elements(v_res) as r (value)
+        where
+          not exists (
+            select
+              1
+            from
+              app.item_provisional_seeds sd
+            where
+              sd.item_id = (r.value ->> 'item_id')::uuid
+          )
+          and not exists (
+            select
+              1
+            from
+              app.item_opening_prices p
+            where
+              p.item_id = (r.value ->> 'item_id')::uuid
+              and p.superseded_change_id is null
+          );
+
+        if coalesce(pg_catalog.cardinality (v_blocked), 0) = 0 then
+          select
+            pg_catalog.array_agg(
+              (r.value ->> 'item_id')::uuid
+              order by
+                r.value ->> 'item_id'
+            )
+          into v_blocked
+          from
+            pg_catalog.jsonb_array_elements(v_res) as r (value);
+        end if;
+
+        raise exception 'missing_cost_basis'
+          using errcode = 'P0001',
+          detail = 'missing_cost_basis',
+          hint = pg_catalog.array_to_string(v_blocked, ',');
+    end;
+  end if;
+
+  insert into
+    app.waste_documents (
+      request_id,
+      occurred_at,
+      reason_code,
+      explanation,
+      shift_id,
+      predecessor_id,
+      is_void,
+      event_position,
+      batch_id,
+      retire_batch_id,
+      actor
+    )
+  values
+    (
+      p_request_id,
+      v_at,
+      v_reason,
+      v_expl,
+      v_shift,
+      v_pred,
+      v_void,
+      v_event,
+      v_batch,
+      v_retire_batch,
+      auth.uid ()
+    )
+  returning
+    id into v_doc;
+
+  insert into
+    app.waste_lines (
+      document_id,
+      line_no,
+      item_id,
+      input_quantity,
+      input_unit,
+      factor,
+      factor_source,
+      conversion_version_id,
+      base_unit,
+      base_quantity
+    )
+  select
+    v_doc,
+    (r.value ->> 'line_no')::integer,
+    (r.value ->> 'item_id')::uuid,
+    (r.value ->> 'input_quantity')::numeric,
+    r.value ->> 'input_unit',
+    (r.value ->> 'factor')::numeric,
+    r.value ->> 'factor_source',
+    (r.value ->> 'conversion_version_id')::uuid,
+    r.value ->> 'base_unit',
+    (r.value ->> 'base_quantity')::numeric
+  from
+    pg_catalog.jsonb_array_elements(v_res) as r (value)
+  order by
+    (r.value ->> 'line_no')::integer;
+
+  if v_batch is not null
+  and not v_closed_waste then
+    insert into
+      app.waste_line_movements (movement_id, line_id, document_id)
+    select
+      sm.id,
+      l.id,
+      v_doc
+    from
+      app.stock_movements sm
+      join app.waste_lines l on l.document_id = v_doc
+      and sm.source_id = 'waste:' || p_request_id::text || ':' || l.line_no::text
+    where
+      sm.batch_id = v_batch
+      and sm.source_type = 'engine'
+      and sm.movement_type = 'waste';
+
+    if (
+      select
+        count(distinct wm.line_id)
+      from
+        app.waste_line_movements wm
+      where
+        wm.document_id = v_doc
+    ) <> pg_catalog.jsonb_array_length(v_res) then
+      raise exception 'waste posting did not link every line'
+        using errcode = '55000';
+    end if;
+  end if;
+
+  select
+    coalesce(e.stock_qty_delta, 0) as qty,
+    coalesce(e.stock_value_delta, 0)::numeric(14, 2) as val,
+    coalesce(e.cogs_cost_delta, 0)::numeric(14, 2) as cogs,
+    coalesce(e.waste_cost_delta, 0)::numeric(14, 2) as waste,
+    coalesce(e.profit_delta, 0)::numeric(14, 2) as profit
+  into v_diff
+  from
+    app.disposition_effect (v_retire_batch, v_batch) e;
+
+  v_kind := case
+    when v_void then 'void'
+    when v_pred is not null then 'correction'
+    else 'record'
+  end;
+
+  v_result := pg_catalog.jsonb_build_object(
+    'status',
+    'ok',
+    'document_id',
+    v_doc,
+    'predecessor_id',
+    v_pred,
+    'kind',
+    v_kind,
+    'occurred_at',
+    app.costing_timestamptz_text (v_at),
+    'reason_code',
+    v_reason,
+    'lines',
+    (
+      select
+        coalesce(
+          pg_catalog.jsonb_agg(
+            pg_catalog.jsonb_build_object(
+              'line_no',
+              l.line_no,
+              'item_id',
+              l.item_id,
+              'input_quantity',
+              pg_catalog.trim_scale (l.input_quantity)::text,
+              'input_unit',
+              l.input_unit,
+              'factor',
+              pg_catalog.trim_scale (l.factor)::text,
+              'factor_source',
+              l.factor_source,
+              'base_unit',
+              l.base_unit,
+              'base_quantity',
+              pg_catalog.trim_scale (l.base_quantity)::text
+            )
+            order by
+              l.line_no
+          ),
+          '[]'::jsonb
+        )
+      from
+        app.waste_lines l
+      where
+        l.document_id = v_doc
+    ),
+    'differences',
+    pg_catalog.jsonb_build_object(
+      'stock_quantity',
+      pg_catalog.trim_scale (v_diff.qty)::text,
+      'stock_value',
+      v_diff.val::text,
+      'cogs',
+      v_diff.cogs::text,
+      'waste',
+      v_diff.waste::text,
+      'profit',
+      v_diff.profit::text
+    )
+  );
+
+  insert into
+    app.waste_requests (request_id, payload_hash, document_id, result)
+  values
+    (p_request_id, v_hash, v_doc, v_result);
+
+  return v_result;
+end;
+$$;
+
+comment on function app.record_waste (uuid, jsonb) is 'Owner only. A correction or cancellation of a waste document dated before the window posts the contribution difference and leaves the original rows. An in-window correction still retires and reposts.';
+
+revoke all on function app.record_waste (uuid, jsonb)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+grant
+execute on function app.record_waste (uuid, jsonb) to authenticated;
 
 create or replace function app.accounting_scaling_ready () returns boolean language sql stable security definer
 set

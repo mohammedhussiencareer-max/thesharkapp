@@ -12,6 +12,13 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const owner = 'b9e00000-0000-4000-8000-0000000000a1';
+// Every order is on or after the restatement window, including the future.
+// An empty activation now completes, so a January history would be closed
+// causes and the measured call would not be the suffix replay.
+const historyOpening = '2026-11-14 08:00:00+00';
+const historyOrigin = '2026-11-15 08:00:00+00';
+const historyCountOrigin = '2026-11-15 22:00:00+00';
+const historyWeekOrigin = '2026-11-21 22:00:00+00';
 
 const histories = [
   {
@@ -165,7 +172,7 @@ select app.set_order_type_packaging(
   'fixture'
 );
 select app.record_opening_stock(
-  '2025-12-31 08:00:00+00',
+  '${historyOpening}',
   jsonb_build_array(jsonb_build_object(
     'item_id', '${history.item}',
     'quantity', '${openingQty}',
@@ -180,7 +187,7 @@ insert into app.inventory_activation (
   stock_started_at, approved_by, request_id, opening_manifest_hash
 )
 select
-  '2025-12-31 08:00:00+00',
+  '${historyOpening}',
   '${owner}',
   '${history.activationRequest}',
   md5('${history.prefix}-manifest')
@@ -189,7 +196,7 @@ update app.accounting_rederive_spans
 set completed_at = pg_catalog.clock_timestamp()
 where completed_at is null;
 insert into app.pos_shifts (id, opened_at, is_active, pos_update_time)
-values ('${shift}', '2025-12-31 08:00:00+00', false, '2025-12-31 08:00:00+00');
+values ('${shift}', '${historyOpening}', false, '${historyOpening}');
 insert into app.pos_orders (
   id, shift_id, status, order_type, ordered_at, subtotal, discount, tax,
   service_tax, delivery_fee, total, pos_update_time, content_hash, missing_from_pos
@@ -199,11 +206,11 @@ select
   '${shift}',
   'complete',
   'hall-${history.prefix}',
-  timestamptz '2026-01-01 08:00:00+00'
+  timestamptz '${historyOrigin}'
     + ((g.n - 1) / ${history.perDay}) * interval '1 day'
     + ((g.n - 1) % ${history.perDay}) * interval '8 minutes',
   0, 0, 0, 0, 0, 0,
-  timestamptz '2026-01-01 08:00:00+00'
+  timestamptz '${historyOrigin}'
     + ((g.n - 1) / ${history.perDay}) * interval '1 day'
     + ((g.n - 1) % ${history.perDay}) * interval '8 minutes',
   rpad(md5('${history.prefix}-' || g.n::text), 64, 'a'),
@@ -243,7 +250,7 @@ with inserted as (
     pg_catalog.gen_random_uuid(),
     pg_catalog.gen_random_uuid(),
     'daily',
-    timestamptz '2026-01-01 22:00:00+00' + ${dayNumber - 1} * interval '1 day'
+    timestamptz '${historyCountOrigin}' + ${dayNumber - 1} * interval '1 day'
   )
   returning id
 )
@@ -264,7 +271,7 @@ with inserted as (
     pg_catalog.gen_random_uuid(),
     pg_catalog.gen_random_uuid(),
     'weekly',
-    timestamptz '2026-01-07 22:00:00+00' + ${week - 1} * interval '7 days'
+    timestamptz '${historyWeekOrigin}' + ${week - 1} * interval '7 days'
   )
   returning id
 )
@@ -422,9 +429,9 @@ insert into app.pos_orders (
   '${shift}',
   'complete',
   'hall-${history.prefix}',
-  timestamptz '2026-01-01 08:00:00+00' + ${history.days} * interval '1 day',
+  timestamptz '${historyOrigin}' + ${history.days} * interval '1 day',
   0, 0, 0, 0, 0, 0,
-  timestamptz '2026-01-01 08:00:00+00' + ${history.days} * interval '1 day',
+  timestamptz '${historyOrigin}' + ${history.days} * interval '1 day',
   rpad(md5('${late}'), 64, 'a'),
   false
 );
@@ -459,6 +466,8 @@ begin
   end if;
 end
 $$;
+delete from app.replay_read_probe;
+select set_config('app.replay_probe', '1', true);
 set statement_timeout = '6s';
 create temp table bench_timed on commit drop as
 select
@@ -495,6 +504,12 @@ declare
   v_suffix_rows bigint;
   v_suffix_index boolean;
   v_deficit_rows bigint;
+  v_time_arm_rows bigint;
+  v_id_arm_rows bigint;
+  v_time_arm_index boolean;
+  v_id_arm_index boolean;
+  v_replay_ms numeric;
+  v_restore_index boolean;
   v_t0 timestamptz;
   v_plan json;
 begin
@@ -619,27 +634,72 @@ begin
   delete from app.accounting_work_queue queue
   where queue.order_id like 'bench-q-%';
 
-  execute
-    'explain (analyze, format json) '
-    || 'select sm.id from app.stock_movements sm '
-    || 'where sm.item_id = ''${history.item}'' '
-    || 'and sm.occurred_at > coalesce((select max(c.cut_occurred_at) from app.replay_checkpoints c where c.item_id = ''${history.item}''), ''-infinity''::timestamptz) '
-    || 'union '
-    || 'select sm.id from app.stock_movements sm '
-    || 'where sm.item_id = ''${history.item}'' '
-    || 'and sm.id > coalesce((select max(c.max_movement_id) from app.replay_checkpoints c where c.item_id = ''${history.item}''), 0)'
-  into v_plan;
-  v_suffix_index := v_plan::text ilike '%Index Scan%'
-    or v_plan::text ilike '%Index Only Scan%'
-    or v_plan::text ilike '%Bitmap%';
-  v_suffix_rows := substring(v_plan::text from '"Actual Rows": ([0-9]+)')::bigint;
+  select
+    probe.time_arm_rows,
+    probe.id_arm_rows,
+    probe.time_arm_index,
+    probe.id_arm_index,
+    probe.replay_ms
+  into
+    v_time_arm_rows,
+    v_id_arm_rows,
+    v_time_arm_index,
+    v_id_arm_index,
+    v_replay_ms
+  from
+    app.replay_read_probe probe
+  order by
+    probe.id desc
+  limit
+    1;
 
-  execute
-    'explain (analyze, format json) '
-    || 'select deficit.* from app.replay_checkpoint_deficits deficit '
-    || 'where deficit.checkpoint_id = (select c.id from app.replay_checkpoints c where c.item_id = ''${history.item}'' order by c.cut_occurred_at desc limit 1)'
-  into v_plan;
-  v_deficit_rows := coalesce(substring(v_plan::text from '"Actual Rows": ([0-9]+)')::bigint, 0);
+  v_suffix_rows := coalesce(v_time_arm_rows, 0) + coalesce(v_id_arm_rows, 0);
+  v_suffix_index := coalesce(v_time_arm_index, false)
+    and coalesce(v_id_arm_index, false);
+
+  -- The measured order restores the history checkpoint. These sales are an
+  -- hour after that order, once on-hand is already negative, so each one is
+  -- its own deficit. A second confirming replay then restores that set.
+  perform app.post_engine_outflows((
+    select
+      pg_catalog.jsonb_agg(
+        pg_catalog.jsonb_build_object(
+          'item_id', '${history.item}',
+          'movement_type', 'sale',
+          'occurred_at', timestamptz '${historyOrigin}'
+            + ${history.days} * interval '1 day'
+            + interval '1 hour',
+          'quantity', 1
+        )
+      )
+    from
+      pg_catalog.generate_series(1, 1001) as g (n)
+  ));
+  perform app.post_engine_outflows(
+    pg_catalog.jsonb_build_array(
+      pg_catalog.jsonb_build_object(
+        'item_id', '${history.item}',
+        'movement_type', 'sale',
+        'occurred_at', timestamptz '${historyOrigin}'
+          + ${history.days} * interval '1 day'
+          + interval '2 hours',
+        'quantity', 1
+      )
+    )
+  );
+
+  select
+    probe.deficit_rows,
+    probe.time_arm_index and probe.id_arm_index
+  into
+    v_deficit_rows,
+    v_restore_index
+  from
+    app.replay_read_probe probe
+  order by
+    probe.id desc
+  limit
+    1;
 
   v_pass := v_result ->> 'status' = 'processed'
     and coalesce((v_result ->> 'failed')::integer, 0) = 0
@@ -650,7 +710,10 @@ begin
     and v_posted = ${orders}
     and v_events + v_anchors <= 100000
     and v_seconds <= 2
-    and v_seconds <= 6;
+    and v_seconds <= 6
+    and v_suffix_index
+    and coalesce(v_restore_index, false)
+    and coalesce(v_deficit_rows, 0) >= 1000;
 
   raise notice 'MEASURE %', pg_catalog.jsonb_build_object(
     'name', '${history.name}',
@@ -673,7 +736,13 @@ begin
     'queue_depth_50000_ms', v_queue_50000,
     'suffix_index', v_suffix_index,
     'suffix_rows', v_suffix_rows,
+    'time_arm_rows', v_time_arm_rows,
+    'id_arm_rows', v_id_arm_rows,
+    'time_arm_index', v_time_arm_index,
+    'id_arm_index', v_id_arm_index,
+    'replay_ms', v_replay_ms,
     'deficit_rows', v_deficit_rows,
+    'restore_index', v_restore_index,
     'pass', v_pass
   );
 end;
@@ -703,7 +772,19 @@ function formatResult(row) {
     `- queue depth 50000 ms: ${row.queue_depth_50000_ms}`,
     `- suffix index range: ${row.suffix_index}`,
     `- suffix rows: ${row.suffix_rows}`,
+    ...(row.time_arm_rows == null
+      ? []
+      : [
+          `- time arm rows: ${row.time_arm_rows}`,
+          `- id arm rows: ${row.id_arm_rows}`,
+          `- time arm index: ${row.time_arm_index}`,
+          `- id arm index: ${row.id_arm_index}`,
+          `- confirming replay ms: ${row.replay_ms}`,
+        ]),
     `- deficit restore rows: ${row.deficit_rows}`,
+    ...(row.restore_index == null
+      ? []
+      : [`- deficit restore index: ${row.restore_index}`]),
     `- measured status: ${row.status}`,
     `- failed: ${row.failed}`,
     `- completion outcome: ${row.outcome}`,
@@ -753,7 +834,28 @@ function existingResultRows() {
         queue_depth_50000_ms: Number(value('queue depth 50000 ms')),
         suffix_index: value('suffix index range') === 'true',
         suffix_rows: Number(value('suffix rows')),
+        time_arm_rows: value('time arm rows')
+          ? Number(value('time arm rows'))
+          : undefined,
+        id_arm_rows: value('id arm rows')
+          ? Number(value('id arm rows'))
+          : undefined,
+        time_arm_index:
+          value('time arm index') == null
+            ? undefined
+            : value('time arm index') === 'true',
+        id_arm_index:
+          value('id arm index') == null
+            ? undefined
+            : value('id arm index') === 'true',
+        replay_ms: value('confirming replay ms')
+          ? Number(value('confirming replay ms'))
+          : undefined,
         deficit_rows: Number(value('deficit restore rows')),
+        restore_index:
+          value('deficit restore index') == null
+            ? undefined
+            : value('deficit restore index') === 'true',
         status: value('measured status'),
         failed: Number(value('failed')),
         outcome: value('completion outcome'),
@@ -787,7 +889,7 @@ function writeResults(rows, note) {
   const body = [
     '# Accounting history benchmark',
     '',
-    'Synthetic catalog. Historical orders were posted with `app.run_accounting_work`. The measured order is a new queue head, timed by a top-level statement after the session statement timeout is set to 6 seconds. The soft gate is 2 seconds and the hard gate is 6 seconds. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.',
+    'Synthetic catalog. Orders start on 2026-11-15 so each one is inside the restatement window, including dates after today. Historical orders were posted with `app.run_accounting_work`. The measured order is a new queue head, timed by a top-level statement after the session statement timeout is set to 6 seconds. The soft gate is 2 seconds and the hard gate is 6 seconds. The pass also requires both suffix arms of that read to be index scans of stock_movements, and a later confirming replay to restore at least 1000 deficits. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk. The earlier 0.785 s two-year figure was measured before the cover path and the closed-period walk, and its suffix query ran after publish so it saw 0 rows.',
     '',
     ...merged.map((row) =>
       row.error

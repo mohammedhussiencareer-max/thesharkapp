@@ -232,11 +232,30 @@ commit;
     pos_update_time: '2026-10-23T20:00:00Z',
     transactions: [],
   }).replaceAll("'", "''");
-  const pauseRace = await race(
-    `
+  await psql(`
+drop trigger if exists replay_race_pause_shifts on app.pos_sync_runs;
+drop function if exists app.replay_race_pause_shifts();
+create function app.replay_race_pause_shifts() returns trigger
+language plpgsql as $$
+begin
+  if new.status = 'running'
+    and new.presented_shift_ids is distinct from old.presented_shift_ids then
+    perform pg_catalog.pg_sleep(2.5);
+  end if;
+  return new;
+end;
+$$;
+create trigger replay_race_pause_shifts
+before update of presented_shift_ids on app.pos_sync_runs
+for each row execute function app.replay_race_pause_shifts();
+`);
+  let pauseRace;
+  let pauseOk = false;
+  try {
+    pauseRace = await race(
+      `
 begin;
 ${claims()}
-select set_config('app.ingest_pause_after_shifts', '1', true);
 select app.start_pos_sync_run('recent') as run_id \\gset
 select app.ingest_pos_batch(
   :run_id,
@@ -248,23 +267,29 @@ select app.finish_pos_sync_run(:run_id, 'ok', '{}'::jsonb, '');
 select 'ingest_committed';
 commit;
 `,
-    `
+      `
 begin;
 ${claims()}
 select ${purchase('2026-10-23 09:00:00+00')};
 select 'purchase_committed';
 commit;
 `,
-    800,
-  );
-  const pauseOk =
-    pauseRace.holder.ok &&
-    pauseRace.waiter.ok &&
-    pauseRace.holder.out.includes('ingest_committed') &&
-    pauseRace.waiter.out.includes('purchase_committed') &&
-    !pauseRace.holder.out.includes('deadlock') &&
-    !pauseRace.waiter.out.includes('deadlock') &&
-    pauseRace.waiter.ms >= minWaitMs;
+      800,
+    );
+    pauseOk =
+      pauseRace.holder.ok &&
+      pauseRace.waiter.ok &&
+      pauseRace.holder.out.includes('ingest_committed') &&
+      pauseRace.waiter.out.includes('purchase_committed') &&
+      !pauseRace.holder.out.includes('deadlock') &&
+      !pauseRace.waiter.out.includes('deadlock') &&
+      pauseRace.waiter.ms >= minWaitMs;
+  } finally {
+    await psql(`
+drop trigger if exists replay_race_pause_shifts on app.pos_sync_runs;
+drop function if exists app.replay_race_pause_shifts();
+`);
+  }
   process.stdout.write(
     `\ningest paused after the shifts upsert, purchase waits\n  blocked: ${pauseRace.waiter.ms >= minWaitMs}\n  pass: ${pauseOk}\n  holder: ${pauseRace.holder.out.replace(/\s+/g, ' ').slice(0, 300)}\n  waiter: ${pauseRace.waiter.out.replace(/\s+/g, ' ').slice(0, 300)}\n`,
   );

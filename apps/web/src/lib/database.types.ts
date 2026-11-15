@@ -203,6 +203,20 @@ isOneToOne: false
                   Relationships: [
                     
                   ]
+                },"activation_history_posted": {
+                  Row: {
+                    "application_id": number,"cost_input_id": number,"order_id": string,"posted_at": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "application_id": number,"cost_input_id": number,"order_id": string,"posted_at"?: string
+                  }
+                  Update: {
+                    "application_id"?: number,"cost_input_id"?: number,"order_id"?: string,"posted_at"?: string
+                  }
+                  Relationships: [
+                    
+                  ]
                 },"closed_period_sources": {
                   Row: {
                     "closed_cause_id": string,"movement_id": number,"reason_code": string | null,"report_class": string | null,"source_id": string,"source_kind": string,"waste_chain_id": string | null
@@ -1459,14 +1473,14 @@ isOneToOne: false
                   ]
                 },"recognized_contribution": {
                   Row: {
-                    "amount": number,"bucket": string,"item_id": string,"source_id": string,"source_kind": string
+                    "amount": number,"bucket": string,"item_id": string,"quantity": number,"source_id": string,"source_kind": string
                   }
                   ComputedFields: never
                   Insert: {
-                    "amount": number,"bucket": string,"item_id": string,"source_id": string,"source_kind": string
+                    "amount": number,"bucket": string,"item_id": string,"quantity"?: number,"source_id": string,"source_kind": string
                   }
                   Update: {
-                    "amount"?: number,"bucket"?: string,"item_id"?: string,"source_id"?: string,"source_kind"?: string
+                    "amount"?: number,"bucket"?: string,"item_id"?: string,"quantity"?: number,"source_id"?: string,"source_kind"?: string
                   }
                   Relationships: [
                     {
@@ -1568,6 +1582,20 @@ isOneToOne: false
       referencedRelation: "stock_movements"
       referencedColumns: ["id"]
     }
+                  ]
+                },"replay_read_probe": {
+                  Row: {
+                    "captured_at": string,"deficit_rows": number,"id": number,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"replay_ms": number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "captured_at"?: string,"deficit_rows": number,"id"?: never,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"replay_ms"?: number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
+                  }
+                  Update: {
+                    "captured_at"?: string,"deficit_rows"?: number,"id"?: never,"id_arm_index"?: boolean,"id_arm_plan"?: string,"id_arm_rows"?: number,"replay_ms"?: number,"time_arm_index"?: boolean,"time_arm_plan"?: string,"time_arm_rows"?: number
+                  }
+                  Relationships: [
+                    
                   ]
                 },"sales_revision_facts": {
                   Row: {
@@ -2349,6 +2377,9 @@ isOneToOne: true
 "append_pos_cost_input":
 { Args: { "p_order_id": string,"p_origin": string,"p_run_id": number }; Returns: number
                            },
+"apply_closed_waste_delta":
+{ Args: { "p_lines": Json,"p_predecessor": number,"p_reason": string,"p_void": boolean }; Returns: string
+                           },
 "apply_decision_work":
 { Args: { "p_order_id": string }; Returns: Json
                            },
@@ -2414,6 +2445,9 @@ isOneToOne: true
                            },
 "closed_net_outflow_qty":
 { Args: { "p_change": string,"p_doc_at": string,"p_item_id": string }; Returns: number
+                           },
+"closed_unit_cost":
+{ Args: { "p_item_id": string }; Returns: number
                            },
 "commit_recipe_import":
 { Args: { "p_payload": Json,"p_request_id": string }; Returns: Json
@@ -2830,6 +2864,9 @@ isOneToOne: true
 "post_closed_legs":
 { Args: { "p_cause": string,"p_legs": Json }; Returns: string
                            },
+"post_closed_order_difference":
+{ Args: { "p_bucket": string,"p_economic": string,"p_order_id": string,"p_requirements": Json,"p_shift": string }; Returns: string
+                           },
 "post_engine_outflows":
 { Args: { "p_lines": Json }; Returns: string
                            },
@@ -2838,6 +2875,9 @@ isOneToOne: true
                            },
 "post_movements_internal":
 { Args: { "p_movements": Json }; Returns: string
+                           },
+"post_recognized_delta":
+{ Args: { "p_bucket": string,"p_cause": string,"p_economic": string,"p_item_id": string,"p_piece": number,"p_reason": string,"p_report": string,"p_required_qty": number,"p_required_value": number,"p_return_movement": number,"p_shift": string,"p_source_id": string,"p_source_kind": string,"p_span_id": number,"p_waste_chain": string }; Returns: number
                            },
 "post_sort":
 { Args: { "p_mixed_item": string,"p_occurred_at": string,"p_qty_taken": number,"p_shift_id"?: string,"p_sizes": Json }; Returns: string
@@ -2950,6 +2990,9 @@ isOneToOne: true
 "replay_cap_waived":
 { Args: { "p_item_ids": (string)[] }; Returns: boolean
                            },
+"replay_capture_read":
+{ Args: { "p_item_ids": (string)[] }; Returns: undefined
+                           },
 "replay_component":
 { Args: { "p_cause": string,"p_item_ids": (string)[],"p_pending": Json,"p_write": boolean }; Returns: undefined
                            },
@@ -2964,11 +3007,17 @@ isOneToOne: true
 "replay_inflow":
 { Args: { "p_in_qty": number,"p_is_pending": boolean,"p_item_id": string,"p_line_key": number,"p_movement_id": number,"p_note": string,"p_occurred_at": string,"p_shift_id": string,"p_source_id": string,"p_source_type": string,"p_total_cost": number,"p_type": Database["app"]['Enums']["movement_type"],"p_unit_cost": number }; Returns: undefined
                            },
+"replay_note_probe_ms":
+{ Args: Record<PropertyKey, never>; Returns: undefined
+                           },
 "replay_note_window":
 { Args: Record<PropertyKey, never>; Returns: undefined
                            },
 "replay_outflow":
 { Args: { "p_forced_total": number,"p_is_pending": boolean,"p_item_id": string,"p_line_key": number,"p_movement_id": number,"p_note": string,"p_occurred_at": string,"p_out_qty": number,"p_shift_id": string,"p_source_id": string,"p_source_type": string,"p_type": Database["app"]['Enums']["movement_type"] }; Returns: undefined
+                           },
+"replay_plan_uses_movement_index":
+{ Args: { "p_plan": string }; Returns: boolean
                            },
 "replay_prepare_tables":
 { Args: Record<PropertyKey, never>; Returns: undefined
@@ -3026,6 +3075,9 @@ isOneToOne: true
                            },
 "schedule_token":
 { Args: { "p_family": string,"p_item_id": string,"p_unit_code": string }; Returns: string
+                           },
+"seed_order_recognized":
+{ Args: { "p_order_id": string }; Returns: undefined
                            },
 "set_base_packaging":
 { Args: { "p_effective_from": string,"p_effective_to": string,"p_expected_token": string,"p_policy": Json,"p_pos_item_id": string,"p_reason": string,"p_request_id": string,"p_size_key": Json }; Returns: Json

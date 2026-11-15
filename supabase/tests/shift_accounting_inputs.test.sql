@@ -6032,9 +6032,8 @@ select
       )
       order by document.id, sm.id$$,
     $$values (true, 'waste', '-80.00'),
-             (false, 'waste_reversal', '80.00'),
-             (false, 'waste', '-100.00')$$,
-    'record_waste posts cost 80.00 and the correction retires it and posts 100.00'
+             (false, 'closed_period', '-20.00')$$,
+    'a closed waste correction keeps the original and posts the -20.00 difference'
   );
 
 select
