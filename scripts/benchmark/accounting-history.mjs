@@ -1,9 +1,11 @@
 // Local history gate for one component. Synthetic catalog only.
-// Historical orders are posted by app.run_accounting_work, one committed call
-// at a time. The measured call is a top-level statement. statement_timeout is
-// set on the session before that statement. The late order is a new order at
-// the queue head. 2 seconds is the soft gate and 6 seconds is the hard gate:
-// either one fails the run. Checkpoints are published by the confirming walk.
+// Historical orders are frozen activation inputs, posted by app.run_accounting_work
+// one committed call at a time, and the history ends yesterday. The measured
+// calls are top-level statements: a new order today, then a purchase today that
+// covers a deficit from 40 days ago. statement_timeout is set on the session
+// before each of those statements. 2 seconds is the soft gate and 6 seconds is
+// the hard gate: either one fails the run. Checkpoints are published by the
+// confirming walk.
 
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -12,13 +14,24 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const owner = 'b9e00000-0000-4000-8000-0000000000a1';
-// Every order is on or after the restatement window, including the future.
-// An empty activation now completes, so a January history would be closed
-// causes and the measured call would not be the suffix replay.
-const historyOpening = '2026-11-14 08:00:00+00';
-const historyOrigin = '2026-11-15 08:00:00+00';
-const historyCountOrigin = '2026-11-15 22:00:00+00';
-const historyWeekOrigin = '2026-11-21 22:00:00+00';
+
+// Cairo midnight of the run, captured once. History ends yesterday. The
+// measured order and the aged-deficit purchase are today.
+function openingAt(anchor, days) {
+  return `timestamptz '${anchor}' - ${days} * interval '1 day' + interval '7 hours'`;
+}
+
+function originAt(anchor, days) {
+  return `timestamptz '${anchor}' - ${days} * interval '1 day' + interval '8 hours'`;
+}
+
+function countAt(anchor, days) {
+  return `timestamptz '${anchor}' - ${days} * interval '1 day' + interval '22 hours'`;
+}
+
+function weekAt(anchor, days) {
+  return `timestamptz '${anchor}' - ${days} * interval '1 day' + interval '6 days 22 hours'`;
+}
 
 const histories = [
   {
@@ -30,6 +43,8 @@ const histories = [
     weeklyItem: 'b9e00000-0000-4000-8000-000000000036',
     openingRequest: 'b9e00000-0000-4000-8000-000000000135',
     activationRequest: 'b9e00000-0000-4000-8000-000000000235',
+    agedItem: 'b9e00000-0000-4000-8000-000000000037',
+    agedPriceRequest: 'b9e00000-0000-4000-8000-000000000138',
   },
   {
     name: '1-year',
@@ -40,6 +55,8 @@ const histories = [
     weeklyItem: 'b9e00000-0000-4000-8000-000000000366',
     openingRequest: 'b9e00000-0000-4000-8000-000000000375',
     activationRequest: 'b9e00000-0000-4000-8000-000000000376',
+    agedItem: 'b9e00000-0000-4000-8000-000000000367',
+    agedPriceRequest: 'b9e00000-0000-4000-8000-000000000380',
   },
   {
     name: '2-year',
@@ -50,6 +67,8 @@ const histories = [
     weeklyItem: 'b9e00000-0000-4000-8000-000000000731',
     openingRequest: 'b9e00000-0000-4000-8000-000000000732',
     activationRequest: 'b9e00000-0000-4000-8000-000000000733',
+    agedItem: 'b9e00000-0000-4000-8000-000000000734',
+    agedPriceRequest: 'b9e00000-0000-4000-8000-000000000740',
   },
 ];
 
@@ -97,7 +116,28 @@ function claims(local = true) {
   return `select set_config('request.jwt.claims', jsonb_build_object('sub', '${owner}', 'role', 'authenticated')::text, ${local});`;
 }
 
-function setupSql() {
+function setupSql(anchor) {
+  const agedSales = histories
+    .map(
+      (history) => `
+insert into app.stock_items (id, name, kind, base_unit, count_frequency)
+values ('${history.agedItem}', 'bench ${history.name} aged', 'seafood', 'kg', 'daily');
+select app.set_item_opening_price(
+  '${history.agedPriceRequest}',
+  '${history.agedItem}',
+  10,
+  null,
+  null,
+  'kg|seafood||'
+);
+select app.post_movements(jsonb_build_array(jsonb_build_object(
+  'item_id', '${history.agedItem}',
+  'movement_type', 'sale',
+  'occurred_at', timestamptz '${anchor}' - interval '40 days',
+  'quantity', 1
+)));`,
+    )
+    .join('\n');
   return `
 begin;
 insert into auth.users (
@@ -116,11 +156,13 @@ insert into auth.users (
 ) on conflict (id) do nothing;
 insert into app.owner (user_id) values ('${owner}')
 on conflict (user_id) do nothing;
+${claims()}
+${agedSales}
 commit;
 `;
 }
 
-function historySql(history) {
+function historySql(history, anchor) {
   const orders = history.days * history.perDay;
   const openingQty = orders + 1;
   const late = `${history.prefix}-late`;
@@ -172,7 +214,7 @@ select app.set_order_type_packaging(
   'fixture'
 );
 select app.record_opening_stock(
-  '${historyOpening}',
+  ${openingAt(anchor, history.days)},
   jsonb_build_array(jsonb_build_object(
     'item_id', '${history.item}',
     'quantity', '${openingQty}',
@@ -187,7 +229,7 @@ insert into app.inventory_activation (
   stock_started_at, approved_by, request_id, opening_manifest_hash
 )
 select
-  '${historyOpening}',
+  timestamptz '${anchor}' - interval '800 days',
   '${owner}',
   '${history.activationRequest}',
   md5('${history.prefix}-manifest')
@@ -196,7 +238,12 @@ update app.accounting_rederive_spans
 set completed_at = pg_catalog.clock_timestamp()
 where completed_at is null;
 insert into app.pos_shifts (id, opened_at, is_active, pos_update_time)
-values ('${shift}', '${historyOpening}', false, '${historyOpening}');
+values (
+  '${shift}',
+  ${openingAt(anchor, history.days)},
+  false,
+  ${openingAt(anchor, history.days)}
+);
 insert into app.pos_orders (
   id, shift_id, status, order_type, ordered_at, subtotal, discount, tax,
   service_tax, delivery_fee, total, pos_update_time, content_hash, missing_from_pos
@@ -206,11 +253,11 @@ select
   '${shift}',
   'complete',
   'hall-${history.prefix}',
-  timestamptz '${historyOrigin}'
+  ${originAt(anchor, history.days)}
     + ((g.n - 1) / ${history.perDay}) * interval '1 day'
     + ((g.n - 1) % ${history.perDay}) * interval '8 minutes',
   0, 0, 0, 0, 0, 0,
-  timestamptz '${historyOrigin}'
+  ${originAt(anchor, history.days)}
     + ((g.n - 1) / ${history.perDay}) * interval '1 day'
     + ((g.n - 1) % ${history.perDay}) * interval '8 minutes',
   rpad(md5('${history.prefix}-' || g.n::text), 64, 'a'),
@@ -227,6 +274,20 @@ select count(app.append_pos_cost_input(o.id, null, 'sync'))
 from app.pos_orders o
 where o.id like '${history.prefix}-%'
   and o.id <> '${late}';
+insert into app.activation_history_input (
+  order_id, bound_at, cost_input_id, ordered_at
+)
+select distinct on (orders.id)
+  orders.id,
+  pg_catalog.clock_timestamp(),
+  input.id,
+  orders.ordered_at
+from app.pos_orders orders
+join app.pos_cost_inputs input on input.order_id = orders.id
+where orders.id like '${history.prefix}-%'
+  and orders.id <> '${late}'
+order by orders.id, input.input_revision desc
+on conflict (order_id) do nothing;
 insert into app.stock_items (id, name, kind, base_unit, count_frequency)
 values (
   '${history.weeklyItem}',
@@ -240,7 +301,7 @@ select '${history.name} catalog committed ${orders}';
 `;
 }
 
-function dayCountSql(history, dayNumber) {
+function dayCountSql(history, dayNumber, anchor) {
   const openingQty = history.days * history.perDay + 1;
   const actual = openingQty - dayNumber * history.perDay;
   const daily = `
@@ -250,7 +311,7 @@ with inserted as (
     pg_catalog.gen_random_uuid(),
     pg_catalog.gen_random_uuid(),
     'daily',
-    timestamptz '${historyCountOrigin}' + ${dayNumber - 1} * interval '1 day'
+    ${countAt(anchor, history.days)} + ${dayNumber - 1} * interval '1 day'
   )
   returning id
 )
@@ -271,7 +332,7 @@ with inserted as (
     pg_catalog.gen_random_uuid(),
     pg_catalog.gen_random_uuid(),
     'weekly',
-    timestamptz '${historyWeekOrigin}' + ${week - 1} * interval '7 days'
+    ${weekAt(anchor, history.days)} + ${week - 1} * interval '7 days'
   )
   returning id
 )
@@ -284,7 +345,7 @@ select
 from inserted;`;
 }
 
-function postCallSql(history, startAt, count, post) {
+function postCallSql(history, startAt, count, post, anchor) {
   const parts = [];
   let posted = startAt;
   const end = startAt + count;
@@ -294,7 +355,7 @@ function postCallSql(history, startAt, count, post) {
     parts.push(Array.from({ length: take }, () => post).join('\n'));
     posted += take;
     if (posted % history.perDay === 0) {
-      parts.push(dayCountSql(history, posted / history.perDay));
+      parts.push(dayCountSql(history, posted / history.perDay, anchor));
     }
   }
   return parts.join('\n');
@@ -302,6 +363,7 @@ function postCallSql(history, startAt, count, post) {
 
 function postSql(
   history,
+  anchor,
   { remaining = null, reset = true, already = 0 } = {},
 ) {
   const orders = history.days * history.perDay;
@@ -311,7 +373,7 @@ function postSql(
   // first would put the checkpoint cut on the last anchor, and every later
   // order would fall behind that cut, so the walk could not resume.
   const startAt = reset ? 0 : already;
-  const callSql = postCallSql(history, startAt, calls, post);
+  const callSql = postCallSql(history, startAt, calls, post, anchor);
   const progressSql = reset
     ? `insert into public.bench_build_progress (history, posted, started_at, updated_at)
 values ('${history.name}', 0, pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp())
@@ -412,7 +474,7 @@ select 'history ${history.name} posted ${orders}';
 `;
 }
 
-function lateSql(history) {
+function lateSql(history, anchor) {
   const late = `${history.prefix}-late`;
   const shift = `${history.prefix}-shift`;
   const pos = `bench-${history.prefix}`;
@@ -429,9 +491,9 @@ insert into app.pos_orders (
   '${shift}',
   'complete',
   'hall-${history.prefix}',
-  timestamptz '${historyOrigin}' + ${history.days} * interval '1 day',
+  timestamptz '${anchor}' + interval '10 hours',
   0, 0, 0, 0, 0, 0,
-  timestamptz '${historyOrigin}' + ${history.days} * interval '1 day',
+  timestamptz '${anchor}' + interval '10 hours',
   rpad(md5('${late}'), 64, 'a'),
   false
 );
@@ -446,7 +508,7 @@ select '${history.name} late order queued';
 `;
 }
 
-function measureSql(history) {
+function measureSql(history, anchor) {
   const late = `${history.prefix}-late`;
   const orders = history.days * history.perDay;
   return `
@@ -480,6 +542,7 @@ select
   ) as result,
   pg_catalog.clock_timestamp() as t1;
 set statement_timeout = 0;
+create temp table bench_fresh (payload jsonb) on commit drop;
 do $$
 declare
   v_head jsonb := (select head from bench_head);
@@ -499,6 +562,7 @@ declare
   v_split boolean;
   v_posted bigint;
   v_pass boolean;
+  v_batch integer;
   v_queue_1 numeric;
   v_queue_50000 numeric;
   v_suffix_rows bigint;
@@ -659,30 +723,30 @@ begin
 
   -- The measured order restores the history checkpoint. These sales are an
   -- hour after that order, once on-hand is already negative, so each one is
-  -- its own deficit. A second confirming replay then restores that set.
-  perform app.post_engine_outflows((
-    select
-      pg_catalog.jsonb_agg(
-        pg_catalog.jsonb_build_object(
-          'item_id', '${history.item}',
-          'movement_type', 'sale',
-          'occurred_at', timestamptz '${historyOrigin}'
-            + ${history.days} * interval '1 day'
-            + interval '1 hour',
-          'quantity', 1
+  -- its own deficit. Separate walks keep every earlier checkpoint's deficit
+  -- rows, so the confirming restore of the latest thousand is an index read
+  -- of a table that is much larger than that one checkpoint.
+  for v_batch in 1..20 loop
+    perform app.post_engine_outflows((
+      select
+        pg_catalog.jsonb_agg(
+          pg_catalog.jsonb_build_object(
+            'item_id', '${history.item}',
+            'movement_type', 'sale',
+            'occurred_at', timestamptz '${anchor}' + interval '12 hours',
+            'quantity', 1
+          )
         )
-      )
-    from
-      pg_catalog.generate_series(1, 1001) as g (n)
-  ));
+      from
+        pg_catalog.generate_series(1, 50) as g (n)
+    ));
+  end loop;
   perform app.post_engine_outflows(
     pg_catalog.jsonb_build_array(
       pg_catalog.jsonb_build_object(
         'item_id', '${history.item}',
         'movement_type', 'sale',
-        'occurred_at', timestamptz '${historyOrigin}'
-          + ${history.days} * interval '1 day'
-          + interval '2 hours',
+        'occurred_at', timestamptz '${anchor}' + interval '13 hours',
         'quantity', 1
       )
     )
@@ -690,7 +754,7 @@ begin
 
   select
     probe.deficit_rows,
-    probe.time_arm_index and probe.id_arm_index
+    probe.deficit_index
   into
     v_deficit_rows,
     v_restore_index
@@ -715,7 +779,8 @@ begin
     and coalesce(v_restore_index, false)
     and coalesce(v_deficit_rows, 0) >= 1000;
 
-  raise notice 'MEASURE %', pg_catalog.jsonb_build_object(
+  insert into bench_fresh (payload)
+  values (pg_catalog.jsonb_build_object(
     'name', '${history.name}',
     'orders', ${orders},
     'days', ${history.days},
@@ -743,6 +808,75 @@ begin
     'replay_ms', v_replay_ms,
     'deficit_rows', v_deficit_rows,
     'restore_index', v_restore_index,
+    'fresh_pass', v_pass
+  ));
+end;
+$$;
+select app.replay_execute(
+  array['${history.agedItem}']::uuid[],
+  '[]'::jsonb,
+  pg_catalog.gen_random_uuid(),
+  true
+);
+delete from app.replay_read_probe;
+select set_config('app.replay_probe', '1', true);
+set statement_timeout = '6s';
+create temp table bench_aged on commit drop as
+select
+  pg_catalog.clock_timestamp() as t0,
+  app.post_movements(pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+    'item_id', '${history.agedItem}',
+    'movement_type', 'purchase',
+    'occurred_at', timestamptz '${anchor}' + interval '15 hours',
+    'quantity', 1,
+    'unit_cost', 10
+  ))) as batch,
+  pg_catalog.clock_timestamp() as t1;
+set statement_timeout = 0;
+do $$
+declare
+  v_fresh jsonb := (select payload from bench_fresh);
+  v_seconds numeric := round(
+    extract(epoch from ((select t1 from bench_aged) - (select t0 from bench_aged)))::numeric,
+    3
+  );
+  v_time boolean;
+  v_id boolean;
+  v_restore boolean;
+  v_rows bigint;
+  v_covered boolean;
+  v_pass boolean;
+begin
+  select
+    probe.time_arm_index,
+    probe.id_arm_index,
+    probe.deficit_index,
+    probe.deficit_rows
+  into v_time, v_id, v_restore, v_rows
+  from app.replay_read_probe probe
+  order by probe.id desc
+  limit 1;
+
+  select coalesce(sum(deficit.qty_uncovered), 0) = 0
+  into v_covered
+  from app.provisional_deficits deficit
+  where deficit.item_id = '${history.agedItem}';
+
+  v_pass := coalesce((v_fresh ->> 'fresh_pass')::boolean, false)
+    and v_seconds <= 2
+    and v_seconds <= 6
+    and coalesce(v_time, false)
+    and coalesce(v_id, false)
+    and coalesce(v_restore, false)
+    and coalesce(v_covered, false);
+
+  raise notice 'MEASURE %', v_fresh || pg_catalog.jsonb_build_object(
+    'aged_seconds', v_seconds,
+    'aged_crossed_2s', v_seconds > 2,
+    'aged_suffix_index', coalesce(v_time, false) and coalesce(v_id, false),
+    'aged_restore_index', coalesce(v_restore, false),
+    'aged_deficit_rows', v_rows,
+    'aged_covered', coalesce(v_covered, false),
     'pass', v_pass
   );
 end;
@@ -793,6 +927,12 @@ function formatResult(row) {
     `- split normal and provisional: ${row.split}`,
     `- wall clock seconds: ${row.seconds}`,
     `- crossed 2s: ${row.crossed_2s}`,
+    `- aged cover seconds: ${row.aged_seconds}`,
+    `- aged cover crossed 2s: ${row.aged_crossed_2s}`,
+    `- aged suffix index: ${row.aged_suffix_index}`,
+    `- aged deficit restore index: ${row.aged_restore_index}`,
+    `- aged deficit rows: ${row.aged_deficit_rows}`,
+    `- aged deficit covered: ${row.aged_covered}`,
     `- gate: ${row.pass ? 'PASS' : 'FAIL'}`,
     '',
   ];
@@ -889,7 +1029,7 @@ function writeResults(rows, note) {
   const body = [
     '# Accounting history benchmark',
     '',
-    'Synthetic catalog. Orders start on 2026-11-15 so each one is inside the restatement window, including dates after today. Historical orders were posted with `app.run_accounting_work`. The measured order is a new queue head, timed by a top-level statement after the session statement timeout is set to 6 seconds. The soft gate is 2 seconds and the hard gate is 6 seconds. The pass also requires both suffix arms of that read to be index scans of stock_movements, and a later confirming replay to restore at least 1000 deficits. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk. The earlier 0.785 s two-year figure was measured before the cover path and the closed-period walk, and its suffix query ran after publish so it saw 0 rows.',
+    'Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. A separate purchase today covers a deficit from 40 days ago and is timed the same way. The soft gate is 2 seconds and the hard gate is 6 seconds. Both reads must index-scan both suffix arms of stock_movements, and the deficit restore must be an index scan of replay_checkpoint_deficits. The fresh order also requires that restore to load at least 1000 deficits. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.',
     '',
     ...merged.map((row) =>
       row.error
@@ -980,7 +1120,18 @@ async function run() {
   const skipBuild = process.argv.includes('--skip-build') ? startName : null;
   const resume = process.argv.includes('--resume');
   let started = startName === null;
-  await psqlCaptured(setupSql());
+  const anchorResult = await psqlCaptured(
+    `select to_char((date_trunc('day', pg_catalog.clock_timestamp() at time zone 'Africa/Cairo') at time zone 'Africa/Cairo'), 'YYYY-MM-DD HH24:MI:SSOF');`,
+  );
+  const anchorMatch = anchorResult.out.match(
+    /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}/,
+  );
+  if (!anchorMatch) {
+    throw new Error(`no cairo anchor in ${anchorResult.out}`);
+  }
+  const anchor = anchorMatch[0];
+  process.stderr.write(`cairo day ${anchor}\n`);
+  await psqlCaptured(setupSql(anchor));
   for (const history of histories) {
     if (!started) {
       if (history.name !== startName) continue;
@@ -989,7 +1140,7 @@ async function run() {
     process.stderr.write(`\nbuilding ${history.name}\n`);
     try {
       if (history.name !== skipBuild) {
-        if (!resume) await psqlCaptured(historySql(history));
+        if (!resume) await psqlCaptured(historySql(history, anchor));
         const already = resume ? await postedReceipts(history) : 0;
         const orders = history.days * history.perDay;
         const remaining = orders - (Number.isFinite(already) ? already : 0);
@@ -998,16 +1149,16 @@ async function run() {
         );
         if (remaining > 0) {
           await psqlCaptured(
-            postSql(history, {
+            postSql(history, anchor, {
               remaining,
               reset: !resume,
               already: resume ? already : 0,
             }),
           );
         }
-        await psqlCaptured(lateSql(history));
+        await psqlCaptured(lateSql(history, anchor));
       }
-      const measured = await psqlCaptured(measureSql(history));
+      const measured = await psqlCaptured(measureSql(history, anchor));
       const row = parseMeasure(measured.err);
       if (!row) {
         throw new Error('the measured session did not report a result');

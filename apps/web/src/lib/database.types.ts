@@ -1585,14 +1585,14 @@ isOneToOne: false
                   ]
                 },"replay_read_probe": {
                   Row: {
-                    "captured_at": string,"deficit_rows": number,"id": number,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"replay_ms": number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
+                    "captured_at": string,"deficit_index": boolean,"deficit_plan": string,"deficit_rows": number,"id": number,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"replay_ms": number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
                   }
                   ComputedFields: never
                   Insert: {
-                    "captured_at"?: string,"deficit_rows": number,"id"?: never,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"replay_ms"?: number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
+                    "captured_at"?: string,"deficit_index": boolean,"deficit_plan": string,"deficit_rows": number,"id"?: never,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"replay_ms"?: number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
                   }
                   Update: {
-                    "captured_at"?: string,"deficit_rows"?: number,"id"?: never,"id_arm_index"?: boolean,"id_arm_plan"?: string,"id_arm_rows"?: number,"replay_ms"?: number,"time_arm_index"?: boolean,"time_arm_plan"?: string,"time_arm_rows"?: number
+                    "captured_at"?: string,"deficit_index"?: boolean,"deficit_plan"?: string,"deficit_rows"?: number,"id"?: never,"id_arm_index"?: boolean,"id_arm_plan"?: string,"id_arm_rows"?: number,"replay_ms"?: number,"time_arm_index"?: boolean,"time_arm_plan"?: string,"time_arm_rows"?: number
                   }
                   Relationships: [
                     
@@ -2446,6 +2446,9 @@ isOneToOne: true
 "closed_net_outflow_qty":
 { Args: { "p_change": string,"p_doc_at": string,"p_item_id": string }; Returns: number
                            },
+"closed_required_value":
+{ Args: { "p_recognized_amount": number,"p_recognized_qty": number,"p_required_qty": number,"p_unit": number }; Returns: number
+                           },
 "closed_unit_cost":
 { Args: { "p_item_id": string }; Returns: number
                            },
@@ -2865,7 +2868,7 @@ isOneToOne: true
 { Args: { "p_cause": string,"p_legs": Json }; Returns: string
                            },
 "post_closed_order_difference":
-{ Args: { "p_bucket": string,"p_economic": string,"p_order_id": string,"p_requirements": Json,"p_shift": string }; Returns: string
+{ Args: { "p_bucket": string,"p_cause"?: string,"p_economic": string,"p_order_id": string,"p_requirements": Json,"p_shift": string }; Returns: string
                            },
 "post_engine_outflows":
 { Args: { "p_lines": Json }; Returns: string
@@ -3016,6 +3019,9 @@ isOneToOne: true
 "replay_outflow":
 { Args: { "p_forced_total": number,"p_is_pending": boolean,"p_item_id": string,"p_line_key": number,"p_movement_id": number,"p_note": string,"p_occurred_at": string,"p_out_qty": number,"p_shift_id": string,"p_source_id": string,"p_source_type": string,"p_type": Database["app"]['Enums']["movement_type"] }; Returns: undefined
                            },
+"replay_plan_uses_deficit_index":
+{ Args: { "p_plan": string }; Returns: boolean
+                           },
 "replay_plan_uses_movement_index":
 { Args: { "p_plan": string }; Returns: boolean
                            },
@@ -3143,6 +3149,9 @@ isOneToOne: true
                            },
 "sync_coverage_covers_shift":
 { Args: { "p_applied": boolean,"p_from": string,"p_kind": string,"p_legacy": boolean,"p_opened_at": string,"p_presented": (string)[],"p_scope_shifts": (string)[],"p_shift_id": string }; Returns: boolean
+                           },
+"test_clock_pin":
+{ Args: Record<PropertyKey, never>; Returns: string
                            },
 "text_has_long_digit_run":
 { Args: { "p_text": string }; Returns: boolean

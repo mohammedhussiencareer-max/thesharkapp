@@ -1,6 +1,12 @@
 -- Codex review fixes. Synthetic ids only.
 begin;
 
+-- The window stays 15 November 2026, so 1 November stays inside it and
+-- 1 January 2030 stays open. app.test_clock is honored only for the
+-- database owner.
+select
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
+
 set
   statement_timeout = 0;
 

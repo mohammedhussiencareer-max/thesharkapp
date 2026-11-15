@@ -111,6 +111,22 @@ function idOf(result, label) {
 
 async function main() {
   container = await containerName();
+  const clock = await psql(`
+select
+  to_char(day + interval '11 hours', 'YYYY-MM-DD HH24:MI:SS+00'),
+  to_char(day + interval '12 hours', 'YYYY-MM-DD HH24:MI:SS+00'),
+  to_char(day + interval '1 day 8 hours', 'YYYY-MM-DD HH24:MI:SS+00'),
+  to_char((day + interval '2 days 8 hours') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+  to_char((day + interval '2 days 20 hours') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+  to_char(day + interval '2 days 9 hours', 'YYYY-MM-DD HH24:MI:SS+00')
+from (
+  select date_trunc('day', clock_timestamp() at time zone 'Africa/Cairo')
+    at time zone 'Africa/Cairo' as day
+) cairo;
+`);
+  if (!clock.ok) throw new Error(clock.out);
+  const [morning, noon, nextMorning, shiftOpen, shiftClose, thirdMorning] =
+    clock.out.trim().split('|');
   const setup = await psql(`
 begin;
 insert into auth.users (
@@ -137,7 +153,7 @@ commit;
 begin;
 ${claims()}
 create temp table held_batch on commit drop as
-select ${purchase('2026-10-21 11:00:00+00')} as batch;
+select ${purchase(morning)} as batch;
 select pg_sleep(${holdMs});
 select 'holder_id=' || sm.id::text
 from app.stock_movements sm
@@ -148,7 +164,7 @@ commit;
 begin;
 ${claims()}
 create temp table waited_batch on commit drop as
-select ${purchase('2026-10-21 12:00:00+00')} as batch;
+select ${purchase(noon)} as batch;
 select 'waiter_id=' || sm.id::text
 from app.stock_movements sm
 join waited_batch on waited_batch.batch = sm.batch_id;
@@ -182,7 +198,7 @@ commit;
     `
 begin;
 ${claims()}
-select ${purchase('2026-10-22 08:00:00+00')};
+select ${purchase(nextMorning)};
 select 'purchase_committed';
 commit;
 `,
@@ -226,10 +242,10 @@ commit;
 
   const shift = JSON.stringify({
     id: 'c-pause-shift',
-    opened_at: '2026-10-23T08:00:00Z',
-    closed_at: '2026-10-23T20:00:00Z',
+    opened_at: shiftOpen,
+    closed_at: shiftClose,
     is_active: false,
-    pos_update_time: '2026-10-23T20:00:00Z',
+    pos_update_time: shiftClose,
     transactions: [],
   }).replaceAll("'", "''");
   await psql(`
@@ -270,7 +286,7 @@ commit;
       `
 begin;
 ${claims()}
-select ${purchase('2026-10-23 09:00:00+00')};
+select ${purchase(thirdMorning)};
 select 'purchase_committed';
 commit;
 `,

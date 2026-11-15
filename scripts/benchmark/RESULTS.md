@@ -1,6 +1,6 @@
 # Accounting history benchmark
 
-Synthetic catalog. Orders start on 2026-11-15 so each one is inside the restatement window, including dates after today. Historical orders were posted with `app.run_accounting_work`. The measured order is a new queue head, timed by a top-level statement after the session statement timeout is set to 6 seconds. The soft gate is 2 seconds and the hard gate is 6 seconds. The pass also requires both suffix arms of that read to be index scans of stock_movements, and a later confirming replay to restore at least 1000 deficits. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk. The earlier 0.785 s two-year figure was measured before the cover path and the closed-period walk, and its suffix query ran after publish so it saw 0 rows.
+Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. A separate purchase today covers a deficit from 40 days ago and is timed the same way. The soft gate is 2 seconds and the hard gate is 6 seconds. Both reads must index-scan both suffix arms of stock_movements, and the deficit restore must be an index scan of replay_checkpoint_deficits. The fresh order also requires that restore to load at least 1000 deficits. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.
 
 ## 35-day
 
@@ -11,19 +11,31 @@ Synthetic catalog. Orders start on 2026-11-15 so each one is inside the restatem
 - stock_count_anchors: 35
 - weekly anchors: 5
 - events plus anchors: 3538
-- queue depth 1 ms: 0.237
-- queue depth 50000 ms: 0.313
+- queue depth 1 ms: 0.341
+- queue depth 50000 ms: 0.856
 - suffix index range: true
-- suffix rows: 0
-- deficit restore rows: 1
+- suffix rows: 4
+- time arm rows: 2
+- id arm rows: 2
+- time arm index: true
+- id arm index: true
+- confirming replay ms: 21.109
+- deficit restore rows: 1001
+- deficit restore index: true
 - measured status: processed
 - failed: 0
 - completion outcome: applied
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.081
+- wall clock seconds: 0.077
 - crossed 2s: false
+- aged cover seconds: 0.069
+- aged cover crossed 2s: false
+- aged suffix index: true
+- aged deficit restore index: true
+- aged deficit rows: 1
+- aged deficit covered: true
 - gate: PASS
 
 ## 1-year
@@ -35,16 +47,16 @@ Synthetic catalog. Orders start on 2026-11-15 so each one is inside the restatem
 - stock_count_anchors: 365
 - weekly anchors: 52
 - events plus anchors: 36868
-- queue depth 1 ms: 0.472
-- queue depth 50000 ms: 0.232
+- queue depth 1 ms: 0.266
+- queue depth 50000 ms: 0.616
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 70.992
-- deficit restore rows: 1002
+- confirming replay ms: 92.759
+- deficit restore rows: 1001
 - deficit restore index: true
 - measured status: processed
 - failed: 0
@@ -52,8 +64,14 @@ Synthetic catalog. Orders start on 2026-11-15 so each one is inside the restatem
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.171
+- wall clock seconds: 0.24
 - crossed 2s: false
+- aged cover seconds: 0.141
+- aged cover crossed 2s: false
+- aged suffix index: true
+- aged deficit restore index: true
+- aged deficit rows: 1
+- aged deficit covered: true
 - gate: PASS
 
 ## 2-year
@@ -65,16 +83,16 @@ Synthetic catalog. Orders start on 2026-11-15 so each one is inside the restatem
 - stock_count_anchors: 730
 - weekly anchors: 104
 - events plus anchors: 73733
-- queue depth 1 ms: 0.236
-- queue depth 50000 ms: 0.196
+- queue depth 1 ms: 0.583
+- queue depth 50000 ms: 0.342
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 146.794
-- deficit restore rows: 1002
+- confirming replay ms: 169.82
+- deficit restore rows: 1001
 - deficit restore index: true
 - measured status: processed
 - failed: 0
@@ -82,8 +100,14 @@ Synthetic catalog. Orders start on 2026-11-15 so each one is inside the restatem
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.42
+- wall clock seconds: 0.463
 - crossed 2s: false
+- aged cover seconds: 0.186
+- aged cover crossed 2s: false
+- aged suffix index: true
+- aged deficit restore index: true
+- aged deficit rows: 1
+- aged deficit covered: true
 - gate: PASS
 
 The 35-day, 1-year, and 2-year histories passed the gate.

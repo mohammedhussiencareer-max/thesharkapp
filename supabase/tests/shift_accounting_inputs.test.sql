@@ -4,6 +4,9 @@
 begin;
 
 select
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
+
+select
   no_plan ();
 
 insert into
@@ -4715,8 +4718,18 @@ select
       from
         app.accounting_revision_differences diff
       where
-        diff.shift_id = 'p77-reclass'
+        diff.shift_id is not distinct from app.closed_containing_shift (
+          pg_catalog.current_setting('app.t_change', true)::timestamptz
+        )
         and diff.cause_kind = 'application'
+        and diff.cause_id in (
+          select
+            application.id::text
+          from
+            app.order_cost_applications application
+          where
+            application.order_id = 'p77-o-reclass'
+        )
         and diff.cogs_difference <> '0.00'
         and diff.waste_difference <> '0.00'$$,
     $$values ('-100.00', '100.00', '0.00')$$,
@@ -6038,14 +6051,16 @@ select
 
 select
   results_eq (
-    $$select diff.cause_kind, diff.waste_difference, diff.profit_difference, diff.is_latest
+    $$select diff.cause_kind, diff.waste_difference, diff.profit_difference, diff.is_latest,
+            diff.shift_id is not distinct from app.closed_containing_shift(
+              pg_catalog.current_setting('app.t_change', true)::timestamptz
+            )
       from app.accounting_revision_differences diff
       join app.waste_documents document
         on document.id::text = diff.cause_id
-       and document.request_id = md5('p77-waste-100')::uuid
-      where diff.shift_id = 'p77-wcost'$$,
-    $$values ('waste_document', '20.00', '-20.00', true)$$,
-    'correcting waste cost 80.00 to 100.00 is one -20.00 profit vector'
+       and document.request_id = md5('p77-waste-100')::uuid$$,
+    $$values ('waste_document', '20.00', '-20.00', true, true)$$,
+    'a closed waste correction is attributed to the shift that contains the change, or to none'
   );
 
 select

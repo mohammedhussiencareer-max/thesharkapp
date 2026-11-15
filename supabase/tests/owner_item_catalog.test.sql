@@ -1,6 +1,9 @@
 begin;
 
 select
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
+
+select
   plan (111);
 
 -- Clean up any existing test rows in the transaction.
