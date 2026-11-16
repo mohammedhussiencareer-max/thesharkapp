@@ -1,37 +1,161 @@
 # Accounting history benchmark
 
-Preliminary single-item measurement. The catalog is one stock item with a direct cashier mapping. It has no recipes, no sorting, no stock counts, and no waste. `stock_count_anchors: 0` is that fixture, not the restaurant's load. The full gate, with those components and count anchors, runs in the checkpoint PR that rebuilds this benchmark.
-
-Historical orders were posted with `app.run_accounting_work`. The measured order was the queue head and was timed in a fresh session with `statement_timeout` of 6 seconds. Crossing 2 seconds is recorded and does not fail. No checkpoint was built.
+Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. Every measured call must resume from a checkpoint. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), shared hit plus read pages below 5000, and a frozen prefix that is not walked. The measured order suffix arms must be index scans on their own. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.
 
 ## 35-day
-
-Preliminary only. One item, direct mapping, no recipes, sorting, counts, or waste.
 
 - orders: 3500
 - days: 35
 - posted historical orders with a posting receipt and movements: 3500
-- build elapsed: 01:44:55.534346
-- eligible replay rows before the measured call: 3501
-- stock_count_anchors: 0
-- events plus anchors: 3501
+- eligible replay rows before the measured call: 3503
+- stock_count_anchors: 35
+- weekly anchors: 5
+- events plus anchors: 3538
+- queue depth 1 ms: 0.234
+- queue depth 50000 ms: 0.209
+- suffix index range: true
+- suffix rows: 4
+- time arm rows: 2
+- id arm rows: 2
+- time arm index: true
+- id arm index: true
+- confirming replay ms: 23.33
+- prefix rows: 0
+- resumed from checkpoint: true
+- shared hit+read limit: 5000
+- fresh buffers: 8
+- selective restore seconds: 0.013
+- selective restore crossed 2s: false
+- selective prefix rows: 0
+- selective deficit rows: 1
+- selective buffers: 10
+- selective resumed: true
+- large-share restore seconds: 0.019
+- large-share restore crossed 2s: false
+- large-share prefix rows: 0
+- large-share deficit rows: 201
+- large-share buffers: 426
+- large-share resumed: true
+- large-share table rows: 402
 - measured status: processed
 - failed: 0
 - completion outcome: applied
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 1.949
+- wall clock seconds: 0.082
 - crossed 2s: false
-- gate: preliminary PASS for this single-item history. The full gate runs with the checkpoint PR
+- aged cover seconds: 0.04
+- aged cover crossed 2s: false
+- aged prefix rows: 0
+- aged deficit rows: 1
+- aged buffers: 13
+- aged resumed: true
+- aged deficit covered: true
+- gate: PASS
 
 ## 1-year
 
-- orders in the catalog: 36500
+- orders: 36500
 - days: 365
-- posted with a posting receipt before the failing call: 3171
-- the next call was cancelled with `statement timeout` inside `app.accounting_pending_orders(1001)`, called from `app.run_accounting_work` while counting the remaining queue
-- the late order was not inserted and was not measured
-- gate: FAIL
+- posted historical orders with a posting receipt and movements: 36500
+- eligible replay rows before the measured call: 36503
+- stock_count_anchors: 365
+- weekly anchors: 52
+- events plus anchors: 36868
+- queue depth 1 ms: 0.316
+- queue depth 50000 ms: 0.223
+- suffix index range: true
+- suffix rows: 4
+- time arm rows: 2
+- id arm rows: 2
+- time arm index: true
+- id arm index: true
+- confirming replay ms: 59.542
+- prefix rows: 0
+- resumed from checkpoint: true
+- shared hit+read limit: 5000
+- fresh buffers: 4
+- selective restore seconds: 0.019
+- selective restore crossed 2s: false
+- selective prefix rows: 0
+- selective deficit rows: 1
+- selective buffers: 11
+- selective resumed: true
+- large-share restore seconds: 0.031
+- large-share restore crossed 2s: false
+- large-share prefix rows: 0
+- large-share deficit rows: 405
+- large-share buffers: 842
+- large-share resumed: true
+- large-share table rows: 810
+- measured status: processed
+- failed: 0
+- completion outcome: applied
+- receipt_kind: posting
+- per-item movement links match negated requirements: true
+- split normal and provisional: true
+- wall clock seconds: 0.179
+- crossed 2s: false
+- aged cover seconds: 0.057
+- aged cover crossed 2s: false
+- aged prefix rows: 0
+- aged deficit rows: 1
+- aged buffers: 13
+- aged resumed: true
+- aged deficit covered: true
+- gate: PASS
 
-Stopped after a failing history. No checkpoint was built.
+## 2-year
+
+- orders: 73000
+- days: 730
+- posted historical orders with a posting receipt and movements: 73000
+- eligible replay rows before the measured call: 73003
+- stock_count_anchors: 730
+- weekly anchors: 104
+- events plus anchors: 73733
+- queue depth 1 ms: 0.318
+- queue depth 50000 ms: 6.122
+- suffix index range: true
+- suffix rows: 4
+- time arm rows: 2
+- id arm rows: 2
+- time arm index: true
+- id arm index: true
+- confirming replay ms: 120.284
+- prefix rows: 0
+- resumed from checkpoint: true
+- shared hit+read limit: 5000
+- fresh buffers: 4
+- selective restore seconds: 0.026
+- selective restore crossed 2s: false
+- selective prefix rows: 0
+- selective deficit rows: 1
+- selective buffers: 11
+- selective resumed: true
+- large-share restore seconds: 0.058
+- large-share restore crossed 2s: false
+- large-share prefix rows: 0
+- large-share deficit rows: 813
+- large-share buffers: 2092
+- large-share resumed: true
+- large-share table rows: 1626
+- measured status: processed
+- failed: 0
+- completion outcome: applied
+- receipt_kind: posting
+- per-item movement links match negated requirements: true
+- split normal and provisional: true
+- wall clock seconds: 0.743
+- crossed 2s: false
+- aged cover seconds: 0.078
+- aged cover crossed 2s: false
+- aged prefix rows: 0
+- aged deficit rows: 1
+- aged buffers: 11
+- aged resumed: true
+- aged deficit covered: true
+- gate: PASS
+
+The 35-day, 1-year, and 2-year histories passed the gate.

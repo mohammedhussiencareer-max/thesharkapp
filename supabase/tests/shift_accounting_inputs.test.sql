@@ -4,6 +4,9 @@
 begin;
 
 select
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
+
+select
   no_plan ();
 
 insert into
@@ -551,13 +554,24 @@ select
 select
   pg_temp.shift ('p77-cover', '2026-12-16 12:00+00', false);
 
--- Inside the one-day freshness budget however old the suite clock is,
--- and after every fixed count so it cannot own one.
-select
-  pg_temp.shift (
+-- Freshness compares coverage with pg_catalog.now(), not the pin. Keep this
+-- shift inside the one-day budget of that clock. Close it after one second so
+-- its span does not contain the pin or a fixed count.
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+values
+  (
     'p77-stale',
-    pg_catalog.clock_timestamp () - interval '2 days',
-    false
+    pg_catalog.now () - interval '2 days',
+    pg_catalog.now () - interval '2 days' + interval '1 second',
+    false,
+    pg_catalog.now () - interval '2 days'
   );
 
 select
@@ -1264,7 +1278,8 @@ select
     )
   );
 
--- Coverage. The stale shift and the scope gap are not in the fresh row.
+-- Coverage. Freshness is pg_catalog.now() minus a budget, so a current run is
+-- stamped from that clock. The stale shift and the scope gap are not in it.
 -- A legacy row presents the gap and still does not cover it.
 insert into
   app.pos_sync_coverage (
@@ -1281,8 +1296,8 @@ insert into
   )
 select
   770001,
-  pg_catalog.clock_timestamp () - interval '1 hour',
-  pg_catalog.clock_timestamp (),
+  pg_catalog.now () - interval '1 hour',
+  pg_catalog.now (),
   true,
   'all',
   null,
@@ -1319,8 +1334,8 @@ insert into
 values
   (
     770002,
-    pg_catalog.clock_timestamp () - interval '3 days 1 minute',
-    pg_catalog.clock_timestamp () - interval '3 days',
+    pg_catalog.now () - interval '3 days 1 minute',
+    pg_catalog.now () - interval '3 days',
     true,
     'shift_ids',
     null,
@@ -1331,8 +1346,8 @@ values
   ),
   (
     770003,
-    pg_catalog.clock_timestamp () - interval '1 hour',
-    pg_catalog.clock_timestamp (),
+    pg_catalog.now () - interval '1 hour',
+    pg_catalog.now (),
     true,
     'all',
     null,
@@ -2664,7 +2679,7 @@ values
   (
     '2026-08-01',
     true,
-    pg_catalog.clock_timestamp (),
+    app.test_clock_pin (),
     'a7700000-0000-4000-8000-0000000000a1'
   );
 
@@ -2804,7 +2819,20 @@ where
 select
   pg_temp.shift (
     'p77-after',
-    pg_catalog.clock_timestamp () + interval '1 hour',
+    (
+      select
+        history.known_since + interval '1 hour'
+      from
+        app.item_tracking_history history
+      where
+        history.item_id = pg_temp.u (3)
+        and not history.active
+      order by
+        history.known_since desc,
+        history.id desc
+      limit
+        1
+    ),
     false
   );
 
@@ -2864,13 +2892,13 @@ values
     'daily',
     0,
     true,
-    pg_catalog.clock_timestamp () - interval '10 days'
+    app.test_clock_pin () - interval '10 days'
   );
 
 select
   pg_temp.shift (
     'p77-freq',
-    pg_catalog.clock_timestamp () - interval '9 days',
+    app.test_clock_pin () - interval '9 days',
     false
   );
 
@@ -2883,7 +2911,20 @@ where
 select
   pg_temp.shift (
     'p77-freq-after',
-    pg_catalog.clock_timestamp () + interval '2 hours',
+    (
+      select
+        history.known_since + interval '1 hour'
+      from
+        app.item_tracking_history history
+      where
+        history.item_id = pg_temp.u (5)
+        and history.count_frequency = 'weekly'
+      order by
+        history.known_since desc,
+        history.id desc
+      limit
+        1
+    ),
     false
   );
 
@@ -3117,8 +3158,8 @@ begin
   values
     (
       v_run,
-      pg_catalog.clock_timestamp () - interval '1 minute',
-      pg_catalog.clock_timestamp (),
+      pg_catalog.now () - interval '1 minute',
+      pg_catalog.now (),
       true,
       'shift_ids',
       null,
@@ -3177,13 +3218,13 @@ values
   (
     '2026-09-01',
     true,
-    pg_catalog.clock_timestamp (),
+    app.test_clock_pin (),
     'a7700000-0000-4000-8000-0000000000a1'
   ),
   (
     '2026-04-01',
     true,
-    pg_catalog.clock_timestamp (),
+    app.test_clock_pin (),
     'a7700000-0000-4000-8000-0000000000a1'
   );
 
@@ -4682,6 +4723,73 @@ select
 select
   app.append_pos_cost_input ('p77-o-reclass', null, 'sync');
 
+update app.pos_shifts
+set
+  closed_at = app.test_clock_pin () - interval '2 hours',
+  is_active = false
+where
+  id = 'p77-open';
+
+select
+  app.post_closed_legs (
+    null,
+    pg_catalog.jsonb_build_array (
+      pg_catalog.jsonb_build_object (
+        'item_id',
+        pg_temp.u (8),
+        'quantity',
+        0,
+        'total_cost',
+        1,
+        'bucket',
+        'inventory',
+        'piece',
+        0
+      )
+    )
+  );
+
+select
+  is (
+    (
+      select
+        attribution.shift_id
+      from
+        app.movement_attributions attribution
+        join app.stock_movements movement on movement.id = attribution.movement_id
+      where
+        movement.item_id = pg_temp.u (8)
+        and movement.total_cost = 1
+        and movement.movement_type = 'closed_period'
+    ),
+    null::text,
+    'a closed posting with no current shift is attributed to none'
+  );
+
+update app.pos_shifts
+set
+  closed_at = null,
+  is_active = true
+where
+  id = 'p77-open';
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+values
+  (
+    'p77-change',
+    app.test_clock_pin () - interval '1 hour',
+    app.test_clock_pin () + interval '4 hours',
+    true,
+    app.test_clock_pin ()
+  );
+
 select
   is (
     pg_temp.account ('p77-o-reclass') ->> 'outcome',
@@ -4715,8 +4823,16 @@ select
       from
         app.accounting_revision_differences diff
       where
-        diff.shift_id = 'p77-reclass'
+        diff.shift_id = 'p77-change'
         and diff.cause_kind = 'application'
+        and diff.cause_id in (
+          select
+            application.id::text
+          from
+            app.order_cost_applications application
+          where
+            application.order_id = 'p77-o-reclass'
+        )
         and diff.cogs_difference <> '0.00'
         and diff.waste_difference <> '0.00'$$,
     $$values ('-100.00', '100.00', '0.00')$$,
@@ -4926,8 +5042,8 @@ insert into
   )
 select
   coalesce(max(coverage.run_id), 772000) + 1,
-  pg_catalog.clock_timestamp () - interval '1 minute',
-  pg_catalog.clock_timestamp (),
+  pg_catalog.now () - interval '1 minute',
+  pg_catalog.now (),
   true,
   'shift_ids',
   null,
@@ -6032,21 +6148,20 @@ select
       )
       order by document.id, sm.id$$,
     $$values (true, 'waste', '-80.00'),
-             (false, 'waste_reversal', '80.00'),
-             (false, 'waste', '-100.00')$$,
-    'record_waste posts cost 80.00 and the correction retires it and posts 100.00'
+             (false, 'closed_period', '-20.00')$$,
+    'a closed waste correction keeps the original and posts the -20.00 difference'
   );
 
 select
   results_eq (
-    $$select diff.cause_kind, diff.waste_difference, diff.profit_difference, diff.is_latest
+    $$select diff.cause_kind, diff.waste_difference, diff.profit_difference, diff.is_latest,
+            diff.shift_id
       from app.accounting_revision_differences diff
       join app.waste_documents document
         on document.id::text = diff.cause_id
-       and document.request_id = md5('p77-waste-100')::uuid
-      where diff.shift_id = 'p77-wcost'$$,
-    $$values ('waste_document', '20.00', '-20.00', true)$$,
-    'correcting waste cost 80.00 to 100.00 is one -20.00 profit vector'
+       and document.request_id = md5('p77-waste-100')::uuid$$,
+    $$values ('waste_document', '20.00', '-20.00', true, 'p77-change')$$,
+    'a closed waste correction is attributed to the current shift, not the historical one'
   );
 
 select

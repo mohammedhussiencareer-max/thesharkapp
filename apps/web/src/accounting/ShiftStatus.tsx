@@ -40,6 +40,7 @@ function DifferenceList({
     ['تكلفة المبيعات', vector.cogsDifference],
     ['الهالك', vector.wasteDifference],
     ['الجرد', vector.countDifference],
+    ['تسوية فترة مقفولة', vector.inventoryDifference],
     ['الربح', vector.profitDifference],
   ].map(([term, value]) => ({ term: term ?? '', value: value ?? '' }));
   return (

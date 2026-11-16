@@ -1,7 +1,10 @@
 begin;
 
 select
-  plan (92);
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
+
+select
+  plan (99);
 
 -- Clean up any existing test rows in the transaction.
 delete from app.provisional_deficits;
@@ -2256,7 +2259,7 @@ select
   throws_ok (
     $$select app.post_sort('10000000-0000-4000-8000-000000000005', now(), 1, '[]'::jsonb, null)$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for schema app',
     'Auth: anon cannot execute app.post_sort'
   );
 
@@ -2270,6 +2273,59 @@ select
   );
 
 reset role;
+
+select
+  is (
+    has_function_privilege(
+      'anon',
+      'app.post_sort(uuid, timestamptz, numeric, jsonb, text)',
+      'execute'
+    ),
+    false,
+    'catalog: anon has no execute on post_sort'
+  );
+
+select
+  is (
+    has_table_privilege('anon', 'app.stock_movements', 'select'),
+    false,
+    'catalog: anon has no select on stock_movements'
+  );
+
+select
+  is (
+    has_table_privilege('authenticated', 'app.stock_movements', 'select'),
+    true,
+    'catalog: authenticated select on stock_movements is granted'
+  );
+
+select
+  is (
+    has_table_privilege('service_role', 'app.stock_movements', 'select'),
+    true,
+    'catalog: service_role select on stock_movements is granted'
+  );
+
+select
+  is (
+    has_table_privilege('anon', 'app.stock_movements', 'insert'),
+    false,
+    'catalog: anon has no insert on stock_movements'
+  );
+
+select
+  is (
+    has_table_privilege('authenticated', 'app.stock_movements', 'insert'),
+    false,
+    'catalog: authenticated has no insert on stock_movements'
+  );
+
+select
+  is (
+    has_table_privilege('service_role', 'app.stock_movements', 'insert'),
+    false,
+    'catalog: service_role has no insert on stock_movements'
+  );
 
 -- Item 9: Session with no role claim and no owner gets insufficient_privilege
 select

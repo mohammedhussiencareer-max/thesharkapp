@@ -12,6 +12,7 @@ const zero: DifferenceVector = {
   cogsDifference: '1.25',
   wasteDifference: '-1.25',
   countDifference: '0.00',
+  inventoryDifference: '1.50',
   profitDifference: '0.00',
 };
 
@@ -45,6 +46,8 @@ describe('ShiftStatus', () => {
     expect(screen.getByText('فيه خصم ناقص')).toBeInTheDocument();
     expect(screen.getByText('الصنف مش مربوط')).toBeInTheDocument();
     expect(screen.getAllByText('فرق المبيعات').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('تسوية فترة مقفولة').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('1.50 ج.م').length).toBeGreaterThan(0);
     expect(screen.getAllByText('1.25 ج.م').length).toBeGreaterThan(0);
     expect(screen.queryByText(/صافي المبيعات/)).toBeNull();
     expect(screen.queryByRole('list', { name: 'أسباب الفروق' })).toBeNull();

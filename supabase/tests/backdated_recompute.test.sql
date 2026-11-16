@@ -1,6 +1,9 @@
 begin;
 
 select
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
+
+select
   no_plan ();
 
 insert into
@@ -3326,8 +3329,8 @@ select
         n.nspname = 'ledger_scratch'
         and c.relkind = 'r'
     ),
-    8::bigint,
-    'ledger_scratch has the eight replay tables'
+    11::bigint,
+    'ledger_scratch has the eleven replay tables'
   );
 
 select

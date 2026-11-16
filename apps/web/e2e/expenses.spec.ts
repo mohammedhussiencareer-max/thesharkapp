@@ -33,8 +33,16 @@ test('owner records expenses and sees the daily allocation', async ({
     page.getByRole('heading', { name: 'المصاريف', exact: true }),
   ).toBeVisible();
 
+  // The next April after this run: a 30-day month that is still inside the
+  // window on whatever day the suite runs.
+  const anchor = new Date();
+  const aprilYear =
+    anchor.getUTCMonth() >= 3
+      ? anchor.getUTCFullYear() + 1
+      : anchor.getUTCFullYear();
+  const april = `${aprilYear}-04`;
   // exact: once the month loads, "مصاريف الشهر كاملة" and "إجمالي الشهر" also match.
-  await page.getByLabel('الشهر', { exact: true }).fill('2030-04');
+  await page.getByLabel('الشهر', { exact: true }).fill(april);
   const table = page.getByRole('table', { name: 'توزيع الشهر' });
   await expect(table).toBeVisible(visible);
   await voidOpenExpenses(page);
@@ -56,19 +64,18 @@ test('owner records expenses and sees the daily allocation', async ({
   );
 
   await form.getByLabel('التصنيف').selectOption({ label: 'أجر طيارين' });
-  await form.getByLabel('التاريخ').fill('2030-04-15');
+  await form.getByLabel('التاريخ').fill(`${april}-15`);
   await form.getByLabel('الساعات').fill('5.5');
   await form.getByLabel('سعر الساعة').fill('30');
   await form.getByLabel('اسم الطيار').fill('طيار اختبار');
   await expect(form.getByLabel('المبلغ')).toContainText('165.00');
   await form.getByRole('button', { name: 'حفظ المصروف' }).click();
-  await expect(table.getByRole('row', { name: /15\/04\/2030/ })).toContainText(
-    '165.00',
-    visible,
-  );
+  await expect(
+    table.getByRole('row', { name: new RegExp(`15/04/${aprilYear}`) }),
+  ).toContainText('165.00', visible);
 
   await form.getByLabel('التصنيف').selectOption({ label: 'غاز' });
-  await form.getByLabel('التاريخ').fill('2030-04-03');
+  await form.getByLabel('التاريخ').fill(`${april}-03`);
   await form.getByLabel('المبلغ').fill('40');
   await form.getByRole('checkbox', { name: 'تقدير' }).check();
   await form.getByRole('button', { name: 'حفظ المصروف' }).click();
@@ -78,12 +85,14 @@ test('owner records expenses and sees the daily allocation', async ({
   );
 
   await form.getByLabel('التصنيف').selectOption({ label: 'غاز' });
-  await form.getByLabel('التاريخ').fill('2030-04-03');
+  await form.getByLabel('التاريخ').fill(`${april}-03`);
   await form.getByLabel('المبلغ').fill('55');
   await form.getByRole('checkbox', { name: 'تقدير' }).uncheck();
   await form.getByRole('button', { name: 'حفظ المصروف' }).click();
   await expect(page.getByText('التقدير اتلغى بالفاتورة')).toBeVisible(visible);
-  const third = table.getByRole('row', { name: /03\/04\/2030/ });
+  const third = table.getByRole('row', {
+    name: new RegExp(`03/04/${aprilYear}`),
+  });
   await expect(third).toContainText('55.00');
   await expect(third).not.toContainText('95.00');
 });
