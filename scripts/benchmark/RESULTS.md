@@ -1,6 +1,6 @@
 # Accounting history benchmark
 
-Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), buffers, and a frozen prefix that is not walked. Suffix arms keep an index scan when the planner still chooses one; otherwise the same latency and no-prefix rule applies. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.
+Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. Every measured call must resume from a checkpoint. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), shared hit plus read pages below 5000, and a frozen prefix that is not walked. The measured order suffix arms must be index scans on their own. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.
 
 ## 35-day
 
@@ -11,26 +11,31 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 35
 - weekly anchors: 5
 - events plus anchors: 3538
-- queue depth 1 ms: 0.32
-- queue depth 50000 ms: 0.381
+- queue depth 1 ms: 0.338
+- queue depth 50000 ms: 0.44
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 15.444
+- confirming replay ms: 18.518
 - prefix rows: 0
-- selective restore seconds: 0.012
+- resumed from checkpoint: true
+- shared hit+read limit: 5000
+- fresh buffers: 8
+- selective restore seconds: 0.013
 - selective restore crossed 2s: false
 - selective prefix rows: 0
 - selective deficit rows: 1
-- selective buffers: 15
-- large-share restore seconds: 0.013
+- selective buffers: 10
+- selective resumed: true
+- large-share restore seconds: 0.017
 - large-share restore crossed 2s: false
 - large-share prefix rows: 0
 - large-share deficit rows: 201
-- large-share buffers: 439
+- large-share buffers: 426
+- large-share resumed: true
 - large-share table rows: 402
 - measured status: processed
 - failed: 0
@@ -38,13 +43,14 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.061
+- wall clock seconds: 0.072
 - crossed 2s: false
-- aged cover seconds: 0.032
+- aged cover seconds: 0.063
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1
-- aged buffers: 18
+- aged buffers: 13
+- aged resumed: true
 - aged deficit covered: true
 - gate: PASS
 
@@ -57,40 +63,46 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 365
 - weekly anchors: 52
 - events plus anchors: 36868
-- queue depth 1 ms: 0.35
-- queue depth 50000 ms: 0.33
+- queue depth 1 ms: 0.201
+- queue depth 50000 ms: 0.223
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 36.702
+- confirming replay ms: 43.277
 - prefix rows: 0
-- selective restore seconds: 0.01
+- resumed from checkpoint: true
+- shared hit+read limit: 5000
+- fresh buffers: 4
+- selective restore seconds: 0.018
 - selective restore crossed 2s: false
 - selective prefix rows: 0
 - selective deficit rows: 1
-- selective buffers: 16
-- large-share restore seconds: 0.032
+- selective buffers: 11
+- selective resumed: true
+- large-share restore seconds: 0.025
 - large-share restore crossed 2s: false
 - large-share prefix rows: 0
-- large-share deficit rows: 406
-- large-share buffers: 865
-- large-share table rows: 812
+- large-share deficit rows: 405
+- large-share buffers: 842
+- large-share resumed: true
+- large-share table rows: 810
 - measured status: processed
 - failed: 0
 - completion outcome: applied
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.122
+- wall clock seconds: 0.143
 - crossed 2s: false
-- aged cover seconds: 0.038
+- aged cover seconds: 0.053
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1
-- aged buffers: 18
+- aged buffers: 13
+- aged resumed: true
 - aged deficit covered: true
 - gate: PASS
 
@@ -103,40 +115,46 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 730
 - weekly anchors: 104
 - events plus anchors: 73733
-- queue depth 1 ms: 0.28
-- queue depth 50000 ms: 0.294
+- queue depth 1 ms: 0.613
+- queue depth 50000 ms: 0.342
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 78.786
+- confirming replay ms: 113.75
 - prefix rows: 0
-- selective restore seconds: 0.013
+- resumed from checkpoint: true
+- shared hit+read limit: 5000
+- fresh buffers: 4
+- selective restore seconds: 0.02
 - selective restore crossed 2s: false
 - selective prefix rows: 0
 - selective deficit rows: 1
-- selective buffers: 16
-- large-share restore seconds: 0.034
+- selective buffers: 11
+- selective resumed: true
+- large-share restore seconds: 0.056
 - large-share restore crossed 2s: false
 - large-share prefix rows: 0
-- large-share deficit rows: 816
-- large-share buffers: 2136
-- large-share table rows: 1632
+- large-share deficit rows: 813
+- large-share buffers: 2092
+- large-share resumed: true
+- large-share table rows: 1626
 - measured status: processed
 - failed: 0
 - completion outcome: applied
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.329
+- wall clock seconds: 0.507
 - crossed 2s: false
-- aged cover seconds: 0.037
+- aged cover seconds: 0.059
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1
-- aged buffers: 16
+- aged buffers: 11
+- aged resumed: true
 - aged deficit covered: true
 - gate: PASS
 

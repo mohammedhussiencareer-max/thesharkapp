@@ -1585,14 +1585,14 @@ isOneToOne: false
                   ]
                 },"replay_read_probe": {
                   Row: {
-                    "captured_at": string,"deficit_buffers": number,"deficit_index": boolean,"deficit_plan": string,"deficit_rows": number,"id": number,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"prefix_rows": number,"replay_ms": number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
+                    "captured_at": string,"deficit_buffers": number,"deficit_index": boolean,"deficit_plan": string,"deficit_rows": number,"id": number,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"prefix_rows": number,"replay_ms": number,"resume_detail": NonNullable<Json>,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
                   }
                   ComputedFields: never
                   Insert: {
-                    "captured_at"?: string,"deficit_buffers"?: number,"deficit_index": boolean,"deficit_plan": string,"deficit_rows": number,"id"?: never,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"prefix_rows"?: number,"replay_ms"?: number,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
+                    "captured_at"?: string,"deficit_buffers"?: number,"deficit_index": boolean,"deficit_plan": string,"deficit_rows": number,"id"?: never,"id_arm_index": boolean,"id_arm_plan": string,"id_arm_rows": number,"prefix_rows"?: number,"replay_ms"?: number,"resume_detail"?: NonNullable<Json>,"time_arm_index": boolean,"time_arm_plan": string,"time_arm_rows": number
                   }
                   Update: {
-                    "captured_at"?: string,"deficit_buffers"?: number,"deficit_index"?: boolean,"deficit_plan"?: string,"deficit_rows"?: number,"id"?: never,"id_arm_index"?: boolean,"id_arm_plan"?: string,"id_arm_rows"?: number,"prefix_rows"?: number,"replay_ms"?: number,"time_arm_index"?: boolean,"time_arm_plan"?: string,"time_arm_rows"?: number
+                    "captured_at"?: string,"deficit_buffers"?: number,"deficit_index"?: boolean,"deficit_plan"?: string,"deficit_rows"?: number,"id"?: never,"id_arm_index"?: boolean,"id_arm_plan"?: string,"id_arm_rows"?: number,"prefix_rows"?: number,"replay_ms"?: number,"resume_detail"?: NonNullable<Json>,"time_arm_index"?: boolean,"time_arm_plan"?: string,"time_arm_rows"?: number
                   }
                   Relationships: [
                     
@@ -3173,6 +3173,9 @@ isOneToOne: true
                            },
 "wake_closed_cost_basis":
 { Args: { "p_cause": string,"p_item_id": string }; Returns: undefined
+                           },
+"waste_document_root":
+{ Args: { "p_document_id": number }; Returns: number
                            }
           }
           Enums: {

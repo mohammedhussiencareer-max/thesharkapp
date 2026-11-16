@@ -4,7 +4,7 @@ select
   set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
 
 select
-  plan (142);
+  plan (149);
 
 -- Synthetic users only. No POS documents and no customer data.
 delete from app.owner;
@@ -641,6 +641,59 @@ select
   );
 
 reset role;
+
+select
+  is (
+    has_table_privilege('anon', 'app.pos_orders', 'insert'),
+    false,
+    'catalog: anon has no insert on pos_orders'
+  );
+
+select
+  is (
+    has_table_privilege('authenticated', 'app.pos_orders', 'insert'),
+    false,
+    'catalog: authenticated has no insert on pos_orders'
+  );
+
+select
+  is (
+    has_table_privilege('service_role', 'app.pos_orders', 'insert'),
+    false,
+    'catalog: service_role has no insert on pos_orders'
+  );
+
+select
+  is (
+    has_table_privilege('anon', 'app.pos_orders', 'select'),
+    false,
+    'catalog: anon has no select on pos_orders'
+  );
+
+select
+  is (
+    has_table_privilege('authenticated', 'app.pos_orders', 'select'),
+    true,
+    'catalog: authenticated select on pos_orders is granted'
+  );
+
+select
+  is (
+    has_table_privilege('service_role', 'app.pos_orders', 'select'),
+    true,
+    'catalog: service_role select on pos_orders is granted'
+  );
+
+select
+  is (
+    has_function_privilege(
+      'anon',
+      'app.ingest_pos_batch(bigint, jsonb, jsonb, jsonb)',
+      'execute'
+    ),
+    false,
+    'catalog: anon has no execute on ingest_pos_batch'
+  );
 
 select
   set_config(

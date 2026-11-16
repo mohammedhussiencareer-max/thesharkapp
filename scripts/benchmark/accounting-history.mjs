@@ -6,8 +6,9 @@
 // a deficit from 40 days ago. statement_timeout is set on the session before
 // each measured statement. 2 seconds is soft and 6 seconds is the hard gate.
 // A restore may sequence-scan replay_checkpoint_deficits. The gate is latency,
-// buffers, and a frozen prefix that is not walked. Suffix arms keep an index
-// scan when the planner still chooses one.
+// a checkpoint cut on every measured call, a frozen prefix that is not walked,
+// and shared hit+read pages below SHARED_HIT_READ_LIMIT. The suffix arms of the
+// measured order must be index scans on their own.
 
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -16,6 +17,10 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const owner = 'b9e00000-0000-4000-8000-0000000000a1';
+// Shared hit + read pages on one restore. Above the last measured restores
+// (the 2-year large share was 2136 including dirtied and written) and below
+// a sequence scan of a multi-year deficit table.
+const SHARED_HIT_READ_LIMIT = 5000;
 
 // Cairo midnight of the run, captured once. History ends yesterday. The
 // measured order and the aged-deficit purchase are today.
@@ -579,6 +584,9 @@ declare
   v_id_arm_index boolean;
   v_replay_ms numeric;
   v_prefix_rows bigint;
+  v_buffers bigint;
+  v_detail jsonb;
+  v_resumed boolean;
   v_t0 timestamptz;
   v_plan json;
 begin
@@ -709,14 +717,18 @@ begin
     probe.time_arm_index,
     probe.id_arm_index,
     probe.replay_ms,
-    probe.prefix_rows
+    probe.prefix_rows,
+    probe.deficit_buffers,
+    probe.resume_detail
   into
     v_time_arm_rows,
     v_id_arm_rows,
     v_time_arm_index,
     v_id_arm_index,
     v_replay_ms,
-    v_prefix_rows
+    v_prefix_rows,
+    v_buffers,
+    v_detail
   from
     app.replay_read_probe probe
   order by
@@ -727,6 +739,14 @@ begin
   v_suffix_rows := coalesce(v_time_arm_rows, 0) + coalesce(v_id_arm_rows, 0);
   v_suffix_index := coalesce(v_time_arm_index, false)
     and coalesce(v_id_arm_index, false);
+  select
+    coalesce(
+      bool_and(elem -> 'checkpoint_id' is distinct from 'null'::jsonb)
+        and count(*) > 0,
+      false
+    )
+  into v_resumed
+  from pg_catalog.jsonb_array_elements(coalesce(v_detail, '[]'::jsonb)) as detail (elem);
 
   -- This probe belongs to the timed order. Later restores record their own.
   v_pass := v_result ->> 'status' = 'processed'
@@ -740,10 +760,10 @@ begin
     and v_seconds <= 2
     and v_seconds <= 6
     and coalesce(v_prefix_rows, 0) = 0
-    and (
-      v_suffix_index
-      or coalesce(v_prefix_rows, 0) = 0
-    );
+    and v_suffix_index
+    and v_resumed
+    and coalesce(v_buffers, 0) > 0
+    and coalesce(v_buffers, 0) < ${SHARED_HIT_READ_LIMIT};
 
   insert into bench_fresh (payload)
   values (pg_catalog.jsonb_build_object(
@@ -773,6 +793,9 @@ begin
     'id_arm_index', v_id_arm_index,
     'replay_ms', v_replay_ms,
     'prefix_rows', coalesce(v_prefix_rows, 0),
+    'buffers', coalesce(v_buffers, 0),
+    'resumed', v_resumed,
+    'buffer_limit', ${SHARED_HIT_READ_LIMIT},
     'fresh_pass', v_pass
   ));
 end;
@@ -858,7 +881,8 @@ select
   probe.prefix_rows,
   probe.deficit_rows,
   probe.deficit_buffers,
-  probe.deficit_plan
+  probe.deficit_plan,
+  probe.resume_detail
 from app.replay_read_probe probe
 order by probe.id desc
 limit 1;
@@ -910,6 +934,7 @@ select
   probe.deficit_rows,
   probe.deficit_buffers,
   probe.deficit_plan,
+  probe.resume_detail,
   (select table_rows from bench_large_size) as table_rows
 from app.replay_read_probe probe
 order by probe.id desc
@@ -967,11 +992,17 @@ declare
   v_sel_rows bigint;
   v_sel_buffers bigint;
   v_sel_plan text;
+  v_sel_detail jsonb;
+  v_sel_resumed boolean;
   v_large_prefix bigint;
   v_large_rows bigint;
   v_large_buffers bigint;
   v_large_plan text;
+  v_large_detail jsonb;
+  v_large_resumed boolean;
   v_large_table bigint;
+  v_detail jsonb;
+  v_resumed boolean;
   v_covered boolean;
   v_suffix_ok boolean;
   v_pass boolean;
@@ -980,44 +1011,80 @@ begin
     probe.prefix_rows,
     probe.deficit_rows,
     probe.deficit_buffers,
-    probe.deficit_plan
-  into v_prefix, v_rows, v_buffers, v_plan
+    probe.deficit_plan,
+    probe.resume_detail
+  into v_prefix, v_rows, v_buffers, v_plan, v_detail
   from app.replay_read_probe probe
   order by probe.id desc
   limit 1;
 
-  select prefix_rows, deficit_rows, deficit_buffers, deficit_plan
-  into v_sel_prefix, v_sel_rows, v_sel_buffers, v_sel_plan
+  select prefix_rows, deficit_rows, deficit_buffers, deficit_plan, resume_detail
+  into v_sel_prefix, v_sel_rows, v_sel_buffers, v_sel_plan, v_sel_detail
   from bench_sel;
 
-  select prefix_rows, deficit_rows, deficit_buffers, deficit_plan, table_rows
-  into v_large_prefix, v_large_rows, v_large_buffers, v_large_plan, v_large_table
+  select prefix_rows, deficit_rows, deficit_buffers, deficit_plan, resume_detail, table_rows
+  into v_large_prefix, v_large_rows, v_large_buffers, v_large_plan, v_large_detail, v_large_table
   from bench_large;
+
+  select
+    coalesce(
+      bool_and(elem -> 'checkpoint_id' is distinct from 'null'::jsonb)
+        and count(*) > 0,
+      false
+    )
+  into v_resumed
+  from pg_catalog.jsonb_array_elements(coalesce(v_detail, '[]'::jsonb)) as detail (elem);
+
+  select
+    coalesce(
+      bool_and(elem -> 'checkpoint_id' is distinct from 'null'::jsonb)
+        and count(*) > 0,
+      false
+    )
+  into v_sel_resumed
+  from pg_catalog.jsonb_array_elements(coalesce(v_sel_detail, '[]'::jsonb)) as detail (elem);
+
+  select
+    coalesce(
+      bool_and(elem -> 'checkpoint_id' is distinct from 'null'::jsonb)
+        and count(*) > 0,
+      false
+    )
+  into v_large_resumed
+  from pg_catalog.jsonb_array_elements(coalesce(v_large_detail, '[]'::jsonb)) as detail (elem);
 
   select coalesce(sum(deficit.qty_uncovered), 0) = 0
   into v_covered
   from app.provisional_deficits deficit
   where deficit.item_id = '${history.agedItem}';
 
-  v_suffix_ok := coalesce((v_fresh ->> 'suffix_index')::boolean, false)
-    or coalesce((v_fresh ->> 'prefix_rows')::bigint, 1) = 0;
+  v_suffix_ok := coalesce((v_fresh ->> 'suffix_index')::boolean, false);
 
   v_pass := coalesce((v_fresh ->> 'fresh_pass')::boolean, false)
     and v_suffix_ok
+    and coalesce((v_fresh ->> 'resumed')::boolean, false)
+    and coalesce((v_fresh ->> 'buffers')::bigint, 0) > 0
+    and coalesce((v_fresh ->> 'buffers')::bigint, 0) < ${SHARED_HIT_READ_LIMIT}
     and v_sel_seconds <= 6
     and coalesce(v_sel_prefix, 1) = 0
-    and coalesce(v_sel_plan, '') like '%Buffers:%'
+    and v_sel_resumed
+    and coalesce(v_sel_buffers, 0) > 0
+    and coalesce(v_sel_buffers, 0) < ${SHARED_HIT_READ_LIMIT}
     and coalesce(v_sel_rows, 0) between 1 and 5
     and v_large_seconds <= 6
     and coalesce(v_large_prefix, 1) = 0
-    and coalesce(v_large_plan, '') like '%Buffers:%'
+    and v_large_resumed
+    and coalesce(v_large_buffers, 0) > 0
+    and coalesce(v_large_buffers, 0) < ${SHARED_HIT_READ_LIMIT}
     and coalesce(v_large_rows, 0) >= 200
     and coalesce(v_large_table, 0) > 0
     and v_large_rows::numeric >= 0.4 * v_large_table
     and v_large_rows::numeric <= 0.7 * v_large_table
     and v_seconds <= 6
     and coalesce(v_prefix, 1) = 0
-    and coalesce(v_plan, '') like '%Buffers:%'
+    and v_resumed
+    and coalesce(v_buffers, 0) > 0
+    and coalesce(v_buffers, 0) < ${SHARED_HIT_READ_LIMIT}
     and coalesce(v_covered, false);
 
   raise notice 'MEASURE %', v_fresh || pg_catalog.jsonb_build_object(
@@ -1026,17 +1093,21 @@ begin
     'selective_prefix_rows', v_sel_prefix,
     'selective_deficit_rows', v_sel_rows,
     'selective_buffers', v_sel_buffers,
+    'selective_resumed', v_sel_resumed,
     'large_seconds', v_large_seconds,
     'large_crossed_2s', v_large_seconds > 2,
     'large_prefix_rows', v_large_prefix,
     'large_deficit_rows', v_large_rows,
     'large_buffers', v_large_buffers,
+    'large_resumed', v_large_resumed,
     'large_table_rows', v_large_table,
     'aged_seconds', v_seconds,
     'aged_crossed_2s', v_seconds > 2,
     'aged_prefix_rows', v_prefix,
     'aged_deficit_rows', v_rows,
     'aged_buffers', v_buffers,
+    'aged_resumed', v_resumed,
+    'buffer_limit', ${SHARED_HIT_READ_LIMIT},
     'aged_covered', coalesce(v_covered, false),
     'pass', v_pass
   );
@@ -1077,16 +1148,21 @@ function formatResult(row) {
           `- confirming replay ms: ${row.replay_ms}`,
         ]),
     `- prefix rows: ${row.prefix_rows}`,
+    `- resumed from checkpoint: ${row.resumed}`,
+    `- shared hit+read limit: ${row.buffer_limit ?? SHARED_HIT_READ_LIMIT}`,
+    `- fresh buffers: ${row.buffers}`,
     `- selective restore seconds: ${row.selective_seconds}`,
     `- selective restore crossed 2s: ${row.selective_crossed_2s}`,
     `- selective prefix rows: ${row.selective_prefix_rows}`,
     `- selective deficit rows: ${row.selective_deficit_rows}`,
     `- selective buffers: ${row.selective_buffers}`,
+    `- selective resumed: ${row.selective_resumed}`,
     `- large-share restore seconds: ${row.large_seconds}`,
     `- large-share restore crossed 2s: ${row.large_crossed_2s}`,
     `- large-share prefix rows: ${row.large_prefix_rows}`,
     `- large-share deficit rows: ${row.large_deficit_rows}`,
     `- large-share buffers: ${row.large_buffers}`,
+    `- large-share resumed: ${row.large_resumed}`,
     `- large-share table rows: ${row.large_table_rows}`,
     `- measured status: ${row.status}`,
     `- failed: ${row.failed}`,
@@ -1101,6 +1177,7 @@ function formatResult(row) {
     `- aged prefix rows: ${row.aged_prefix_rows}`,
     `- aged deficit rows: ${row.aged_deficit_rows}`,
     `- aged buffers: ${row.aged_buffers}`,
+    `- aged resumed: ${row.aged_resumed}`,
     `- aged deficit covered: ${row.aged_covered}`,
     `- gate: ${row.pass ? 'PASS' : 'FAIL'}`,
     '',
@@ -1198,7 +1275,7 @@ function writeResults(rows, note) {
   const body = [
     '# Accounting history benchmark',
     '',
-    'Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), buffers, and a frozen prefix that is not walked. Suffix arms keep an index scan when the planner still chooses one; otherwise the same latency and no-prefix rule applies. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.',
+    'Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. Every measured call must resume from a checkpoint. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), shared hit plus read pages below 5000, and a frozen prefix that is not walked. The measured order suffix arms must be index scans on their own. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.',
     '',
     ...merged.map((row) =>
       row.error

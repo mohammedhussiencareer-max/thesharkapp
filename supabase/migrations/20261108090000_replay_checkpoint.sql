@@ -160,7 +160,7 @@ create table app.replay_checkpoint_deficits (
   primary key (checkpoint_id, movement_id)
 );
 
-comment on table app.replay_checkpoint_deficits is 'Open deficits at the cut, including a closed deficit that a later inflow has not covered yet. A resume restores these rows before the walk.';
+comment on table app.replay_checkpoint_deficits is 'Deficits still open at the cut. A resume restores these rows before the walk. A fully covered deficit is not stored, so completed settlements do not grow the restore set.';
 
 create index replay_checkpoint_deficits_item_idx on app.replay_checkpoint_deficits (item_id, checkpoint_id);
 
@@ -204,10 +204,11 @@ create table app.replay_read_probe (
   deficit_index boolean not null,
   prefix_rows bigint not null default 0,
   deficit_buffers bigint not null default 0,
-  replay_ms numeric(14, 3) not null default 0
+  replay_ms numeric(14, 3) not null default 0,
+  resume_detail jsonb not null default '[]'::jsonb
 );
 
-comment on table app.replay_read_probe is 'One confirming replay. Suffix plans are EXPLAIN text. The deficit plan and buffers are the restore insert that just ran. prefix_rows is the frozen prefix loaded into the walk, which stays zero.';
+comment on table app.replay_read_probe is 'One confirming replay. Suffix plans are EXPLAIN text. The deficit plan and buffers are the restore insert that just ran. prefix_rows counts frozen history loaded into the walk, including every row of an item that did not resume. resume_detail is the cut and the rows loaded for each item.';
 
 alter table app.replay_read_probe enable row level security;
 
@@ -1018,6 +1019,7 @@ declare
   v_use boolean;
   v_plan text;
   v_line text;
+  v_demote uuid[];
 begin
   v_frozen := coalesce(pg_catalog.current_setting('app.replay_frozen', true), '') = '1';
 
@@ -1246,24 +1248,44 @@ begin
   -- A sort output can resume while its input cannot: the new purchase is on
   -- the input, before the sort, so the output's own suffix is empty. Walking
   -- only the input reprices the sort and leaves the output at the old value.
-  -- If any item in this call has to walk from the start, they all do.
-  if exists (
-    select
-      1
-    from
-      ledger_scratch.replay_resume resume
-    where
-      resume.checkpoint_id is null
-  ) then
-    delete from ledger_scratch.recompute_def deficit
-    where
-      deficit.item_id in (
-        select
-          resume.item_id
-        from
-          ledger_scratch.replay_resume resume
-      );
+  -- Demote that sort component, both directions, and only that component.
+  -- An item with no sort tie to the walking item keeps its checkpoint.
+  with recursive
+    component as (
+      select
+        resume.item_id
+      from
+        ledger_scratch.replay_resume resume
+      where
+        resume.checkpoint_id is null
+      union
+      select
+        other.item_id
+      from
+        component
+        join app.stock_movements edge on edge.item_id = component.item_id
+        and edge.batch_id is not null
+        and edge.movement_type in (
+          'sort_out'::app.movement_type,
+          'sort_in'::app.movement_type,
+          'sort_loss'::app.movement_type
+        )
+        join app.stock_movements sibling on sibling.batch_id = edge.batch_id
+        and sibling.item_id <> edge.item_id
+        and sibling.movement_type in (
+          'sort_out'::app.movement_type,
+          'sort_in'::app.movement_type,
+          'sort_loss'::app.movement_type
+        )
+        join ledger_scratch.replay_resume other on other.item_id = sibling.item_id
+    )
+  select
+    coalesce(pg_catalog.array_agg(component.item_id), '{}'::uuid[])
+  into v_demote
+  from
+    component;
 
+  if coalesce(pg_catalog.cardinality(v_demote), 0) > 0 then
     delete from ledger_scratch.replay_restore_plan stored
     where
       stored.checkpoint_id in (
@@ -1272,7 +1294,21 @@ begin
         from
           ledger_scratch.replay_resume resume
         where
-          resume.checkpoint_id is not null
+          resume.item_id = any (v_demote)
+          and resume.checkpoint_id is not null
+      );
+
+    delete from ledger_scratch.recompute_def deficit
+    where
+      deficit.item_id = any (v_demote)
+      and exists (
+        select
+          1
+        from
+          ledger_scratch.replay_resume resume
+        where
+          resume.item_id = deficit.item_id
+          and resume.checkpoint_id is not null
       );
 
     update ledger_scratch.replay_resume
@@ -1287,12 +1323,13 @@ begin
       has_uncovered_deficit = false,
       digest = null
     where
-      checkpoint_id is not null;
+      item_id = any (v_demote)
+      and checkpoint_id is not null;
   end if;
 end;
 $$;
 
-comment on function app.replay_bind_resume (uuid[], jsonb) is 'Choose one usable checkpoint per item whose cut is strictly before the earliest effect, and restore its balance and open deficits. A checkpoint that fails the anchor count or the suffix test is skipped. If one item in the call cannot resume, none of them do, so a sort is repriced on both sides.';
+comment on function app.replay_bind_resume (uuid[], jsonb) is 'Choose one usable checkpoint per item whose cut is strictly before the earliest effect, and restore its balance and open deficits. A checkpoint that fails the anchor count or the suffix test is skipped. Only the sort-connected component of an item that cannot resume walks from the start.';
 
 revoke all on function app.replay_bind_resume (uuid[], jsonb)
 from
@@ -1564,6 +1601,11 @@ declare
   v_shift text;
   v_bucket text;
   v_cause uuid;
+  v_absorb jsonb := '{}'::jsonb;
+  v_left numeric(14, 2);
+  v_take numeric(14, 2);
+  v_inflow_at timestamptz;
+  v_key text;
 begin
   v_cause := coalesce(p_cause, pg_catalog.gen_random_uuid ());
 
@@ -1625,6 +1667,65 @@ begin
       and sm.cover_deficit_movement_id = v_pair.deficit_movement_id;
 
     v_delta := v_pair.value_adj - v_posted;
+
+    -- A cover posted while the deficit was still in the window is a
+    -- cost_adjustment. A full walk derives that cover again. The effect
+    -- keeps the adjustment, so the carrier is only the value not already
+    -- posted. A new inflow inside the window still posts its whole carrier.
+    if coalesce(pg_catalog.current_setting('app.restatement_window_start', true), '') <> '' then
+      select
+        sm.occurred_at
+      into v_inflow_at
+      from
+        app.stock_movements sm
+      where
+        sm.id = v_pair.inflow_movement_id;
+
+      if v_inflow_at < pg_catalog.current_setting('app.restatement_window_start', true)::timestamptz then
+        v_key := v_pair.deficit_movement_id::text;
+
+        if not pg_catalog.jsonb_exists(v_absorb, v_key) then
+          select
+            coalesce(sum(adjustment.total_cost), 0)
+          into v_left
+          from
+            app.stock_movements adjustment
+          where
+            adjustment.adjusts_movement_id = v_pair.deficit_movement_id
+            and adjustment.movement_type = 'cost_adjustment'::app.movement_type;
+
+          v_absorb := v_absorb || pg_catalog.jsonb_build_object(v_key, v_left);
+        end if;
+
+        v_left := (v_absorb ->> v_key)::numeric;
+
+        if v_delta <> 0
+        and coalesce(v_left, 0) <> 0
+        and (
+          (
+            v_delta < 0
+            and v_left < 0
+          )
+          or (
+            v_delta > 0
+            and v_left > 0
+          )
+        ) then
+          if abs(v_left) >= abs(v_delta) then
+            v_take := v_delta;
+          else
+            v_take := v_left;
+          end if;
+
+          v_delta := v_delta - v_take;
+          v_absorb := pg_catalog.jsonb_set(
+            v_absorb,
+            array[v_key],
+            pg_catalog.to_jsonb(v_left - v_take)
+          );
+        end if;
+      end if;
+    end if;
 
     if v_delta = 0 then
       continue;
@@ -1912,7 +2013,11 @@ begin
     from
       ledger_scratch.recompute_def deficit
     where
-      deficit.item_id = v_item;
+      deficit.item_id = v_item
+      and (
+        deficit.qty_uncovered > 0
+        or deficit.value_uncovered <> 0
+      );
 
     insert into
       app.replay_checkpoint_anchors (checkpoint_id, count_id, line_no)
@@ -4187,16 +4292,17 @@ create function app.replay_plan_shared_buffers (p_plan text) returns bigint lang
 set
   search_path = '' as $$
   select
-    coalesce(sum((match[1])::bigint), 0)
+    coalesce(sum((hit[1])::bigint), 0)
   from
     pg_catalog.regexp_matches(
       coalesce(p_plan, ''),
-      '(?:hit|read|dirtied|written)=([0-9]+)',
+      'shared((?:\s+(?:hit|read|dirtied|written)=[0-9]+)+)',
       'g'
-    ) as match;
+    ) as segment (match),
+    lateral pg_catalog.regexp_matches(segment.match[1], '(?:hit|read)=([0-9]+)', 'g') as page (hit);
 $$;
 
-comment on function app.replay_plan_shared_buffers (text) is 'Shared hit, read, dirtied and written pages reported on an EXPLAIN ANALYZE BUFFERS plan.';
+comment on function app.replay_plan_shared_buffers (text) is 'Shared hit and read pages on an EXPLAIN ANALYZE BUFFERS plan. Dirtied, written, local and temp pages are not counted.';
 
 revoke all on function app.replay_plan_shared_buffers (text)
 from
@@ -4231,6 +4337,7 @@ declare
   v_def_plan text := '';
   v_def_buffers bigint := 0;
   v_prefix_rows bigint := 0;
+  v_resume_detail jsonb := '[]'::jsonb;
   v_line record;
   v_resume record;
   v_has_checkpoint boolean := false;
@@ -4283,20 +4390,75 @@ begin
   where
     d.item_id = any (p_item_ids);
 
-  if v_has_checkpoint then
-    select
-      count(*)
-    into v_prefix_rows
-    from
-      ledger_scratch.recompute_row q
-      join ledger_scratch.replay_resume resume on resume.item_id = q.item_id
-    where
-      not q.is_pending
-      and q.item_id = any (p_item_ids)
-      and resume.checkpoint_id is not null
-      and q.occurred_at <= resume.cut_occurred_at
-      and q.movement_id <= resume.max_movement_id;
+  select
+    count(*)
+  into v_prefix_rows
+  from
+    ledger_scratch.recompute_row q
+    join ledger_scratch.replay_resume resume on resume.item_id = q.item_id
+  where
+    not q.is_pending
+    and q.item_id = any (p_item_ids)
+    and (
+      resume.checkpoint_id is null
+      or (
+        q.occurred_at <= resume.cut_occurred_at
+        and q.movement_id <= resume.max_movement_id
+      )
+    );
 
+  select
+    coalesce(
+      pg_catalog.jsonb_agg(
+        pg_catalog.jsonb_build_object(
+          'item_id',
+          resume.item_id,
+          'checkpoint_id',
+          resume.checkpoint_id,
+          'cut_occurred_at',
+          resume.cut_occurred_at,
+          'max_movement_id',
+          resume.max_movement_id,
+          'rows_loaded',
+          (
+            select
+              count(*)
+            from
+              ledger_scratch.recompute_row q
+            where
+              q.item_id = resume.item_id
+              and not q.is_pending
+          ),
+          'prefix_rows',
+          (
+            select
+              count(*)
+            from
+              ledger_scratch.recompute_row q
+            where
+              q.item_id = resume.item_id
+              and not q.is_pending
+              and (
+                resume.checkpoint_id is null
+                or (
+                  q.occurred_at <= resume.cut_occurred_at
+                  and q.movement_id <= resume.max_movement_id
+                )
+              )
+          )
+        )
+        order by
+          resume.item_id
+      ),
+      '[]'::jsonb
+    )
+  into v_resume_detail
+  from
+    ledger_scratch.replay_resume resume
+  where
+    resume.item_id = any (p_item_ids);
+
+  if v_has_checkpoint then
     select
       coalesce(string_agg(saved.plan, ''), ''),
       coalesce(sum(saved.buffers), 0)
@@ -4395,7 +4557,8 @@ begin
       id_arm_index,
       deficit_index,
       prefix_rows,
-      deficit_buffers
+      deficit_buffers,
+      resume_detail
     )
   values
     (
@@ -4409,12 +4572,13 @@ begin
       app.replay_plan_uses_movement_index (v_id_plan),
       app.replay_plan_uses_deficit_index (v_def_plan),
       v_prefix_rows,
-      v_def_buffers
+      v_def_buffers,
+      v_resume_detail
     );
 end;
 $$;
 
-comment on function app.replay_capture_read (uuid[]) is 'While app.replay_probe is 1, record the suffix rows just loaded, the deficits restored before the walk, the suffix plans, and the plan and buffers of the restore insert that already ran. prefix_rows counts frozen prefix rows loaded into the walk.';
+comment on function app.replay_capture_read (uuid[]) is 'While app.replay_probe is 1, record the suffix rows just loaded, the deficits restored before the walk, the suffix plans, and the plan and buffers of the restore insert that already ran. prefix_rows counts frozen history loaded into the walk. resume_detail records the cut and the rows loaded for each item.';
 
 revoke all on function app.replay_capture_read (uuid[])
 from
@@ -5331,9 +5495,37 @@ begin
   -- before the ledger-sum check, so the carrier is part of the same cut.
   perform app.replay_write_cover_pairs (p_cause);
 
+  -- A fully covered deficit is not in the checkpoint, so a resume does not
+  -- restore it. The live row is still the settlement. Keep it when this walk
+  -- resumed and did not recompute that movement. Everything the walk rebuilt,
+  -- and every row of an item that walked from the start, is replaced below.
   delete from app.provisional_deficits pd
   where
-    pd.item_id = any (p_item_ids);
+    pd.item_id = any (p_item_ids)
+    and (
+      exists (
+        select
+          1
+        from
+          ledger_scratch.recompute_def rebuilt
+        where
+          rebuilt.movement_id = pd.movement_id
+      )
+      or not exists (
+        select
+          1
+        from
+          ledger_scratch.replay_resume resume
+          join app.stock_movements sm on sm.id = pd.movement_id
+        where
+          resume.item_id = pd.item_id
+          and resume.checkpoint_id is not null
+          and pd.qty_uncovered = 0
+          and pd.value_uncovered = 0
+          and sm.id <= resume.max_movement_id
+          and sm.occurred_at <= resume.cut_occurred_at
+      )
+    );
 
   insert into
     app.provisional_deficits (
@@ -5772,6 +5964,27 @@ begin
           where
             existing.movement_id = sm.id
         );
+
+      -- replay_outflow seeds cover_total at 0, and a full walk already has
+      -- that row, so the insert above does not run. The posted adjustments
+      -- are the frozen cover. Leaving 0 makes the writer reverse them and
+      -- post the same cover again on the old inflow.
+      update ledger_scratch.recompute_effect effect
+      set
+        cover_total = coalesce(
+          (
+            select
+              sum(adjustment.total_cost)
+            from
+              app.stock_movements adjustment
+            where
+              adjustment.adjusts_movement_id = effect.movement_id
+              and adjustment.movement_type = 'cost_adjustment'::app.movement_type
+          ),
+          0
+        )
+      where
+        effect.movement_id = r_def.movement_id;
     else
       -- A resume does not re-walk the deficit, so its effect row is absent.
       -- The stored total omits covers already posted. Start from those
@@ -6173,6 +6386,47 @@ from
   authenticated,
   service_role;
 
+create function app.waste_document_root (p_document_id bigint) returns bigint language plpgsql stable security definer
+set
+  search_path = '' as $$
+declare
+  v_id bigint := p_document_id;
+  v_next bigint;
+  v_guard integer := 0;
+begin
+  if v_id is null then
+    return null;
+  end if;
+
+  loop
+    select
+      document.predecessor_id
+    into v_next
+    from
+      app.waste_documents document
+    where
+      document.id = v_id;
+
+    exit when v_next is null;
+
+    v_id := v_next;
+    v_guard := v_guard + 1;
+    exit when v_guard >= 16;
+  end loop;
+
+  return v_id;
+end;
+$$;
+
+comment on function app.waste_document_root (bigint) is 'The waste document with no predecessor. A correction chain is short; the walk stops at 16 steps.';
+
+revoke all on function app.waste_document_root (bigint)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
 create function app.note_recognized_cover (p_movement_id bigint, p_consumption_delta numeric) returns void language plpgsql security definer
 set
   search_path = '' as $$
@@ -6209,22 +6463,33 @@ begin
       )
       or (
         contribution.source_kind = 'waste'
-        and exists (
-          select
-            1
-          from
-            app.closed_period_sources src
-          where
-            src.movement_id = sm.id
-            and src.source_kind = 'waste'
-            and src.source_id = contribution.source_id
+        and (
+          exists (
+            select
+              1
+            from
+              app.closed_period_sources src
+            where
+              src.movement_id = sm.id
+              and src.source_kind = 'waste'
+              and src.source_id = contribution.source_id
+          )
+          or exists (
+            select
+              1
+            from
+              app.waste_line_movements line
+            where
+              line.movement_id = sm.id
+              and app.waste_document_root (line.document_id)::text = contribution.source_id
+          )
         )
       )
     );
 end;
 $$;
 
-comment on function app.note_recognized_cover (bigint, numeric) is 'Add a cover or restatement adjustment to the recognized value of the pieces it changes, in the same transaction. Quantity stays. A later return then restores the covered value.';
+comment on function app.note_recognized_cover (bigint, numeric) is 'Add a cover or restatement adjustment to the recognized value of the pieces it changes, in the same transaction. Ordinary waste resolves through its document root. Quantity stays. A later return then restores the covered value.';
 
 revoke all on function app.note_recognized_cover (bigint, numeric)
 from
@@ -6845,10 +7110,79 @@ begin
 
     v_piece := v_piece + 1;
 
-    -- A reason change rebooks the line. The whole posted value comes back on
-    -- the old reason; the new quantity, including an addition, goes out on
-    -- the new reason. A quantity-only edit keeps one delta.
+    -- A reason change that reduces the line returns only that reduction, at
+    -- the posted piece value, against the original movement. The retained
+    -- quantity keeps that deficit and its date. Zero-quantity legs move the
+    -- retained value to the new reason. An increase still rebooks.
     if not p_void
+    and p_reason is distinct from v_old_reason
+    and coalesce((v_elem ->> 'recognized_qty')::numeric, 0) > 0
+    and (v_elem ->> 'qty')::numeric < (v_elem ->> 'recognized_qty')::numeric then
+      v_qty := (v_elem ->> 'qty')::numeric;
+      v_value := (v_elem ->> 'value')::numeric;
+      v_move := app.post_recognized_delta (
+        v_cause,
+        'waste',
+        v_root::text,
+        v_item,
+        'waste',
+        'waste',
+        v_qty,
+        v_value,
+        v_old_reason,
+        'manual',
+        v_chain,
+        v_prior,
+        null,
+        v_piece
+      );
+
+      if coalesce(v_value, 0) <> 0 then
+        v_piece := v_piece + 1;
+
+        perform app.insert_closed_movement (
+          v_cause,
+          v_item,
+          v_change,
+          0,
+          v_value,
+          'waste',
+          'waste',
+          v_shift,
+          'waste',
+          v_root::text,
+          v_old_reason,
+          'manual',
+          v_chain,
+          null,
+          null,
+          null,
+          v_piece
+        );
+
+        v_piece := v_piece + 1;
+
+        perform app.insert_closed_movement (
+          v_cause,
+          v_item,
+          v_change,
+          0,
+          -v_value,
+          'waste',
+          'waste',
+          v_shift,
+          'waste',
+          v_root::text,
+          p_reason,
+          'manual',
+          v_chain,
+          null,
+          null,
+          null,
+          v_piece
+        );
+      end if;
+    elsif not p_void
     and p_reason is distinct from v_old_reason
     and (
       (v_elem ->> 'qty')::numeric is distinct from coalesce((v_elem ->> 'recognized_qty')::numeric, 0)
@@ -16022,6 +16356,8 @@ begin
       -- from a cut that sits between the deficit and the cover.
       perform app.invalidate_checkpoints_from (p_item_id, r_def.prov_at, 'cover');
     end if;
+
+    perform app.note_recognized_cover (r_def.movement_id, -v_adj_total_cost);
 
     update app.provisional_deficits
     set
