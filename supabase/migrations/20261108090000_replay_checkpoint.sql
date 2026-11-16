@@ -205,10 +205,11 @@ create table app.replay_read_probe (
   prefix_rows bigint not null default 0,
   deficit_buffers bigint not null default 0,
   replay_ms numeric(14, 3) not null default 0,
-  resume_detail jsonb not null default '[]'::jsonb
+  resume_detail jsonb not null default '[]'::jsonb,
+  replace_plan text not null default ''
 );
 
-comment on table app.replay_read_probe is 'One confirming replay. Suffix plans are EXPLAIN text. The deficit plan and buffers are the restore insert that just ran. prefix_rows counts frozen history loaded into the walk, including every row of an item that did not resume. resume_detail is the cut and the rows loaded for each item.';
+comment on table app.replay_read_probe is 'One confirming replay. Suffix plans are EXPLAIN text. The deficit plan and buffers are the restore insert that just ran. prefix_rows counts frozen history loaded into the walk, including every row of an item that did not resume. resume_detail is the cut and the rows loaded for each item. replace_plan is the delete of the deficits this walk recomputed.';
 
 alter table app.replay_read_probe enable row level security;
 
@@ -1020,6 +1021,8 @@ declare
   v_plan text;
   v_line text;
   v_demote uuid[];
+  v_members uuid[];
+  v_add uuid[];
 begin
   v_frozen := coalesce(pg_catalog.current_setting('app.replay_frozen', true), '') = '1';
 
@@ -1027,12 +1030,6 @@ begin
   and coalesce(pg_catalog.current_setting('app.replay_order_at', true), '') <> '' then
     v_order_at := pg_catalog.current_setting('app.replay_order_at', true)::timestamptz;
   end if;
-
-  select
-    min((elem.value ->> 'occurred_at')::timestamptz)
-  into v_pending_min
-  from
-    pg_catalog.jsonb_array_elements(coalesce(p_pending, '[]'::jsonb)) as elem (value);
 
   for v_item in
     select distinct
@@ -1046,6 +1043,67 @@ begin
   loop
     v_use := false;
     v_checkpoint := null;
+
+    -- The effect boundary is the earliest pending row of this item's sort
+    -- component. Posted sort edges and pending sort edges in one batch are
+    -- the same component. A purchase that merely shares a batch is not.
+    with recursive
+      posted as (
+        select
+          v_item as item_id
+        union
+        select
+          sibling.item_id
+        from
+          posted
+          join app.stock_movements edge on edge.item_id = posted.item_id
+          and edge.batch_id is not null
+          and edge.movement_type in (
+            'sort_out'::app.movement_type,
+            'sort_in'::app.movement_type,
+            'sort_loss'::app.movement_type
+          )
+          join app.stock_movements sibling on sibling.batch_id = edge.batch_id
+          and sibling.item_id <> edge.item_id
+          and sibling.movement_type in (
+            'sort_out'::app.movement_type,
+            'sort_in'::app.movement_type,
+            'sort_loss'::app.movement_type
+          )
+      )
+    select
+      coalesce(array_agg(posted.item_id), array[v_item])
+    into v_members
+    from
+      posted;
+
+    loop
+      select
+        array_agg(distinct (other.value ->> 'item_id')::uuid)
+      into v_add
+      from
+        pg_catalog.jsonb_array_elements(coalesce(p_pending, '[]'::jsonb)) as edge (value)
+        join pg_catalog.jsonb_array_elements(coalesce(p_pending, '[]'::jsonb)) as other (value) on other.value ->> 'batch_id' = edge.value ->> 'batch_id'
+        and (other.value ->> 'item_id')::uuid <> (edge.value ->> 'item_id')::uuid
+      where
+        coalesce(edge.value ->> 'batch_id', '') <> ''
+        and edge.value ->> 'movement_type' in ('sort_out', 'sort_in', 'sort_loss')
+        and other.value ->> 'movement_type' in ('sort_out', 'sort_in', 'sort_loss')
+        and (edge.value ->> 'item_id')::uuid = any (v_members)
+        and (other.value ->> 'item_id')::uuid <> all (v_members);
+
+      exit when v_add is null;
+
+      v_members := v_members || v_add;
+    end loop;
+
+    select
+      min((elem.value ->> 'occurred_at')::timestamptz)
+    into v_pending_min
+    from
+      pg_catalog.jsonb_array_elements(coalesce(p_pending, '[]'::jsonb)) as elem (value)
+    where
+      (elem.value ->> 'item_id')::uuid = any (v_members);
 
     for v_checkpoint in
       select
@@ -1329,7 +1387,7 @@ begin
 end;
 $$;
 
-comment on function app.replay_bind_resume (uuid[], jsonb) is 'Choose one usable checkpoint per item whose cut is strictly before the earliest effect, and restore its balance and open deficits. A checkpoint that fails the anchor count or the suffix test is skipped. Only the sort-connected component of an item that cannot resume walks from the start.';
+comment on function app.replay_bind_resume (uuid[], jsonb) is 'Choose one usable checkpoint per item whose cut is strictly before that item''s own effect. The effect is the earliest pending row in the item''s sort component, posted or still pending, not the earliest row of an unrelated item in the same batch. A checkpoint that fails the anchor count or the suffix test is skipped. Only the sort-connected component of an item that cannot resume walks from the start.';
 
 revoke all on function app.replay_bind_resume (uuid[], jsonb)
 from
@@ -1601,11 +1659,16 @@ declare
   v_shift text;
   v_bucket text;
   v_cause uuid;
-  v_absorb jsonb := '{}'::jsonb;
-  v_left numeric(14, 2);
-  v_take numeric(14, 2);
-  v_inflow_at timestamptz;
-  v_key text;
+  v_deficit_id bigint;
+  v_vals numeric[];
+  v_inflows bigint[];
+  v_adj numeric[];
+  v_adj_i integer;
+  v_i integer;
+  v_k integer;
+  v_n integer;
+  v_sum numeric(14, 2);
+  v_found boolean;
 begin
   v_cause := coalesce(p_cause, pg_catalog.gen_random_uuid ());
 
@@ -1645,6 +1708,163 @@ begin
     ) as posted
   on conflict (inflow_movement_id, deficit_movement_id) do nothing;
 
+  -- A cover is the fact (deficit, inflow, quantity, value), not the age of
+  -- the inflow. Posted cost adjustments are those facts in posting order.
+  -- Match each one to a consecutive run of the pairs this walk derived, in
+  -- inflow order. An adjustment that equals the run is already posted,
+  -- including a run of opposite signs. A same-sign partial smaller than the
+  -- current pair is the posted portion of that one cover. Only the remainder
+  -- is a new carrier. A cover already posted in a frozen period is not
+  -- posted again, reversed, or moved.
+  for v_deficit_id in
+    select distinct
+      pair.deficit_movement_id
+    from
+      ledger_scratch.recompute_cover_pair pair
+    where
+      pair.value_adj <> 0
+  loop
+    -- A resumed walk does not re-derive prefix covers. Their adjustments
+    -- belong to those missing pairs, not to a suffix cover.
+    if exists (
+      select
+        1
+      from
+        app.stock_movements deficit
+        join ledger_scratch.replay_resume resume on resume.item_id = deficit.item_id
+      where
+        deficit.id = v_deficit_id
+        and resume.checkpoint_id is not null
+    ) then
+      continue;
+    end if;
+
+    select
+      coalesce(
+        array_agg(
+          adjustment.total_cost
+          order by
+            adjustment.id
+        ),
+        '{}'::numeric[]
+      )
+    into v_adj
+    from
+      app.stock_movements adjustment
+    where
+      adjustment.adjusts_movement_id = v_deficit_id
+      and adjustment.movement_type = 'cost_adjustment'::app.movement_type
+      and adjustment.total_cost <> 0;
+
+    select
+      coalesce(
+        array_agg(
+          open_pair.inflow_movement_id
+          order by
+            open_pair.occurred_at,
+            open_pair.inflow_movement_id
+        ),
+        '{}'::bigint[]
+      ),
+      coalesce(
+        array_agg(
+          open_pair.open_value
+          order by
+            open_pair.occurred_at,
+            open_pair.inflow_movement_id
+        ),
+        '{}'::numeric[]
+      )
+    into
+      v_inflows,
+      v_vals
+    from
+      (
+        select
+          pair.inflow_movement_id,
+          inflow.occurred_at,
+          pair.value_adj - coalesce(
+            (
+              select
+                sum(carrier.total_cost)
+              from
+                app.stock_movements carrier
+              where
+                carrier.movement_type = 'closed_period'::app.movement_type
+                and carrier.cover_inflow_movement_id = pair.inflow_movement_id
+                and carrier.cover_deficit_movement_id = pair.deficit_movement_id
+            ),
+            0
+          ) as open_value
+        from
+          ledger_scratch.recompute_cover_pair pair
+          join app.stock_movements inflow on inflow.id = pair.inflow_movement_id
+        where
+          pair.deficit_movement_id = v_deficit_id
+      ) open_pair
+    where
+      open_pair.open_value <> 0;
+
+    v_n := coalesce(pg_catalog.cardinality(v_vals), 0);
+    v_i := 1;
+    v_adj_i := 1;
+
+    while v_adj_i <= coalesce(pg_catalog.cardinality(v_adj), 0)
+    and v_i <= v_n loop
+      v_sum := 0;
+      v_found := false;
+      v_k := v_i;
+
+      while v_k <= v_n loop
+        v_sum := v_sum + v_vals[v_k];
+
+        if v_sum = v_adj[v_adj_i] then
+          v_found := true;
+          exit;
+        end if;
+
+        v_k := v_k + 1;
+      end loop;
+
+      if v_found then
+        for v_j in v_i..v_k loop
+          update ledger_scratch.recompute_cover_pair pair
+          set
+            value_adj = pair.value_adj - v_vals[v_j]
+          where
+            pair.deficit_movement_id = v_deficit_id
+            and pair.inflow_movement_id = v_inflows[v_j];
+        end loop;
+
+        v_i := v_k + 1;
+        v_adj_i := v_adj_i + 1;
+      elsif (
+        (
+          v_vals[v_i] < 0
+          and v_adj[v_adj_i] < 0
+        )
+        or (
+          v_vals[v_i] > 0
+          and v_adj[v_adj_i] > 0
+        )
+      )
+      and abs(v_adj[v_adj_i]) < abs(v_vals[v_i]) then
+        update ledger_scratch.recompute_cover_pair pair
+        set
+          value_adj = pair.value_adj - v_adj[v_adj_i]
+        where
+          pair.deficit_movement_id = v_deficit_id
+          and pair.inflow_movement_id = v_inflows[v_i];
+
+        v_vals[v_i] := v_vals[v_i] - v_adj[v_adj_i];
+
+        v_adj_i := v_adj_i + 1;
+      else
+        v_i := v_i + 1;
+      end if;
+    end loop;
+  end loop;
+
   for v_pair in
     select
       pair.inflow_movement_id,
@@ -1667,65 +1887,6 @@ begin
       and sm.cover_deficit_movement_id = v_pair.deficit_movement_id;
 
     v_delta := v_pair.value_adj - v_posted;
-
-    -- A cover posted while the deficit was still in the window is a
-    -- cost_adjustment. A full walk derives that cover again. The effect
-    -- keeps the adjustment, so the carrier is only the value not already
-    -- posted. A new inflow inside the window still posts its whole carrier.
-    if coalesce(pg_catalog.current_setting('app.restatement_window_start', true), '') <> '' then
-      select
-        sm.occurred_at
-      into v_inflow_at
-      from
-        app.stock_movements sm
-      where
-        sm.id = v_pair.inflow_movement_id;
-
-      if v_inflow_at < pg_catalog.current_setting('app.restatement_window_start', true)::timestamptz then
-        v_key := v_pair.deficit_movement_id::text;
-
-        if not pg_catalog.jsonb_exists(v_absorb, v_key) then
-          select
-            coalesce(sum(adjustment.total_cost), 0)
-          into v_left
-          from
-            app.stock_movements adjustment
-          where
-            adjustment.adjusts_movement_id = v_pair.deficit_movement_id
-            and adjustment.movement_type = 'cost_adjustment'::app.movement_type;
-
-          v_absorb := v_absorb || pg_catalog.jsonb_build_object(v_key, v_left);
-        end if;
-
-        v_left := (v_absorb ->> v_key)::numeric;
-
-        if v_delta <> 0
-        and coalesce(v_left, 0) <> 0
-        and (
-          (
-            v_delta < 0
-            and v_left < 0
-          )
-          or (
-            v_delta > 0
-            and v_left > 0
-          )
-        ) then
-          if abs(v_left) >= abs(v_delta) then
-            v_take := v_delta;
-          else
-            v_take := v_left;
-          end if;
-
-          v_delta := v_delta - v_take;
-          v_absorb := pg_catalog.jsonb_set(
-            v_absorb,
-            array[v_key],
-            pg_catalog.to_jsonb(v_left - v_take)
-          );
-        end if;
-      end if;
-    end if;
 
     if v_delta = 0 then
       continue;
@@ -1806,7 +1967,7 @@ begin
 end;
 $$;
 
-comment on function app.replay_write_cover_pairs (uuid) is 'Post the delta of each closed cover as one carrier row at the inflow. A second walk of the same pair posts nothing when the posted total already equals the required adjustment.';
+comment on function app.replay_write_cover_pairs (uuid) is 'Post only the cover value that is not already a posted fact. A cost adjustment and a closed carrier are that fact, matched per deficit in posting order, independent of the inflow age and of the sign of the other covers. A second walk of the same pair posts nothing.';
 
 revoke all on function app.replay_write_cover_pairs (uuid)
 from
@@ -4669,6 +4830,9 @@ declare
   v_shift text;
   v_new_id bigint;
   e record;
+  v_touch bigint[];
+  v_replace_plan text;
+  v_line text;
 begin
   if p_pending is null then
     p_pending := '[]'::jsonb;
@@ -5495,37 +5659,99 @@ begin
   -- before the ledger-sum check, so the carrier is part of the same cut.
   perform app.replay_write_cover_pairs (p_cause);
 
-  -- A fully covered deficit is not in the checkpoint, so a resume does not
-  -- restore it. The live row is still the settlement. Keep it when this walk
-  -- resumed and did not recompute that movement. Everything the walk rebuilt,
-  -- and every row of an item that walked from the start, is replaced below.
-  delete from app.provisional_deficits pd
-  where
-    pd.item_id = any (p_item_ids)
-    and (
-      exists (
-        select
-          1
+  -- Replace only the deficits this walk recomputed. The frozen prefix is
+  -- not in the suffix and not in the rebuilt set, so those settled rows are
+  -- neither read nor deleted. A reversed movement is not re-walked; its
+  -- deficit is dropped by primary key when this walk is responsible for it.
+  select
+    coalesce(
+      array(
+        select distinct
+          touched.movement_id
         from
-          ledger_scratch.recompute_def rebuilt
-        where
-          rebuilt.movement_id = pd.movement_id
-      )
-      or not exists (
+          (
+            select
+              walked.movement_id
+            from
+              ledger_scratch.recompute_row walked
+            where
+              walked.item_id = any (p_item_ids)
+              and not walked.is_pending
+              and walked.movement_id is not null
+            union
+            select
+              rebuilt.movement_id
+            from
+              ledger_scratch.recompute_def rebuilt
+            where
+              rebuilt.item_id = any (p_item_ids)
+              and rebuilt.movement_id is not null
+            union
+            select
+              sm.id
+            from
+              app.stock_movements sm
+              join ledger_scratch.replay_resume resume on resume.item_id = sm.item_id
+            where
+              sm.item_id = any (p_item_ids)
+              and (
+                resume.checkpoint_id is null
+                or sm.occurred_at > resume.cut_occurred_at
+                or sm.id > resume.max_movement_id
+              )
+              and (
+                sm.reverses_movement_id is not null
+                or sm.movement_type in (
+                  'sale_reversal'::app.movement_type,
+                  'waste_reversal'::app.movement_type
+                )
+                or exists (
+                  select
+                    1
+                  from
+                    app.stock_movements rev
+                  where
+                    rev.reverses_movement_id = sm.id
+                )
+              )
+          ) touched
+      ),
+      '{}'::bigint[]
+    )
+  into v_touch;
+
+  if coalesce(pg_catalog.current_setting('app.replay_probe', true), '') = '1' then
+    v_replace_plan := '';
+
+    for v_line in execute pg_catalog.format(
+      $explain$
+      explain (analyze, buffers)
+      delete from app.provisional_deficits deficit
+      using pg_catalog.unnest(%L::bigint[]) as touch (movement_id)
+      where deficit.movement_id = touch.movement_id
+      $explain$,
+      v_touch
+    )
+    loop
+      v_replace_plan := v_replace_plan || v_line || e'\n';
+    end loop;
+
+    update app.replay_read_probe probe
+    set
+      replace_plan = v_replace_plan
+    where
+      probe.id = (
         select
-          1
+          max(latest.id)
         from
-          ledger_scratch.replay_resume resume
-          join app.stock_movements sm on sm.id = pd.movement_id
-        where
-          resume.item_id = pd.item_id
-          and resume.checkpoint_id is not null
-          and pd.qty_uncovered = 0
-          and pd.value_uncovered = 0
-          and sm.id <= resume.max_movement_id
-          and sm.occurred_at <= resume.cut_occurred_at
-      )
-    );
+          app.replay_read_probe latest
+      );
+  else
+    delete from app.provisional_deficits deficit
+    using pg_catalog.unnest(v_touch) as touch (movement_id)
+    where
+      deficit.movement_id = touch.movement_id;
+  end if;
 
   insert into
     app.provisional_deficits (
@@ -6392,13 +6618,19 @@ set
 declare
   v_id bigint := p_document_id;
   v_next bigint;
-  v_guard integer := 0;
+  v_seen bigint[] := '{}'::bigint[];
 begin
   if v_id is null then
     return null;
   end if;
 
   loop
+    if v_id = any (v_seen) then
+      return v_seen[1];
+    end if;
+
+    v_seen := v_seen || v_id;
+
     select
       document.predecessor_id
     into v_next
@@ -6410,15 +6642,13 @@ begin
     exit when v_next is null;
 
     v_id := v_next;
-    v_guard := v_guard + 1;
-    exit when v_guard >= 16;
   end loop;
 
   return v_id;
 end;
 $$;
 
-comment on function app.waste_document_root (bigint) is 'The waste document with no predecessor. A correction chain is short; the walk stops at 16 steps.';
+comment on function app.waste_document_root (bigint) is 'The waste document with no predecessor. The walk has no depth cap. A cycle returns the first document seen in that cycle.';
 
 revoke all on function app.waste_document_root (bigint)
 from
@@ -6557,6 +6787,27 @@ begin
           where
             link.order_id = p_order_id
             and sm.movement_type <> 'cost_adjustment'::app.movement_type
+          union all
+          select
+            sm.item_id,
+            case
+              when sm.movement_type = 'waste'::app.movement_type
+              or sm.closed_bucket = 'waste' then 'waste'
+              else 'cogs'
+            end as bucket,
+            0,
+            carrier.total_cost
+          from
+            app.order_cost_movement_links link
+            join app.order_cost_state head on head.order_id = link.order_id
+            and head.owner_application_id = link.application_id
+            join app.stock_movements sm on sm.id = link.movement_id
+            join app.stock_movements carrier on carrier.cover_deficit_movement_id = sm.id
+            and carrier.movement_type = 'closed_period'::app.movement_type
+            and carrier.cover_inflow_movement_id is not null
+          where
+            link.order_id = p_order_id
+            and sm.movement_type <> 'cost_adjustment'::app.movement_type
         ) priced
       group by
         priced.item_id,
@@ -6566,7 +6817,7 @@ begin
 end;
 $$;
 
-comment on function app.seed_order_recognized (text) is 'The live owner posting, including cost adjustments already attached to those pieces, is the recognized contribution when this order has no row yet. A later edit posts only the difference.';
+comment on function app.seed_order_recognized (text) is 'The live owner posting, including cost adjustments and closed cover carriers already attached to those pieces, is the recognized contribution when this order has no row yet. A later edit posts only the difference.';
 
 revoke all on function app.seed_order_recognized (text)
 from
@@ -6954,6 +7205,29 @@ begin
         ) piece
         join app.stock_movements ca on ca.adjusts_movement_id = piece.id
         and ca.movement_type = 'cost_adjustment'::app.movement_type
+    ),
+    cover as (
+      select
+        piece.item_id,
+        0::numeric as quantity,
+        carrier.total_cost
+      from
+        (
+          select
+            base.id,
+            base.item_id
+          from
+            base
+          union all
+          select
+            reversal.id,
+            reversal.item_id
+          from
+            reversal
+        ) piece
+        join app.stock_movements carrier on carrier.cover_deficit_movement_id = piece.id
+        and carrier.movement_type = 'closed_period'::app.movement_type
+        and carrier.cover_inflow_movement_id is not null
     )
   select
     'waste',
@@ -6984,6 +7258,13 @@ begin
         adjustment.total_cost
       from
         adjustment
+      union all
+      select
+        cover.item_id,
+        cover.quantity,
+        cover.total_cost
+      from
+        cover
     ) net
   group by
     net.item_id
@@ -7110,10 +7391,10 @@ begin
 
     v_piece := v_piece + 1;
 
-    -- A reason change that reduces the line returns only that reduction, at
-    -- the posted piece value, against the original movement. The retained
-    -- quantity keeps that deficit and its date. Zero-quantity legs move the
-    -- retained value to the new reason. An increase still rebooks.
+    -- A reason change keeps the original deficit for the retained quantity.
+    -- A reduction returns only the cut. An increase or a value change posts
+    -- only the difference. Zero-quantity legs move the previously recognized
+    -- value onto the new reason.
     if not p_void
     and p_reason is distinct from v_old_reason
     and coalesce((v_elem ->> 'recognized_qty')::numeric, 0) > 0
@@ -7188,6 +7469,9 @@ begin
       (v_elem ->> 'qty')::numeric is distinct from coalesce((v_elem ->> 'recognized_qty')::numeric, 0)
       or (v_elem ->> 'value')::numeric is distinct from coalesce((v_elem ->> 'recognized_amount')::numeric, 0)
     ) then
+      v_qty := (v_elem ->> 'qty')::numeric;
+      v_value := (v_elem ->> 'value')::numeric;
+      v_retained := coalesce((v_elem ->> 'recognized_amount')::numeric, 0);
       v_move := app.post_recognized_delta (
         v_cause,
         'waste',
@@ -7195,9 +7479,9 @@ begin
         v_item,
         'waste',
         'waste',
-        0,
-        0,
-        v_old_reason,
+        v_qty,
+        v_value,
+        p_reason,
         'manual',
         v_chain,
         v_prior,
@@ -7205,28 +7489,51 @@ begin
         v_piece
       );
 
-      if v_move is not null then
-        v_posted := true;
-        v_items := v_items || v_item;
-      end if;
+      if v_retained <> 0 then
+        v_piece := v_piece + 1;
 
-      v_piece := v_piece + 1;
-      v_move := app.post_recognized_delta (
-        v_cause,
-        'waste',
-        v_root::text,
-        v_item,
-        'waste',
-        'waste',
-        (v_elem ->> 'qty')::numeric,
-        (v_elem ->> 'value')::numeric,
-        p_reason,
-        'manual',
-        v_chain,
-        null,
-        null,
-        v_piece
-      );
+        perform app.insert_closed_movement (
+          v_cause,
+          v_item,
+          v_change,
+          0,
+          v_retained,
+          'waste',
+          'waste',
+          v_shift,
+          'waste',
+          v_root::text,
+          v_old_reason,
+          'manual',
+          v_chain,
+          null,
+          null,
+          null,
+          v_piece
+        );
+
+        v_piece := v_piece + 1;
+
+        perform app.insert_closed_movement (
+          v_cause,
+          v_item,
+          v_change,
+          0,
+          -v_retained,
+          'waste',
+          'waste',
+          v_shift,
+          'waste',
+          v_root::text,
+          p_reason,
+          'manual',
+          v_chain,
+          null,
+          null,
+          null,
+          v_piece
+        );
+      end if;
     else
       v_move := app.post_recognized_delta (
         v_cause,

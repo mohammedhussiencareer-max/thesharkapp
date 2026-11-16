@@ -4557,6 +4557,1311 @@ select
     'fully covered deficits do not grow the restore set'
   );
 
+-- An increase keeps the original deficit and posts only the added quantity.
+insert into
+  app.stock_items (id, name, kind, base_unit, count_frequency)
+values
+  (
+    'f6e00000-0000-4000-8000-00000000001e',
+    'f6 waste increase',
+    'seafood',
+    'kg',
+    'daily'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-00000000031e',
+    'f6e00000-0000-4000-8000-00000000001e',
+    10,
+    null,
+    null,
+    'kg|seafood||'
+  );
+
+select
+  app.record_waste (
+    'f6e00000-0000-4000-8000-00000000033e',
+    jsonb_build_object(
+      'occurred_at',
+      (
+        select
+          anchor.at - interval '40 days'
+        from
+          f6_anchor anchor
+      ),
+      'reason_code',
+      'staff_meal',
+      'lines',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          'f6e00000-0000-4000-8000-00000000001e',
+          'quantity',
+          '10',
+          'unit',
+          'kg'
+        )
+      )
+    )
+  );
+
+create temp table f6_increase_waste as
+select
+  movement.id,
+  movement.occurred_at
+from
+  app.stock_movements movement
+  join app.waste_line_movements link on link.movement_id = movement.id
+where
+  movement.item_id = 'f6e00000-0000-4000-8000-00000000001e'
+  and movement.movement_type = 'waste';
+
+select
+  app.apply_closed_waste_delta (
+    (
+      select
+        document.id
+      from
+        app.waste_documents document
+      where
+        document.request_id = 'f6e00000-0000-4000-8000-00000000033e'
+    ),
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000001e',
+        'base_quantity',
+        12
+      )
+    ),
+    false,
+    'spoilage'
+  );
+
+select
+  results_eq (
+    $$select source.reason_code, sum(movement.total_cost)::text
+      from app.stock_movements movement
+      join app.closed_period_sources source on source.movement_id = movement.id
+      where movement.item_id = 'f6e00000-0000-4000-8000-00000000001e'
+      group by source.reason_code
+      order by source.reason_code$$,
+    $$values ('spoilage', '-120.00'), ('staff_meal', '100.00')$$,
+    'an increase moves the original value and posts only the added quantity on the new reason'
+  );
+
+select
+  is (
+    (
+      select
+        deficit.qty_uncovered
+      from
+        app.provisional_deficits deficit
+      where
+        deficit.movement_id = (
+          select
+            waste.id
+          from
+            f6_increase_waste waste
+        )
+    ),
+    10::numeric,
+    'an increase keeps the original deficit quantity'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.provisional_deficits deficit
+        join app.stock_movements movement on movement.id = deficit.movement_id
+      where
+        movement.item_id = 'f6e00000-0000-4000-8000-00000000001e'
+        and deficit.qty_uncovered = 12
+    ),
+    0::bigint,
+    'an increase does not replace the original deficit with the new total'
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000001e',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        10,
+        'unit_cost',
+        20
+      )
+    )
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements movement
+      where
+        movement.movement_type = 'closed_period'
+        and movement.cover_deficit_movement_id = (
+          select
+            waste.id
+          from
+            f6_increase_waste waste
+        )
+    ),
+    1::bigint,
+    'a later purchase covers the original closed deficit'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements movement
+      where
+        movement.movement_type = 'cost_adjustment'
+        and movement.adjusts_movement_id = (
+          select
+            waste.id
+          from
+            f6_increase_waste waste
+        )
+    ),
+    0::bigint,
+    'a later purchase does not adjust the retained deficit inside the window'
+  );
+
+-- A cover that exists before the first correction is part of the seed.
+insert into
+  app.stock_items (id, name, kind, base_unit, count_frequency)
+values
+  (
+    'f6e00000-0000-4000-8000-00000000001f',
+    'f6 cover before seed',
+    'seafood',
+    'kg',
+    'daily'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-00000000031f',
+    'f6e00000-0000-4000-8000-00000000001f',
+    10,
+    null,
+    null,
+    'kg|seafood||'
+  );
+
+select
+  app.record_waste (
+    'f6e00000-0000-4000-8000-00000000033f',
+    jsonb_build_object(
+      'occurred_at',
+      (
+        select
+          anchor.at - interval '40 days'
+        from
+          f6_anchor anchor
+      ),
+      'reason_code',
+      'spoilage',
+      'lines',
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          'f6e00000-0000-4000-8000-00000000001f',
+          'quantity',
+          '5',
+          'unit',
+          'kg'
+        )
+      )
+    )
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000001f',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        5,
+        'unit_cost',
+        20
+      )
+    )
+  );
+
+create temp table f6_seed_void as
+select
+  app.apply_closed_waste_delta (
+    (
+      select
+        document.id
+      from
+        app.waste_documents document
+      where
+        document.request_id = 'f6e00000-0000-4000-8000-00000000033f'
+    ),
+    '[]'::jsonb,
+    true,
+    null
+  ) as cause;
+
+select
+  is (
+    (
+      select
+        coalesce(sum(movement.total_cost), 0)
+      from
+        app.stock_movements movement
+        join app.closed_period_sources source on source.movement_id = movement.id
+        join f6_seed_void voided on voided.cause = movement.batch_id
+      where
+        source.source_kind = 'return'
+    ),
+    100.00,
+    'the first closed void returns a cover that happened before the seed'
+  );
+
+-- The document root is the row with no predecessor, however long the chain.
+create temp table f6_waste_chain (n integer primary key, id bigint not null);
+
+do $$
+declare
+  v_prev bigint;
+  v_id bigint;
+  v_i integer;
+begin
+  for v_i in 0..17 loop
+    insert into
+      app.waste_documents (
+        request_id,
+        occurred_at,
+        reason_code,
+        event_position,
+        batch_id,
+        retire_batch_id,
+        predecessor_id,
+        actor
+      )
+    values
+      (
+        pg_catalog.gen_random_uuid (),
+        pg_catalog.clock_timestamp (),
+        'spoilage',
+        990000 + v_i,
+        pg_catalog.gen_random_uuid (),
+        case
+          when v_prev is null then null
+          else pg_catalog.gen_random_uuid ()
+        end,
+        v_prev,
+        'f6e00000-0000-4000-8000-0000000000a1'
+      )
+    returning
+      id into v_id;
+
+    insert into
+      f6_waste_chain (n, id)
+    values
+      (v_i, v_id);
+
+    v_prev := v_id;
+  end loop;
+end $$;
+
+select
+  is (
+    app.waste_document_root (
+      (
+        select
+          chain.id
+        from
+          f6_waste_chain chain
+        where
+          chain.n = 17
+      )
+    ),
+    (
+      select
+        chain.id
+      from
+        f6_waste_chain chain
+      where
+        chain.n = 0
+    ),
+    'a correction chain longer than 16 steps resolves to the original document'
+  );
+
+-- An unrelated earlier purchase does not pull this item off its checkpoint.
+insert into
+  app.stock_items (id, name, kind, base_unit, count_frequency)
+values
+  (
+    'f6e00000-0000-4000-8000-000000000021',
+    'f6 boundary kept',
+    'seafood',
+    'kg',
+    'daily'
+  ),
+  (
+    'f6e00000-0000-4000-8000-000000000022',
+    'f6 boundary other',
+    'seafood',
+    'kg',
+    'daily'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-000000000321',
+    'f6e00000-0000-4000-8000-000000000021',
+    10,
+    null,
+    null,
+    'kg|seafood||'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-000000000322',
+    'f6e00000-0000-4000-8000-000000000022',
+    10,
+    null,
+    null,
+    'kg|seafood||'
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000021',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '3 days'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        1,
+        'unit_cost',
+        10
+      ),
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000021',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '2 days'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        1,
+        'unit_cost',
+        10
+      ),
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000021',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '1 day'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        1,
+        'unit_cost',
+        10
+      ),
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000022',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '10 days'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        1,
+        'unit_cost',
+        10
+      )
+    )
+  );
+
+select
+  app.replay_execute (
+    array['f6e00000-0000-4000-8000-000000000021']::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-000000000421',
+    true
+  );
+
+select
+  app.replay_execute (
+    array['f6e00000-0000-4000-8000-000000000022']::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-000000000422',
+    true
+  );
+
+select
+  set_config('app.replay_probe', '1', true);
+
+delete from app.replay_read_probe;
+
+select
+  app.replay_execute (
+    array[
+      'f6e00000-0000-4000-8000-000000000021',
+      'f6e00000-0000-4000-8000-000000000022'
+    ]::uuid[],
+    jsonb_build_array(
+      jsonb_build_object(
+        'line_key',
+        1,
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000021',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        1,
+        'unit_cost',
+        10,
+        'total_cost',
+        10,
+        'batch_id',
+        'f6e00000-0000-4000-8000-000000000423'
+      ),
+      jsonb_build_object(
+        'line_key',
+        2,
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000022',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '20 days'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        1,
+        'unit_cost',
+        10,
+        'total_cost',
+        10,
+        'batch_id',
+        'f6e00000-0000-4000-8000-000000000424'
+      )
+    ),
+    'f6e00000-0000-4000-8000-000000000425',
+    false
+  );
+
+select
+  ok (
+    (
+      select
+        (detail ->> 'checkpoint_id') is not null
+        and (detail ->> 'rows_loaded')::bigint = 0
+      from
+        pg_catalog.jsonb_array_elements (
+          (
+            select
+              probe.resume_detail
+            from
+              app.replay_read_probe probe
+            order by
+              probe.id desc
+            limit
+              1
+          )
+        ) as detail
+      where
+        detail ->> 'item_id' = 'f6e00000-0000-4000-8000-000000000021'
+    ),
+    'a checkpointed item keeps its cut beside an unrelated earlier purchase'
+  );
+
+select
+  ok (
+    (
+      select
+        (detail ->> 'checkpoint_id') is null
+      from
+        pg_catalog.jsonb_array_elements (
+          (
+            select
+              probe.resume_detail
+            from
+              app.replay_read_probe probe
+            order by
+              probe.id desc
+            limit
+              1
+          )
+        ) as detail
+      where
+        detail ->> 'item_id' = 'f6e00000-0000-4000-8000-000000000022'
+    ),
+    'the unrelated item drops the cut that is after its own pending purchase'
+  );
+
+select
+  set_config('app.replay_probe', '', true);
+
+-- A posted cover whose inflow is still inside the window is not posted again.
+insert into
+  app.stock_items (id, name, kind, base_unit, count_frequency)
+values
+  (
+    'f6e00000-0000-4000-8000-00000000001c',
+    'f6 in-window cover',
+    'seafood',
+    'kg',
+    'daily'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-00000000031c',
+    'f6e00000-0000-4000-8000-00000000001c',
+    10,
+    null,
+    null,
+    'kg|seafood||'
+  );
+
+select
+  app.post_engine_outflows (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000001c',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        (
+          select
+            anchor.at
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        10
+      )
+    )
+  );
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config(
+    'app.test_clock',
+    (
+      select
+        (anchor.at + interval '30 days')::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000001c',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at + interval '30 days'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        5,
+        'unit_cost',
+        20
+      )
+    )
+  );
+
+select
+  is (
+    (
+      select
+        coalesce(sum(adjustment.total_cost), 0)
+      from
+        app.stock_movements adjustment
+      where
+        adjustment.movement_type = 'cost_adjustment'
+        and adjustment.adjusts_movement_id = (
+          select
+            movement.id
+          from
+            app.stock_movements movement
+          where
+            movement.item_id = 'f6e00000-0000-4000-8000-00000000001c'
+            and movement.movement_type = 'sale'
+        )
+    ),
+    -50.00,
+    'the in-window cover is one adjustment of -50'
+  );
+
+create temp table f6_inflow_before as
+select
+  balance.on_hand_value,
+  (
+    select
+      count(*)
+    from
+      app.stock_movements movement
+    where
+      movement.item_id = 'f6e00000-0000-4000-8000-00000000001c'
+  ) as movement_count
+from
+  app.item_balances balance
+where
+  balance.item_id = 'f6e00000-0000-4000-8000-00000000001c';
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config(
+    'app.test_clock',
+    (
+      select
+        (anchor.at + interval '40 days')::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+insert into
+  app.replay_checkpoint_invalidations (checkpoint_id, reason)
+select
+  checkpoint.id,
+  'in-window-cover'
+from
+  app.replay_checkpoints
+checkpoint
+where
+  checkpoint.item_id = 'f6e00000-0000-4000-8000-00000000001c'
+  and not exists (
+    select
+      1
+    from
+      app.replay_checkpoint_invalidations invalidation
+    where
+      invalidation.checkpoint_id = checkpoint.id
+  );
+
+select
+  app.replay_execute (
+    array['f6e00000-0000-4000-8000-00000000001c']::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-00000000041c',
+    true
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements movement
+      where
+        movement.item_id = 'f6e00000-0000-4000-8000-00000000001c'
+    ),
+    (
+      select
+        before.movement_count
+      from
+        f6_inflow_before before
+    ),
+    'a full replay does not post the cover again when its inflow is still in the window'
+  );
+
+select
+  is (
+    (
+      select
+        balance.on_hand_value
+      from
+        app.item_balances balance
+      where
+        balance.item_id = 'f6e00000-0000-4000-8000-00000000001c'
+    ),
+    (
+      select
+        before.on_hand_value
+      from
+        f6_inflow_before before
+    ),
+    'a full replay leaves the in-window cover ledger equal to the snapshot'
+  );
+
+-- Opposing historical covers stay as their own posted facts.
+insert into
+  app.stock_items (id, name, kind, base_unit, count_frequency)
+values
+  (
+    'f6e00000-0000-4000-8000-00000000001d',
+    'f6 opposing covers',
+    'seafood',
+    'kg',
+    'daily'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-00000000031d',
+    'f6e00000-0000-4000-8000-00000000001d',
+    10,
+    null,
+    null,
+    'kg|seafood||'
+  );
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config(
+    'app.test_clock',
+    (
+      select
+        anchor.at::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+select
+  app.post_engine_outflows (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000001d',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        (
+          select
+            anchor.at
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        10
+      )
+    )
+  );
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config(
+    'app.test_clock',
+    (
+      select
+        (anchor.at + interval '1 day')::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000001d',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at + interval '1 day'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        5,
+        'unit_cost',
+        20
+      )
+    )
+  );
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config(
+    'app.test_clock',
+    (
+      select
+        (anchor.at + interval '2 days')::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000001d',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at + interval '2 days'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        5,
+        'unit_cost',
+        5
+      )
+    )
+  );
+
+select
+  results_eq (
+    $$select adjustment.total_cost::text
+      from app.stock_movements adjustment
+      where adjustment.movement_type = 'cost_adjustment'
+        and adjustment.adjusts_movement_id = (
+          select movement.id
+          from app.stock_movements movement
+          where movement.item_id = 'f6e00000-0000-4000-8000-00000000001d'
+            and movement.movement_type = 'sale'
+        )
+      order by adjustment.id$$,
+    $$values ('-50.00'), ('25.00')$$,
+    'the two historical covers are adjustments of -50 and +25'
+  );
+
+create temp table f6_opposing_before as
+select
+  count(*) as movement_count
+from
+  app.stock_movements movement
+where
+  movement.item_id = 'f6e00000-0000-4000-8000-00000000001d';
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config(
+    'app.test_clock',
+    (
+      select
+        (anchor.at + interval '40 days')::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+insert into
+  app.replay_checkpoint_invalidations (checkpoint_id, reason)
+select
+  checkpoint.id,
+  'opposing-covers'
+from
+  app.replay_checkpoints
+checkpoint
+where
+  checkpoint.item_id = 'f6e00000-0000-4000-8000-00000000001d'
+  and not exists (
+    select
+      1
+    from
+      app.replay_checkpoint_invalidations invalidation
+    where
+      invalidation.checkpoint_id = checkpoint.id
+  );
+
+select
+  app.replay_execute (
+    array['f6e00000-0000-4000-8000-00000000001d']::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-00000000041d',
+    true
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements movement
+      where
+        movement.item_id = 'f6e00000-0000-4000-8000-00000000001d'
+        and movement.movement_type = 'closed_period'
+        and movement.cover_inflow_movement_id is not null
+    ),
+    0::bigint,
+    'a full replay does not add carriers for opposing covers that are already posted'
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.stock_movements movement
+      where
+        movement.item_id = 'f6e00000-0000-4000-8000-00000000001d'
+    ),
+    (
+      select
+        before.movement_count
+      from
+        f6_opposing_before before
+    ),
+    'a full replay leaves the opposing historical covers unchanged'
+  );
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config(
+    'app.test_clock',
+    (
+      select
+        anchor.at::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+-- Settled prefix rows are replaced by primary key, not by an item scan.
+insert into
+  app.stock_items (id, name, kind, base_unit, count_frequency)
+values
+  (
+    'f6e00000-0000-4000-8000-000000000023',
+    'f6 settled prefix',
+    'seafood',
+    'kg',
+    'daily'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-000000000323',
+    'f6e00000-0000-4000-8000-000000000023',
+    10,
+    null,
+    null,
+    'kg|seafood||'
+  );
+
+select
+  app.post_engine_outflows (
+    (
+      select
+        pg_catalog.jsonb_agg (
+          pg_catalog.jsonb_build_object (
+            'item_id',
+            'f6e00000-0000-4000-8000-000000000023',
+            'movement_type',
+            'sale',
+            'occurred_at',
+            (
+              select
+                anchor.at - interval '2 days'
+              from
+                f6_anchor anchor
+            ) + (sale.n || ' minutes')::interval,
+            'quantity',
+            1
+          )
+        )
+      from
+        pg_catalog.generate_series (1, 20) as sale (n)
+    )
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000023',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '2 days' + interval '1 hour'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        19,
+        'unit_cost',
+        10
+      )
+    )
+  );
+
+select
+  app.replay_execute (
+    array['f6e00000-0000-4000-8000-000000000023']::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-000000000426',
+    true
+  );
+
+create temp table f6_settled_before as
+select
+  count(*) as settled_count
+from
+  app.provisional_deficits deficit
+  join app.stock_movements movement on movement.id = deficit.movement_id
+where
+  movement.item_id = 'f6e00000-0000-4000-8000-000000000023'
+  and deficit.qty_uncovered = 0
+  and deficit.value_uncovered = 0;
+
+-- A one-page deficit table makes a seq scan cheaper than the primary key.
+-- These settled rows belong to another item. The replace must not read them.
+set
+  local session_replication_role = replica;
+
+insert into
+  app.stock_items (id, name, kind, base_unit, count_frequency)
+values
+  (
+    'f6e00000-0000-4000-8000-000000000024',
+    'f6 deficit filler',
+    'seafood',
+    'kg',
+    'daily'
+  );
+
+insert into
+  app.stock_movements (
+    batch_id,
+    item_id,
+    movement_type,
+    occurred_at,
+    quantity,
+    unit_cost,
+    total_cost
+  )
+select
+  pg_catalog.gen_random_uuid (),
+  'f6e00000-0000-4000-8000-000000000024',
+  'purchase',
+  pg_catalog.clock_timestamp (),
+  1,
+  1,
+  1
+from
+  pg_catalog.generate_series (1, 20000);
+
+insert into
+  app.provisional_deficits (
+    movement_id,
+    item_id,
+    qty_uncovered,
+    provisional_unit_cost,
+    value_uncovered
+  )
+select
+  movement.id,
+  movement.item_id,
+  0,
+  0,
+  0
+from
+  app.stock_movements movement
+where
+  movement.item_id = 'f6e00000-0000-4000-8000-000000000024';
+
+set
+  local session_replication_role = origin;
+
+analyze app.provisional_deficits;
+
+select
+  set_config('app.replay_probe', '1', true);
+
+delete from app.replay_read_probe;
+
+select
+  app.replay_execute (
+    array['f6e00000-0000-4000-8000-000000000023']::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-000000000428',
+    true
+  );
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.provisional_deficits deficit
+        join app.stock_movements movement on movement.id = deficit.movement_id
+      where
+        movement.item_id = 'f6e00000-0000-4000-8000-000000000023'
+        and deficit.qty_uncovered = 0
+        and deficit.value_uncovered = 0
+    ),
+    (
+      select
+        before.settled_count
+      from
+        f6_settled_before before
+    ),
+    'a resumed write leaves the settled historical deficits in place'
+  );
+
+select
+  ok (
+    (
+      select
+        probe.replace_plan <> ''
+        and probe.replace_plan not like '%Seq Scan on provisional_deficits%'
+        and probe.replace_plan like '%provisional_deficits_pkey%'
+      from
+        app.replay_read_probe probe
+      order by
+        probe.id desc
+      limit
+        1
+    ),
+    'the settled-deficit replace looks up recomputed movement ids by primary key'
+  );
+
 select
   finish ();
 
