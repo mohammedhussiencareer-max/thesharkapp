@@ -59,14 +59,15 @@ export type HeldWriteRecord<T = unknown> = {
 /**
  * Non-request-id post-write read marker for writers whose RPC has no client
  * request id (e.g. catalog update, month completion toggle). Stored separately
- * from held-write records with no `requestId`.
+ * from held-write records with no `requestId`, keyed per claim by a unique
+ * never-reused `id` so concurrent targets never overwrite each other and slow
+ * reads cannot clear later markers.
  */
 export type ReloadMarkerRecord = {
   v: 1;
   subject: string;
+  id: string;
   target?: string;
-  /** Durable monotonic version stored in localStorage so an older read in another tab cannot clear a newer marker. */
-  version?: number;
 };
 
 /** Captured auth identity + monotonic session generation for multi-step writes. */
@@ -212,6 +213,10 @@ function postedMapKey(subject: string, requestId: string): string {
   return `${subject}\0${requestId}`;
 }
 
+function markerMapKey(subject: string, id: string): string {
+  return `${subject}\0${id}`;
+}
+
 function parseRecord(raw: string): HeldWriteRecord | null {
   let parsed: unknown;
   try {
@@ -263,15 +268,19 @@ function parseReloadMarker(raw: string): ReloadMarkerRecord | null {
   const row = parsed as Record<string, unknown>;
   if (row.v !== 1) return null;
   if (typeof row.subject !== 'string' || row.subject.length === 0) return null;
+  const id =
+    typeof row.id === 'string' && row.id.length > 0
+      ? row.id
+      : typeof row.version === 'number' && Number.isFinite(row.version)
+        ? `legacy-${row.version}`
+        : 'legacy';
   const marker: ReloadMarkerRecord = {
     v: 1,
     subject: row.subject,
+    id,
   };
   if (typeof row.target === 'string' && row.target.length > 0) {
     marker.target = row.target;
-  }
-  if (typeof row.version === 'number' && Number.isFinite(row.version)) {
-    marker.version = row.version;
   }
   return marker;
 }
@@ -317,6 +326,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   const postedReloads = new Map<string, HeldWriteRecord>();
   const reloadMarkers = new Map<string, ReloadMarkerRecord>();
   const activeLockReleases = new Map<string, () => void>();
+  let liveClaimCount = 0;
   const listeners = new Set<() => void>();
 
   function emit(): void {
@@ -355,7 +365,24 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     return `${postedSubjectPrefix(subject, userId, projectUrl)}${encodeURIComponent(requestId)}`;
   }
 
+  function markerSubjectPrefix(
+    subject: string,
+    userId: string,
+    projectUrl = getProjectUrl(),
+  ): string {
+    return `${reloadMarkerPrefix(userId, projectUrl)}${encodeURIComponent(subject)}:`;
+  }
+
   function markerStorageKey(
+    subject: string,
+    id: string,
+    userId: string,
+    projectUrl = getProjectUrl(),
+  ): string {
+    return `${markerSubjectPrefix(subject, userId, projectUrl)}${encodeURIComponent(id)}`;
+  }
+
+  function legacyMarkerStorageKey(
     subject: string,
     userId: string,
     projectUrl = getProjectUrl(),
@@ -451,7 +478,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     } catch {
       return false;
     }
-    return safeSetItem(markerStorageKey(marker.subject, userId), serialized);
+    return safeSetItem(
+      markerStorageKey(marker.subject, marker.id, userId),
+      serialized,
+    );
   }
 
   function removeRecordFromStorage(subject: string, userId: string): void {
@@ -477,8 +507,19 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
   }
 
-  function removeMarkerFromStorage(subject: string, userId: string): void {
-    safeRemoveItem(markerStorageKey(subject, userId));
+  function removeMarkerFromStorage(
+    subject: string,
+    id: string,
+    userId: string,
+  ): void {
+    safeRemoveItem(markerStorageKey(subject, id, userId));
+    // Also clean up any legacy single-slot marker with matching id.
+    const legacyKey = legacyMarkerStorageKey(subject, userId);
+    const raw = safeReadItem(legacyKey);
+    const parsed = raw !== null ? parseReloadMarker(raw) : null;
+    if (parsed && parsed.id === id) {
+      safeRemoveItem(legacyKey);
+    }
   }
 
   async function acquireSubjectLock(
@@ -538,9 +579,24 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       : { acquired: false, release: () => {} };
   }
 
+  function wrapClaimRelease(lockRelease: () => void): () => void {
+    liveClaimCount += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      lockRelease();
+      liveClaimCount = Math.max(0, liveClaimCount - 1);
+      if (liveClaimCount === 0) {
+        emit();
+      }
+    };
+  }
+
   function releaseAllLocks(): void {
     const releases = [...activeLockReleases.values()];
     activeLockReleases.clear();
+    liveClaimCount = 0;
     for (const release of releases) {
       release();
     }
@@ -586,7 +642,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (raw === null) continue;
       const parsed = parseReloadMarker(raw);
       if (!parsed) continue;
-      reloadMarkers.set(parsed.subject, parsed);
+      reloadMarkers.set(markerMapKey(parsed.subject, parsed.id), parsed);
     }
 
     return inflightSubjects;
@@ -860,12 +916,21 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     return false;
   }
 
+  /** True while any dispatched write still holds a live claim / Web Lock in this tab. */
+  function hasLiveHeldWriteClaims(): boolean {
+    return liveClaimCount > 0 || activeLockReleases.size > 0;
+  }
+
   /**
-   * True while any pin or post-write reload marker is held in storage OR
-   * memory for the active user. Consults localStorage directly so another
-   * tab's pin blocks a PWA shell reload even before a storage event fires.
+   * True while any pin, post-write reload marker, or live claim lock is held
+   * in storage OR memory. Consults live claims even after sign-out clears user
+   * keys, and consults localStorage directly so another tab's pin blocks a PWA
+   * shell reload even before a storage event fires.
    */
   function hasAnyHeldWrite(): boolean {
+    if (hasLiveHeldWriteClaims()) {
+      return true;
+    }
     ensureHydrated();
     if (records.size > 0 || postedReloads.size > 0 || reloadMarkers.size > 0) {
       return true;
@@ -978,9 +1043,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         return { ok: false, reason: 'storage' };
       }
       records.set(subject, next);
+      const release = wrapClaimRelease(lock.release);
       emit();
       handedOff = true;
-      return { ok: true, record: next, release: lock.release, session };
+      return { ok: true, record: next, release, session };
     } finally {
       if (!handedOff) {
         lock.release();
@@ -1061,9 +1127,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         return { ok: false, reason: 'storage' };
       }
       records.set(subject, next);
+      const release = wrapClaimRelease(lock.release);
       emit();
       handedOff = true;
-      return { ok: true, record: next, release: lock.release, session };
+      return { ok: true, record: next, release, session };
     } finally {
       if (!handedOff) {
         lock.release();
@@ -1614,9 +1681,9 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       ) {
         return;
       }
-      seen.set(`marker:${marker.subject}`, {
+      seen.set(`marker:${markerMapKey(marker.subject, marker.id)}`, {
         subject: marker.subject,
-        requestId: String(marker.version ?? 0),
+        requestId: marker.id,
         ...(marker.target !== undefined ? { readTarget: marker.target } : {}),
         isMarker: true,
       });
@@ -1625,12 +1692,22 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     for (const marker of reloadMarkers.values()) {
       considerMarker(marker);
     }
-    // Always consult localStorage last so cross-tab newer versions win in the snapshot.
+    // Always consult localStorage so cross-tab markers are included in the snapshot.
     if (filter.subject !== undefined) {
-      const markerRaw = safeReadItem(markerStorageKey(filter.subject, userId));
-      const parsedMarker =
-        markerRaw !== null ? parseReloadMarker(markerRaw) : null;
-      if (parsedMarker) considerMarker(parsedMarker);
+      for (const key of safeListKeys(
+        markerSubjectPrefix(filter.subject, userId),
+      )) {
+        const markerRaw = safeReadItem(key);
+        const parsedMarker =
+          markerRaw !== null ? parseReloadMarker(markerRaw) : null;
+        if (parsedMarker) considerMarker(parsedMarker);
+      }
+      const legacyRaw = safeReadItem(
+        legacyMarkerStorageKey(filter.subject, userId),
+      );
+      const legacyParsed =
+        legacyRaw !== null ? parseReloadMarker(legacyRaw) : null;
+      if (legacyParsed) considerMarker(legacyParsed);
     } else {
       for (const key of safeListKeys(reloadMarkerPrefix(userId))) {
         const markerRaw = safeReadItem(key);
@@ -1649,11 +1726,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   ): void {
     for (const item of snapshot) {
       if (item.isMarker) {
-        const expectedVersion = Number(item.requestId);
         clearReloadMarker(
           item.subject,
           loadedTarget ?? item.readTarget,
-          Number.isFinite(expectedVersion) ? expectedVersion : undefined,
+          item.requestId,
         );
         continue;
       }
@@ -1665,73 +1741,109 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
   }
 
-  function setReloadMarker(subject: string, target?: string): boolean {
+  function setReloadMarker(
+    subject: string,
+    target?: string,
+    claimId?: string,
+  ): boolean {
     ensureHydrated();
     const userId = activeUserId();
     if (userId === null) return false;
-    const raw = safeReadItem(markerStorageKey(subject, userId));
-    const stored = raw !== null ? parseReloadMarker(raw) : null;
-    const existing = reloadMarkers.get(subject) ?? null;
-    const prevVersion = Math.max(stored?.version ?? 0, existing?.version ?? 0);
+    const id =
+      claimId && claimId.trim().length > 0
+        ? claimId.trim()
+        : crypto.randomUUID();
     const marker: ReloadMarkerRecord = {
       v: 1,
       subject,
+      id,
       ...(target ? { target } : {}),
-      version: prevVersion + 1,
     };
     const persisted = writeMarkerToStorage(marker, userId);
-    reloadMarkers.set(subject, marker);
+    reloadMarkers.set(markerMapKey(subject, id), marker);
     emit();
     return persisted;
   }
 
-  function getReloadMarker(subject: string): ReloadMarkerRecord | null {
+  function listReloadMarkers(subject: string): ReloadMarkerRecord[] {
     ensureHydrated();
-    return reloadMarkers.get(subject) ?? null;
+    const found: ReloadMarkerRecord[] = [];
+    for (const marker of reloadMarkers.values()) {
+      if (marker.subject === subject) {
+        found.push(marker);
+      }
+    }
+    return found;
+  }
+
+  function getReloadMarker(subject: string): ReloadMarkerRecord | null {
+    return listReloadMarkers(subject)[0] ?? null;
+  }
+
+  function hasAnyReloadMarker(subject: string): boolean {
+    return listReloadMarkers(subject).length > 0;
   }
 
   function hasReloadMarker(subject: string, expectedTarget?: string): boolean {
-    const marker = getReloadMarker(subject);
-    if (!marker) return false;
-    if (marker.target === undefined || marker.target === '*') {
-      return true;
+    for (const marker of listReloadMarkers(subject)) {
+      if (marker.target === undefined || marker.target === '*') {
+        return true;
+      }
+      if (expectedTarget !== undefined && marker.target === expectedTarget) {
+        return true;
+      }
     }
-    if (expectedTarget === undefined) return false;
-    return marker.target === expectedTarget;
+    return false;
   }
 
   function clearReloadMarker(
     subject: string,
     expectedTarget?: string,
-    expectedVersion?: number,
+    expectedId?: string,
   ): void {
     ensureHydrated();
     const userId = activeUserId();
     if (userId === null) return;
-    const raw = safeReadItem(markerStorageKey(subject, userId));
-    const stored = raw !== null ? parseReloadMarker(raw) : null;
-    const current = stored ?? reloadMarkers.get(subject) ?? null;
-    if (!current) return;
-    if (
-      expectedVersion !== undefined &&
-      (current.version ?? 0) !== expectedVersion
-    ) {
-      if (stored) {
-        reloadMarkers.set(subject, stored);
-        emit();
+    const candidates = new Map<string, ReloadMarkerRecord>();
+    for (const [k, marker] of reloadMarkers.entries()) {
+      if (marker.subject === subject) {
+        candidates.set(k, marker);
       }
-      return;
     }
-    if (
-      current.target !== undefined &&
-      current.target !== '*' &&
-      current.target !== expectedTarget
-    ) {
-      return;
+    for (const key of safeListKeys(markerSubjectPrefix(subject, userId))) {
+      const raw = safeReadItem(key);
+      const parsed = raw !== null ? parseReloadMarker(raw) : null;
+      if (parsed && parsed.subject === subject) {
+        candidates.set(markerMapKey(parsed.subject, parsed.id), parsed);
+      }
     }
-    reloadMarkers.delete(subject);
-    removeMarkerFromStorage(subject, userId);
-    emit();
+    const legacyRaw = safeReadItem(legacyMarkerStorageKey(subject, userId));
+    const legacyParsed =
+      legacyRaw !== null ? parseReloadMarker(legacyRaw) : null;
+    if (legacyParsed && legacyParsed.subject === subject) {
+      candidates.set(
+        markerMapKey(legacyParsed.subject, legacyParsed.id),
+        legacyParsed,
+      );
+    }
+
+    let changed = false;
+    for (const [k, marker] of candidates.entries()) {
+      if (expectedId !== undefined && marker.id !== expectedId) {
+        continue;
+      }
+      if (
+        marker.target !== undefined &&
+        marker.target !== '*' &&
+        marker.target !== expectedTarget
+      ) {
+        continue;
+      }
+      reloadMarkers.delete(k);
+      removeMarkerFromStorage(marker.subject, marker.id, userId);
+      changed = true;
+    }
+    if (changed) emit();
   }
 
   function resetHeldWritesStore(resetOptions?: {
@@ -1781,6 +1893,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     rehydrateHeldWritesAsync,
     getHeldWrite,
     hasHeldWrite,
+    hasLiveHeldWriteClaims,
     hasAnyHeldWrite,
     listHeldWritesByPrefix,
     claimFreshHeldWrite,
@@ -1801,7 +1914,9 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     snapshotPostedReloads,
     clearPostedReloadSnapshot,
     setReloadMarker,
+    listReloadMarkers,
     getReloadMarker,
+    hasAnyReloadMarker,
     hasReloadMarker,
     clearReloadMarker,
     resetHeldWritesStore,
@@ -1823,6 +1938,7 @@ export const rehydrateHeldWrites = defaultStore.rehydrateHeldWrites;
 export const rehydrateHeldWritesAsync = defaultStore.rehydrateHeldWritesAsync;
 export const getHeldWrite = defaultStore.getHeldWrite;
 export const hasHeldWrite = defaultStore.hasHeldWrite;
+export const hasLiveHeldWriteClaims = defaultStore.hasLiveHeldWriteClaims;
 export const hasAnyHeldWrite = defaultStore.hasAnyHeldWrite;
 export const listHeldWritesByPrefix = defaultStore.listHeldWritesByPrefix;
 export const claimFreshHeldWrite = defaultStore.claimFreshHeldWrite;
@@ -1843,7 +1959,9 @@ export const clearPostedReload = defaultStore.clearPostedReload;
 export const snapshotPostedReloads = defaultStore.snapshotPostedReloads;
 export const clearPostedReloadSnapshot = defaultStore.clearPostedReloadSnapshot;
 export const setReloadMarker = defaultStore.setReloadMarker;
+export const listReloadMarkers = defaultStore.listReloadMarkers;
 export const getReloadMarker = defaultStore.getReloadMarker;
+export const hasAnyReloadMarker = defaultStore.hasAnyReloadMarker;
 export const hasReloadMarker = defaultStore.hasReloadMarker;
 export const clearReloadMarker = defaultStore.clearReloadMarker;
 export const resetHeldWritesStore = defaultStore.resetHeldWritesStore;

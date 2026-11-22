@@ -38,16 +38,16 @@ import {
   clearHeldWrite,
   clearPostedReloadSnapshot,
   getHeldWrite,
-  getReloadMarker,
   hasDurableHeldWrite,
-  hasReloadMarker,
   listHeldWritesByPrefix,
+  listReloadMarkers,
   setHeldWritePhase,
   setReloadMarker,
   snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
   type HeldWriteKind,
+  type HeldWriteRecord,
   type PostedReloadSnapshot,
   type WriteSession,
 } from '@/lib/held-writes';
@@ -64,6 +64,68 @@ const EXPENSE_VOID_PREFIX = 'expense:void:';
 const EXPENSE_COMPLETE_PREFIX = 'expense:complete:';
 const EXPENSE_CATEGORY_PREFIX = 'expense:category:';
 const EXPENSE_RELOAD_SUBJECT = 'expense:reload';
+
+/** Minimal intended state persisted for request-less expense mutations so ambiguous outcomes can be verified and explicitly replayed. */
+type StoredExpenseMutationIntent =
+  | { kind: 'complete'; monthStart: string; complete: boolean }
+  | { kind: 'category_add'; name: string; categoryKind: ExpenseKind }
+  | { kind: 'category_rename'; categoryId: string; name: string }
+  | { kind: 'category_active'; categoryId: string; active: boolean };
+
+function isStoredExpenseMutationIntent(
+  value: unknown,
+): value is StoredExpenseMutationIntent {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Partial<StoredExpenseMutationIntent>;
+  if (row.kind === 'complete') {
+    return (
+      typeof row.monthStart === 'string' && typeof row.complete === 'boolean'
+    );
+  }
+  if (row.kind === 'category_add') {
+    return typeof row.name === 'string' && typeof row.categoryKind === 'string';
+  }
+  if (row.kind === 'category_rename') {
+    return typeof row.categoryId === 'string' && typeof row.name === 'string';
+  }
+  if (row.kind === 'category_active') {
+    return (
+      typeof row.categoryId === 'string' && typeof row.active === 'boolean'
+    );
+  }
+  return false;
+}
+
+function monthMatchesMutationIntent(
+  monthData: ExpenseMonth,
+  intent: StoredExpenseMutationIntent,
+): boolean {
+  if (intent.kind === 'complete') {
+    return (
+      monthData.monthStart === intent.monthStart &&
+      monthData.complete === intent.complete
+    );
+  }
+  if (intent.kind === 'category_add') {
+    const trimmed = intent.name.trim();
+    return monthData.categories.some(
+      (cat) => cat.name === trimmed && cat.kind === intent.categoryKind,
+    );
+  }
+  if (intent.kind === 'category_rename') {
+    const trimmed = intent.name.trim();
+    return monthData.categories.some(
+      (cat) => cat.id === intent.categoryId && cat.name === trimmed,
+    );
+  }
+  return monthData.categories.some(
+    (cat) => cat.id === intent.categoryId && cat.active === intent.active,
+  );
+}
+
+function mutationPinKey(record: HeldWriteRecord): string {
+  return `${record.subject}:${record.requestId}`;
+}
 
 /** Stored in localStorage for void retries: request id, reason, and target month (no cached money). */
 type StoredVoidPayload = {
@@ -161,6 +223,10 @@ export function ExpensesPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [categoryError, setCategoryError] = useState<string | null>(null);
+  const [mutationNotice, setMutationNotice] = useState<string | null>(null);
+  const [verifiedAbsentMutations, setVerifiedAbsentMutations] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
   const [saving, setSaving] = useState(false);
   const [localNeedsReload, setLocalNeedsReload] = useState(false);
   const [readLoads, setReadLoads] = useState(0);
@@ -219,6 +285,56 @@ export function ExpensesPage() {
     }
   }
 
+  function reconcileUnknownMutations(monthData: ExpenseMonth): {
+    reconciledSubjects: ReadonlySet<string>;
+  } {
+    const reconciled = new Set<string>();
+    const absentKeys: string[] = [];
+    const clearedKeys: string[] = [];
+    const allPins = [
+      ...listHeldWritesByPrefix<StoredExpenseMutationIntent>(
+        EXPENSE_COMPLETE_PREFIX,
+      ),
+      ...listHeldWritesByPrefix<StoredExpenseMutationIntent>(
+        EXPENSE_CATEGORY_PREFIX,
+      ),
+    ];
+    for (const record of allPins) {
+      if (
+        record.phase !== 'unknown' ||
+        !isStoredExpenseMutationIntent(record.payload)
+      ) {
+        continue;
+      }
+      if (
+        record.payload.kind === 'complete' &&
+        record.payload.monthStart !== monthData.monthStart
+      ) {
+        continue;
+      }
+      const key = mutationPinKey(record);
+      if (monthMatchesMutationIntent(monthData, record.payload)) {
+        clearHeldWrite(record.subject, record.requestId);
+        reconciled.add(record.subject);
+        clearedKeys.push(key);
+      } else {
+        absentKeys.push(key);
+      }
+    }
+    if (reconciled.size > 0) {
+      setMutationNotice('اتحفظ التعديل');
+    }
+    if (absentKeys.length > 0 || clearedKeys.length > 0) {
+      setVerifiedAbsentMutations((current) => {
+        const next = new Set(current);
+        for (const key of clearedKeys) next.delete(key);
+        for (const key of absentKeys) next.add(key);
+        return next;
+      });
+    }
+    return { reconciledSubjects: reconciled };
+  }
+
   const storedExpense =
     heldEpoch < 0 ? null : getHeldWrite<ExpenseDraft>(EXPENSE_NEW_SUBJECT);
   const pendingExpense =
@@ -240,19 +356,32 @@ export function ExpensesPage() {
     });
   }
   const storedCompletes =
-    heldEpoch < 0 ? [] : listHeldWritesByPrefix(EXPENSE_COMPLETE_PREFIX);
+    heldEpoch < 0
+      ? []
+      : listHeldWritesByPrefix<StoredExpenseMutationIntent>(
+          EXPENSE_COMPLETE_PREFIX,
+        );
   const storedCategories =
-    heldEpoch < 0 ? [] : listHeldWritesByPrefix(EXPENSE_CATEGORY_PREFIX);
+    heldEpoch < 0
+      ? []
+      : listHeldWritesByPrefix<StoredExpenseMutationIntent>(
+          EXPENSE_CATEGORY_PREFIX,
+        );
+  const unknownMutations = [...storedCompletes, ...storedCategories].filter(
+    (record) =>
+      record.phase === 'unknown' &&
+      isStoredExpenseMutationIntent(record.payload),
+  );
   const inflightVoid =
     storedVoids.some((record) => record.phase === 'inflight') ||
     storedCompletes.some((record) => record.phase === 'inflight') ||
     storedCategories.some((record) => record.phase === 'inflight');
-  const reloadMarker =
-    heldEpoch < 0 ? null : getReloadMarker(EXPENSE_RELOAD_SUBJECT);
+  const expenseReloadMarkers =
+    heldEpoch < 0 ? [] : listReloadMarkers(EXPENSE_RELOAD_SUBJECT);
   const postedReload =
     heldEpoch >= 0 &&
     (storedExpense?.phase === 'posted_reload' ||
-      hasReloadMarker(EXPENSE_RELOAD_SUBJECT) ||
+      expenseReloadMarkers.length > 0 ||
       storedVoids.some((record) => record.phase === 'posted_reload') ||
       storedCompletes.some((record) => record.phase === 'posted_reload') ||
       storedCategories.some((record) => record.phase === 'posted_reload'));
@@ -264,10 +393,12 @@ export function ExpensesPage() {
       (!storedExpense.readTarget ||
         storedExpense.readTarget === '*' ||
         storedExpense.readTarget === monthStart)) ||
-      (reloadMarker !== null &&
-        (!reloadMarker.target ||
-          reloadMarker.target === '*' ||
-          reloadMarker.target === monthStart)) ||
+      expenseReloadMarkers.some(
+        (marker) =>
+          !marker.target ||
+          marker.target === '*' ||
+          marker.target === monthStart,
+      ) ||
       storedVoids.some(
         (record) =>
           record.phase === 'posted_reload' &&
@@ -330,9 +461,35 @@ export function ExpensesPage() {
         setData(next);
         setLoadError(null);
         reconcileCommittedVoids(next.entries);
+        reconcileUnknownMutations(next);
         clearPostedReloadSnapshot(pendingReloads, next.monthStart);
         needsReloadRef.current = false;
         setLocalNeedsReload(false);
+        // Also run targeted reads for any unknown month-complete pin targeting
+        // another month so the owner can reconcile or retry it without switching.
+        const otherMonthPins =
+          listHeldWritesByPrefix<StoredExpenseMutationIntent>(
+            EXPENSE_COMPLETE_PREFIX,
+          ).filter(
+            (record) =>
+              record.phase === 'unknown' &&
+              isStoredExpenseMutationIntent(record.payload) &&
+              record.payload.kind === 'complete' &&
+              record.payload.monthStart !== next.monthStart,
+          );
+        if (otherMonthPins.length > 0) {
+          await Promise.all(
+            otherMonthPins.map(async (pin) => {
+              if (pin.payload.kind !== 'complete') return;
+              try {
+                const targeted = await loadExpenseMonth(pin.payload.monthStart);
+                if (!cancelled) reconcileUnknownMutations(targeted);
+              } catch {
+                // Keep unknown until targeted read succeeds.
+              }
+            }),
+          );
+        }
       } catch (error) {
         if (cancelled) return;
         setLoadError(messageFrom(error));
@@ -406,6 +563,7 @@ export function ExpensesPage() {
           setData(next);
           setLoadError(null);
           reconcileCommittedVoids(next.entries);
+          reconcileUnknownMutations(next);
           clearPostedReloadSnapshot(pendingReloads, next.monthStart);
           needsReloadRef.current = false;
           setLocalNeedsReload(false);
@@ -431,8 +589,10 @@ export function ExpensesPage() {
     subject: string,
     kind: HeldWriteKind,
     readTarget: string,
+    intent: StoredExpenseMutationIntent,
     action: () => Promise<void>,
     setError: (message: string | null) => void,
+    replayRecord?: HeldWriteRecord<StoredExpenseMutationIntent>,
   ): Promise<boolean> {
     if (
       savingRef.current ||
@@ -443,12 +603,19 @@ export function ExpensesPage() {
     ) {
       return false;
     }
+    setMutationNotice(null);
     const session = captureWriteSession();
-    const claim = await claimFreshHeldWrite<{ requestId: string }>(
-      subject,
-      (requestId) => ({ requestId }),
-      { kind, session },
-    );
+    const claim = replayRecord
+      ? await claimReplayHeldWrite<StoredExpenseMutationIntent>(
+          replayRecord.subject,
+          replayRecord.requestId,
+          { session },
+        )
+      : await claimFreshHeldWrite<StoredExpenseMutationIntent>(
+          subject,
+          () => intent,
+          { kind, session },
+        );
     if (!claim.ok) {
       if (claim.reason === 'storage' || claim.reason === 'missing') {
         setError(storageWriteFailedMessage);
@@ -470,23 +637,103 @@ export function ExpensesPage() {
         action,
         setError,
         () => {
-          if (setReloadMarker(EXPENSE_RELOAD_SUBJECT, readTarget)) {
+          if (setReloadMarker(EXPENSE_RELOAD_SUBJECT, readTarget, requestId)) {
             clearHeldWrite(subject, requestId);
           }
         },
         { subject, requestId, session },
       );
       if (!result.dispatched) {
-        abortClaimBeforeDispatch(subject, requestId, null, releaseOnce);
+        abortClaimBeforeDispatch(
+          subject,
+          requestId,
+          replayRecord ? 'unknown' : null,
+          releaseOnce,
+        );
         return false;
       }
       if (!result.saved && result.error) {
-        clearHeldWrite(subject, requestId);
+        if (isPayloadRefusal(result.error)) {
+          clearHeldWrite(subject, requestId);
+          return false;
+        }
+        // Ambiguous outcome: never clear the pin without a targeted read!
+        setHeldWritePhase(subject, requestId, 'unknown');
+        releaseOnce();
+        const verifyMonth =
+          intent.kind === 'complete'
+            ? intent.monthStart
+            : `${monthRef.current}-01`;
+        try {
+          const fresh = await loadExpenseMonth(verifyMonth);
+          if (verifyMonth === `${monthRef.current}-01`) {
+            setData(fresh);
+            setLoadError(null);
+          }
+          const { reconciledSubjects } = reconcileUnknownMutations(fresh);
+          if (reconciledSubjects.has(subject)) {
+            setError(null);
+            return true;
+          }
+        } catch {
+          // Keep pin in `unknown` until a later targeted read succeeds.
+        }
       }
       return result.saved;
     } finally {
       releaseOnce();
     }
+  }
+
+  function replayUnknownMutation(
+    record: HeldWriteRecord<StoredExpenseMutationIntent>,
+  ): void {
+    const intent = record.payload;
+    if (intent.kind === 'complete') {
+      void runClaimedMutation(
+        record.subject,
+        'expense_complete',
+        intent.monthStart,
+        intent,
+        () => setMonthExpenseComplete(intent.monthStart, intent.complete),
+        setListError,
+        record,
+      );
+      return;
+    }
+    if (intent.kind === 'category_add') {
+      void runClaimedMutation(
+        record.subject,
+        'expense_category',
+        '*',
+        intent,
+        () => addExpenseCategory(intent.name, intent.categoryKind),
+        setCategoryError,
+        record,
+      );
+      return;
+    }
+    if (intent.kind === 'category_rename') {
+      void runClaimedMutation(
+        record.subject,
+        'expense_category',
+        '*',
+        intent,
+        () => renameExpenseCategory(intent.categoryId, intent.name),
+        setCategoryError,
+        record,
+      );
+      return;
+    }
+    void runClaimedMutation(
+      record.subject,
+      'expense_category',
+      '*',
+      intent,
+      () => setExpenseCategoryActive(intent.categoryId, intent.active),
+      setCategoryError,
+      record,
+    );
   }
 
   async function submitExpense(draft: ExpenseDraft) {
@@ -714,6 +961,48 @@ export function ExpensesPage() {
           <p role="status">{offlineMoneyMessage}</p>
         </>
       ) : null}
+      {mutationNotice ? <p role="status">{mutationNotice}</p> : null}
+      {unknownMutations.length > 0 ? (
+        <section
+          aria-label="تعديلات مصاريف مش متأكد إنها اتسجلت"
+          className="flex flex-col gap-2 rounded border border-neutral-300 p-3"
+        >
+          {unknownMutations.map((pin) => {
+            const absent = verifiedAbsentMutations.has(mutationPinKey(pin));
+            const isComplete = pin.payload.kind === 'complete';
+            return (
+              <div key={pin.subject} className="flex flex-col gap-1">
+                <p role="status">
+                  {isComplete
+                    ? 'تأكيد الشهر مش متأكد إنه اتسجل'
+                    : 'تعديل التصنيف مش متأكد إنه اتسجل'}
+                </p>
+                {absent ? (
+                  <button
+                    className={secondaryButton}
+                    type="button"
+                    disabled={writeDisabled}
+                    onClick={() => replayUnknownMutation(pin)}
+                  >
+                    {isComplete
+                      ? 'إعادة محاولة تأكيد الشهر'
+                      : 'إعادة محاولة حفظ التصنيف'}
+                  </button>
+                ) : (
+                  <button
+                    className={secondaryButton}
+                    type="button"
+                    disabled={saving || readLoads > 0 || !online}
+                    onClick={retry}
+                  >
+                    التحقق من حالة الحفظ
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </section>
+      ) : null}
       <p>{formatMonth(monthStart)}</p>
       <label className="flex flex-col gap-1">
         الشهر
@@ -790,6 +1079,7 @@ export function ExpensesPage() {
                   `${EXPENSE_COMPLETE_PREFIX}${monthStart}`,
                   'expense_complete',
                   monthStart,
+                  { kind: 'complete', monthStart, complete: nextChecked },
                   () => setMonthExpenseComplete(monthStart, nextChecked),
                   setListError,
                 );
@@ -833,6 +1123,7 @@ export function ExpensesPage() {
                 `${EXPENSE_CATEGORY_PREFIX}add`,
                 'expense_category',
                 '*',
+                { kind: 'category_add', name, categoryKind: kind },
                 () => addExpenseCategory(name, kind),
                 setCategoryError,
               )
@@ -842,6 +1133,7 @@ export function ExpensesPage() {
                 `${EXPENSE_CATEGORY_PREFIX}rename:${id}`,
                 'expense_category',
                 '*',
+                { kind: 'category_rename', categoryId: id, name },
                 () => renameExpenseCategory(id, name),
                 setCategoryError,
               )
@@ -851,6 +1143,7 @@ export function ExpensesPage() {
                 `${EXPENSE_CATEGORY_PREFIX}active:${id}`,
                 'expense_category',
                 '*',
+                { kind: 'category_active', categoryId: id, active },
                 () => setExpenseCategoryActive(id, active),
                 setCategoryError,
               )

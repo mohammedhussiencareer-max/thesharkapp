@@ -1,4 +1,8 @@
-import { hasAnyHeldWrite } from '@/lib/held-writes';
+import {
+  hasAnyHeldWrite,
+  hasLiveHeldWriteClaims,
+  subscribeHeldWritesStore,
+} from '@/lib/held-writes';
 
 export type PwaUpdateSnapshot = {
   waiting: boolean;
@@ -10,7 +14,19 @@ let started = false;
 let reloadRequested = false;
 let reloadDeferred = false;
 let authResolvedState = false;
+let lastHadLiveClaims = false;
 const listeners = new Set<() => void>();
+
+subscribeHeldWritesStore(() => {
+  const hasLive = hasLiveHeldWriteClaims();
+  const releasedLast = lastHadLiveClaims && !hasLive;
+  lastHadLiveClaims = hasLive;
+  if (releasedLast && snapshot.waiting) {
+    // Notify update-guard subscribers when the last live claim releases;
+    // never auto-reload (still requires an explicit owner click).
+    emit();
+  }
+});
 
 export function setPwaAuthResolved(resolved: boolean): void {
   authResolvedState = resolved;
@@ -60,7 +76,7 @@ export function applyPwaUpdate(
 ): boolean {
   const resolved = options?.authResolved ?? authResolvedState;
   if (!resolved) return false;
-  if (hasAnyHeldWrite()) return false;
+  if (hasAnyHeldWrite() || hasLiveHeldWriteClaims()) return false;
   if (reloadDeferred) {
     reloadDeferred = false;
     reloadRequested = false;
@@ -100,7 +116,7 @@ export function initPwa(
   const container = navigator.serviceWorker;
   container.addEventListener('controllerchange', () => {
     if (!reloadRequested) return;
-    if (hasAnyHeldWrite()) {
+    if (hasAnyHeldWrite() || hasLiveHeldWriteClaims()) {
       // Worker already activated after explicit approval, but a pin appeared
       // in the race window: keep the banner visible and defer reload until
       // the next explicit click after pins clear.
@@ -150,6 +166,7 @@ export function resetPwaState(): void {
   reloadRequested = false;
   reloadDeferred = false;
   authResolvedState = false;
+  lastHadLiveClaims = false;
   snapshot = { waiting: false };
   listeners.clear();
 }

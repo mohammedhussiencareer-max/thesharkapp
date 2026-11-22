@@ -1,7 +1,10 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { formatCairo } from '@/lib/cairo';
-import { DecisionForm } from '@/order-decisions/DecisionForm';
+import {
+  DecisionForm,
+  type OrderDecisionDraft,
+} from '@/order-decisions/DecisionForm';
 import { DifferencesList } from '@/order-decisions/DifferencesList';
 import {
   basisStatusLabels,
@@ -91,11 +94,15 @@ export function DecisionCard({
   row,
   closed,
   hideMoney = false,
+  savedDraft,
+  onDraftChange,
   onChanged,
 }: {
   row: QueueRow;
   closed: boolean;
   hideMoney?: boolean;
+  savedDraft?: OrderDecisionDraft;
+  onDraftChange?: (orderId: string, next: OrderDecisionDraft | null) => void;
   onChanged: (orderId: string) => Promise<void>;
 }) {
   const [notice, setNotice] = useState<DecisionNotice | null>(null);
@@ -186,6 +193,8 @@ export function DecisionCard({
         <DecisionForm
           key={`${row.token}:${row.eventId}`}
           row={row}
+          savedDraft={savedDraft}
+          onDraftChange={onDraftChange}
           onNotice={setNotice}
           onChanged={onChanged}
         />

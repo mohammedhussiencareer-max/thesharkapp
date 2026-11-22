@@ -51,23 +51,52 @@ export const returnedReviewMessage = 'راجع الكميات المرتجعة';
 
 const field = 'rounded border border-neutral-300 px-3 py-2';
 
+export type OrderDecisionDraft = {
+  choice: Decision;
+  reason: string;
+  draft: Record<string, string>;
+  clearReturned: boolean;
+  rowVersion: string;
+};
+
+function draftsEqual(
+  left: Readonly<Record<string, string>>,
+  right: Readonly<Record<string, string>>,
+): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every((key) => left[key] === right[key]);
+}
+
 export function DecisionForm({
   row,
+  savedDraft,
+  onDraftChange,
   onNotice,
   onChanged,
 }: {
   row: QueueRow;
+  savedDraft?: OrderDecisionDraft;
+  onDraftChange?: (orderId: string, next: OrderDecisionDraft | null) => void;
   onNotice: (notice: DecisionNotice | null) => void;
   onChanged: (orderId: string) => Promise<void>;
 }) {
   const online = useOnline();
   const subject = decisionSubject(row.orderId);
-  const [choice, setChoice] = useState<Decision>(row.decision);
-  const [reason, setReason] = useState('');
-  const [draft, setDraft] = useState<Record<string, string>>(() =>
-    draftFromReturned(row.returned),
+  const rowVersion = `${row.token}:${row.eventId}`;
+  const restored =
+    savedDraft && savedDraft.rowVersion === rowVersion ? savedDraft : null;
+  const [choice, setChoice] = useState<Decision>(
+    () => restored?.choice ?? row.decision,
   );
-  const [clearReturned, setClearReturned] = useState(false);
+  const [reason, setReason] = useState(() => restored?.reason ?? '');
+  const [draft, setDraft] = useState<Record<string, string>>(() =>
+    restored ? { ...restored.draft } : draftFromReturned(row.returned),
+  );
+  const [clearReturned, setClearReturned] = useState(
+    () => restored?.clearReturned ?? false,
+  );
   const [saving, setSaving] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [heldEpoch, setHeldEpoch] = useState(0);
@@ -78,6 +107,38 @@ export function DecisionForm({
     () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
     [],
   );
+
+  useEffect(() => {
+    if (!onDraftChange) return;
+    const baseDraft = draftFromReturned(row.returned);
+    const dirty =
+      choice !== row.decision ||
+      reason !== '' ||
+      clearReturned ||
+      !draftsEqual(draft, baseDraft);
+    onDraftChange(
+      row.orderId,
+      dirty
+        ? {
+            choice,
+            reason,
+            draft: { ...draft },
+            clearReturned,
+            rowVersion,
+          }
+        : null,
+    );
+  }, [
+    choice,
+    clearReturned,
+    draft,
+    onDraftChange,
+    reason,
+    row.decision,
+    row.orderId,
+    row.returned,
+    rowVersion,
+  ]);
 
   const unresolved = row.currentClass === 'unresolved_refund';
   const onlyMade = row.currentClass === null;
@@ -139,6 +200,7 @@ export function DecisionForm({
         saved = await setOrderDisposition(action);
         persisted = true;
         if (saved.status === 'ok') {
+          onDraftChange?.(row.orderId, null);
           markActionPostedReload(subject, action.requestId, subject);
         } else {
           settleAction(subject, action.requestId);

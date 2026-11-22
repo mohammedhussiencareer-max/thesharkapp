@@ -14,7 +14,10 @@ import {
   loadUnlinkedRefunds,
 } from '@/order-decisions/api';
 import { DecisionCard, NoticeView } from '@/order-decisions/DecisionCard';
-import { reloadFailedMessage } from '@/order-decisions/DecisionForm';
+import {
+  reloadFailedMessage,
+  type OrderDecisionDraft,
+} from '@/order-decisions/DecisionForm';
 import { decisionSubject, moneyText } from '@/order-decisions/format';
 import { orderIdFromDecisionSubject } from '@/order-decisions/held-decisions';
 import { PendingSaves } from '@/order-decisions/PendingSaves';
@@ -50,6 +53,36 @@ export function OrderDecisionsPage() {
   const seqRef = useRef(0);
   const loadedPagesRef = useRef(1);
   const preservePagesRef = useRef(false);
+  // In-memory unsent drafts keyed by orderId (never written to localStorage).
+  const [drafts, setDrafts] = useState<ReadonlyMap<string, OrderDecisionDraft>>(
+    () => new Map(),
+  );
+  const draftsRef = useRef<Map<string, OrderDecisionDraft>>(new Map());
+  const entriesRef = useRef<Entry[] | null>(null);
+
+  const handleDraftChange = useCallback(
+    (orderId: string, nextDraft: OrderDecisionDraft | null) => {
+      const prev = draftsRef.current.get(orderId) ?? null;
+      if (nextDraft === null) {
+        if (prev === null) return;
+        draftsRef.current.delete(orderId);
+        setDrafts((current) => {
+          if (!current.has(orderId)) return current;
+          const next = new Map(current);
+          next.delete(orderId);
+          return next;
+        });
+        return;
+      }
+      draftsRef.current.set(orderId, nextDraft);
+      setDrafts((current) => {
+        const next = new Map(current);
+        next.set(orderId, nextDraft);
+        return next;
+      });
+    },
+    [],
+  );
 
   const online = useReconnectReload(() => {
     preservePagesRef.current = true;
@@ -61,9 +94,8 @@ export function OrderDecisionsPage() {
   useEffect(() => {
     const seq = ++seqRef.current;
     let cancelled = false;
-    const pagesToLoad = preservePagesRef.current
-      ? Math.max(1, loadedPagesRef.current)
-      : 1;
+    const isReconnect = preservePagesRef.current;
+    const pagesToLoad = isReconnect ? Math.max(1, loadedPagesRef.current) : 1;
     preservePagesRef.current = false;
     const pendingReloads = snapshotActionPostedReloads({
       prefix: 'order-decision:',
@@ -90,7 +122,26 @@ export function OrderDecisionsPage() {
           cursor = nextCursor;
         }
         loadedPagesRef.current = Math.max(1, loadedCount);
-        setEntries(merged.map((row) => ({ row, closed: false })));
+        const nextEntries: Entry[] = merged.map((row) => ({
+          row,
+          closed: false,
+        }));
+        // If earlier orders entered the queue while offline and pushed a
+        // drafted card past the loaded pages, keep the drafted card rendered
+        // (and draftsRef also restores it by orderId if it later remounts).
+        if (isReconnect && entriesRef.current) {
+          for (const previous of entriesRef.current) {
+            if (
+              !seen.has(previous.row.orderId) &&
+              draftsRef.current.has(previous.row.orderId)
+            ) {
+              seen.add(previous.row.orderId);
+              nextEntries.push(previous);
+            }
+          }
+        }
+        entriesRef.current = nextEntries;
+        setEntries(nextEntries);
         setNext(nextCursor);
         setLoadError(null);
         setMoreError(null);
@@ -213,15 +264,20 @@ export function OrderDecisionsPage() {
       if (seq !== seqRef.current) return;
       loadedPagesRef.current += 1;
       setEntries((current) => {
-        const known = new Set(
-          (current ?? []).map((entry) => entry.row.orderId),
-        );
-        return [
-          ...(current ?? []),
+        const byId = new Map(page.rows.map((row) => [row.orderId, row]));
+        const updated = (current ?? []).map((entry) => {
+          const refreshed = byId.get(entry.row.orderId);
+          return refreshed ? { row: refreshed, closed: false } : entry;
+        });
+        const known = new Set(updated.map((entry) => entry.row.orderId));
+        const combined = [
+          ...updated,
           ...page.rows
             .filter((row) => !known.has(row.orderId))
             .map((row) => ({ row, closed: false })),
         ];
+        entriesRef.current = combined;
+        return combined;
       });
       setNext(page.next);
       const loadedSubjects = new Set(
@@ -246,17 +302,20 @@ export function OrderDecisionsPage() {
     const pendingReloads = snapshotActionPostedReloads({ subject: subj });
     const row = await loadQueueRow(orderId);
     clearActionPostedReloadSnapshot(pendingReloads, subj);
-    setEntries((current) =>
-      current === null
-        ? current
-        : current.map((entry) =>
-            entry.row.orderId !== orderId
-              ? entry
-              : row === null
-                ? { row: entry.row, closed: true }
-                : { row, closed: false },
-          ),
-    );
+    setEntries((current) => {
+      const updated =
+        current === null
+          ? current
+          : current.map((entry) =>
+              entry.row.orderId !== orderId
+                ? entry
+                : row === null
+                  ? { row: entry.row, closed: true }
+                  : { row, closed: false },
+            );
+      entriesRef.current = updated;
+      return updated;
+    });
   }, []);
 
   return (
@@ -322,6 +381,8 @@ export function OrderDecisionsPage() {
               row={entry.row}
               closed={entry.closed}
               hideMoney={!online}
+              savedDraft={drafts.get(entry.row.orderId)}
+              onDraftChange={handleDraftChange}
               onChanged={reloadRow}
             />
           ))}

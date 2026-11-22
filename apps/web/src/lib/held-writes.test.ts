@@ -905,4 +905,93 @@ describe('held-writes store', () => {
       store.dispose();
     }
   });
+
+  it('R6-1a: reload marker ids never restart after deletion, so a slow read cannot clear a later marker', () => {
+    const tab1 = createHeldWriteStore();
+    const tab2 = createHeldWriteStore();
+    try {
+      tab1.setHeldWriteUser('user-1');
+      tab2.setHeldWriteUser('user-1');
+
+      // Marker #1 is written and snapshotted by a slow read in Tab 1.
+      tab1.setReloadMarker('expense:reload', '2026-01-01');
+      const slowSnap = tab1.snapshotPostedReloads({
+        subject: 'expense:reload',
+      });
+
+      // Another fast read clears marker #1 completely (deleting it from storage).
+      tab2.clearPostedReloadSnapshot(slowSnap, '2026-01-01');
+      expect(tab2.hasReloadMarker('expense:reload', '2026-01-01')).toBe(false);
+
+      // A later write creates marker #2 for the same subject + target.
+      tab2.setReloadMarker('expense:reload', '2026-01-01');
+
+      // Tab 1's slow read finally completes and attempts to clear its old snapshot.
+      tab1.clearPostedReloadSnapshot(slowSnap, '2026-01-01');
+
+      // Marker #2 MUST NOT have been cleared by slowSnap!
+      tab2.rehydrateHeldWrites();
+      expect(tab2.hasReloadMarker('expense:reload', '2026-01-01')).toBe(true);
+    } finally {
+      tab1.dispose();
+      tab2.dispose();
+    }
+  });
+
+  it('R6-3a: live claim locks keep hasAnyHeldWrite true after sign-out and notify subscribers when the last claim releases', async () => {
+    const heldLocks = new Set<string>();
+    const locks = {
+      async request<T>(
+        name: string,
+        options: { mode?: 'exclusive' | 'shared'; ifAvailable?: boolean },
+        callback: (
+          lock: { name: string; mode: string } | null,
+        ) => Promise<T> | T,
+      ): Promise<T> {
+        if (options.ifAvailable && heldLocks.has(name)) {
+          return await callback(null);
+        }
+        heldLocks.add(name);
+        try {
+          return await callback({ name, mode: options.mode ?? 'exclusive' });
+        } finally {
+          heldLocks.delete(name);
+        }
+      },
+    };
+
+    const store = createHeldWriteStore({ getLocks: () => locks });
+    try {
+      store.setHeldWriteUser('user-1');
+      const claim = await store.claimFreshHeldWrite(
+        'purchase:new',
+        (requestId) => ({ requestId }),
+      );
+      expect(claim.ok).toBe(true);
+      if (!claim.ok) return;
+
+      // Sign-out clears user storage and memory pins while the RPC lock is still held.
+      store.setWritesLocked(true);
+      store.clearHeldWritesForUser('user-1');
+      store.setHeldWriteUser(null);
+
+      // Live claim MUST still block shell updates!
+      expect(store.hasAnyHeldWrite()).toBe(true);
+
+      let notifications = 0;
+      const unsub = store.subscribeHeldWritesStore(() => {
+        notifications += 1;
+      });
+      try {
+        claim.release();
+        await Promise.resolve();
+        expect(store.hasAnyHeldWrite()).toBe(false);
+        expect(notifications).toBeGreaterThan(0);
+      } finally {
+        unsub();
+      }
+    } finally {
+      store.dispose();
+    }
+  });
 });
