@@ -2472,6 +2472,8 @@ isOneToOne: true
                            },
 "cover_profit_bucket":
 { Args: { "p_movement_id": number }; Returns: string
+                           } |
+{ Args: { "p_as_of": string,"p_movement_id": number }; Returns: string
                            },
 "coverage_dependency_items":
 { Args: { "p_provenance": Json }; Returns: string[]

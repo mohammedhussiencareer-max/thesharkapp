@@ -1189,6 +1189,9 @@ begin
 
   v_members := array[p_item_id];
 
+  -- Pending edges and posted edges must close together. Exhausting one
+  -- kind first drops pending edges that are only reachable through a
+  -- posted sibling.
   loop
     select
       pg_catalog.array_agg(distinct (other.value ->> 'item_id')::uuid)
@@ -1204,16 +1207,12 @@ begin
       and (edge.value ->> 'item_id')::uuid = any (v_members)
       and (other.value ->> 'item_id')::uuid <> all (v_members);
 
-    exit when v_add is null;
+    v_add := coalesce(v_add, '{}'::uuid[]) || coalesce(
+      app.replay_posted_sort_siblings (v_members, v_pending_ids),
+      '{}'::uuid[]
+    );
 
-    v_members := v_members || v_add;
-  end loop;
-
-  loop
-    v_add := app.replay_posted_sort_siblings (v_members, v_pending_ids);
-
-    exit when v_add is null
-    or pg_catalog.cardinality(v_add) = 0;
+    exit when pg_catalog.cardinality(v_add) = 0;
 
     v_members := v_members || v_add;
   end loop;
@@ -1249,7 +1248,6 @@ declare
   v_members uuid[];
   v_pending_ids uuid[];
   v_component_plan text := '';
-  v_seqscan text;
 begin
   v_frozen := coalesce(pg_catalog.current_setting('app.replay_frozen', true), '') = '1';
 
@@ -1274,16 +1272,30 @@ begin
     where
       (elem.value ->> 'item_id')::uuid is not null;
 
-    -- SECURITY DEFINER SQL is not inlined, so the probe explains the
-    -- indexed join the helper runs, not the function call.
-    v_seqscan := pg_catalog.current_setting('enable_seqscan');
-    perform pg_catalog.set_config('enable_seqscan', 'off', true);
+    -- SECURITY DEFINER SQL is not inlined. Explain the helper body with
+    -- the same members the first traversal call uses, default planner.
+    select
+      t.item_id
+    into v_item
+    from
+      pg_catalog.unnest(p_item_ids) as t (item_id)
+    where
+      t.item_id is not null
+    order by
+      t.item_id
+    limit
+      1;
+
+    v_members := array[v_item];
 
     for v_line in execute pg_catalog.format(
       $explain$
-      explain (format text)
+      explain (analyze, buffers)
       select
-        sibling.item_id
+        coalesce(
+          pg_catalog.array_agg(distinct sibling.item_id),
+          '{}'::uuid[]
+        )
       from
         app.stock_movements edge
         join app.stock_movements sibling on sibling.batch_id = edge.batch_id
@@ -1304,15 +1316,13 @@ begin
         and sibling.item_id = any (%L::uuid[])
         and sibling.item_id <> all (%L::uuid[])
       $explain$,
-      p_item_ids,
+      v_members,
       v_pending_ids,
-      p_item_ids
+      v_members
     )
     loop
       v_component_plan := v_component_plan || v_line || e'\n';
     end loop;
-
-    perform pg_catalog.set_config('enable_seqscan', v_seqscan, true);
   end if;
 
   if coalesce(pg_catalog.current_setting('app.replay_probe', true), '') = '1' then
@@ -1550,6 +1560,8 @@ begin
   -- only the input reprices the sort and leaves the output at the old value.
   -- Demote that sort component, both directions, and only that component.
   -- An item with no sort tie to the walking item keeps its checkpoint.
+  -- Start from a missing cut or from a cut that already sits before a
+  -- posted sort, so a later valid cut on the other leg is pulled in too.
   with recursive
     component as (
       select
@@ -1558,6 +1570,21 @@ begin
         ledger_scratch.replay_resume resume
       where
         resume.checkpoint_id is null
+        or exists (
+          select
+            1
+          from
+            app.stock_movements edge
+          where
+            edge.item_id = resume.item_id
+            and edge.batch_id is not null
+            and edge.movement_type in (
+              'sort_out'::app.movement_type,
+              'sort_in'::app.movement_type,
+              'sort_loss'::app.movement_type
+            )
+            and edge.occurred_at > resume.cut_occurred_at
+        )
       union
       select
         other.item_id
@@ -1889,7 +1916,7 @@ from
   authenticated,
   service_role;
 
-create function app.cover_profit_bucket (p_movement_id bigint) returns text language plpgsql stable security definer
+create function app.cover_profit_bucket (p_movement_id bigint, p_as_of timestamptz) returns text language plpgsql stable security definer
 set
   search_path = '' as $$
 declare
@@ -1903,7 +1930,7 @@ begin
       when 'waste'::app.movement_type then 'waste'
       when 'sort_loss'::app.movement_type then 'waste'
       when 'closed_period'::app.movement_type then case
-        when sm.closed_bucket in ('cogs', 'waste') then sm.closed_bucket
+        when sm.closed_bucket in ('cogs', 'waste', 'count') then sm.closed_bucket
         else 'cogs'
       end
       else 'cogs'
@@ -1917,7 +1944,9 @@ begin
     sm.id = p_movement_id;
 
   -- A reclassification keeps the original deficit and moves its recognized
-  -- quantity onto the new bucket. A later cover follows that bucket.
+  -- quantity onto the new bucket. A later cover follows that bucket at
+  -- today's key. An earlier inflow keeps the bucket that was in force
+  -- then: a zero-qty reclass after p_as_of is ignored here.
   select
     contribution.bucket
   into v_live
@@ -1975,6 +2004,38 @@ begin
           )
         )
       )
+      or (
+        contribution.source_kind = 'count'
+        and exists (
+          select
+            1
+          from
+            app.closed_period_sources src
+          where
+            src.movement_id = p_movement_id
+            and src.source_kind = 'count'
+            and src.source_id = contribution.source_id
+        )
+      )
+    )
+    and (
+      p_as_of is null
+      or not exists (
+        select
+          1
+        from
+          app.stock_movements later
+          join app.closed_period_sources later_src on later_src.movement_id = later.id
+        where
+          later.item_id = v_item
+          and later.movement_type = 'closed_period'::app.movement_type
+          and later.quantity = 0
+          and later.occurred_at > p_as_of
+          and later.closed_bucket = contribution.bucket
+          and later.cover_inflow_movement_id is null
+          and later_src.source_kind = contribution.source_kind
+          and later_src.source_id = contribution.source_id
+      )
     )
   order by
     case
@@ -1989,7 +2050,23 @@ begin
 end;
 $$;
 
-comment on function app.cover_profit_bucket (bigint) is 'Profit bucket of a cover. A closed waste or sort loss stays waste. A piece whose recognized quantity now lives on another bucket follows that bucket, so a reclassification is not covered back into the old one.';
+comment on function app.cover_profit_bucket (bigint, timestamptz) is 'Profit bucket of a cover at p_as_of. Null as-of is today''s live bucket. A closed waste, sort loss, or count stays that bucket. A later zero-qty reclass after p_as_of is left for its own day.';
+
+revoke all on function app.cover_profit_bucket (bigint, timestamptz)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.cover_profit_bucket (p_movement_id bigint) returns text language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    app.cover_profit_bucket (p_movement_id, null::timestamptz);
+$$;
+
+comment on function app.cover_profit_bucket (bigint) is 'Profit bucket of a cover. A closed waste or sort loss stays waste. A closed count stays count. A piece whose recognized quantity now lives on another bucket follows that bucket, so a reclassification is not covered back into the old one.';
 
 revoke all on function app.cover_profit_bucket (bigint)
 from
@@ -2254,7 +2331,7 @@ begin
     where
       sm.id = v_pair.inflow_movement_id;
 
-    v_bucket := app.cover_profit_bucket (v_pair.deficit_movement_id);
+    v_bucket := app.cover_profit_bucket (v_pair.deficit_movement_id, v_inflow.occurred_at);
 
     v_shift := app.closed_containing_shift (v_inflow.occurred_at);
 
@@ -5259,21 +5336,32 @@ set
       where
         resume.checkpoint_id is not null
         and resume.item_id = any (p_item_ids)
-        and (
-          sm.reverses_movement_id is not null
-          or sm.movement_type in (
-            'sale_reversal'::app.movement_type,
-            'waste_reversal'::app.movement_type
-          )
-          or exists (
-            select
-              1
-            from
-              app.stock_movements rev
-            where
-              rev.reverses_movement_id = sm.id
-          )
+        and sm.reverses_movement_id is not null
+      union
+      select
+        sm.id
+      from
+        ledger_scratch.replay_resume resume
+        join app.stock_movements sm on sm.item_id = resume.item_id
+        and sm.occurred_at > resume.cut_occurred_at
+      where
+        resume.checkpoint_id is not null
+        and resume.item_id = any (p_item_ids)
+        and sm.movement_type in (
+          'sale_reversal'::app.movement_type,
+          'waste_reversal'::app.movement_type
         )
+      union
+      select
+        sm.id
+      from
+        ledger_scratch.replay_resume resume
+        join app.stock_movements sm on sm.item_id = resume.item_id
+        and sm.occurred_at > resume.cut_occurred_at
+        join app.stock_movements rev on rev.reverses_movement_id = sm.id
+      where
+        resume.checkpoint_id is not null
+        and resume.item_id = any (p_item_ids)
       union
       select
         sm.id
@@ -5284,21 +5372,32 @@ set
       where
         resume.checkpoint_id is not null
         and resume.item_id = any (p_item_ids)
-        and (
-          sm.reverses_movement_id is not null
-          or sm.movement_type in (
-            'sale_reversal'::app.movement_type,
-            'waste_reversal'::app.movement_type
-          )
-          or exists (
-            select
-              1
-            from
-              app.stock_movements rev
-            where
-              rev.reverses_movement_id = sm.id
-          )
+        and sm.reverses_movement_id is not null
+      union
+      select
+        sm.id
+      from
+        ledger_scratch.replay_resume resume
+        join app.stock_movements sm on sm.item_id = resume.item_id
+        and sm.id > resume.max_movement_id
+      where
+        resume.checkpoint_id is not null
+        and resume.item_id = any (p_item_ids)
+        and sm.movement_type in (
+          'sale_reversal'::app.movement_type,
+          'waste_reversal'::app.movement_type
         )
+      union
+      select
+        sm.id
+      from
+        ledger_scratch.replay_resume resume
+        join app.stock_movements sm on sm.item_id = resume.item_id
+        and sm.id > resume.max_movement_id
+        join app.stock_movements rev on rev.reverses_movement_id = sm.id
+      where
+        resume.checkpoint_id is not null
+        and resume.item_id = any (p_item_ids)
       union
       select
         sm.id
@@ -5308,21 +5407,30 @@ set
       where
         resume.checkpoint_id is null
         and resume.item_id = any (p_item_ids)
-        and (
-          sm.reverses_movement_id is not null
-          or sm.movement_type in (
-            'sale_reversal'::app.movement_type,
-            'waste_reversal'::app.movement_type
-          )
-          or exists (
-            select
-              1
-            from
-              app.stock_movements rev
-            where
-              rev.reverses_movement_id = sm.id
-          )
+        and sm.reverses_movement_id is not null
+      union
+      select
+        sm.id
+      from
+        ledger_scratch.replay_resume resume
+        join app.stock_movements sm on sm.item_id = resume.item_id
+      where
+        resume.checkpoint_id is null
+        and resume.item_id = any (p_item_ids)
+        and sm.movement_type in (
+          'sale_reversal'::app.movement_type,
+          'waste_reversal'::app.movement_type
         )
+      union
+      select
+        sm.id
+      from
+        ledger_scratch.replay_resume resume
+        join app.stock_movements sm on sm.item_id = resume.item_id
+        join app.stock_movements rev on rev.reverses_movement_id = sm.id
+      where
+        resume.checkpoint_id is null
+        and resume.item_id = any (p_item_ids)
     ) touched;
 $$;
 
@@ -6223,80 +6331,148 @@ begin
 
   if coalesce(pg_catalog.current_setting('app.replay_probe', true), '') = '1' then
     v_replace_plan := '';
-    v_seqscan := pg_catalog.current_setting('enable_seqscan');
-    perform pg_catalog.set_config('enable_seqscan', 'off', true);
 
-    -- SECURITY DEFINER SQL is not inlined. Explain the two suffix
-    -- ranges the helper uses on a resume, then the delete.
+    -- SECURITY DEFINER SQL is not inlined. Explain the helper body under
+    -- the default planner, then the delete. Each reversal condition is its
+    -- own union arm so the suffix ranges drive index nested loops.
     for v_line in execute pg_catalog.format(
       $explain$
       explain (analyze, buffers)
       select
-        sm.id
-      from
-        ledger_scratch.replay_resume resume
-        join app.stock_movements sm on sm.item_id = resume.item_id
-        and sm.occurred_at > resume.cut_occurred_at
-      where
-        resume.checkpoint_id is not null
-        and resume.item_id = any (%L::uuid[])
-        and (
-          sm.reverses_movement_id is not null
-          or sm.movement_type in (
-            'sale_reversal'::app.movement_type,
-            'waste_reversal'::app.movement_type
-          )
-          or exists (
-            select
-              1
-            from
-              app.stock_movements rev
-            where
-              rev.reverses_movement_id = sm.id
-          )
+        coalesce(
+          pg_catalog.array_agg(distinct touched.movement_id),
+          '{}'::bigint[]
         )
+      from
+        (
+          select
+            walked.movement_id
+          from
+            ledger_scratch.recompute_row walked
+          where
+            walked.item_id = any (%1$L::uuid[])
+            and not walked.is_pending
+            and walked.movement_id is not null
+          union
+          select
+            rebuilt.movement_id
+          from
+            ledger_scratch.recompute_def rebuilt
+          where
+            rebuilt.item_id = any (%1$L::uuid[])
+            and rebuilt.movement_id is not null
+          union
+          select
+            sm.id
+          from
+            ledger_scratch.replay_resume resume
+            join app.stock_movements sm on sm.item_id = resume.item_id
+            and sm.occurred_at > resume.cut_occurred_at
+          where
+            resume.checkpoint_id is not null
+            and resume.item_id = any (%1$L::uuid[])
+            and sm.reverses_movement_id is not null
+          union
+          select
+            sm.id
+          from
+            ledger_scratch.replay_resume resume
+            join app.stock_movements sm on sm.item_id = resume.item_id
+            and sm.occurred_at > resume.cut_occurred_at
+          where
+            resume.checkpoint_id is not null
+            and resume.item_id = any (%1$L::uuid[])
+            and sm.movement_type in (
+              'sale_reversal'::app.movement_type,
+              'waste_reversal'::app.movement_type
+            )
+          union
+          select
+            sm.id
+          from
+            ledger_scratch.replay_resume resume
+            join app.stock_movements sm on sm.item_id = resume.item_id
+            and sm.occurred_at > resume.cut_occurred_at
+            join app.stock_movements rev on rev.reverses_movement_id = sm.id
+          where
+            resume.checkpoint_id is not null
+            and resume.item_id = any (%1$L::uuid[])
+          union
+          select
+            sm.id
+          from
+            ledger_scratch.replay_resume resume
+            join app.stock_movements sm on sm.item_id = resume.item_id
+            and sm.id > resume.max_movement_id
+          where
+            resume.checkpoint_id is not null
+            and resume.item_id = any (%1$L::uuid[])
+            and sm.reverses_movement_id is not null
+          union
+          select
+            sm.id
+          from
+            ledger_scratch.replay_resume resume
+            join app.stock_movements sm on sm.item_id = resume.item_id
+            and sm.id > resume.max_movement_id
+          where
+            resume.checkpoint_id is not null
+            and resume.item_id = any (%1$L::uuid[])
+            and sm.movement_type in (
+              'sale_reversal'::app.movement_type,
+              'waste_reversal'::app.movement_type
+            )
+          union
+          select
+            sm.id
+          from
+            ledger_scratch.replay_resume resume
+            join app.stock_movements sm on sm.item_id = resume.item_id
+            and sm.id > resume.max_movement_id
+            join app.stock_movements rev on rev.reverses_movement_id = sm.id
+          where
+            resume.checkpoint_id is not null
+            and resume.item_id = any (%1$L::uuid[])
+          union
+          select
+            sm.id
+          from
+            ledger_scratch.replay_resume resume
+            join app.stock_movements sm on sm.item_id = resume.item_id
+          where
+            resume.checkpoint_id is null
+            and resume.item_id = any (%1$L::uuid[])
+            and sm.reverses_movement_id is not null
+          union
+          select
+            sm.id
+          from
+            ledger_scratch.replay_resume resume
+            join app.stock_movements sm on sm.item_id = resume.item_id
+          where
+            resume.checkpoint_id is null
+            and resume.item_id = any (%1$L::uuid[])
+            and sm.movement_type in (
+              'sale_reversal'::app.movement_type,
+              'waste_reversal'::app.movement_type
+            )
+          union
+          select
+            sm.id
+          from
+            ledger_scratch.replay_resume resume
+            join app.stock_movements sm on sm.item_id = resume.item_id
+            join app.stock_movements rev on rev.reverses_movement_id = sm.id
+          where
+            resume.checkpoint_id is null
+            and resume.item_id = any (%1$L::uuid[])
+        ) touched
       $explain$,
       p_item_ids
     )
     loop
       v_replace_plan := v_replace_plan || v_line || e'\n';
     end loop;
-
-    for v_line in execute pg_catalog.format(
-      $explain$
-      explain (analyze, buffers)
-      select
-        sm.id
-      from
-        ledger_scratch.replay_resume resume
-        join app.stock_movements sm on sm.item_id = resume.item_id
-        and sm.id > resume.max_movement_id
-      where
-        resume.checkpoint_id is not null
-        and resume.item_id = any (%L::uuid[])
-        and (
-          sm.reverses_movement_id is not null
-          or sm.movement_type in (
-            'sale_reversal'::app.movement_type,
-            'waste_reversal'::app.movement_type
-          )
-          or exists (
-            select
-              1
-            from
-              app.stock_movements rev
-            where
-              rev.reverses_movement_id = sm.id
-          )
-        )
-      $explain$,
-      p_item_ids
-    )
-    loop
-      v_replace_plan := v_replace_plan || v_line || e'\n';
-    end loop;
-
-    perform pg_catalog.set_config('enable_seqscan', v_seqscan, true);
 
     for v_line in execute pg_catalog.format(
       $explain$
@@ -6645,7 +6821,12 @@ begin
       v_kind app.movement_type;
     begin
       select
-        coalesce(sm.closed_economic_kind, 'purchase')::app.movement_type
+        (
+          case coalesce(sm.closed_economic_kind, 'purchase')
+            when 'count' then 'count_adjustment'
+            else coalesce(sm.closed_economic_kind, 'purchase')
+          end
+        )::app.movement_type
       into v_kind
       from
         app.stock_movements sm
@@ -7484,6 +7665,19 @@ begin
               line.movement_id = sm.id
               and app.waste_document_root (line.document_id)::text = contribution.source_id
           )
+        )
+      )
+      or (
+        contribution.source_kind = 'count'
+        and exists (
+          select
+            1
+          from
+            app.closed_period_sources src
+          where
+            src.movement_id = sm.id
+            and src.source_kind = 'count'
+            and src.source_id = contribution.source_id
         )
       )
     );
@@ -13826,6 +14020,29 @@ begin
       );
     end loop;
   else
+    -- Closed legs post at t_change against the live mixed balance.
+    -- An in-window backdated sort still walks history at occurred_at.
+    if p_occurred_at < app.restatement_window_start (app.note_change_instant ()) then
+      perform app.prepare_balance_locks (array[p_mixed_item]);
+
+      select
+        ib.*
+      into v_mixed_bal
+      from
+        app.item_balances ib
+      where
+        ib.item_id = p_mixed_item;
+
+      if v_mixed_bal.has_uncovered_deficit
+      or v_mixed_bal.on_hand_qty <= 0
+      or v_qty_taken > v_mixed_bal.on_hand_qty then
+        raise exception 'not enough stock to sort: on_hand_qty %, requested %',
+          v_mixed_bal.on_hand_qty,
+          v_qty_taken
+          using errcode = '22023';
+      end if;
+    end if;
+
     v_key := v_key + 1;
     v_pending := v_pending || pg_catalog.jsonb_build_array(
       pg_catalog.jsonb_build_object(
@@ -14992,6 +15209,12 @@ begin
         using errcode = '22023';
     end if;
   end loop;
+
+  perform app.assert_not_before_opening (
+    v_item_ids,
+    pg_catalog.array_fill(v_counted_at, array[v_n]),
+    pg_catalog.array_fill('count_adjustment'::text, array[v_n])
+  );
 
   v_closed := v_counted_at < app.restatement_window_start (app.note_change_instant ());
 

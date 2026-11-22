@@ -304,11 +304,11 @@ insert into app.pos_order_lines (
 select o.id, 'l1', '${pos}', 'x', 1, '[]'::jsonb, 0
 from app.pos_orders o
 where o.id like '${history.prefix}-%'
-  and o.id <> '${late}';
+  and o.id not like '${late}%';
 select count(app.append_pos_cost_input(o.id, null, 'sync'))
 from app.pos_orders o
 where o.id like '${history.prefix}-%'
-  and o.id <> '${late}';
+  and o.id not like '${late}%';
 insert into app.activation_history_input (
   order_id, bound_at, cost_input_id, ordered_at
 )
@@ -320,7 +320,7 @@ select distinct on (orders.id)
 from app.pos_orders orders
 join app.pos_cost_inputs input on input.order_id = orders.id
 where orders.id like '${history.prefix}-%'
-  and orders.id <> '${late}'
+  and orders.id not like '${late}%'
 order by orders.id, input.input_revision desc
 on conflict (order_id) do nothing;
 insert into app.stock_items (id, name, kind, base_unit, count_frequency)
@@ -489,7 +489,7 @@ begin
     raise exception 'history gate failed: queue empty before the history was posted';
   end if;
   if (h ->> 'order_id') not like p_prefix || '-%'
-    or (h ->> 'order_id') = p_prefix || '-late' then
+    or (h ->> 'order_id') like p_prefix || '-late%' then
     raise exception 'history gate failed: unexpected queue head %', h;
   end if;
   v := app.run_accounting_work(
@@ -531,7 +531,7 @@ begin
     select 1
     from app.pos_orders o
     where o.id like '${history.prefix}-%'
-      and o.id <> '${history.prefix}-late'
+      and o.id not like '${history.prefix}-late%'
       and not exists (
         select 1
         from app.order_cost_state s
@@ -564,26 +564,67 @@ begin;
 set statement_timeout = 0;
 set lock_timeout = 0;
 ${claims()}
+create temp table late_pick (id text) on commit drop;
+insert into late_pick (id)
+select o.id
+from app.pos_orders o
+where (o.id = '${late}' or o.id like '${late}-%')
+  and exists (
+    select 1 from app.pos_cost_inputs input where input.order_id = o.id
+  )
+  and not exists (
+    select 1
+    from app.pos_cost_inputs input
+    join app.order_cost_applications application
+      on application.cost_input_id = input.id
+    where input.order_id = o.id
+      and application.receipt_kind = 'posting'
+  )
+order by o.id
+limit 1;
+insert into late_pick (id)
+select case
+  when exists (
+    select 1 from app.pos_orders o where o.id = '${late}'
+  ) then '${late}-' || (
+    select count(*) + 1
+    from app.pos_orders o
+    where o.id = '${late}' or o.id like '${late}-%'
+  )::text
+  else '${late}'
+end
+where not exists (select 1 from late_pick);
 insert into app.pos_orders (
   id, shift_id, status, order_type, ordered_at, subtotal, discount, tax,
   service_tax, delivery_fee, total, pos_update_time, content_hash, missing_from_pos
-) values (
-  '${late}',
+)
+select
+  pick.id,
   '${shift}',
   'complete',
   'hall-${history.prefix}',
   timestamptz '${anchor}' + interval '10 hours',
   0, 0, 0, 0, 0, 0,
   timestamptz '${anchor}' + interval '10 hours',
-  rpad(md5('${late}'), 64, 'a'),
+  rpad(md5(pick.id), 64, 'a'),
   false
+from late_pick pick
+where not exists (
+  select 1 from app.pos_orders o where o.id = pick.id
 );
 insert into app.pos_order_lines (
   order_id, line_id, item_id, item_name, quantity, options, line_total
-) values (
-  '${late}', 'l1', '${pos}', 'x', 2, '[]'::jsonb, 0
+)
+select pick.id, 'l1', '${pos}', 'x', 2, '[]'::jsonb, 0
+from late_pick pick
+where not exists (
+  select 1 from app.pos_order_lines line where line.order_id = pick.id
 );
-select app.append_pos_cost_input('${late}', null, 'sync');
+select app.append_pos_cost_input(pick.id, null, 'sync')
+from late_pick pick
+where not exists (
+  select 1 from app.pos_cost_inputs input where input.order_id = pick.id
+);
 commit;
 select '${history.name} late order queued';
 `;
@@ -603,7 +644,7 @@ select
   pg_catalog.gen_random_uuid() as attempt;
 do $$
 begin
-  if (select head ->> 'order_id' from bench_head) is distinct from '${late}' then
+  if (select head ->> 'order_id' from bench_head) not like '${late}%' then
     raise exception 'history gate failed: measured order is not the queue head (%)',
       (select head from bench_head);
   end if;
@@ -749,7 +790,7 @@ begin
   into v_posted
   from app.pos_orders o
   where o.id like '${history.prefix}-%'
-    and o.id <> '${late}'
+    and o.id not like '${late}%'
     and exists (
       select 1
       from app.order_cost_state s
@@ -1456,7 +1497,7 @@ async function postedReceipts(history) {
      from app.order_cost_state s
      join app.order_cost_applications a on a.id = s.owner_application_id
      where s.order_id like '${history.prefix}-%'
-       and s.order_id <> '${history.prefix}-late'
+       and s.order_id not like '${history.prefix}-late%'
        and a.receipt_kind = 'posting';`,
   );
   return firstInteger(result.out);
@@ -1584,4 +1625,4 @@ if (
   });
 }
 
-export { setupSql, histories };
+export { setupSql, histories, lateSql };
