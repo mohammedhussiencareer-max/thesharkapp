@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
 import {
-  canDispatchWriteFor,
+  abortClaimBeforeDispatch,
+  canDispatchHeldWrite,
   captureWriteSession,
   claimFreshHeldWrite,
   claimReplayHeldWrite,
@@ -10,6 +11,7 @@ import {
   clearPostedReload,
   clearPostedReloadSnapshot,
   getHeldWrite,
+  hasDurableHeldWrite,
   setHeldWritePhase,
   snapshotPostedReloads,
   storageWriteFailedMessage,
@@ -233,14 +235,16 @@ export function SortingPage() {
       }
       return;
     }
-    if (!canDispatchWriteFor(session)) {
-      if (wasPinned) {
-        setHeldWritePhase(SORT_SUBJECT, draft.requestId, 'unknown');
-      } else {
-        clearHeldWrite(SORT_SUBJECT, draft.requestId);
-      }
-      claim.release();
-      if (!isOnline()) setServerError(offlineWriteMessage);
+    if (!canDispatchHeldWrite(SORT_SUBJECT, draft.requestId, session)) {
+      const durable = hasDurableHeldWrite(SORT_SUBJECT, draft.requestId);
+      abortClaimBeforeDispatch(
+        SORT_SUBJECT,
+        draft.requestId,
+        wasPinned ? 'unknown' : null,
+        claim.release,
+      );
+      if (!durable) setServerError(storageWriteFailedMessage);
+      else if (!isOnline()) setServerError(offlineWriteMessage);
       return;
     }
     setSaving(true);

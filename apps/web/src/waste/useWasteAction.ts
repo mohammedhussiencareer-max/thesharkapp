@@ -1,19 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
 import { messageFrom } from '@/items/errors';
 import {
+  abortActionBeforeDispatch,
+  canDispatchAction,
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
   hasAction,
+  hasDurableAction,
   markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
 import {
-  canDispatchWriteFor,
   captureWriteSession,
-  setHeldWritePhase,
   storageWriteFailedMessage,
   type WriteSession,
 } from '@/lib/held-writes';
@@ -64,14 +65,20 @@ export function useWasteAction(
     isReplay: boolean,
     releaseLock: () => void,
   ): Promise<void> {
-    if (flight.current || !canDispatchWriteFor(session)) {
-      if (isReplay) {
-        setHeldWritePhase(subject, action.requestId, 'unknown');
-      } else {
-        settleAction(subject, action.requestId);
-      }
-      releaseLock();
-      if (!isOnline()) {
+    if (
+      flight.current ||
+      !canDispatchAction(subject, action.requestId, session)
+    ) {
+      const durable = hasDurableAction(subject, action.requestId);
+      abortActionBeforeDispatch(
+        subject,
+        action.requestId,
+        isReplay,
+        releaseLock,
+      );
+      if (!durable) {
+        setNotice({ kind: 'failed', message: storageWriteFailedMessage });
+      } else if (!isOnline()) {
         setNotice({ kind: 'failed', message: offlineWriteMessage });
       }
       return;

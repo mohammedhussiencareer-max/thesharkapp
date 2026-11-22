@@ -283,6 +283,21 @@ export async function loadExpenseMonth(
   };
 }
 
+export async function loadExpenseEntryMonth(
+  id: string,
+): Promise<string | null> {
+  const { data, error } = await appDb()
+    .from('expense_lines')
+    .select('period_month, expense_date')
+    .eq('id', id)
+    .maybeSingle();
+  if (error || !data) return null;
+  const periodMonth = optionalDate(data.period_month);
+  if (periodMonth) return periodMonth;
+  const expenseDate = optionalDate(data.expense_date);
+  return expenseDate ? `${expenseDate.slice(0, 7)}-01` : null;
+}
+
 export async function addExpenseEntry(draft: ExpenseDraft): Promise<void> {
   const args: EntryArgs = {
     p_category_id: draft.categoryId,

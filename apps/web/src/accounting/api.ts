@@ -835,6 +835,7 @@ export function webAccountingDb(): AccountingDb {
 export async function runDeductions(
   onBoundAttempt?: (report: AttemptReport) => void,
   onFailureClassified?: (report: AttemptReport) => void,
+  canContinue?: () => boolean,
 ): Promise<RunOutcome> {
   const initiatingUser = captureWriteSession();
   return runAccountingWork(webAccountingDb(), {
@@ -844,7 +845,9 @@ export async function runDeductions(
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     onBoundAttempt,
     onFailureClassified,
-    canContinue: () => canDispatchWriteFor(initiatingUser),
+    canContinue: () =>
+      canDispatchWriteFor(initiatingUser) &&
+      (canContinue ? canContinue() : true),
   });
 }
 

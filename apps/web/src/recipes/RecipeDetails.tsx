@@ -5,10 +5,13 @@ import {
   staleWriteMessage,
 } from '@/items/errors';
 import {
+  abortActionBeforeDispatch,
+  canDispatchAction,
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
   hasAction,
+  hasDurableAction,
   markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
@@ -16,7 +19,6 @@ import {
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import {
-  canDispatchWriteFor,
   captureWriteSession,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
@@ -108,8 +110,17 @@ export function RecipeDetails({
       releaseLock = claim.release;
       const action = claim.record.payload;
       requestId = claim.record.requestId;
-      if (!canDispatchWriteFor(session)) {
-        if (!isOnline()) setError(offlineWriteMessage);
+      if (!canDispatchAction(subject, requestId, session)) {
+        const durable = hasDurableAction(subject, requestId);
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        if (!durable) setError(storageWriteFailedMessage);
+        else if (!isOnline()) setError(offlineWriteMessage);
         return;
       }
       await updateRecipe(action.recipeId, action.update);

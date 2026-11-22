@@ -4,18 +4,17 @@ import {
   genericCatalogError,
 } from '@/items/errors';
 import {
+  abortActionBeforeDispatch,
+  canDispatchAction,
   claimFreshAction,
   claimReplayAction,
+  hasDurableAction,
   markActionPostedReload,
   settleAction,
   unknownAction,
 } from '@/items/request-id';
 import { isStockKind } from '@/items/types';
-import {
-  canDispatchWriteFor,
-  captureWriteSession,
-  HeldWriteStorageError,
-} from '@/lib/held-writes';
+import { captureWriteSession, HeldWriteStorageError } from '@/lib/held-writes';
 import { offlineWriteMessage } from '@/lib/online';
 import {
   keysAfterFilter,
@@ -221,10 +220,16 @@ export async function createRecipe(
     throw new Error(genericCatalogError);
   }
   const requestId = claim.record.requestId;
+  const isReplay = existing !== null;
+  let releaseLock = claim.release;
   let dispatched = false;
   let saved = false;
   try {
-    if (!canDispatchWriteFor(session)) {
+    if (!canDispatchAction(subject, requestId, session)) {
+      const durable = hasDurableAction(subject, requestId);
+      abortActionBeforeDispatch(subject, requestId, isReplay, releaseLock);
+      releaseLock = () => {};
+      if (!durable) throw new HeldWriteStorageError();
       throw new Error(offlineWriteMessage);
     }
     dispatched = true;
@@ -247,7 +252,7 @@ export async function createRecipe(
     }
     throw failure;
   } finally {
-    claim.release();
+    releaseLock();
   }
 }
 

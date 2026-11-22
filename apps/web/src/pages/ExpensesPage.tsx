@@ -4,6 +4,7 @@ import { AllocationTable } from '@/expenses/AllocationTable';
 import {
   addExpenseCategory,
   addExpenseEntry,
+  loadExpenseEntryMonth,
   loadExpenseMonth,
   renameExpenseCategory,
   setExpenseCategoryActive,
@@ -29,7 +30,8 @@ import { fieldClass } from '@/expenses/labels';
 import { messageFrom } from '@/items/errors';
 import { cairoMonthInput, formatCairo, formatMonth } from '@/lib/cairo';
 import {
-  canDispatchWriteFor,
+  abortClaimBeforeDispatch,
+  canDispatchHeldWrite,
   captureWriteSession,
   claimFreshHeldWrite,
   claimReplayHeldWrite,
@@ -37,6 +39,7 @@ import {
   clearPostedReloadSnapshot,
   getHeldWrite,
   getReloadMarker,
+  hasDurableHeldWrite,
   hasReloadMarker,
   listHeldWritesByPrefix,
   setHeldWritePhase,
@@ -44,6 +47,7 @@ import {
   snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
+  type HeldWriteKind,
   type PostedReloadSnapshot,
   type WriteSession,
 } from '@/lib/held-writes';
@@ -57,6 +61,8 @@ import { pageShell, secondaryButton } from '@/lib/page-style';
 
 const EXPENSE_NEW_SUBJECT = 'expense:new';
 const EXPENSE_VOID_PREFIX = 'expense:void:';
+const EXPENSE_COMPLETE_PREFIX = 'expense:complete:';
+const EXPENSE_CATEGORY_PREFIX = 'expense:category:';
 const EXPENSE_RELOAD_SUBJECT = 'expense:reload';
 
 /** Stored in localStorage for void retries: request id, reason, and target month (no cached money). */
@@ -90,15 +96,19 @@ function expenseTargetMonth(
   return `${fallbackMonth}-01`;
 }
 
-function voidTargetMonth(
-  entry: ExpenseLine | null,
-  fallbackMonth: string,
-): string {
+function voidTargetMonthFromEntry(entry: ExpenseLine | null): string | null {
   if (entry?.periodMonth) return entry.periodMonth;
   if (entry?.expenseDate && entry.expenseDate.length >= 7) {
     return `${entry.expenseDate.slice(0, 7)}-01`;
   }
-  return `${fallbackMonth}-01`;
+  return null;
+}
+
+function voidTargetMonth(
+  entry: ExpenseLine | null,
+  fallbackMonth: string,
+): string {
+  return voidTargetMonthFromEntry(entry) ?? `${fallbackMonth}-01`;
 }
 
 function snapshotExpensePostedReloads(): PostedReloadSnapshot {
@@ -106,6 +116,8 @@ function snapshotExpensePostedReloads(): PostedReloadSnapshot {
     ...snapshotPostedReloads({ subject: EXPENSE_NEW_SUBJECT }),
     ...snapshotPostedReloads({ subject: EXPENSE_RELOAD_SUBJECT }),
     ...snapshotPostedReloads({ prefix: EXPENSE_VOID_PREFIX }),
+    ...snapshotPostedReloads({ prefix: EXPENSE_COMPLETE_PREFIX }),
+    ...snapshotPostedReloads({ prefix: EXPENSE_CATEGORY_PREFIX }),
   ];
 }
 
@@ -126,6 +138,7 @@ function entriesWithPinnedVoids(
 }
 
 type WriteResult = {
+  dispatched: boolean;
   saved: boolean;
   /** Null when the write was stored or was not sent. */
   error: unknown;
@@ -226,16 +239,23 @@ export function ExpensesPage() {
       entry: voidSnapshots.get(id) ?? null,
     });
   }
-  const inflightVoid = storedVoids.some(
-    (record) => record.phase === 'inflight',
-  );
+  const storedCompletes =
+    heldEpoch < 0 ? [] : listHeldWritesByPrefix(EXPENSE_COMPLETE_PREFIX);
+  const storedCategories =
+    heldEpoch < 0 ? [] : listHeldWritesByPrefix(EXPENSE_CATEGORY_PREFIX);
+  const inflightVoid =
+    storedVoids.some((record) => record.phase === 'inflight') ||
+    storedCompletes.some((record) => record.phase === 'inflight') ||
+    storedCategories.some((record) => record.phase === 'inflight');
   const reloadMarker =
     heldEpoch < 0 ? null : getReloadMarker(EXPENSE_RELOAD_SUBJECT);
   const postedReload =
     heldEpoch >= 0 &&
     (storedExpense?.phase === 'posted_reload' ||
       hasReloadMarker(EXPENSE_RELOAD_SUBJECT) ||
-      storedVoids.some((record) => record.phase === 'posted_reload'));
+      storedVoids.some((record) => record.phase === 'posted_reload') ||
+      storedCompletes.some((record) => record.phase === 'posted_reload') ||
+      storedCategories.some((record) => record.phase === 'posted_reload'));
 
   const monthStart = `${month}-01`;
   const postedReloadForCurrentMonth =
@@ -254,7 +274,15 @@ export function ExpensesPage() {
           (!record.readTarget ||
             record.readTarget === '*' ||
             record.readTarget === monthStart),
-      ));
+      ) ||
+      storedCompletes.some(
+        (record) =>
+          record.phase === 'posted_reload' &&
+          (!record.readTarget ||
+            record.readTarget === '*' ||
+            record.readTarget === monthStart),
+      ) ||
+      storedCategories.some((record) => record.phase === 'posted_reload'));
 
   const needsReload = localNeedsReload || postedReload;
   const ready = data !== null && data.monthStart === monthStart;
@@ -337,8 +365,12 @@ export function ExpensesPage() {
   async function runWrite(
     action: () => Promise<void>,
     setError: (message: string | null) => void,
-    onSaved?: () => void,
-    session?: WriteSession | null,
+    onSaved: (() => void | Promise<void>) | undefined,
+    guard: {
+      subject: string;
+      requestId: string;
+      session: WriteSession | null;
+    },
   ): Promise<WriteResult> {
     if (
       savingRef.current ||
@@ -347,12 +379,14 @@ export function ExpensesPage() {
       readsRef.current > 0 ||
       !isOnline()
     ) {
-      return { saved: false, error: null };
+      return { dispatched: false, saved: false, error: null };
     }
-    const activeSession = session ?? captureWriteSession();
-    if (!canDispatchWriteFor(activeSession)) {
+    if (!canDispatchHeldWrite(guard.subject, guard.requestId, guard.session)) {
       if (!isOnline()) setError(offlineWriteMessage);
-      return { saved: false, error: null };
+      else if (!hasDurableHeldWrite(guard.subject, guard.requestId)) {
+        setError(storageWriteFailedMessage);
+      }
+      return { dispatched: false, saved: false, error: null };
     }
     savingRef.current = true;
     setSaving(true);
@@ -365,7 +399,7 @@ export function ExpensesPage() {
       needsReloadRef.current = true;
       setLocalNeedsReload(true);
       try {
-        onSaved?.();
+        await onSaved?.();
         const pendingReloads = snapshotExpensePostedReloads();
         const next = await readMonth(monthRef.current);
         if (next) {
@@ -390,7 +424,69 @@ export function ExpensesPage() {
       savingRef.current = false;
       setSaving(false);
     }
-    return { saved, error: failure };
+    return { dispatched: true, saved, error: failure };
+  }
+
+  async function runClaimedMutation(
+    subject: string,
+    kind: HeldWriteKind,
+    readTarget: string,
+    action: () => Promise<void>,
+    setError: (message: string | null) => void,
+  ): Promise<boolean> {
+    if (
+      savingRef.current ||
+      needsReloadRef.current ||
+      postedReload ||
+      readsRef.current > 0 ||
+      !isOnline()
+    ) {
+      return false;
+    }
+    const session = captureWriteSession();
+    const claim = await claimFreshHeldWrite<{ requestId: string }>(
+      subject,
+      (requestId) => ({ requestId }),
+      { kind, session },
+    );
+    if (!claim.ok) {
+      if (claim.reason === 'storage' || claim.reason === 'missing') {
+        setError(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setError(offlineWriteMessage);
+      }
+      return false;
+    }
+    const requestId = claim.record.requestId;
+    let released = false;
+    const releaseOnce = () => {
+      if (!released) {
+        released = true;
+        claim.release();
+      }
+    };
+    try {
+      const result = await runWrite(
+        action,
+        setError,
+        () => {
+          if (setReloadMarker(EXPENSE_RELOAD_SUBJECT, readTarget)) {
+            clearHeldWrite(subject, requestId);
+          }
+        },
+        { subject, requestId, session },
+      );
+      if (!result.dispatched) {
+        abortClaimBeforeDispatch(subject, requestId, null, releaseOnce);
+        return false;
+      }
+      if (!result.saved && result.error) {
+        clearHeldWrite(subject, requestId);
+      }
+      return result.saved;
+    } finally {
+      releaseOnce();
+    }
   }
 
   async function submitExpense(draft: ExpenseDraft) {
@@ -430,16 +526,13 @@ export function ExpensesPage() {
       }
       return;
     }
-    if (!canDispatchWriteFor(session)) {
-      if (wasPinned) {
-        setHeldWritePhase(EXPENSE_NEW_SUBJECT, draft.requestId, 'unknown');
-      } else {
-        clearHeldWrite(EXPENSE_NEW_SUBJECT, draft.requestId);
+    let released = false;
+    const releaseOnce = () => {
+      if (!released) {
+        released = true;
+        claim.release();
       }
-      claim.release();
-      if (!isOnline()) setFormError(offlineWriteMessage);
-      return;
-    }
+    };
     let result: WriteResult;
     try {
       result = await runWrite(
@@ -454,8 +547,17 @@ export function ExpensesPage() {
           );
           setFormEpoch((value) => value + 1);
         },
-        session,
+        { subject: EXPENSE_NEW_SUBJECT, requestId: draft.requestId, session },
       );
+      if (!result.dispatched) {
+        abortClaimBeforeDispatch(
+          EXPENSE_NEW_SUBJECT,
+          draft.requestId,
+          wasPinned ? 'unknown' : null,
+          releaseOnce,
+        );
+        return;
+      }
       if (!result.saved && result.error) {
         setFormError(reportedExpenseError(result.error));
         if (wasPinned) {
@@ -471,7 +573,7 @@ export function ExpensesPage() {
         }
       }
     } finally {
-      claim.release();
+      releaseOnce();
     }
   }
 
@@ -509,15 +611,14 @@ export function ExpensesPage() {
         return next;
       });
     };
-    const targetMonth =
-      pinned?.targetMonth ?? voidTargetMonth(visible, monthRef.current);
+    const freshTargetMonth = voidTargetMonth(visible, monthRef.current);
     const claim = wasPinned
       ? await claimReplayHeldWrite<StoredVoidPayload>(subject, requestId, {
           session,
         })
       : await claimFreshHeldWrite<StoredVoidPayload>(
           subject,
-          () => ({ id, requestId, reason, targetMonth }),
+          () => ({ id, requestId, reason, targetMonth: freshTargetMonth }),
           { requestId, kind: 'expense_void', session },
         );
     if (!claim.ok) {
@@ -528,33 +629,55 @@ export function ExpensesPage() {
       }
       return;
     }
-    const effectiveTargetMonth =
-      claim.record.payload.targetMonth ?? targetMonth;
-    if (!canDispatchWriteFor(session)) {
-      if (wasPinned) {
-        setHeldWritePhase(subject, requestId, 'unknown');
-      } else {
-        clearHeldWrite(subject, requestId);
+    let released = false;
+    const releaseOnce = () => {
+      if (!released) {
+        released = true;
+        claim.release();
       }
-      claim.release();
-      if (!isOnline()) setListError(offlineWriteMessage);
-      return;
-    }
+    };
     if (visible) setVoidSnapshot({ ...visible });
     let result: WriteResult;
     try {
       result = await runWrite(
         () => voidExpenseEntry(id, reason, requestId),
         setListError,
-        () => {
+        async () => {
           voidRequestIdsRef.current.delete(id);
           setVoidSnapshot(null);
-          setHeldWritePhase(subject, requestId, 'posted_reload', {
-            readTarget: effectiveTargetMonth,
-          });
+          let resolvedTarget: string | null =
+            claim.record.payload.targetMonth ??
+            voidTargetMonthFromEntry(visible);
+          if (resolvedTarget === null) {
+            if (typeof loadExpenseEntryMonth === 'function') {
+              try {
+                resolvedTarget = await loadExpenseEntryMonth(id);
+              } catch {
+                resolvedTarget = null;
+              }
+            }
+          }
+          if (resolvedTarget !== null) {
+            setHeldWritePhase(subject, requestId, 'posted_reload', {
+              readTarget: resolvedTarget,
+            });
+          } else {
+            // Legacy void pin whose month could not be resolved: do NOT fall
+            // back to the displayed month — keep the pin held until verified.
+            setHeldWritePhase(subject, requestId, 'unknown');
+          }
         },
-        session,
+        { subject, requestId, session },
       );
+      if (!result.dispatched) {
+        abortClaimBeforeDispatch(
+          subject,
+          requestId,
+          wasPinned ? 'unknown' : null,
+          releaseOnce,
+        );
+        return;
+      }
       if (!result.saved && result.error) {
         voidRequestIdsRef.current.set(id, requestId);
         setListError(reportedExpenseError(result.error));
@@ -573,7 +696,7 @@ export function ExpensesPage() {
         }
       }
     } finally {
-      claim.release();
+      releaseOnce();
     }
   }
 
@@ -661,16 +784,16 @@ export function ExpensesPage() {
               type="checkbox"
               checked={data.complete}
               disabled={writeDisabled}
-              onChange={(event) =>
-                void runWrite(
-                  () =>
-                    setMonthExpenseComplete(monthStart, event.target.checked),
+              onChange={(event) => {
+                const nextChecked = event.target.checked;
+                void runClaimedMutation(
+                  `${EXPENSE_COMPLETE_PREFIX}${monthStart}`,
+                  'expense_complete',
+                  monthStart,
+                  () => setMonthExpenseComplete(monthStart, nextChecked),
                   setListError,
-                  () => {
-                    setReloadMarker(EXPENSE_RELOAD_SUBJECT, monthStart);
-                  },
-                )
-              }
+                );
+              }}
             />
             مصاريف الشهر كاملة
           </label>
@@ -705,21 +828,29 @@ export function ExpensesPage() {
             categories={data.categories}
             disabled={writeDisabled}
             serverError={categoryError}
-            onAdd={async (name, kind: ExpenseKind) => {
-              const result = await runWrite(
+            onAdd={(name, kind: ExpenseKind) =>
+              runClaimedMutation(
+                `${EXPENSE_CATEGORY_PREFIX}add`,
+                'expense_category',
+                '*',
                 () => addExpenseCategory(name, kind),
                 setCategoryError,
-              );
-              return result.saved;
-            }}
+              )
+            }
             onRename={(id, name) =>
-              void runWrite(
+              void runClaimedMutation(
+                `${EXPENSE_CATEGORY_PREFIX}rename:${id}`,
+                'expense_category',
+                '*',
                 () => renameExpenseCategory(id, name),
                 setCategoryError,
               )
             }
             onSetActive={(id, active) =>
-              void runWrite(
+              void runClaimedMutation(
+                `${EXPENSE_CATEGORY_PREFIX}active:${id}`,
+                'expense_category',
+                '*',
                 () => setExpenseCategoryActive(id, active),
                 setCategoryError,
               )

@@ -24,16 +24,28 @@ import {
 import { groupCatalog } from '@/items/group';
 import { ItemForm } from '@/items/ItemForm';
 import { ItemList } from '@/items/ItemList';
-import { firstUnknownItemCreate } from '@/items/request-id';
+import {
+  firstUnknownItemCreate,
+  markActionPostedReload,
+  priceSubject,
+} from '@/items/request-id';
 import type { CatalogItem, ItemSave } from '@/items/types';
 import { emptyItemForm, itemToFormValues } from '@/items/validation';
 import {
+  abortClaimBeforeDispatch,
+  canDispatchHeldWrite,
+  captureWriteSession,
+  claimFreshHeldWrite,
+  clearHeldWrite,
   clearPostedReloadSnapshot,
-  clearReloadMarker,
+  hasDurableHeldWrite,
+  hasPostedReloadForTarget,
   hasReloadMarker,
   setReloadMarker,
   snapshotPostedReloads,
+  storageWriteFailedMessage,
   subscribeHeldWritesStore,
+  type PostedReloadSnapshot,
 } from '@/lib/held-writes';
 import {
   isOnline,
@@ -44,6 +56,13 @@ import {
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
 
 const ITEMS_RELOAD_SUBJECT = 'items:reload';
+
+function snapshotItemsReloads(): PostedReloadSnapshot {
+  return [
+    ...snapshotPostedReloads({ readTarget: ITEMS_RELOAD_SUBJECT }),
+    ...snapshotPostedReloads({ subject: ITEMS_RELOAD_SUBJECT }),
+  ];
+}
 
 function visibleCount(
   items: readonly CatalogItem[],
@@ -85,7 +104,10 @@ export function ItemsPage() {
   // reload after it) is in flight, nothing that edits data or remounts a panel
   // can start, so no editor or panel ever opens on stale data.
   const [catalogLoads, setCatalogLoads] = useState(0);
-  const postedReload = heldEpoch >= 0 && hasReloadMarker(ITEMS_RELOAD_SUBJECT);
+  const postedReload =
+    heldEpoch >= 0 &&
+    (hasPostedReloadForTarget(ITEMS_RELOAD_SUBJECT) ||
+      hasReloadMarker(ITEMS_RELOAD_SUBJECT));
   const needsReload = localNeedsReload || postedReload;
   const busy = saving || conversionsBusy || needsReload || catalogLoads > 0;
   const online = useReconnectReload(() => {
@@ -133,14 +155,12 @@ export function ItemsPage() {
   }
 
   async function reloadCatalog(staleItemId?: string) {
-    const pendingReload = snapshotPostedReloads({
-      subject: ITEMS_RELOAD_SUBJECT,
-    });
+    const pendingReload = snapshotItemsReloads();
     const next = await readCatalog();
     if (!next) return;
     setItems(next);
     setLoadError(null);
-    clearPostedReloadSnapshot(pendingReload);
+    clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
     setLocalNeedsReload(false);
     const editing = formModeRef.current;
     if (staleItemId && editing?.type === 'edit' && editing.id === staleItemId) {
@@ -167,16 +187,14 @@ export function ItemsPage() {
 
   useEffect(() => {
     let cancelled = false;
-    const pendingReload = snapshotPostedReloads({
-      subject: ITEMS_RELOAD_SUBJECT,
-    });
+    const pendingReload = snapshotItemsReloads();
     void (async () => {
       try {
         const next = await readCatalog();
         if (cancelled || !next) return;
         setItems(next);
         setLoadError(null);
-        clearPostedReloadSnapshot(pendingReload);
+        clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -218,20 +236,108 @@ export function ItemsPage() {
       return false;
     setSaving(true);
     setFormError(null);
+    let detailsClaim: {
+      subject: string;
+      requestId: string;
+      release: () => void;
+    } | null = null;
     let saved = false;
     try {
+      if (action.kind === 'details') {
+        if (started.type !== 'edit') return false;
+        const detailsSubject = `item:details:${started.id}`;
+        const session = captureWriteSession();
+        const claim = await claimFreshHeldWrite<{
+          requestId: string;
+          itemId: string;
+        }>(detailsSubject, (requestId) => ({ requestId, itemId: started.id }), {
+          kind: 'item_details',
+          session,
+        });
+        if (!claim.ok) {
+          if (claim.reason === 'storage' || claim.reason === 'missing') {
+            setFormError(storageWriteFailedMessage);
+          } else if (claim.reason === 'session_invalid' && !isOnline()) {
+            setFormError(offlineWriteMessage);
+          }
+          return false;
+        }
+        let released = false;
+        const releaseOnce = () => {
+          if (!released) {
+            released = true;
+            claim.release();
+          }
+        };
+        if (
+          !canDispatchHeldWrite(detailsSubject, claim.record.requestId, session)
+        ) {
+          const missingPin = !hasDurableHeldWrite(
+            detailsSubject,
+            claim.record.requestId,
+          );
+          abortClaimBeforeDispatch(
+            detailsSubject,
+            claim.record.requestId,
+            null,
+            releaseOnce,
+          );
+          if (!isOnline()) setFormError(offlineWriteMessage);
+          else if (missingPin) setFormError(storageWriteFailedMessage);
+          return false;
+        }
+        detailsClaim = {
+          subject: detailsSubject,
+          requestId: claim.record.requestId,
+          release: releaseOnce,
+        };
+      }
       if (action.kind === 'create') {
         if (started.type !== 'create') return false;
         await createItem(action.draft);
+        saved = true;
+        if (!hasPostedReloadForTarget(ITEMS_RELOAD_SUBJECT)) {
+          setReloadMarker(ITEMS_RELOAD_SUBJECT);
+        }
       } else if (started.type !== 'edit') {
+        if (detailsClaim) {
+          abortClaimBeforeDispatch(
+            detailsClaim.subject,
+            detailsClaim.requestId,
+            null,
+            detailsClaim.release,
+          );
+          detailsClaim = null;
+        }
         return false;
       } else if (action.kind === 'details') {
         const expected = expectedRef.current;
-        if (!expected) throw new StaleWriteError();
+        if (!expected) {
+          if (detailsClaim) {
+            abortClaimBeforeDispatch(
+              detailsClaim.subject,
+              detailsClaim.requestId,
+              null,
+              detailsClaim.release,
+            );
+            detailsClaim = null;
+          }
+          throw new StaleWriteError();
+        }
         await updateItem(started.id, action.draft, expected);
         expectedRef.current = expectationFromDraft(action.draft);
+        saved = true;
+        if (detailsClaim) {
+          if (setReloadMarker(ITEMS_RELOAD_SUBJECT)) {
+            clearHeldWrite(detailsClaim.subject, detailsClaim.requestId);
+          }
+          detailsClaim.release();
+          detailsClaim = null;
+        }
       } else if (action.kind === 'loss') {
         await setItemLoss(started.id, action.lossPct, action.write);
+        saved = true;
+        setReloadMarker(ITEMS_RELOAD_SUBJECT);
       } else {
         await setOpeningPrice(
           started.id,
@@ -241,11 +347,15 @@ export function ItemsPage() {
           action.requestId,
           action.identity,
         );
+        saved = true;
+        markActionPostedReload(
+          priceSubject(started.id),
+          action.requestId,
+          ITEMS_RELOAD_SUBJECT,
+        );
       }
-      saved = true;
       // Locked from the moment the save lands until fresh rows are applied.
       // The editor stays open so a sibling section keeps its pending value.
-      setReloadMarker(ITEMS_RELOAD_SUBJECT);
       setLocalNeedsReload(true);
       if (
         action.kind === 'create' &&
@@ -253,14 +363,18 @@ export function ItemsPage() {
       ) {
         setEditor(null);
       }
+      const pendingReload = snapshotItemsReloads();
       const next = await readCatalog();
       if (next) {
         setItems(next);
         setLoadError(null);
-        clearReloadMarker(ITEMS_RELOAD_SUBJECT);
+        clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
         setLocalNeedsReload(false);
       }
     } catch (error) {
+      if (!saved && detailsClaim) {
+        clearHeldWrite(detailsClaim.subject, detailsClaim.requestId);
+      }
       if (
         !saved &&
         error instanceof StaleWriteError &&
@@ -285,6 +399,7 @@ export function ItemsPage() {
       }
       if (!saved) throw error;
     } finally {
+      detailsClaim?.release();
       setSaving(false);
     }
     return saved;

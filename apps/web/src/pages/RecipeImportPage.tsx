@@ -2,10 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import {
+  abortActionBeforeDispatch,
+  canDispatchAction,
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReloadSnapshot,
   hasAction,
+  hasDurableAction,
   markActionPostedReload,
   settleAction,
   snapshotActionPostedReloads,
@@ -210,15 +213,21 @@ function Workspace({
   async function run(
     action: ImportAction,
     session: WriteSession | null,
+    isReplay: boolean,
     releaseLock: () => void,
   ) {
     setSaving(true);
     setError(null);
     let outcome: ImportResult;
     let saved = false;
+    let release = releaseLock;
     try {
-      if (!canDispatchWriteFor(session)) {
-        if (!isOnline()) setError(offlineWriteMessage);
+      if (!canDispatchAction(subject, action.requestId, session)) {
+        const durable = hasDurableAction(subject, action.requestId);
+        abortActionBeforeDispatch(subject, action.requestId, isReplay, release);
+        release = () => {};
+        if (!durable) setError(storageWriteFailedMessage);
+        else if (!isOnline()) setError(offlineWriteMessage);
         flight.current = false;
         setSaving(false);
         return;
@@ -235,7 +244,7 @@ function Workspace({
       setSaving(false);
       return;
     } finally {
-      releaseLock();
+      release();
     }
     timing.refreshClock();
     setResult(outcome);
@@ -315,7 +324,7 @@ function Workspace({
       }
       return;
     }
-    await run(claim.record.payload, initiatingUser, claim.release);
+    await run(claim.record.payload, initiatingUser, false, claim.release);
   }
 
   function retry() {
@@ -336,7 +345,7 @@ function Workspace({
         }
         return;
       }
-      await run(claim.record.payload, session, claim.release);
+      await run(claim.record.payload, session, true, claim.release);
     })();
   }
 

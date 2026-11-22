@@ -11,10 +11,12 @@ import type {
 } from '@/accounting/types';
 import { messageFrom } from '@/items/errors';
 import {
+  canDispatchAction,
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
   hasAction,
+  hasDurableAction,
   activationReviewReloadPending,
   heldAction,
   heldRequestId,
@@ -26,9 +28,8 @@ import {
   unknownAction,
 } from '@/items/request-id';
 import {
-  canDispatchWriteFor,
+  abortClaimBeforeDispatch,
   captureWriteSession,
-  setHeldWritePhase,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
@@ -161,9 +162,9 @@ export function useActivationAction(
     const session = captureWriteSession();
     let action: ActivationWrite;
     let releaseLock: () => void;
-    let isReplay = false;
+    let priorPhase: 'unknown' | 'inflight' | null = null;
     if (unknownHeld) {
-      isReplay = true;
+      priorPhase = 'unknown';
       const claim = await claimReplayAction<ActivationWrite>(
         ACTIVATION_SUBJECT,
         unknownHeld.requestId,
@@ -180,7 +181,7 @@ export function useActivationAction(
       action = claim.record.payload;
       releaseLock = claim.release;
     } else if (current && !activationReviewReloadPending(ACTIVATION_SUBJECT)) {
-      isReplay = true;
+      priorPhase = 'inflight';
       const nextPayload: ActivationWrite = {
         ...current,
         explicitZeroItemIds: zerosOf(checked),
@@ -224,14 +225,16 @@ export function useActivationAction(
       releaseLock = claim.release;
     }
 
-    if (!canDispatchWriteFor(session)) {
-      if (isReplay) {
-        setHeldWritePhase(ACTIVATION_SUBJECT, action.requestId, 'unknown');
-      } else {
-        settleAction(ACTIVATION_SUBJECT, action.requestId);
-      }
-      releaseLock();
-      if (!isOnline()) setNotice(offlineWriteMessage);
+    if (!canDispatchAction(ACTIVATION_SUBJECT, action.requestId, session)) {
+      const durable = hasDurableAction(ACTIVATION_SUBJECT, action.requestId);
+      abortClaimBeforeDispatch(
+        ACTIVATION_SUBJECT,
+        action.requestId,
+        priorPhase,
+        releaseLock,
+      );
+      if (!durable) setNotice(storageWriteFailedMessage);
+      else if (!isOnline()) setNotice(offlineWriteMessage);
       return;
     }
 

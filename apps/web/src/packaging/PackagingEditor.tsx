@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import {
+  abortActionBeforeDispatch,
+  canDispatchAction,
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
   hasAction,
+  hasDurableAction,
   markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
@@ -15,7 +18,6 @@ import { currentMinuteMs } from '@/items/effective';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatCairo } from '@/lib/cairo';
 import {
-  canDispatchWriteFor,
   captureWriteSession,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
@@ -491,8 +493,28 @@ export function PackagingEditor({
       releaseLock = claim.release;
       const write = claim.record.payload;
       const requestId = claim.record.requestId;
-      if (!canDispatchWriteFor(session)) {
-        if (!isOnline()) setError(offlineWriteMessage);
+      if (!canDispatchAction(subjectKey, requestId, session)) {
+        const durable = hasDurableAction(subjectKey, requestId);
+        abortActionBeforeDispatch(
+          subjectKey,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        if (!durable) setError(storageWriteFailedMessage);
+        else if (!isOnline()) setError(offlineWriteMessage);
+        return;
+      }
+      if (kind !== 'order_type' && (!posItemId || !sizeKey)) {
+        abortActionBeforeDispatch(
+          subjectKey,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        setError(genericCatalogError);
         return;
       }
       let saved = false;

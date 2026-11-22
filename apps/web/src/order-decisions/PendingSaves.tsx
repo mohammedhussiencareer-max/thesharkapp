@@ -1,35 +1,43 @@
 import { useEffect, useRef, useState } from 'react';
 import { messageFrom } from '@/items/errors';
 import {
+  abortActionBeforeDispatch,
+  canDispatchAction,
   claimReplayAction,
+  hasDurableAction,
   markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import {
-  canDispatchWriteFor,
   captureWriteSession,
-  setHeldWritePhase,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
+import { secondaryButton } from '@/lib/page-style';
 import { setOrderDisposition } from '@/order-decisions/api';
-import { unknownDecisions } from '@/order-decisions/held-decisions';
+import {
+  postedDecisionOrders,
+  unknownDecisions,
+} from '@/order-decisions/held-decisions';
 import { decisionLabels, decisionSubject } from '@/order-decisions/format';
 import type { DecisionNotice, DecisionWrite } from '@/order-decisions/types';
 
 /**
  * The retry control for a decision whose answer was lost, shown for orders that
  * have no form on screen: a refresh or a filter change can drop the card, and a
- * closing decision takes the order out of both queue filters.
+ * closing decision takes the order out of both queue filters. Also surfaces
+ * `posted_reload` pins awaiting direct verification by order id.
  */
 export function PendingSaves({
   shown,
   onSettled,
+  onVerifyPosted,
 }: {
   shown: ReadonlySet<string>;
   onSettled: (orderId: string, notice: DecisionNotice) => void;
+  onVerifyPosted?: (orderId: string) => Promise<void>;
 }) {
   const online = useOnline();
   const [, setEpoch] = useState(0);
@@ -44,7 +52,8 @@ export function PendingSaves({
   const pending = unknownDecisions().filter(
     (write) => !shown.has(write.orderId),
   );
-  if (pending.length === 0) return null;
+  const posted = postedDecisionOrders();
+  if (pending.length === 0 && posted.length === 0) return null;
 
   async function retry(write: DecisionWrite): Promise<void> {
     if (flight.current || !isOnline()) return;
@@ -69,13 +78,25 @@ export function PendingSaves({
       }
       return;
     }
-    if (!canDispatchWriteFor(session)) {
-      setHeldWritePhase(subject, write.requestId, 'unknown');
-      claim.release();
+    let released = false;
+    const releaseOnce = () => {
+      if (!released) {
+        released = true;
+        claim.release();
+      }
+    };
+    if (!canDispatchAction(subject, write.requestId, session)) {
+      const missingPin = !hasDurableAction(subject, write.requestId);
+      abortActionBeforeDispatch(subject, write.requestId, true, releaseOnce);
       if (!isOnline()) {
         onSettled(write.orderId, {
           kind: 'failed',
           message: offlineWriteMessage,
+        });
+      } else if (missingPin) {
+        onSettled(write.orderId, {
+          kind: 'failed',
+          message: storageWriteFailedMessage,
         });
       }
       return;
@@ -101,7 +122,24 @@ export function PendingSaves({
         message: messageFrom(failure),
       });
     } finally {
-      claim.release();
+      releaseOnce();
+      flight.current = false;
+      setBusy(null);
+    }
+  }
+
+  async function verifyPosted(orderId: string): Promise<void> {
+    if (!onVerifyPosted || flight.current || !isOnline()) return;
+    flight.current = true;
+    setBusy(orderId);
+    try {
+      await onVerifyPosted(orderId);
+    } catch (failure) {
+      onSettled(orderId, {
+        kind: 'failed',
+        message: messageFrom(failure),
+      });
+    } finally {
       flight.current = false;
       setBusy(null);
     }
@@ -122,6 +160,21 @@ export function PendingSaves({
             disabled={busy !== null || !online}
             onRetry={() => void retry(write)}
           />
+        </div>
+      ))}
+      {posted.map((pin) => (
+        <div key={`posted:${pin.orderId}`} className="flex flex-col gap-1">
+          <p>طلب {pin.orderId} — القرار اتسجل ومستني تأكيد التحديث</p>
+          {onVerifyPosted ? (
+            <button
+              className={secondaryButton}
+              type="button"
+              disabled={busy !== null || !online}
+              onClick={() => void verifyPosted(pin.orderId)}
+            >
+              تحديث حالة القرار
+            </button>
+          ) : null}
         </div>
       ))}
     </section>

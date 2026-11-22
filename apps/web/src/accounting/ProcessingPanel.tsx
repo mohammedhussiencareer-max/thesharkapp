@@ -27,17 +27,22 @@ import {
 import type { ParkedOrder, ProcessingSummary } from '@/accounting/types';
 import { ConfirmedRefusalError, messageFrom } from '@/items/errors';
 import {
+  abortActionBeforeDispatch,
+  canDispatchAction,
   claimFreshAction,
   claimReplayAction,
+  clearActionPostedReloadSnapshot,
   hasAction,
+  hasDurableAction,
+  markActionPostedReload,
   settleAction,
+  snapshotActionPostedReloads,
   subscribeHeldWrites,
   unknownAction,
   updateActionPayload,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import {
-  canDispatchWriteFor,
   captureWriteSession,
   setHeldWritePhase,
   storageWriteFailedMessage,
@@ -125,12 +130,17 @@ export function ProcessingPanel({
   useEffect(() => {
     const seq = ++seqRef.current;
     let cancelled = false;
+    const pendingReloads = [
+      ...snapshotActionPostedReloads({ subject: accountingRunSubject }),
+      ...snapshotActionPostedReloads({ prefix: 'accounting:retry:' }),
+    ];
     void (async () => {
       try {
         const next = await loadProcessingSummary();
         if (cancelled || seq !== seqRef.current) return;
         setSummary(next);
         setLoadError(null);
+        clearActionPostedReloadSnapshot(pendingReloads);
       } catch (error) {
         if (cancelled || seq !== seqRef.current) return;
         setLoadError(messageFrom(error));
@@ -160,15 +170,28 @@ export function ProcessingPanel({
     session: WriteSession | null,
     release: () => void,
   ): Promise<void> {
-    if (flight.current || !canDispatchWriteFor(session)) {
-      settleAction(accountingRunSubject, action.requestId);
-      release();
+    if (
+      flight.current ||
+      !canDispatchAction(accountingRunSubject, action.requestId, session)
+    ) {
+      const missingPin = !hasDurableAction(
+        accountingRunSubject,
+        action.requestId,
+      );
+      abortActionBeforeDispatch(
+        accountingRunSubject,
+        action.requestId,
+        false,
+        release,
+      );
       if (!isOnline()) setNotice(offlineWriteMessage);
+      else if (missingPin) setNotice(storageWriteFailedMessage);
       return;
     }
     flight.current = true;
     setRunning(true);
     setNotice(null);
+    let saved = false;
     try {
       let outcome: RunOutcome;
       try {
@@ -178,7 +201,9 @@ export function ProcessingPanel({
             ...action,
           });
         };
-        outcome = await runDeductions(persistAttempt, persistAttempt);
+        outcome = await runDeductions(persistAttempt, persistAttempt, () =>
+          canDispatchAction(accountingRunSubject, action.requestId, session),
+        );
       } catch (error) {
         updateActionPayload(accountingRunSubject, action.requestId, action);
         settleAction(accountingRunSubject, action.requestId, error);
@@ -196,6 +221,14 @@ export function ProcessingPanel({
       }
       if (
         outcome.stop === 'call_failed' &&
+        outcome.report === 'not_needed' &&
+        !hasDurableAction(accountingRunSubject, action.requestId)
+      ) {
+        setNotice(storageWriteFailedMessage);
+        return;
+      }
+      if (
+        outcome.stop === 'call_failed' &&
         (outcome.report === 'unreported' || outcome.report === 'busy')
       ) {
         updateActionPayload(accountingRunSubject, action.requestId, action);
@@ -203,9 +236,24 @@ export function ProcessingPanel({
         setNotice(runStopLabel('call_failed'));
         return;
       }
-      settleAction(accountingRunSubject, action.requestId);
+      saved = true;
+      try {
+        markActionPostedReload(
+          accountingRunSubject,
+          action.requestId,
+          accountingRunSubject,
+        );
+      } catch (error) {
+        setNotice(messageFrom(error));
+        return;
+      }
       setNotice(runStopLabel(outcome.stop));
       publishAcknowledged();
+    } catch (error) {
+      if (!saved) {
+        settleAction(accountingRunSubject, action.requestId, error);
+      }
+      setNotice(messageFrom(error));
     } finally {
       release();
       flight.current = false;
@@ -218,10 +266,22 @@ export function ProcessingPanel({
     session: WriteSession | null,
     release: () => void,
   ): Promise<void> {
-    if (flight.current || !canDispatchWriteFor(session)) {
-      setHeldWritePhase(accountingRunSubject, action.requestId, 'unknown');
-      release();
+    if (
+      flight.current ||
+      !canDispatchAction(accountingRunSubject, action.requestId, session)
+    ) {
+      const missingPin = !hasDurableAction(
+        accountingRunSubject,
+        action.requestId,
+      );
+      abortActionBeforeDispatch(
+        accountingRunSubject,
+        action.requestId,
+        true,
+        release,
+      );
       if (!isOnline()) setNotice(offlineWriteMessage);
+      else if (missingPin) setNotice(storageWriteFailedMessage);
       return;
     }
     flight.current = true;
@@ -233,6 +293,7 @@ export function ProcessingPanel({
         setNotice(runStopLabel('call_failed'));
         return;
       }
+      let persisted = false;
       try {
         const status = await recordRunFailure(action.report);
         if (!acknowledgedReport(status)) {
@@ -240,12 +301,19 @@ export function ProcessingPanel({
           setNotice(busyNotice);
           return;
         }
-        settleAction(accountingRunSubject, action.requestId);
+        persisted = true;
+        markActionPostedReload(
+          accountingRunSubject,
+          action.requestId,
+          accountingRunSubject,
+        );
         setNotice(recordedNotice);
         publishAcknowledged();
       } catch (error) {
         // The attempt stays until recording acknowledges a terminal status.
-        setHeldWritePhase(accountingRunSubject, action.requestId, 'unknown');
+        if (!persisted) {
+          setHeldWritePhase(accountingRunSubject, action.requestId, 'unknown');
+        }
         setNotice(messageFrom(error));
       }
     } finally {
@@ -262,14 +330,14 @@ export function ProcessingPanel({
     release: () => void,
   ): Promise<void> {
     const subject = accountingRetrySubject(action.orderId);
-    if (flight.current || !canDispatchWriteFor(session)) {
-      if (isReplay) {
-        setHeldWritePhase(subject, action.requestId, 'unknown');
-      } else {
-        settleAction(subject, action.requestId);
-      }
-      release();
+    if (
+      flight.current ||
+      !canDispatchAction(subject, action.requestId, session)
+    ) {
+      const missingPin = !hasDurableAction(subject, action.requestId);
+      abortActionBeforeDispatch(subject, action.requestId, isReplay, release);
       if (!isOnline()) setNotice(offlineWriteMessage);
+      else if (missingPin) setNotice(storageWriteFailedMessage);
       return;
     }
     flight.current = true;
@@ -277,20 +345,25 @@ export function ProcessingPanel({
     setNotice(null);
     try {
       let status: 'retried' | 'not_failed' | 'busy';
+      let persisted = false;
       try {
         status = await retryParkedOrder(action.orderId);
+        if (status === 'busy') {
+          settleAction(subject, action.requestId);
+          setNotice(busyNotice);
+          return;
+        }
+        persisted = true;
+        markActionPostedReload(subject, action.requestId, subject);
       } catch (error) {
-        if (isDefiniteRefusal(error)) {
-          retireRefusal(subject, action.requestId, error);
-        } else {
-          settleAction(subject, action.requestId, error);
+        if (!persisted) {
+          if (isDefiniteRefusal(error)) {
+            retireRefusal(subject, action.requestId, error);
+          } else {
+            settleAction(subject, action.requestId, error);
+          }
         }
         setNotice(messageFrom(error));
-        return;
-      }
-      settleAction(subject, action.requestId);
-      if (status === 'busy') {
-        setNotice(busyNotice);
         return;
       }
       setNotice(status === 'not_failed' ? notFailedNotice : retriedNotice);

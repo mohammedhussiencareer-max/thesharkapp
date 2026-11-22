@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
 import {
-  canDispatchWriteFor,
+  abortClaimBeforeDispatch,
+  canDispatchHeldWrite,
   captureWriteSession,
   claimFreshHeldWrite,
   claimReplayHeldWrite,
@@ -10,6 +11,7 @@ import {
   clearPostedReload,
   clearPostedReloadSnapshot,
   getHeldWrite,
+  hasDurableHeldWrite,
   setHeldWritePhase,
   snapshotPostedReloads,
   storageWriteFailedMessage,
@@ -141,14 +143,16 @@ export function OpeningPage() {
       }
       return;
     }
-    if (!canDispatchWriteFor(session)) {
-      if (wasPinned) {
-        setHeldWritePhase(OPENING_SUBJECT, draft.requestId, 'unknown');
-      } else {
-        clearHeldWrite(OPENING_SUBJECT, draft.requestId);
-      }
-      claim.release();
-      if (!isOnline()) setServerError(offlineWriteMessage);
+    if (!canDispatchHeldWrite(OPENING_SUBJECT, draft.requestId, session)) {
+      const durable = hasDurableHeldWrite(OPENING_SUBJECT, draft.requestId);
+      abortClaimBeforeDispatch(
+        OPENING_SUBJECT,
+        draft.requestId,
+        wasPinned ? 'unknown' : null,
+        claim.release,
+      );
+      if (!durable) setServerError(storageWriteFailedMessage);
+      else if (!isOnline()) setServerError(offlineWriteMessage);
       return;
     }
     setSaving(true);

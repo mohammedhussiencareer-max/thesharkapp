@@ -16,6 +16,7 @@ import {
 import { DecisionCard, NoticeView } from '@/order-decisions/DecisionCard';
 import { reloadFailedMessage } from '@/order-decisions/DecisionForm';
 import { decisionSubject, moneyText } from '@/order-decisions/format';
+import { orderIdFromDecisionSubject } from '@/order-decisions/held-decisions';
 import { PendingSaves } from '@/order-decisions/PendingSaves';
 import type {
   DecisionNotice,
@@ -47,8 +48,11 @@ export function OrderDecisionsPage() {
   const [unlinkedId, setUnlinkedId] = useState(0);
   const [rescued, setRescued] = useState<Rescued[]>([]);
   const seqRef = useRef(0);
+  const loadedPagesRef = useRef(1);
+  const preservePagesRef = useRef(false);
 
   const online = useReconnectReload(() => {
+    preservePagesRef.current = true;
     setLoading(true);
     setLoadError(null);
     setLoadId((value) => value + 1);
@@ -57,27 +61,71 @@ export function OrderDecisionsPage() {
   useEffect(() => {
     const seq = ++seqRef.current;
     let cancelled = false;
+    const pagesToLoad = preservePagesRef.current
+      ? Math.max(1, loadedPagesRef.current)
+      : 1;
+    preservePagesRef.current = false;
     const pendingReloads = snapshotActionPostedReloads({
       prefix: 'order-decision:',
     });
     void (async () => {
       try {
-        const page = await loadQueuePage(filter, null);
-        if (cancelled || seq !== seqRef.current) return;
-        setEntries(page.rows.map((row) => ({ row, closed: false })));
-        setNext(page.next);
+        const merged: QueueRow[] = [];
+        const seen = new Set<string>();
+        let cursor: string | null = null;
+        let nextCursor: string | null = null;
+        let loadedCount = 0;
+        for (let index = 0; index < pagesToLoad; index += 1) {
+          const page = await loadQueuePage(filter, cursor);
+          if (cancelled || seq !== seqRef.current) return;
+          loadedCount += 1;
+          for (const row of page.rows) {
+            if (!seen.has(row.orderId)) {
+              seen.add(row.orderId);
+              merged.push(row);
+            }
+          }
+          nextCursor = page.next;
+          if (nextCursor === null) break;
+          cursor = nextCursor;
+        }
+        loadedPagesRef.current = Math.max(1, loadedCount);
+        setEntries(merged.map((row) => ({ row, closed: false })));
+        setNext(nextCursor);
         setLoadError(null);
         setMoreError(null);
+        // Clear posted_reload pins directly covered by loaded rows, AND verify
+        // any remaining posted_reload pins (e.g., closed decisions or later
+        // pages) directly by order id via loadQueueRow(orderId).
         const loadedSubjects = new Set(
-          page.rows.map((row) => decisionSubject(row.orderId)),
+          merged.map((row) => decisionSubject(row.orderId)),
         );
-        clearActionPostedReloadSnapshot(
-          pendingReloads.filter(
-            (entry) =>
-              loadedSubjects.has(entry.subject) &&
-              entry.readTarget === entry.subject,
-          ),
+        const directlyCovered = pendingReloads.filter(
+          (entry) =>
+            loadedSubjects.has(entry.subject) &&
+            entry.readTarget === entry.subject,
         );
+        clearActionPostedReloadSnapshot(directlyCovered);
+        const unverified = pendingReloads.filter(
+          (entry) =>
+            !loadedSubjects.has(entry.subject) &&
+            entry.readTarget === entry.subject,
+        );
+        if (unverified.length > 0) {
+          await Promise.all(
+            unverified.map(async (pin) => {
+              const orderId = orderIdFromDecisionSubject(pin.subject);
+              if (!orderId) return;
+              try {
+                await loadQueueRow(orderId);
+                if (cancelled || seq !== seqRef.current) return;
+                clearActionPostedReloadSnapshot([pin], pin.subject);
+              } catch {
+                // Keep posted_reload held until a direct read for this order succeeds.
+              }
+            }),
+          );
+        }
       } catch (error) {
         if (cancelled || seq !== seqRef.current) return;
         setLoadError(messageFrom(error));
@@ -109,6 +157,8 @@ export function OrderDecisionsPage() {
   }, [loadId, unlinkedId]);
 
   function reload() {
+    loadedPagesRef.current = 1;
+    preservePagesRef.current = false;
     setLoading(true);
     setLoadError(null);
     setEntries(null);
@@ -141,6 +191,8 @@ export function OrderDecisionsPage() {
 
   function chooseFilter(value: QueueFilter) {
     if (value === filter) return;
+    loadedPagesRef.current = 1;
+    preservePagesRef.current = false;
     setEntries(null);
     setNext(null);
     setLoadError(null);
@@ -151,11 +203,15 @@ export function OrderDecisionsPage() {
   async function loadMore() {
     if (next === null || loadingMore) return;
     const seq = seqRef.current;
+    const pendingReloads = snapshotActionPostedReloads({
+      prefix: 'order-decision:',
+    });
     setLoadingMore(true);
     setMoreError(null);
     try {
       const page = await loadQueuePage(filter, next);
       if (seq !== seqRef.current) return;
+      loadedPagesRef.current += 1;
       setEntries((current) => {
         const known = new Set(
           (current ?? []).map((entry) => entry.row.orderId),
@@ -168,6 +224,16 @@ export function OrderDecisionsPage() {
         ];
       });
       setNext(page.next);
+      const loadedSubjects = new Set(
+        page.rows.map((row) => decisionSubject(row.orderId)),
+      );
+      clearActionPostedReloadSnapshot(
+        pendingReloads.filter(
+          (entry) =>
+            loadedSubjects.has(entry.subject) &&
+            entry.readTarget === entry.subject,
+        ),
+      );
     } catch (error) {
       if (seq === seqRef.current) setMoreError(messageFrom(error));
     } finally {
@@ -228,6 +294,7 @@ export function OrderDecisionsPage() {
           )
         }
         onSettled={settled}
+        onVerifyPosted={reloadRow}
       />
       {rescued.map((item) => (
         <section

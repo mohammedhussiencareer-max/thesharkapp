@@ -31,3 +31,36 @@ export function unknownDecisions(): DecisionWrite[] {
   }
   return [...byOrder.values()];
 }
+
+export type PostedDecisionPin = {
+  orderId: string;
+  subject: string;
+  requestId: string;
+};
+
+/** Parse the order id out of a `order-decision:` held-write subject. */
+export function orderIdFromDecisionSubject(subject: string): string | null {
+  if (!subject.startsWith(DECISION_PREFIX)) return null;
+  try {
+    const parsed: unknown = JSON.parse(subject.slice(DECISION_PREFIX.length));
+    return typeof parsed === 'string' && parsed.length > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Decisions whose RPC succeeded and are awaiting a verifying read for that order. */
+export function postedDecisionOrders(): PostedDecisionPin[] {
+  const byOrder = new Map<string, PostedDecisionPin>();
+  for (const record of listHeldWritesByPrefix(DECISION_PREFIX)) {
+    if (record.phase !== 'posted_reload') continue;
+    const orderId = orderIdFromDecisionSubject(record.subject);
+    if (!orderId) continue;
+    byOrder.set(orderId, {
+      orderId,
+      subject: record.subject,
+      requestId: record.requestId,
+    });
+  }
+  return [...byOrder.values()];
+}

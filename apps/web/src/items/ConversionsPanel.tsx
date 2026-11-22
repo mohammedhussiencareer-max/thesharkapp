@@ -24,12 +24,15 @@ import {
   StaleWriteError,
 } from '@/items/errors';
 import {
+  abortActionBeforeDispatch,
+  canDispatchAction,
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
   clearActionPostedReloadSnapshot,
   conversionSubject,
   hasAction,
+  hasDurableAction,
   listUnknownConversionsForItem,
   markActionPostedReload,
   settleAction,
@@ -58,6 +61,7 @@ import { formatCairo } from '@/lib/cairo';
 import {
   canDispatchWriteFor,
   captureWriteSession,
+  HeldWriteStorageError,
   storageWriteFailedMessage,
   type WriteSession,
 } from '@/lib/held-writes';
@@ -571,9 +575,17 @@ export function ConversionsPanel({
     action: ConversionAction,
     initiatingUser: WriteSession | null,
   ): Promise<void> {
-    if (!canDispatchWriteFor(initiatingUser)) {
-      throw new Error(offlineWriteMessage);
-    }
+    const subject = actionSubject(action);
+    const requestId = action.write.requestId;
+    const ensureCanDispatch = () => {
+      if (!canDispatchWriteFor(initiatingUser)) {
+        throw new Error(offlineWriteMessage);
+      }
+      if (!hasDurableAction(subject, requestId)) {
+        throw new HeldWriteStorageError();
+      }
+    };
+    ensureCanDispatch();
     switch (action.kind) {
       case 'remove_conversion':
         await deleteConversion(
@@ -607,20 +619,14 @@ export function ConversionsPanel({
       case 'create_unit_then_conversion': {
         let unitCode = action.createdCode;
         if (unitCode === null) {
-          if (!canDispatchWriteFor(initiatingUser)) {
-            throw new Error(offlineWriteMessage);
-          }
+          ensureCanDispatch();
           unitCode = await addCustomUnit(
             action.inputCode,
             action.label,
             action.unitRequestId,
           );
           action.createdCode = unitCode;
-          updateActionPayload(
-            actionSubject(action),
-            action.write.requestId,
-            action,
-          );
+          updateActionPayload(subject, requestId, action);
           setCreatedUnit({
             code: unitCode,
             inputCode: action.inputCode,
@@ -636,9 +642,7 @@ export function ConversionsPanel({
               : current,
           );
         }
-        if (!canDispatchWriteFor(initiatingUser)) {
-          throw new Error(offlineWriteMessage);
-        }
+        ensureCanDispatch();
         await addConversion(
           action.itemId,
           unitCode,
@@ -699,13 +703,17 @@ export function ConversionsPanel({
       releaseLock = claim.release;
       const action = claim.record.payload;
       const requestId = claim.record.requestId;
-      if (!canDispatchWriteFor(session)) {
-        if (mode.kind === 'fresh') {
-          settleAction(subject, requestId);
-        } else {
-          settleAction(subject, requestId, new Error(offlineWriteMessage));
-        }
+      if (!canDispatchAction(subject, requestId, session)) {
+        const missingPin = !hasDurableAction(subject, requestId);
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
         if (!isOnline()) setActionError(offlineWriteMessage);
+        else if (missingPin) setActionError(storageWriteFailedMessage);
         return;
       }
       let saved = false;
@@ -717,7 +725,11 @@ export function ConversionsPanel({
             markActionPostedReload(subject, requestId, subject);
             clearSubmittedAdd(action);
           } catch (error) {
-            if (!saved && hasAction(subject)) {
+            if (
+              !saved &&
+              !(error instanceof HeldWriteStorageError) &&
+              hasAction(subject)
+            ) {
               settleAction(subject, requestId, error);
             }
             throw error;
@@ -731,11 +743,13 @@ export function ConversionsPanel({
         },
       );
       if (accepted === false) {
-        if (mode.kind === 'fresh') {
-          settleAction(subject, requestId);
-        } else {
-          settleAction(subject, requestId, new Error('retry deferred'));
-        }
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
       }
     } catch {
       // run already settled this action and showed the error.

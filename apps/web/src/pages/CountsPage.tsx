@@ -28,6 +28,8 @@ import type {
 import { messageFrom } from '@/items/errors';
 import type { Json } from '@/lib/database.types';
 import {
+  abortClaimBeforeDispatch,
+  canDispatchHeldWrite,
   canDispatchWriteFor,
   captureWriteSession,
   claimFreshHeldWrite,
@@ -35,6 +37,7 @@ import {
   clearHeldWrite,
   clearPostedReloadSnapshot,
   getHeldWrite,
+  hasDurableHeldWrite,
   listHeldWritesByPrefix,
   setHeldWritePhase,
   snapshotPostedReloads,
@@ -418,14 +421,16 @@ export function CountsPage() {
       }
       return;
     }
-    if (!canDispatchWriteFor(session)) {
-      if (priorPhase !== null) {
-        setHeldWritePhase(COUNT_DAILY_SUBJECT, draft.requestId, priorPhase);
-      } else {
-        clearHeldWrite(COUNT_DAILY_SUBJECT, draft.requestId);
-      }
-      claim.release();
-      if (!isOnline()) setServerError(offlineWriteMessage);
+    if (!canDispatchHeldWrite(COUNT_DAILY_SUBJECT, draft.requestId, session)) {
+      const durable = hasDurableHeldWrite(COUNT_DAILY_SUBJECT, draft.requestId);
+      abortClaimBeforeDispatch(
+        COUNT_DAILY_SUBJECT,
+        draft.requestId,
+        priorPhase,
+        claim.release,
+      );
+      if (!durable) setServerError(storageWriteFailedMessage);
+      else if (!isOnline()) setServerError(offlineWriteMessage);
       return;
     }
     setSaving(true);
@@ -483,16 +488,27 @@ export function CountsPage() {
       }
       releaseLock = claim.release;
     }
-    if (!canDispatchWriteFor(session)) {
+    const canDispatch =
+      storedSubject && requestId !== null
+        ? canDispatchHeldWrite(storedSubject, requestId, session)
+        : canDispatchWriteFor(session);
+    if (!canDispatch) {
+      const durable =
+        storedSubject && requestId !== null
+          ? hasDurableHeldWrite(storedSubject, requestId)
+          : true;
       if (storedSubject && requestId !== null) {
-        if (isLocalReplay) {
-          setHeldWritePhase(storedSubject, requestId, 'unknown');
-        } else {
-          clearHeldWrite(storedSubject, requestId);
-        }
+        abortClaimBeforeDispatch(
+          storedSubject,
+          requestId,
+          isLocalReplay ? 'unknown' : null,
+          releaseLock,
+        );
+      } else {
+        releaseLock();
       }
-      releaseLock();
-      if (!isOnline()) setCardError(offlineWriteMessage);
+      if (!durable) setCardError(storageWriteFailedMessage);
+      else if (!isOnline()) setCardError(offlineWriteMessage);
       return;
     }
     setSaving(true);

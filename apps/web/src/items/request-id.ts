@@ -5,6 +5,8 @@ import {
 } from '@/items/errors';
 import type { ItemDraft } from '@/items/types';
 import {
+  abortClaimBeforeDispatch,
+  canDispatchHeldWrite,
   claimFreshHeldWrite,
   claimReplayHeldWrite,
   clearHeldWrite,
@@ -266,6 +268,30 @@ export function claimReplayAction<T>(
 /** True iff localStorage currently holds an unresolved pin for `(subject, requestId)`. */
 export function hasDurableAction(subject: string, requestId: string): boolean {
   return hasDurableHeldWrite(subject, requestId);
+}
+
+/** Combined pre-dispatch guard: session + user + online AND durable pin present. */
+export function canDispatchAction(
+  subject: string,
+  requestId: string,
+  session: WriteSession | null,
+): boolean {
+  return canDispatchHeldWrite(subject, requestId, session);
+}
+
+/** Roll back an undispatched fresh claim (or restore a replay to `unknown`) and release its Web Lock. */
+export function abortActionBeforeDispatch(
+  subject: string,
+  requestId: string,
+  isReplay: boolean,
+  release: () => void,
+): void {
+  abortClaimBeforeDispatch(
+    subject,
+    requestId,
+    isReplay ? 'unknown' : null,
+    release,
+  );
 }
 
 /**

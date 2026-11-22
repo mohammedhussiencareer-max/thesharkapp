@@ -2,10 +2,13 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { currentMinuteMs } from '@/items/effective';
 import { messageFrom } from '@/items/errors';
 import {
+  abortActionBeforeDispatch,
+  canDispatchAction,
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
   hasAction,
+  hasDurableAction,
   markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
@@ -14,7 +17,6 @@ import {
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import {
-  canDispatchWriteFor,
   captureWriteSession,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
@@ -145,8 +147,17 @@ export function VersionEditor({
       releaseLock = claim.release;
       const action = claim.record.payload;
       requestId = claim.record.requestId;
-      if (!canDispatchWriteFor(session)) {
-        if (!isOnline()) setError(offlineWriteMessage);
+      if (!canDispatchAction(subject, requestId, session)) {
+        const durable = hasDurableAction(subject, requestId);
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        if (!durable) setError(storageWriteFailedMessage);
+        else if (!isOnline()) setError(offlineWriteMessage);
         return;
       }
       await setRecipeVersion(action.recipeId, action.write);

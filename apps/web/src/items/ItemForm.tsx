@@ -30,6 +30,8 @@ import {
   saveDetailsFirstMessage,
 } from '@/items/errors';
 import {
+  abortActionBeforeDispatch,
+  canDispatchAction,
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
@@ -67,7 +69,6 @@ import {
 } from '@/items/types';
 
 import {
-  canDispatchWriteFor,
   captureWriteSession,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
@@ -407,13 +408,17 @@ export function ItemForm({
       releaseLock = claim.release;
       const action = claim.record.payload;
       requestId = claim.record.requestId;
-      if (!canDispatchWriteFor(session)) {
-        if (mode.kind === 'fresh') {
-          settleAction(subject, requestId);
-        } else {
-          settleAction(subject, requestId, new Error(offlineWriteMessage));
-        }
+      if (!canDispatchAction(subject, requestId, session)) {
+        const missingPin = !hasDurableAction(subject, requestId);
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
         if (!isOnline()) setExtraError(offlineWriteMessage);
+        else if (missingPin) setExtraError(storageWriteFailedMessage);
         return;
       }
       const accepted = await onSubmit({
@@ -424,11 +429,13 @@ export function ItemForm({
       // A refused send never reached the database. A retry whose page is
       // busy still has an unknown outcome and must keep its payload.
       if (accepted !== true) {
-        if (mode.kind === 'fresh') {
-          settleAction(subject, requestId);
-        } else {
-          settleAction(subject, requestId, new Error('retry deferred'));
-        }
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
         return;
       }
       saved = true;
@@ -493,13 +500,17 @@ export function ItemForm({
       releaseLock = claim.release;
       const action = claim.record.payload;
       requestId = claim.record.requestId;
-      if (!canDispatchWriteFor(session)) {
-        if (mode.kind === 'fresh') {
-          settleAction(subject, requestId);
-        } else {
-          settleAction(subject, requestId, new Error(offlineWriteMessage));
-        }
+      if (!canDispatchAction(subject, requestId, session)) {
+        const missingPin = !hasDurableAction(subject, requestId);
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
         if (!isOnline()) setPriceError(offlineWriteMessage);
+        else if (missingPin) setPriceError(storageWriteFailedMessage);
         return;
       }
       const accepted = await onSubmit({
@@ -511,15 +522,21 @@ export function ItemForm({
         requestId: action.requestId,
       });
       if (accepted !== true) {
-        if (mode.kind === 'fresh') {
-          settleAction(subject, requestId);
-        } else {
-          settleAction(subject, requestId, new Error('retry deferred'));
-        }
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
         return;
       }
       saved = true;
-      settleAction(subject, requestId);
+      // ItemsPage transitions `price:<id>` to `posted_reload` until its catalog
+      // readback succeeds; only settle here if the caller did not manage it.
+      if (hasDurableAction(subject, requestId)) {
+        settleAction(subject, requestId);
+      }
     } catch (error) {
       if (!saved && requestId !== null) {
         settleAction(subject, requestId, error);

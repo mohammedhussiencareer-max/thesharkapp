@@ -761,4 +761,148 @@ describe('held-writes store', () => {
       store.dispose();
     }
   });
+
+  it('R5-1b: sign-out and setWritesLocked(true) keep an already-dispatched Web Lock until its call settles', async () => {
+    const heldLocks = new Set<string>();
+    const sharedLocks = {
+      async request<T>(
+        name: string,
+        options: { mode?: 'exclusive' | 'shared'; ifAvailable?: boolean },
+        callback: (
+          lock: { name: string; mode: string } | null,
+        ) => Promise<T> | T,
+      ): Promise<T> {
+        if (options.ifAvailable && heldLocks.has(name)) {
+          return await callback(null);
+        }
+        heldLocks.add(name);
+        try {
+          return await callback({ name, mode: options.mode ?? 'exclusive' });
+        } finally {
+          heldLocks.delete(name);
+        }
+      },
+      query: () =>
+        Promise.resolve({
+          held: [...heldLocks].map((name) => ({ name })),
+        }),
+    };
+
+    const tab1 = createHeldWriteStore({ getLocks: () => sharedLocks });
+    const tab2 = createHeldWriteStore({ getLocks: () => sharedLocks });
+    try {
+      tab1.setHeldWriteUser('user-1');
+      tab2.setHeldWriteUser('user-1');
+
+      const claim1 = await tab1.claimFreshHeldWrite(
+        'count:daily',
+        (requestId) => ({ requestId }),
+        { kind: 'count' },
+      );
+      expect(claim1.ok).toBe(true);
+      if (!claim1.ok) return;
+      expect(heldLocks.size).toBe(1);
+
+      // Sign-out in Tab 1 (while its RPC is still in flight) MUST NOT release
+      // the lock prematurely — Tab 2 must still see the subject as locked.
+      tab1.setHeldWriteUser(null);
+      expect(heldLocks.size).toBe(1);
+
+      const blocked = await tab2.claimFreshHeldWrite(
+        'count:daily',
+        (requestId) => ({ requestId }),
+        { kind: 'count' },
+      );
+      expect(blocked.ok).toBe(false);
+      if (!blocked.ok) expect(blocked.reason).toBe('locked');
+
+      // setWritesLocked(true) while another lock is held must also keep it.
+      tab1.setHeldWriteUser('user-1');
+      tab1.setWritesLocked(true);
+      expect(heldLocks.size).toBe(1);
+
+      // Only once Tab 1's call settles and releases the lock does it free up.
+      claim1.release();
+      await Promise.resolve();
+      expect(heldLocks.size).toBe(0);
+    } finally {
+      tab1.dispose();
+      tab2.dispose();
+    }
+  });
+
+  it('R5-2c: an older read in Tab 1 cannot clear a newer reload marker written by Tab 2', () => {
+    const tab1 = createHeldWriteStore();
+    const tab2 = createHeldWriteStore();
+    try {
+      tab1.setHeldWriteUser('user-1');
+      tab2.setHeldWriteUser('user-1');
+
+      tab1.setReloadMarker('expense:reload', '2026-11-01');
+      const snapBeforeTab1Read = tab1.snapshotPostedReloads({
+        subject: 'expense:reload',
+      });
+
+      // Tab 2 performs a newer write and sets a newer reload marker while Tab 1's read is in flight.
+      tab2.setReloadMarker('expense:reload', '2026-11-01');
+
+      // Tab 1's older read finishes and attempts to clear its snapshot.
+      tab1.clearPostedReloadSnapshot(snapBeforeTab1Read, '2026-11-01');
+
+      // Tab 2's newer marker MUST still be held in storage!
+      tab2.rehydrateHeldWrites();
+      expect(tab2.hasReloadMarker('expense:reload', '2026-11-01')).toBe(true);
+    } finally {
+      tab1.dispose();
+      tab2.dispose();
+    }
+  });
+
+  it('R5-7: claimFreshHeldWrite and claimReplayHeldWrite release the Web Lock if create or storage throws', async () => {
+    const heldLocks = new Set<string>();
+    const locks = {
+      async request<T>(
+        name: string,
+        options: { mode?: 'exclusive' | 'shared'; ifAvailable?: boolean },
+        callback: (
+          lock: { name: string; mode: string } | null,
+        ) => Promise<T> | T,
+      ): Promise<T> {
+        if (options.ifAvailable && heldLocks.has(name)) {
+          return await callback(null);
+        }
+        heldLocks.add(name);
+        try {
+          return await callback({ name, mode: options.mode ?? 'exclusive' });
+        } finally {
+          heldLocks.delete(name);
+        }
+      },
+    };
+
+    const store = createHeldWriteStore({ getLocks: () => locks });
+    try {
+      store.setHeldWriteUser('user-1');
+      await expect(
+        store.claimFreshHeldWrite('count:daily', () => {
+          throw new Error('builder boom');
+        }),
+      ).rejects.toThrow('builder boom');
+
+      // Wait a microtask for lock finally to settle, then verify no lock leaked.
+      await Promise.resolve();
+      expect(heldLocks.size).toBe(0);
+
+      const next = await store.claimFreshHeldWrite(
+        'count:daily',
+        (requestId) => ({ requestId }),
+      );
+      expect(next.ok).toBe(true);
+      if (next.ok) next.release();
+      await Promise.resolve();
+      expect(heldLocks.size).toBe(0);
+    } finally {
+      store.dispose();
+    }
+  });
 });

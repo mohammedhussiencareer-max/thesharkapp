@@ -208,6 +208,9 @@ export async function runAccountingWork(
             failureKind: null,
           };
     if (held) onBoundAttempt?.(held);
+    if (!checkAllowed()) {
+      return done('call_failed', 'not_needed', new Error(offlineWriteMessage));
+    }
     let run: AccountingRun;
     try {
       run = await db.runAccountingWork(attemptId, RUN_BATCH_LIMIT, binding);
