@@ -78,7 +78,7 @@ async function writeRpc(
   if (mapped === genericPurchaseError) {
     throw new Error(retrySafeMessage, { cause: result.error });
   }
-  throw new Error(mapped);
+  throw new Error(mapped, { cause: result.error });
 }
 
 function throwIfError(

@@ -10,6 +10,7 @@ import {
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
+import { isOnline, useOnline } from '@/lib/online';
 import { setRecipeVersion } from '@/recipes/api';
 import { sourceChangedMessage } from '@/recipes/labels';
 import { LinesTable } from '@/recipes/LinesTable';
@@ -55,13 +56,14 @@ export function VersionEditor({
   /** Re-reads the schedule. Never rejects; the page shows its own load error. */
   onReload: () => Promise<void>;
 }) {
+  const online = useOnline();
   const subject = recipeVersionSubject(recipe.id);
   const [mountNow] = useState(() => currentMinuteMs(Date.now()));
   const [heldEpoch, setHeldEpoch] = useState(0);
   const [saving, setSaving] = useState(false);
   const flight = useRef(false);
   const held = heldEpoch < 0 ? null : unknownAction<VersionAction>(subject);
-  const disabled = locked || saving || held !== null;
+  const disabled = locked || saving || held !== null || !online;
   const timing = useDatedTiming(
     undefined,
     catalog.shiftStart,
@@ -99,7 +101,7 @@ export function VersionEditor({
   );
 
   async function finish(action: VersionAction) {
-    if (flight.current) return;
+    if (flight.current || !isOnline()) return;
     flight.current = true;
     setSaving(true);
     onBusyChange(true);

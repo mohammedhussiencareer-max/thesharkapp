@@ -9,6 +9,7 @@ import { assessCount } from '@/counts/validation';
 import type { CountDraft, CountItem, CountValues } from '@/counts/types';
 import { unitLabels } from '@/items/labels';
 import type { BaseUnit } from '@/items/types';
+import { useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import { formatMoneyText } from '@/purchases/decimal';
 import { formatCairoDateTime, nowCairoDateTimeLocal } from '@/purchases/time';
@@ -112,9 +113,10 @@ export function CountForm({
     setAppliedKey(requestKey);
     setRequestId(crypto.randomUUID());
   }
+  const online = useOnline();
   const [values, setValues] = useState<CountValues>(emptyValues);
   const [showErrors, setShowErrors] = useState(false);
-  const disabled = locked || submitting;
+  const disabled = locked || submitting || !online;
   const pinned = pending ?? waiting;
   const assessment = pinned ? null : assessCount(values, items);
   const preview = assessment?.preview ?? null;

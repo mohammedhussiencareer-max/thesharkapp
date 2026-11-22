@@ -28,14 +28,50 @@ import type {
 import { fieldClass } from '@/expenses/labels';
 import { messageFrom } from '@/items/errors';
 import { cairoMonthInput, formatCairo, formatMonth } from '@/lib/cairo';
+import {
+  clearHeldWrite,
+  clearPostedReload,
+  getHeldWrite,
+  hasPostedReload,
+  listHeldWritesByPrefix,
+  putHeldWrite,
+  setHeldWritePhase,
+  subscribeHeldWritesStore,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
+
+const EXPENSE_NEW_SUBJECT = 'expense:new';
+const EXPENSE_VOID_PREFIX = 'expense:void:';
+const EXPENSE_RELOAD_SUBJECT = 'expense:reload';
+
+/** Stored in localStorage for void retries: request id and reason only (no cached money). */
+type StoredVoidPayload = {
+  id: string;
+  requestId: string;
+  reason: string;
+};
 
 type VoidAttempt = {
   requestId: string;
   reason: string;
-  /** The row as it was when the void was sent. The list follows the month picker. */
+  /** The row as it was when the void was sent (in-memory only). */
   entry: ExpenseLine | null;
 };
+
+function voidSubject(id: string): string {
+  return `${EXPENSE_VOID_PREFIX}${id}`;
+}
+
+function clearExpensePostedReloads(): void {
+  clearPostedReload(EXPENSE_NEW_SUBJECT);
+  clearPostedReload(EXPENSE_RELOAD_SUBJECT);
+  for (const record of listHeldWritesByPrefix(EXPENSE_VOID_PREFIX)) {
+    if (record.phase === 'posted_reload') {
+      clearPostedReload(record.subject);
+    }
+  }
+}
 
 /**
  * Pinned void targets stay on screen with the snapshotted row, including when
@@ -67,23 +103,8 @@ function reportedExpenseError(error: unknown): string {
   return mapExpenseError(error);
 }
 
-/**
- * A pin stays until this exact payload succeeds or the same replay is refused
- * by a rule the payload itself breaks. A permission or contention error can
- * fire before the server's request_id replay, so it leaves the original
- * unknown and keeps the pin. The first attempt pins only an unknown outcome.
- */
-function pinnedAfter<T>(
-  current: T | null,
-  attempt: T,
-  error: unknown,
-): T | null {
-  if (current && current !== attempt) return current;
-  if (current) return isPayloadRefusal(error) ? null : current;
-  return isUnknownOutcome(error) ? attempt : null;
-}
-
 export function ExpensesPage() {
+  const online = useOnline();
   const initialMonth = cairoMonthInput();
   const [month, setMonth] = useState(initialMonth);
   const monthRef = useRef(initialMonth);
@@ -93,17 +114,15 @@ export function ExpensesPage() {
   const [listError, setListError] = useState<string | null>(null);
   const [categoryError, setCategoryError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [needsReload, setNeedsReload] = useState(false);
+  const [localNeedsReload, setLocalNeedsReload] = useState(false);
   const [readLoads, setReadLoads] = useState(0);
   const [loadId, setLoadId] = useState(0);
   const [formEpoch, setFormEpoch] = useState(0);
-  const [pendingExpense, setPendingExpense] = useState<ExpenseDraft | null>(
-    null,
-  );
-  const [pendingVoids, setPendingVoids] = useState<
-    ReadonlyMap<string, VoidAttempt>
-  >(new Map());
-  const pendingVoidsRef = useRef(pendingVoids);
+  const [heldEpoch, setHeldEpoch] = useState(0);
+  // In-memory snapshots of voided rows while switching months (never written to localStorage).
+  const [voidSnapshots, setVoidSnapshots] = useState<
+    ReadonlyMap<string, ExpenseLine>
+  >(() => new Map());
   // Ids of voids that were sent and refused. A refusal is not stored, so a
   // correction reuses the id. Cleared once that void succeeds.
   const voidRequestIdsRef = useRef(new Map<string, string>());
@@ -112,10 +131,45 @@ export function ExpensesPage() {
   const savingRef = useRef(false);
   const needsReloadRef = useRef(false);
 
+  useEffect(
+    () => subscribeHeldWritesStore(() => setHeldEpoch((value) => value + 1)),
+    [],
+  );
+
+  const storedExpense =
+    heldEpoch < 0 ? null : getHeldWrite<ExpenseDraft>(EXPENSE_NEW_SUBJECT);
+  const pendingExpense =
+    storedExpense?.phase === 'unknown' ? storedExpense.payload : null;
+  const inflightExpense = storedExpense?.phase === 'inflight';
+  const storedVoids =
+    heldEpoch < 0
+      ? []
+      : listHeldWritesByPrefix<StoredVoidPayload>(EXPENSE_VOID_PREFIX);
+  const pendingVoids = new Map<string, VoidAttempt>();
+  for (const record of storedVoids) {
+    if (record.phase !== 'unknown' || !record.payload) continue;
+    const { id, requestId, reason } = record.payload;
+    pendingVoids.set(id, {
+      requestId,
+      reason,
+      entry: voidSnapshots.get(id) ?? null,
+    });
+  }
+  const inflightVoid = storedVoids.some(
+    (record) => record.phase === 'inflight',
+  );
+  const postedReload =
+    heldEpoch >= 0 &&
+    (storedExpense?.phase === 'posted_reload' ||
+      hasPostedReload(EXPENSE_RELOAD_SUBJECT) ||
+      storedVoids.some((record) => record.phase === 'posted_reload'));
+
+  const needsReload = localNeedsReload || postedReload;
   const monthStart = `${month}-01`;
   const ready = data !== null && data.monthStart === monthStart;
-  const writeLocked = saving || needsReload;
+  const writeLocked = saving || inflightExpense || inflightVoid || needsReload;
   const busy = writeLocked || readLoads > 0;
+  const writeDisabled = busy || !online;
 
   async function readMonth(monthValue: string): Promise<ExpenseMonth | null> {
     const seq = ++seqRef.current;
@@ -141,8 +195,9 @@ export function ExpensesPage() {
         if (cancelled || !next) return;
         setData(next);
         setLoadError(null);
+        clearExpensePostedReloads();
         needsReloadRef.current = false;
-        setNeedsReload(false);
+        setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
         setLoadError(messageFrom(error));
@@ -160,7 +215,7 @@ export function ExpensesPage() {
   }
 
   function changeMonth(next: string) {
-    if (savingRef.current || needsReloadRef.current) return;
+    if (savingRef.current || needsReloadRef.current || postedReload) return;
     if (!/^\d{4}-\d{2}$/.test(next) || next === monthRef.current) return;
     monthRef.current = next;
     setLoadError(null);
@@ -170,8 +225,15 @@ export function ExpensesPage() {
   async function runWrite(
     action: () => Promise<void>,
     setError: (message: string | null) => void,
+    onSaved?: () => void,
   ): Promise<WriteResult> {
-    if (savingRef.current || needsReloadRef.current || readsRef.current > 0) {
+    if (
+      savingRef.current ||
+      needsReloadRef.current ||
+      postedReload ||
+      readsRef.current > 0 ||
+      !isOnline()
+    ) {
       return { saved: false, error: null };
     }
     savingRef.current = true;
@@ -182,15 +244,17 @@ export function ExpensesPage() {
     try {
       await action();
       saved = true;
+      onSaved?.();
       needsReloadRef.current = true;
-      setNeedsReload(true);
+      setLocalNeedsReload(true);
       try {
         const next = await readMonth(monthRef.current);
         if (next) {
           setData(next);
           setLoadError(null);
+          clearExpensePostedReloads();
           needsReloadRef.current = false;
-          setNeedsReload(false);
+          setLocalNeedsReload(false);
         }
       } catch (error) {
         // The write is already stored. Stay locked until a later read applies,
@@ -209,65 +273,108 @@ export function ExpensesPage() {
     return { saved, error: failure };
   }
 
-  function clearVoidPin(id: string) {
-    voidRequestIdsRef.current.delete(id);
-    if (!pendingVoidsRef.current.has(id)) return;
-    const done = new Map(pendingVoidsRef.current);
-    done.delete(id);
-    pendingVoidsRef.current = done;
-    setPendingVoids(done);
-  }
-
-  function applyVoidPin(id: string, next: VoidAttempt | null) {
-    const current = pendingVoidsRef.current.get(id) ?? null;
-    if (next === current) return;
-    const updated = new Map(pendingVoidsRef.current);
-    if (next) updated.set(id, next);
-    else updated.delete(id);
-    pendingVoidsRef.current = updated;
-    setPendingVoids(updated);
-  }
-
   async function submitExpense(draft: ExpenseDraft) {
-    const result = await runWrite(() => addExpenseEntry(draft), setFormError);
-    if (result.saved) {
-      setPendingExpense(null);
-      setFormEpoch((value) => value + 1);
-      return;
-    }
+    const prior = getHeldWrite<ExpenseDraft>(EXPENSE_NEW_SUBJECT);
+    const wasPinned =
+      prior !== null &&
+      prior.requestId === draft.requestId &&
+      prior.phase === 'unknown';
+    const result = await runWrite(
+      () => {
+        putHeldWrite(EXPENSE_NEW_SUBJECT, {
+          requestId: draft.requestId,
+          payload: draft,
+          phase: 'inflight',
+          kind: 'expense',
+        });
+        return addExpenseEntry(draft);
+      },
+      setFormError,
+      () => {
+        setHeldWritePhase(
+          EXPENSE_NEW_SUBJECT,
+          draft.requestId,
+          'posted_reload',
+        );
+        setFormEpoch((value) => value + 1);
+      },
+    );
+    if (result.saved) return;
     // Not sent: the form stays editable and nothing is pinned.
     if (!result.error) return;
     setFormError(reportedExpenseError(result.error));
-    setPendingExpense((current) => pinnedAfter(current, draft, result.error));
+    if (wasPinned) {
+      if (isPayloadRefusal(result.error)) {
+        clearHeldWrite(EXPENSE_NEW_SUBJECT, draft.requestId);
+      } else {
+        setHeldWritePhase(EXPENSE_NEW_SUBJECT, draft.requestId, 'unknown');
+      }
+    } else if (isUnknownOutcome(result.error)) {
+      setHeldWritePhase(EXPENSE_NEW_SUBJECT, draft.requestId, 'unknown');
+    } else {
+      clearHeldWrite(EXPENSE_NEW_SUBJECT, draft.requestId);
+    }
   }
 
   async function voidEntry(id: string, typedReason: string) {
-    const pinned = pendingVoidsRef.current.get(id) ?? null;
+    const subject = voidSubject(id);
+    const prior = getHeldWrite<StoredVoidPayload>(subject);
+    const wasPinned = prior !== null && prior.phase === 'unknown';
+    const pinned = wasPinned ? prior.payload : null;
     const requestId =
       pinned?.requestId ??
       voidRequestIdsRef.current.get(id) ??
       crypto.randomUUID();
+    const reason = pinned?.reason ?? typedReason;
     const visible =
-      pinned?.entry ?? data?.entries.find((line) => line.id === id) ?? null;
-    const attempt = pinned ?? {
-      requestId,
-      reason: typedReason,
-      entry: visible ? { ...visible } : null,
+      voidSnapshots.get(id) ??
+      data?.entries.find((line) => line.id === id) ??
+      null;
+    const setVoidSnapshot = (entry: ExpenseLine | null) => {
+      setVoidSnapshots((current) => {
+        if (entry === null && !current.has(id)) return current;
+        const next = new Map(current);
+        if (entry) next.set(id, entry);
+        else next.delete(id);
+        return next;
+      });
     };
     const result = await runWrite(
-      () => voidExpenseEntry(id, attempt.reason, attempt.requestId),
+      () => {
+        if (visible) setVoidSnapshot({ ...visible });
+        putHeldWrite<StoredVoidPayload>(subject, {
+          requestId,
+          payload: { id, requestId, reason },
+          phase: 'inflight',
+          kind: 'expense_void',
+        });
+        return voidExpenseEntry(id, reason, requestId);
+      },
       setListError,
+      () => {
+        voidRequestIdsRef.current.delete(id);
+        setVoidSnapshot(null);
+        setHeldWritePhase(subject, requestId, 'posted_reload');
+      },
     );
-    if (result.saved) {
-      clearVoidPin(id);
-      return;
-    }
+    if (result.saved) return;
     // Not sent: leave an existing pin alone, and do not store this attempt.
     if (!result.error) return;
-    voidRequestIdsRef.current.set(id, attempt.requestId);
+    voidRequestIdsRef.current.set(id, requestId);
     setListError(reportedExpenseError(result.error));
-    const current = pendingVoidsRef.current.get(id) ?? null;
-    applyVoidPin(id, pinnedAfter(current, attempt, result.error));
+    if (wasPinned) {
+      if (isPayloadRefusal(result.error)) {
+        clearHeldWrite(subject, requestId);
+        setVoidSnapshot(null);
+      } else {
+        setHeldWritePhase(subject, requestId, 'unknown');
+      }
+    } else if (isUnknownOutcome(result.error)) {
+      setHeldWritePhase(subject, requestId, 'unknown');
+    } else {
+      clearHeldWrite(subject, requestId);
+      setVoidSnapshot(null);
+    }
   }
 
   return (
@@ -278,6 +385,7 @@ export function ExpensesPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">المصاريف</h1>
+      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
       <p>{formatMonth(monthStart)}</p>
       <label className="flex flex-col gap-1">
         الشهر
@@ -310,7 +418,7 @@ export function ExpensesPage() {
           key={formEpoch}
           categories={data.categories}
           month={month}
-          disabled={busy || !ready}
+          disabled={writeDisabled || !ready}
           serverError={formError}
           pending={pendingExpense}
           onMonthChange={changeMonth}
@@ -323,12 +431,20 @@ export function ExpensesPage() {
             <input
               type="checkbox"
               checked={data.complete}
-              disabled={busy}
+              disabled={writeDisabled}
               onChange={(event) =>
                 void runWrite(
                   () =>
                     setMonthExpenseComplete(monthStart, event.target.checked),
                   setListError,
+                  () => {
+                    putHeldWrite(EXPENSE_RELOAD_SUBJECT, {
+                      requestId: crypto.randomUUID(),
+                      payload: null,
+                      phase: 'posted_reload',
+                      kind: 'expense',
+                    });
+                  },
                 )
               }
             />
@@ -341,7 +457,7 @@ export function ExpensesPage() {
           {listError ? <p role="alert">{listError}</p> : null}
           <ExpenseList
             entries={entriesWithPinnedVoids(data.entries, pendingVoids)}
-            disabled={busy}
+            disabled={writeDisabled}
             pendingReasons={
               new Map(
                 [...pendingVoids].map(([id, pending]) => [id, pending.reason]),
@@ -354,7 +470,7 @@ export function ExpensesPage() {
           <AllocationTable days={data.days} />
           <CategoryManager
             categories={data.categories}
-            disabled={busy}
+            disabled={writeDisabled}
             serverError={categoryError}
             onAdd={async (name, kind: ExpenseKind) => {
               const result = await runWrite(

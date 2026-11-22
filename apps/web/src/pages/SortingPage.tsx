@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
+import {
+  clearHeldWrite,
+  clearPostedReload,
+  getHeldWrite,
+  putHeldWrite,
+  setHeldWritePhase,
+  subscribeHeldWritesStore,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
 import {
@@ -18,6 +27,8 @@ import {
   cairoNextDateStartIso,
   dateRangeError,
 } from '@/purchases/time';
+
+const SORT_SUBJECT = 'sort:new';
 
 const fieldClass = 'w-full rounded border border-neutral-300 px-3 py-2';
 
@@ -41,15 +52,16 @@ function historyFilterError(from: string, to: string): string | null {
 }
 
 export function SortingPage() {
+  const online = useOnline();
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadId, setLoadId] = useState(0);
   const [saving, setSaving] = useState(false);
-  const [needsReload, setNeedsReload] = useState(false);
+  const [localNeedsReload, setLocalNeedsReload] = useState(false);
   const [loads, setLoads] = useState(0);
   const [serverError, setServerError] = useState<string | null>(null);
-  const [pending, setPending] = useState<SortDraft | null>(null);
+  const [heldEpoch, setHeldEpoch] = useState(0);
   const [success, setSuccess] = useState<string | null>(null);
   const [formEpoch, setFormEpoch] = useState(0);
   const [from, setFrom] = useState('');
@@ -58,8 +70,20 @@ export function SortingPage() {
   const seqRef = useRef(0);
   const loadsRef = useRef(0);
   const filterRef = useRef({ from: '', to: '' });
-  const editingLocked = saving || needsReload;
+
+  useEffect(
+    () => subscribeHeldWritesStore(() => setHeldEpoch((value) => value + 1)),
+    [],
+  );
+
+  const stored = heldEpoch < 0 ? null : getHeldWrite<SortDraft>(SORT_SUBJECT);
+  const pending = stored?.phase === 'unknown' ? stored.payload : null;
+  const inflight = stored?.phase === 'inflight';
+  const postedReload = stored?.phase === 'posted_reload';
+  const needsReload = localNeedsReload || postedReload;
+  const editingLocked = saving || inflight || needsReload;
   const busy = editingLocked || loads > 0;
+  const writeLocked = busy || !online;
 
   async function readSnapshot(): Promise<ReadResult> {
     const problem = historyFilterError(
@@ -108,12 +132,13 @@ export function SortingPage() {
         if (cancelled || next.status === 'stale') return;
         if (next.status === 'blocked') {
           setLoadError(next.message);
-          setNeedsReload(false);
+          setLocalNeedsReload(false);
           return;
         }
         setSnapshot(next.snapshot);
         setLoadError(null);
-        setNeedsReload(false);
+        clearPostedReload(SORT_SUBJECT);
+        setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
         setLoadError(messageFrom(error));
@@ -157,7 +182,7 @@ export function SortingPage() {
   }
 
   async function handleSubmit(draft: SortDraft) {
-    if (busy || loadsRef.current > 0) return;
+    if (busy || loadsRef.current > 0 || !isOnline()) return;
     const problem = historyFilterError(
       filterRef.current.from,
       filterRef.current.to,
@@ -166,6 +191,17 @@ export function SortingPage() {
       setFilterError(problem);
       return;
     }
+    const prior = getHeldWrite<SortDraft>(SORT_SUBJECT);
+    const wasPinned =
+      prior !== null &&
+      prior.requestId === draft.requestId &&
+      prior.phase === 'unknown';
+    putHeldWrite(SORT_SUBJECT, {
+      requestId: draft.requestId,
+      payload: draft,
+      phase: 'inflight',
+      kind: 'sort',
+    });
     setSaving(true);
     setServerError(null);
     setSuccess(null);
@@ -173,38 +209,38 @@ export function SortingPage() {
     try {
       await recordSort(draft);
       saved = true;
-      // The form resubmits the pinned object, so this success is that payload.
-      setPending(null);
-      // Stays set until the reload applies data, or a visible retryable error
-      // replaces it. A range that cannot be read clears the lock instead.
-      setNeedsReload(true);
+      setHeldWritePhase(SORT_SUBJECT, draft.requestId, 'posted_reload');
+      setLocalNeedsReload(true);
       setFormEpoch((value) => value + 1);
       setSuccess('اتسجل الفرز');
       const next = await readSnapshot();
       if (next.status === 'ready') {
         setSnapshot(next.snapshot);
         setLoadError(null);
-        setNeedsReload(false);
+        clearPostedReload(SORT_SUBJECT);
+        setLocalNeedsReload(false);
       } else if (next.status === 'blocked') {
         setLoadError(next.message);
-        setNeedsReload(false);
+        setLocalNeedsReload(false);
       } else {
-        setNeedsReload(false);
+        setLocalNeedsReload(false);
       }
     } catch (error) {
       if (!saved) {
         setServerError(reportedSortError(error));
-        // A pin stays until this exact payload succeeds or the same replay
-        // is refused by a rule the payload itself breaks. A permission or
-        // contention error can fire before the server's request_id replay,
-        // so it leaves the original unknown and keeps the pin.
-        setPending((current) => {
-          if (current && current !== draft) return current;
-          if (current) return isPayloadRefusal(error) ? null : current;
-          return isUnknownOutcome(error) ? draft : null;
-        });
+        if (wasPinned) {
+          if (isPayloadRefusal(error)) {
+            clearHeldWrite(SORT_SUBJECT, draft.requestId);
+          } else {
+            setHeldWritePhase(SORT_SUBJECT, draft.requestId, 'unknown');
+          }
+        } else if (isUnknownOutcome(error)) {
+          setHeldWritePhase(SORT_SUBJECT, draft.requestId, 'unknown');
+        } else {
+          clearHeldWrite(SORT_SUBJECT, draft.requestId);
+        }
       } else {
-        setNeedsReload(true);
+        setLocalNeedsReload(true);
         setLoadError(messageFrom(error));
       }
     } finally {
@@ -222,6 +258,7 @@ export function SortingPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الفرز</h1>
+      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
       {success ? <p role="status">{success}</p> : null}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <label className="flex flex-col gap-1">
@@ -293,13 +330,13 @@ export function SortingPage() {
       ) : null}
       {snapshot !== null ? (
         <>
-          {items.length === 0 ? (
+          {items.length === 0 && pending === null ? (
             <p>لسه مفيش سمك مخلوط — ضيف صنف الأول</p>
           ) : (
             <SortForm
               key={formEpoch}
               items={items}
-              locked={busy}
+              locked={writeLocked}
               submitting={saving}
               serverError={serverError}
               pending={pending}

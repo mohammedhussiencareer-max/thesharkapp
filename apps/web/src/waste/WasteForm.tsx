@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { kindLabels as stockKindLabels } from '@/items/labels';
 import { stockKinds } from '@/items/types';
+import { useOnline } from '@/lib/online';
 import { primaryButton, secondaryButton } from '@/lib/page-style';
 import { listUnitsAt } from '@/purchases/api';
 import type { StockChoice } from '@/purchases/types';
@@ -42,10 +43,11 @@ export function WasteForm({
   submitLabel: string;
   onCancel?: () => void;
 }) {
+  const online = useOnline();
   const [values, setValues] = useState<FormValues>(start.values);
   const [errors, setErrors] = useState<FormErrors | null>(null);
   const counter = useRef(start.values.lines.length);
-  const locked = action.saving || action.held !== null;
+  const locked = action.saving || action.held !== null || !online;
 
   const used = new Set(values.lines.map((line) => line.itemId));
   const selected = choices.filter((choice) => used.has(choice.id));

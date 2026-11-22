@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { messageFrom } from '@/items/errors';
 import { settleAction, subscribeHeldWrites } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { isOnline, useOnline } from '@/lib/online';
 import { setOrderDisposition } from '@/order-decisions/api';
 import { unknownDecisions } from '@/order-decisions/held-decisions';
 import { decisionLabels, decisionSubject } from '@/order-decisions/format';
@@ -19,6 +20,7 @@ export function PendingSaves({
   shown: ReadonlySet<string>;
   onSettled: (orderId: string, notice: DecisionNotice) => void;
 }) {
+  const online = useOnline();
   const [, setEpoch] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
   const flight = useRef(false);
@@ -34,7 +36,7 @@ export function PendingSaves({
   if (pending.length === 0) return null;
 
   async function retry(write: DecisionWrite): Promise<void> {
-    if (flight.current) return;
+    if (flight.current || !isOnline()) return;
     flight.current = true;
     setBusy(write.orderId);
     const subject = decisionSubject(write.orderId);
@@ -66,7 +68,7 @@ export function PendingSaves({
             طلب {write.orderId} — {decisionLabels[write.decision]}
           </p>
           <UnknownSave
-            disabled={busy !== null}
+            disabled={busy !== null || !online}
             onRetry={() => void retry(write)}
           />
         </div>

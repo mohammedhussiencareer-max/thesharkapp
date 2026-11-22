@@ -11,6 +11,7 @@ import { UnknownSave } from '@/items/UnknownSave';
 import { currentMinuteMs } from '@/items/effective';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatCairo } from '@/lib/cairo';
+import { isOnline, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import { coverAt, quantityError } from '@/mapping/format';
 import { sourceChangedMessage } from '@/mapping/labels';
@@ -432,13 +433,14 @@ export function PackagingEditor({
   allowCapacity: boolean;
   onReload: () => Promise<void>;
 }) {
+  const online = useOnline();
   const [heldEpoch, setHeldEpoch] = useState(0);
   const [saving, setSaving] = useState(false);
   const flight = useRef(false);
   const held = heldEpoch < 0 ? null : unknownAction<PackagingWrite>(subjectKey);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const disabled = saving || held !== null;
+  const disabled = saving || held !== null || !online;
 
   useEffect(
     () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
@@ -446,7 +448,7 @@ export function PackagingEditor({
   );
 
   async function finish(write: PackagingWrite) {
-    if (flight.current) return;
+    if (flight.current || !isOnline()) return;
     flight.current = true;
     setSaving(true);
     setError(null);

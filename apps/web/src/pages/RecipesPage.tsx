@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import { subscribeHeldWrites, unknownAction } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
 import { createRecipe, listRecipes } from '@/recipes/api';
 import {
@@ -28,6 +29,7 @@ function isKindFilter(value: string): value is 'all' | RecipeKind {
 }
 
 export function RecipesPage() {
+  const online = useOnline();
   const navigate = useNavigate();
   const [recipes, setRecipes] = useState<RecipeSummary[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -48,7 +50,7 @@ export function RecipesPage() {
       : unknownAction<string>(
           recipeCreateSubject(submitted.name, submitted.kind),
         );
-  const formDisabled = creating || held !== null;
+  const formDisabled = creating || held !== null || !online;
 
   useEffect(
     () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
@@ -81,7 +83,7 @@ export function RecipesPage() {
   }
 
   async function send(draft: Draft) {
-    if (flight.current) return;
+    if (flight.current || !isOnline()) return;
     flight.current = true;
     setCreating(true);
     setCreateError(null);
@@ -125,6 +127,7 @@ export function RecipesPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الوصفات</h1>
+      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
       <p>
         <Link className="underline" to="/recipes/import">
           استيراد الوصفات

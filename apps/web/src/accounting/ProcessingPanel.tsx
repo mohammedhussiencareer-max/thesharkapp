@@ -32,8 +32,10 @@ import {
   settleAction,
   subscribeHeldWrites,
   unknownAction,
+  updateActionPayload,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { isOnline, useOnline } from '@/lib/online';
 import { isDefiniteRefusal } from '@/lib/write-outcome';
 import { primaryButton, secondaryButton } from '@/lib/page-style';
 
@@ -88,6 +90,7 @@ export function ProcessingPanel({
   refreshKey?: number;
   onShiftDataStale?: () => void;
 }) {
+  const online = useOnline();
   const [summary, setSummary] = useState<ProcessingSummary | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -144,7 +147,7 @@ export function ProcessingPanel({
   }
 
   async function finishFresh(action: RunHeld): Promise<void> {
-    if (flight.current) return;
+    if (flight.current || !isOnline()) return;
     flight.current = true;
     setRunning(true);
     setNotice(null);
@@ -153,8 +156,10 @@ export function ProcessingPanel({
       try {
         outcome = await runDeductions((report: AttemptReport) => {
           action.report = report;
+          updateActionPayload(accountingRunSubject, action.requestId, action);
         });
       } catch (error) {
+        updateActionPayload(accountingRunSubject, action.requestId, action);
         settleAction(accountingRunSubject, action.requestId, error);
         setNotice(messageFrom(error));
         return;
@@ -172,6 +177,7 @@ export function ProcessingPanel({
         outcome.stop === 'call_failed' &&
         (outcome.report === 'unreported' || outcome.report === 'busy')
       ) {
+        updateActionPayload(accountingRunSubject, action.requestId, action);
         settleAction(accountingRunSubject, action.requestId, outcome.cause);
         setNotice(runStopLabel('call_failed'));
         return;
@@ -186,7 +192,7 @@ export function ProcessingPanel({
   }
 
   async function finishUnknown(action: RunHeld): Promise<void> {
-    if (flight.current) return;
+    if (flight.current || !isOnline()) return;
     flight.current = true;
     setRunning(true);
     setNotice(null);
@@ -216,7 +222,7 @@ export function ProcessingPanel({
   }
 
   async function finishRetry(action: RetryHeld): Promise<void> {
-    if (flight.current) return;
+    if (flight.current || !isOnline()) return;
     flight.current = true;
     setRunning(true);
     setNotice(null);
@@ -248,7 +254,13 @@ export function ProcessingPanel({
   }
 
   function run(): void {
-    if (flight.current || running || hasAction(accountingRunSubject)) return;
+    if (
+      flight.current ||
+      running ||
+      !isOnline() ||
+      hasAction(accountingRunSubject)
+    )
+      return;
     const action = beginAction<RunHeld>(accountingRunSubject, (requestId) => ({
       requestId,
       report: null,
@@ -257,13 +269,13 @@ export function ProcessingPanel({
   }
 
   function retryRun(): void {
-    if (!heldRun || flight.current || running) return;
+    if (!heldRun || flight.current || running || !isOnline()) return;
     void finishUnknown(heldRun);
   }
 
   function retryOrder(order: ParkedOrder): void {
     const subject = accountingRetrySubject(order.orderId);
-    if (flight.current || running || hasAction(subject)) return;
+    if (flight.current || running || !isOnline() || hasAction(subject)) return;
     const action = beginAction<RetryHeld>(subject, (requestId) => ({
       requestId,
       orderId: order.orderId,
@@ -327,12 +339,12 @@ export function ProcessingPanel({
           <p>{formatCoverage(summary.coverage)}</p>
           {notice ? <p>{notice}</p> : null}
           {heldRun ? (
-            <UnknownSave disabled={running} onRetry={retryRun} />
+            <UnknownSave disabled={running || !online} onRetry={retryRun} />
           ) : (
             <button
               className={primaryButton}
               type="button"
-              disabled={running}
+              disabled={running || !online}
               onClick={run}
             >
               {running ? 'جاري الحساب…' : 'شغّل الخصم'}
@@ -353,14 +365,14 @@ export function ProcessingPanel({
                     <p>{formatFailureReason(order.reason, order.sqlstate)}</p>
                     {held ? (
                       <UnknownSave
-                        disabled={running}
+                        disabled={running || !online}
                         onRetry={() => retryHeldOrder(order.orderId)}
                       />
                     ) : (
                       <button
                         className={secondaryButton}
                         type="button"
-                        disabled={running}
+                        disabled={running || !online}
                         onClick={() => retryOrder(order)}
                       >
                         رجّع الطلب
@@ -377,7 +389,7 @@ export function ProcessingPanel({
                 <li key={held.orderId} className="flex flex-col gap-1">
                   <p dir="ltr">{held.orderId}</p>
                   <UnknownSave
-                    disabled={running}
+                    disabled={running || !online}
                     onRetry={() => retryHeldOrder(held.orderId)}
                   />
                 </li>

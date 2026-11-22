@@ -29,6 +29,7 @@ import {
   hasAction,
   settleAction,
   unknownAction,
+  updateActionPayload,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
@@ -46,6 +47,7 @@ import {
 } from '@/items/types';
 import { validateConversion } from '@/items/validation';
 import { formatCairo } from '@/lib/cairo';
+import { isOnline, useOnline } from '@/lib/online';
 
 const noVersions: readonly CostingVersion[] = [];
 
@@ -342,7 +344,9 @@ export function ConversionsPanel({
   const metaReady = meta?.itemId === item.id;
   const shiftStart = metaReady ? (meta?.shiftStart ?? null) : null;
   const unitOptions = metaReady ? (meta?.unitOptions ?? []) : [];
-  const controlsDisabled = busy || locked || !metaReady || schedule === null;
+  const online = useOnline();
+  const controlsDisabled =
+    busy || locked || !online || !metaReady || schedule === null;
   // Fresh saves wait until the cached rows, the schedule and the item shown
   // agree on the identity. A held retry still replays unchanged.
   const snapshotMismatch =
@@ -484,7 +488,7 @@ export function ConversionsPanel({
   }
 
   async function run(work: () => Promise<void>): Promise<boolean> {
-    if (busy || locked) return false;
+    if (busy || locked || !isOnline()) return false;
     setBusy(true);
     onBusyChange?.(true);
     setActionError(null);
@@ -543,6 +547,11 @@ export function ConversionsPanel({
             action.unitRequestId,
           );
           action.createdCode = unitCode;
+          updateActionPayload(
+            actionSubject(action),
+            action.write.requestId,
+            action,
+          );
           setCreatedUnit({
             code: unitCode,
             inputCode: action.inputCode,

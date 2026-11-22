@@ -24,6 +24,7 @@ import { SalesShiftPage } from '@/pages/SalesShiftPage';
 import { WastePage } from '@/pages/WastePage';
 import { MissingEnvScreen } from '@/pages/MissingEnvScreen';
 import { NotFoundPage } from '@/pages/NotFoundPage';
+import { UpdateBanner } from '@/pwa/UpdateBanner';
 
 function HomeRoute() {
   const { email, signOut } = useAuth();
@@ -191,6 +192,7 @@ export function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
+        <UpdateBanner />
         <AppRoutes />
       </AuthProvider>
     </BrowserRouter>

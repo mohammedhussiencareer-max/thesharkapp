@@ -21,6 +21,7 @@ import {
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
+import { isOnline, useOnline } from '@/lib/online';
 import { reloadFailedMessage } from '@/waste/useWasteAction';
 
 export const ACTIVATION_SUBJECT = 'activation';
@@ -41,6 +42,7 @@ export function useActivationAction(
   review: OpeningReview | null,
   onReview: (review: OpeningReview) => void,
 ) {
+  const online = useOnline();
   const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [reloadBlocked, setReloadBlocked] = useState(false);
@@ -88,7 +90,7 @@ export function useActivationAction(
       ? 'إعادة المحاولة'
       : 'تفعيل الخصم';
   const activateDisabled =
-    saving || (!reloadPending && unknown === null && !allChecked);
+    !online || saving || (!reloadPending && unknown === null && !allChecked);
 
   async function reloadReview(): Promise<OpeningReview | null> {
     try {
@@ -126,7 +128,7 @@ export function useActivationAction(
   }
 
   async function activate(): Promise<void> {
-    if (!review || flight.current) return;
+    if (!review || flight.current || !isOnline()) return;
     const current = heldAction<ActivationWrite>(ACTIVATION_SUBJECT);
     const unknownHeld = unknownAction<ActivationWrite>(ACTIVATION_SUBJECT);
     if (reloadPending) {

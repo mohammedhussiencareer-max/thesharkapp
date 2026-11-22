@@ -7,6 +7,7 @@ import {
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
+import { isOnline } from '@/lib/online';
 import { recordWaste } from '@/waste/api';
 import { MissingCostBasisError } from '@/waste/errors';
 import type { WasteNotice, WasteResult, WasteWrite } from '@/waste/types';
@@ -86,12 +87,12 @@ export function useWasteAction(
 
   /** Starts a new action, or does nothing while one is outstanding. */
   function send(create: (requestId: string) => WasteWrite): void {
-    if (flight.current || saving || hasAction(subject)) return;
+    if (flight.current || saving || !isOnline() || hasAction(subject)) return;
     void finish(beginAction<WasteWrite>(subject, create));
   }
 
   function retry(): void {
-    if (held) void finish(held);
+    if (held && isOnline()) void finish(held);
   }
 
   return {

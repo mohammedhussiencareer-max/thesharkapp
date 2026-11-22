@@ -11,6 +11,7 @@ import {
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatCairo } from '@/lib/cairo';
+import { isOnline, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import {
   setBaseMapping,
@@ -350,6 +351,7 @@ export function SubjectPanel({
   catalog: MappingCatalog;
   onReload: () => Promise<void>;
 }) {
+  const online = useOnline();
   const subject = baseSubject(base.posItemId, base.sizeKeyText);
   const [heldEpoch, setHeldEpoch] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -361,7 +363,7 @@ export function SubjectPanel({
     null,
   );
   const [resetEpoch, setResetEpoch] = useState(0);
-  const disabled = saving || held !== null;
+  const disabled = saving || held !== null || !online;
 
   useEffect(
     () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
@@ -369,7 +371,7 @@ export function SubjectPanel({
   );
 
   async function finish(action: BaseHeld) {
-    if (flight.current) return;
+    if (flight.current || !isOnline()) return;
     flight.current = true;
     setSaving(true);
     setError(null);
@@ -1031,6 +1033,7 @@ function OptionMappingForm({
   catalog: MappingCatalog;
   onReload: () => Promise<void>;
 }) {
+  const online = useOnline();
   const subject = optionSubject(
     scope,
     scope === 'item' ? base.posItemId : '',
@@ -1042,7 +1045,7 @@ function OptionMappingForm({
   const flight = useRef(false);
   const held =
     heldEpoch < 0 ? null : unknownAction<OptionMappingWrite>(subject);
-  const disabled = saving || held !== null;
+  const disabled = saving || held !== null || !online;
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const { timing, covering, atMs } = useFamilyTiming(
@@ -1087,7 +1090,7 @@ function OptionMappingForm({
   }
 
   async function finish(write: OptionMappingWrite) {
-    if (flight.current) return;
+    if (flight.current || !isOnline()) return;
     flight.current = true;
     setSaving(true);
     setError(null);

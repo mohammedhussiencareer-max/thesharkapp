@@ -12,6 +12,7 @@ import {
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { isOnline, useOnline } from '@/lib/online';
 import { updateRecipe, type RecipeUpdate } from '@/recipes/api';
 import { recipeKindLabels } from '@/recipes/labels';
 import { recipeUpdateSubject } from '@/recipes/subjects';
@@ -38,6 +39,7 @@ export function RecipeDetails({
   /** Re-reads the recipe. Resolves to null when the read failed. */
   onReload: () => Promise<RecipeRecord | null>;
 }) {
+  const online = useOnline();
   const subject = recipeUpdateSubject(recipe.id);
   const [expected, setExpected] = useState(recipe);
   const [name, setName] = useState(recipe.name);
@@ -48,7 +50,7 @@ export function RecipeDetails({
   const [notice, setNotice] = useState<string | null>(null);
   const flight = useRef(false);
   const held = heldEpoch < 0 ? null : unknownAction<DetailsAction>(subject);
-  const disabled = locked || saving || held !== null;
+  const disabled = locked || saving || held !== null || !online;
 
   useEffect(
     () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
@@ -62,7 +64,7 @@ export function RecipeDetails({
   }
 
   async function finish(action: DetailsAction) {
-    if (flight.current) return;
+    if (flight.current || !isOnline()) return;
     flight.current = true;
     setSaving(true);
     onBusyChange(true);

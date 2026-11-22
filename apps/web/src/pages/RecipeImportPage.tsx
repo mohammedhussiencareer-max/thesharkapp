@@ -10,6 +10,7 @@ import {
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
 import {
   commitRecipeImport,
@@ -106,6 +107,7 @@ function Workspace({
   ctx: ImportContext;
   reload: () => Promise<void>;
 }) {
+  const online = useOnline();
   const subject = recipeImportSubject;
   const [heldEpoch, setHeldEpoch] = useState(0);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
@@ -120,7 +122,7 @@ function Workspace({
   const [pickerKey, setPickerKey] = useState(0);
   const flight = useRef(false);
   const held = heldEpoch < 0 ? null : unknownAction<ImportAction>(subject);
-  const disabled = saving || reading || stale || held !== null;
+  const disabled = saving || reading || stale || held !== null || !online;
   const timing = useDatedTiming(
     undefined,
     ctx.shiftStart,
@@ -263,7 +265,7 @@ function Workspace({
   }
 
   function retry() {
-    if (!held || flight.current) return;
+    if (!held || flight.current || !isOnline()) return;
     flight.current = true;
     void run(held);
   }
@@ -282,6 +284,7 @@ function Workspace({
 
   return (
     <>
+      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
       {result ? (
         <section className="flex flex-col gap-2" aria-label="نتيجة الاستيراد">
           <p role="status">الاستيراد اتحفظ</p>

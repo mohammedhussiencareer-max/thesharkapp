@@ -18,6 +18,7 @@ const ledgerSpecs = [
   '**/mapping.spec.ts',
   '**/packaging.spec.ts',
   '**/order-decisions.spec.ts',
+  '**/mobile-pwa.spec.ts',
 ];
 
 export default defineConfig({

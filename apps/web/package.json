@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:desktop": "node scripts/build-desktop.mjs",
     "preview": "vite preview --host 127.0.0.1 --port 4173 --strictPort",
     "lint": "eslint . --max-warnings=0",
     "typecheck": "tsc -b --pretty false",
@@ -36,6 +37,7 @@
     "typescript": "5.9.3",
     "typescript-eslint": "8.71.2",
     "vite": "8.3.4",
+    "vite-plugin-pwa": "2.0.0",
     "vitest": "5.0.5"
   }
 }

@@ -1,4 +1,9 @@
 import type { Session } from '@supabase/supabase-js';
+import {
+  clearHeldWritesForUser,
+  resetHeldWritesStore,
+  setHeldWriteUser,
+} from '@/lib/held-writes';
 import { supabase } from '@/lib/supabase';
 import type { AuthStatus } from '@/lib/auth-context';
 
@@ -11,6 +16,7 @@ let snapshot: Snapshot = { status: 'loading', email: null };
 let started = false;
 let checkId = 0;
 let currentSession: Session | null = null;
+let lastUserId: string | null = null;
 let unsubscribeAuth: (() => void) | null = null;
 const listeners = new Set<() => void>();
 
@@ -54,16 +60,25 @@ export function startAuth() {
   const client = supabase;
   if (!client) return;
   started = true;
+  setHeldWriteUser(null);
 
   const {
     data: { subscription },
-  } = client.auth.onAuthStateChange((_event, session) => {
+  } = client.auth.onAuthStateChange((event, session) => {
+    const previousUserId = currentSession?.user.id ?? lastUserId;
     currentSession = session;
     if (!session) {
+      if (event === 'SIGNED_OUT' && previousUserId) {
+        clearHeldWritesForUser(previousUserId);
+      }
+      lastUserId = null;
+      setHeldWriteUser(null);
       checkId += 1;
       emit({ status: 'signed-out', email: null });
       return;
     }
+    lastUserId = session.user.id;
+    setHeldWriteUser(session.user.id);
     checkOwner(session);
   });
 
@@ -96,6 +111,12 @@ export async function signIn(
 export async function signOut() {
   const client = supabase;
   if (!client) return;
+  const userId = currentSession?.user.id ?? lastUserId;
+  if (userId) {
+    clearHeldWritesForUser(userId);
+  }
+  lastUserId = null;
+  setHeldWriteUser(null);
   checkId += 1;
   await client.auth.signOut();
 }
@@ -109,9 +130,11 @@ export function retryOwnerCheck() {
 export function resetAuthStore() {
   checkId += 1;
   currentSession = null;
+  lastUserId = null;
   unsubscribeAuth?.();
   unsubscribeAuth = null;
   started = false;
   snapshot = { status: 'loading', email: null };
   listeners.clear();
+  resetHeldWritesStore({ clearStorage: false, resetUser: true });
 }

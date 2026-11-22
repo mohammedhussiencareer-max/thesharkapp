@@ -26,7 +26,16 @@ import { ItemForm } from '@/items/ItemForm';
 import { ItemList } from '@/items/ItemList';
 import type { CatalogItem, ItemSave } from '@/items/types';
 import { emptyItemForm, itemToFormValues } from '@/items/validation';
+import {
+  clearPostedReload,
+  hasPostedReload,
+  putHeldWrite,
+  subscribeHeldWritesStore,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
+
+const ITEMS_RELOAD_SUBJECT = 'items:reload';
 
 function visibleCount(
   items: readonly CatalogItem[],
@@ -48,6 +57,7 @@ function visibleCount(
 }
 
 export function ItemsPage() {
+  const online = useOnline();
   const [items, setItems] = useState<CatalogItem[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -60,12 +70,21 @@ export function ItemsPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   // A save landed and fresh rows are not applied yet: stay locked until a read applies them.
-  const [needsReload, setNeedsReload] = useState(false);
+  const [localNeedsReload, setLocalNeedsReload] = useState(false);
+  const [heldEpoch, setHeldEpoch] = useState(0);
   // One page-wide lock: while an item save or a conversion operation (and the
   // reload after it) is in flight, nothing that edits data or remounts a panel
   // can start, so no editor or panel ever opens on stale data.
   const [catalogLoads, setCatalogLoads] = useState(0);
+  const postedReload = heldEpoch >= 0 && hasPostedReload(ITEMS_RELOAD_SUBJECT);
+  const needsReload = localNeedsReload || postedReload;
   const busy = saving || conversionsBusy || needsReload || catalogLoads > 0;
+  const writeLocked = busy || !online;
+
+  useEffect(
+    () => subscribeHeldWritesStore(() => setHeldEpoch((value) => value + 1)),
+    [],
+  );
   const [openConversionsId, setOpenConversionsId] = useState<string | null>(
     null,
   );
@@ -102,7 +121,8 @@ export function ItemsPage() {
     if (!next) return;
     setItems(next);
     setLoadError(null);
-    setNeedsReload(false);
+    clearPostedReload(ITEMS_RELOAD_SUBJECT);
+    setLocalNeedsReload(false);
     const editing = formModeRef.current;
     if (staleItemId && editing?.type === 'edit' && editing.id === staleItemId) {
       const fresh = next.find((row) => row.id === staleItemId);
@@ -117,7 +137,13 @@ export function ItemsPage() {
   // A landed conversion can configure the item. Stay locked until the catalog
   // says so; a failed read leaves the lock and the retry button in place.
   async function refreshAfterConversion() {
-    setNeedsReload(true);
+    putHeldWrite(ITEMS_RELOAD_SUBJECT, {
+      requestId: crypto.randomUUID(),
+      payload: null,
+      phase: 'posted_reload',
+      kind: 'action',
+    });
+    setLocalNeedsReload(true);
     try {
       await reloadCatalog();
     } catch (error) {
@@ -133,7 +159,8 @@ export function ItemsPage() {
         if (cancelled || !next) return;
         setItems(next);
         setLoadError(null);
-        setNeedsReload(false);
+        clearPostedReload(ITEMS_RELOAD_SUBJECT);
+        setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
         setLoadError(messageFrom(error));
@@ -154,13 +181,13 @@ export function ItemsPage() {
   }
 
   function openCreate() {
-    if (busy) return;
+    if (writeLocked) return;
     setFormError(null);
     setEditor({ type: 'create' });
   }
 
   function openEdit(item: CatalogItem) {
-    if (busy) return;
+    if (writeLocked) return;
     setFormError(null);
     // The form and the stale-write expectation always start from the same row.
     expectedRef.current = expectationFromItem(item);
@@ -170,7 +197,8 @@ export function ItemsPage() {
 
   async function handleSubmit(action: ItemSave): Promise<boolean> {
     const started = formModeRef.current;
-    if (!started || busy || catalogLoadsRef.current > 0) return false;
+    if (!started || busy || catalogLoadsRef.current > 0 || !isOnline())
+      return false;
     setSaving(true);
     setFormError(null);
     let saved = false;
@@ -200,7 +228,13 @@ export function ItemsPage() {
       saved = true;
       // Locked from the moment the save lands until fresh rows are applied.
       // The editor stays open so a sibling section keeps its pending value.
-      setNeedsReload(true);
+      putHeldWrite(ITEMS_RELOAD_SUBJECT, {
+        requestId: crypto.randomUUID(),
+        payload: null,
+        phase: 'posted_reload',
+        kind: 'action',
+      });
+      setLocalNeedsReload(true);
       if (
         action.kind === 'create' &&
         sameEditor(formModeRef.current, started)
@@ -211,7 +245,8 @@ export function ItemsPage() {
       if (next) {
         setItems(next);
         setLoadError(null);
-        setNeedsReload(false);
+        clearPostedReload(ITEMS_RELOAD_SUBJECT);
+        setLocalNeedsReload(false);
       }
     } catch (error) {
       if (
@@ -233,7 +268,7 @@ export function ItemsPage() {
           setFormError(messageFrom(error));
         }
       } else {
-        setNeedsReload(true);
+        setLocalNeedsReload(true);
         setLoadError(messageFrom(error));
       }
       if (!saved) throw error;
@@ -258,6 +293,7 @@ export function ItemsPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الأصناف</h1>
+      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
       {loading && items === null ? <p>جاري تحميل الأصناف…</p> : null}
       {items === null && !loading ? (
         <div className="flex flex-col gap-3">
@@ -291,7 +327,7 @@ export function ItemsPage() {
             <button
               className={primaryButton}
               type="button"
-              disabled={busy}
+              disabled={writeLocked}
               onClick={openCreate}
             >
               ضيف صنف
@@ -315,7 +351,7 @@ export function ItemsPage() {
                 editingItem ? itemToFormValues(editingItem) : emptyItemForm()
               }
               submitting={saving}
-              locked={busy}
+              locked={writeLocked}
               serverError={formError}
               onClearServerError={() => setFormError(null)}
               detailsKey={formEpoch}
@@ -342,7 +378,7 @@ export function ItemsPage() {
               items={items}
               showInactive={showInactive}
               openConversionsId={openConversionsId}
-              editsDisabled={busy}
+              editsDisabled={writeLocked}
               identityDirtyId={
                 formIdentityDirty && formMode?.type === 'edit'
                   ? formMode.id

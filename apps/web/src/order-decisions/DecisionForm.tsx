@@ -8,6 +8,7 @@ import {
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { isOnline, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import { setOrderDisposition } from '@/order-decisions/api';
 import { noteDecisionOrder } from '@/order-decisions/held-decisions';
@@ -48,6 +49,7 @@ export function DecisionForm({
   onNotice: (notice: DecisionNotice | null) => void;
   onChanged: (orderId: string) => Promise<void>;
 }) {
+  const online = useOnline();
   const subject = decisionSubject(row.orderId);
   const [choice, setChoice] = useState<Decision>(row.decision);
   const [reason, setReason] = useState('');
@@ -92,10 +94,10 @@ export function DecisionForm({
         ? reasonTooLongMessage
         : null
     : null;
-  const blocked = saving || held !== null || unresolved;
+  const blocked = saving || held !== null || unresolved || !online;
 
   async function finish(action: DecisionWrite): Promise<void> {
-    if (flight.current) return;
+    if (flight.current || !isOnline()) return;
     flight.current = true;
     setSaving(true);
     setProblem(null);

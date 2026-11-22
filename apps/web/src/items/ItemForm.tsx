@@ -59,6 +59,7 @@ import {
   type ItemSave,
 } from '@/items/types';
 
+import { isOnline, useOnline } from '@/lib/online';
 import { cairoDateTimeLocalToIso } from '@/purchases/time';
 import {
   decimalsEqual,
@@ -116,6 +117,7 @@ export function ItemForm({
   /** The costing schedule is for a different identity than the shown item. */
   onItemStale?: (itemId: string) => void | Promise<void>;
 }) {
+  const online = useOnline();
   const titleId = useId();
   const [values, setValues] = useState(initial ?? emptyItemForm);
   const [seenDetails, setSeenDetails] = useState(detailsKey);
@@ -205,9 +207,10 @@ export function ItemForm({
   const lossBlocked = lossHeld !== null;
   const priceBlocked = priceHeld !== null;
   const createBlocked = createHeld !== null;
-  const detailsDisabled = submitting || locked || createBlocked;
-  const lossDisabled = submitting || locked || lossBlocked || createBlocked;
-  const priceDisabled = submitting || locked || priceBlocked;
+  const detailsDisabled = submitting || locked || createBlocked || !online;
+  const lossDisabled =
+    submitting || locked || lossBlocked || createBlocked || !online;
+  const priceDisabled = submitting || locked || priceBlocked || !online;
   const parsedPrice = parseUnitCost(priceText);
   const zeroPrice =
     parsedPrice.ok && !('empty' in parsedPrice) && parsedPrice.text === '0';
@@ -425,7 +428,14 @@ export function ItemForm({
   }
 
   function retryCreate() {
-    if (!submittedDraft || submitting || locked || createFlight.current) return;
+    if (
+      !submittedDraft ||
+      submitting ||
+      locked ||
+      !isOnline() ||
+      createFlight.current
+    )
+      return;
     if (unknownAction<string>(createSubject(submittedDraft)) === null) return;
     createFlight.current = true;
     void onSubmit({ kind: 'create', draft: submittedDraft })
@@ -467,6 +477,7 @@ export function ItemForm({
       !editingId ||
       submitting ||
       locked ||
+      !isOnline() ||
       refreshingSchedule ||
       lossFlight.current
     ) {
@@ -564,7 +575,14 @@ export function ItemForm({
   }
 
   function retryPrice() {
-    if (!editingId || submitting || locked || priceFlight.current) return;
+    if (
+      !editingId ||
+      submitting ||
+      locked ||
+      !isOnline() ||
+      priceFlight.current
+    )
+      return;
     const action = unknownAction<PriceAction>(priceSubject(editingId));
     if (!action) return;
     void finishPrice(action);

@@ -1,0 +1,815 @@
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  activateInventory,
+  loadOpeningReview,
+  loadProcessingSummary,
+  runDeductions,
+} from '@/accounting/api';
+import { ProcessingPanel } from '@/accounting/ProcessingPanel';
+import type { OpeningReview, ProcessingSummary } from '@/accounting/types';
+import {
+  listCounts,
+  listDailyItems,
+  listPendingCounts,
+  recordCount,
+  recordStoredCount,
+} from '@/counts/api';
+import { pendingResendMessage, retrySafeMessage } from '@/counts/errors';
+import type { CountItem, CountWriteResult } from '@/counts/types';
+import {
+  addExpenseCategory,
+  addExpenseEntry,
+  loadExpenseMonth,
+  renameExpenseCategory,
+  setExpenseCategoryActive,
+  setMonthExpenseComplete,
+  voidExpenseEntry,
+} from '@/expenses/api';
+import { pendingResendMessage as expensePendingMessage } from '@/expenses/errors';
+import type { ExpenseMonth } from '@/expenses/types';
+import { unknownSaveMessage } from '@/items/request-id';
+import {
+  beginHeldWrite,
+  clearHeldWrite,
+  rehydrateHeldWrites,
+} from '@/lib/held-writes';
+import { setTestWaitingWorker } from '@/lib/pwa';
+import { setBaseMapping } from '@/mapping/api';
+import { SubjectPanel } from '@/mapping/SubjectPanel';
+import type {
+  MappingCatalog,
+  ObservedBase,
+  SubjectDetail,
+} from '@/mapping/types';
+import { ActivationPage } from '@/pages/ActivationPage';
+import { CountsPage } from '@/pages/CountsPage';
+import { ExpensesPage } from '@/pages/ExpensesPage';
+import { OpeningPage } from '@/pages/OpeningPage';
+import { PurchasesPage } from '@/pages/PurchasesPage';
+import { SortingPage } from '@/pages/SortingPage';
+import {
+  listPurchases,
+  listStockChoices,
+  listUnitsAt,
+  recordOpeningStock,
+  recordPurchase,
+} from '@/purchases/api';
+import type { StockChoice } from '@/purchases/types';
+import { UpdateBanner } from '@/pwa/UpdateBanner';
+import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
+import { pendingResendMessage as sortPendingMessage } from '@/sorting/errors';
+import type { MixedFish } from '@/sorting/types';
+
+vi.mock('@/counts/api', () => ({
+  listDailyItems: vi.fn(),
+  listCounts: vi.fn(),
+  listPendingCounts: vi.fn(),
+  recordCount: vi.fn(),
+  recordStoredCount: vi.fn(),
+}));
+
+vi.mock('@/purchases/api', () => ({
+  listStockChoices: vi.fn(),
+  listPurchases: vi.fn(),
+  recordPurchase: vi.fn(),
+  recordOpeningStock: vi.fn(),
+  listUnitsAt: vi.fn(() => Promise.resolve({})),
+}));
+
+vi.mock('@/sorting/api', () => ({
+  listMixedFish: vi.fn(),
+  listSorts: vi.fn(),
+  recordSort: vi.fn(),
+}));
+
+vi.mock('@/expenses/api', () => ({
+  loadExpenseMonth: vi.fn(),
+  addExpenseEntry: vi.fn(),
+  voidExpenseEntry: vi.fn(),
+  addExpenseCategory: vi.fn(),
+  renameExpenseCategory: vi.fn(),
+  setExpenseCategoryActive: vi.fn(),
+  setMonthExpenseComplete: vi.fn(),
+}));
+
+vi.mock('@/mapping/api', () => ({
+  setBaseMapping: vi.fn(),
+  setOptionPolicy: vi.fn(),
+  setException: vi.fn(),
+  setOptionMapping: vi.fn(),
+}));
+
+vi.mock('@/accounting/api', () => ({
+  loadProcessingSummary: vi.fn(),
+  runDeductions: vi.fn(),
+  recordRunFailure: vi.fn(),
+  retryParkedOrder: vi.fn(),
+  loadOpeningReview: vi.fn(),
+  activateInventory: vi.fn(),
+}));
+
+const tilapia: CountItem = {
+  id: 'tilapia',
+  name: 'بلطي',
+  baseUnit: 'kg',
+  onHandQty: '10',
+  onHandValue: '100.00',
+  avgCost: '10.00',
+};
+
+const oil: StockChoice = {
+  id: 'oil',
+  name: 'زيت',
+  kind: 'ingredient',
+  baseUnit: 'kg',
+  parentItemId: null,
+  active: true,
+  hasMovements: true,
+  conversions: [],
+};
+
+const openingOil: StockChoice = {
+  ...oil,
+  hasMovements: false,
+};
+
+const mixedFish: MixedFish = {
+  id: 'mixed',
+  name: 'بوري مخلوط',
+  onHandQty: '100',
+  onHandValue: '5000.00',
+  avgCost: '50',
+  hasUncoveredDeficit: false,
+  sizes: [{ id: 'large', name: 'كبير' }],
+};
+
+function expenseMonth(monthStart: string): ExpenseMonth {
+  return {
+    monthStart,
+    categories: [
+      { id: 'rent', name: 'إيجار', kind: 'fixed_monthly', active: true },
+    ],
+    entries: [],
+    days: [],
+    complete: false,
+    confirmedAt: null,
+  };
+}
+
+const mapBase: ObservedBase = {
+  posItemId: 'pos-item-1',
+  sizeKey: ['none'],
+  sizeKeyText: '["none"]',
+  itemName: 'طبق تجريبي',
+  saleCount: 2,
+  lastOrderedAt: '2030-06-01T08:00:00.000Z',
+  latestOrderId: 'order-1',
+  latestLineId: 'line-1',
+  mapStatus: 'incomplete',
+};
+
+const mapCatalog: MappingCatalog = {
+  recipes: [],
+  items: [{ id: 'item-1', name: 'ملح تجريبي', baseUnit: 'kg' }],
+  packagingItems: [],
+  units: [{ code: 'kg', label: 'كيلو' }],
+  shiftStart: null,
+};
+
+const mapDetail: SubjectDetail = {
+  schedule: {
+    subjectId: null,
+    token: 'tok-1',
+    emptyToken: 'tok-1',
+    versions: [],
+  },
+  options: [],
+  optionBindings: [],
+  suggestions: [],
+  history: [],
+  optionHistory: [],
+  resolution: {
+    status: 'incomplete',
+    issues: [{ code: 'unmapped_base', expandIssue: null }],
+    requirements: [],
+  },
+  packaging: {
+    schedule: {
+      subjectId: null,
+      token: 'pack-tok',
+      emptyToken: 'pack-tok',
+      versions: [],
+    },
+    history: [],
+  },
+};
+
+const processingSummary: ProcessingSummary = {
+  activated: true,
+  pendingCount: '1',
+  blockedCount: '0',
+  failedCount: '0',
+  processedEventCount: '0',
+  openEventCount: '1',
+  openSpanCount: '0',
+  coverage: null,
+  parked: [],
+  parkedCount: '0',
+  parkedTruncated: false,
+};
+
+const openingReview: OpeningReview = {
+  activated: false,
+  stockStartedAt: null,
+  openingManifestHash: 'a'.repeat(32),
+  canActivate: true,
+  checklist: [{ code: 'unreceipted_outflows', ready: true, count: '0' }],
+  roster: [
+    {
+      itemId: 'item-1',
+      name: 'بلطي',
+      baseUnit: 'kg',
+      active: true,
+      missing: false,
+      openingLineCount: '1',
+      observation: {
+        openingId: 'op-1',
+        lineNo: '1',
+        quantity: '10',
+        unit: 'kg',
+        unitCost: '50',
+        occurredAt: '2026-10-22T09:00:00.000Z',
+        explicitZero: false,
+      },
+    },
+  ],
+  nextItemId: null,
+};
+
+function setOnline(online: boolean): void {
+  Object.defineProperty(window.navigator, 'onLine', {
+    configurable: true,
+    value: online,
+  });
+  window.dispatchEvent(new Event(online ? 'online' : 'offline'));
+}
+
+describe('held writes and offline behavior across writers', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    setOnline(true);
+    vi.mocked(listDailyItems).mockReset();
+    vi.mocked(listCounts).mockReset();
+    vi.mocked(listPendingCounts).mockReset();
+    vi.mocked(listDailyItems).mockResolvedValue([tilapia]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([]);
+    vi.mocked(recordCount).mockReset();
+    vi.mocked(recordCount).mockResolvedValue({
+      status: 'posted',
+      countId: 'c-1',
+    });
+    vi.mocked(recordStoredCount).mockReset();
+
+    vi.mocked(listStockChoices).mockReset();
+    vi.mocked(listPurchases).mockReset();
+    vi.mocked(listUnitsAt).mockReset();
+    vi.mocked(listStockChoices).mockResolvedValue([oil]);
+    vi.mocked(listPurchases).mockResolvedValue([]);
+    vi.mocked(listUnitsAt).mockResolvedValue({});
+    vi.mocked(recordPurchase).mockReset();
+    vi.mocked(recordPurchase).mockResolvedValue(undefined);
+    vi.mocked(recordOpeningStock).mockReset();
+    vi.mocked(recordOpeningStock).mockResolvedValue(undefined);
+
+    vi.mocked(listMixedFish).mockReset();
+    vi.mocked(listSorts).mockReset();
+    vi.mocked(listMixedFish).mockResolvedValue([mixedFish]);
+    vi.mocked(listSorts).mockResolvedValue([]);
+    vi.mocked(recordSort).mockReset();
+    vi.mocked(recordSort).mockResolvedValue(undefined);
+
+    vi.mocked(loadExpenseMonth).mockReset();
+    vi.mocked(loadExpenseMonth).mockImplementation((m) =>
+      Promise.resolve(expenseMonth(m)),
+    );
+    vi.mocked(addExpenseEntry).mockReset();
+    vi.mocked(addExpenseEntry).mockResolvedValue(undefined);
+    vi.mocked(voidExpenseEntry).mockReset();
+    vi.mocked(voidExpenseEntry).mockResolvedValue(undefined);
+    vi.mocked(addExpenseCategory).mockResolvedValue(undefined);
+    vi.mocked(renameExpenseCategory).mockResolvedValue(undefined);
+    vi.mocked(setExpenseCategoryActive).mockResolvedValue(undefined);
+    vi.mocked(setMonthExpenseComplete).mockResolvedValue(undefined);
+
+    vi.mocked(setBaseMapping).mockReset();
+    vi.mocked(setBaseMapping).mockResolvedValue(undefined);
+
+    vi.mocked(loadProcessingSummary).mockReset();
+    vi.mocked(loadProcessingSummary).mockResolvedValue(processingSummary);
+    vi.mocked(runDeductions).mockReset();
+    vi.mocked(loadOpeningReview).mockReset();
+    vi.mocked(loadOpeningReview).mockResolvedValue(openingReview);
+    vi.mocked(activateInventory).mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    setOnline(true);
+    localStorage.clear();
+  });
+
+  it('reload during transmission restores count as unknown without auto-sending', async () => {
+    vi.mocked(recordCount).mockReturnValueOnce(
+      new Promise<CountWriteResult>(() => {
+        // Never resolves: simulates reload mid-transmission.
+      }),
+    );
+
+    const view = render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('وقت الجرد')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('وقت الجرد'), {
+      target: { value: '2026-10-22T12:00' },
+    });
+    fireEvent.change(screen.getByLabelText('الكمية المعدودة بلطي'), {
+      target: { value: '7' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordCount).toHaveBeenCalledTimes(1);
+    });
+    const sent = vi.mocked(recordCount).mock.calls[0]?.[0];
+    expect(sent).toBeDefined();
+    expect(localStorage.length).toBeGreaterThan(0);
+
+    view.unmount();
+    rehydrateHeldWrites();
+
+    // Fresh mount must restore unknown without auto-sending.
+    render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+    expect(recordCount).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('7');
+    expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveAttribute(
+      'readonly',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordCount).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(sent);
+  });
+
+  it('a committed post whose reply was lost retries with the same id and payload after reload', async () => {
+    vi.mocked(recordCount).mockRejectedValueOnce(new Error(retrySafeMessage));
+    const view = render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('وقت الجرد')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('وقت الجرد'), {
+      target: { value: '2026-10-22T12:00' },
+    });
+    fireEvent.change(screen.getByLabelText('الكمية المعدودة بلطي'), {
+      target: { value: '6' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+    const first = vi.mocked(recordCount).mock.calls[0]?.[0];
+
+    view.unmount();
+    rehydrateHeldWrites();
+
+    render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordCount).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(first);
+  });
+
+  it('reopening while offline keeps the ledger button disabled until back online', async () => {
+    vi.mocked(recordCount).mockRejectedValueOnce(new Error(retrySafeMessage));
+    const view = render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('وقت الجرد')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('وقت الجرد'), {
+      target: { value: '2026-10-22T12:00' },
+    });
+    fireEvent.change(screen.getByLabelText('الكمية المعدودة بلطي'), {
+      target: { value: '7' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+    view.unmount();
+
+    setOnline(false);
+    rehydrateHeldWrites();
+    render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+
+    act(() => {
+      setOnline(true);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+  });
+
+  it('a successful save followed by a failed reload keeps posted_reload until a read succeeds', async () => {
+    vi.mocked(listCounts)
+      .mockResolvedValueOnce([])
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockRejectedValueOnce(new Error('still down'))
+      .mockResolvedValueOnce([]);
+
+    const view = render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('وقت الجرد')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('وقت الجرد'), {
+      target: { value: '2026-10-22T12:00' },
+    });
+    fireEvent.change(screen.getByLabelText('الكمية المعدودة بلطي'), {
+      target: { value: '7' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('network down');
+    expect(localStorage.length).toBeGreaterThan(0);
+
+    view.unmount();
+    rehydrateHeldWrites();
+
+    // Reopen while read still fails: posted_reload stays held and save stays locked.
+    render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent('still down');
+    expect(recordCount).toHaveBeenCalledTimes(1);
+    expect(localStorage.length).toBeGreaterThan(0);
+
+    // Retry reload succeeds -> posted_reload clears and form unlocks.
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    expect(localStorage.length).toBe(0);
+  });
+
+  it('reload restores purchase payload', async () => {
+    vi.mocked(recordPurchase).mockRejectedValueOnce(new Error('socket'));
+    const view = render(
+      <MemoryRouter>
+        <PurchasesPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('الصنف')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('المورد'), {
+      target: { value: 'مورد تجريبي' },
+    });
+    fireEvent.change(screen.getByLabelText('الصنف'), {
+      target: { value: 'oil' },
+    });
+    fireEvent.change(screen.getByLabelText('الكمية'), {
+      target: { value: '3' },
+    });
+    fireEvent.change(screen.getByLabelText('المبلغ'), {
+      target: { value: '75' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'مراجعة' }));
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('socket');
+    const first = vi.mocked(recordPurchase).mock.calls[0]?.[0];
+
+    view.unmount();
+    rehydrateHeldWrites();
+
+    render(
+      <MemoryRouter>
+        <PurchasesPage />
+      </MemoryRouter>,
+    );
+    expect(
+      await screen.findByRole('heading', { name: 'مراجعة المشتريات' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('مورد تجريبي')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordPurchase).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(recordPurchase).mock.calls[1]?.[0]).toEqual(first);
+  });
+
+  it('reload restores opening stock payload', async () => {
+    vi.mocked(listStockChoices).mockResolvedValue([openingOil]);
+    vi.mocked(recordOpeningStock).mockRejectedValueOnce(new Error('socket'));
+    const view = render(
+      <MemoryRouter>
+        <OpeningPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('كمية زيت')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('كمية زيت'), {
+      target: { value: '5' },
+    });
+    fireEvent.change(screen.getByLabelText('تكلفة زيت'), {
+      target: { value: '20' },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('socket');
+    const first = vi.mocked(recordOpeningStock).mock.calls[0]?.[0];
+
+    view.unmount();
+    rehydrateHeldWrites();
+
+    // Even if server already moved oil out of candidates, pinned retry stays available.
+    vi.mocked(listStockChoices).mockResolvedValue([oil]);
+    render(
+      <MemoryRouter>
+        <OpeningPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText(/5 kg/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordOpeningStock).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(recordOpeningStock).mock.calls[1]?.[0]).toEqual(first);
+  });
+
+  it('reload restores sort payload', async () => {
+    vi.mocked(recordSort).mockRejectedValueOnce(new Error('socket'));
+    const view = render(
+      <MemoryRouter>
+        <SortingPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('السمك المخلوط')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('السمك المخلوط'), {
+      target: { value: 'mixed' },
+    });
+    fireEvent.change(screen.getByLabelText('كمية المخلوط'), {
+      target: { value: '10' },
+    });
+    fireEvent.change(screen.getByLabelText('كمية كبير'), {
+      target: { value: '9' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByText(sortPendingMessage)).toBeInTheDocument();
+    const first = vi.mocked(recordSort).mock.calls[0]?.[0];
+
+    view.unmount();
+    rehydrateHeldWrites();
+
+    render(
+      <MemoryRouter>
+        <SortingPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText(sortPendingMessage)).toBeInTheDocument();
+    expect(screen.getByLabelText('كمية المخلوط')).toHaveValue('10');
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordSort).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(recordSort).mock.calls[1]?.[0]).toEqual(first);
+  });
+
+  it('reload restores expense payload', async () => {
+    vi.mocked(addExpenseEntry).mockRejectedValueOnce(new Error('socket'));
+    const view = render(
+      <MemoryRouter>
+        <ExpensesPage />
+      </MemoryRouter>,
+    );
+    fireEvent.change(await screen.findByLabelText('التصنيف'), {
+      target: { value: 'rent' },
+    });
+    fireEvent.change(screen.getByLabelText('المبلغ'), {
+      target: { value: '1000' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    expect(await screen.findByText(expensePendingMessage)).toBeInTheDocument();
+    const first = vi.mocked(addExpenseEntry).mock.calls[0]?.[0];
+
+    view.unmount();
+    rehydrateHeldWrites();
+
+    render(
+      <MemoryRouter>
+        <ExpensesPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText(expensePendingMessage)).toBeInTheDocument();
+    expect(screen.getByLabelText('المبلغ')).toHaveValue('1000.00');
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => {
+      expect(addExpenseEntry).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(addExpenseEntry).mock.calls[1]?.[0]).toEqual(first);
+  });
+
+  it('reload restores mapping payload from localStorage and retries with same id', async () => {
+    vi.mocked(setBaseMapping).mockRejectedValueOnce(new Error('socket'));
+    const view = render(
+      <SubjectPanel
+        base={mapBase}
+        detail={mapDetail}
+        catalog={mapCatalog}
+        onReload={() => Promise.resolve()}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('الصنف'), {
+      target: { value: 'item-1' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'احفظ الربط' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(localStorage.length).toBeGreaterThan(0);
+    const first = vi.mocked(setBaseMapping).mock.calls[0]?.[0];
+
+    view.unmount();
+    rehydrateHeldWrites();
+
+    render(
+      <SubjectPanel
+        base={mapBase}
+        detail={mapDetail}
+        catalog={mapCatalog}
+        onReload={() => Promise.resolve()}
+      />,
+    );
+    expect(screen.getByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(setBaseMapping).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => {
+      expect(setBaseMapping).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(setBaseMapping).mock.calls[1]?.[0]).toEqual(first);
+  });
+
+  it('a throwing localStorage does not break the form', async () => {
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new DOMException('SecurityError');
+    });
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('QuotaExceededError');
+    });
+    vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
+      throw new DOMException('SecurityError');
+    });
+    vi.spyOn(Storage.prototype, 'key').mockImplementation(() => {
+      throw new DOMException('SecurityError');
+    });
+
+    vi.mocked(recordCount).mockRejectedValueOnce(new Error(retrySafeMessage));
+    render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('وقت الجرد')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('وقت الجرد'), {
+      target: { value: '2026-10-22T12:00' },
+    });
+    fireEvent.change(screen.getByLabelText('الكمية المعدودة بلطي'), {
+      target: { value: '7' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => {
+      expect(recordCount).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(recordCount).mock.calls[0]?.[0],
+    );
+  });
+
+  it('disables ledger buttons across screens while navigator.onLine is false', async () => {
+    setOnline(false);
+
+    const countsView = render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('وقت الجرد')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+    countsView.unmount();
+
+    const purchasesView = render(
+      <MemoryRouter>
+        <PurchasesPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('الصنف')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'مراجعة' })).toBeDisabled();
+    purchasesView.unmount();
+
+    const sortView = render(
+      <MemoryRouter>
+        <SortingPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('السمك المخلوط')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+    sortView.unmount();
+
+    const expenseView = render(
+      <MemoryRouter>
+        <ExpensesPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('التصنيف')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'حفظ المصروف' })).toBeDisabled();
+    expenseView.unmount();
+
+    const mappingView = render(
+      <SubjectPanel
+        base={mapBase}
+        detail={mapDetail}
+        catalog={mapCatalog}
+        onReload={() => Promise.resolve()}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'احفظ الربط' })).toBeDisabled();
+    mappingView.unmount();
+
+    const processingView = render(<ProcessingPanel />);
+    expect(
+      await screen.findByRole('button', { name: 'شغّل الخصم' }),
+    ).toBeDisabled();
+    processingView.unmount();
+
+    const activationView = render(
+      <MemoryRouter>
+        <ActivationPage />
+      </MemoryRouter>,
+    );
+    expect(
+      await screen.findByRole('button', { name: 'تفعيل الخصم' }),
+    ).toBeDisabled();
+    activationView.unmount();
+  });
+
+  it('UpdateBanner waits for owner reload and never reloads while a pin is held', () => {
+    const postMessage = vi.fn();
+    const reload = vi.fn();
+    setTestWaitingWorker({ postMessage } as unknown as ServiceWorker);
+    const held = beginHeldWrite('count:daily', (requestId) => ({ requestId }));
+
+    render(<UpdateBanner onReload={reload} />);
+    const button = screen.getByRole('button', { name: 'تحديث التطبيق' });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+
+    act(() => {
+      clearHeldWrite('count:daily', held.requestId);
+    });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    expect(postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
+  });
+});

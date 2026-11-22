@@ -2,6 +2,16 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
 import {
+  clearHeldWrite,
+  clearPostedReload,
+  getHeldWrite,
+  putHeldWrite,
+  setHeldWritePhase,
+  subscribeHeldWritesStore,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
+import { isPayloadRefusal, isUnknownOutcome } from '@/lib/write-outcome';
+import {
   listPurchases,
   listStockChoices,
   listUnitsAt,
@@ -20,6 +30,8 @@ import {
   dateRangeError,
 } from '@/purchases/time';
 
+const PURCHASE_SUBJECT = 'purchase:new';
+
 const shell =
   'mx-auto flex min-h-dvh w-full max-w-3xl flex-col gap-4 px-4 py-6 text-start';
 const fieldClass = 'w-full rounded border border-neutral-300 px-3 py-2';
@@ -29,25 +41,40 @@ const secondaryButton =
 type Snapshot = { choices: StockChoice[]; purchases: Purchase[] };
 
 export function PurchasesPage() {
+  const online = useOnline();
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadId, setLoadId] = useState(0);
   const [saving, setSaving] = useState(false);
-  const [needsReload, setNeedsReload] = useState(false);
+  const [localNeedsReload, setLocalNeedsReload] = useState(false);
   const [loads, setLoads] = useState(0);
   const [serverError, setServerError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [formEpoch, setFormEpoch] = useState(0);
   const [unitsNonce, setUnitsNonce] = useState(0);
+  const [heldEpoch, setHeldEpoch] = useState(0);
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [filterError, setFilterError] = useState<string | null>(null);
   const seqRef = useRef(0);
   const loadsRef = useRef(0);
   const filterRef = useRef({ from: '', to: '' });
-  const editingLocked = saving || needsReload;
+
+  useEffect(
+    () => subscribeHeldWritesStore(() => setHeldEpoch((value) => value + 1)),
+    [],
+  );
+
+  const stored =
+    heldEpoch < 0 ? null : getHeldWrite<PurchaseDraft>(PURCHASE_SUBJECT);
+  const pending = stored?.phase === 'unknown' ? stored.payload : null;
+  const inflight = stored?.phase === 'inflight';
+  const postedReload = stored?.phase === 'posted_reload';
+  const needsReload = localNeedsReload || postedReload;
+  const editingLocked = saving || inflight || needsReload;
   const busy = editingLocked || loads > 0;
+  const writeLocked = busy || !online;
 
   async function readSnapshot(): Promise<Snapshot | null> {
     const range = dateRangeError(filterRef.current.from, filterRef.current.to);
@@ -98,7 +125,8 @@ export function PurchasesPage() {
         if (cancelled || !next) return;
         setSnapshot(next);
         setLoadError(null);
-        setNeedsReload(false);
+        clearPostedReload(PURCHASE_SUBJECT);
+        setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
         setLoadError(messageFrom(error));
@@ -151,7 +179,18 @@ export function PurchasesPage() {
   }
 
   async function handleSubmit(draft: PurchaseDraft) {
-    if (busy || loadsRef.current > 0) return;
+    if (busy || loadsRef.current > 0 || !isOnline()) return;
+    const prior = getHeldWrite<PurchaseDraft>(PURCHASE_SUBJECT);
+    const wasPinned =
+      prior !== null &&
+      prior.requestId === draft.requestId &&
+      prior.phase === 'unknown';
+    putHeldWrite(PURCHASE_SUBJECT, {
+      requestId: draft.requestId,
+      payload: draft,
+      phase: 'inflight',
+      kind: 'purchase',
+    });
     setSaving(true);
     setServerError(null);
     setSuccess(null);
@@ -159,26 +198,39 @@ export function PurchasesPage() {
     try {
       await recordPurchase(draft);
       saved = true;
-      setNeedsReload(true);
+      setHeldWritePhase(PURCHASE_SUBJECT, draft.requestId, 'posted_reload');
+      setLocalNeedsReload(true);
       setFormEpoch((value) => value + 1);
       setSuccess('اتسجلت المشتريات');
       const next = await readSnapshot();
       if (next) {
         setSnapshot(next);
         setLoadError(null);
-        setNeedsReload(false);
+        clearPostedReload(PURCHASE_SUBJECT);
+        setLocalNeedsReload(false);
       }
     } catch (error) {
       if (!saved) {
         setServerError(messageFrom(error));
         if (error instanceof ConversionChangedError) {
+          clearHeldWrite(PURCHASE_SUBJECT, draft.requestId);
           // Same items and timestamp. The nonce is what makes the dated
           // lookup run again; remounting the form would drop the draft.
           setUnitsNonce((value) => value + 1);
           await reloadChoices();
+        } else if (wasPinned) {
+          if (isPayloadRefusal(error)) {
+            clearHeldWrite(PURCHASE_SUBJECT, draft.requestId);
+          } else {
+            setHeldWritePhase(PURCHASE_SUBJECT, draft.requestId, 'unknown');
+          }
+        } else if (isUnknownOutcome(error)) {
+          setHeldWritePhase(PURCHASE_SUBJECT, draft.requestId, 'unknown');
+        } else {
+          clearHeldWrite(PURCHASE_SUBJECT, draft.requestId);
         }
       } else {
-        setNeedsReload(true);
+        setLocalNeedsReload(true);
         setLoadError(messageFrom(error));
       }
     } finally {
@@ -196,6 +248,7 @@ export function PurchasesPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">المشتريات</h1>
+      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
       {success ? <p role="status">{success}</p> : null}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <label className="flex flex-col gap-1">
@@ -259,15 +312,16 @@ export function PurchasesPage() {
       ) : null}
       {snapshot !== null ? (
         <>
-          {choices.length === 0 ? (
+          {choices.length === 0 && pending === null ? (
             <p>لسه مفيش أصناف — ضيف صنف الأول</p>
           ) : (
             <PurchaseForm
               key={formEpoch}
               items={choices}
-              locked={busy}
+              locked={writeLocked}
               submitting={saving}
               serverError={serverError}
+              pending={pending}
               onClearServerError={() => setServerError(null)}
               onSubmit={(next) => void handleSubmit(next)}
               resolveUnits={listUnitsAt}

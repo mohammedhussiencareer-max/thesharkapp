@@ -27,7 +27,20 @@ import type {
 } from '@/counts/types';
 import { messageFrom } from '@/items/errors';
 import type { Json } from '@/lib/database.types';
+import {
+  clearHeldWrite,
+  clearPostedReload,
+  getHeldWrite,
+  listHeldWritesByPrefix,
+  putHeldWrite,
+  setHeldWritePhase,
+  subscribeHeldWritesStore,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
+
+const COUNT_DAILY_SUBJECT = 'count:daily';
+const COUNT_STORED_PREFIX = 'count:stored:';
 
 type Snapshot = {
   items: CountItem[];
@@ -45,18 +58,27 @@ function requestIdOf(payload: Json): string | null {
   return typeof requestId === 'string' ? requestId : null;
 }
 
+function clearCountPostedReloads(): void {
+  clearPostedReload(COUNT_DAILY_SUBJECT);
+  for (const record of listHeldWritesByPrefix(COUNT_STORED_PREFIX)) {
+    if (record.phase === 'posted_reload') {
+      clearPostedReload(record.subject);
+    }
+  }
+}
+
 export function CountsPage() {
+  const online = useOnline();
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadId, setLoadId] = useState(0);
   const [saving, setSaving] = useState(false);
-  const [needsReload, setNeedsReload] = useState(false);
+  const [localNeedsReload, setLocalNeedsReload] = useState(false);
   const [loads, setLoads] = useState(0);
   const [serverError, setServerError] = useState<string | null>(null);
   const [cardError, setCardError] = useState<string | null>(null);
-  const [pending, setPending] = useState<CountDraft | null>(null);
-  const [waiting, setWaiting] = useState<CountDraft | null>(null);
+  const [heldEpoch, setHeldEpoch] = useState(0);
   // The request id whose waiting_for_sync reply is shown, so its own
   // later success clears it even when no local draft matches (a card).
   const [waitNotice, setWaitNotice] = useState<string | null>(null);
@@ -65,8 +87,29 @@ export function CountsPage() {
   const [requestKey, setRequestKey] = useState(0);
   const seqRef = useRef(0);
   const loadsRef = useRef(0);
-  const editingLocked = saving || needsReload;
+
+  useEffect(
+    () => subscribeHeldWritesStore(() => setHeldEpoch((value) => value + 1)),
+    [],
+  );
+
+  const storedDaily =
+    heldEpoch < 0 ? null : getHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
+  const pending = storedDaily?.phase === 'unknown' ? storedDaily.payload : null;
+  const waiting =
+    storedDaily?.phase === 'waiting_for_sync' ? storedDaily.payload : null;
+  const inflightDaily = storedDaily?.phase === 'inflight';
+  const postedReload =
+    heldEpoch >= 0 &&
+    (storedDaily?.phase === 'posted_reload' ||
+      listHeldWritesByPrefix(COUNT_STORED_PREFIX).some(
+        (record) => record.phase === 'posted_reload',
+      ));
+
+  const needsReload = localNeedsReload || postedReload;
+  const editingLocked = saving || inflightDaily || needsReload;
   const busy = editingLocked || loads > 0;
+  const writeLocked = busy || !online;
 
   async function readSnapshot(): Promise<ReadResult> {
     const seq = ++seqRef.current;
@@ -98,7 +141,8 @@ export function CountsPage() {
         if (cancelled || next.status === 'stale') return;
         setSnapshot(next.snapshot);
         setLoadError(null);
-        setNeedsReload(false);
+        clearCountPostedReloads();
+        setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
         setLoadError(messageFrom(error));
@@ -144,46 +188,46 @@ export function CountsPage() {
     }
   }
 
-  function applyPosted(requestId: string | null, fromForm: boolean): void {
-    const matches = (draft: CountDraft | null) =>
-      requestId !== null && draft?.requestId === requestId;
-    // Success releases only this request. A different pending card can still
-    // post while another draft stays pinned after an unknown outcome.
-    if (fromForm || matches(pending) || matches(waiting)) {
-      setPending((current) => (matches(current) ? null : current));
-      setWaiting((current) => (matches(current) ? null : current));
+  function applyPosted(
+    requestId: string | null,
+    fromForm: boolean,
+    storedSubject: string | null,
+  ): void {
+    const daily = getHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
+    const matchesDaily = requestId !== null && daily?.requestId === requestId;
+    if (fromForm || matchesDaily) {
+      if (daily && requestId !== null && daily.requestId === requestId) {
+        setHeldWritePhase(COUNT_DAILY_SUBJECT, requestId, 'posted_reload');
+      }
       setFormEpoch((value) => value + 1);
+    }
+    if (storedSubject && requestId !== null) {
+      setHeldWritePhase(storedSubject, requestId, 'posted_reload');
     }
     setWaitNotice((current) =>
       current !== null && current === requestId ? null : current,
     );
     // Stays set until the reload applies data, or a visible retryable error
-    // replaces it. A stale read clears the lock instead of leaving it stuck.
-    setNeedsReload(true);
+    // replaces it. A stale read clears the local lock while posted_reload waits
+    // for a successful read.
+    setLocalNeedsReload(true);
     setSuccess('اتسجل الجرد');
   }
 
-  function holdUnknown(draft: CountDraft, error: unknown): void {
+  function holdUnknown(
+    draft: CountDraft,
+    error: unknown,
+    priorPhase: 'unknown' | 'waiting_for_sync' | null,
+  ): void {
     setServerError(reportedCountError(error));
     // A pin stays until this exact payload succeeds or the same replay
     // is refused by a rule the payload itself breaks. A permission or
     // contention error can fire before the server's request_id replay,
     // so it leaves the existing pin in place and does not start a new one.
     if (isPayloadRefusal(error)) {
-      // A lost prepare reply can already be stored. Reusing that id for an
-      // edited count is refused, so any payload refusal of a pinned or
-      // stored request starts a new id. A first submit that is refused
-      // stored nothing and keeps its id. The old row stays in the list.
-      const replay =
-        pending?.requestId === draft.requestId ||
-        waiting?.requestId === draft.requestId;
+      const replay = priorPhase !== null;
       setWaitNotice(null);
-      setPending((current) =>
-        current?.requestId === draft.requestId ? null : current,
-      );
-      setWaiting((current) =>
-        current?.requestId === draft.requestId ? null : current,
-      );
+      clearHeldWrite(COUNT_DAILY_SUBJECT, draft.requestId);
       if (replay) setRequestKey((value) => value + 1);
       return;
     }
@@ -191,40 +235,68 @@ export function CountsPage() {
       // A lost reply may have posted. The next حفظ resends this payload,
       // including when the lost call was the waiting resend.
       setWaitNotice(null);
-      setPending((current) => (current && current !== draft ? current : draft));
-      setWaiting((current) => (current && current !== draft ? current : null));
+      setHeldWritePhase(COUNT_DAILY_SUBJECT, draft.requestId, 'unknown');
+      return;
     }
+    if (priorPhase !== null) {
+      setHeldWritePhase(COUNT_DAILY_SUBJECT, draft.requestId, priorPhase);
+      return;
+    }
+    // Definite non-payload refusal on a first submit stored nothing.
+    clearHeldWrite(COUNT_DAILY_SUBJECT, draft.requestId);
   }
 
   async function finishWrite(
     result: CountWriteResult,
     draft: CountDraft | null,
     requestId: string | null,
+    storedSubject: string | null,
   ): Promise<boolean> {
     if (result.status === 'waiting_for_sync') {
       if (draft) {
-        setWaiting(draft);
-        setPending(null);
+        setHeldWritePhase(
+          COUNT_DAILY_SUBJECT,
+          draft.requestId,
+          'waiting_for_sync',
+        );
+      }
+      if (storedSubject && requestId) {
+        clearHeldWrite(storedSubject, requestId);
       }
       setWaitNotice(requestId ?? draft?.requestId ?? null);
       setSuccess(null);
       await refreshAfterWait();
       return false;
     }
-    applyPosted(requestId, draft !== null);
+    applyPosted(requestId, draft !== null, storedSubject);
     const next = await readSnapshot();
     if (next.status === 'ready') {
       setSnapshot(next.snapshot);
       setLoadError(null);
-      setNeedsReload(false);
+      clearCountPostedReloads();
+      setLocalNeedsReload(false);
     } else {
-      setNeedsReload(false);
+      setLocalNeedsReload(false);
     }
     return true;
   }
 
   async function handleSubmit(draft: CountDraft) {
-    if (busy || loadsRef.current > 0) return;
+    if (busy || loadsRef.current > 0 || !isOnline()) return;
+    const prior = getHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
+    const priorPhase =
+      prior !== null &&
+      prior.requestId === draft.requestId &&
+      (prior.phase === 'unknown' || prior.phase === 'waiting_for_sync')
+        ? prior.phase
+        : null;
+    // Persist BEFORE sending so a reload during transmission restores `unknown`.
+    putHeldWrite(COUNT_DAILY_SUBJECT, {
+      requestId: draft.requestId,
+      payload: draft,
+      phase: 'inflight',
+      kind: 'count',
+    });
     setSaving(true);
     setServerError(null);
     setCardError(null);
@@ -233,12 +305,12 @@ export function CountsPage() {
     try {
       const result = await recordCount(draft);
       if (result.status === 'posted') saved = true;
-      await finishWrite(result, draft, draft.requestId);
+      await finishWrite(result, draft, draft.requestId, null);
     } catch (error) {
       if (!saved) {
-        holdUnknown(draft, error);
+        holdUnknown(draft, error, priorPhase);
       } else {
-        setNeedsReload(true);
+        setLocalNeedsReload(true);
         setLoadError(messageFrom(error));
       }
     } finally {
@@ -247,8 +319,18 @@ export function CountsPage() {
   }
 
   async function handleStored(payload: Json) {
-    if (busy || loadsRef.current > 0) return;
+    if (busy || loadsRef.current > 0 || !isOnline()) return;
     const requestId = requestIdOf(payload);
+    const storedSubject =
+      requestId !== null ? `${COUNT_STORED_PREFIX}${requestId}` : null;
+    if (storedSubject && requestId !== null) {
+      putHeldWrite(storedSubject, {
+        requestId,
+        payload,
+        phase: 'inflight',
+        kind: 'count_stored',
+      });
+    }
     setSaving(true);
     setServerError(null);
     setCardError(null);
@@ -257,34 +339,34 @@ export function CountsPage() {
     try {
       const result = await recordStoredCount(payload);
       if (result.status === 'posted') saved = true;
-      await finishWrite(result, null, requestId);
+      await finishWrite(result, null, requestId, storedSubject);
     } catch (error) {
       if (!saved) {
-        // The form is hidden when nothing is active, so a card refusal
-        // has to render beside the pending list.
         setCardError(reportedCountError(error));
-        // A definite refusal of this card ends its wait, even with no local
-        // draft for it (after a reload). An unknown outcome keeps the notice.
         if (requestId && !isUnknownOutcome(error)) {
           setWaitNotice((current) => (current === requestId ? null : current));
         }
+        if (storedSubject && requestId) {
+          if (isUnknownOutcome(error)) {
+            setHeldWritePhase(storedSubject, requestId, 'unknown');
+          } else {
+            clearHeldWrite(storedSubject, requestId);
+          }
+        }
+        const daily = getHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
         if (
           requestId &&
-          (pending?.requestId === requestId ||
-            waiting?.requestId === requestId) &&
+          daily &&
+          daily.requestId === requestId &&
+          (daily.phase === 'unknown' || daily.phase === 'waiting_for_sync') &&
           isPayloadRefusal(error)
         ) {
           setRequestKey((value) => value + 1);
-          setPending((current) =>
-            current?.requestId === requestId ? null : current,
-          );
-          setWaiting((current) =>
-            current?.requestId === requestId ? null : current,
-          );
+          clearHeldWrite(COUNT_DAILY_SUBJECT, requestId);
           setWaitNotice(null);
         }
       } else {
-        setNeedsReload(true);
+        setLocalNeedsReload(true);
         setLoadError(messageFrom(error));
       }
     } finally {
@@ -302,6 +384,7 @@ export function CountsPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الجرد اليومي</h1>
+      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
       {waiting || waitNotice !== null ? (
         <p role="status">{waitingForSyncMessage}</p>
       ) : null}
@@ -349,7 +432,7 @@ export function CountsPage() {
             <CountForm
               key={formEpoch}
               items={items}
-              locked={busy}
+              locked={writeLocked}
               submitting={saving}
               serverError={serverError}
               pending={pending}
@@ -364,7 +447,7 @@ export function CountsPage() {
             counts={snapshot.pendingCounts.filter(
               (row) => row.requestId !== waiting?.requestId,
             )}
-            disabled={busy}
+            disabled={writeLocked}
             onResend={(payload) => void handleStored(payload)}
           />
           <CountList counts={snapshot.counts} refreshKey={loadId} />

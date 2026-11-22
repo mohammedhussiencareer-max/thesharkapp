@@ -16,6 +16,7 @@ import {
 } from '@/expenses/validation';
 import { monthEndIso } from '@/lib/cairo';
 import { formatEgpText } from '@/lib/money';
+import { useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 
 type PinnedCategory = {
@@ -62,6 +63,8 @@ export function ExpenseForm({
   onMonthChange: (month: string) => void;
   onSubmit: (draft: ExpenseDraft) => void;
 }) {
+  const online = useOnline();
+  const effectiveDisabled = disabled || !online;
   const amountErrorId = useId();
   const headingId = useId();
   // Reused after a definite refusal, because that attempt was not stored.
@@ -119,7 +122,7 @@ export function ExpenseForm({
 
   function onSubmitForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (disabled) return;
+    if (effectiveDisabled) return;
     if (pending) {
       onSubmit(pending);
       return;
@@ -314,7 +317,11 @@ export function ExpenseForm({
       </label>
       {errors.note ? <p role="alert">{errors.note}</p> : null}
       {pending ? <p>{pendingResendMessage}</p> : null}
-      <button className={primaryButton} type="submit" disabled={disabled}>
+      <button
+        className={primaryButton}
+        type="submit"
+        disabled={effectiveDisabled}
+      >
         حفظ المصروف
       </button>
     </form>

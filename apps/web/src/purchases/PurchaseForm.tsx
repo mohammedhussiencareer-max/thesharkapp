@@ -2,6 +2,7 @@ import { useRef, useState, type FormEvent } from 'react';
 import { formatStoredFactor } from '@/items/format';
 import { kindLabels, unitLabels } from '@/items/labels';
 import type { StockKind } from '@/items/types';
+import { useOnline } from '@/lib/online';
 import { formatMoneyText } from '@/purchases/decimal';
 import type { PurchaseDraft, StockChoice, UnitOption } from '@/purchases/types';
 import { useResolvedUnits } from '@/purchases/units-at';
@@ -45,6 +46,7 @@ export function PurchaseForm({
   locked,
   submitting,
   serverError,
+  pending = null,
   onClearServerError,
   onSubmit,
   resolveUnits,
@@ -54,6 +56,8 @@ export function PurchaseForm({
   locked: boolean;
   submitting: boolean;
   serverError: string | null;
+  /** Set only after an unknown outcome or reload recovery. */
+  pending?: PurchaseDraft | null;
   onClearServerError: () => void;
   onSubmit: (draft: PurchaseDraft) => void;
   /** Dated unit list for the form's own timestamp. Catalog tests omit it. */
@@ -64,6 +68,7 @@ export function PurchaseForm({
   /** Bumped after a rejected factor so the same instant is fetched again. */
   reloadKey?: number;
 }) {
+  const online = useOnline();
   const keyRef = useRef(1);
   // One id for this draft. A failed save retries it; a new form gets a new one.
   const [requestId] = useState(() => crypto.randomUUID());
@@ -89,7 +94,7 @@ export function PurchaseForm({
     ready: unitsReady,
     retry: retryUnits,
   } = useResolvedUnits(items, values.purchasedAt, resolveUnits, reloadKey);
-  const disabled = locked || submitting;
+  const disabled = locked || submitting || !online;
   const unavailableUnit = (line: PurchaseLineValues): boolean => {
     if (!unitsReady || !line.itemId || !line.unit) return false;
     const item = resolvedItems.find(
@@ -99,6 +104,7 @@ export function PurchaseForm({
   };
   const unitBlocked = values.lines.some(unavailableUnit);
   const blocked = disabled || !unitsReady || unitBlocked;
+  const shownDraft = pending ?? draft;
 
   function edit(patch: Partial<PurchaseValues>) {
     onClearServerError();
@@ -141,7 +147,12 @@ export function PurchaseForm({
 
   function onSubmitForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (disabled || !unitsReady) return;
+    if (disabled) return;
+    if (pending) {
+      onSubmit(pending);
+      return;
+    }
+    if (!unitsReady) return;
     if (!draft) {
       if (unitBlocked) {
         const nextErrors: PurchaseErrors = { lines: {} };
@@ -180,45 +191,54 @@ export function PurchaseForm({
         </div>
       ) : null}
       {errors.form ? <p role="alert">{errors.form}</p> : null}
-      {draft ? (
+      {shownDraft ? (
         <section aria-label="مراجعة المشتريات" className="flex flex-col gap-3">
           <h2 className="text-lg font-semibold">مراجعة المشتريات</h2>
           <p>المشتريات نهائية لحد ما نضيف التعديل</p>
+          {pending ? (
+            <p>الحفظ اللي فات ممكن يكون اتسجل — هيتبعت تاني من غير تغيير</p>
+          ) : null}
           <dl className="flex flex-col gap-1">
             <div>
               <dt className="text-neutral-600">المورد</dt>
-              <dd>{draft.supplier ?? 'من غير مورد'}</dd>
+              <dd>{shownDraft.supplier ?? 'من غير مورد'}</dd>
             </div>
-            {draft.invoiceNo ? (
+            {shownDraft.invoiceNo ? (
               <div>
                 <dt className="text-neutral-600">رقم الفاتورة</dt>
-                <dd>{draft.invoiceNo}</dd>
+                <dd>{shownDraft.invoiceNo}</dd>
               </div>
             ) : null}
-            {draft.note ? (
+            {shownDraft.note ? (
               <div>
                 <dt className="text-neutral-600">ملاحظة</dt>
-                <dd>{draft.note}</dd>
+                <dd>{shownDraft.note}</dd>
               </div>
             ) : null}
           </dl>
           <ul className="flex flex-col gap-2">
-            {draft.lines.map((line, index) => (
+            {shownDraft.lines.map((line, index) => (
               <li key={`${index}:${line.itemId}`}>
                 {`${line.itemName}: ${formatStoredFactor(line.quantity)} ${unitLabel(line.unit, line.baseUnit)} = ${formatStoredFactor(line.baseQuantity)} ${unitLabels[line.baseUnit]} — ${formatMoneyText(line.amountPaid)} — تكلفة ${unitLabels[line.baseUnit]} ${formatStoredFactor(line.unitCost)} ج.م`}
               </li>
             ))}
           </ul>
           <div className="flex flex-wrap gap-2">
+            {pending ? null : (
+              <button
+                className={secondaryButton}
+                type="button"
+                disabled={disabled}
+                onClick={() => setDraft(null)}
+              >
+                رجوع
+              </button>
+            )}
             <button
-              className={secondaryButton}
-              type="button"
-              disabled={disabled}
-              onClick={() => setDraft(null)}
+              className={primaryButton}
+              type="submit"
+              disabled={pending ? disabled : blocked}
             >
-              رجوع
-            </button>
-            <button className={primaryButton} type="submit" disabled={blocked}>
               حفظ
             </button>
           </div>

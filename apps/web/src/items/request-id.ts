@@ -4,47 +4,29 @@ import {
   StaleWriteError,
 } from '@/items/errors';
 import type { ItemDraft } from '@/items/types';
+import {
+  beginHeldWrite,
+  clearHeldWrite,
+  getHeldWrite,
+  listHeldWritesByPrefix,
+  resetHeldWritesStore,
+  setHeldWritePhase,
+  subscribeHeldWritesStore,
+  updateHeldWritePayload,
+} from '@/lib/held-writes';
 import { isPayloadRefusal } from '@/lib/write-outcome';
 
 /** Shown while the last save for a subject might already be stored. */
 export const unknownSaveMessage = 'آخر حفظ مش متأكد إنه اتسجل';
 
-type Held = {
-  requestId: string;
-  payload: unknown;
-  /**
-   * Set once an outcome did not prove the action is absent. The section stays
-   * locked and the only send is a retry of this payload.
-   */
-  unknown: boolean;
-  /**
-   * The server refused this activation token as a changed manifest. The
-   * request stays pinned, but nothing sends until a review reload replaces it.
-   */
-  awaitingReviewReload: boolean;
-};
-
-const held = new Map<string, Held>();
-
-const heldListeners = new Set<() => void>();
-
-function emitHeldWrites(): void {
-  for (const listener of heldListeners) listener();
-}
-
 /** Re-render when a sibling section starts or settles a held action. */
 export function subscribeHeldWrites(listener: () => void): () => void {
-  heldListeners.add(listener);
-  return () => {
-    heldListeners.delete(listener);
-  };
+  return subscribeHeldWritesStore(listener);
 }
 
 /** Test isolation. Production callers never clear another subject's action. */
 export function resetHeldWrites(): void {
-  if (held.size === 0) return;
-  held.clear();
-  emitHeldWrites();
+  resetHeldWritesStore({ clearStorage: true });
 }
 
 export function lossSubject(itemId: string): string {
@@ -81,7 +63,8 @@ export function unitSubject(code: string, label: string): string {
 }
 
 export function hasAction(subject: string): boolean {
-  return held.has(subject);
+  const current = getHeldWrite(subject);
+  return current !== null && current.phase !== 'posted_reload';
 }
 
 const conversionPrefix = 'conversion:';
@@ -91,14 +74,14 @@ const conversionPrefix = 'conversion:';
  * flight or still has an unknown outcome. Item creation does not count.
  */
 export function hasItemConfigurationAction(itemId: string): boolean {
-  if (held.has(lossSubject(itemId)) || held.has(priceSubject(itemId))) {
+  if (hasAction(lossSubject(itemId)) || hasAction(priceSubject(itemId))) {
     return true;
   }
-  for (const key of held.keys()) {
-    if (!key.startsWith(conversionPrefix)) continue;
+  for (const record of listHeldWritesByPrefix(conversionPrefix)) {
+    if (record.phase === 'posted_reload') continue;
     let parsed: unknown;
     try {
-      parsed = JSON.parse(key.slice(conversionPrefix.length));
+      parsed = JSON.parse(record.subject.slice(conversionPrefix.length));
     } catch {
       continue;
     }
@@ -109,9 +92,11 @@ export function hasItemConfigurationAction(itemId: string): boolean {
 
 /** The payload whose outcome is still unknown. Null while a send is in flight. */
 export function unknownAction<T>(subject: string): T | null {
-  const current = held.get(subject);
-  if (!current?.unknown) return null;
-  return current.payload as T;
+  const current = getHeldWrite<T>(subject);
+  if (!current || current.phase !== 'unknown' || current.awaitingReviewReload) {
+    return null;
+  }
+  return current.payload;
 }
 
 /**
@@ -119,14 +104,20 @@ export function unknownAction<T>(subject: string): T | null {
  * unknown, so a retry of an unknown write cannot pick up a newer payload.
  */
 export function heldAction<T>(subject: string): T | null {
-  const current = held.get(subject);
-  if (!current || current.unknown) return null;
-  return current.payload as T;
+  const current = getHeldWrite<T>(subject);
+  if (
+    !current ||
+    current.phase === 'unknown' ||
+    current.phase === 'posted_reload'
+  ) {
+    return null;
+  }
+  return current.payload;
 }
 
 /** True while this request must reload the review before it can send again. */
 export function activationReviewReloadPending(subject: string): boolean {
-  return held.get(subject)?.awaitingReviewReload === true;
+  return getHeldWrite(subject)?.awaitingReviewReload === true;
 }
 
 /**
@@ -137,11 +128,12 @@ export function pinActivationReviewReload(
   subject: string,
   requestId: string,
 ): void {
-  const current = held.get(subject);
+  const current = getHeldWrite(subject);
   if (!current || current.requestId !== requestId) return;
-  current.unknown = false;
-  current.awaitingReviewReload = true;
-  emitHeldWrites();
+  updateHeldWritePayload(subject, requestId, current.payload, {
+    phase: 'inflight',
+    awaitingReviewReload: true,
+  });
 }
 
 /**
@@ -153,35 +145,41 @@ export function replaceActivationPayload<T extends { requestId: string }>(
   requestId: string,
   next: T,
 ): void {
-  const current = held.get(subject);
+  const current = getHeldWrite(subject);
   if (!current || current.requestId !== requestId) return;
   if (next.requestId !== requestId) return;
-  current.payload = next;
-  current.unknown = false;
-  current.awaitingReviewReload = false;
-  emitHeldWrites();
+  updateHeldWritePayload(subject, requestId, next, {
+    phase: 'inflight',
+    awaitingReviewReload: false,
+  });
+}
+
+/** Persist an updated payload for an active held action (same requestId). */
+export function updateActionPayload<T>(
+  subject: string,
+  requestId: string,
+  payload: T,
+): void {
+  updateHeldWritePayload(subject, requestId, payload);
 }
 
 /**
  * At most one outstanding action per subject. A second begin returns the
- * payload already held, including its request id.
+ * payload already held, including its request id. Persisted to localStorage
+ * with phase `inflight` BEFORE the caller sends the request.
  */
 export function beginAction<T>(
   subject: string,
   create: (requestId: string) => T,
 ): T {
-  const existing = held.get(subject);
-  if (existing) return existing.payload as T;
-  const requestId = crypto.randomUUID();
-  const payload = create(requestId);
-  held.set(subject, {
-    requestId,
-    payload,
-    unknown: false,
-    awaitingReviewReload: false,
-  });
-  emitHeldWrites();
-  return payload;
+  const existing = getHeldWrite<T>(subject);
+  if (existing && existing.phase !== 'posted_reload') {
+    return existing.payload;
+  }
+  if (existing && existing.phase === 'posted_reload') {
+    clearHeldWrite(subject, existing.requestId);
+  }
+  return beginHeldWrite<T>(subject, create, { kind: 'action' }).payload;
 }
 
 /**
@@ -196,11 +194,10 @@ export function settleAction(
   requestId: string,
   error?: unknown,
 ): void {
-  const current = held.get(subject);
+  const current = getHeldWrite(subject);
   if (!current || current.requestId !== requestId) return;
   if (error === undefined) {
-    held.delete(subject);
-    emitHeldWrites();
+    clearHeldWrite(subject, requestId);
     return;
   }
   if (
@@ -209,12 +206,10 @@ export function settleAction(
     error instanceof ConfirmedRefusalError ||
     error instanceof StaleWriteError
   ) {
-    held.delete(subject);
-    emitHeldWrites();
+    clearHeldWrite(subject, requestId);
     return;
   }
-  if (!current.unknown) {
-    current.unknown = true;
-    emitHeldWrites();
+  if (current.phase !== 'unknown') {
+    setHeldWritePhase(subject, requestId, 'unknown');
   }
 }
