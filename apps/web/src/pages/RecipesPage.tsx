@@ -2,12 +2,17 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import {
-  clearActionPostedReload,
+  clearActionPostedReloadSnapshot,
+  hasDurableAction,
+  snapshotActionPostedReloads,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
-import { listHeldWritesByPrefix } from '@/lib/held-writes';
+import {
+  listHeldWritesByPrefix,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
 import { createRecipe, listRecipes } from '@/recipes/api';
@@ -90,17 +95,16 @@ export function RecipesPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const pendingReloads = snapshotActionPostedReloads({
+      prefix: recipeCreatePrefix,
+    });
     void (async () => {
       try {
         const next = await listRecipes();
         if (cancelled) return;
         setRecipes(next);
         setLoadError(null);
-        for (const pin of listHeldWritesByPrefix(recipeCreatePrefix)) {
-          if (pin.phase === 'posted_reload') {
-            clearActionPostedReload(pin.subject);
-          }
-        }
+        clearActionPostedReloadSnapshot(pendingReloads);
       } catch (error) {
         if (!cancelled) setLoadError(messageFrom(error));
       } finally {
@@ -118,8 +122,18 @@ export function RecipesPage() {
     setLoadId((value) => value + 1);
   }
 
-  async function send(draft: Draft) {
+  async function send(draft: Draft, replayRequestId?: string) {
     if (flight.current || !isOnline()) return;
+    if (
+      replayRequestId !== undefined &&
+      !hasDurableAction(
+        recipeCreateSubject(draft.name, draft.kind),
+        replayRequestId,
+      )
+    ) {
+      setCreateError(storageWriteFailedMessage);
+      return;
+    }
     flight.current = true;
     setCreating(true);
     setCreateError(null);
@@ -229,7 +243,7 @@ export function RecipesPage() {
             {held && activeDraft ? (
               <UnknownSave
                 disabled={creating}
-                onRetry={() => void send(activeDraft)}
+                onRetry={() => void send(activeDraft, held)}
               />
             ) : null}
             {createError ? <p role="alert">{createError}</p> : null}

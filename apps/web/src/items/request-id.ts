@@ -5,18 +5,22 @@ import {
 } from '@/items/errors';
 import type { ItemDraft } from '@/items/types';
 import {
-  beginHeldWrite,
   claimFreshHeldWrite,
   claimReplayHeldWrite,
   clearHeldWrite,
   clearPostedReload,
+  clearPostedReloadSnapshot,
   getHeldWrite,
+  hasDurableHeldWrite,
   listHeldWritesByPrefix,
   resetHeldWritesStore,
   setHeldWritePhase,
+  snapshotPostedReloads,
   subscribeHeldWritesStore,
   updateHeldWritePayload,
   type ClaimHeldWriteResult,
+  type PostedReloadSnapshot,
+  type WriteSession,
 } from '@/lib/held-writes';
 import { isPayloadRefusal } from '@/lib/write-outcome';
 
@@ -226,48 +230,48 @@ export function updateActionPayload<T>(
 }
 
 /**
- * At most one outstanding active action per subject. Persists to localStorage
- * with phase `inflight` BEFORE the caller sends the request, without
- * discarding any existing `posted_reload` pin on the same subject.
- */
-export function beginAction<T>(
-  subject: string,
-  create: (requestId: string) => T,
-): T {
-  const existing = getHeldWrite<T>(subject);
-  if (existing && existing.phase !== 'posted_reload') {
-    return existing.payload;
-  }
-  return beginHeldWrite<T>(subject, create, { kind: 'action' }).payload;
-}
-
-/**
  * Atomically claim a fresh action on `subject` under a Web Lock (when
- * supported), refusing if another tab holds the lock or an unresolved pin
- * already exists in storage.
+ * supported), rechecking session generation + user + online under the lock
+ * and refusing if another tab holds the lock or an unresolved pin already
+ * exists in storage. Never discards an existing `posted_reload` pin.
  */
 export function claimFreshAction<T>(
   subject: string,
   create: (requestId: string) => T,
+  opts?: { session?: WriteSession | null },
 ): Promise<ClaimHeldWriteResult<T>> {
-  return claimFreshHeldWrite<T>(subject, create, { kind: 'action' });
+  return claimFreshHeldWrite<T>(subject, create, {
+    kind: 'action',
+    ...(opts?.session !== undefined ? { session: opts.session } : {}),
+  });
 }
 
 /**
  * Atomically claim an explicit replay of an existing durable action pin,
- * verifying storage still holds the matching `subject` and `requestId`.
+ * verifying storage still holds the matching `subject` and `requestId` and
+ * rechecking session generation + user + online under the lock.
  */
 export function claimReplayAction<T>(
   subject: string,
   requestId: string,
-  opts?: { payload?: T; awaitingReviewReload?: boolean },
+  opts?: {
+    payload?: T;
+    awaitingReviewReload?: boolean;
+    session?: WriteSession | null;
+  },
 ): Promise<ClaimHeldWriteResult<T>> {
   return claimReplayHeldWrite<T>(subject, requestId, opts);
 }
 
+/** True iff localStorage currently holds an unresolved pin for `(subject, requestId)`. */
+export function hasDurableAction(subject: string, requestId: string): boolean {
+  return hasDurableHeldWrite(subject, requestId);
+}
+
 /**
  * Move a confirmed RPC write to `posted_reload` until its post-write read
- * covering `readTarget` succeeds.
+ * covering `readTarget` succeeds. Throws `HeldWriteStorageError` (keeping the
+ * old durable record intact) if storage cannot persist the replacement.
  */
 export function markActionPostedReload(
   subject: string,
@@ -286,20 +290,20 @@ export function clearActionPostedReload(
   clearPostedReload(subject, readTarget, requestId);
 }
 
-/** Clear all `posted_reload` pins whose subject starts with `prefix` and whose target matches. */
-export function clearPostedReloadsByPrefix(
-  prefix: string,
-  expectedTarget?: string,
+/** Capture existing `posted_reload` pins before starting a read so only those pins can clear when it completes. */
+export function snapshotActionPostedReloads(filter: {
+  subject?: string;
+  prefix?: string;
+}): PostedReloadSnapshot {
+  return snapshotPostedReloads(filter);
+}
+
+/** Clear only `posted_reload` pins that existed when the read started and match `loadedTarget`. */
+export function clearActionPostedReloadSnapshot(
+  snapshot: PostedReloadSnapshot,
+  loadedTarget?: string,
 ): void {
-  for (const record of listHeldWritesByPrefix(prefix)) {
-    if (record.phase === 'posted_reload') {
-      clearPostedReload(
-        record.subject,
-        expectedTarget ?? record.readTarget,
-        record.requestId,
-      );
-    }
-  }
+  clearPostedReloadSnapshot(snapshot, loadedTarget);
 }
 
 /**

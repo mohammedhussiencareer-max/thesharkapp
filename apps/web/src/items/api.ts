@@ -6,13 +6,21 @@ import {
 } from '@/items/errors';
 import type { ItemExpectation } from '@/items/expectation';
 import {
-  beginAction,
+  claimFreshAction,
+  claimReplayAction,
   createSubject,
   settleAction,
   unitSubject,
+  unknownAction,
 } from '@/items/request-id';
 import type { Database } from '@/lib/database.types';
 import { exactDecimal } from '@/lib/decimal';
+import {
+  canDispatchWriteFor,
+  captureWriteSession,
+  HeldWriteStorageError,
+} from '@/lib/held-writes';
+import { offlineWriteMessage } from '@/lib/online';
 import { readAllPages } from '@/lib/paged';
 import { isDefiniteRefusal } from '@/lib/write-outcome';
 import { supabase } from '@/lib/supabase';
@@ -199,8 +207,28 @@ export async function listItems(): Promise<CatalogItem[]> {
 
 export async function createItem(draft: ItemDraft): Promise<void> {
   const subject = createSubject(draft);
-  const requestId = beginAction(subject, (id) => id);
+  const session = captureWriteSession();
+  const existing = unknownAction<string>(subject);
+  const claim =
+    existing !== null
+      ? await claimReplayAction<string>(subject, existing, { session })
+      : await claimFreshAction<string>(subject, (id) => id, { session });
+  if (!claim.ok) {
+    if (claim.reason === 'storage' || claim.reason === 'missing') {
+      throw new HeldWriteStorageError();
+    }
+    if (claim.reason === 'session_invalid') {
+      throw new Error(offlineWriteMessage);
+    }
+    throw new Error(genericCatalogError);
+  }
+  const requestId = claim.record.requestId;
+  let dispatched = false;
   try {
+    if (!canDispatchWriteFor(session)) {
+      throw new Error(offlineWriteMessage);
+    }
+    dispatched = true;
     const { data, error } = await appDb().rpc('create_stock_item', {
       p_request_id: requestId,
       p_name: draft.name.trim(),
@@ -217,8 +245,12 @@ export async function createItem(draft: ItemDraft): Promise<void> {
     }
     settleAction(subject, requestId);
   } catch (error) {
-    settleAction(subject, requestId, error);
+    if (dispatched) {
+      settleAction(subject, requestId, error);
+    }
     throw error;
+  } finally {
+    claim.release();
   }
 }
 
@@ -482,8 +514,33 @@ export async function addCustomUnit(
   requestId?: string,
 ): Promise<string> {
   const subject = unitSubject(code, labelAr);
-  const id = requestId ?? beginAction(subject, (next) => next);
+  let id = requestId;
+  let releaseLock = () => {};
+  const session = requestId ? null : captureWriteSession();
+  if (!id) {
+    const existing = unknownAction<string>(subject);
+    const claim =
+      existing !== null
+        ? await claimReplayAction<string>(subject, existing, { session })
+        : await claimFreshAction<string>(subject, (next) => next, { session });
+    if (!claim.ok) {
+      if (claim.reason === 'storage' || claim.reason === 'missing') {
+        throw new HeldWriteStorageError();
+      }
+      if (claim.reason === 'session_invalid') {
+        throw new Error(offlineWriteMessage);
+      }
+      throw new Error(genericCatalogError);
+    }
+    id = claim.record.requestId;
+    releaseLock = claim.release;
+  }
+  let dispatched = false;
   try {
+    if (!requestId && !canDispatchWriteFor(session)) {
+      throw new Error(offlineWriteMessage);
+    }
+    dispatched = true;
     const { data, error } = await appDb().rpc('add_custom_unit', {
       p_request_id: id,
       p_code: code.trim(),
@@ -496,8 +553,10 @@ export async function addCustomUnit(
     if (!requestId) settleAction(subject, id);
     return data;
   } catch (error) {
-    if (!requestId) settleAction(subject, id, error);
+    if (!requestId && dispatched) settleAction(subject, id, error);
     throw error;
+  } finally {
+    releaseLock();
   }
 }
 

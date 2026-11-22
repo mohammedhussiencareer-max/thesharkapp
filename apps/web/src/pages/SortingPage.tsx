@@ -2,12 +2,16 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
 import {
+  canDispatchWriteFor,
+  captureWriteSession,
   claimFreshHeldWrite,
   claimReplayHeldWrite,
   clearHeldWrite,
   clearPostedReload,
+  clearPostedReloadSnapshot,
   getHeldWrite,
   setHeldWritePhase,
+  snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
 } from '@/lib/held-writes';
@@ -140,6 +144,7 @@ export function SortingPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const pendingReloads = snapshotPostedReloads({ subject: SORT_SUBJECT });
     void (async () => {
       try {
         const next = await readSnapshot();
@@ -151,7 +156,7 @@ export function SortingPage() {
         }
         setSnapshot(next.snapshot);
         setLoadError(null);
-        clearPostedReload(SORT_SUBJECT);
+        clearPostedReloadSnapshot(pendingReloads);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -205,21 +210,37 @@ export function SortingPage() {
       setFilterError(problem);
       return;
     }
+    const session = captureWriteSession();
     const prior = getHeldWrite<SortDraft>(SORT_SUBJECT);
     const wasPinned =
       prior !== null &&
       prior.requestId === draft.requestId &&
       prior.phase === 'unknown';
     const claim = wasPinned
-      ? await claimReplayHeldWrite<SortDraft>(SORT_SUBJECT, draft.requestId)
+      ? await claimReplayHeldWrite<SortDraft>(SORT_SUBJECT, draft.requestId, {
+          session,
+        })
       : await claimFreshHeldWrite<SortDraft>(SORT_SUBJECT, () => draft, {
           requestId: draft.requestId,
           kind: 'sort',
+          session,
         });
     if (!claim.ok) {
       if (claim.reason === 'storage' || claim.reason === 'missing') {
         setServerError(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setServerError(offlineWriteMessage);
       }
+      return;
+    }
+    if (!canDispatchWriteFor(session)) {
+      if (wasPinned) {
+        setHeldWritePhase(SORT_SUBJECT, draft.requestId, 'unknown');
+      } else {
+        clearHeldWrite(SORT_SUBJECT, draft.requestId);
+      }
+      claim.release();
+      if (!isOnline()) setServerError(offlineWriteMessage);
       return;
     }
     setSaving(true);

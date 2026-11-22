@@ -41,7 +41,7 @@ import {
 } from '@/items/api';
 import { ConversionsPanel } from '@/items/ConversionsPanel';
 import {
-  beginAction,
+  claimFreshAction,
   markActionPostedReload,
   resetHeldWrites,
 } from '@/items/request-id';
@@ -579,14 +579,26 @@ describe('P7-3 round-3 review fixes', () => {
     expect(hasPostedReload(subjectA, subjectA)).toBe(true);
   });
 
-  it('R3-2c: beginAction does not discard an existing posted_reload pin on a second submit', () => {
+  it('R3-2c: claimFreshAction does not discard an existing posted_reload pin on a second submit', async () => {
     const subject = 'mapping:base:pos-1:';
-    const first = beginAction(subject, (requestId) => ({ requestId, n: 1 }));
-    markActionPostedReload(subject, first.requestId, subject);
+    const first = await claimFreshAction(subject, (requestId) => ({
+      requestId,
+      n: 1,
+    }));
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    markActionPostedReload(subject, first.record.requestId, subject);
+    first.release();
     expect(hasPostedReload(subject, subject)).toBe(true);
 
-    const second = beginAction(subject, (requestId) => ({ requestId, n: 2 }));
-    expect(second.requestId).not.toBe(first.requestId);
+    const second = await claimFreshAction(subject, (requestId) => ({
+      requestId,
+      n: 2,
+    }));
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.record.requestId).not.toBe(first.record.requestId);
+    second.release();
     // First posted_reload pin MUST NOT be discarded by the second submit.
     expect(hasPostedReload(subject, subject)).toBe(true);
   });

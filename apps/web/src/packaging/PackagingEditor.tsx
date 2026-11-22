@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
   hasAction,
@@ -15,10 +15,11 @@ import { currentMinuteMs } from '@/items/effective';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatCairo } from '@/lib/cairo';
 import {
-  HeldWriteStorageError,
+  canDispatchWriteFor,
+  captureWriteSession,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
-import { isOnline, useOnline } from '@/lib/online';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import { coverAt, quantityError } from '@/mapping/format';
 import { sourceChangedMessage } from '@/mapping/labels';
@@ -415,6 +416,7 @@ function HistoryList({
 
 export function PackagingEditor({
   subjectKey,
+  expectedKey,
   kind,
   orderType,
   posItemId,
@@ -428,6 +430,7 @@ export function PackagingEditor({
   onReload,
 }: {
   subjectKey: string;
+  expectedKey?: string;
   kind: 'order_type' | 'base';
   orderType?: string | null;
   posItemId?: string;
@@ -438,7 +441,7 @@ export function PackagingEditor({
   units: readonly EditorUnit[];
   shiftStart: string | null;
   allowCapacity: boolean;
-  onReload: () => Promise<boolean | void>;
+  onReload: (expectedKey?: string) => Promise<boolean | void>;
 }) {
   const online = useOnline();
   const [heldEpoch, setHeldEpoch] = useState(0);
@@ -454,28 +457,45 @@ export function PackagingEditor({
     [],
   );
 
-  async function finish(write: PackagingWrite, isReplay = false) {
+  async function finish(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => PackagingWrite }
+      | { kind: 'replay'; write: PackagingWrite },
+  ) {
     if (flight.current || !isOnline()) return;
-    const requestId = write.requestId;
-    let releaseLock = () => {};
-    if (isReplay) {
-      const claim = await claimReplayAction<PackagingWrite>(
-        subjectKey,
-        requestId,
-      );
-      if (!claim.ok) {
-        if (claim.reason === 'missing' || claim.reason === 'storage') {
-          setError(storageWriteFailedMessage);
-        }
-        return;
-      }
-      releaseLock = claim.release;
-    }
+    const session = captureWriteSession();
     flight.current = true;
     setSaving(true);
     setError(null);
     setNotice(null);
+    let releaseLock = () => {};
     try {
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<PackagingWrite>(subjectKey, mode.create, {
+              session,
+            })
+          : await claimReplayAction<PackagingWrite>(
+              subjectKey,
+              mode.write.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setError(offlineWriteMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+      const write = claim.record.payload;
+      const requestId = claim.record.requestId;
+      if (!canDispatchWriteFor(session)) {
+        if (!isOnline()) setError(offlineWriteMessage);
+        return;
+      }
+      let saved = false;
       try {
         if (kind === 'order_type') {
           const orderWrite: OrderTypePackagingWrite = {
@@ -492,16 +512,20 @@ export function PackagingEditor({
           };
           await setBasePackaging(baseWrite);
         }
+        saved = true;
         markActionPostedReload(subjectKey, requestId, subjectKey);
       } catch (failure) {
-        settleAction(subjectKey, requestId, failure);
+        if (!saved) {
+          settleAction(subjectKey, requestId, failure);
+        }
         setError(messageFrom(failure));
-        if (!hasAction(subjectKey)) await onReload();
+        if (!saved && !hasAction(subjectKey)) await onReload(expectedKey);
         return;
       } finally {
         releaseLock();
+        releaseLock = () => {};
       }
-      const reloaded = await onReload();
+      const reloaded = await onReload(expectedKey);
       if (reloaded !== false) {
         clearActionPostedReload(subjectKey, subjectKey, requestId);
       }
@@ -509,6 +533,7 @@ export function PackagingEditor({
     } catch (failure) {
       setError(messageFrom(failure));
     } finally {
+      releaseLock();
       flight.current = false;
       setSaving(false);
     }
@@ -520,24 +545,17 @@ export function PackagingEditor({
     reason: string | null;
     policy: PackagingPolicy | null;
   }) {
-    let write: PackagingWrite;
-    try {
-      write = beginAction(subjectKey, (requestId) => ({
+    void finish({
+      kind: 'fresh',
+      create: (requestId) => ({
         requestId,
         effectiveFrom: timing.effectiveFrom,
         effectiveTo: timing.effectiveTo,
         token: schedule.token,
         reason: timing.reason,
         policy: timing.policy,
-      }));
-    } catch (failure) {
-      if (failure instanceof HeldWriteStorageError) {
-        setError(failure.message);
-        return;
-      }
-      throw failure;
-    }
-    void finish(write);
+      }),
+    });
   }
 
   return (
@@ -546,7 +564,7 @@ export function PackagingEditor({
       {held ? (
         <UnknownSave
           disabled={saving}
-          onRetry={() => void finish(held, true)}
+          onRetry={() => void finish({ kind: 'replay', write: held })}
         />
       ) : null}
       {notice ? <p role="status">{notice}</p> : null}

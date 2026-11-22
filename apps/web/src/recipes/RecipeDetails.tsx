@@ -5,7 +5,7 @@ import {
   staleWriteMessage,
 } from '@/items/errors';
 import {
-  beginAction,
+  claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
   hasAction,
@@ -16,10 +16,11 @@ import {
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import {
-  HeldWriteStorageError,
+  canDispatchWriteFor,
+  captureWriteSession,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
-import { isOnline, useOnline } from '@/lib/online';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { updateRecipe, type RecipeUpdate } from '@/recipes/api';
 import { recipeKindLabels } from '@/recipes/labels';
 import { recipeUpdateSubject } from '@/recipes/subjects';
@@ -70,35 +71,55 @@ export function RecipeDetails({
     setActive(next.active);
   }
 
-  async function finish(action: DetailsAction, isReplay = false) {
+  async function finish(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => DetailsAction }
+      | { kind: 'replay'; action: DetailsAction },
+  ) {
     if (flight.current || !isOnline()) return;
-    let releaseLock = () => {};
-    if (isReplay) {
-      const claim = await claimReplayAction<DetailsAction>(
-        subject,
-        action.update.requestId,
-      );
-      if (!claim.ok) {
-        if (claim.reason === 'missing' || claim.reason === 'storage') {
-          setError(storageWriteFailedMessage);
-        }
-        return;
-      }
-      releaseLock = claim.release;
-    }
+    const session = captureWriteSession();
     flight.current = true;
     setSaving(true);
     onBusyChange(true);
     setError(null);
     setNotice(null);
+    let releaseLock = () => {};
+    let saved = false;
+    let requestId: string | null = null;
     try {
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<DetailsAction>(subject, mode.create, {
+              session,
+            })
+          : await claimReplayAction<DetailsAction>(
+              subject,
+              mode.action.update.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setError(offlineWriteMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+      const action = claim.record.payload;
+      requestId = claim.record.requestId;
+      if (!canDispatchWriteFor(session)) {
+        if (!isOnline()) setError(offlineWriteMessage);
+        return;
+      }
       await updateRecipe(action.recipeId, action.update);
-      markActionPostedReload(subject, action.update.requestId, subject);
+      saved = true;
+      markActionPostedReload(subject, requestId, subject);
       releaseLock();
       releaseLock = () => {};
       const fresh = await onReload();
       if (fresh !== null) {
-        clearActionPostedReload(subject, subject, action.update.requestId);
+        clearActionPostedReload(subject, subject, requestId);
       }
       adopt(
         fresh ?? {
@@ -109,8 +130,10 @@ export function RecipeDetails({
       );
       setNotice('الوصفة اتحفظت');
     } catch (failure) {
-      settleAction(subject, action.update.requestId, failure);
-      if (failure instanceof StaleWriteError) {
+      if (!saved && requestId !== null) {
+        settleAction(subject, requestId, failure);
+      }
+      if (!saved && failure instanceof StaleWriteError) {
         const fresh = await onReload();
         if (fresh) adopt(fresh);
         setError(staleWriteMessage);
@@ -138,9 +161,9 @@ export function RecipeDetails({
       setNotice('مفيش تغيير للحفظ');
       return;
     }
-    let action: DetailsAction;
-    try {
-      action = beginAction<DetailsAction>(subject, (requestId) => ({
+    void finish({
+      kind: 'fresh',
+      create: (requestId) => ({
         recipeId: recipe.id,
         update: {
           requestId,
@@ -149,20 +172,13 @@ export function RecipeDetails({
           expectedName: expected.name,
           expectedActive: expected.active,
         },
-      }));
-    } catch (failure) {
-      if (failure instanceof HeldWriteStorageError) {
-        setError(failure.message);
-        return;
-      }
-      throw failure;
-    }
-    void finish(action);
+      }),
+    });
   }
 
   function retry() {
     if (!held || locked || flight.current) return;
-    void finish(held, true);
+    void finish({ kind: 'replay', action: held });
   }
 
   return (

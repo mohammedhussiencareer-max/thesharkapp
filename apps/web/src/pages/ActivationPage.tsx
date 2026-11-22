@@ -8,7 +8,10 @@ import { loadOpeningReview } from '@/accounting/api';
 import { ActivationReview } from '@/accounting/ActivationReview';
 import type { OpeningReview } from '@/accounting/types';
 import { messageFrom } from '@/items/errors';
-import { clearActionPostedReload } from '@/items/request-id';
+import {
+  clearActionPostedReloadSnapshot,
+  snapshotActionPostedReloads,
+} from '@/items/request-id';
 import { offlineMoneyMessage, useReconnectReload } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 
@@ -28,13 +31,16 @@ export function ActivationPage() {
   useEffect(() => {
     const seq = ++seqRef.current;
     let cancelled = false;
+    const pendingReloads = snapshotActionPostedReloads({
+      subject: ACTIVATION_SUBJECT,
+    });
     void (async () => {
       try {
         const next = await loadOpeningReview();
         if (cancelled || seq !== seqRef.current) return;
         setReview(next);
         setLoadError(null);
-        clearActionPostedReload(ACTIVATION_SUBJECT, ACTIVATION_SUBJECT);
+        clearActionPostedReloadSnapshot(pendingReloads, ACTIVATION_SUBJECT);
       } catch (error) {
         if (cancelled || seq !== seqRef.current) return;
         setLoadError(messageFrom(error));

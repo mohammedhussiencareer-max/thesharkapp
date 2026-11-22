@@ -25,7 +25,13 @@ function Num({ value }: { value: string }) {
   return <span dir="ltr">{value}</span>;
 }
 
-function HistoryItem({ entry }: { entry: HistoryEntry }) {
+function HistoryItem({
+  entry,
+  hideMoney = false,
+}: {
+  entry: HistoryEntry;
+  hideMoney?: boolean;
+}) {
   return (
     <li className="flex flex-col gap-1 border-t border-neutral-200 pt-2">
       <p>
@@ -42,15 +48,23 @@ function HistoryItem({ entry }: { entry: HistoryEntry }) {
           ))}
         </ul>
       ) : null}
-      <DifferencesList
-        differences={entry.differences}
-        label={`فروق القرار ${entry.eventId}`}
-      />
+      {!hideMoney ? (
+        <DifferencesList
+          differences={entry.differences}
+          label={`فروق القرار ${entry.eventId}`}
+        />
+      ) : null}
     </li>
   );
 }
 
-export function NoticeView({ notice }: { notice: DecisionNotice }) {
+export function NoticeView({
+  notice,
+  hideMoney = false,
+}: {
+  notice: DecisionNotice;
+  hideMoney?: boolean;
+}) {
   if (notice.kind === 'failed') return <p role="alert">{notice.message}</p>;
   const { result, warning } = notice;
   return (
@@ -58,10 +72,12 @@ export function NoticeView({ notice }: { notice: DecisionNotice }) {
       {result.status === 'ok' ? (
         <>
           <p>{outcomeMessage(result.outcome, result.reason)}</p>
-          <DifferencesList
-            differences={result.differences}
-            label="الفروق الناتجة"
-          />
+          {!hideMoney ? (
+            <DifferencesList
+              differences={result.differences}
+              label="الفروق الناتجة"
+            />
+          ) : null}
         </>
       ) : (
         <p>{notActivatedMessage}</p>
@@ -74,10 +90,12 @@ export function NoticeView({ notice }: { notice: DecisionNotice }) {
 export function DecisionCard({
   row,
   closed,
+  hideMoney = false,
   onChanged,
 }: {
   row: QueueRow;
   closed: boolean;
+  hideMoney?: boolean;
   onChanged: (orderId: string) => Promise<void>;
 }) {
   const [notice, setNotice] = useState<DecisionNotice | null>(null);
@@ -111,21 +129,23 @@ export function DecisionCard({
         ) : null}
         {row.decisionReason ? <p>سبب القرار: {row.decisionReason}</p> : null}
       </header>
-      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
-        <dt>إجمالي الطلب</dt>
-        <dd>
-          <Num value={moneyText(row.orderTotal)} />
-        </dd>
-        {row.refundTotal !== null ? (
-          <>
-            <dt>إجمالي المرتجع</dt>
-            <dd>
-              <Num value={moneyText(row.refundTotal)} />
-            </dd>
-          </>
-        ) : null}
-      </dl>
-      {row.refunds.length > 0 ? (
+      {!hideMoney ? (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
+          <dt>إجمالي الطلب</dt>
+          <dd>
+            <Num value={moneyText(row.orderTotal)} />
+          </dd>
+          {row.refundTotal !== null ? (
+            <>
+              <dt>إجمالي المرتجع</dt>
+              <dd>
+                <Num value={moneyText(row.refundTotal)} />
+              </dd>
+            </>
+          ) : null}
+        </dl>
+      ) : null}
+      {!hideMoney && row.refunds.length > 0 ? (
         <ul aria-label="المرتجعات">
           {row.refunds.map((refund) => (
             <li key={`${refund.shiftId}/${refund.txId}`}>
@@ -150,11 +170,16 @@ export function DecisionCard({
           </ul>
         ) : null}
       </section>
-      <section className="flex flex-col gap-1">
-        <h3 className="font-semibold">الفرق عن البيع العادي</h3>
-        <DifferencesList differences={row.differences} label="الفروق الحالية" />
-      </section>
-      {notice ? <NoticeView notice={notice} /> : null}
+      {!hideMoney ? (
+        <section className="flex flex-col gap-1">
+          <h3 className="font-semibold">الفرق عن البيع العادي</h3>
+          <DifferencesList
+            differences={row.differences}
+            label="الفروق الحالية"
+          />
+        </section>
+      ) : null}
+      {notice ? <NoticeView notice={notice} hideMoney={hideMoney} /> : null}
       {closed ? (
         <p>الطلب ده مبقاش محتاج قرار</p>
       ) : (
@@ -170,7 +195,11 @@ export function DecisionCard({
           <summary>سجل القرارات ({history.length})</summary>
           <ol className="flex flex-col gap-2">
             {history.map((entry) => (
-              <HistoryItem key={entry.eventId} entry={entry} />
+              <HistoryItem
+                key={entry.eventId}
+                entry={entry}
+                hideMoney={hideMoney}
+              />
             ))}
           </ol>
         </details>

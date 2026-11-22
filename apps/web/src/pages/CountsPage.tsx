@@ -28,15 +28,19 @@ import type {
 import { messageFrom } from '@/items/errors';
 import type { Json } from '@/lib/database.types';
 import {
+  canDispatchWriteFor,
+  captureWriteSession,
   claimFreshHeldWrite,
   claimReplayHeldWrite,
   clearHeldWrite,
-  clearPostedReload,
+  clearPostedReloadSnapshot,
   getHeldWrite,
   listHeldWritesByPrefix,
   setHeldWritePhase,
+  snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
+  type PostedReloadSnapshot,
 } from '@/lib/held-writes';
 import {
   isOnline,
@@ -118,13 +122,11 @@ function storedPinToPendingEntry(
   };
 }
 
-function clearCountPostedReloads(): void {
-  clearPostedReload(COUNT_DAILY_SUBJECT);
-  for (const record of listHeldWritesByPrefix(COUNT_STORED_PREFIX)) {
-    if (record.phase === 'posted_reload') {
-      clearPostedReload(record.subject);
-    }
-  }
+function snapshotCountPostedReloads(): PostedReloadSnapshot {
+  return [
+    ...snapshotPostedReloads({ subject: COUNT_DAILY_SUBJECT }),
+    ...snapshotPostedReloads({ prefix: COUNT_STORED_PREFIX }),
+  ];
 }
 
 export function CountsPage() {
@@ -231,6 +233,7 @@ export function CountsPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const pendingReloads = snapshotCountPostedReloads();
     void (async () => {
       try {
         const next = await readSnapshot();
@@ -238,7 +241,7 @@ export function CountsPage() {
         setSnapshot(next.snapshot);
         rememberItemNames(next.snapshot.items);
         setLoadError(null);
-        clearCountPostedReloads();
+        clearPostedReloadSnapshot(pendingReloads);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -366,11 +369,12 @@ export function CountsPage() {
       return false;
     }
     applyPosted(requestId, draft !== null, storedSubject);
+    const pendingReloads = snapshotCountPostedReloads();
     const next = await readSnapshot();
     if (next.status === 'ready') {
       setSnapshot(next.snapshot);
       setLoadError(null);
-      clearCountPostedReloads();
+      clearPostedReloadSnapshot(pendingReloads);
       setLocalNeedsReload(false);
     } else {
       setLocalNeedsReload(false);
@@ -380,6 +384,7 @@ export function CountsPage() {
 
   async function handleSubmit(draft: CountDraft) {
     if (busy || loadsRef.current > 0 || !isOnline()) return;
+    const session = captureWriteSession();
     const prior = getHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
     const priorPhase =
       prior !== null &&
@@ -398,16 +403,29 @@ export function CountsPage() {
         ? await claimReplayHeldWrite<CountDraft>(
             COUNT_DAILY_SUBJECT,
             draft.requestId,
+            { session },
           )
         : await claimFreshHeldWrite<CountDraft>(
             COUNT_DAILY_SUBJECT,
             () => storedDraft,
-            { requestId: draft.requestId, kind: 'count' },
+            { requestId: draft.requestId, kind: 'count', session },
           );
     if (!claim.ok) {
       if (claim.reason === 'storage' || claim.reason === 'missing') {
         setServerError(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setServerError(offlineWriteMessage);
       }
+      return;
+    }
+    if (!canDispatchWriteFor(session)) {
+      if (priorPhase !== null) {
+        setHeldWritePhase(COUNT_DAILY_SUBJECT, draft.requestId, priorPhase);
+      } else {
+        clearHeldWrite(COUNT_DAILY_SUBJECT, draft.requestId);
+      }
+      claim.release();
+      if (!isOnline()) setServerError(offlineWriteMessage);
       return;
     }
     setSaving(true);
@@ -434,29 +452,48 @@ export function CountsPage() {
 
   async function handleStored(payload: Json) {
     if (busy || loadsRef.current > 0 || !isOnline()) return;
+    const session = captureWriteSession();
     const requestId = requestIdOf(payload);
     const storedSubject =
       requestId !== null ? `${COUNT_STORED_PREFIX}${requestId}` : null;
     let releaseLock = () => {};
+    let isLocalReplay = false;
     if (storedSubject && requestId !== null) {
       const prior = getHeldWrite<Json>(storedSubject);
-      const isLocalReplay =
+      isLocalReplay =
         prior !== null &&
         prior.requestId === requestId &&
         prior.phase === 'unknown';
       const claim = isLocalReplay
-        ? await claimReplayHeldWrite<Json>(storedSubject, requestId)
+        ? await claimReplayHeldWrite<Json>(storedSubject, requestId, {
+            session,
+          })
         : await claimFreshHeldWrite<Json>(storedSubject, () => payload, {
             requestId,
             kind: 'count_stored',
+            session,
           });
       if (!claim.ok) {
         if (claim.reason === 'storage' || claim.reason === 'missing') {
           setCardError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setCardError(offlineWriteMessage);
         }
         return;
       }
       releaseLock = claim.release;
+    }
+    if (!canDispatchWriteFor(session)) {
+      if (storedSubject && requestId !== null) {
+        if (isLocalReplay) {
+          setHeldWritePhase(storedSubject, requestId, 'unknown');
+        } else {
+          clearHeldWrite(storedSubject, requestId);
+        }
+      }
+      releaseLock();
+      if (!isOnline()) setCardError(offlineWriteMessage);
+      return;
     }
     setSaving(true);
     setServerError(null);

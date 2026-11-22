@@ -20,9 +20,9 @@ export const test = base.extend<{ supabaseUrl: string }>({
     },
     { auto: true },
   ],
-  page: async ({ page }, expose) => {
-    await installLoopbackGuard(page);
-    await expose(page);
+  context: async ({ context }, expose) => {
+    await installLoopbackGuard(context);
+    await expose(context);
   },
 });
 

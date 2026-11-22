@@ -146,7 +146,9 @@ export function SortForm({
       </div>
       {selected ? (
         <p>
-          {`الرصيد ${formatKg(selected.onHandQty)} — متوسط التكلفة ${formatCostPerKg(selected.avgCost)}`}
+          {online
+            ? `الرصيد ${formatKg(selected.onHandQty)} — متوسط التكلفة ${formatCostPerKg(selected.avgCost)}`
+            : `الرصيد ${formatKg(selected.onHandQty)}`}
         </p>
       ) : null}
       <label className="flex flex-col gap-1">
@@ -214,11 +216,15 @@ export function SortForm({
         <section aria-label="معاينة الفرز" className="flex flex-col gap-1">
           <h2 className="text-lg font-semibold">معاينة الفرز</h2>
           <p>{`مجموع الأحجام ${formatKg(preview.sizesQty)}`}</p>
-          <p>{`تكلفة الكيلو ${formatCostPerKg(preview.costPerKg)}`}</p>
+          {online ? (
+            <p>{`تكلفة الكيلو ${formatCostPerKg(preview.costPerKg)}`}</p>
+          ) : null}
           {preview.lossQty !== null && preview.lossValue !== null ? (
             <>
               <p>{`الفاقد ${formatKg(preview.lossQty)}`}</p>
-              <p>{`قيمة الفاقد ${formatLossMoney(preview.lossValue)}`}</p>
+              {online ? (
+                <p>{`قيمة الفاقد ${formatLossMoney(preview.lossValue)}`}</p>
+              ) : null}
             </>
           ) : null}
           <ul className="flex flex-col gap-1">
@@ -228,7 +234,9 @@ export function SortForm({
               );
               return (
                 <li key={line.itemId}>
-                  {`${size?.name ?? line.itemId}: ${formatKg(line.quantity)} — ${formatLossMoney(line.value)}`}
+                  {online
+                    ? `${size?.name ?? line.itemId}: ${formatKg(line.quantity)} — ${formatLossMoney(line.value)}`
+                    : `${size?.name ?? line.itemId}: ${formatKg(line.quantity)}`}
                 </li>
               );
             })}

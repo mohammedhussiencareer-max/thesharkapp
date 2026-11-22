@@ -24,11 +24,16 @@ import {
   StaleWriteError,
 } from '@/items/errors';
 import {
-  beginAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearActionPostedReload,
+  clearActionPostedReloadSnapshot,
   conversionSubject,
   hasAction,
   listUnknownConversionsForItem,
+  markActionPostedReload,
   settleAction,
+  snapshotActionPostedReloads,
   subscribeHeldWrites,
   unknownAction,
   unknownSaveMessage,
@@ -53,7 +58,8 @@ import { formatCairo } from '@/lib/cairo';
 import {
   canDispatchWriteFor,
   captureWriteSession,
-  HeldWriteStorageError,
+  storageWriteFailedMessage,
+  type WriteSession,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 
@@ -113,6 +119,14 @@ function actionSubject(action: ConversionAction): string {
   return conversionSubject(action.itemId, unit);
 }
 
+type ConversionSubmit =
+  | {
+      kind: 'fresh';
+      subject: string;
+      create: (requestId: string) => ConversionAction;
+    }
+  | { kind: 'replay'; action: ConversionAction };
+
 function ConversionRow({
   conversion,
   baseLabel,
@@ -133,7 +147,7 @@ function ConversionRow({
   shiftStart: string | null;
   versions: readonly CostingVersion[];
   token: string;
-  onReplay: (action: ConversionAction) => Promise<void>;
+  onReplay: (mode: ConversionSubmit) => Promise<void>;
 }) {
   const subject = conversionSubject(conversion.itemId, conversion.unit);
   const [factor, setFactor] = useState(() =>
@@ -160,11 +174,11 @@ function ConversionRow({
   const automatic = conversion.source === 'implicit' ? ' تلقائي' : '';
   const readOnly = conversion.source === 'implicit';
 
-  async function finish(action: ConversionAction) {
+  async function finish(mode: ConversionSubmit) {
     if (flight.current) return;
     flight.current = true;
     try {
-      await onReplay(action);
+      await onReplay(mode);
     } finally {
       flight.current = false;
       setActionEpoch((value) => value + 1);
@@ -187,19 +201,11 @@ function ConversionRow({
       return;
     }
     setError(null);
-    let action: ConversionAction;
-    try {
-      action = beginAction(subject, (requestId) =>
-        create({ ...built.write, requestId }),
-      );
-    } catch (failure) {
-      if (failure instanceof HeldWriteStorageError) {
-        setError(failure.message);
-        return;
-      }
-      throw failure;
-    }
-    void finish(action);
+    void finish({
+      kind: 'fresh',
+      subject,
+      create: (requestId) => create({ ...built.write, requestId }),
+    });
   }
 
   function onSubmit(event: FormEvent<HTMLFormElement>) {
@@ -234,7 +240,7 @@ function ConversionRow({
   function retry() {
     if (!held || disabled || flight.current) return;
     setError(null);
-    void finish(held);
+    void finish({ kind: 'replay', action: held });
   }
 
   return (
@@ -449,14 +455,17 @@ export function ConversionsPanel({
     [],
   );
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (): Promise<boolean> => {
     const requestId = ++requestRef.current;
+    const pendingReloads = snapshotActionPostedReloads({
+      prefix: `conversion:[${JSON.stringify(item.id)},`,
+    });
     try {
       const [next, nextSchedule] = await Promise.all([
         listConversions(item.id),
         listCostingSchedule(item.id),
       ]);
-      if (!aliveRef.current || requestId !== requestRef.current) return;
+      if (!aliveRef.current || requestId !== requestRef.current) return false;
       setSchedule(nextSchedule);
       await applySnapshot(
         item.id,
@@ -465,8 +474,11 @@ export function ConversionsPanel({
         requestId,
         () => false,
       );
+      clearActionPostedReloadSnapshot(pendingReloads);
+      return true;
     } catch (error) {
       await failLoad(item.id, error, requestId, () => false);
+      return false;
     }
   }, [applySnapshot, failLoad, item.id]);
 
@@ -474,6 +486,9 @@ export function ConversionsPanel({
     const requestId = ++requestRef.current;
     let cancelled = false;
     aliveRef.current = true;
+    const pendingReloads = snapshotActionPostedReloads({
+      prefix: `conversion:[${JSON.stringify(item.id)},`,
+    });
 
     void (async () => {
       try {
@@ -491,6 +506,7 @@ export function ConversionsPanel({
           requestId,
           () => cancelled,
         );
+        clearActionPostedReloadSnapshot(pendingReloads);
       } catch (error) {
         await failLoad(item.id, error, requestId, () => cancelled);
       }
@@ -527,14 +543,18 @@ export function ConversionsPanel({
     setMetaAttempt((attempt) => attempt + 1);
   }
 
-  async function run(work: () => Promise<void>): Promise<boolean> {
+  async function run(
+    work: () => Promise<void>,
+    onReloaded?: () => void,
+  ): Promise<boolean> {
     if (busy || locked || !isOnline()) return false;
     setBusy(true);
     onBusyChange?.(true);
     setActionError(null);
     try {
       await work();
-      await load();
+      const reloaded = await load();
+      if (reloaded) onReloaded?.();
       await onConversionSaved?.(item.id);
       return true;
     } catch (error) {
@@ -547,7 +567,13 @@ export function ConversionsPanel({
     }
   }
 
-  async function perform(action: ConversionAction): Promise<void> {
+  async function perform(
+    action: ConversionAction,
+    initiatingUser: WriteSession | null,
+  ): Promise<void> {
+    if (!canDispatchWriteFor(initiatingUser)) {
+      throw new Error(offlineWriteMessage);
+    }
     switch (action.kind) {
       case 'remove_conversion':
         await deleteConversion(
@@ -579,7 +605,6 @@ export function ConversionsPanel({
         );
         return;
       case 'create_unit_then_conversion': {
-        const initiatingUser = captureWriteSession();
         let unitCode = action.createdCode;
         if (unitCode === null) {
           if (!canDispatchWriteFor(initiatingUser)) {
@@ -642,41 +667,89 @@ export function ConversionsPanel({
     setFactor('');
   }
 
-  async function replay(action: ConversionAction): Promise<void> {
-    const subject = actionSubject(action);
-    if (replayFlight.current.has(subject)) return;
+  async function replay(mode: ConversionSubmit): Promise<void> {
+    const subject =
+      mode.kind === 'fresh' ? mode.subject : actionSubject(mode.action);
+    if (replayFlight.current.has(subject) || busy || locked || !isOnline()) {
+      return;
+    }
+    const session = captureWriteSession();
     replayFlight.current.add(subject);
+    setActionError(null);
+    let releaseLock = () => {};
     try {
-      const accepted = await run(async () => {
-        try {
-          await perform(action);
-          settleAction(subject, action.write.requestId);
-          clearSubmittedAdd(action);
-        } catch (error) {
-          if (hasAction(subject)) {
-            settleAction(subject, action.write.requestId, error);
-          }
-          throw error;
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<ConversionAction>(subject, mode.create, {
+              session,
+            })
+          : await claimReplayAction<ConversionAction>(
+              subject,
+              mode.action.write.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setActionError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setActionError(offlineWriteMessage);
         }
-      });
-      if (
-        accepted === false &&
-        unknownAction<ConversionAction>(subject) === null
-      ) {
-        settleAction(subject, action.write.requestId);
+        return;
+      }
+      releaseLock = claim.release;
+      const action = claim.record.payload;
+      const requestId = claim.record.requestId;
+      if (!canDispatchWriteFor(session)) {
+        if (mode.kind === 'fresh') {
+          settleAction(subject, requestId);
+        } else {
+          settleAction(subject, requestId, new Error(offlineWriteMessage));
+        }
+        if (!isOnline()) setActionError(offlineWriteMessage);
+        return;
+      }
+      let saved = false;
+      const accepted = await run(
+        async () => {
+          try {
+            await perform(action, session);
+            saved = true;
+            markActionPostedReload(subject, requestId, subject);
+            clearSubmittedAdd(action);
+          } catch (error) {
+            if (!saved && hasAction(subject)) {
+              settleAction(subject, requestId, error);
+            }
+            throw error;
+          } finally {
+            releaseLock();
+            releaseLock = () => {};
+          }
+        },
+        () => {
+          clearActionPostedReload(subject, subject, requestId);
+        },
+      );
+      if (accepted === false) {
+        if (mode.kind === 'fresh') {
+          settleAction(subject, requestId);
+        } else {
+          settleAction(subject, requestId, new Error('retry deferred'));
+        }
       }
     } catch {
       // run already settled this action and showed the error.
     } finally {
+      releaseLock();
       replayFlight.current.delete(subject);
       setActionEpoch((value) => value + 1);
     }
   }
 
-  function send(action: ConversionAction) {
+  function send(mode: ConversionSubmit) {
     if (addFlight.current) return;
     addFlight.current = true;
-    void replay(action).finally(() => {
+    void replay(mode).finally(() => {
       addFlight.current = false;
     });
   }
@@ -712,9 +785,10 @@ export function ConversionsPanel({
       return;
     }
     const snapshotBaseUnit = baseUnit;
-    let action: ConversionAction;
-    try {
-      action = beginAction(subject, (requestId) => {
+    send({
+      kind: 'fresh',
+      subject,
+      create: (requestId) => {
         const write = { ...built.write, requestId };
         if (freshUnit) {
           const createdCode =
@@ -745,15 +819,8 @@ export function ConversionsPanel({
           baseUnit: snapshotBaseUnit,
           write,
         };
-      });
-    } catch (failure) {
-      if (failure instanceof HeldWriteStorageError) {
-        setActionError(failure.message);
-        return;
-      }
-      throw failure;
-    }
-    send(action);
+      },
+    });
   }
 
   function retryAdd() {
@@ -763,7 +830,7 @@ export function ConversionsPanel({
       conversionSubject(item.id, code),
     );
     if (!action) return;
-    send(action);
+    send({ kind: 'replay', action });
   }
 
   const shownError = loadError ?? metaError;
@@ -868,7 +935,9 @@ export function ConversionsPanel({
                   className={secondaryButton}
                   type="button"
                   disabled={busy || locked || !online}
-                  onClick={() => send(pendingAction)}
+                  onClick={() =>
+                    send({ kind: 'replay', action: pendingAction })
+                  }
                 >
                   إعادة المحاولة
                 </button>

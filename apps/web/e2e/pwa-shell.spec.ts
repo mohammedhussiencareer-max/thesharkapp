@@ -98,6 +98,10 @@ test('serves Arabic RTL manifest, registers shell-only service worker, and keeps
   expect(onlineFetch.status).toBe(200);
   expect(networkHits).toBe(1);
 
+  // Remove the mock route before going offline so Playwright cannot fulfill
+  // the probe without network; the request must hit the offline network stack
+  // (or service worker NetworkOnly handler) and fail.
+  await context.unroute(restProbeUrl);
   await context.setOffline(true);
   try {
     // Loopback API read MUST fail offline (proving NetworkOnly, never served from SW cache).

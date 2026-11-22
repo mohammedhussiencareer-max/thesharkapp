@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { ConfirmedRefusalError } from '@/items/errors';
 import {
-  beginAction,
+  claimFreshAction,
   hasAction,
   heldAction,
   replaceActivationPayload,
@@ -15,12 +15,16 @@ describe('settleAction', () => {
     resetHeldWrites();
   });
 
-  it('is a no-op when the held action has a different request id', () => {
+  it('is a no-op when the held action has a different request id', async () => {
     const subject = 'pos-base:newer';
-    const held = beginAction(subject, (requestId) => ({
+    const claim = await claimFreshAction(subject, (requestId) => ({
       requestId,
       label: 'write-2',
     }));
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    const held = claim.record.payload;
+    claim.release();
     settleAction(subject, held.requestId, new Error('socket'));
     const before = unknownAction<typeof held>(subject);
 
@@ -36,13 +40,17 @@ describe('settleAction', () => {
     expect(before).toEqual(held);
   });
 
-  it('replaces an activation payload and keeps the request id', () => {
+  it('replaces an activation payload and keeps the request id', async () => {
     const subject = 'activation';
-    const held = beginAction(subject, (requestId) => ({
+    const claim = await claimFreshAction(subject, (requestId) => ({
       requestId,
       manifestHash: 'a'.repeat(32),
       explicitZeroItemIds: ['item-1'],
     }));
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    const held = claim.record.payload;
+    claim.release();
     settleAction(subject, held.requestId, new Error('socket'));
     expect(unknownAction(subject)).toEqual(held);
 

@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
-import { clearPostedReloadsByPrefix } from '@/items/request-id';
+import {
+  clearActionPostedReloadSnapshot,
+  snapshotActionPostedReloads,
+} from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import { offlineMoneyMessage, useReconnectReload } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
@@ -43,6 +46,7 @@ export function WastePage() {
     const seq = ++loadSeqRef.current;
     const historySeq = ++historySeqRef.current;
     let cancelled = false;
+    const pendingReloads = snapshotActionPostedReloads({ prefix: 'waste:' });
     void (async () => {
       try {
         const [items, page] = await Promise.all([
@@ -57,7 +61,7 @@ export function WastePage() {
           setNext(page.next);
           loadedRef.current = page.entries.length;
           setMoreError(null);
-          clearPostedReloadsByPrefix('waste:');
+          clearActionPostedReloadSnapshot(pendingReloads);
         }
       } catch (error) {
         if (cancelled || seq !== loadSeqRef.current) return;
@@ -105,6 +109,7 @@ export function WastePage() {
   // Re-reads everything already on screen plus the new document, so a corrected row refreshes too.
   const reload = useCallback(async (): Promise<void> => {
     const seq = ++historySeqRef.current;
+    const pendingReloads = snapshotActionPostedReloads({ prefix: 'waste:' });
     setReloading((count) => count + 1);
     try {
       const page = await reloadHistory(
@@ -115,7 +120,7 @@ export function WastePage() {
       setNext(page.next);
       loadedRef.current = page.entries.length;
       setMoreError(null);
-      clearPostedReloadsByPrefix('waste:');
+      clearActionPostedReloadSnapshot(pendingReloads);
     } finally {
       setReloading((count) => count - 1);
     }

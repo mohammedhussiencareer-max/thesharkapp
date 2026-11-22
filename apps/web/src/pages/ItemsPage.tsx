@@ -28,9 +28,11 @@ import { firstUnknownItemCreate } from '@/items/request-id';
 import type { CatalogItem, ItemSave } from '@/items/types';
 import { emptyItemForm, itemToFormValues } from '@/items/validation';
 import {
+  clearPostedReloadSnapshot,
   clearReloadMarker,
   hasReloadMarker,
   setReloadMarker,
+  snapshotPostedReloads,
   subscribeHeldWritesStore,
 } from '@/lib/held-writes';
 import {
@@ -131,11 +133,14 @@ export function ItemsPage() {
   }
 
   async function reloadCatalog(staleItemId?: string) {
+    const pendingReload = snapshotPostedReloads({
+      subject: ITEMS_RELOAD_SUBJECT,
+    });
     const next = await readCatalog();
     if (!next) return;
     setItems(next);
     setLoadError(null);
-    clearReloadMarker(ITEMS_RELOAD_SUBJECT);
+    clearPostedReloadSnapshot(pendingReload);
     setLocalNeedsReload(false);
     const editing = formModeRef.current;
     if (staleItemId && editing?.type === 'edit' && editing.id === staleItemId) {
@@ -162,13 +167,16 @@ export function ItemsPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const pendingReload = snapshotPostedReloads({
+      subject: ITEMS_RELOAD_SUBJECT,
+    });
     void (async () => {
       try {
         const next = await readCatalog();
         if (cancelled || !next) return;
         setItems(next);
         setLoadError(null);
-        clearReloadMarker(ITEMS_RELOAD_SUBJECT);
+        clearPostedReloadSnapshot(pendingReload);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;

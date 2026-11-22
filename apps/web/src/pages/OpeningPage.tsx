@@ -2,12 +2,16 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
 import {
+  canDispatchWriteFor,
+  captureWriteSession,
   claimFreshHeldWrite,
   claimReplayHeldWrite,
   clearHeldWrite,
   clearPostedReload,
+  clearPostedReloadSnapshot,
   getHeldWrite,
   setHeldWritePhase,
+  snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
 } from '@/lib/held-writes';
@@ -82,13 +86,14 @@ export function OpeningPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const pendingReloads = snapshotPostedReloads({ subject: OPENING_SUBJECT });
     void (async () => {
       try {
         const next = await readChoices();
         if (cancelled || !next) return;
         setItems(next);
         setLoadError(null);
-        clearPostedReload(OPENING_SUBJECT);
+        clearPostedReloadSnapshot(pendingReloads);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -111,6 +116,7 @@ export function OpeningPage() {
 
   async function handleSubmit(draft: OpeningDraft) {
     if (busy || loadsRef.current > 0 || !isOnline()) return;
+    const session = captureWriteSession();
     const prior = getHeldWrite<OpeningDraft>(OPENING_SUBJECT);
     const wasPinned =
       prior !== null &&
@@ -120,15 +126,29 @@ export function OpeningPage() {
       ? await claimReplayHeldWrite<OpeningDraft>(
           OPENING_SUBJECT,
           draft.requestId,
+          { session },
         )
       : await claimFreshHeldWrite<OpeningDraft>(OPENING_SUBJECT, () => draft, {
           requestId: draft.requestId,
           kind: 'opening',
+          session,
         });
     if (!claim.ok) {
       if (claim.reason === 'storage' || claim.reason === 'missing') {
         setServerError(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setServerError(offlineWriteMessage);
       }
+      return;
+    }
+    if (!canDispatchWriteFor(session)) {
+      if (wasPinned) {
+        setHeldWritePhase(OPENING_SUBJECT, draft.requestId, 'unknown');
+      } else {
+        clearHeldWrite(OPENING_SUBJECT, draft.requestId);
+      }
+      claim.release();
+      if (!isOnline()) setServerError(offlineWriteMessage);
       return;
     }
     setSaving(true);

@@ -11,8 +11,14 @@ import {
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
-import { storageWriteFailedMessage } from '@/lib/held-writes';
-import { isOnline, useOnline } from '@/lib/online';
+import {
+  canDispatchWriteFor,
+  captureWriteSession,
+  setHeldWritePhase,
+  storageWriteFailedMessage,
+  type WriteSession,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import { setOrderDisposition } from '@/order-decisions/api';
 import { noteDecisionOrder } from '@/order-decisions/held-decisions';
@@ -102,10 +108,18 @@ export function DecisionForm({
 
   async function finish(
     action: DecisionWrite,
+    session: WriteSession | null,
+    isReplay: boolean,
     releaseLock: () => void,
   ): Promise<void> {
-    if (flight.current || !isOnline()) {
+    if (flight.current || !canDispatchWriteFor(session)) {
+      if (isReplay) {
+        setHeldWritePhase(subject, action.requestId, 'unknown');
+      } else {
+        settleAction(subject, action.requestId);
+      }
       releaseLock();
+      if (!isOnline()) setProblem(offlineWriteMessage);
       return;
     }
     flight.current = true;
@@ -114,17 +128,21 @@ export function DecisionForm({
     onNotice(null);
     try {
       let saved: Awaited<ReturnType<typeof setOrderDisposition>>;
+      let persisted = false;
       try {
         saved = await setOrderDisposition(action);
+        persisted = true;
         if (saved.status === 'ok') {
           markActionPostedReload(subject, action.requestId, subject);
         } else {
           settleAction(subject, action.requestId);
         }
       } catch (failure) {
-        settleAction(subject, action.requestId, failure);
+        if (!persisted) {
+          settleAction(subject, action.requestId, failure);
+        }
         const message = messageFrom(failure);
-        if (hasAction(subject)) {
+        if (persisted || hasAction(subject)) {
           onNotice({ kind: 'failed', message });
           return;
         }
@@ -175,6 +193,7 @@ export function DecisionForm({
       reason: flipping ? reasonText : null,
       returned: clearing ? [] : parsed?.ok === true ? parsed.lines : null,
     };
+    const session = captureWriteSession();
     void (async () => {
       const claim = await claimFreshAction<DecisionWrite>(
         subject,
@@ -182,30 +201,38 @@ export function DecisionForm({
           requestId,
           ...payloadDraft,
         }),
+        { session },
       );
       if (!claim.ok) {
         if (claim.reason === 'storage') {
           setProblem(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setProblem(offlineWriteMessage);
         }
         return;
       }
       noteDecisionOrder(row.orderId);
-      await finish(claim.record.payload, claim.release);
+      await finish(claim.record.payload, session, false, claim.release);
     })();
   }
 
   function retry() {
     if (!held || flight.current || saving || !isOnline()) return;
     const targetId = held.requestId;
+    const session = captureWriteSession();
     void (async () => {
-      const claim = await claimReplayAction<DecisionWrite>(subject, targetId);
+      const claim = await claimReplayAction<DecisionWrite>(subject, targetId, {
+        session,
+      });
       if (!claim.ok) {
         if (claim.reason === 'missing' || claim.reason === 'storage') {
           setProblem(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setProblem(offlineWriteMessage);
         }
         return;
       }
-      await finish(claim.record.payload, claim.release);
+      await finish(claim.record.payload, session, true, claim.release);
     })();
   }
 

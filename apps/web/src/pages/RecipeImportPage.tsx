@@ -2,12 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  claimFreshAction,
   claimReplayAction,
-  clearActionPostedReload,
+  clearActionPostedReloadSnapshot,
   hasAction,
   markActionPostedReload,
   settleAction,
+  snapshotActionPostedReloads,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
@@ -18,6 +19,7 @@ import {
   captureWriteSession,
   hasPostedReload,
   storageWriteFailedMessage,
+  type WriteSession,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
@@ -193,28 +195,47 @@ function Workspace({
 
   async function refresh() {
     setReloadError(null);
+    const pendingReloads = snapshotActionPostedReloads({
+      subject: recipeImportSubject,
+    });
     try {
       await reload();
-      clearActionPostedReload(recipeImportSubject, recipeImportSubject);
+      clearActionPostedReloadSnapshot(pendingReloads, recipeImportSubject);
       setStale(false);
     } catch (failure) {
       setReloadError(messageFrom(failure) || genericCatalogError);
     }
   }
 
-  async function run(action: ImportAction) {
+  async function run(
+    action: ImportAction,
+    session: WriteSession | null,
+    releaseLock: () => void,
+  ) {
     setSaving(true);
     setError(null);
     let outcome: ImportResult;
+    let saved = false;
     try {
+      if (!canDispatchWriteFor(session)) {
+        if (!isOnline()) setError(offlineWriteMessage);
+        flight.current = false;
+        setSaving(false);
+        return;
+      }
       outcome = await commitRecipeImport(action);
+      saved = true;
       markActionPostedReload(subject, action.requestId, recipeImportSubject);
     } catch (failure) {
-      settleAction(subject, action.requestId, failure);
+      if (!saved) {
+        settleAction(subject, action.requestId, failure);
+      }
       setError(messageFrom(failure));
       flight.current = false;
       setSaving(false);
       return;
+    } finally {
+      releaseLock();
     }
     timing.refreshClock();
     setResult(outcome);
@@ -251,7 +272,7 @@ function Workspace({
     const initiatingUser = captureWriteSession();
     flight.current = true;
     setSaving(true);
-    let action: ImportAction;
+    let payload: ImportAction['payload'];
     try {
       const tokens = await fetchImportTokens(
         requiredTokens(loaded.review, loaded.parsed),
@@ -262,7 +283,7 @@ function Workspace({
         setError(offlineWriteMessage);
         return;
       }
-      const payload = buildImportPayload({
+      payload = buildImportPayload({
         review: loaded.review,
         parsed: loaded.parsed,
         hash: loaded.hash,
@@ -270,42 +291,52 @@ function Workspace({
         reason: built.write.reason,
         tokens,
       });
-      action = beginAction<ImportAction>(subject, (requestId) => ({
-        requestId,
-        payload,
-      }));
     } catch (failure) {
       flight.current = false;
       setSaving(false);
       setError(messageFrom(failure) || genericCatalogError);
       return;
     }
-    if (!canDispatchWriteFor(initiatingUser)) {
+    const claim = await claimFreshAction<ImportAction>(
+      subject,
+      (requestId) => ({
+        requestId,
+        payload,
+      }),
+      { session: initiatingUser },
+    );
+    if (!claim.ok) {
       flight.current = false;
       setSaving(false);
-      setError(offlineWriteMessage);
+      if (claim.reason === 'storage' || claim.reason === 'missing') {
+        setError(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setError(offlineWriteMessage);
+      }
       return;
     }
-    await run(action);
+    await run(claim.record.payload, initiatingUser, claim.release);
   }
 
   function retry() {
     if (!held || flight.current || !isOnline()) return;
     const targetId = held.requestId;
+    const session = captureWriteSession();
+    flight.current = true;
     void (async () => {
-      const claim = await claimReplayAction<ImportAction>(subject, targetId);
+      const claim = await claimReplayAction<ImportAction>(subject, targetId, {
+        session,
+      });
       if (!claim.ok) {
+        flight.current = false;
         if (claim.reason === 'missing' || claim.reason === 'storage') {
           setError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setError(offlineWriteMessage);
         }
         return;
       }
-      flight.current = true;
-      try {
-        await run(claim.record.payload);
-      } finally {
-        claim.release();
-      }
+      await run(claim.record.payload, session, claim.release);
     })();
   }
 
@@ -486,13 +517,16 @@ export function RecipeImportPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const pendingReloads = snapshotActionPostedReloads({
+      subject: recipeImportSubject,
+    });
     void (async () => {
       try {
         const next = await loadImportContext();
         if (cancelled) return;
         setCtx(next);
         setLoadError(null);
-        clearActionPostedReload(recipeImportSubject, recipeImportSubject);
+        clearActionPostedReloadSnapshot(pendingReloads, recipeImportSubject);
       } catch (failure) {
         if (!cancelled) setLoadError(messageFrom(failure));
       } finally {

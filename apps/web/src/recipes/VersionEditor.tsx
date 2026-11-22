@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { currentMinuteMs } from '@/items/effective';
 import { messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
   hasAction,
@@ -14,10 +14,11 @@ import {
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import {
-  HeldWriteStorageError,
+  canDispatchWriteFor,
+  captureWriteSession,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
-import { isOnline, useOnline } from '@/lib/online';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { setRecipeVersion } from '@/recipes/api';
 import { sourceChangedMessage } from '@/recipes/labels';
 import { LinesTable } from '@/recipes/LinesTable';
@@ -107,32 +108,50 @@ export function VersionEditor({
     [],
   );
 
-  async function finish(action: VersionAction, isReplay = false) {
+  async function finish(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => VersionAction }
+      | { kind: 'replay'; action: VersionAction },
+  ) {
     if (flight.current || !isOnline()) return;
-    let releaseLock = () => {};
-    if (isReplay) {
-      const claim = await claimReplayAction<VersionAction>(
-        subject,
-        action.write.requestId,
-      );
-      if (!claim.ok) {
-        if (claim.reason === 'missing' || claim.reason === 'storage') {
-          setError(storageWriteFailedMessage);
-        }
-        return;
-      }
-      releaseLock = claim.release;
-    }
+    const session = captureWriteSession();
     flight.current = true;
     setSaving(true);
     onBusyChange(true);
     setError(null);
     setNotice(null);
+    let releaseLock = () => {};
     let saved = false;
+    let requestId: string | null = null;
     try {
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<VersionAction>(subject, mode.create, {
+              session,
+            })
+          : await claimReplayAction<VersionAction>(
+              subject,
+              mode.action.write.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setError(offlineWriteMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+      const action = claim.record.payload;
+      requestId = claim.record.requestId;
+      if (!canDispatchWriteFor(session)) {
+        if (!isOnline()) setError(offlineWriteMessage);
+        return;
+      }
       await setRecipeVersion(action.recipeId, action.write);
       saved = true;
-      markActionPostedReload(subject, action.write.requestId, subject);
+      markActionPostedReload(subject, requestId, subject);
       releaseLock();
       releaseLock = () => {};
       setDirty(false);
@@ -145,14 +164,14 @@ export function VersionEditor({
       );
       const reloaded = await onReload();
       if (reloaded !== false) {
-        clearActionPostedReload(subject, subject, action.write.requestId);
+        clearActionPostedReload(subject, subject, requestId);
       }
     } catch (failure) {
-      if (!saved) {
-        settleAction(subject, action.write.requestId, failure);
+      if (!saved && requestId !== null) {
+        settleAction(subject, requestId, failure);
       }
       setError(messageFrom(failure));
-      if (!saved && !hasAction(subject)) await onReload();
+      if (!saved && requestId !== null && !hasAction(subject)) await onReload();
     } finally {
       releaseLock();
       flight.current = false;
@@ -188,9 +207,9 @@ export function VersionEditor({
       return;
     }
     setError(null);
-    let action: VersionAction;
-    try {
-      action = beginAction<VersionAction>(subject, (requestId) => ({
+    void finish({
+      kind: 'fresh',
+      create: (requestId) => ({
         recipeId: recipe.id,
         write: {
           requestId,
@@ -202,15 +221,8 @@ export function VersionEditor({
           reason: built.write.reason,
           token: built.write.token,
         },
-      }));
-    } catch (failure) {
-      if (failure instanceof HeldWriteStorageError) {
-        setError(failure.message);
-        return;
-      }
-      throw failure;
-    }
-    void finish(action);
+      }),
+    });
   }
 
   function onSubmit(event: FormEvent<HTMLFormElement>) {
@@ -235,7 +247,7 @@ export function VersionEditor({
 
   function retry() {
     if (!held || locked || flight.current) return;
-    void finish(held, true);
+    void finish({ kind: 'replay', action: held });
   }
 
   const batchUnits =

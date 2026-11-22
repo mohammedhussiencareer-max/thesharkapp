@@ -2,8 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { currentShiftStart } from '@/items/api';
 import { genericCatalogError, messageFrom } from '@/items/errors';
-import { clearActionPostedReload } from '@/items/request-id';
-import { listHeldWritesByPrefix } from '@/lib/held-writes';
+import {
+  clearActionPostedReloadSnapshot,
+  snapshotActionPostedReloads,
+} from '@/items/request-id';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import {
   getRecipe,
@@ -39,6 +41,13 @@ function RecipeEditor({ recipeId }: { recipeId: string }) {
 
   useEffect(() => {
     let cancelled = false;
+    const updSubj = recipeUpdateSubject(recipeId);
+    const verSubj = recipeVersionSubject(recipeId);
+    const pendingUpdate = snapshotActionPostedReloads({ subject: updSubj });
+    const pendingVersion = snapshotActionPostedReloads({ subject: verSubj });
+    const pendingCreate = snapshotActionPostedReloads({
+      prefix: 'recipe-create:',
+    });
     void (async () => {
       try {
         const [
@@ -64,15 +73,9 @@ function RecipeEditor({ recipeId }: { recipeId: string }) {
         setSchedule(nextSchedule);
         setCatalog({ stock, itemUnits, units, batches, shiftStart });
         setLoadError(null);
-        const updSubj = recipeUpdateSubject(recipeId);
-        clearActionPostedReload(updSubj, updSubj);
-        const verSubj = recipeVersionSubject(recipeId);
-        clearActionPostedReload(verSubj, verSubj);
-        for (const pin of listHeldWritesByPrefix('recipe-create:')) {
-          if (pin.phase === 'posted_reload') {
-            clearActionPostedReload(pin.subject, recipeId);
-          }
-        }
+        clearActionPostedReloadSnapshot(pendingUpdate, updSubj);
+        clearActionPostedReloadSnapshot(pendingVersion, verSubj);
+        clearActionPostedReloadSnapshot(pendingCreate, recipeId);
       } catch (error) {
         if (!cancelled) setLoadError(messageFrom(error));
       } finally {
@@ -86,13 +89,14 @@ function RecipeEditor({ recipeId }: { recipeId: string }) {
 
   const reloadSchedule = useCallback(async (): Promise<boolean> => {
     const seq = ++scheduleSeq.current;
+    const verSubj = recipeVersionSubject(recipeId);
+    const pendingVersion = snapshotActionPostedReloads({ subject: verSubj });
     try {
       const next = await recipeSchedule(recipeId);
       if (seq !== scheduleSeq.current) return false;
       setSchedule(next);
       setLoadError(null);
-      const verSubj = recipeVersionSubject(recipeId);
-      clearActionPostedReload(verSubj, verSubj);
+      clearActionPostedReloadSnapshot(pendingVersion, verSubj);
       return true;
     } catch (error) {
       if (seq === scheduleSeq.current) setLoadError(messageFrom(error));
@@ -102,6 +106,8 @@ function RecipeEditor({ recipeId }: { recipeId: string }) {
 
   const reloadRecipe = useCallback(async (): Promise<RecipeRecord | null> => {
     const seq = ++recipeSeq.current;
+    const updSubj = recipeUpdateSubject(recipeId);
+    const pendingUpdate = snapshotActionPostedReloads({ subject: updSubj });
     try {
       const next = await getRecipe(recipeId);
       if (seq !== recipeSeq.current) return null;
@@ -111,8 +117,7 @@ function RecipeEditor({ recipeId }: { recipeId: string }) {
       }
       setRecipe(next);
       setLoadError(null);
-      const updSubj = recipeUpdateSubject(recipeId);
-      clearActionPostedReload(updSubj, updSubj);
+      clearActionPostedReloadSnapshot(pendingUpdate, updSubj);
       return next;
     } catch (error) {
       if (seq === recipeSeq.current) setLoadError(messageFrom(error));

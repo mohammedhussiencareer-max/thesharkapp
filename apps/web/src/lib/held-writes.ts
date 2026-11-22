@@ -102,12 +102,32 @@ export type TryPutHeldWriteResult<T> =
     };
 
 export type ClaimHeldWriteResult<T> =
-  | { ok: true; record: HeldWriteRecord<T>; release: () => void }
+  | {
+      ok: true;
+      record: HeldWriteRecord<T>;
+      release: () => void;
+      session: WriteSession;
+    }
   | {
       ok: false;
-      reason: 'locked' | 'conflict' | 'missing' | 'storage' | 'signed_out';
+      reason:
+        | 'locked'
+        | 'conflict'
+        | 'missing'
+        | 'storage'
+        | 'signed_out'
+        | 'session_invalid';
       existing?: HeldWriteRecord;
     };
+
+export type PostedReloadSnapshotItem = {
+  subject: string;
+  requestId: string;
+  readTarget?: string;
+  isMarker?: true;
+};
+
+export type PostedReloadSnapshot = ReadonlyArray<PostedReloadSnapshotItem>;
 
 const KEY_PREFIX = 'theshark:held:v1:';
 const RELOAD_PREFIX = 'theshark:reload:v1:';
@@ -288,6 +308,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   const records = new Map<string, HeldWriteRecord>();
   const postedReloads = new Map<string, HeldWriteRecord>();
   const reloadMarkers = new Map<string, ReloadMarkerRecord>();
+  const reloadMarkerSeq = new Map<string, number>();
+  let nextMarkerSeq = 0;
   const activeLockReleases = new Map<string, () => void>();
   const listeners = new Set<() => void>();
 
@@ -888,28 +910,38 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
 
   /**
    * Atomically claim a fresh write on `subject` using Web Locks when available.
-   * Refuses if another tab holds the lock OR if any unresolved pin already
-   * exists in localStorage for `subject` (never replaces an existing pin).
+   * Captures (or uses) the write session before awaiting the lock, then under
+   * the lock rechecks session generation + user + `navigator.onLine`, refuses
+   * if any unresolved pin exists in localStorage, and persists `inflight`.
    * The caller MUST invoke `release()` after updating storage on completion.
    */
   async function claimFreshHeldWrite<T>(
     subject: string,
     create: (requestId: string) => T,
-    opts?: { requestId?: string; kind?: HeldWriteKind },
+    opts?: {
+      requestId?: string;
+      kind?: HeldWriteKind;
+      session?: WriteSession | null;
+    },
   ): Promise<ClaimHeldWriteResult<T>> {
     ensureHydrated();
-    const userId = activeUserId();
-    if (userId === null) {
+    const session =
+      opts?.session !== undefined ? opts.session : captureWriteSession();
+    if (session === null) {
       return { ok: false, reason: 'signed_out' };
     }
+    if (!canDispatchWriteFor(session)) {
+      return { ok: false, reason: 'session_invalid' };
+    }
+    const userId = session.userId;
     const key = entryStorageKey(subject, userId);
     const lock = await acquireSubjectLock(key);
     if (!lock.acquired) {
       return { ok: false, reason: 'locked' };
     }
-    if (activeUserId() !== userId) {
+    if (!canDispatchWriteFor(session)) {
       lock.release();
-      return { ok: false, reason: 'signed_out' };
+      return { ok: false, reason: 'session_invalid' };
     }
     const read = strictReadItem(key);
     if (!read.ok) {
@@ -940,33 +972,43 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
     records.set(subject, next);
     emit();
-    return { ok: true, record: next, release: lock.release };
+    return { ok: true, record: next, release: lock.release, session };
   }
 
   /**
    * Atomically claim an EXPLICIT REPLAY of an existing durable pin in storage.
-   * Re-reads localStorage directly inside the Web Lock and requires the exact
-   * same `subject` and `requestId` to exist durably in storage before allowing
-   * any retry to send.
+   * Re-reads localStorage directly inside the Web Lock, rechecks session
+   * generation + user + `navigator.onLine`, and requires the exact same
+   * `subject` and `requestId` to exist durably in storage before allowing any
+   * retry to send.
    */
   async function claimReplayHeldWrite<T>(
     subject: string,
     requestId: string,
-    opts?: { payload?: T; awaitingReviewReload?: boolean },
+    opts?: {
+      payload?: T;
+      awaitingReviewReload?: boolean;
+      session?: WriteSession | null;
+    },
   ): Promise<ClaimHeldWriteResult<T>> {
     ensureHydrated();
-    const userId = activeUserId();
-    if (userId === null) {
+    const session =
+      opts?.session !== undefined ? opts.session : captureWriteSession();
+    if (session === null) {
       return { ok: false, reason: 'signed_out' };
     }
+    if (!canDispatchWriteFor(session)) {
+      return { ok: false, reason: 'session_invalid' };
+    }
+    const userId = session.userId;
     const key = entryStorageKey(subject, userId);
     const lock = await acquireSubjectLock(key);
     if (!lock.acquired) {
       return { ok: false, reason: 'locked' };
     }
-    if (activeUserId() !== userId) {
+    if (!canDispatchWriteFor(session)) {
       lock.release();
-      return { ok: false, reason: 'signed_out' };
+      return { ok: false, reason: 'session_invalid' };
     }
     const read = strictReadItem(key);
     if (!read.ok) {
@@ -1009,7 +1051,22 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
     records.set(subject, next);
     emit();
-    return { ok: true, record: next, release: lock.release };
+    return { ok: true, record: next, release: lock.release, session };
+  }
+
+  function hasDurableHeldWrite(subject: string, requestId: string): boolean {
+    ensureHydrated();
+    const userId = activeUserId();
+    if (userId === null) return false;
+    const read = strictReadItem(entryStorageKey(subject, userId));
+    if (!read.ok || read.value === null) return false;
+    const stored = parseRecord(read.value);
+    return (
+      stored !== null &&
+      stored.subject === subject &&
+      stored.requestId === requestId &&
+      isUnresolvedPhase(stored.phase)
+    );
   }
 
   function tryBeginHeldWrite<T>(
@@ -1122,7 +1179,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       ...(input.awaitingReviewReload ? { awaitingReviewReload: true } : {}),
     };
     const wrote = writeRecordToStorage(next, userId);
-    if (!wrote && input.phase !== 'posted_reload') {
+    if (!wrote) {
       return { ok: false, reason: 'storage' };
     }
     if (input.phase === 'posted_reload') {
@@ -1213,8 +1270,11 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       delete next.awaitingReviewReload;
     }
     const wrote = writeRecordToStorage(next, userId);
-    if (!wrote && phase === 'inflight') {
-      throw new HeldWriteStorageError();
+    if (!wrote) {
+      if (phase === 'inflight' || phase === 'posted_reload') {
+        // Keep the existing durable record intact until the replacement is stored.
+        throw new HeldWriteStorageError();
+      }
     }
     if (phase === 'posted_reload') {
       removeRecordFromStorage(subject, userId);
@@ -1393,6 +1453,110 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     if (changed) emit();
   }
 
+  function snapshotPostedReloads(filter: {
+    subject?: string;
+    prefix?: string;
+  }): PostedReloadSnapshot {
+    ensureHydrated();
+    const userId = activeUserId();
+    if (userId === null) return [];
+    const seen = new Map<string, PostedReloadSnapshotItem>();
+
+    const consider = (entry: HeldWriteRecord) => {
+      if (entry.phase !== 'posted_reload') return;
+      if (filter.subject !== undefined && entry.subject !== filter.subject) {
+        return;
+      }
+      if (
+        filter.prefix !== undefined &&
+        !entry.subject.startsWith(filter.prefix)
+      ) {
+        return;
+      }
+      seen.set(postedMapKey(entry.subject, entry.requestId), {
+        subject: entry.subject,
+        requestId: entry.requestId,
+        ...(entry.readTarget !== undefined
+          ? { readTarget: entry.readTarget }
+          : {}),
+      });
+    };
+
+    for (const entry of postedReloads.values()) {
+      consider(entry);
+    }
+    const listPrefix =
+      filter.subject !== undefined
+        ? postedSubjectPrefix(filter.subject, userId)
+        : `${userStoragePrefix(userId)}${POSTED_SEGMENT}`;
+    for (const key of safeListKeys(listPrefix)) {
+      const raw = safeReadItem(key);
+      const parsed = raw !== null ? parseRecord(raw) : null;
+      if (parsed) consider(parsed);
+    }
+    if (filter.subject !== undefined) {
+      const legacyRaw = safeReadItem(entryStorageKey(filter.subject, userId));
+      const legacyParsed = legacyRaw !== null ? parseRecord(legacyRaw) : null;
+      if (legacyParsed) consider(legacyParsed);
+    }
+
+    const considerMarker = (marker: ReloadMarkerRecord) => {
+      if (filter.subject !== undefined && marker.subject !== filter.subject) {
+        return;
+      }
+      if (
+        filter.prefix !== undefined &&
+        !marker.subject.startsWith(filter.prefix)
+      ) {
+        return;
+      }
+      seen.set(`marker:${marker.subject}`, {
+        subject: marker.subject,
+        requestId: String(reloadMarkerSeq.get(marker.subject) ?? 0),
+        ...(marker.target !== undefined ? { readTarget: marker.target } : {}),
+        isMarker: true,
+      });
+    };
+
+    for (const marker of reloadMarkers.values()) {
+      considerMarker(marker);
+    }
+    if (filter.subject !== undefined) {
+      const markerRaw = safeReadItem(markerStorageKey(filter.subject, userId));
+      const parsedMarker =
+        markerRaw !== null ? parseReloadMarker(markerRaw) : null;
+      if (parsedMarker) considerMarker(parsedMarker);
+    } else {
+      for (const key of safeListKeys(reloadMarkerPrefix(userId))) {
+        const markerRaw = safeReadItem(key);
+        const parsedMarker =
+          markerRaw !== null ? parseReloadMarker(markerRaw) : null;
+        if (parsedMarker) considerMarker(parsedMarker);
+      }
+    }
+
+    return [...seen.values()];
+  }
+
+  function clearPostedReloadSnapshot(
+    snapshot: PostedReloadSnapshot,
+    loadedTarget?: string,
+  ): void {
+    for (const item of snapshot) {
+      if (item.isMarker) {
+        if (String(reloadMarkerSeq.get(item.subject) ?? 0) === item.requestId) {
+          clearReloadMarker(item.subject, loadedTarget ?? item.readTarget);
+        }
+        continue;
+      }
+      clearPostedReload(
+        item.subject,
+        loadedTarget ?? item.readTarget,
+        item.requestId,
+      );
+    }
+  }
+
   function setReloadMarker(subject: string, target?: string): void {
     ensureHydrated();
     const userId = activeUserId();
@@ -1402,6 +1566,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       subject,
       ...(target ? { target } : {}),
     };
+    nextMarkerSeq += 1;
+    reloadMarkerSeq.set(subject, nextMarkerSeq);
     reloadMarkers.set(subject, marker);
     writeMarkerToStorage(marker, userId);
     emit();
@@ -1493,6 +1659,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     listHeldWritesByPrefix,
     claimFreshHeldWrite,
     claimReplayHeldWrite,
+    hasDurableHeldWrite,
     tryBeginHeldWrite,
     beginHeldWrite,
     tryPutHeldWrite,
@@ -1502,6 +1669,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     clearHeldWrite,
     hasPostedReload,
     clearPostedReload,
+    snapshotPostedReloads,
+    clearPostedReloadSnapshot,
     setReloadMarker,
     getReloadMarker,
     hasReloadMarker,
@@ -1529,6 +1698,7 @@ export const hasAnyHeldWrite = defaultStore.hasAnyHeldWrite;
 export const listHeldWritesByPrefix = defaultStore.listHeldWritesByPrefix;
 export const claimFreshHeldWrite = defaultStore.claimFreshHeldWrite;
 export const claimReplayHeldWrite = defaultStore.claimReplayHeldWrite;
+export const hasDurableHeldWrite = defaultStore.hasDurableHeldWrite;
 export const tryBeginHeldWrite = defaultStore.tryBeginHeldWrite;
 export const beginHeldWrite = defaultStore.beginHeldWrite;
 export const tryPutHeldWrite = defaultStore.tryPutHeldWrite;
@@ -1538,6 +1708,8 @@ export const updateHeldWritePayload = defaultStore.updateHeldWritePayload;
 export const clearHeldWrite = defaultStore.clearHeldWrite;
 export const hasPostedReload = defaultStore.hasPostedReload;
 export const clearPostedReload = defaultStore.clearPostedReload;
+export const snapshotPostedReloads = defaultStore.snapshotPostedReloads;
+export const clearPostedReloadSnapshot = defaultStore.clearPostedReloadSnapshot;
 export const setReloadMarker = defaultStore.setReloadMarker;
 export const getReloadMarker = defaultStore.getReloadMarker;
 export const hasReloadMarker = defaultStore.hasReloadMarker;

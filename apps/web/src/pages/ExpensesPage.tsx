@@ -29,19 +29,23 @@ import { fieldClass } from '@/expenses/labels';
 import { messageFrom } from '@/items/errors';
 import { cairoMonthInput, formatCairo, formatMonth } from '@/lib/cairo';
 import {
+  canDispatchWriteFor,
+  captureWriteSession,
   claimFreshHeldWrite,
   claimReplayHeldWrite,
   clearHeldWrite,
-  clearPostedReload,
-  clearReloadMarker,
+  clearPostedReloadSnapshot,
   getHeldWrite,
   getReloadMarker,
   hasReloadMarker,
   listHeldWritesByPrefix,
   setHeldWritePhase,
   setReloadMarker,
+  snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
+  type PostedReloadSnapshot,
+  type WriteSession,
 } from '@/lib/held-writes';
 import {
   isOnline,
@@ -55,11 +59,12 @@ const EXPENSE_NEW_SUBJECT = 'expense:new';
 const EXPENSE_VOID_PREFIX = 'expense:void:';
 const EXPENSE_RELOAD_SUBJECT = 'expense:reload';
 
-/** Stored in localStorage for void retries: request id and reason only (no cached money). */
+/** Stored in localStorage for void retries: request id, reason, and target month (no cached money). */
 type StoredVoidPayload = {
   id: string;
   requestId: string;
   reason: string;
+  targetMonth?: string;
 };
 
 type VoidAttempt = {
@@ -96,14 +101,12 @@ function voidTargetMonth(
   return `${fallbackMonth}-01`;
 }
 
-function clearExpensePostedReloads(loadedMonthStart: string): void {
-  clearPostedReload(EXPENSE_NEW_SUBJECT, loadedMonthStart);
-  clearReloadMarker(EXPENSE_RELOAD_SUBJECT, loadedMonthStart);
-  for (const record of listHeldWritesByPrefix(EXPENSE_VOID_PREFIX)) {
-    if (record.phase === 'posted_reload') {
-      clearPostedReload(record.subject, loadedMonthStart, record.requestId);
-    }
-  }
+function snapshotExpensePostedReloads(): PostedReloadSnapshot {
+  return [
+    ...snapshotPostedReloads({ subject: EXPENSE_NEW_SUBJECT }),
+    ...snapshotPostedReloads({ subject: EXPENSE_RELOAD_SUBJECT }),
+    ...snapshotPostedReloads({ prefix: EXPENSE_VOID_PREFIX }),
+  ];
 }
 
 /**
@@ -291,6 +294,7 @@ export function ExpensesPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const pendingReloads = snapshotExpensePostedReloads();
     void (async () => {
       try {
         const next = await readMonth(month);
@@ -298,7 +302,7 @@ export function ExpensesPage() {
         setData(next);
         setLoadError(null);
         reconcileCommittedVoids(next.entries);
-        clearExpensePostedReloads(next.monthStart);
+        clearPostedReloadSnapshot(pendingReloads, next.monthStart);
         needsReloadRef.current = false;
         setLocalNeedsReload(false);
       } catch (error) {
@@ -334,6 +338,7 @@ export function ExpensesPage() {
     action: () => Promise<void>,
     setError: (message: string | null) => void,
     onSaved?: () => void,
+    session?: WriteSession | null,
   ): Promise<WriteResult> {
     if (
       savingRef.current ||
@@ -344,6 +349,11 @@ export function ExpensesPage() {
     ) {
       return { saved: false, error: null };
     }
+    const activeSession = session ?? captureWriteSession();
+    if (!canDispatchWriteFor(activeSession)) {
+      if (!isOnline()) setError(offlineWriteMessage);
+      return { saved: false, error: null };
+    }
     savingRef.current = true;
     setSaving(true);
     setError(null);
@@ -352,16 +362,17 @@ export function ExpensesPage() {
     try {
       await action();
       saved = true;
-      onSaved?.();
       needsReloadRef.current = true;
       setLocalNeedsReload(true);
       try {
+        onSaved?.();
+        const pendingReloads = snapshotExpensePostedReloads();
         const next = await readMonth(monthRef.current);
         if (next) {
           setData(next);
           setLoadError(null);
           reconcileCommittedVoids(next.entries);
-          clearExpensePostedReloads(next.monthStart);
+          clearPostedReloadSnapshot(pendingReloads, next.monthStart);
           needsReloadRef.current = false;
           setLocalNeedsReload(false);
         }
@@ -393,6 +404,7 @@ export function ExpensesPage() {
       return;
     }
     setFormError(null);
+    const session = captureWriteSession();
     const prior = getHeldWrite<ExpenseDraft>(EXPENSE_NEW_SUBJECT);
     const wasPinned =
       prior !== null &&
@@ -403,16 +415,29 @@ export function ExpensesPage() {
       ? await claimReplayHeldWrite<ExpenseDraft>(
           EXPENSE_NEW_SUBJECT,
           draft.requestId,
+          { session },
         )
       : await claimFreshHeldWrite<ExpenseDraft>(
           EXPENSE_NEW_SUBJECT,
           () => draft,
-          { requestId: draft.requestId, kind: 'expense' },
+          { requestId: draft.requestId, kind: 'expense', session },
         );
     if (!claim.ok) {
       if (claim.reason === 'storage' || claim.reason === 'missing') {
         setFormError(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setFormError(offlineWriteMessage);
       }
+      return;
+    }
+    if (!canDispatchWriteFor(session)) {
+      if (wasPinned) {
+        setHeldWritePhase(EXPENSE_NEW_SUBJECT, draft.requestId, 'unknown');
+      } else {
+        clearHeldWrite(EXPENSE_NEW_SUBJECT, draft.requestId);
+      }
+      claim.release();
+      if (!isOnline()) setFormError(offlineWriteMessage);
       return;
     }
     let result: WriteResult;
@@ -429,6 +454,7 @@ export function ExpensesPage() {
           );
           setFormEpoch((value) => value + 1);
         },
+        session,
       );
       if (!result.saved && result.error) {
         setFormError(reportedExpenseError(result.error));
@@ -460,6 +486,7 @@ export function ExpensesPage() {
       return;
     }
     setListError(null);
+    const session = captureWriteSession();
     const subject = voidSubject(id);
     const prior = getHeldWrite<StoredVoidPayload>(subject);
     const wasPinned = prior !== null && prior.phase === 'unknown';
@@ -482,18 +509,35 @@ export function ExpensesPage() {
         return next;
       });
     };
-    const targetMonth = voidTargetMonth(visible, monthRef.current);
+    const targetMonth =
+      pinned?.targetMonth ?? voidTargetMonth(visible, monthRef.current);
     const claim = wasPinned
-      ? await claimReplayHeldWrite<StoredVoidPayload>(subject, requestId)
+      ? await claimReplayHeldWrite<StoredVoidPayload>(subject, requestId, {
+          session,
+        })
       : await claimFreshHeldWrite<StoredVoidPayload>(
           subject,
-          () => ({ id, requestId, reason }),
-          { requestId, kind: 'expense_void' },
+          () => ({ id, requestId, reason, targetMonth }),
+          { requestId, kind: 'expense_void', session },
         );
     if (!claim.ok) {
       if (claim.reason === 'storage' || claim.reason === 'missing') {
         setListError(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setListError(offlineWriteMessage);
       }
+      return;
+    }
+    const effectiveTargetMonth =
+      claim.record.payload.targetMonth ?? targetMonth;
+    if (!canDispatchWriteFor(session)) {
+      if (wasPinned) {
+        setHeldWritePhase(subject, requestId, 'unknown');
+      } else {
+        clearHeldWrite(subject, requestId);
+      }
+      claim.release();
+      if (!isOnline()) setListError(offlineWriteMessage);
       return;
     }
     if (visible) setVoidSnapshot({ ...visible });
@@ -506,9 +550,10 @@ export function ExpensesPage() {
           voidRequestIdsRef.current.delete(id);
           setVoidSnapshot(null);
           setHeldWritePhase(subject, requestId, 'posted_reload', {
-            readTarget: targetMonth,
+            readTarget: effectiveTargetMonth,
           });
         },
+        session,
       );
       if (!result.saved && result.error) {
         voidRequestIdsRef.current.set(id, requestId);

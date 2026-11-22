@@ -7,8 +7,13 @@ import {
   subscribeHeldWrites,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
-import { storageWriteFailedMessage } from '@/lib/held-writes';
-import { isOnline, useOnline } from '@/lib/online';
+import {
+  canDispatchWriteFor,
+  captureWriteSession,
+  setHeldWritePhase,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { setOrderDisposition } from '@/order-decisions/api';
 import { unknownDecisions } from '@/order-decisions/held-decisions';
 import { decisionLabels, decisionSubject } from '@/order-decisions/format';
@@ -43,10 +48,12 @@ export function PendingSaves({
 
   async function retry(write: DecisionWrite): Promise<void> {
     if (flight.current || !isOnline()) return;
+    const session = captureWriteSession();
     const subject = decisionSubject(write.orderId);
     const claim = await claimReplayAction<DecisionWrite>(
       subject,
       write.requestId,
+      { session },
     );
     if (!claim.ok) {
       if (claim.reason === 'missing' || claim.reason === 'storage') {
@@ -54,13 +61,31 @@ export function PendingSaves({
           kind: 'failed',
           message: storageWriteFailedMessage,
         });
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        onSettled(write.orderId, {
+          kind: 'failed',
+          message: offlineWriteMessage,
+        });
+      }
+      return;
+    }
+    if (!canDispatchWriteFor(session)) {
+      setHeldWritePhase(subject, write.requestId, 'unknown');
+      claim.release();
+      if (!isOnline()) {
+        onSettled(write.orderId, {
+          kind: 'failed',
+          message: offlineWriteMessage,
+        });
       }
       return;
     }
     flight.current = true;
     setBusy(write.orderId);
+    let persisted = false;
     try {
       const saved = await setOrderDisposition(claim.record.payload);
+      persisted = true;
       if (saved.status === 'ok') {
         markActionPostedReload(subject, write.requestId, subject);
       } else {
@@ -68,7 +93,9 @@ export function PendingSaves({
       }
       onSettled(write.orderId, { kind: 'saved', result: saved, warning: null });
     } catch (failure) {
-      settleAction(subject, write.requestId, failure);
+      if (!persisted) {
+        settleAction(subject, write.requestId, failure);
+      }
       onSettled(write.orderId, {
         kind: 'failed',
         message: messageFrom(failure),

@@ -47,7 +47,7 @@ import {
 import { ConversionsPanel } from '@/items/ConversionsPanel';
 import { ItemForm } from '@/items/ItemForm';
 import {
-  beginAction,
+  claimFreshAction,
   createSubject,
   settleAction,
   unknownSaveMessage,
@@ -609,8 +609,11 @@ describe('P7-3 review fixes', () => {
       active: true,
     };
     const itemSubj = createSubject(draft);
-    const reqItem = beginAction(itemSubj, (id) => id);
-    settleAction(itemSubj, reqItem, new Error('socket'));
+    const itemClaim = await claimFreshAction(itemSubj, (id) => id);
+    expect(itemClaim.ok).toBe(true);
+    if (!itemClaim.ok) return;
+    itemClaim.release();
+    settleAction(itemSubj, itemClaim.record.requestId, new Error('socket'));
     rehydrateHeldWrites();
 
     const onItemSubmit = vi.fn(() => Promise.resolve(true));
@@ -634,8 +637,11 @@ describe('P7-3 review fixes', () => {
     // 2. RecipesPage create after reload
     resetHeldWritesStore({ clearStorage: true });
     const recSubj = recipeCreateSubject('وصفة معلقة', 'dish');
-    const reqRec = beginAction(recSubj, (id) => id);
-    settleAction(recSubj, reqRec, new Error('socket'));
+    const recClaim = await claimFreshAction(recSubj, (id) => id);
+    expect(recClaim.ok).toBe(true);
+    if (!recClaim.ok) return;
+    recClaim.release();
+    settleAction(recSubj, recClaim.record.requestId, new Error('socket'));
     rehydrateHeldWrites();
 
     const recView = render(

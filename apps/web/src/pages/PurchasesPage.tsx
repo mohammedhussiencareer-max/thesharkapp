@@ -2,12 +2,16 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
 import {
+  canDispatchWriteFor,
+  captureWriteSession,
   claimFreshHeldWrite,
   claimReplayHeldWrite,
   clearHeldWrite,
   clearPostedReload,
+  clearPostedReloadSnapshot,
   getHeldWrite,
   setHeldWritePhase,
+  snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
 } from '@/lib/held-writes';
@@ -227,6 +231,7 @@ export function PurchasesPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const pendingReloads = snapshotPostedReloads({ subject: PURCHASE_SUBJECT });
     void (async () => {
       try {
         const next = await readSnapshot();
@@ -234,7 +239,7 @@ export function PurchasesPage() {
         setSnapshot(next);
         rememberChoiceNames(next.choices);
         setLoadError(null);
-        clearPostedReload(PURCHASE_SUBJECT);
+        clearPostedReloadSnapshot(pendingReloads);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -292,6 +297,7 @@ export function PurchasesPage() {
 
   async function handleSubmit(draft: PurchaseDraft) {
     if (busy || loadsRef.current > 0 || !isOnline()) return;
+    const session = captureWriteSession();
     const prior = getHeldWrite<StoredPurchaseDraft>(PURCHASE_SUBJECT);
     const wasPinned =
       prior !== null &&
@@ -305,16 +311,29 @@ export function PurchasesPage() {
       ? await claimReplayHeldWrite<StoredPurchaseDraft>(
           PURCHASE_SUBJECT,
           draft.requestId,
+          { session },
         )
       : await claimFreshHeldWrite<StoredPurchaseDraft>(
           PURCHASE_SUBJECT,
           () => storedDraft,
-          { requestId: draft.requestId, kind: 'purchase' },
+          { requestId: draft.requestId, kind: 'purchase', session },
         );
     if (!claim.ok) {
       if (claim.reason === 'storage' || claim.reason === 'missing') {
         setServerError(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setServerError(offlineWriteMessage);
       }
+      return;
+    }
+    if (!canDispatchWriteFor(session)) {
+      if (wasPinned) {
+        setHeldWritePhase(PURCHASE_SUBJECT, draft.requestId, 'unknown');
+      } else {
+        clearHeldWrite(PURCHASE_SUBJECT, draft.requestId);
+      }
+      claim.release();
+      if (!isOnline()) setServerError(offlineWriteMessage);
       return;
     }
     setSaving(true);

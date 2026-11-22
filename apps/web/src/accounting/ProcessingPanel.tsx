@@ -37,11 +37,14 @@ import {
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import {
+  canDispatchWriteFor,
+  captureWriteSession,
   setHeldWritePhase,
   storageWriteFailedMessage,
   type HeldWriteRecord,
+  type WriteSession,
 } from '@/lib/held-writes';
-import { isOnline, useOnline } from '@/lib/online';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { isDefiniteRefusal } from '@/lib/write-outcome';
 import { primaryButton, secondaryButton } from '@/lib/page-style';
 
@@ -154,10 +157,13 @@ export function ProcessingPanel({
 
   async function finishFresh(
     action: RunHeld,
+    session: WriteSession | null,
     release: () => void,
   ): Promise<void> {
-    if (flight.current || !isOnline()) {
+    if (flight.current || !canDispatchWriteFor(session)) {
+      settleAction(accountingRunSubject, action.requestId);
       release();
+      if (!isOnline()) setNotice(offlineWriteMessage);
       return;
     }
     flight.current = true;
@@ -209,10 +215,13 @@ export function ProcessingPanel({
 
   async function finishUnknown(
     action: RunHeld,
+    session: WriteSession | null,
     release: () => void,
   ): Promise<void> {
-    if (flight.current || !isOnline()) {
+    if (flight.current || !canDispatchWriteFor(session)) {
+      setHeldWritePhase(accountingRunSubject, action.requestId, 'unknown');
       release();
+      if (!isOnline()) setNotice(offlineWriteMessage);
       return;
     }
     flight.current = true;
@@ -248,16 +257,24 @@ export function ProcessingPanel({
 
   async function finishRetry(
     action: RetryHeld,
+    session: WriteSession | null,
+    isReplay: boolean,
     release: () => void,
   ): Promise<void> {
-    if (flight.current || !isOnline()) {
+    const subject = accountingRetrySubject(action.orderId);
+    if (flight.current || !canDispatchWriteFor(session)) {
+      if (isReplay) {
+        setHeldWritePhase(subject, action.requestId, 'unknown');
+      } else {
+        settleAction(subject, action.requestId);
+      }
       release();
+      if (!isOnline()) setNotice(offlineWriteMessage);
       return;
     }
     flight.current = true;
     setRunning(true);
     setNotice(null);
-    const subject = accountingRetrySubject(action.orderId);
     try {
       let status: 'retried' | 'not_failed' | 'busy';
       try {
@@ -285,21 +302,28 @@ export function ProcessingPanel({
     }
   }
 
-  async function replayUnknownRun(requestId: string): Promise<void> {
+  async function replayUnknownRun(
+    requestId: string,
+    initiatingSession?: WriteSession | null,
+  ): Promise<void> {
     if (flight.current || running || !isOnline()) return;
+    const session = initiatingSession ?? captureWriteSession();
     const claim = await claimReplayAction<RunHeld>(
       accountingRunSubject,
       requestId,
+      { session },
     );
     if (!claim.ok) {
       if (claim.reason === 'locked') {
         setNotice(busyNotice);
       } else if (claim.reason === 'missing' || claim.reason === 'storage') {
         setNotice(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setNotice(offlineWriteMessage);
       }
       return;
     }
-    await finishUnknown(claim.record.payload, claim.release);
+    await finishUnknown(claim.record.payload, session, claim.release);
   }
 
   async function run(): Promise<void> {
@@ -310,12 +334,14 @@ export function ProcessingPanel({
       hasAction(accountingRunSubject)
     )
       return;
+    const session = captureWriteSession();
     const claim = await claimFreshAction<RunHeld>(
       accountingRunSubject,
       (requestId) => ({
         requestId,
         report: null,
       }),
+      { session },
     );
     if (!claim.ok) {
       if (claim.reason === 'storage') {
@@ -326,17 +352,21 @@ export function ProcessingPanel({
         setNotice(busyNotice);
         return;
       }
+      if (claim.reason === 'session_invalid') {
+        if (!isOnline()) setNotice(offlineWriteMessage);
+        return;
+      }
       if (claim.reason === 'conflict' && claim.existing) {
         const existing = claim.existing as HeldWriteRecord<RunHeld>;
         if (existing.phase === 'unknown') {
-          await replayUnknownRun(existing.requestId);
+          await replayUnknownRun(existing.requestId, session);
         } else {
           setNotice(busyNotice);
         }
       }
       return;
     }
-    await finishFresh(claim.record.payload, claim.release);
+    await finishFresh(claim.record.payload, session, claim.release);
   }
 
   function retryRun(): void {
@@ -347,20 +377,27 @@ export function ProcessingPanel({
   async function retryOrder(order: ParkedOrder): Promise<void> {
     const subject = accountingRetrySubject(order.orderId);
     if (flight.current || running || !isOnline() || hasAction(subject)) return;
-    const claim = await claimFreshAction<RetryHeld>(subject, (requestId) => ({
-      requestId,
-      orderId: order.orderId,
-    }));
+    const session = captureWriteSession();
+    const claim = await claimFreshAction<RetryHeld>(
+      subject,
+      (requestId) => ({
+        requestId,
+        orderId: order.orderId,
+      }),
+      { session },
+    );
     if (!claim.ok) {
       if (claim.reason === 'storage') {
         setNotice(storageWriteFailedMessage);
       } else if (claim.reason === 'locked') {
         setNotice(busyNotice);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setNotice(offlineWriteMessage);
       }
       return;
     }
     noteRetryOrder(order.orderId);
-    await finishRetry(claim.record.payload, claim.release);
+    await finishRetry(claim.record.payload, session, false, claim.release);
   }
 
   const unresolvedRetries =
@@ -375,16 +412,21 @@ export function ProcessingPanel({
     const subject = accountingRetrySubject(orderId);
     const held = unknownAction<RetryHeld>(subject);
     if (!held || flight.current || running || !isOnline()) return;
-    const claim = await claimReplayAction<RetryHeld>(subject, held.requestId);
+    const session = captureWriteSession();
+    const claim = await claimReplayAction<RetryHeld>(subject, held.requestId, {
+      session,
+    });
     if (!claim.ok) {
       if (claim.reason === 'locked') {
         setNotice(busyNotice);
       } else if (claim.reason === 'missing' || claim.reason === 'storage') {
         setNotice(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setNotice(offlineWriteMessage);
       }
       return;
     }
-    await finishRetry(claim.record.payload, claim.release);
+    await finishRetry(claim.record.payload, session, true, claim.release);
   }
 
   return (

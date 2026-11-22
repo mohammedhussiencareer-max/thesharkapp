@@ -30,14 +30,20 @@ import {
   saveDetailsFirstMessage,
 } from '@/items/errors';
 import {
-  beginAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearActionPostedReload,
+  clearActionPostedReloadSnapshot,
   createSubject,
   firstUnknownItemCreate,
   hasAction,
+  hasDurableAction,
   hasItemConfigurationAction,
   lossSubject,
+  markActionPostedReload,
   priceSubject,
   settleAction,
+  snapshotActionPostedReloads,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
@@ -60,8 +66,12 @@ import {
   type ItemSave,
 } from '@/items/types';
 
-import { HeldWriteStorageError } from '@/lib/held-writes';
-import { isOnline, useOnline } from '@/lib/online';
+import {
+  canDispatchWriteFor,
+  captureWriteSession,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { cairoDateTimeLocalToIso } from '@/purchases/time';
 import {
   decimalsEqual,
@@ -245,6 +255,8 @@ export function ItemForm({
     if (!editingId) return;
     const request = ++scheduleLoad.current;
     let cancelled = false;
+    const subject = lossSubject(editingId);
+    const pendingReloads = snapshotActionPostedReloads({ subject });
     void (async () => {
       try {
         const [shift, nextSchedule] = await Promise.all([
@@ -254,6 +266,7 @@ export function ItemForm({
         if (cancelled || request !== scheduleLoad.current) return;
         setShiftStart(shift);
         setSchedule(nextSchedule);
+        clearActionPostedReloadSnapshot(pendingReloads, subject);
         if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
         if (nextSchedule.identity !== editingIdentity) {
           void onItemStaleRef.current?.(editingId);
@@ -269,21 +282,28 @@ export function ItemForm({
     };
   }, [editingId, editingIdentity]);
 
-  async function reloadLossSchedule(expectedIdentity?: string): Promise<void> {
-    if (!editingId) return;
+  async function reloadLossSchedule(
+    expectedIdentity?: string,
+  ): Promise<boolean> {
+    if (!editingId) return false;
     const request = ++scheduleLoad.current;
+    const subject = lossSubject(editingId);
+    const pendingReloads = snapshotActionPostedReloads({ subject });
     try {
       const next = await listCostingSchedule(editingId);
-      if (request !== scheduleLoad.current) return;
+      if (request !== scheduleLoad.current) return false;
       setSchedule(next);
+      clearActionPostedReloadSnapshot(pendingReloads, subject);
       if (
         expectedIdentity !== undefined &&
         next.identity !== expectedIdentity
       ) {
         void onItemStaleRef.current?.(editingId);
       }
+      return true;
     } catch (error) {
       if (request === scheduleLoad.current) setExtraError(messageFrom(error));
+      return false;
     }
   }
 
@@ -350,12 +370,52 @@ export function ItemForm({
     });
   }
 
-  async function finishLoss(action: LossAction) {
-    if (!editingId || lossFlight.current) return;
+  async function finishLoss(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => LossAction }
+      | { kind: 'replay'; action: LossAction },
+  ) {
+    if (!editingId || lossFlight.current || !isOnline()) return;
+    const session = captureWriteSession();
     lossFlight.current = true;
     const subject = lossSubject(editingId);
     setRefreshingSchedule(true);
+    onClearServerError();
+    setExtraError(null);
+    let releaseLock = () => {};
+    let saved = false;
+    let requestId: string | null = null;
     try {
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<LossAction>(subject, mode.create, {
+              session,
+            })
+          : await claimReplayAction<LossAction>(
+              subject,
+              mode.action.write.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setExtraError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setExtraError(offlineWriteMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+      const action = claim.record.payload;
+      requestId = claim.record.requestId;
+      if (!canDispatchWriteFor(session)) {
+        if (mode.kind === 'fresh') {
+          settleAction(subject, requestId);
+        } else {
+          settleAction(subject, requestId, new Error(offlineWriteMessage));
+        }
+        if (!isOnline()) setExtraError(offlineWriteMessage);
+        return;
+      }
       const accepted = await onSubmit({
         kind: 'loss',
         lossPct: action.lossPct,
@@ -364,29 +424,84 @@ export function ItemForm({
       // A refused send never reached the database. A retry whose page is
       // busy still has an unknown outcome and must keep its payload.
       if (accepted !== true) {
-        if (unknownAction<LossAction>(subject) === null) {
-          settleAction(subject, action.write.requestId);
+        if (mode.kind === 'fresh') {
+          settleAction(subject, requestId);
+        } else {
+          settleAction(subject, requestId, new Error('retry deferred'));
         }
         return;
       }
-      settleAction(subject, action.write.requestId);
+      saved = true;
+      markActionPostedReload(subject, requestId, subject);
+      releaseLock();
+      releaseLock = () => {};
       setDatedLoss(false);
-      await reloadLossSchedule();
+      const reloaded = await reloadLossSchedule();
+      if (reloaded) {
+        clearActionPostedReload(subject, subject, requestId);
+      }
     } catch (error) {
-      settleAction(subject, action.write.requestId, error);
-      if (isConfirmedConfigurationChange(error)) await reloadLossSchedule();
+      if (!saved && requestId !== null) {
+        settleAction(subject, requestId, error);
+      }
+      if (saved) {
+        setExtraError(messageFrom(error));
+      } else if (isConfirmedConfigurationChange(error)) {
+        await reloadLossSchedule();
+      }
     } finally {
+      releaseLock();
       lossFlight.current = false;
       setRefreshingSchedule(false);
       setActionEpoch((value) => value + 1);
     }
   }
 
-  async function finishPrice(action: PriceAction) {
-    if (!editingId || priceFlight.current) return;
+  async function finishPrice(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => PriceAction }
+      | { kind: 'replay'; action: PriceAction },
+  ) {
+    if (!editingId || priceFlight.current || !isOnline()) return;
+    const session = captureWriteSession();
     priceFlight.current = true;
     const subject = priceSubject(editingId);
+    onClearServerError();
+    setPriceError(null);
+    let releaseLock = () => {};
+    let saved = false;
+    let requestId: string | null = null;
     try {
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<PriceAction>(subject, mode.create, {
+              session,
+            })
+          : await claimReplayAction<PriceAction>(
+              subject,
+              mode.action.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setPriceError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setPriceError(offlineWriteMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+      const action = claim.record.payload;
+      requestId = claim.record.requestId;
+      if (!canDispatchWriteFor(session)) {
+        if (mode.kind === 'fresh') {
+          settleAction(subject, requestId);
+        } else {
+          settleAction(subject, requestId, new Error(offlineWriteMessage));
+        }
+        if (!isOnline()) setPriceError(offlineWriteMessage);
+        return;
+      }
       const accepted = await onSubmit({
         kind: 'price',
         price: action.price,
@@ -396,18 +511,28 @@ export function ItemForm({
         requestId: action.requestId,
       });
       if (accepted !== true) {
-        if (unknownAction<PriceAction>(subject) === null) {
-          settleAction(subject, action.requestId);
+        if (mode.kind === 'fresh') {
+          settleAction(subject, requestId);
+        } else {
+          settleAction(subject, requestId, new Error('retry deferred'));
         }
         return;
       }
-      settleAction(subject, action.requestId);
+      saved = true;
+      settleAction(subject, requestId);
     } catch (error) {
-      settleAction(subject, action.requestId, error);
-      // The held price keeps the identity it was submitted with. A confirmed
-      // conflict retires that hold; the next fresh action reads this reload.
-      if (isConfirmedConfigurationChange(error)) await reloadLossSchedule();
+      if (!saved && requestId !== null) {
+        settleAction(subject, requestId, error);
+      }
+      if (saved) {
+        setPriceError(messageFrom(error));
+      } else if (isConfirmedConfigurationChange(error)) {
+        // The held price keeps the identity it was submitted with. A confirmed
+        // conflict retires that hold; the next fresh action reads this reload.
+        await reloadLossSchedule();
+      }
     } finally {
+      releaseLock();
       priceFlight.current = false;
       setActionEpoch((value) => value + 1);
     }
@@ -441,8 +566,13 @@ export function ItemForm({
       createFlight.current
     )
       return;
-    if (unknownAction<string>(createSubject(activeCreateDraft)) === null)
+    const subject = createSubject(activeCreateDraft);
+    const heldId = unknownAction<string>(subject);
+    if (heldId === null) return;
+    if (!hasDurableAction(subject, heldId)) {
+      setExtraError(storageWriteFailedMessage);
       return;
+    }
     createFlight.current = true;
     setSubmittedDraft(activeCreateDraft);
     void onSubmit({ kind: 'create', draft: activeCreateDraft })
@@ -492,7 +622,7 @@ export function ItemForm({
     }
     const action = unknownAction<LossAction>(lossSubject(editingId));
     if (!action) return;
-    void finishLoss(action);
+    void finishLoss({ kind: 'replay', action });
   }
 
   function saveLoss() {
@@ -574,20 +704,13 @@ export function ItemForm({
         return;
       }
     }
-    let action: LossAction;
-    try {
-      action = beginAction(lossSubject(editingId), (requestId) => ({
+    void finishLoss({
+      kind: 'fresh',
+      create: (requestId) => ({
         lossPct,
         write: { ...built.write, requestId },
-      }));
-    } catch (error) {
-      if (error instanceof HeldWriteStorageError) {
-        setExtraError(error.message);
-        return;
-      }
-      throw error;
-    }
-    void finishLoss(action);
+      }),
+    });
   }
 
   function retryPrice() {
@@ -601,7 +724,7 @@ export function ItemForm({
       return;
     const action = unknownAction<PriceAction>(priceSubject(editingId));
     if (!action) return;
-    void finishPrice(action);
+    void finishPrice({ kind: 'replay', action });
   }
 
   function savePrice() {
@@ -639,23 +762,16 @@ export function ItemForm({
       return;
     }
     const reason = price === '0' ? priceReason.trim() : null;
-    let action: PriceAction;
-    try {
-      action = beginAction(priceSubject(editingId), (requestId) => ({
+    void finishPrice({
+      kind: 'fresh',
+      create: (requestId) => ({
         price,
         reason,
         expectedId: editing?.openingPriceId ?? null,
         identity,
         requestId,
-      }));
-    } catch (error) {
-      if (error instanceof HeldWriteStorageError) {
-        setPriceError(error.message);
-        return;
-      }
-      throw error;
-    }
-    void finishPrice(action);
+      }),
+    });
   }
 
   return (
@@ -904,7 +1020,7 @@ export function ItemForm({
                 dir="ltr"
                 inputMode="decimal"
                 disabled={priceDisabled}
-                value={priceText}
+                value={online ? priceText : ''}
                 onChange={(event) => {
                   if (priceDisabled) return;
                   onClearServerError();
@@ -913,7 +1029,7 @@ export function ItemForm({
                 }}
               />
             </label>
-            {zeroPrice ? (
+            {online && zeroPrice ? (
               <label className="flex flex-col gap-1">
                 سبب إن السعر صفر
                 <input

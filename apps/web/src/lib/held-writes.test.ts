@@ -662,4 +662,103 @@ describe('held-writes store', () => {
       fallbackB.dispose();
     }
   });
+
+  it('R4-2: failed posted_reload storage write keeps the old durable inflight pin and throws HeldWriteStorageError', async () => {
+    const { HeldWriteStorageError, claimFreshHeldWrite } =
+      await import('@/lib/held-writes');
+    setHeldWriteUser('user-a');
+    const claimed = await claimFreshHeldWrite(
+      'purchase:new',
+      (requestId) => ({ requestId, supplier: 'مورد' }),
+      { kind: 'purchase' },
+    );
+    expect(claimed.ok).toBe(true);
+    if (!claimed.ok) return;
+    const reqId = claimed.record.requestId;
+    claimed.release();
+
+    const activeKey = `${userStoragePrefix('user-a')}${encodeURIComponent('purchase:new')}`;
+    expect(localStorage.getItem(activeKey)).not.toBeNull();
+
+    // Simulate quota error when writing the replacement posted_reload key.
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError');
+    });
+
+    expect(() =>
+      setHeldWritePhase('purchase:new', reqId, 'posted_reload', {
+        readTarget: 'purchase:new',
+      }),
+    ).toThrow(HeldWriteStorageError);
+
+    // The old durable inflight record MUST still exist in localStorage!
+    const remaining = localStorage.getItem(activeKey);
+    expect(remaining).not.toBeNull();
+    expect(JSON.parse(remaining ?? '{}')).toMatchObject({
+      requestId: reqId,
+      phase: 'inflight',
+    });
+  });
+
+  it('R4-4a: async claims reject if user signs out and re-signs in as same user OR goes offline during lock acquisition', async () => {
+    let releaseLockGate!: () => void;
+    const gatedLocks = {
+      async request<T>(
+        name: string,
+        options: { mode?: 'exclusive' | 'shared'; ifAvailable?: boolean },
+        callback: (
+          lock: { name: string; mode: string } | null,
+        ) => Promise<T> | T,
+      ): Promise<T> {
+        await new Promise<void>((resolve) => {
+          releaseLockGate = resolve;
+        });
+        return await callback({ name, mode: options.mode ?? 'exclusive' });
+      },
+    };
+
+    const store = createHeldWriteStore({ getLocks: () => gatedLocks });
+    const origOnline = Object.getOwnPropertyDescriptor(navigator, 'onLine');
+    try {
+      store.setHeldWriteUser('user-a');
+
+      // Case 1: sign-out and sign back in to the SAME account while awaiting lock.
+      const claimPromise1 = store.claimFreshHeldWrite(
+        'purchase:new',
+        (requestId) => ({ requestId }),
+        { kind: 'purchase' },
+      );
+      store.setHeldWriteUser(null);
+      store.setHeldWriteUser('user-a');
+      releaseLockGate();
+      const res1 = await claimPromise1;
+      expect(res1.ok).toBe(false);
+      expect(store.getHeldWrite('purchase:new')).toBeNull();
+
+      // Case 2: go offline while awaiting lock.
+      const claimPromise2 = store.claimFreshHeldWrite(
+        'count:daily',
+        (requestId) => ({ requestId }),
+        { kind: 'count' },
+      );
+      Object.defineProperty(navigator, 'onLine', {
+        configurable: true,
+        value: false,
+      });
+      releaseLockGate();
+      const res2 = await claimPromise2;
+      expect(res2.ok).toBe(false);
+      expect(store.getHeldWrite('count:daily')).toBeNull();
+    } finally {
+      if (origOnline) {
+        Object.defineProperty(navigator, 'onLine', origOnline);
+      } else {
+        Object.defineProperty(navigator, 'onLine', {
+          configurable: true,
+          value: true,
+        });
+      }
+      store.dispose();
+    }
+  });
 });

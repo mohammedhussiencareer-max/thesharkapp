@@ -25,8 +25,13 @@ import {
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
-import { storageWriteFailedMessage } from '@/lib/held-writes';
-import { isOnline, useOnline } from '@/lib/online';
+import {
+  canDispatchWriteFor,
+  captureWriteSession,
+  setHeldWritePhase,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { reloadFailedMessage } from '@/waste/useWasteAction';
 
 export const ACTIVATION_SUBJECT = 'activation';
@@ -153,22 +158,29 @@ export function useActivationAction(
       return;
     }
 
+    const session = captureWriteSession();
     let action: ActivationWrite;
     let releaseLock: () => void;
+    let isReplay = false;
     if (unknownHeld) {
+      isReplay = true;
       const claim = await claimReplayAction<ActivationWrite>(
         ACTIVATION_SUBJECT,
         unknownHeld.requestId,
+        { session },
       );
       if (!claim.ok) {
         if (claim.reason === 'missing' || claim.reason === 'storage') {
           setNotice(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setNotice(offlineWriteMessage);
         }
         return;
       }
       action = claim.record.payload;
       releaseLock = claim.release;
     } else if (current && !activationReviewReloadPending(ACTIVATION_SUBJECT)) {
+      isReplay = true;
       const nextPayload: ActivationWrite = {
         ...current,
         explicitZeroItemIds: zerosOf(checked),
@@ -176,11 +188,13 @@ export function useActivationAction(
       const claim = await claimReplayAction<ActivationWrite>(
         ACTIVATION_SUBJECT,
         current.requestId,
-        { payload: nextPayload, awaitingReviewReload: false },
+        { payload: nextPayload, awaitingReviewReload: false, session },
       );
       if (!claim.ok) {
         if (claim.reason === 'missing' || claim.reason === 'storage') {
           setNotice(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setNotice(offlineWriteMessage);
         }
         return;
       }
@@ -196,10 +210,13 @@ export function useActivationAction(
           manifestHash,
           explicitZeroItemIds: zerosOf(checked),
         }),
+        { session },
       );
       if (!claim.ok) {
         if (claim.reason === 'storage') {
           setNotice(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setNotice(offlineWriteMessage);
         }
         return;
       }
@@ -207,13 +224,26 @@ export function useActivationAction(
       releaseLock = claim.release;
     }
 
+    if (!canDispatchWriteFor(session)) {
+      if (isReplay) {
+        setHeldWritePhase(ACTIVATION_SUBJECT, action.requestId, 'unknown');
+      } else {
+        settleAction(ACTIVATION_SUBJECT, action.requestId);
+      }
+      releaseLock();
+      if (!isOnline()) setNotice(offlineWriteMessage);
+      return;
+    }
+
     flight.current = true;
     setSaving(true);
     setNotice(null);
     try {
       let saved: ActivationResult;
+      let persisted = false;
       try {
         saved = await activateInventory(action);
+        persisted = true;
         markActionPostedReload(
           ACTIVATION_SUBJECT,
           action.requestId,
@@ -228,14 +258,16 @@ export function useActivationAction(
           canActivate: false,
         });
       } catch (failure) {
-        if (isOpeningManifestChange(failure)) {
+        if (!persisted && isOpeningManifestChange(failure)) {
           pinActivationReviewReload(ACTIVATION_SUBJECT, action.requestId);
           setReloadBlocked(true);
           const next = await reloadReview();
           if (next) acceptReloaded(action.requestId, next);
           return;
         }
-        settleAction(ACTIVATION_SUBJECT, action.requestId, failure);
+        if (!persisted) {
+          settleAction(ACTIVATION_SUBJECT, action.requestId, failure);
+        }
         setNotice(messageFrom(failure));
         return;
       } finally {

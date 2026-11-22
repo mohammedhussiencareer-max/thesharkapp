@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
-import { clearActionPostedReload } from '@/items/request-id';
+import {
+  clearActionPostedReloadSnapshot,
+  snapshotActionPostedReloads,
+} from '@/items/request-id';
 import { formatCairo } from '@/lib/cairo';
 import { offlineMoneyMessage, useReconnectReload } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
@@ -54,6 +57,9 @@ export function OrderDecisionsPage() {
   useEffect(() => {
     const seq = ++seqRef.current;
     let cancelled = false;
+    const pendingReloads = snapshotActionPostedReloads({
+      prefix: 'order-decision:',
+    });
     void (async () => {
       try {
         const page = await loadQueuePage(filter, null);
@@ -62,10 +68,16 @@ export function OrderDecisionsPage() {
         setNext(page.next);
         setLoadError(null);
         setMoreError(null);
-        for (const row of page.rows) {
-          const subj = decisionSubject(row.orderId);
-          clearActionPostedReload(subj, subj);
-        }
+        const loadedSubjects = new Set(
+          page.rows.map((row) => decisionSubject(row.orderId)),
+        );
+        clearActionPostedReloadSnapshot(
+          pendingReloads.filter(
+            (entry) =>
+              loadedSubjects.has(entry.subject) &&
+              entry.readTarget === entry.subject,
+          ),
+        );
       } catch (error) {
         if (cancelled || seq !== seqRef.current) return;
         setLoadError(messageFrom(error));
@@ -164,9 +176,10 @@ export function OrderDecisionsPage() {
   }
 
   const reloadRow = useCallback(async (orderId: string): Promise<void> => {
-    const row = await loadQueueRow(orderId);
     const subj = decisionSubject(orderId);
-    clearActionPostedReload(subj, subj);
+    const pendingReloads = snapshotActionPostedReloads({ subject: subj });
+    const row = await loadQueueRow(orderId);
+    clearActionPostedReloadSnapshot(pendingReloads, subj);
     setEntries((current) =>
       current === null
         ? current
@@ -222,7 +235,7 @@ export function OrderDecisionsPage() {
           className="flex flex-col gap-1"
           aria-label={`نتيجة إعادة المحاولة لطلب ${item.orderId}`}
         >
-          <NoticeView notice={item.notice} />
+          <NoticeView notice={item.notice} hideMoney={!online} />
         </section>
       ))}
       {loading && entries === null ? <p>جاري تحميل الطلبات…</p> : null}
@@ -234,13 +247,14 @@ export function OrderDecisionsPage() {
             : 'مفيش طلبات ملغية أو مرتجعة'}
         </p>
       ) : null}
-      {online && entries && entries.length > 0 ? (
+      {entries && entries.length > 0 ? (
         <div className="flex flex-col gap-3">
           {entries.map((entry) => (
             <DecisionCard
               key={entry.row.orderId}
               row={entry.row}
               closed={entry.closed}
+              hideMoney={!online}
               onChanged={reloadRow}
             />
           ))}

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { currentMinuteMs, type SchedulePoint } from '@/items/effective';
 import { messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
   hasAction,
@@ -15,10 +15,11 @@ import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatCairo } from '@/lib/cairo';
 import {
-  HeldWriteStorageError,
+  canDispatchWriteFor,
+  captureWriteSession,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
-import { isOnline, useOnline } from '@/lib/online';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import {
   setBaseMapping,
@@ -356,9 +357,10 @@ export function SubjectPanel({
   base: ObservedBase;
   detail: SubjectDetail;
   catalog: MappingCatalog;
-  onReload: () => Promise<boolean | void>;
+  onReload: (expectedKey?: string) => Promise<boolean | void>;
 }) {
   const online = useOnline();
+  const expectedBaseKey = `${base.posItemId}\n${base.sizeKeyText}`;
   const subject = baseSubject(base.posItemId, base.sizeKeyText);
   const [heldEpoch, setHeldEpoch] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -377,40 +379,62 @@ export function SubjectPanel({
     [],
   );
 
-  async function finish(action: BaseHeld, isReplay = false) {
+  async function finish(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => BaseHeld }
+      | { kind: 'replay'; action: BaseHeld },
+  ) {
     if (flight.current || !isOnline()) return;
-    const requestId = action.write.requestId;
-    let releaseLock = () => {};
-    if (isReplay) {
-      const claim = await claimReplayAction<BaseHeld>(subject, requestId);
-      if (!claim.ok) {
-        if (claim.reason === 'missing' || claim.reason === 'storage') {
-          setError(storageWriteFailedMessage);
-        }
-        return;
-      }
-      releaseLock = claim.release;
-    }
+    const session = captureWriteSession();
     flight.current = true;
     setSaving(true);
     setError(null);
     setNotice(null);
+    let releaseLock = () => {};
     try {
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<BaseHeld>(subject, mode.create, { session })
+          : await claimReplayAction<BaseHeld>(
+              subject,
+              mode.action.write.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setError(offlineWriteMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+      const action = claim.record.payload;
+      const requestId = claim.record.requestId;
+      if (!canDispatchWriteFor(session)) {
+        if (!isOnline()) setError(offlineWriteMessage);
+        return;
+      }
+      let saved = false;
       try {
         if (action.kind === 'mapping') await setBaseMapping(action.write);
         else if (action.kind === 'policy') await setOptionPolicy(action.write);
         else await setException(action.write);
+        saved = true;
         markActionPostedReload(subject, requestId, subject);
         setResetEpoch((value) => value + 1);
       } catch (failure) {
-        settleAction(subject, requestId, failure);
+        if (!saved) {
+          settleAction(subject, requestId, failure);
+        }
         setError(messageFrom(failure));
-        if (!hasAction(subject)) await onReload();
+        if (!saved && !hasAction(subject)) await onReload(expectedBaseKey);
         return;
       } finally {
         releaseLock();
+        releaseLock = () => {};
       }
-      const reloaded = await onReload();
+      const reloaded = await onReload(expectedBaseKey);
       if (reloaded !== false) {
         clearActionPostedReload(subject, subject, requestId);
       }
@@ -424,6 +448,7 @@ export function SubjectPanel({
     } catch (failure) {
       setError(messageFrom(failure));
     } finally {
+      releaseLock();
       flight.current = false;
       setSaving(false);
     }
@@ -461,7 +486,7 @@ export function SubjectPanel({
       {held ? (
         <UnknownSave
           disabled={saving}
-          onRetry={() => void finish(held, true)}
+          onRetry={() => void finish({ kind: 'replay', action: held })}
         />
       ) : null}
       {notice ? <p role="status">{notice}</p> : null}
@@ -474,7 +499,7 @@ export function SubjectPanel({
         picked={picked}
         resetEpoch={resetEpoch}
         onError={setError}
-        onFinish={(action) => void finish(action)}
+        onFinish={(create) => void finish({ kind: 'fresh', create })}
       />
       <section className="flex flex-col gap-2" aria-label="اقتراحات">
         <h3 className="font-semibold">اقتراحات</h3>
@@ -505,7 +530,7 @@ export function SubjectPanel({
         disabled={disabled}
         resetEpoch={resetEpoch}
         onError={setError}
-        onFinish={(action) => void finish(action)}
+        onFinish={(create) => void finish({ kind: 'fresh', create })}
       />
       <ExceptionForm
         base={base}
@@ -514,11 +539,12 @@ export function SubjectPanel({
         disabled={disabled}
         resetEpoch={resetEpoch}
         onError={setError}
-        onFinish={(action) => void finish(action)}
+        onFinish={(create) => void finish({ kind: 'fresh', create })}
       />
       <HistoryList rows={detail.history} catalog={catalog} />
       <PackagingEditor
         subjectKey={basePackagingSubject(base.posItemId, base.sizeKeyText)}
+        expectedKey={expectedBaseKey}
         kind="base"
         posItemId={base.posItemId}
         sizeKey={base.sizeKey}
@@ -570,7 +596,7 @@ function BaseMappingForm({
   picked: { id: string; nonce: number } | null;
   resetEpoch: number;
   onError: (message: string | null) => void;
-  onFinish: (action: BaseHeld) => void;
+  onFinish: (create: (requestId: string) => BaseHeld) => void;
 }) {
   const subject = baseSubject(base.posItemId, base.sizeKeyText);
   const { timing, covering, atMs } = useFamilyTiming(
@@ -653,26 +679,16 @@ function BaseMappingForm({
       return;
     }
     onError(null);
-    let action: BaseHeld;
-    try {
-      action = beginAction<BaseHeld>(subject, (requestId) => ({
-        kind: 'mapping',
-        write: {
-          ...dated.write,
-          requestId,
-          posItemId: base.posItemId,
-          sizeKey: base.sizeKey,
-          target: target.target,
-        },
-      }));
-    } catch (failure) {
-      if (failure instanceof HeldWriteStorageError) {
-        onError(failure.message);
-        return;
-      }
-      throw failure;
-    }
-    onFinish(action);
+    onFinish((requestId) => ({
+      kind: 'mapping',
+      write: {
+        ...dated.write,
+        requestId,
+        posItemId: base.posItemId,
+        sizeKey: base.sizeKey,
+        target: target.target,
+      },
+    }));
   }
 
   const summary =
@@ -751,7 +767,7 @@ function PolicyForm({
   disabled: boolean;
   resetEpoch: number;
   onError: (message: string | null) => void;
-  onFinish: (action: BaseHeld) => void;
+  onFinish: (create: (requestId: string) => BaseHeld) => void;
 }) {
   const subject = baseSubject(base.posItemId, base.sizeKeyText);
   const { timing, covering, atMs } = useFamilyTiming(
@@ -807,26 +823,16 @@ function PolicyForm({
       return;
     }
     onError(null);
-    let action: BaseHeld;
-    try {
-      action = beginAction<BaseHeld>(subject, (requestId) => ({
-        kind: 'policy',
-        write: {
-          ...dated.write,
-          requestId,
-          posItemId: base.posItemId,
-          sizeKey: base.sizeKey,
-          policy: policy === '' ? null : policy,
-        },
-      }));
-    } catch (failure) {
-      if (failure instanceof HeldWriteStorageError) {
-        onError(failure.message);
-        return;
-      }
-      throw failure;
-    }
-    onFinish(action);
+    onFinish((requestId) => ({
+      kind: 'policy',
+      write: {
+        ...dated.write,
+        requestId,
+        posItemId: base.posItemId,
+        sizeKey: base.sizeKey,
+        policy: policy === '' ? null : policy,
+      },
+    }));
   }
 
   return (
@@ -889,7 +895,7 @@ function ExceptionForm({
   disabled: boolean;
   resetEpoch: number;
   onError: (message: string | null) => void;
-  onFinish: (action: BaseHeld) => void;
+  onFinish: (create: (requestId: string) => BaseHeld) => void;
 }) {
   const subject = baseSubject(base.posItemId, base.sizeKeyText);
   const { timing, covering, atMs } = useFamilyTiming(
@@ -948,26 +954,16 @@ function ExceptionForm({
       return;
     }
     onError(null);
-    let action: BaseHeld;
-    try {
-      action = beginAction<BaseHeld>(subject, (requestId) => ({
-        kind: 'exception',
-        write: {
-          ...dated.write,
-          requestId,
-          posItemId: base.posItemId,
-          sizeKey: base.sizeKey,
-          exceptionReason: trimmed.length === 0 ? null : trimmed,
-        },
-      }));
-    } catch (failure) {
-      if (failure instanceof HeldWriteStorageError) {
-        onError(failure.message);
-        return;
-      }
-      throw failure;
-    }
-    onFinish(action);
+    onFinish((requestId) => ({
+      kind: 'exception',
+      write: {
+        ...dated.write,
+        requestId,
+        posItemId: base.posItemId,
+        sizeKey: base.sizeKey,
+        exceptionReason: trimmed.length === 0 ? null : trimmed,
+      },
+    }));
   }
 
   return (
@@ -1012,7 +1008,7 @@ function OptionBlock({
   seenCount: number;
   detail: SubjectDetail;
   catalog: MappingCatalog;
-  onReload: () => Promise<boolean | void>;
+  onReload: (expectedKey?: string) => Promise<boolean | void>;
 }) {
   const global = detail.optionBindings.find(
     (binding) =>
@@ -1084,9 +1080,10 @@ function OptionMappingForm({
   schedule: SubjectDetail['schedule'];
   history: readonly HistoryRow[];
   catalog: MappingCatalog;
-  onReload: () => Promise<boolean | void>;
+  onReload: (expectedKey?: string) => Promise<boolean | void>;
 }) {
   const online = useOnline();
+  const expectedBaseKey = `${base.posItemId}\n${base.sizeKeyText}`;
   const subject = optionSubject(
     scope,
     scope === 'item' ? base.posItemId : '',
@@ -1142,47 +1139,70 @@ function OptionMappingForm({
     setUnit(next.unit);
   }
 
-  async function finish(write: OptionMappingWrite, isReplay = false) {
+  async function finish(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => OptionMappingWrite }
+      | { kind: 'replay'; write: OptionMappingWrite },
+  ) {
     if (flight.current || !isOnline()) return;
-    let releaseLock = () => {};
-    if (isReplay) {
-      const claim = await claimReplayAction<OptionMappingWrite>(
-        subject,
-        write.requestId,
-      );
-      if (!claim.ok) {
-        if (claim.reason === 'missing' || claim.reason === 'storage') {
-          setError(storageWriteFailedMessage);
-        }
-        return;
-      }
-      releaseLock = claim.release;
-    }
+    const session = captureWriteSession();
     flight.current = true;
     setSaving(true);
     setError(null);
     setNotice(null);
+    let releaseLock = () => {};
     try {
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<OptionMappingWrite>(subject, mode.create, {
+              session,
+            })
+          : await claimReplayAction<OptionMappingWrite>(
+              subject,
+              mode.write.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setError(offlineWriteMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+      const write = claim.record.payload;
+      const requestId = claim.record.requestId;
+      if (!canDispatchWriteFor(session)) {
+        if (!isOnline()) setError(offlineWriteMessage);
+        return;
+      }
+      let saved = false;
       try {
         await setOptionMapping(write);
-        markActionPostedReload(subject, write.requestId, subject);
+        saved = true;
+        markActionPostedReload(subject, requestId, subject);
         setDirty(false);
       } catch (failure) {
-        settleAction(subject, write.requestId, failure);
+        if (!saved) {
+          settleAction(subject, requestId, failure);
+        }
         setError(messageFrom(failure));
-        if (!hasAction(subject)) await onReload();
+        if (!saved && !hasAction(subject)) await onReload(expectedBaseKey);
         return;
       } finally {
         releaseLock();
+        releaseLock = () => {};
       }
-      const reloaded = await onReload();
+      const reloaded = await onReload(expectedBaseKey);
       if (reloaded !== false) {
-        clearActionPostedReload(subject, subject, write.requestId);
+        clearActionPostedReload(subject, subject, requestId);
       }
       setNotice(savedOptionMessage);
     } catch (failure) {
       setError(messageFrom(failure));
     } finally {
+      releaseLock();
       flight.current = false;
       setSaving(false);
     }
@@ -1220,9 +1240,9 @@ function OptionMappingForm({
       setError(target.error);
       return;
     }
-    let action: OptionMappingWrite;
-    try {
-      action = beginAction<OptionMappingWrite>(subject, (requestId) => ({
+    void finish({
+      kind: 'fresh',
+      create: (requestId) => ({
         ...dated.write,
         requestId,
         scope,
@@ -1230,15 +1250,8 @@ function OptionMappingForm({
         sizeKey: scope === 'item' ? base.sizeKey : null,
         optionValue,
         target: target.target,
-      }));
-    } catch (failure) {
-      if (failure instanceof HeldWriteStorageError) {
-        setError(failure.message);
-        return;
-      }
-      throw failure;
-    }
-    void finish(action);
+      }),
+    });
   }
 
   return (
@@ -1256,7 +1269,7 @@ function OptionMappingForm({
       {held ? (
         <UnknownSave
           disabled={saving}
-          onRetry={() => void finish(held, true)}
+          onRetry={() => void finish({ kind: 'replay', write: held })}
         />
       ) : null}
       {notice ? <p role="status">{notice}</p> : null}

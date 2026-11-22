@@ -10,8 +10,14 @@ import {
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
-import { storageWriteFailedMessage } from '@/lib/held-writes';
-import { isOnline } from '@/lib/online';
+import {
+  canDispatchWriteFor,
+  captureWriteSession,
+  setHeldWritePhase,
+  storageWriteFailedMessage,
+  type WriteSession,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage } from '@/lib/online';
 import { recordWaste } from '@/waste/api';
 import { MissingCostBasisError } from '@/waste/errors';
 import type { WasteNotice, WasteResult, WasteWrite } from '@/waste/types';
@@ -54,10 +60,20 @@ export function useWasteAction(
 
   async function finish(
     action: WasteWrite,
+    session: WriteSession | null,
+    isReplay: boolean,
     releaseLock: () => void,
   ): Promise<void> {
-    if (flight.current || !isOnline()) {
+    if (flight.current || !canDispatchWriteFor(session)) {
+      if (isReplay) {
+        setHeldWritePhase(subject, action.requestId, 'unknown');
+      } else {
+        settleAction(subject, action.requestId);
+      }
       releaseLock();
+      if (!isOnline()) {
+        setNotice({ kind: 'failed', message: offlineWriteMessage });
+      }
       return;
     }
     flight.current = true;
@@ -65,17 +81,21 @@ export function useWasteAction(
     setNotice(null);
     try {
       let saved: WasteResult;
+      let persisted = false;
       try {
         saved = await recordWaste(action);
+        persisted = true;
         markActionPostedReload(subject, action.requestId, subject);
       } catch (failure) {
-        settleAction(subject, action.requestId, failure);
+        if (!persisted) {
+          settleAction(subject, action.requestId, failure);
+        }
         const message = messageFrom(failure);
         const itemIds =
-          failure instanceof MissingCostBasisError
+          !persisted && failure instanceof MissingCostBasisError
             ? failure.itemIds
             : undefined;
-        if (hasAction(subject)) {
+        if (persisted || hasAction(subject)) {
           setNotice({ kind: 'failed', message, itemIds });
           return;
         }
@@ -104,30 +124,40 @@ export function useWasteAction(
   /** Starts a new action, or does nothing while one is outstanding. */
   function send(create: (requestId: string) => WasteWrite): void {
     if (flight.current || saving || !isOnline() || hasAction(subject)) return;
+    const session = captureWriteSession();
     void (async () => {
-      const claim = await claimFreshAction<WasteWrite>(subject, create);
+      const claim = await claimFreshAction<WasteWrite>(subject, create, {
+        session,
+      });
       if (!claim.ok) {
         if (claim.reason === 'storage') {
           setNotice({ kind: 'failed', message: storageWriteFailedMessage });
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setNotice({ kind: 'failed', message: offlineWriteMessage });
         }
         return;
       }
-      await finish(claim.record.payload, claim.release);
+      await finish(claim.record.payload, session, false, claim.release);
     })();
   }
 
   function retry(): void {
     if (!held || flight.current || saving || !isOnline()) return;
     const targetId = held.requestId;
+    const session = captureWriteSession();
     void (async () => {
-      const claim = await claimReplayAction<WasteWrite>(subject, targetId);
+      const claim = await claimReplayAction<WasteWrite>(subject, targetId, {
+        session,
+      });
       if (!claim.ok) {
         if (claim.reason === 'missing' || claim.reason === 'storage') {
           setNotice({ kind: 'failed', message: storageWriteFailedMessage });
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setNotice({ kind: 'failed', message: offlineWriteMessage });
         }
         return;
       }
-      await finish(claim.record.payload, claim.release);
+      await finish(claim.record.payload, session, true, claim.release);
     })();
   }
 
