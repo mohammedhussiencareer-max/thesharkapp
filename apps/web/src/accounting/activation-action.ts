@@ -11,18 +11,21 @@ import type {
 } from '@/accounting/types';
 import { messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearActionPostedReload,
   hasAction,
   activationReviewReloadPending,
   heldAction,
   heldRequestId,
+  markActionPostedReload,
   pinActivationReviewReload,
   replaceActivationPayload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
-import { HeldWriteStorageError } from '@/lib/held-writes';
+import { storageWriteFailedMessage } from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { reloadFailedMessage } from '@/waste/useWasteAction';
 
@@ -151,31 +154,57 @@ export function useActivationAction(
     }
 
     let action: ActivationWrite;
-    try {
-      if (unknownHeld) {
-        action = unknownHeld;
-      } else if (
-        current &&
-        !activationReviewReloadPending(ACTIVATION_SUBJECT)
-      ) {
-        action = { ...current, explicitZeroItemIds: zerosOf(checked) };
-        replaceActivationPayload(ACTIVATION_SUBJECT, action.requestId, action);
-      } else {
-        if (hasAction(ACTIVATION_SUBJECT) || !review.openingManifestHash)
-          return;
-        const manifestHash = review.openingManifestHash;
-        action = beginAction(ACTIVATION_SUBJECT, (requestId) => ({
+    let releaseLock: () => void;
+    if (unknownHeld) {
+      const claim = await claimReplayAction<ActivationWrite>(
+        ACTIVATION_SUBJECT,
+        unknownHeld.requestId,
+      );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setNotice(storageWriteFailedMessage);
+        }
+        return;
+      }
+      action = claim.record.payload;
+      releaseLock = claim.release;
+    } else if (current && !activationReviewReloadPending(ACTIVATION_SUBJECT)) {
+      const nextPayload: ActivationWrite = {
+        ...current,
+        explicitZeroItemIds: zerosOf(checked),
+      };
+      const claim = await claimReplayAction<ActivationWrite>(
+        ACTIVATION_SUBJECT,
+        current.requestId,
+        { payload: nextPayload, awaitingReviewReload: false },
+      );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setNotice(storageWriteFailedMessage);
+        }
+        return;
+      }
+      action = claim.record.payload;
+      releaseLock = claim.release;
+    } else {
+      if (hasAction(ACTIVATION_SUBJECT) || !review.openingManifestHash) return;
+      const manifestHash = review.openingManifestHash;
+      const claim = await claimFreshAction<ActivationWrite>(
+        ACTIVATION_SUBJECT,
+        (requestId) => ({
           requestId,
           manifestHash,
           explicitZeroItemIds: zerosOf(checked),
-        }));
-      }
-    } catch (failure) {
-      if (failure instanceof HeldWriteStorageError) {
-        setNotice(failure.message);
+        }),
+      );
+      if (!claim.ok) {
+        if (claim.reason === 'storage') {
+          setNotice(storageWriteFailedMessage);
+        }
         return;
       }
-      throw failure;
+      action = claim.record.payload;
+      releaseLock = claim.release;
     }
 
     flight.current = true;
@@ -185,7 +214,11 @@ export function useActivationAction(
       let saved: ActivationResult;
       try {
         saved = await activateInventory(action);
-        settleAction(ACTIVATION_SUBJECT, action.requestId);
+        markActionPostedReload(
+          ACTIVATION_SUBJECT,
+          action.requestId,
+          ACTIVATION_SUBJECT,
+        );
         onReview({
           ...review,
           activated: true,
@@ -205,9 +238,16 @@ export function useActivationAction(
         settleAction(ACTIVATION_SUBJECT, action.requestId, failure);
         setNotice(messageFrom(failure));
         return;
+      } finally {
+        releaseLock();
       }
       try {
         onReview(await loadOpeningReview());
+        clearActionPostedReload(
+          ACTIVATION_SUBJECT,
+          ACTIVATION_SUBJECT,
+          action.requestId,
+        );
         setNotice(null);
       } catch {
         setNotice(reloadFailedMessage);

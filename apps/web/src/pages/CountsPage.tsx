@@ -28,6 +28,8 @@ import type {
 import { messageFrom } from '@/items/errors';
 import type { Json } from '@/lib/database.types';
 import {
+  claimFreshHeldWrite,
+  claimReplayHeldWrite,
   clearHeldWrite,
   clearPostedReload,
   getHeldWrite,
@@ -35,9 +37,13 @@ import {
   setHeldWritePhase,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
-  tryPutHeldWrite,
 } from '@/lib/held-writes';
-import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
+import {
+  isOnline,
+  offlineMoneyMessage,
+  offlineWriteMessage,
+  useReconnectReload,
+} from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 
 const COUNT_DAILY_SUBJECT = 'count:daily';
@@ -122,7 +128,6 @@ function clearCountPostedReloads(): void {
 }
 
 export function CountsPage() {
-  const online = useOnline();
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -146,6 +151,14 @@ export function CountsPage() {
   );
   const seqRef = useRef(0);
   const loadsRef = useRef(0);
+
+  const online = useReconnectReload(() => {
+    if (!saving && loadsRef.current === 0) {
+      setLoading(true);
+      setLoadError(null);
+      setLoadId((value) => value + 1);
+    }
+  });
 
   function rememberItemNames(
     list: readonly { id: string; name?: string }[],
@@ -379,14 +392,20 @@ export function CountsPage() {
     );
     // Persist BEFORE sending (without display-only fields) so a reload during
     // transmission restores `unknown`. Refuse to send if storage fails.
-    const pin = tryPutHeldWrite(COUNT_DAILY_SUBJECT, {
-      requestId: draft.requestId,
-      payload: toStoredCountDraft(draft),
-      phase: 'inflight',
-      kind: 'count',
-    });
-    if (!pin.ok) {
-      if (pin.reason === 'storage') {
+    const storedDraft = toStoredCountDraft(draft);
+    const claim =
+      priorPhase !== null
+        ? await claimReplayHeldWrite<CountDraft>(
+            COUNT_DAILY_SUBJECT,
+            draft.requestId,
+          )
+        : await claimFreshHeldWrite<CountDraft>(
+            COUNT_DAILY_SUBJECT,
+            () => storedDraft,
+            { requestId: draft.requestId, kind: 'count' },
+          );
+    if (!claim.ok) {
+      if (claim.reason === 'storage' || claim.reason === 'missing') {
         setServerError(storageWriteFailedMessage);
       }
       return;
@@ -408,6 +427,7 @@ export function CountsPage() {
         setLoadError(messageFrom(error));
       }
     } finally {
+      claim.release();
       setSaving(false);
     }
   }
@@ -417,19 +437,26 @@ export function CountsPage() {
     const requestId = requestIdOf(payload);
     const storedSubject =
       requestId !== null ? `${COUNT_STORED_PREFIX}${requestId}` : null;
+    let releaseLock = () => {};
     if (storedSubject && requestId !== null) {
-      const pin = tryPutHeldWrite(storedSubject, {
-        requestId,
-        payload,
-        phase: 'inflight',
-        kind: 'count_stored',
-      });
-      if (!pin.ok) {
-        if (pin.reason === 'storage') {
+      const prior = getHeldWrite<Json>(storedSubject);
+      const isLocalReplay =
+        prior !== null &&
+        prior.requestId === requestId &&
+        prior.phase === 'unknown';
+      const claim = isLocalReplay
+        ? await claimReplayHeldWrite<Json>(storedSubject, requestId)
+        : await claimFreshHeldWrite<Json>(storedSubject, () => payload, {
+            requestId,
+            kind: 'count_stored',
+          });
+      if (!claim.ok) {
+        if (claim.reason === 'storage' || claim.reason === 'missing') {
           setCardError(storageWriteFailedMessage);
         }
         return;
       }
+      releaseLock = claim.release;
     }
     setSaving(true);
     setServerError(null);
@@ -470,6 +497,7 @@ export function CountsPage() {
         setLoadError(messageFrom(error));
       }
     } finally {
+      releaseLock();
       setSaving(false);
     }
   }
@@ -512,7 +540,12 @@ export function CountsPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الجرد اليومي</h1>
-      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
+      {!online ? (
+        <>
+          <p role="status">{offlineWriteMessage}</p>
+          <p role="status">{offlineMoneyMessage}</p>
+        </>
+      ) : null}
       {waiting || waitNotice !== null ? (
         <p role="status">{waitingForSyncMessage}</p>
       ) : null}
@@ -566,6 +599,7 @@ export function CountsPage() {
               pending={pending}
               waiting={waiting}
               requestKey={requestKey}
+              hideMoney={!online}
               onClearServerError={() => setServerError(null)}
               onSubmit={(next) => void handleSubmit(next)}
             />
@@ -576,7 +610,9 @@ export function CountsPage() {
             disabled={writeLocked}
             onResend={(payload) => void handleStored(payload)}
           />
-          <CountList counts={snapshot.counts} refreshKey={loadId} />
+          {online ? (
+            <CountList counts={snapshot.counts} refreshKey={loadId} />
+          ) : null}
         </>
       ) : null}
     </main>

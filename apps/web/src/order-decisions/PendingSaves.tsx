@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { messageFrom } from '@/items/errors';
-import { settleAction, subscribeHeldWrites } from '@/items/request-id';
+import {
+  claimReplayAction,
+  markActionPostedReload,
+  settleAction,
+  subscribeHeldWrites,
+} from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { storageWriteFailedMessage } from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { setOrderDisposition } from '@/order-decisions/api';
 import { unknownDecisions } from '@/order-decisions/held-decisions';
@@ -37,12 +43,29 @@ export function PendingSaves({
 
   async function retry(write: DecisionWrite): Promise<void> {
     if (flight.current || !isOnline()) return;
+    const subject = decisionSubject(write.orderId);
+    const claim = await claimReplayAction<DecisionWrite>(
+      subject,
+      write.requestId,
+    );
+    if (!claim.ok) {
+      if (claim.reason === 'missing' || claim.reason === 'storage') {
+        onSettled(write.orderId, {
+          kind: 'failed',
+          message: storageWriteFailedMessage,
+        });
+      }
+      return;
+    }
     flight.current = true;
     setBusy(write.orderId);
-    const subject = decisionSubject(write.orderId);
     try {
-      const saved = await setOrderDisposition(write);
-      settleAction(subject, write.requestId);
+      const saved = await setOrderDisposition(claim.record.payload);
+      if (saved.status === 'ok') {
+        markActionPostedReload(subject, write.requestId, subject);
+      } else {
+        settleAction(subject, write.requestId);
+      }
       onSettled(write.orderId, { kind: 'saved', result: saved, warning: null });
     } catch (failure) {
       settleAction(subject, write.requestId, failure);
@@ -51,6 +74,7 @@ export function PendingSaves({
         message: messageFrom(failure),
       });
     } finally {
+      claim.release();
       flight.current = false;
       setBusy(null);
     }

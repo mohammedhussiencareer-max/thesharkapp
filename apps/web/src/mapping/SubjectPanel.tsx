@@ -3,6 +3,7 @@ import { currentMinuteMs, type SchedulePoint } from '@/items/effective';
 import { messageFrom } from '@/items/errors';
 import {
   beginAction,
+  claimReplayAction,
   clearActionPostedReload,
   hasAction,
   markActionPostedReload,
@@ -13,7 +14,10 @@ import {
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatCairo } from '@/lib/cairo';
-import { HeldWriteStorageError } from '@/lib/held-writes';
+import {
+  HeldWriteStorageError,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import {
@@ -352,7 +356,7 @@ export function SubjectPanel({
   base: ObservedBase;
   detail: SubjectDetail;
   catalog: MappingCatalog;
-  onReload: () => Promise<void>;
+  onReload: () => Promise<boolean | void>;
 }) {
   const online = useOnline();
   const subject = baseSubject(base.posItemId, base.sizeKeyText);
@@ -373,13 +377,24 @@ export function SubjectPanel({
     [],
   );
 
-  async function finish(action: BaseHeld) {
+  async function finish(action: BaseHeld, isReplay = false) {
     if (flight.current || !isOnline()) return;
+    const requestId = action.write.requestId;
+    let releaseLock = () => {};
+    if (isReplay) {
+      const claim = await claimReplayAction<BaseHeld>(subject, requestId);
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+    }
     flight.current = true;
     setSaving(true);
     setError(null);
     setNotice(null);
-    const requestId = action.write.requestId;
     try {
       try {
         if (action.kind === 'mapping') await setBaseMapping(action.write);
@@ -392,9 +407,13 @@ export function SubjectPanel({
         setError(messageFrom(failure));
         if (!hasAction(subject)) await onReload();
         return;
+      } finally {
+        releaseLock();
       }
-      await onReload();
-      clearActionPostedReload(subject, subject);
+      const reloaded = await onReload();
+      if (reloaded !== false) {
+        clearActionPostedReload(subject, subject, requestId);
+      }
       setNotice(
         action.kind === 'mapping'
           ? savedMappingMessage
@@ -440,7 +459,10 @@ export function SubjectPanel({
         </ul>
       ) : null}
       {held ? (
-        <UnknownSave disabled={saving} onRetry={() => void finish(held)} />
+        <UnknownSave
+          disabled={saving}
+          onRetry={() => void finish(held, true)}
+        />
       ) : null}
       {notice ? <p role="status">{notice}</p> : null}
       {error ? <p role="alert">{error}</p> : null}
@@ -990,7 +1012,7 @@ function OptionBlock({
   seenCount: number;
   detail: SubjectDetail;
   catalog: MappingCatalog;
-  onReload: () => Promise<void>;
+  onReload: () => Promise<boolean | void>;
 }) {
   const global = detail.optionBindings.find(
     (binding) =>
@@ -1062,7 +1084,7 @@ function OptionMappingForm({
   schedule: SubjectDetail['schedule'];
   history: readonly HistoryRow[];
   catalog: MappingCatalog;
-  onReload: () => Promise<void>;
+  onReload: () => Promise<boolean | void>;
 }) {
   const online = useOnline();
   const subject = optionSubject(
@@ -1120,8 +1142,22 @@ function OptionMappingForm({
     setUnit(next.unit);
   }
 
-  async function finish(write: OptionMappingWrite) {
+  async function finish(write: OptionMappingWrite, isReplay = false) {
     if (flight.current || !isOnline()) return;
+    let releaseLock = () => {};
+    if (isReplay) {
+      const claim = await claimReplayAction<OptionMappingWrite>(
+        subject,
+        write.requestId,
+      );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+    }
     flight.current = true;
     setSaving(true);
     setError(null);
@@ -1136,9 +1172,13 @@ function OptionMappingForm({
         setError(messageFrom(failure));
         if (!hasAction(subject)) await onReload();
         return;
+      } finally {
+        releaseLock();
       }
-      await onReload();
-      clearActionPostedReload(subject, subject);
+      const reloaded = await onReload();
+      if (reloaded !== false) {
+        clearActionPostedReload(subject, subject, write.requestId);
+      }
       setNotice(savedOptionMessage);
     } catch (failure) {
       setError(messageFrom(failure));
@@ -1214,7 +1254,10 @@ function OptionMappingForm({
           : 'التخصيص غير المربوط أو من غير مخزون بيمنع الرجوع للعام. الفضي بيرجع للعام.'}
       </p>
       {held ? (
-        <UnknownSave disabled={saving} onRetry={() => void finish(held)} />
+        <UnknownSave
+          disabled={saving}
+          onRetry={() => void finish(held, true)}
+        />
       ) : null}
       {notice ? <p role="status">{notice}</p> : null}
       {error ? <p role="alert">{error}</p> : null}

@@ -29,6 +29,8 @@ import { fieldClass } from '@/expenses/labels';
 import { messageFrom } from '@/items/errors';
 import { cairoMonthInput, formatCairo, formatMonth } from '@/lib/cairo';
 import {
+  claimFreshHeldWrite,
+  claimReplayHeldWrite,
   clearHeldWrite,
   clearPostedReload,
   clearReloadMarker,
@@ -40,9 +42,13 @@ import {
   setReloadMarker,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
-  tryPutHeldWrite,
 } from '@/lib/held-writes';
-import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
+import {
+  isOnline,
+  offlineMoneyMessage,
+  offlineWriteMessage,
+  useReconnectReload,
+} from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 
 const EXPENSE_NEW_SUBJECT = 'expense:new';
@@ -57,6 +63,7 @@ type StoredVoidPayload = {
 };
 
 type VoidAttempt = {
+  id: string;
   requestId: string;
   reason: string;
   /** The row as it was when the void was sent (in-memory only). */
@@ -94,7 +101,7 @@ function clearExpensePostedReloads(loadedMonthStart: string): void {
   clearReloadMarker(EXPENSE_RELOAD_SUBJECT, loadedMonthStart);
   for (const record of listHeldWritesByPrefix(EXPENSE_VOID_PREFIX)) {
     if (record.phase === 'posted_reload') {
-      clearPostedReload(record.subject, loadedMonthStart);
+      clearPostedReload(record.subject, loadedMonthStart, record.requestId);
     }
   }
 }
@@ -130,7 +137,6 @@ function reportedExpenseError(error: unknown): string {
 }
 
 export function ExpensesPage() {
-  const online = useOnline();
   const initialMonth = cairoMonthInput();
   const [month, setMonth] = useState(initialMonth);
   const monthRef = useRef(initialMonth);
@@ -157,10 +163,45 @@ export function ExpensesPage() {
   const savingRef = useRef(false);
   const needsReloadRef = useRef(false);
 
+  const online = useReconnectReload(() => {
+    if (!savingRef.current && readsRef.current === 0) {
+      setLoadError(null);
+      setLoadId((value) => value + 1);
+    }
+  });
+
   useEffect(
     () => subscribeHeldWritesStore(() => setHeldEpoch((value) => value + 1)),
     [],
   );
+
+  function reconcileCommittedVoids(entries: readonly ExpenseLine[]): void {
+    const voidedIds = new Set(
+      entries.filter((line) => line.voided).map((line) => line.id),
+    );
+    if (voidedIds.size === 0) return;
+    const clearedIds: string[] = [];
+    for (const record of listHeldWritesByPrefix<StoredVoidPayload>(
+      EXPENSE_VOID_PREFIX,
+    )) {
+      if (record.phase !== 'unknown' || !record.payload) continue;
+      if (voidedIds.has(record.payload.id)) {
+        clearHeldWrite(record.subject, record.requestId);
+        voidRequestIdsRef.current.delete(record.payload.id);
+        clearedIds.push(record.payload.id);
+      }
+    }
+    if (clearedIds.length > 0) {
+      setVoidSnapshots((current) => {
+        let changed = false;
+        const next = new Map(current);
+        for (const id of clearedIds) {
+          if (next.delete(id)) changed = true;
+        }
+        return changed ? next : current;
+      });
+    }
+  }
 
   const storedExpense =
     heldEpoch < 0 ? null : getHeldWrite<ExpenseDraft>(EXPENSE_NEW_SUBJECT);
@@ -176,6 +217,7 @@ export function ExpensesPage() {
     if (record.phase !== 'unknown' || !record.payload) continue;
     const { id, requestId, reason } = record.payload;
     pendingVoids.set(id, {
+      id,
       requestId,
       reason,
       entry: voidSnapshots.get(id) ?? null,
@@ -223,6 +265,14 @@ export function ExpensesPage() {
   const busy = writeLocked || readLoads > 0;
   const writeDisabled = busy || !online;
 
+  const visibleEntries =
+    ready && data ? entriesWithPinnedVoids(data.entries, pendingVoids) : [];
+  const detachedVoids = [...pendingVoids.values()].filter(
+    (pin) =>
+      !online ||
+      !visibleEntries.some((line) => line.id === pin.id && !line.voided),
+  );
+
   async function readMonth(monthValue: string): Promise<ExpenseMonth | null> {
     const seq = ++seqRef.current;
     readsRef.current += 1;
@@ -247,6 +297,7 @@ export function ExpensesPage() {
         if (cancelled || !next) return;
         setData(next);
         setLoadError(null);
+        reconcileCommittedVoids(next.entries);
         clearExpensePostedReloads(next.monthStart);
         needsReloadRef.current = false;
         setLocalNeedsReload(false);
@@ -261,7 +312,7 @@ export function ExpensesPage() {
   }, [month, loadId]);
 
   function retry() {
-    if (savingRef.current || readsRef.current > 0) return;
+    if (savingRef.current || readsRef.current > 0 || !isOnline()) return;
     setLoadError(null);
     setLoadId((value) => value + 1);
   }
@@ -309,6 +360,7 @@ export function ExpensesPage() {
         if (next) {
           setData(next);
           setLoadError(null);
+          reconcileCommittedVoids(next.entries);
           clearExpensePostedReloads(next.monthStart);
           needsReloadRef.current = false;
           setLocalNeedsReload(false);
@@ -331,72 +383,83 @@ export function ExpensesPage() {
   }
 
   async function submitExpense(draft: ExpenseDraft) {
+    if (
+      savingRef.current ||
+      needsReloadRef.current ||
+      postedReload ||
+      readsRef.current > 0 ||
+      !isOnline()
+    ) {
+      return;
+    }
+    setFormError(null);
     const prior = getHeldWrite<ExpenseDraft>(EXPENSE_NEW_SUBJECT);
     const wasPinned =
       prior !== null &&
       prior.requestId === draft.requestId &&
       prior.phase === 'unknown';
     const targetMonth = expenseTargetMonth(draft, monthRef.current);
-    let pinBlocked = false;
-    const result = await runWrite(
-      () => {
-        const pin = tryPutHeldWrite(EXPENSE_NEW_SUBJECT, {
-          requestId: draft.requestId,
-          payload: draft,
-          phase: 'inflight',
-          kind: 'expense',
-        });
-        if (!pin.ok) {
-          pinBlocked = true;
-          if (pin.reason === 'storage') {
-            setFormError(storageWriteFailedMessage);
-          }
-          return Promise.reject(new Error('__pin_blocked__'));
-        }
-        return addExpenseEntry(draft);
-      },
-      setFormError,
-      () => {
-        setHeldWritePhase(
+    const claim = wasPinned
+      ? await claimReplayHeldWrite<ExpenseDraft>(
           EXPENSE_NEW_SUBJECT,
           draft.requestId,
-          'posted_reload',
-          { readTarget: targetMonth },
+        )
+      : await claimFreshHeldWrite<ExpenseDraft>(
+          EXPENSE_NEW_SUBJECT,
+          () => draft,
+          { requestId: draft.requestId, kind: 'expense' },
         );
-        setFormEpoch((value) => value + 1);
-      },
-    );
-    if (pinBlocked) {
-      if (
-        formError === null &&
-        result.error instanceof Error &&
-        result.error.message === '__pin_blocked__'
-      ) {
-        // Error was already set when reason === 'storage'; clear internal sentinel otherwise.
+    if (!claim.ok) {
+      if (claim.reason === 'storage' || claim.reason === 'missing') {
+        setFormError(storageWriteFailedMessage);
       }
-      setFormError((current) =>
-        current === '__pin_blocked__' ? null : current,
-      );
       return;
     }
-    if (result.saved) return;
-    // Not sent: the form stays editable and nothing is pinned.
-    if (!result.error) return;
-    setFormError(reportedExpenseError(result.error));
-    if (wasPinned) {
-      if (isPayloadRefusal(result.error)) {
-        clearHeldWrite(EXPENSE_NEW_SUBJECT, draft.requestId);
-      } else {
-        setHeldWritePhase(EXPENSE_NEW_SUBJECT, draft.requestId, 'unknown');
+    let result: WriteResult;
+    try {
+      result = await runWrite(
+        () => addExpenseEntry(draft),
+        setFormError,
+        () => {
+          setHeldWritePhase(
+            EXPENSE_NEW_SUBJECT,
+            draft.requestId,
+            'posted_reload',
+            { readTarget: targetMonth },
+          );
+          setFormEpoch((value) => value + 1);
+        },
+      );
+      if (!result.saved && result.error) {
+        setFormError(reportedExpenseError(result.error));
+        if (wasPinned) {
+          if (isPayloadRefusal(result.error)) {
+            clearHeldWrite(EXPENSE_NEW_SUBJECT, draft.requestId);
+          } else {
+            setHeldWritePhase(EXPENSE_NEW_SUBJECT, draft.requestId, 'unknown');
+          }
+        } else if (isUnknownOutcome(result.error)) {
+          setHeldWritePhase(EXPENSE_NEW_SUBJECT, draft.requestId, 'unknown');
+        } else {
+          clearHeldWrite(EXPENSE_NEW_SUBJECT, draft.requestId);
+        }
       }
-    } else if (isUnknownOutcome(result.error)) {
-      setHeldWritePhase(EXPENSE_NEW_SUBJECT, draft.requestId, 'unknown');
-    } else {
-      clearHeldWrite(EXPENSE_NEW_SUBJECT, draft.requestId);
+    } finally {
+      claim.release();
     }
   }
 
   async function voidEntry(id: string, typedReason: string) {
+    if (
+      savingRef.current ||
+      needsReloadRef.current ||
+      postedReload ||
+      readsRef.current > 0 ||
+      !isOnline()
+    ) {
+      return;
+    }
+    setListError(null);
     const subject = voidSubject(id);
     const prior = getHeldWrite<StoredVoidPayload>(subject);
     const wasPinned = prior !== null && prior.phase === 'unknown';
@@ -420,57 +483,52 @@ export function ExpensesPage() {
       });
     };
     const targetMonth = voidTargetMonth(visible, monthRef.current);
-    let pinBlocked = false;
-    const result = await runWrite(
-      () => {
-        const pin = tryPutHeldWrite<StoredVoidPayload>(subject, {
-          requestId,
-          payload: { id, requestId, reason },
-          phase: 'inflight',
-          kind: 'expense_void',
-        });
-        if (!pin.ok) {
-          pinBlocked = true;
-          if (pin.reason === 'storage') {
-            setListError(storageWriteFailedMessage);
-          }
-          return Promise.reject(new Error('__pin_blocked__'));
-        }
-        if (visible) setVoidSnapshot({ ...visible });
-        return voidExpenseEntry(id, reason, requestId);
-      },
-      setListError,
-      () => {
-        voidRequestIdsRef.current.delete(id);
-        setVoidSnapshot(null);
-        setHeldWritePhase(subject, requestId, 'posted_reload', {
-          readTarget: targetMonth,
-        });
-      },
-    );
-    if (pinBlocked) {
-      setListError((current) =>
-        current === '__pin_blocked__' ? null : current,
-      );
+    const claim = wasPinned
+      ? await claimReplayHeldWrite<StoredVoidPayload>(subject, requestId)
+      : await claimFreshHeldWrite<StoredVoidPayload>(
+          subject,
+          () => ({ id, requestId, reason }),
+          { requestId, kind: 'expense_void' },
+        );
+    if (!claim.ok) {
+      if (claim.reason === 'storage' || claim.reason === 'missing') {
+        setListError(storageWriteFailedMessage);
+      }
       return;
     }
-    if (result.saved) return;
-    // Not sent: leave an existing pin alone, and do not store this attempt.
-    if (!result.error) return;
-    voidRequestIdsRef.current.set(id, requestId);
-    setListError(reportedExpenseError(result.error));
-    if (wasPinned) {
-      if (isPayloadRefusal(result.error)) {
-        clearHeldWrite(subject, requestId);
-        setVoidSnapshot(null);
-      } else {
-        setHeldWritePhase(subject, requestId, 'unknown');
+    if (visible) setVoidSnapshot({ ...visible });
+    let result: WriteResult;
+    try {
+      result = await runWrite(
+        () => voidExpenseEntry(id, reason, requestId),
+        setListError,
+        () => {
+          voidRequestIdsRef.current.delete(id);
+          setVoidSnapshot(null);
+          setHeldWritePhase(subject, requestId, 'posted_reload', {
+            readTarget: targetMonth,
+          });
+        },
+      );
+      if (!result.saved && result.error) {
+        voidRequestIdsRef.current.set(id, requestId);
+        setListError(reportedExpenseError(result.error));
+        if (wasPinned) {
+          if (isPayloadRefusal(result.error)) {
+            clearHeldWrite(subject, requestId);
+            setVoidSnapshot(null);
+          } else {
+            setHeldWritePhase(subject, requestId, 'unknown');
+          }
+        } else if (isUnknownOutcome(result.error)) {
+          setHeldWritePhase(subject, requestId, 'unknown');
+        } else {
+          clearHeldWrite(subject, requestId);
+          setVoidSnapshot(null);
+        }
       }
-    } else if (isUnknownOutcome(result.error)) {
-      setHeldWritePhase(subject, requestId, 'unknown');
-    } else {
-      clearHeldWrite(subject, requestId);
-      setVoidSnapshot(null);
+    } finally {
+      claim.release();
     }
   }
 
@@ -482,7 +540,12 @@ export function ExpensesPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">المصاريف</h1>
-      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
+      {!online ? (
+        <>
+          <p role="status">{offlineWriteMessage}</p>
+          <p role="status">{offlineMoneyMessage}</p>
+        </>
+      ) : null}
       <p>{formatMonth(monthStart)}</p>
       <label className="flex flex-col gap-1">
         الشهر
@@ -496,19 +559,43 @@ export function ExpensesPage() {
         {/* This picker still moves the list and the allocation while a save
             or void is pinned. The form and the void card keep the payload. */}
       </label>
-      {!ready && !loadError ? <p>جاري تحميل المصاريف…</p> : null}
+      {online && !ready && !loadError ? <p>جاري تحميل المصاريف…</p> : null}
       {loadError ? (
         <div className="flex flex-col gap-2">
           <p role="alert">{loadError}</p>
           <button
             className={secondaryButton}
             type="button"
-            disabled={saving || readLoads > 0}
+            disabled={saving || readLoads > 0 || !online}
             onClick={retry}
           >
             إعادة المحاولة
           </button>
         </div>
+      ) : null}
+      {detachedVoids.length > 0 ? (
+        <section
+          aria-label="إلغاءات مش متأكد إنها اتسجلت"
+          className="flex flex-col gap-2 rounded border border-neutral-300 p-3"
+        >
+          <h2 className="text-lg font-semibold">
+            إلغاءات مش متأكد إنها اتسجلت
+          </h2>
+          {listError ? <p role="alert">{listError}</p> : null}
+          {detachedVoids.map((pin) => (
+            <div key={pin.id} className="flex flex-col gap-1">
+              <p>سبب الإلغاء: {pin.reason}</p>
+              <button
+                className={secondaryButton}
+                type="button"
+                disabled={writeDisabled}
+                onClick={() => void voidEntry(pin.id, pin.reason)}
+              >
+                إعادة محاولة الإلغاء
+              </button>
+            </div>
+          ))}
+        </section>
       ) : null}
       {data ? (
         <ExpenseForm
@@ -545,21 +632,30 @@ export function ExpensesPage() {
           {data.confirmedAt ? (
             <p>اتأكدت {formatCairo(data.confirmedAt)}</p>
           ) : null}
-          <h2 className="text-lg font-semibold">مصاريف الشهر</h2>
-          {listError ? <p role="alert">{listError}</p> : null}
-          <ExpenseList
-            entries={entriesWithPinnedVoids(data.entries, pendingVoids)}
-            disabled={writeDisabled}
-            pendingReasons={
-              new Map(
-                [...pendingVoids].map(([id, pending]) => [id, pending.reason]),
-              )
-            }
-            onVoid={(id, typedReason) => {
-              void voidEntry(id, typedReason);
-            }}
-          />
-          <AllocationTable days={data.days} />
+          {online ? (
+            <>
+              <h2 className="text-lg font-semibold">مصاريف الشهر</h2>
+              {listError && detachedVoids.length === 0 ? (
+                <p role="alert">{listError}</p>
+              ) : null}
+              <ExpenseList
+                entries={visibleEntries}
+                disabled={writeDisabled}
+                pendingReasons={
+                  new Map(
+                    [...pendingVoids].map(([id, pending]) => [
+                      id,
+                      pending.reason,
+                    ]),
+                  )
+                }
+                onVoid={(id, typedReason) => {
+                  void voidEntry(id, typedReason);
+                }}
+              />
+              <AllocationTable days={data.days} />
+            </>
+          ) : null}
           <CategoryManager
             categories={data.categories}
             disabled={writeDisabled}

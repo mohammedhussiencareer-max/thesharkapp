@@ -14,6 +14,7 @@ function ItemCard({
   editsDisabled,
   conversionsLocked,
   identityDirty,
+  hideMoney = false,
   onEdit,
   onToggleConversions,
   onConversionsBusy,
@@ -25,6 +26,7 @@ function ItemCard({
   editsDisabled: boolean;
   conversionsLocked: boolean;
   identityDirty: boolean;
+  hideMoney?: boolean;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusy: (busy: boolean) => void;
@@ -58,14 +60,18 @@ function ItemCard({
             {formatQty(item.onHandQty)} {unitLabels[item.baseUnit]}
           </dd>
         </div>
-        <div>
-          <dt className="text-neutral-600">متوسط التكلفة</dt>
-          <dd>{formatEgp(item.avgCost)}</dd>
-        </div>
-        <div>
-          <dt className="text-neutral-600">القيمة</dt>
-          <dd>{formatEgp(item.onHandValue)}</dd>
-        </div>
+        {hideMoney ? null : (
+          <>
+            <div>
+              <dt className="text-neutral-600">متوسط التكلفة</dt>
+              <dd>{formatEgp(item.avgCost)}</dd>
+            </div>
+            <div>
+              <dt className="text-neutral-600">القيمة</dt>
+              <dd>{formatEgp(item.onHandValue)}</dd>
+            </div>
+          </>
+        )}
       </dl>
       <div className="flex flex-wrap gap-2">
         <button
@@ -118,6 +124,7 @@ export function ItemList({
   openConversionsId,
   editsDisabled,
   identityDirtyId = null,
+  hideMoney = false,
   onEdit,
   onToggleConversions,
   onConversionsBusyChange,
@@ -130,6 +137,7 @@ export function ItemList({
   editsDisabled: boolean;
   /** The item whose open editor holds an unsaved kind, base unit or parent. */
   identityDirtyId?: string | null;
+  hideMoney?: boolean;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusyChange?: (busy: boolean) => void;
@@ -151,6 +159,7 @@ export function ItemList({
       editsDisabled={editsDisabled}
       conversionsLocked={conversionsBusy || editsDisabled}
       identityDirty={identityDirtyId === item.id}
+      hideMoney={hideMoney}
       onEdit={onEdit}
       onToggleConversions={onToggleConversions}
       onConversionsBusy={setConversionsBusy}
@@ -180,6 +189,7 @@ export function ItemList({
                   editsDisabled={editsDisabled}
                   conversionsLocked={conversionsBusy || editsDisabled}
                   identityDirty={identityDirtyId === block.parent.id}
+                  hideMoney={hideMoney}
                   onEdit={onEdit}
                   onToggleConversions={onToggleConversions}
                   onConversionsBusy={setConversionsBusy}

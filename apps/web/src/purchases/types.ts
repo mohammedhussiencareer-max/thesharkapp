@@ -37,17 +37,29 @@ export type OpeningDraft = {
   lines: OpeningLineDraft[];
 };
 
-export type PurchaseLineDraft = {
+export type StoredPurchaseLineDraft = {
   itemId: string;
-  itemName: string;
   quantity: string;
   unit: string;
   amountPaid: string;
   baseUnit: BaseUnit;
-  baseQuantity: string;
-  unitCost: string;
   /** Exact factor shown on the review step. `"1"` when the unit is the base unit. */
   expectedFactor: string;
+};
+
+export type StoredPurchaseDraft = {
+  requestId: string;
+  purchasedAt: string;
+  supplier: string | null;
+  invoiceNo: string | null;
+  note: string | null;
+  lines: StoredPurchaseLineDraft[];
+};
+
+export type PurchaseLineDraft = StoredPurchaseLineDraft & {
+  itemName: string;
+  baseQuantity: string;
+  unitCost: string;
 };
 
 export type PurchaseDraft = {

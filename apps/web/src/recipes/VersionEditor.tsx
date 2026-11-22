@@ -3,6 +3,7 @@ import { currentMinuteMs } from '@/items/effective';
 import { messageFrom } from '@/items/errors';
 import {
   beginAction,
+  claimReplayAction,
   clearActionPostedReload,
   hasAction,
   markActionPostedReload,
@@ -12,7 +13,10 @@ import {
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
-import { HeldWriteStorageError } from '@/lib/held-writes';
+import {
+  HeldWriteStorageError,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { setRecipeVersion } from '@/recipes/api';
 import { sourceChangedMessage } from '@/recipes/labels';
@@ -103,8 +107,22 @@ export function VersionEditor({
     [],
   );
 
-  async function finish(action: VersionAction) {
+  async function finish(action: VersionAction, isReplay = false) {
     if (flight.current || !isOnline()) return;
+    let releaseLock = () => {};
+    if (isReplay) {
+      const claim = await claimReplayAction<VersionAction>(
+        subject,
+        action.write.requestId,
+      );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+    }
     flight.current = true;
     setSaving(true);
     onBusyChange(true);
@@ -115,6 +133,8 @@ export function VersionEditor({
       await setRecipeVersion(action.recipeId, action.write);
       saved = true;
       markActionPostedReload(subject, action.write.requestId, subject);
+      releaseLock();
+      releaseLock = () => {};
       setDirty(false);
       setConfirmStop(false);
       timing.refreshClock();
@@ -125,7 +145,7 @@ export function VersionEditor({
       );
       const reloaded = await onReload();
       if (reloaded !== false) {
-        clearActionPostedReload(subject, subject);
+        clearActionPostedReload(subject, subject, action.write.requestId);
       }
     } catch (failure) {
       if (!saved) {
@@ -134,6 +154,7 @@ export function VersionEditor({
       setError(messageFrom(failure));
       if (!saved && !hasAction(subject)) await onReload();
     } finally {
+      releaseLock();
       flight.current = false;
       setSaving(false);
       onBusyChange(false);
@@ -214,7 +235,7 @@ export function VersionEditor({
 
   function retry() {
     if (!held || locked || flight.current) return;
-    void finish(held);
+    void finish(held, true);
   }
 
   const batchUnits =

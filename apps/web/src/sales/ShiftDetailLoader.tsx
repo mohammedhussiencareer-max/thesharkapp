@@ -3,6 +3,11 @@ import { Link } from 'react-router-dom';
 import { loadShiftStatuses } from '@/accounting/api';
 import type { ShiftAccountingStatus } from '@/accounting/types';
 import { messageFrom } from '@/items/errors';
+import {
+  isOnline,
+  offlineMoneyMessage,
+  useReconnectReload,
+} from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { loadShiftDetail } from '@/sales/api';
 import { ShiftDetailView } from '@/sales/ShiftDetail';
@@ -34,7 +39,14 @@ export function ShiftDetailLoader({ shiftId }: { shiftId: string }) {
   }
   const seqRef = useRef(0);
 
+  const online = useReconnectReload(() => {
+    setLoading(true);
+    setLoadError(null);
+    setLoadId((value) => value + 1);
+  });
+
   useEffect(() => {
+    if (!isOnline()) return;
     const seq = ++seqRef.current;
     let cancelled = false;
     void (async () => {
@@ -56,7 +68,7 @@ export function ShiftDetailLoader({ shiftId }: { shiftId: string }) {
   }, [loadId, shiftId]);
 
   useEffect(() => {
-    if (!detail) return;
+    if (!detail || !online) return;
     let cancelled = false;
     const id = detail.summary.shiftId;
     void (async () => {
@@ -80,12 +92,26 @@ export function ShiftDetailLoader({ shiftId }: { shiftId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [detail]);
+  }, [detail, online]);
 
   function reload() {
+    if (!online) return;
     setLoading(true);
     setLoadError(null);
     setLoadId((value) => value + 1);
+  }
+
+  if (!online) {
+    return (
+      <main className={pageShell}>
+        <p>
+          <Link className="underline" to="/sales">
+            المبيعات
+          </Link>
+        </p>
+        <p role="status">{offlineMoneyMessage}</p>
+      </main>
+    );
   }
 
   if (loading && detail === undefined) {

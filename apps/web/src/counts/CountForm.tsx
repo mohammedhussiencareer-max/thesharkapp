@@ -83,6 +83,7 @@ export function CountForm({
   pending,
   waiting,
   requestKey,
+  hideMoney = false,
   onClearServerError,
   onSubmit,
 }: {
@@ -100,6 +101,7 @@ export function CountForm({
    * pending list, so an edited count must not reuse that id.
    */
   requestKey: number;
+  hideMoney?: boolean;
   onClearServerError: () => void;
   onSubmit: (draft: CountDraft) => void;
 }) {
@@ -259,7 +261,11 @@ export function CountForm({
                   className={`flex flex-col gap-2 rounded border border-neutral-300 p-3${line?.surplus ? ' bg-amber-50' : ''}`}
                 >
                   <p className="font-medium">{item.name}</p>
-                  <p>{`الرصيد ${formatQty(item.onHandQty)} — متوسط التكلفة ${formatQty(item.avgCost)} ج.م`}</p>
+                  <p>
+                    {hideMoney
+                      ? `الرصيد ${formatQty(item.onHandQty)}`
+                      : `الرصيد ${formatQty(item.onHandQty)} — متوسط التكلفة ${formatQty(item.avgCost)} ج.م`}
+                  </p>
                   <QuantityControl
                     name={item.name}
                     fieldId={`count-qty-${item.id}`}
@@ -271,7 +277,7 @@ export function CountForm({
                     onValue={(quantity) => editQuantity(item.id, quantity)}
                   />
                   {fieldError ? <p role="alert">{fieldError}</p> : null}
-                  {line ? (
+                  {line && !hideMoney ? (
                     <p>{`الفرق ${formatQty(line.deltaQty)} — القيمة ${formatSignedMoney(line.deltaValue)}`}</p>
                   ) : null}
                   {line?.surplus ? <p>{surplusWarning}</p> : null}
@@ -279,7 +285,7 @@ export function CountForm({
               );
             })}
       </div>
-      {preview ? (
+      {preview && !hideMoney ? (
         <section
           aria-label="معاينة الجرد"
           className="flex flex-col gap-1 rounded border border-neutral-300 p-3"

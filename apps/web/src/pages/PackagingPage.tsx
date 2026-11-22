@@ -141,14 +141,16 @@ export function PackagingPage() {
     };
   }, [selected]);
 
-  async function reload() {
+  async function reload(): Promise<boolean> {
     const keyAtStart = selectedKeyRef.current;
     const gen = ++listSeq.current;
     const nextTypes = await loadHome(gen);
-    if (!nextTypes || gen !== listSeq.current) return;
-    if (keyAtStart === null || selectedKeyRef.current !== keyAtStart) return;
+    if (!nextTypes || gen !== listSeq.current) return false;
+    if (keyAtStart === null || selectedKeyRef.current !== keyAtStart) {
+      return false;
+    }
     const current = nextTypes.find((row) => row.key === keyAtStart);
-    if (!current) return;
+    if (!current) return false;
     const detailRequest = ++detailSeq.current;
     const next = await loadOrderTypePackaging(current.label);
     if (
@@ -156,12 +158,13 @@ export function PackagingPage() {
       detailRequest !== detailSeq.current ||
       selectedKeyRef.current !== keyAtStart
     ) {
-      return;
+      return false;
     }
     setDetail({ key: keyAtStart, value: next });
     setDetailError(null);
     const packSubj = orderTypePackagingSubject(current.key);
     clearActionPostedReload(packSubj, packSubj);
+    return true;
   }
 
   return (

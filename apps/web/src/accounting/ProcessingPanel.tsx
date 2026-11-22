@@ -27,7 +27,8 @@ import {
 import type { ParkedOrder, ProcessingSummary } from '@/accounting/types';
 import { ConfirmedRefusalError, messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  claimFreshAction,
+  claimReplayAction,
   hasAction,
   settleAction,
   subscribeHeldWrites,
@@ -35,7 +36,11 @@ import {
   updateActionPayload,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
-import { HeldWriteStorageError } from '@/lib/held-writes';
+import {
+  setHeldWritePhase,
+  storageWriteFailedMessage,
+  type HeldWriteRecord,
+} from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { isDefiniteRefusal } from '@/lib/write-outcome';
 import { primaryButton, secondaryButton } from '@/lib/page-style';
@@ -147,8 +152,14 @@ export function ProcessingPanel({
     requestReload();
   }
 
-  async function finishFresh(action: RunHeld): Promise<void> {
-    if (flight.current || !isOnline()) return;
+  async function finishFresh(
+    action: RunHeld,
+    release: () => void,
+  ): Promise<void> {
+    if (flight.current || !isOnline()) {
+      release();
+      return;
+    }
     flight.current = true;
     setRunning(true);
     setNotice(null);
@@ -190,13 +201,20 @@ export function ProcessingPanel({
       setNotice(runStopLabel(outcome.stop));
       publishAcknowledged();
     } finally {
+      release();
       flight.current = false;
       setRunning(false);
     }
   }
 
-  async function finishUnknown(action: RunHeld): Promise<void> {
-    if (flight.current || !isOnline()) return;
+  async function finishUnknown(
+    action: RunHeld,
+    release: () => void,
+  ): Promise<void> {
+    if (flight.current || !isOnline()) {
+      release();
+      return;
+    }
     flight.current = true;
     setRunning(true);
     setNotice(null);
@@ -209,6 +227,7 @@ export function ProcessingPanel({
       try {
         const status = await recordRunFailure(action.report);
         if (!acknowledgedReport(status)) {
+          setHeldWritePhase(accountingRunSubject, action.requestId, 'unknown');
           setNotice(busyNotice);
           return;
         }
@@ -217,16 +236,24 @@ export function ProcessingPanel({
         publishAcknowledged();
       } catch (error) {
         // The attempt stays until recording acknowledges a terminal status.
+        setHeldWritePhase(accountingRunSubject, action.requestId, 'unknown');
         setNotice(messageFrom(error));
       }
     } finally {
+      release();
       flight.current = false;
       setRunning(false);
     }
   }
 
-  async function finishRetry(action: RetryHeld): Promise<void> {
-    if (flight.current || !isOnline()) return;
+  async function finishRetry(
+    action: RetryHeld,
+    release: () => void,
+  ): Promise<void> {
+    if (flight.current || !isOnline()) {
+      release();
+      return;
+    }
     flight.current = true;
     setRunning(true);
     setNotice(null);
@@ -252,12 +279,30 @@ export function ProcessingPanel({
       setNotice(status === 'not_failed' ? notFailedNotice : retriedNotice);
       publishAcknowledged();
     } finally {
+      release();
       flight.current = false;
       setRunning(false);
     }
   }
 
-  function run(): void {
+  async function replayUnknownRun(requestId: string): Promise<void> {
+    if (flight.current || running || !isOnline()) return;
+    const claim = await claimReplayAction<RunHeld>(
+      accountingRunSubject,
+      requestId,
+    );
+    if (!claim.ok) {
+      if (claim.reason === 'locked') {
+        setNotice(busyNotice);
+      } else if (claim.reason === 'missing' || claim.reason === 'storage') {
+        setNotice(storageWriteFailedMessage);
+      }
+      return;
+    }
+    await finishUnknown(claim.record.payload, claim.release);
+  }
+
+  async function run(): Promise<void> {
     if (
       flight.current ||
       running ||
@@ -265,45 +310,57 @@ export function ProcessingPanel({
       hasAction(accountingRunSubject)
     )
       return;
-    let action: RunHeld;
-    try {
-      action = beginAction<RunHeld>(accountingRunSubject, (requestId) => ({
+    const claim = await claimFreshAction<RunHeld>(
+      accountingRunSubject,
+      (requestId) => ({
         requestId,
         report: null,
-      }));
-    } catch (error) {
-      if (error instanceof HeldWriteStorageError) {
-        setNotice(error.message);
+      }),
+    );
+    if (!claim.ok) {
+      if (claim.reason === 'storage') {
+        setNotice(storageWriteFailedMessage);
         return;
       }
-      throw error;
+      if (claim.reason === 'locked') {
+        setNotice(busyNotice);
+        return;
+      }
+      if (claim.reason === 'conflict' && claim.existing) {
+        const existing = claim.existing as HeldWriteRecord<RunHeld>;
+        if (existing.phase === 'unknown') {
+          await replayUnknownRun(existing.requestId);
+        } else {
+          setNotice(busyNotice);
+        }
+      }
+      return;
     }
-    void finishFresh(action);
+    await finishFresh(claim.record.payload, claim.release);
   }
 
   function retryRun(): void {
     if (!heldRun || flight.current || running || !isOnline()) return;
-    void finishUnknown(heldRun);
+    void replayUnknownRun(heldRun.requestId);
   }
 
-  function retryOrder(order: ParkedOrder): void {
+  async function retryOrder(order: ParkedOrder): Promise<void> {
     const subject = accountingRetrySubject(order.orderId);
     if (flight.current || running || !isOnline() || hasAction(subject)) return;
-    let action: RetryHeld;
-    try {
-      action = beginAction<RetryHeld>(subject, (requestId) => ({
-        requestId,
-        orderId: order.orderId,
-      }));
-    } catch (error) {
-      if (error instanceof HeldWriteStorageError) {
-        setNotice(error.message);
-        return;
+    const claim = await claimFreshAction<RetryHeld>(subject, (requestId) => ({
+      requestId,
+      orderId: order.orderId,
+    }));
+    if (!claim.ok) {
+      if (claim.reason === 'storage') {
+        setNotice(storageWriteFailedMessage);
+      } else if (claim.reason === 'locked') {
+        setNotice(busyNotice);
       }
-      throw error;
+      return;
     }
     noteRetryOrder(order.orderId);
-    void finishRetry(action);
+    await finishRetry(claim.record.payload, claim.release);
   }
 
   const unresolvedRetries =
@@ -314,10 +371,20 @@ export function ProcessingPanel({
             !summary.parked.some((order) => order.orderId === held.orderId),
         );
 
-  function retryHeldOrder(orderId: string): void {
-    const held = unknownAction<RetryHeld>(accountingRetrySubject(orderId));
-    if (!held || flight.current || running) return;
-    void finishRetry(held);
+  async function retryHeldOrder(orderId: string): Promise<void> {
+    const subject = accountingRetrySubject(orderId);
+    const held = unknownAction<RetryHeld>(subject);
+    if (!held || flight.current || running || !isOnline()) return;
+    const claim = await claimReplayAction<RetryHeld>(subject, held.requestId);
+    if (!claim.ok) {
+      if (claim.reason === 'locked') {
+        setNotice(busyNotice);
+      } else if (claim.reason === 'missing' || claim.reason === 'storage') {
+        setNotice(storageWriteFailedMessage);
+      }
+      return;
+    }
+    await finishRetry(claim.record.payload, claim.release);
   }
 
   return (
@@ -367,7 +434,7 @@ export function ProcessingPanel({
               className={primaryButton}
               type="button"
               disabled={running || !online}
-              onClick={run}
+              onClick={() => void run()}
             >
               {running ? 'جاري الحساب…' : 'شغّل الخصم'}
             </button>
@@ -388,14 +455,14 @@ export function ProcessingPanel({
                     {held ? (
                       <UnknownSave
                         disabled={running || !online}
-                        onRetry={() => retryHeldOrder(order.orderId)}
+                        onRetry={() => void retryHeldOrder(order.orderId)}
                       />
                     ) : (
                       <button
                         className={secondaryButton}
                         type="button"
                         disabled={running || !online}
-                        onClick={() => retryOrder(order)}
+                        onClick={() => void retryOrder(order)}
                       >
                         رجّع الطلب
                       </button>
@@ -412,7 +479,7 @@ export function ProcessingPanel({
                   <p dir="ltr">{held.orderId}</p>
                   <UnknownSave
                     disabled={running || !online}
-                    onRetry={() => retryHeldOrder(held.orderId)}
+                    onRetry={() => void retryHeldOrder(held.orderId)}
                   />
                 </li>
               ))}

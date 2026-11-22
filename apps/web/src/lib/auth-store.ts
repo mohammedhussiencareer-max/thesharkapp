@@ -1,5 +1,6 @@
 import type { Session } from '@supabase/supabase-js';
 import {
+  bumpSessionGeneration,
   clearHeldWritesForUser,
   resetHeldWritesStore,
   setHeldWriteUser,
@@ -72,6 +73,7 @@ export function startAuth() {
     currentSession = session;
     if (!session) {
       setWritesLocked(true);
+      bumpSessionGeneration();
       if (event === 'SIGNED_OUT' && previousUserId) {
         clearHeldWritesForUser(previousUserId);
       }
@@ -82,6 +84,9 @@ export function startAuth() {
       return;
     }
     lastUserId = session.user.id;
+    if (event === 'SIGNED_IN') {
+      bumpSessionGeneration();
+    }
     setWritesLocked(false);
     setHeldWriteUser(session.user.id);
     checkOwner(session);

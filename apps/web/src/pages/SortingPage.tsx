@@ -2,15 +2,21 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
 import {
+  claimFreshHeldWrite,
+  claimReplayHeldWrite,
   clearHeldWrite,
   clearPostedReload,
   getHeldWrite,
   setHeldWritePhase,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
-  tryPutHeldWrite,
 } from '@/lib/held-writes';
-import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
+import {
+  isOnline,
+  offlineMoneyMessage,
+  offlineWriteMessage,
+  useReconnectReload,
+} from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
 import {
@@ -53,7 +59,6 @@ function historyFilterError(from: string, to: string): string | null {
 }
 
 export function SortingPage() {
-  const online = useOnline();
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -71,6 +76,14 @@ export function SortingPage() {
   const seqRef = useRef(0);
   const loadsRef = useRef(0);
   const filterRef = useRef({ from: '', to: '' });
+
+  const online = useReconnectReload(() => {
+    if (!saving && loadsRef.current === 0) {
+      setLoading(true);
+      setLoadError(null);
+      setLoadId((value) => value + 1);
+    }
+  });
 
   useEffect(
     () => subscribeHeldWritesStore(() => setHeldEpoch((value) => value + 1)),
@@ -197,14 +210,14 @@ export function SortingPage() {
       prior !== null &&
       prior.requestId === draft.requestId &&
       prior.phase === 'unknown';
-    const pin = tryPutHeldWrite(SORT_SUBJECT, {
-      requestId: draft.requestId,
-      payload: draft,
-      phase: 'inflight',
-      kind: 'sort',
-    });
-    if (!pin.ok) {
-      if (pin.reason === 'storage') {
+    const claim = wasPinned
+      ? await claimReplayHeldWrite<SortDraft>(SORT_SUBJECT, draft.requestId)
+      : await claimFreshHeldWrite<SortDraft>(SORT_SUBJECT, () => draft, {
+          requestId: draft.requestId,
+          kind: 'sort',
+        });
+    if (!claim.ok) {
+      if (claim.reason === 'storage' || claim.reason === 'missing') {
         setServerError(storageWriteFailedMessage);
       }
       return;
@@ -214,7 +227,7 @@ export function SortingPage() {
     setSuccess(null);
     let saved = false;
     try {
-      await recordSort(draft);
+      await recordSort(claim.record.payload);
       saved = true;
       setHeldWritePhase(SORT_SUBJECT, draft.requestId, 'posted_reload');
       setLocalNeedsReload(true);
@@ -224,7 +237,7 @@ export function SortingPage() {
       if (next.status === 'ready') {
         setSnapshot(next.snapshot);
         setLoadError(null);
-        clearPostedReload(SORT_SUBJECT);
+        clearPostedReload(SORT_SUBJECT, undefined, draft.requestId);
         setLocalNeedsReload(false);
       } else if (next.status === 'blocked') {
         setLoadError(next.message);
@@ -251,6 +264,7 @@ export function SortingPage() {
         setLoadError(messageFrom(error));
       }
     } finally {
+      claim.release();
       setSaving(false);
     }
   }
@@ -265,7 +279,12 @@ export function SortingPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الفرز</h1>
-      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
+      {!online ? (
+        <>
+          <p role="status">{offlineWriteMessage}</p>
+          <p role="status">{offlineMoneyMessage}</p>
+        </>
+      ) : null}
       {success ? <p role="status">{success}</p> : null}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <label className="flex flex-col gap-1">
@@ -351,7 +370,7 @@ export function SortingPage() {
               onSubmit={(next) => void handleSubmit(next)}
             />
           )}
-          <SortList sorts={snapshot.sorts} />
+          {online ? <SortList sorts={snapshot.sorts} /> : null}
         </>
       ) : null}
     </main>

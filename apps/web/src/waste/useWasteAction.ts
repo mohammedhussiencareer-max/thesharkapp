@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import { messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearActionPostedReload,
   hasAction,
+  markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
-import { HeldWriteStorageError } from '@/lib/held-writes';
+import { storageWriteFailedMessage } from '@/lib/held-writes';
 import { isOnline } from '@/lib/online';
 import { recordWaste } from '@/waste/api';
 import { MissingCostBasisError } from '@/waste/errors';
@@ -18,8 +21,9 @@ export const reloadFailedMessage =
 
 /**
  * One outstanding waste action per subject. A save whose outcome is unknown
- * stays held and can only be sent again as the same payload. A failed reload
- * only warns: it never settles or releases the action.
+ * stays held and can only be sent again as the same payload after re-verifying
+ * the durable pin in localStorage. On RPC success, moves to `posted_reload`
+ * and clears only after the post-write reload succeeds.
  */
 export function useWasteAction(
   subject: string,
@@ -48,8 +52,14 @@ export function useWasteAction(
     }
   }
 
-  async function finish(action: WasteWrite): Promise<void> {
-    if (flight.current) return;
+  async function finish(
+    action: WasteWrite,
+    releaseLock: () => void,
+  ): Promise<void> {
+    if (flight.current || !isOnline()) {
+      releaseLock();
+      return;
+    }
     flight.current = true;
     setSaving(true);
     setNotice(null);
@@ -57,7 +67,7 @@ export function useWasteAction(
       let saved: WasteResult;
       try {
         saved = await recordWaste(action);
-        settleAction(subject, action.requestId);
+        markActionPostedReload(subject, action.requestId, subject);
       } catch (failure) {
         settleAction(subject, action.requestId, failure);
         const message = messageFrom(failure);
@@ -76,8 +86,13 @@ export function useWasteAction(
           itemIds,
         });
         return;
+      } finally {
+        releaseLock();
       }
       const warning = await reload();
+      if (warning === null) {
+        clearActionPostedReload(subject, subject, action.requestId);
+      }
       options.onSaved?.(saved);
       setNotice({ kind: 'saved', result: saved, warning });
     } finally {
@@ -89,21 +104,31 @@ export function useWasteAction(
   /** Starts a new action, or does nothing while one is outstanding. */
   function send(create: (requestId: string) => WasteWrite): void {
     if (flight.current || saving || !isOnline() || hasAction(subject)) return;
-    let action: WasteWrite;
-    try {
-      action = beginAction<WasteWrite>(subject, create);
-    } catch (failure) {
-      if (failure instanceof HeldWriteStorageError) {
-        setNotice({ kind: 'failed', message: failure.message });
+    void (async () => {
+      const claim = await claimFreshAction<WasteWrite>(subject, create);
+      if (!claim.ok) {
+        if (claim.reason === 'storage') {
+          setNotice({ kind: 'failed', message: storageWriteFailedMessage });
+        }
         return;
       }
-      throw failure;
-    }
-    void finish(action);
+      await finish(claim.record.payload, claim.release);
+    })();
   }
 
   function retry(): void {
-    if (held && isOnline()) void finish(held);
+    if (!held || flight.current || saving || !isOnline()) return;
+    const targetId = held.requestId;
+    void (async () => {
+      const claim = await claimReplayAction<WasteWrite>(subject, targetId);
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setNotice({ kind: 'failed', message: storageWriteFailedMessage });
+        }
+        return;
+      }
+      await finish(claim.record.payload, claim.release);
+    })();
   }
 
   return {

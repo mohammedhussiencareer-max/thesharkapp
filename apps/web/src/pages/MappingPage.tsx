@@ -161,14 +161,16 @@ export function MappingPage() {
     };
   }, [selected]);
 
-  async function reload() {
+  async function reload(): Promise<boolean> {
     const keyAtStart = selectedKeyRef.current;
     const gen = ++listSeq.current;
     const nextBases = await loadHome(gen);
-    if (!nextBases || gen !== listSeq.current) return;
-    if (keyAtStart === null || selectedKeyRef.current !== keyAtStart) return;
+    if (!nextBases || gen !== listSeq.current) return false;
+    if (keyAtStart === null || selectedKeyRef.current !== keyAtStart) {
+      return false;
+    }
     const current = nextBases.find((base) => baseKey(base) === keyAtStart);
-    if (!current) return;
+    if (!current) return false;
     const detailRequest = ++detailSeq.current;
     const next = await loadSubjectDetail(current);
     if (
@@ -176,11 +178,12 @@ export function MappingPage() {
       detailRequest !== detailSeq.current ||
       selectedKeyRef.current !== keyAtStart
     ) {
-      return;
+      return false;
     }
     setDetail({ key: keyAtStart, value: next });
     setDetailError(null);
     clearMappingReloads(current, next);
+    return true;
   }
 
   const shown = sortBases(bases ?? []).filter((base) =>

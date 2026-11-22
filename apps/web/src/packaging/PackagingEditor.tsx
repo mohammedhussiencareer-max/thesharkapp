@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import {
   beginAction,
+  claimReplayAction,
   clearActionPostedReload,
   hasAction,
   markActionPostedReload,
@@ -13,7 +14,10 @@ import { UnknownSave } from '@/items/UnknownSave';
 import { currentMinuteMs } from '@/items/effective';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatCairo } from '@/lib/cairo';
-import { HeldWriteStorageError } from '@/lib/held-writes';
+import {
+  HeldWriteStorageError,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import { coverAt, quantityError } from '@/mapping/format';
@@ -434,7 +438,7 @@ export function PackagingEditor({
   units: readonly EditorUnit[];
   shiftStart: string | null;
   allowCapacity: boolean;
-  onReload: () => Promise<void>;
+  onReload: () => Promise<boolean | void>;
 }) {
   const online = useOnline();
   const [heldEpoch, setHeldEpoch] = useState(0);
@@ -450,13 +454,27 @@ export function PackagingEditor({
     [],
   );
 
-  async function finish(write: PackagingWrite) {
+  async function finish(write: PackagingWrite, isReplay = false) {
     if (flight.current || !isOnline()) return;
+    const requestId = write.requestId;
+    let releaseLock = () => {};
+    if (isReplay) {
+      const claim = await claimReplayAction<PackagingWrite>(
+        subjectKey,
+        requestId,
+      );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+    }
     flight.current = true;
     setSaving(true);
     setError(null);
     setNotice(null);
-    const requestId = write.requestId;
     try {
       try {
         if (kind === 'order_type') {
@@ -480,9 +498,13 @@ export function PackagingEditor({
         setError(messageFrom(failure));
         if (!hasAction(subjectKey)) await onReload();
         return;
+      } finally {
+        releaseLock();
       }
-      await onReload();
-      clearActionPostedReload(subjectKey, subjectKey);
+      const reloaded = await onReload();
+      if (reloaded !== false) {
+        clearActionPostedReload(subjectKey, subjectKey, requestId);
+      }
       setNotice('التغليف اتحفظ');
     } catch (failure) {
       setError(messageFrom(failure));
@@ -522,7 +544,10 @@ export function PackagingEditor({
     <section className="flex flex-col gap-3" aria-label="التغليف">
       <h3 className="text-lg font-semibold">التغليف</h3>
       {held ? (
-        <UnknownSave disabled={saving} onRetry={() => void finish(held)} />
+        <UnknownSave
+          disabled={saving}
+          onRetry={() => void finish(held, true)}
+        />
       ) : null}
       {notice ? <p role="status">{notice}</p> : null}
       {error ? <p role="alert">{error}</p> : null}

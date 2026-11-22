@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
+import { clearActionPostedReload } from '@/items/request-id';
 import { formatCairo } from '@/lib/cairo';
+import { offlineMoneyMessage, useReconnectReload } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import {
   loadQueuePage,
@@ -10,7 +12,7 @@ import {
 } from '@/order-decisions/api';
 import { DecisionCard, NoticeView } from '@/order-decisions/DecisionCard';
 import { reloadFailedMessage } from '@/order-decisions/DecisionForm';
-import { moneyText } from '@/order-decisions/format';
+import { decisionSubject, moneyText } from '@/order-decisions/format';
 import { PendingSaves } from '@/order-decisions/PendingSaves';
 import type {
   DecisionNotice,
@@ -43,6 +45,12 @@ export function OrderDecisionsPage() {
   const [rescued, setRescued] = useState<Rescued[]>([]);
   const seqRef = useRef(0);
 
+  const online = useReconnectReload(() => {
+    setLoading(true);
+    setLoadError(null);
+    setLoadId((value) => value + 1);
+  });
+
   useEffect(() => {
     const seq = ++seqRef.current;
     let cancelled = false;
@@ -54,6 +62,10 @@ export function OrderDecisionsPage() {
         setNext(page.next);
         setLoadError(null);
         setMoreError(null);
+        for (const row of page.rows) {
+          const subj = decisionSubject(row.orderId);
+          clearActionPostedReload(subj, subj);
+        }
       } catch (error) {
         if (cancelled || seq !== seqRef.current) return;
         setLoadError(messageFrom(error));
@@ -153,6 +165,8 @@ export function OrderDecisionsPage() {
 
   const reloadRow = useCallback(async (orderId: string): Promise<void> => {
     const row = await loadQueueRow(orderId);
+    const subj = decisionSubject(orderId);
+    clearActionPostedReload(subj, subj);
     setEntries((current) =>
       current === null
         ? current
@@ -174,6 +188,7 @@ export function OrderDecisionsPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">قرارات الطلبات</h1>
+      {!online ? <p role="status">{offlineMoneyMessage}</p> : null}
       <p>الطلبات الملغية والمرتجعة: اتعملت ولا ماتعملتش؟</p>
       <div className="flex flex-wrap gap-2" role="group" aria-label="التصفية">
         {filters.map(([value, label]) => (
@@ -219,7 +234,7 @@ export function OrderDecisionsPage() {
             : 'مفيش طلبات ملغية أو مرتجعة'}
         </p>
       ) : null}
-      {entries && entries.length > 0 ? (
+      {online && entries && entries.length > 0 ? (
         <div className="flex flex-col gap-3">
           {entries.map((entry) => (
             <DecisionCard
@@ -231,8 +246,8 @@ export function OrderDecisionsPage() {
           ))}
         </div>
       ) : null}
-      {moreError ? <p role="alert">{moreError}</p> : null}
-      {next !== null ? (
+      {online && moreError ? <p role="alert">{moreError}</p> : null}
+      {online && next !== null ? (
         <button
           className={secondaryButton}
           type="button"
@@ -242,26 +257,31 @@ export function OrderDecisionsPage() {
           عرض المزيد
         </button>
       ) : null}
-      {entries === null && !loading && !loadError ? (
+      {online && entries === null && !loading && !loadError ? (
         <p role="alert">{genericCatalogError}</p>
       ) : null}
-      <section className="flex flex-col gap-2" aria-label="مرتجعات من غير طلب">
-        <h2 className="text-lg font-semibold">مرتجعات من غير طلب</h2>
-        {unlinkedError ? <p role="alert">{unlinkedError}</p> : null}
-        {unlinked && unlinked.length === 0 ? (
-          <p>مفيش مرتجعات من غير طلب</p>
-        ) : null}
-        {unlinked && unlinked.length > 0 ? (
-          <ul>
-            {unlinked.map((refund) => (
-              <li key={`${refund.shiftId}/${refund.txId}`}>
-                {formatCairo(refund.occurredAt)} —{' '}
-                <span dir="ltr">{moneyText(refund.amount)}</span>
-              </li>
-            ))}
-          </ul>
-        ) : null}
-      </section>
+      {online ? (
+        <section
+          className="flex flex-col gap-2"
+          aria-label="مرتجعات من غير طلب"
+        >
+          <h2 className="text-lg font-semibold">مرتجعات من غير طلب</h2>
+          {unlinkedError ? <p role="alert">{unlinkedError}</p> : null}
+          {unlinked && unlinked.length === 0 ? (
+            <p>مفيش مرتجعات من غير طلب</p>
+          ) : null}
+          {unlinked && unlinked.length > 0 ? (
+            <ul>
+              {unlinked.map((refund) => (
+                <li key={`${refund.shiftId}/${refund.txId}`}>
+                  {formatCairo(refund.occurredAt)} —{' '}
+                  <span dir="ltr">{moneyText(refund.amount)}</span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </section>
+      ) : null}
     </main>
   );
 }

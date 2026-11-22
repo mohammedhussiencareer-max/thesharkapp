@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import {
   beginAction,
+  claimReplayAction,
   clearActionPostedReload,
   hasAction,
   markActionPostedReload,
@@ -16,6 +17,7 @@ import {
   canDispatchWriteFor,
   captureWriteSession,
   hasPostedReload,
+  storageWriteFailedMessage,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
@@ -289,8 +291,22 @@ function Workspace({
 
   function retry() {
     if (!held || flight.current || !isOnline()) return;
-    flight.current = true;
-    void run(held);
+    const targetId = held.requestId;
+    void (async () => {
+      const claim = await claimReplayAction<ImportAction>(subject, targetId);
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        }
+        return;
+      }
+      flight.current = true;
+      try {
+        await run(claim.record.payload);
+      } finally {
+        claim.release();
+      }
+    })();
   }
 
   const knownStructure = loaded ? isKnownStructure(loaded.hash, ctx) : false;

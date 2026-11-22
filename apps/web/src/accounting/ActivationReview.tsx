@@ -21,11 +21,13 @@ function RosterRow({
   item,
   checked,
   checksLocked,
+  hideMoney = false,
   onToggleZero,
 }: {
   item: RosterItem;
   checked: boolean;
   checksLocked: boolean;
+  hideMoney?: boolean;
   onToggleZero?: (itemId: string) => void;
 }) {
   const observation = item.observation;
@@ -61,9 +63,11 @@ function RosterRow({
           <p>
             الكمية <Num value={observation.quantity} /> {observation.unit}
           </p>
-          <p>
-            سعر الوحدة <Num value={observation.unitCost} />
-          </p>
+          {hideMoney ? null : (
+            <p>
+              سعر الوحدة <Num value={observation.unitCost} />
+            </p>
+          )}
           <p>{formatCairo(observation.occurredAt)}</p>
           {repeated ? <p>اتسجل {item.openingLineCount} مرات</p> : null}
         </>
@@ -76,6 +80,7 @@ export function ActivationReview({
   review,
   checkedZeroIds = noChecks,
   checksLocked = false,
+  hideMoney = false,
   onToggleZero,
   notice = null,
   showActivate = false,
@@ -86,6 +91,7 @@ export function ActivationReview({
   review: OpeningReview;
   checkedZeroIds?: ReadonlySet<string>;
   checksLocked?: boolean;
+  hideMoney?: boolean;
   onToggleZero?: (itemId: string) => void;
   notice?: string | null;
   showActivate?: boolean;
@@ -140,6 +146,7 @@ export function ActivationReview({
             item={item}
             checked={checkedZeroIds.has(item.itemId)}
             checksLocked={checksLocked}
+            hideMoney={hideMoney}
             onToggleZero={onToggleZero}
           />
         ))}

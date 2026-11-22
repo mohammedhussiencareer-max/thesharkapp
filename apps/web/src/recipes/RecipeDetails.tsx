@@ -6,6 +6,7 @@ import {
 } from '@/items/errors';
 import {
   beginAction,
+  claimReplayAction,
   clearActionPostedReload,
   hasAction,
   markActionPostedReload,
@@ -14,7 +15,10 @@ import {
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
-import { HeldWriteStorageError } from '@/lib/held-writes';
+import {
+  HeldWriteStorageError,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { updateRecipe, type RecipeUpdate } from '@/recipes/api';
 import { recipeKindLabels } from '@/recipes/labels';
@@ -66,8 +70,22 @@ export function RecipeDetails({
     setActive(next.active);
   }
 
-  async function finish(action: DetailsAction) {
+  async function finish(action: DetailsAction, isReplay = false) {
     if (flight.current || !isOnline()) return;
+    let releaseLock = () => {};
+    if (isReplay) {
+      const claim = await claimReplayAction<DetailsAction>(
+        subject,
+        action.update.requestId,
+      );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+    }
     flight.current = true;
     setSaving(true);
     onBusyChange(true);
@@ -76,9 +94,11 @@ export function RecipeDetails({
     try {
       await updateRecipe(action.recipeId, action.update);
       markActionPostedReload(subject, action.update.requestId, subject);
+      releaseLock();
+      releaseLock = () => {};
       const fresh = await onReload();
       if (fresh !== null) {
-        clearActionPostedReload(subject, subject);
+        clearActionPostedReload(subject, subject, action.update.requestId);
       }
       adopt(
         fresh ?? {
@@ -98,6 +118,7 @@ export function RecipeDetails({
         setError(messageFrom(failure));
       }
     } finally {
+      releaseLock();
       flight.current = false;
       setSaving(false);
       onBusyChange(false);
@@ -141,7 +162,7 @@ export function RecipeDetails({
 
   function retry() {
     if (!held || locked || flight.current) return;
-    void finish(held);
+    void finish(held, true);
   }
 
   return (

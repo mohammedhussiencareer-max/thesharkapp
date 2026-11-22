@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
+import { clearPostedReloadsByPrefix } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { offlineMoneyMessage, useReconnectReload } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { listStockChoices } from '@/purchases/api';
 import type { StockChoice } from '@/purchases/types';
@@ -31,6 +33,12 @@ export function WastePage() {
   // The cursor only belongs to the list on screen while no refresh or reload is replacing that list.
   const pagingBlocked = loading || reloading > 0;
 
+  const online = useReconnectReload(() => {
+    setLoading(true);
+    setLoadError(null);
+    setLoadId((value) => value + 1);
+  });
+
   useEffect(() => {
     const seq = ++loadSeqRef.current;
     const historySeq = ++historySeqRef.current;
@@ -49,6 +57,7 @@ export function WastePage() {
           setNext(page.next);
           loadedRef.current = page.entries.length;
           setMoreError(null);
+          clearPostedReloadsByPrefix('waste:');
         }
       } catch (error) {
         if (cancelled || seq !== loadSeqRef.current) return;
@@ -106,6 +115,7 @@ export function WastePage() {
       setNext(page.next);
       loadedRef.current = page.entries.length;
       setMoreError(null);
+      clearPostedReloadsByPrefix('waste:');
     } finally {
       setReloading((count) => count - 1);
     }
@@ -134,6 +144,7 @@ export function WastePage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الهالك</h1>
+      {!online ? <p role="status">{offlineMoneyMessage}</p> : null}
       <p>سجّل الأصناف اللي اتشالت من المخزون من غير بيع، مع السبب.</p>
       <div className="flex flex-wrap gap-2">
         <button
@@ -173,8 +184,10 @@ export function WastePage() {
       </section>
       <section className="flex flex-col gap-3" aria-label="سجل الهالك">
         <h2 className="text-lg font-semibold">سجل الهالك</h2>
-        {entries && entries.length === 0 ? <p>مفيش هالك متسجل</p> : null}
-        {entries && entries.length > 0 ? (
+        {online && entries && entries.length === 0 ? (
+          <p>مفيش هالك متسجل</p>
+        ) : null}
+        {online && entries && entries.length > 0 ? (
           <WasteHistory
             entries={entries}
             choices={choices ?? []}
@@ -182,8 +195,8 @@ export function WastePage() {
             reload={reload}
           />
         ) : null}
-        {moreError ? <p role="alert">{moreError}</p> : null}
-        {next !== null ? (
+        {online && moreError ? <p role="alert">{moreError}</p> : null}
+        {online && next !== null ? (
           <button
             className={secondaryButton}
             type="button"

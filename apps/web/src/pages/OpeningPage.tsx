@@ -2,13 +2,14 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
 import {
+  claimFreshHeldWrite,
+  claimReplayHeldWrite,
   clearHeldWrite,
   clearPostedReload,
   getHeldWrite,
   setHeldWritePhase,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
-  tryPutHeldWrite,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { isPayloadRefusal, isUnknownOutcome } from '@/lib/write-outcome';
@@ -115,14 +116,17 @@ export function OpeningPage() {
       prior !== null &&
       prior.requestId === draft.requestId &&
       prior.phase === 'unknown';
-    const pin = tryPutHeldWrite(OPENING_SUBJECT, {
-      requestId: draft.requestId,
-      payload: draft,
-      phase: 'inflight',
-      kind: 'opening',
-    });
-    if (!pin.ok) {
-      if (pin.reason === 'storage') {
+    const claim = wasPinned
+      ? await claimReplayHeldWrite<OpeningDraft>(
+          OPENING_SUBJECT,
+          draft.requestId,
+        )
+      : await claimFreshHeldWrite<OpeningDraft>(OPENING_SUBJECT, () => draft, {
+          requestId: draft.requestId,
+          kind: 'opening',
+        });
+    if (!claim.ok) {
+      if (claim.reason === 'storage' || claim.reason === 'missing') {
         setServerError(storageWriteFailedMessage);
       }
       return;
@@ -132,7 +136,7 @@ export function OpeningPage() {
     setSuccess(null);
     let saved = false;
     try {
-      await recordOpeningStock(draft);
+      await recordOpeningStock(claim.record.payload);
       saved = true;
       setHeldWritePhase(OPENING_SUBJECT, draft.requestId, 'posted_reload');
       setLocalNeedsReload(true);
@@ -142,7 +146,7 @@ export function OpeningPage() {
       if (next) {
         setItems(next);
         setLoadError(null);
-        clearPostedReload(OPENING_SUBJECT);
+        clearPostedReload(OPENING_SUBJECT, undefined, draft.requestId);
         setLocalNeedsReload(false);
       }
     } catch (error) {
@@ -175,6 +179,7 @@ export function OpeningPage() {
         setLoadError(messageFrom(error));
       }
     } finally {
+      claim.release();
       setSaving(false);
     }
   }

@@ -6,6 +6,8 @@ import {
 import type { ItemDraft } from '@/items/types';
 import {
   beginHeldWrite,
+  claimFreshHeldWrite,
+  claimReplayHeldWrite,
   clearHeldWrite,
   clearPostedReload,
   getHeldWrite,
@@ -14,6 +16,7 @@ import {
   setHeldWritePhase,
   subscribeHeldWritesStore,
   updateHeldWritePayload,
+  type ClaimHeldWriteResult,
 } from '@/lib/held-writes';
 import { isPayloadRefusal } from '@/lib/write-outcome';
 
@@ -223,9 +226,9 @@ export function updateActionPayload<T>(
 }
 
 /**
- * At most one outstanding action per subject. A second begin returns the
- * payload already held, including its request id. Persisted to localStorage
- * with phase `inflight` BEFORE the caller sends the request.
+ * At most one outstanding active action per subject. Persists to localStorage
+ * with phase `inflight` BEFORE the caller sends the request, without
+ * discarding any existing `posted_reload` pin on the same subject.
  */
 export function beginAction<T>(
   subject: string,
@@ -235,10 +238,31 @@ export function beginAction<T>(
   if (existing && existing.phase !== 'posted_reload') {
     return existing.payload;
   }
-  if (existing && existing.phase === 'posted_reload') {
-    clearHeldWrite(subject, existing.requestId);
-  }
   return beginHeldWrite<T>(subject, create, { kind: 'action' }).payload;
+}
+
+/**
+ * Atomically claim a fresh action on `subject` under a Web Lock (when
+ * supported), refusing if another tab holds the lock or an unresolved pin
+ * already exists in storage.
+ */
+export function claimFreshAction<T>(
+  subject: string,
+  create: (requestId: string) => T,
+): Promise<ClaimHeldWriteResult<T>> {
+  return claimFreshHeldWrite<T>(subject, create, { kind: 'action' });
+}
+
+/**
+ * Atomically claim an explicit replay of an existing durable action pin,
+ * verifying storage still holds the matching `subject` and `requestId`.
+ */
+export function claimReplayAction<T>(
+  subject: string,
+  requestId: string,
+  opts?: { payload?: T; awaitingReviewReload?: boolean },
+): Promise<ClaimHeldWriteResult<T>> {
+  return claimReplayHeldWrite<T>(subject, requestId, opts);
 }
 
 /**
@@ -253,12 +277,29 @@ export function markActionPostedReload(
   setHeldWritePhase(subject, requestId, 'posted_reload', { readTarget });
 }
 
-/** Clear a `posted_reload` pin only after a read covering `readTarget` succeeds. */
+/** Clear a `posted_reload` pin only after a read covering `readTarget` (and matching `requestId` when supplied) succeeds. */
 export function clearActionPostedReload(
   subject: string,
   readTarget?: string,
+  requestId?: string,
 ): void {
-  clearPostedReload(subject, readTarget);
+  clearPostedReload(subject, readTarget, requestId);
+}
+
+/** Clear all `posted_reload` pins whose subject starts with `prefix` and whose target matches. */
+export function clearPostedReloadsByPrefix(
+  prefix: string,
+  expectedTarget?: string,
+): void {
+  for (const record of listHeldWritesByPrefix(prefix)) {
+    if (record.phase === 'posted_reload') {
+      clearPostedReload(
+        record.subject,
+        expectedTarget ?? record.readTarget,
+        record.requestId,
+      );
+    }
+  }
 }
 
 /**

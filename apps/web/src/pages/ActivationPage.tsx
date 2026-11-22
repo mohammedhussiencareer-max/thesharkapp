@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useActivationAction } from '@/accounting/activation-action';
+import {
+  ACTIVATION_SUBJECT,
+  useActivationAction,
+} from '@/accounting/activation-action';
 import { loadOpeningReview } from '@/accounting/api';
 import { ActivationReview } from '@/accounting/ActivationReview';
 import type { OpeningReview } from '@/accounting/types';
 import { messageFrom } from '@/items/errors';
+import { clearActionPostedReload } from '@/items/request-id';
+import { offlineMoneyMessage, useReconnectReload } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 
 export function ActivationPage() {
@@ -13,6 +18,12 @@ export function ActivationPage() {
   const [loading, setLoading] = useState(true);
   const [loadId, setLoadId] = useState(0);
   const seqRef = useRef(0);
+
+  const online = useReconnectReload(() => {
+    setLoading(true);
+    setLoadError(null);
+    setLoadId((value) => value + 1);
+  });
 
   useEffect(() => {
     const seq = ++seqRef.current;
@@ -23,6 +34,7 @@ export function ActivationPage() {
         if (cancelled || seq !== seqRef.current) return;
         setReview(next);
         setLoadError(null);
+        clearActionPostedReload(ACTIVATION_SUBJECT, ACTIVATION_SUBJECT);
       } catch (error) {
         if (cancelled || seq !== seqRef.current) return;
         setLoadError(messageFrom(error));
@@ -45,13 +57,17 @@ export function ActivationPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">مراجعة التفعيل</h1>
-      {loading && review === null ? <p>جاري تحميل المراجعة…</p> : null}
+      {!online ? <p role="status">{offlineMoneyMessage}</p> : null}
+      {online && loading && review === null ? (
+        <p>جاري تحميل المراجعة…</p>
+      ) : null}
       {loadError ? (
         <>
           <p>{loadError}</p>
           <button
             className={secondaryButton}
             type="button"
+            disabled={!online}
             onClick={() => setLoadId((value) => value + 1)}
           >
             إعادة تحميل المراجعة
@@ -63,6 +79,7 @@ export function ActivationPage() {
           review={review}
           checkedZeroIds={activation.checkedZeroIds}
           checksLocked={activation.checksLocked}
+          hideMoney={!online}
           onToggleZero={activation.toggleZero}
           notice={activation.notice}
           showActivate={activation.showActivate}

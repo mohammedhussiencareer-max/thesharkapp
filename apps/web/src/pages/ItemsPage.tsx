@@ -33,7 +33,12 @@ import {
   setReloadMarker,
   subscribeHeldWritesStore,
 } from '@/lib/held-writes';
-import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
+import {
+  isOnline,
+  offlineMoneyMessage,
+  offlineWriteMessage,
+  useReconnectReload,
+} from '@/lib/online';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
 
 const ITEMS_RELOAD_SUBJECT = 'items:reload';
@@ -58,7 +63,6 @@ function visibleCount(
 }
 
 export function ItemsPage() {
-  const online = useOnline();
   const [items, setItems] = useState<CatalogItem[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -82,6 +86,13 @@ export function ItemsPage() {
   const postedReload = heldEpoch >= 0 && hasReloadMarker(ITEMS_RELOAD_SUBJECT);
   const needsReload = localNeedsReload || postedReload;
   const busy = saving || conversionsBusy || needsReload || catalogLoads > 0;
+  const online = useReconnectReload(() => {
+    if (!saving && !conversionsBusy && catalogLoads === 0) {
+      setLoading(true);
+      setLoadError(null);
+      setLoadId((value) => value + 1);
+    }
+  });
   const writeLocked = busy || !online;
 
   useEffect(
@@ -286,7 +297,12 @@ export function ItemsPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الأصناف</h1>
-      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
+      {!online ? (
+        <>
+          <p role="status">{offlineWriteMessage}</p>
+          <p role="status">{offlineMoneyMessage}</p>
+        </>
+      ) : null}
       {loading && items === null ? <p>جاري تحميل الأصناف…</p> : null}
       {items === null && !loading ? (
         <div className="flex flex-col gap-3">
@@ -372,6 +388,7 @@ export function ItemsPage() {
               showInactive={showInactive}
               openConversionsId={openConversionsId}
               editsDisabled={writeLocked}
+              hideMoney={!online}
               identityDirtyId={
                 formIdentityDirty && formMode?.type === 'edit'
                   ? formMode.id

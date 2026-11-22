@@ -8,6 +8,7 @@ let snapshot: PwaUpdateSnapshot = { waiting: false };
 let waitingWorker: ServiceWorker | null = null;
 let started = false;
 let reloadRequested = false;
+let reloadDeferred = false;
 let authResolvedState = false;
 const listeners = new Set<() => void>();
 
@@ -25,7 +26,7 @@ function emit(): void {
 
 function setWaiting(worker: ServiceWorker | null): void {
   waitingWorker = worker;
-  const next = worker !== null;
+  const next = worker !== null || reloadDeferred;
   if (snapshot.waiting === next) return;
   snapshot = { waiting: next };
   emit();
@@ -49,16 +50,29 @@ export function subscribePwaUpdate(listener: () => void): () => void {
 /**
  * Activate a waiting service worker and reload, ONLY when auth has resolved,
  * the owner explicitly asks, and NO held write pin is active in storage or
- * memory. Returns false if blocked or no update.
+ * memory. If a previous explicit approval activated the worker while a pin
+ * appeared before `controllerchange`, the next explicit click reloads directly
+ * once pins have cleared without waiting for a second `controllerchange`.
  */
 export function applyPwaUpdate(
   reload: () => void = () => window.location.reload(),
   options?: { authResolved?: boolean },
 ): boolean {
-  if (!waitingWorker) return false;
   const resolved = options?.authResolved ?? authResolvedState;
   if (!resolved) return false;
   if (hasAnyHeldWrite()) return false;
+  if (reloadDeferred) {
+    reloadDeferred = false;
+    reloadRequested = false;
+    waitingWorker = null;
+    if (snapshot.waiting) {
+      snapshot = { waiting: false };
+      emit();
+    }
+    reload();
+    return true;
+  }
+  if (!waitingWorker) return false;
   reloadRequested = true;
   waitingWorker.postMessage({ type: 'SKIP_WAITING' });
   if (
@@ -66,6 +80,7 @@ export function applyPwaUpdate(
     !('serviceWorker' in navigator) ||
     !navigator.serviceWorker
   ) {
+    reloadRequested = false;
     reload();
   }
   return true;
@@ -86,10 +101,20 @@ export function initPwa(
   container.addEventListener('controllerchange', () => {
     if (!reloadRequested) return;
     if (hasAnyHeldWrite()) {
+      // Worker already activated after explicit approval, but a pin appeared
+      // in the race window: keep the banner visible and defer reload until
+      // the next explicit click after pins clear.
       reloadRequested = false;
+      reloadDeferred = true;
+      waitingWorker = null;
+      if (!snapshot.waiting) {
+        snapshot = { waiting: true };
+        emit();
+      }
       return;
     }
     reloadRequested = false;
+    reloadDeferred = false;
     reload();
   });
 
@@ -123,6 +148,7 @@ export function resetPwaState(): void {
   waitingWorker = null;
   started = false;
   reloadRequested = false;
+  reloadDeferred = false;
   authResolvedState = false;
   snapshot = { waiting: false };
   listeners.clear();

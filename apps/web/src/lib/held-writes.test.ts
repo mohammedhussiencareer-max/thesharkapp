@@ -421,4 +421,245 @@ describe('held-writes store', () => {
     await pending;
     signOutSpy.mockRestore();
   });
+
+  it('R3-1a: new tab hydration does not promote another live tab inflight pin when its Web Lock is held', async () => {
+    const heldLocks = new Set<string>();
+    const fakeLocks = {
+      async request<T>(
+        name: string,
+        options: { mode?: 'exclusive' | 'shared'; ifAvailable?: boolean },
+        callback: (
+          lock: { name: string; mode: string } | null,
+        ) => Promise<T> | T,
+      ): Promise<T> {
+        if (heldLocks.has(name)) {
+          if (options.ifAvailable) return await callback(null);
+          throw new Error('blocking wait not expected');
+        }
+        heldLocks.add(name);
+        try {
+          return await callback({ name, mode: options.mode ?? 'exclusive' });
+        } finally {
+          heldLocks.delete(name);
+        }
+      },
+      query() {
+        return Promise.resolve({
+          held: [...heldLocks].map((name) => ({ name, mode: 'exclusive' })),
+          pending: [],
+        });
+      },
+    };
+    const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: fakeLocks,
+    });
+
+    const tab1 = createHeldWriteStore();
+    const tab2 = createHeldWriteStore();
+    try {
+      tab1.setHeldWriteUser('user-a');
+      const subject = 'purchase:new';
+      const lockKey = `${userStoragePrefix('user-a')}${encodeURIComponent(subject)}`;
+      // Simulate Tab 1 holding the subject lock while its write is inflight.
+      heldLocks.add(lockKey);
+      tab1.putHeldWrite(subject, {
+        requestId: 'req-live-1',
+        payload: { requestId: 'req-live-1' },
+        phase: 'inflight',
+        kind: 'purchase',
+      });
+
+      // Tab 2 opens and hydrates while Tab 1's lock is still held.
+      tab2.setHeldWriteUser('user-a');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const rawWhileLive = localStorage.getItem(lockKey);
+      expect(JSON.parse(rawWhileLive ?? '{}')).toMatchObject({
+        requestId: 'req-live-1',
+        phase: 'inflight',
+      });
+
+      // Once Tab 1 crashes/releases the lock, a fresh hydration promotes inflight -> unknown.
+      heldLocks.delete(lockKey);
+      tab2.rehydrateHeldWrites();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const rawAfterCrash = localStorage.getItem(lockKey);
+      expect(JSON.parse(rawAfterCrash ?? '{}')).toMatchObject({
+        requestId: 'req-live-1',
+        phase: 'unknown',
+      });
+    } finally {
+      tab1.dispose();
+      tab2.dispose();
+      if (originalLocks) {
+        Object.defineProperty(navigator, 'locks', originalLocks);
+      } else {
+        delete (navigator as unknown as { locks?: unknown }).locks;
+      }
+    }
+  });
+
+  it('R3-1d: clearPostedReload requires BOTH matching requestId and readTarget', () => {
+    setHeldWriteUser('user-a');
+    putHeldWrite('expense:new', {
+      requestId: 'req-exp-1',
+      payload: { requestId: 'req-exp-1' },
+      phase: 'inflight',
+      kind: 'expense',
+    });
+    setHeldWritePhase('expense:new', 'req-exp-1', 'posted_reload', {
+      readTarget: '2030-03-01',
+    });
+
+    // Clearing without target must NOT clear a targeted posted_reload pin.
+    clearPostedReload('expense:new');
+    expect(hasPostedReload('expense:new', '2030-03-01')).toBe(true);
+
+    // Clearing with wrong target must NOT clear.
+    clearPostedReload('expense:new', '2030-04-01');
+    expect(hasPostedReload('expense:new', '2030-03-01')).toBe(true);
+
+    // Clearing with matching target + WRONG requestId must NOT clear.
+    clearPostedReload('expense:new', '2030-03-01', 'req-exp-wrong');
+    expect(hasPostedReload('expense:new', '2030-03-01')).toBe(true);
+
+    // Clearing with matching target AND matching requestId clears it.
+    clearPostedReload('expense:new', '2030-03-01', 'req-exp-1');
+    expect(hasPostedReload('expense:new', '2030-03-01')).toBe(false);
+  });
+
+  it('R3-3: sign-out then re-sign-in to the SAME user invalidates a captured write session', async () => {
+    const mod = await import('@/lib/held-writes');
+    setHeldWriteUser('user-a');
+    const captured = mod.captureWriteSession();
+    expect(mod.canDispatchWriteFor(captured)).toBe(true);
+
+    // Sign out then sign back into the exact same account.
+    setHeldWriteUser(null);
+    setHeldWriteUser('user-a');
+
+    // Old continuation must NOT be allowed to dispatch under the new session generation.
+    expect(mod.canDispatchWriteFor(captured)).toBe(false);
+  });
+
+  it('R3-1b: Web Locks prevent concurrent cross-tab claims and missing navigator.locks falls back cleanly', async () => {
+    const heldLocks = new Set<string>();
+    const fakeLocks = {
+      async request<T>(
+        name: string,
+        options: { mode?: 'exclusive' | 'shared'; ifAvailable?: boolean },
+        callback: (
+          lock: { name: string; mode: string } | null,
+        ) => Promise<T> | T,
+      ): Promise<T> {
+        if (heldLocks.has(name)) {
+          if (options.ifAvailable) return await callback(null);
+          throw new Error('unexpected blocking request');
+        }
+        heldLocks.add(name);
+        try {
+          return await callback({ name, mode: options.mode ?? 'exclusive' });
+        } finally {
+          heldLocks.delete(name);
+        }
+      },
+      query() {
+        return Promise.resolve({
+          held: [...heldLocks].map((name) => ({ name, mode: 'exclusive' })),
+        });
+      },
+    };
+
+    const tab1 = createHeldWriteStore({ getLocks: () => fakeLocks });
+    const tab2 = createHeldWriteStore({ getLocks: () => fakeLocks });
+    try {
+      tab1.setHeldWriteUser('user-a');
+      tab2.setHeldWriteUser('user-a');
+
+      const [c1, c2] = await Promise.all([
+        tab1.claimFreshHeldWrite('purchase:new', (requestId) => ({
+          requestId,
+          tab: 1,
+        })),
+        tab2.claimFreshHeldWrite('purchase:new', (requestId) => ({
+          requestId,
+          tab: 2,
+        })),
+      ]);
+
+      expect(c1.ok).toBe(true);
+      expect(c2.ok).toBe(false);
+      if (!c2.ok) {
+        expect(c2.reason).toBe('locked');
+      }
+      if (c1.ok) {
+        // While Tab 1 holds the lock, Tab 2 cannot replay either.
+        const replayWhileLocked = await tab2.claimReplayHeldWrite(
+          'purchase:new',
+          c1.record.requestId,
+        );
+        expect(replayWhileLocked.ok).toBe(false);
+        if (!replayWhileLocked.ok) {
+          expect(replayWhileLocked.reason).toBe('locked');
+        }
+
+        // After Tab 1 marks unknown and releases the lock, fresh claim is still refused (conflict),
+        // while explicit replay succeeds with the exact same requestId.
+        tab1.setHeldWritePhase('purchase:new', c1.record.requestId, 'unknown');
+        c1.release();
+        await Promise.resolve();
+
+        const freshAfterRelease = await tab2.claimFreshHeldWrite(
+          'purchase:new',
+          (requestId) => ({ requestId, tab: 2 }),
+        );
+        expect(freshAfterRelease.ok).toBe(false);
+        if (!freshAfterRelease.ok) {
+          expect(freshAfterRelease.reason).toBe('conflict');
+        }
+
+        const replayAfterRelease = await tab2.claimReplayHeldWrite(
+          'purchase:new',
+          c1.record.requestId,
+        );
+        expect(replayAfterRelease.ok).toBe(true);
+        if (replayAfterRelease.ok) {
+          expect(replayAfterRelease.record.requestId).toBe(c1.record.requestId);
+          replayAfterRelease.release();
+        }
+      }
+    } finally {
+      tab1.dispose();
+      tab2.dispose();
+    }
+
+    // Fallback when navigator.locks is missing: inflight promotes to unknown on hydration,
+    // and claimFreshHeldWrite still refuses an existing unresolved pin via storage re-read.
+    localStorage.clear();
+    const fallbackA = createHeldWriteStore({ getLocks: () => null });
+    const fallbackB = createHeldWriteStore({ getLocks: () => null });
+    try {
+      fallbackA.setHeldWriteUser('user-a');
+      const claimed = await fallbackA.claimFreshHeldWrite(
+        'count:daily',
+        (requestId) => ({ requestId }),
+      );
+      expect(claimed.ok).toBe(true);
+      if (claimed.ok) claimed.release();
+
+      fallbackB.setHeldWriteUser('user-a');
+      expect(fallbackB.getHeldWrite('count:daily')?.phase).toBe('unknown');
+
+      const refused = await fallbackB.claimFreshHeldWrite(
+        'count:daily',
+        (requestId) => ({ requestId }),
+      );
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) expect(refused.reason).toBe('conflict');
+    } finally {
+      fallbackA.dispose();
+      fallbackB.dispose();
+    }
+  });
 });

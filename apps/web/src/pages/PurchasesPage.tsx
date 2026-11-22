@@ -2,15 +2,21 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { messageFrom } from '@/items/errors';
 import {
+  claimFreshHeldWrite,
+  claimReplayHeldWrite,
   clearHeldWrite,
   clearPostedReload,
   getHeldWrite,
   setHeldWritePhase,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
-  tryPutHeldWrite,
 } from '@/lib/held-writes';
-import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
+import {
+  isOnline,
+  offlineMoneyMessage,
+  offlineWriteMessage,
+  useReconnectReload,
+} from '@/lib/online';
 import { isPayloadRefusal, isUnknownOutcome } from '@/lib/write-outcome';
 import {
   listPurchases,
@@ -19,12 +25,24 @@ import {
   recordPurchase,
 } from '@/purchases/api';
 import {
+  divRound,
+  formatDec,
+  isZero,
+  mulRound,
+  parseUserDecimal,
+} from '@/purchases/decimal';
+import {
   ConversionChangedError,
   genericPurchaseError,
 } from '@/purchases/errors';
 import { PurchaseForm } from '@/purchases/PurchaseForm';
 import { PurchaseList } from '@/purchases/PurchaseList';
-import type { Purchase, PurchaseDraft, StockChoice } from '@/purchases/types';
+import type {
+  Purchase,
+  PurchaseDraft,
+  StockChoice,
+  StoredPurchaseDraft,
+} from '@/purchases/types';
 import {
   cairoDateStartIso,
   cairoNextDateStartIso,
@@ -41,8 +59,62 @@ const secondaryButton =
 
 type Snapshot = { choices: StockChoice[]; purchases: Purchase[] };
 
+/** Persist only retry fields (no itemName, baseQuantity, or unitCost) in localStorage. */
+function toStoredPurchaseDraft(draft: PurchaseDraft): StoredPurchaseDraft {
+  return {
+    requestId: draft.requestId,
+    purchasedAt: draft.purchasedAt,
+    supplier: draft.supplier,
+    invoiceNo: draft.invoiceNo,
+    note: draft.note,
+    lines: draft.lines.map((line) => ({
+      itemId: line.itemId,
+      quantity: line.quantity,
+      unit: line.unit,
+      amountPaid: line.amountPaid,
+      baseUnit: line.baseUnit,
+      expectedFactor: line.expectedFactor,
+    })),
+  };
+}
+
+/** Restore item labels from live catalog (or in-memory cache) and recompute display math. */
+function hydratePurchaseDraft(
+  stored: StoredPurchaseDraft | null,
+  choices: readonly StockChoice[],
+  knownNames: ReadonlyMap<string, string>,
+): PurchaseDraft | null {
+  if (!stored) return null;
+  const byId = new Map<string, string>(knownNames);
+  for (const choice of choices) byId.set(choice.id, choice.name);
+  return {
+    requestId: stored.requestId,
+    purchasedAt: stored.purchasedAt,
+    supplier: stored.supplier,
+    invoiceNo: stored.invoiceNo,
+    note: stored.note,
+    lines: stored.lines.map((line) => {
+      const qty = parseUserDecimal(line.quantity);
+      const factor = parseUserDecimal(line.expectedFactor);
+      const amount = parseUserDecimal(line.amountPaid);
+      const base = qty && factor ? mulRound(qty, factor, 6) : null;
+      const baseQuantity = base ? formatDec(base) : line.quantity;
+      let unitCost = '0';
+      if (amount && !isZero(amount) && base && !isZero(base)) {
+        const cost = divRound(amount, base, 6);
+        if (cost) unitCost = formatDec(cost);
+      }
+      return {
+        ...line,
+        itemName: byId.get(line.itemId) ?? line.itemId,
+        baseQuantity,
+        unitCost,
+      };
+    }),
+  };
+}
+
 export function PurchasesPage() {
-  const online = useOnline();
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -58,18 +130,51 @@ export function PurchasesPage() {
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [filterError, setFilterError] = useState<string | null>(null);
+  // In-memory-only item names for hydrated pending drafts if a choice disappears.
+  const [knownNames, setKnownNames] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
   const seqRef = useRef(0);
   const loadsRef = useRef(0);
   const filterRef = useRef({ from: '', to: '' });
+
+  const online = useReconnectReload(() => {
+    if (!saving && loadsRef.current === 0) {
+      setLoading(true);
+      setLoadError(null);
+      setLoadId((value) => value + 1);
+    }
+  });
+
+  function rememberChoiceNames(
+    list: readonly { id: string; name?: string }[],
+  ): void {
+    setKnownNames((current) => {
+      let changed = false;
+      const next = new Map(current);
+      for (const entry of list) {
+        if (entry.name && next.get(entry.id) !== entry.name) {
+          next.set(entry.id, entry.name);
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }
 
   useEffect(
     () => subscribeHeldWritesStore(() => setHeldEpoch((value) => value + 1)),
     [],
   );
 
+  const choices = snapshot?.choices ?? [];
   const stored =
-    heldEpoch < 0 ? null : getHeldWrite<PurchaseDraft>(PURCHASE_SUBJECT);
-  const pending = stored?.phase === 'unknown' ? stored.payload : null;
+    heldEpoch < 0 ? null : getHeldWrite<StoredPurchaseDraft>(PURCHASE_SUBJECT);
+  const pending = hydratePurchaseDraft(
+    stored?.phase === 'unknown' ? stored.payload : null,
+    choices,
+    knownNames,
+  );
   const inflight = stored?.phase === 'inflight';
   const postedReload = stored?.phase === 'posted_reload';
   const needsReload = localNeedsReload || postedReload;
@@ -101,14 +206,16 @@ export function PurchasesPage() {
     loadsRef.current += 1;
     setLoads(loadsRef.current);
     try {
-      const [choices, purchases] = await Promise.all([
+      const [nextChoices, purchases] = await Promise.all([
         listStockChoices(),
         listPurchases({
           from: fromIso ?? undefined,
           toExclusive: toExclusive ?? undefined,
         }),
       ]);
-      return seq === seqRef.current ? { choices, purchases } : null;
+      return seq === seqRef.current
+        ? { choices: nextChoices, purchases }
+        : null;
     } catch (error) {
       if (seq !== seqRef.current) return null;
       throw error;
@@ -125,6 +232,7 @@ export function PurchasesPage() {
         const next = await readSnapshot();
         if (cancelled || !next) return;
         setSnapshot(next);
+        rememberChoiceNames(next.choices);
         setLoadError(null);
         clearPostedReload(PURCHASE_SUBJECT);
         setLocalNeedsReload(false);
@@ -145,9 +253,12 @@ export function PurchasesPage() {
     loadsRef.current += 1;
     setLoads(loadsRef.current);
     try {
-      const choices = await listStockChoices();
+      const nextChoices = await listStockChoices();
       if (seq !== seqRef.current) return;
-      setSnapshot((current) => (current ? { ...current, choices } : current));
+      rememberChoiceNames(nextChoices);
+      setSnapshot((current) =>
+        current ? { ...current, choices: nextChoices } : current,
+      );
     } catch (error) {
       if (seq !== seqRef.current) return;
       setLoadError(messageFrom(error));
@@ -158,7 +269,7 @@ export function PurchasesPage() {
   }
 
   function retry() {
-    if (saving || loadsRef.current > 0) return;
+    if (saving || loadsRef.current > 0 || !isOnline()) return;
     setLoading(true);
     setLoadError(null);
     setLoadId((value) => value + 1);
@@ -181,19 +292,27 @@ export function PurchasesPage() {
 
   async function handleSubmit(draft: PurchaseDraft) {
     if (busy || loadsRef.current > 0 || !isOnline()) return;
-    const prior = getHeldWrite<PurchaseDraft>(PURCHASE_SUBJECT);
+    const prior = getHeldWrite<StoredPurchaseDraft>(PURCHASE_SUBJECT);
     const wasPinned =
       prior !== null &&
       prior.requestId === draft.requestId &&
       prior.phase === 'unknown';
-    const pin = tryPutHeldWrite(PURCHASE_SUBJECT, {
-      requestId: draft.requestId,
-      payload: draft,
-      phase: 'inflight',
-      kind: 'purchase',
-    });
-    if (!pin.ok) {
-      if (pin.reason === 'storage') {
+    rememberChoiceNames(
+      draft.lines.map((line) => ({ id: line.itemId, name: line.itemName })),
+    );
+    const storedDraft = toStoredPurchaseDraft(draft);
+    const claim = wasPinned
+      ? await claimReplayHeldWrite<StoredPurchaseDraft>(
+          PURCHASE_SUBJECT,
+          draft.requestId,
+        )
+      : await claimFreshHeldWrite<StoredPurchaseDraft>(
+          PURCHASE_SUBJECT,
+          () => storedDraft,
+          { requestId: draft.requestId, kind: 'purchase' },
+        );
+    if (!claim.ok) {
+      if (claim.reason === 'storage' || claim.reason === 'missing') {
         setServerError(storageWriteFailedMessage);
       }
       return;
@@ -202,8 +321,10 @@ export function PurchasesPage() {
     setServerError(null);
     setSuccess(null);
     let saved = false;
+    const hydratedDraft =
+      hydratePurchaseDraft(claim.record.payload, choices, knownNames) ?? draft;
     try {
-      await recordPurchase(draft);
+      await recordPurchase(hydratedDraft);
       saved = true;
       setHeldWritePhase(PURCHASE_SUBJECT, draft.requestId, 'posted_reload');
       setLocalNeedsReload(true);
@@ -212,8 +333,9 @@ export function PurchasesPage() {
       const next = await readSnapshot();
       if (next) {
         setSnapshot(next);
+        rememberChoiceNames(next.choices);
         setLoadError(null);
-        clearPostedReload(PURCHASE_SUBJECT);
+        clearPostedReload(PURCHASE_SUBJECT, undefined, draft.requestId);
         setLocalNeedsReload(false);
       }
     } catch (error) {
@@ -241,11 +363,10 @@ export function PurchasesPage() {
         setLoadError(messageFrom(error));
       }
     } finally {
+      claim.release();
       setSaving(false);
     }
   }
-
-  const choices = snapshot?.choices ?? [];
 
   return (
     <main className={shell}>
@@ -255,7 +376,12 @@ export function PurchasesPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">المشتريات</h1>
-      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
+      {!online ? (
+        <>
+          <p role="status">{offlineWriteMessage}</p>
+          <p role="status">{offlineMoneyMessage}</p>
+        </>
+      ) : null}
       {success ? <p role="status">{success}</p> : null}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <label className="flex flex-col gap-1">
@@ -290,14 +416,16 @@ export function PurchasesPage() {
         </label>
       </div>
       {filterError ? <p role="alert">{filterError}</p> : null}
-      {loading && snapshot === null ? <p>جاري تحميل المشتريات…</p> : null}
+      {online && loading && snapshot === null ? (
+        <p>جاري تحميل المشتريات…</p>
+      ) : null}
       {snapshot === null && !loading ? (
         <div className="flex flex-col gap-3">
           <p role="alert">{loadError ?? genericPurchaseError}</p>
           <button
             className={secondaryButton}
             type="button"
-            disabled={saving || loads > 0}
+            disabled={saving || loads > 0 || !online}
             onClick={retry}
           >
             إعادة المحاولة
@@ -310,7 +438,7 @@ export function PurchasesPage() {
           <button
             className={secondaryButton}
             type="button"
-            disabled={saving || loads > 0}
+            disabled={saving || loads > 0 || !online}
             onClick={retry}
           >
             إعادة المحاولة
@@ -335,7 +463,7 @@ export function PurchasesPage() {
               reloadKey={unitsNonce}
             />
           )}
-          <PurchaseList purchases={snapshot.purchases} />
+          {online ? <PurchaseList purchases={snapshot.purchases} /> : null}
         </>
       ) : null}
     </main>
