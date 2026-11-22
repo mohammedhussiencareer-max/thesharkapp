@@ -17,6 +17,7 @@ import {
   recordOpeningStock,
 } from '@/purchases/api';
 import { OpeningPage } from '@/pages/OpeningPage';
+import { cairoDateTimeLocalToIso } from '@/purchases/time';
 import type { StockChoice, UnitOption } from '@/purchases/types';
 
 vi.mock('@/purchases/api', () => ({
@@ -93,7 +94,12 @@ describe('OpeningPage', () => {
     fireEvent.change(screen.getByLabelText('تكلفة زيت'), {
       target: { value: '12.5' },
     });
+    const stampIso = cairoDateTimeLocalToIso(
+      screen.getByLabelText<HTMLInputElement>('وقت الرصيد').value,
+    );
+    expect(stampIso).not.toBeNull();
     expect(listUnitsAt).toHaveBeenCalledTimes(1);
+    expect(listUnitsAt).toHaveBeenCalledWith(['oil'], stampIso);
     expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
     await act(async () => {
       releaseUnits({});
@@ -119,6 +125,7 @@ describe('OpeningPage', () => {
         expectedFactor: '1',
       },
     ]);
+    expect(payload?.occurredAt).toBe(stampIso);
     expect(payload?.requestId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
     );
@@ -138,6 +145,8 @@ describe('OpeningPage', () => {
       expect(listStockChoices).toHaveBeenCalledTimes(2);
     });
     expect(screen.getByLabelText('كمية زيت')).toHaveValue('');
+    // The page lock, not only the remounted grid's unit lookup, holds the form.
+    expect(screen.getByLabelText('كمية زيت')).toBeDisabled();
     expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
 
     releaseReload([{ ...oil, hasMovements: true }]);
