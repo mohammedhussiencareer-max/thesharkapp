@@ -90,6 +90,9 @@ function fakeDb(
       timeouts.push({ attemptId, orderId, generation });
       return takeReply();
     },
+    async recoverAccountingAttempt() {
+      return 'absent';
+    },
   };
   return { db, runs, reports, timeouts };
 }
@@ -389,6 +392,37 @@ describe('drainAccountingWork', () => {
     expect(reports).toEqual([]);
     expect(timeouts).toHaveLength(2);
     expect(timeouts[0]).toEqual(timeouts[1]);
+  });
+
+  it('continues when a lost unbound reply had already committed', async () => {
+    const network = new SupabaseRpcError(
+      'Supabase RPC failed: network',
+      'network',
+    );
+    const runs: string[] = [];
+    const db: AccountingDb = {
+      async getNextWork() {
+        return { status: 'empty', head: null };
+      },
+      async runAccountingWork(attemptId) {
+        runs.push(attemptId);
+        if (runs.length === 1) throw network;
+        return run('empty');
+      },
+      async recordAccountingCallFailure() {
+        return 'recorded';
+      },
+      async recordAccountingRecomputeTimeout() {
+        return 'recorded';
+      },
+      async recoverAccountingAttempt() {
+        return 'committed';
+      },
+    };
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('empty');
+    expect(outcome.calls).toBe(2);
+    expect(outcome.report).toBeNull();
   });
 
   it('makes no report when an unbound (maintenance) call fails, as it processed no order', async () => {

@@ -119,6 +119,14 @@ export async function drainAccountingWork(
     try {
       run = await db.runAccountingWork(attemptId, DRAIN_BATCH_LIMIT, binding);
     } catch (error) {
+      if (binding === null && isUnknownOutcome(error)) {
+        try {
+          const recovered = await db.recoverAccountingAttempt(attemptId);
+          if (recovered === 'committed') continue;
+        } catch {
+          // The recovery read failed. Fall through and stop.
+        }
+      }
       return failedCall(db, attemptId, binding, error, pacing, done);
     }
     if (run.status === 'stale') {

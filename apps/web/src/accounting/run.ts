@@ -88,6 +88,7 @@ export type AccountingDb = {
     orderId: string,
     workGeneration: number,
   ): Promise<FailureReport>;
+  recoverAccountingAttempt?(attemptId: string): Promise<'committed' | 'absent'>;
 };
 
 export type RunOutcome = {
@@ -194,6 +195,18 @@ export async function runAccountingWork(
     try {
       run = await db.runAccountingWork(attemptId, RUN_BATCH_LIMIT, binding);
     } catch (error) {
+      if (
+        binding === null &&
+        isUnknownOutcome(error) &&
+        db.recoverAccountingAttempt
+      ) {
+        try {
+          const recovered = await db.recoverAccountingAttempt(attemptId);
+          if (recovered === 'committed') continue;
+        } catch {
+          // The recovery read failed. Fall through and stop.
+        }
+      }
       if (held && isUnknownOutcome(error)) {
         held.failureKind =
           failureCode(error) === '57014' ? 'recompute_timeout' : 'escaped';

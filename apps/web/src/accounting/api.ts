@@ -787,6 +787,7 @@ async function writeRpc(
     | 'accounting_next_work'
     | 'run_accounting_work'
     | 'record_accounting_call_failure'
+    | 'recover_accounting_attempt'
     | 'record_accounting_recompute_timeout'
     | 'retry_accounting_work'
     | 'activate_inventory',
@@ -815,6 +816,20 @@ export function webAccountingDb(): AccountingDb {
             : {}),
         }),
       );
+    },
+    async recoverAccountingAttempt(attemptId) {
+      const row = await writeRpc('recover_accounting_attempt', {
+        p_attempt_id: attemptId,
+      });
+      if (
+        !row ||
+        typeof row !== 'object' ||
+        !('status' in row) ||
+        (row.status !== 'committed' && row.status !== 'absent')
+      ) {
+        throw new Error('unreadable recovery');
+      }
+      return row.status;
     },
     async recordAccountingCallFailure(attemptId, orderId, workGeneration) {
       return failureReportOf(

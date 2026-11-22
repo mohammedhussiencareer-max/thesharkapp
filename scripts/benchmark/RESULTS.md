@@ -11,26 +11,26 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 35
 - weekly anchors: 5
 - events plus anchors: 3538
-- queue depth 1 ms: 0.234
-- queue depth 50000 ms: 0.209
+- queue depth 1 ms: 0.488
+- queue depth 50000 ms: 0.538
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 23.33
+- confirming replay ms: 20.166
 - prefix rows: 0
 - resumed from checkpoint: true
 - shared hit+read limit: 5000
-- fresh buffers: 8
+- fresh buffers: 3
 - selective restore seconds: 0.013
 - selective restore crossed 2s: false
 - selective prefix rows: 0
 - selective deficit rows: 1
 - selective buffers: 10
 - selective resumed: true
-- large-share restore seconds: 0.019
+- large-share restore seconds: 0.017
 - large-share restore crossed 2s: false
 - large-share prefix rows: 0
 - large-share deficit rows: 201
@@ -43,9 +43,9 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.082
+- wall clock seconds: 0.07
 - crossed 2s: false
-- aged cover seconds: 0.04
+- aged cover seconds: 0.035
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1
@@ -63,41 +63,41 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 365
 - weekly anchors: 52
 - events plus anchors: 36868
-- queue depth 1 ms: 0.316
-- queue depth 50000 ms: 0.223
+- queue depth 1 ms: 5.678
+- queue depth 50000 ms: 5.695
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 59.542
+- confirming replay ms: 58.564
 - prefix rows: 0
 - resumed from checkpoint: true
 - shared hit+read limit: 5000
 - fresh buffers: 4
-- selective restore seconds: 0.019
+- selective restore seconds: 0.013
 - selective restore crossed 2s: false
 - selective prefix rows: 0
 - selective deficit rows: 1
 - selective buffers: 11
 - selective resumed: true
-- large-share restore seconds: 0.031
+- large-share restore seconds: 0.023
 - large-share restore crossed 2s: false
 - large-share prefix rows: 0
-- large-share deficit rows: 405
-- large-share buffers: 842
+- large-share deficit rows: 404
+- large-share buffers: 840
 - large-share resumed: true
-- large-share table rows: 810
+- large-share table rows: 808
 - measured status: processed
 - failed: 0
 - completion outcome: applied
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.179
+- wall clock seconds: 0.147
 - crossed 2s: false
-- aged cover seconds: 0.057
+- aged cover seconds: 0.053
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1
@@ -115,41 +115,41 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 730
 - weekly anchors: 104
 - events plus anchors: 73733
-- queue depth 1 ms: 0.318
-- queue depth 50000 ms: 6.122
+- queue depth 1 ms: 18.478
+- queue depth 50000 ms: 13.216
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 120.284
+- confirming replay ms: 395.959
 - prefix rows: 0
 - resumed from checkpoint: true
 - shared hit+read limit: 5000
 - fresh buffers: 4
-- selective restore seconds: 0.026
+- selective restore seconds: 0.035
 - selective restore crossed 2s: false
 - selective prefix rows: 0
 - selective deficit rows: 1
 - selective buffers: 11
 - selective resumed: true
-- large-share restore seconds: 0.058
+- large-share restore seconds: 0.055
 - large-share restore crossed 2s: false
 - large-share prefix rows: 0
-- large-share deficit rows: 813
-- large-share buffers: 2092
+- large-share deficit rows: 810
+- large-share buffers: 2081
 - large-share resumed: true
-- large-share table rows: 1626
+- large-share table rows: 1620
 - measured status: processed
 - failed: 0
 - completion outcome: applied
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.743
+- wall clock seconds: 0.711
 - crossed 2s: false
-- aged cover seconds: 0.078
+- aged cover seconds: 0.095
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1

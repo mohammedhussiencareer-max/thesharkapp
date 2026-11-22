@@ -199,6 +199,32 @@ describe('runAccountingWork', () => {
     expect(timeout).not.toHaveBeenCalled();
   });
 
+  it('continues after a lost reply when the unbound attempt committed', async () => {
+    let calls = 0;
+    const recover = vi.fn(() => Promise.resolve('committed' as const));
+    const db = harness({
+      getNextWork: vi.fn(() => Promise.resolve(next('empty', null))),
+      runAccountingWork: vi.fn(() => {
+        calls += 1;
+        if (calls === 1) return Promise.reject(new Error('network'));
+        return Promise.resolve({
+          status: 'empty' as const,
+          counts: zeroAccountingCounts(),
+          head: null,
+          critical: null,
+        });
+      }),
+      recoverAccountingAttempt: recover,
+    });
+    const result = await runAccountingWork(db, {
+      clock: () => 0,
+      sleep: noSleep,
+    });
+    expect(result.stop).toBe('empty');
+    expect(result.calls).toBe(2);
+    expect(recover).toHaveBeenCalledTimes(1);
+  });
+
   it('does not record an unbound unknown outcome', async () => {
     const record = vi.fn(() => Promise.resolve('recorded' as const));
     const db = harness({

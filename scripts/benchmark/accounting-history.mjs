@@ -13,7 +13,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const owner = 'b9e00000-0000-4000-8000-0000000000a1';
@@ -131,21 +131,43 @@ function setupSql(anchor) {
     .map(
       (history) => `
 insert into app.stock_items (id, name, kind, base_unit, count_frequency)
-values ('${history.agedItem}', 'bench ${history.name} aged', 'seafood', 'kg', 'daily');
-select app.set_item_opening_price(
-  '${history.agedPriceRequest}',
-  '${history.agedItem}',
-  10,
-  null,
-  null,
-  'kg|seafood||'
-);
-select app.post_movements(jsonb_build_array(jsonb_build_object(
-  'item_id', '${history.agedItem}',
-  'movement_type', 'sale',
-  'occurred_at', timestamptz '${anchor}' - interval '40 days',
-  'quantity', 1
-)));`,
+values ('${history.agedItem}', 'bench ${history.name} aged', 'seafood', 'kg', 'daily')
+on conflict (id) do nothing;
+do $$
+begin
+  if not exists (
+    select 1
+    from app.item_opening_prices price
+    where price.item_id = '${history.agedItem}'
+      and price.superseded_change_id is null
+  ) then
+    perform app.set_item_opening_price(
+      '${history.agedPriceRequest}',
+      '${history.agedItem}',
+      10,
+      null,
+      null,
+      'kg|seafood||'
+    );
+  end if;
+  if not exists (
+    select 1
+    from app.stock_movements movement
+    where movement.item_id = '${history.agedItem}'
+      and movement.movement_type = 'sale'
+  ) then
+    -- The public purchase and movement posters close a pre-window effect.
+    -- This fixture still needs the deficit on its own day, so it uses the
+    -- engine outflow, and only when that sale is not already posted.
+    perform app.post_engine_outflows(jsonb_build_array(jsonb_build_object(
+      'item_id', '${history.agedItem}',
+      'movement_type', 'sale',
+      'occurred_at', timestamptz '${anchor}' - interval '40 days',
+      'quantity', 1
+    )));
+  end if;
+end
+$$;`,
     )
     .join('\n');
   return `
@@ -164,8 +186,11 @@ insert into auth.users (
   '2026-01-01 00:00:00+00',
   '', '', '', ''
 ) on conflict (id) do nothing;
-insert into app.owner (user_id) values ('${owner}')
-on conflict (user_id) do nothing;
+insert into app.owner (user_id)
+select '${owner}'
+where not exists (
+  select 1 from app.owner owner_row where owner_row.user_id = '${owner}'
+);
 ${claims()}
 ${agedSales}
 commit;
@@ -355,20 +380,65 @@ select
 from inserted;`;
 }
 
-function postCallSql(history, startAt, count, post, anchor) {
-  const parts = [];
-  let posted = startAt;
-  const end = startAt + count;
-  while (posted < end) {
-    const used = posted % history.perDay;
-    const take = Math.min(history.perDay - used, end - posted);
-    parts.push(Array.from({ length: take }, () => post).join('\n'));
-    posted += take;
-    if (posted % history.perDay === 0) {
-      parts.push(dayCountSql(history, posted / history.perDay, anchor));
-    }
-  }
-  return parts.join('\n');
+function postCallSql(history, startAt, count, _post, anchor) {
+  const openingQty = history.days * history.perDay + 1;
+  return `
+create function pg_temp.post_day_count(p_day integer) returns void
+language plpgsql as $count$
+declare
+  v_count uuid;
+  v_actual numeric;
+begin
+  v_actual := ${openingQty} - p_day * ${history.perDay};
+  insert into app.stock_counts (id, request_id, frequency, counted_at)
+  values (
+    pg_catalog.gen_random_uuid(),
+    pg_catalog.gen_random_uuid(),
+    'daily',
+    ${countAt(anchor, history.days)} + (p_day - 1) * interval '1 day'
+  )
+  returning id into v_count;
+  insert into app.stock_count_lines (
+    count_id, line_no, item_id, expected_base_unit,
+    counted_qty, expected_qty, delta_qty, delta_value
+  )
+  values (v_count, 1, '${history.item}', 'kg', v_actual, v_actual, 0, 0);
+  if p_day % 7 = 0 then
+    insert into app.stock_counts (id, request_id, frequency, counted_at)
+    values (
+      pg_catalog.gen_random_uuid(),
+      pg_catalog.gen_random_uuid(),
+      'weekly',
+      ${weekAt(anchor, history.days)} + (p_day / 7 - 1) * interval '7 days'
+    )
+    returning id into v_count;
+    insert into app.stock_count_lines (
+      count_id, line_no, item_id, expected_base_unit,
+      counted_qty, expected_qty, delta_qty, delta_value
+    )
+    values (v_count, 1, '${history.weeklyItem}', 'kg', 0, 0, 0, 0);
+  end if;
+end
+$count$;
+create procedure pg_temp.post_bench_chunk()
+language plpgsql as $chunk$
+declare
+  i integer;
+  n integer := ${startAt};
+begin
+  for i in 1..${count} loop
+    perform pg_temp.post_next_bench_order('${history.prefix}');
+    n := n + 1;
+    commit;
+    if n % ${history.perDay} = 0 then
+      perform pg_temp.post_day_count(n / ${history.perDay});
+      commit;
+    end if;
+  end loop;
+end
+$chunk$;
+call pg_temp.post_bench_chunk();
+`;
 }
 
 function postSql(
@@ -382,6 +452,7 @@ function postSql(
   // A count is written after the day it closes. Inserting every future count
   // first would put the checkpoint cut on the last anchor, and every later
   // order would fall behind that cut, so the walk could not resume.
+  // One DO loop posts the chunk so the docker stdin pipe stays small.
   const startAt = reset ? 0 : already;
   const callSql = postCallSql(history, startAt, calls, post, anchor);
   const progressSql = reset
@@ -442,21 +513,21 @@ begin
   end if;
 end
 $$;
-set statement_timeout = '6s';
-${callSql}
 set statement_timeout = 0;
+${callSql}
 do $$
 begin
   if (
     select posted
     from public.bench_build_progress
     where history = '${history.name}'
-  ) <> ${orders} then
+  ) <> ${startAt + calls} then
     raise exception 'history gate failed: applied % of % orders',
       (select posted from public.bench_build_progress where history = '${history.name}'),
-      ${orders};
+      ${startAt + calls};
   end if;
-  if exists (
+  if ${startAt + calls} = ${orders}
+    and exists (
     select 1
     from app.pos_orders o
     where o.id like '${history.prefix}-%'
@@ -480,7 +551,7 @@ begin
   end if;
 end
 $$;
-select 'history ${history.name} posted ${orders}';
+select 'history ${history.name} posted ${startAt + calls}';
 `;
 }
 
@@ -1185,6 +1256,10 @@ function formatResult(row) {
   return lines.join('\n');
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function existingResultRows() {
   const path = join(here, 'RESULTS.md');
   if (!existsSync(path)) return [];
@@ -1196,8 +1271,16 @@ function existingResultRows() {
       const body = part.slice(part.indexOf('\n') + 1).trim();
       if (!name || body.startsWith('gate: FAIL')) return null;
       const value = (label) => {
-        const match = body.match(new RegExp(`^- ${label}: (.+)$`, 'm'));
+        const match = body.match(
+          new RegExp(`^- ${escapeRegExp(label)}: (.+)$`, 'm'),
+        );
         return match ? match[1].trim() : null;
+      };
+      const maybeNumber = (label) => {
+        const raw = value(label);
+        if (raw == null) return undefined;
+        const parsed = Number(raw);
+        return Number.isFinite(parsed) ? parsed : undefined;
       };
       const seconds = Number(value('wall clock seconds'));
       if (!Number.isFinite(seconds)) return null;
@@ -1252,6 +1335,30 @@ function existingResultRows() {
         split: value('split normal and provisional') === 'true',
         seconds,
         crossed_2s: value('crossed 2s') === 'true',
+        prefix_rows: Number(value('prefix rows')),
+        resumed: value('resumed from checkpoint') === 'true',
+        buffer_limit: maybeNumber('shared hit+read limit'),
+        buffers: Number(value('fresh buffers')),
+        selective_seconds: Number(value('selective restore seconds')),
+        selective_crossed_2s: value('selective restore crossed 2s') === 'true',
+        selective_prefix_rows: Number(value('selective prefix rows')),
+        selective_deficit_rows: Number(value('selective deficit rows')),
+        selective_buffers: Number(value('selective buffers')),
+        selective_resumed: value('selective resumed') === 'true',
+        large_seconds: Number(value('large-share restore seconds')),
+        large_crossed_2s: value('large-share restore crossed 2s') === 'true',
+        large_prefix_rows: Number(value('large-share prefix rows')),
+        large_deficit_rows: Number(value('large-share deficit rows')),
+        large_buffers: Number(value('large-share buffers')),
+        large_resumed: value('large-share resumed') === 'true',
+        large_table_rows: Number(value('large-share table rows')),
+        aged_seconds: Number(value('aged cover seconds')),
+        aged_crossed_2s: value('aged cover crossed 2s') === 'true',
+        aged_prefix_rows: Number(value('aged prefix rows')),
+        aged_deficit_rows: Number(value('aged deficit rows')),
+        aged_buffers: Number(value('aged buffers')),
+        aged_resumed: value('aged resumed') === 'true',
+        aged_covered: value('aged deficit covered') === 'true',
         pass: value('gate') === 'PASS',
       };
     })
@@ -1324,6 +1431,16 @@ function psqlCaptured(sql) {
       if (code === 0) resolve({ out, err });
       else reject(new Error((err || out).trim().slice(0, 2000)));
     });
+    child.on('error', (error) => {
+      reject(error);
+    });
+    child.stdin.on('error', (error) => {
+      reject(
+        new Error(
+          `docker stdin ${error.code ?? error.message}: ${(err || out).trim().slice(0, 500)}`,
+        ),
+      );
+    });
     child.stdin.end(sql);
   });
 }
@@ -1353,6 +1470,17 @@ async function postedCount(historyName) {
     return result.out.trim();
   } catch {
     return 'unknown';
+  }
+}
+
+async function catalogReady(history) {
+  try {
+    const result = await psqlCaptured(
+      `select count(*)::text from app.stock_items where id = '${history.item}';`,
+    );
+    return firstInteger(result.out) > 0;
+  } catch {
+    return false;
   }
 }
 
@@ -1386,19 +1514,22 @@ async function run() {
     process.stderr.write(`\nbuilding ${history.name}\n`);
     try {
       if (history.name !== skipBuild) {
-        if (!resume) await psqlCaptured(historySql(history, anchor));
-        const already = resume ? await postedReceipts(history) : 0;
+        const haveCatalog = resume && (await catalogReady(history));
+        if (!haveCatalog) await psqlCaptured(historySql(history, anchor));
+        const already = haveCatalog ? await postedReceipts(history) : 0;
         const orders = history.days * history.perDay;
         const remaining = orders - (Number.isFinite(already) ? already : 0);
         process.stderr.write(
           `resume=${resume} already=${already} remaining=${remaining}\n`,
         );
         if (remaining > 0) {
+          // One CALL posts the remaining orders and commits each one.
+          // A 36,500-statement stdin pipe has killed Docker Desktop.
           await psqlCaptured(
             postSql(history, anchor, {
               remaining,
-              reset: !resume,
-              already: resume ? already : 0,
+              reset: !haveCatalog,
+              already: Number.isFinite(already) ? already : 0,
             }),
           );
         }
@@ -1443,7 +1574,14 @@ async function run() {
   );
 }
 
-run().catch((error) => {
-  process.stderr.write(`${error.message}\n`);
-  process.exitCode = 1;
-});
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  run().catch((error) => {
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+  });
+}
+
+export { setupSql, histories };

@@ -6063,6 +6063,18 @@ select
   pg_temp.shift ('p77-wcost', '2026-09-25 08:00+00', false);
 
 select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config('app.test_clock', '2026-09-25 12:00:00+00', true);
+
+select
   app.post_movements (
     pg_catalog.jsonb_build_array (
       pg_catalog.jsonb_build_object (
@@ -6101,6 +6113,18 @@ select
       )
     )
   );
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
 
 select
   app.record_waste (
@@ -6159,6 +6183,7 @@ select
       from app.accounting_revision_differences diff
       join app.waste_documents document
         on document.id::text = diff.cause_id
+       and diff.cause_kind = 'waste_document'
        and document.request_id = md5('p77-waste-100')::uuid$$,
     $$values ('waste_document', '20.00', '-20.00', true, 'p77-change')$$,
     'a closed waste correction is attributed to the current shift, not the historical one'
