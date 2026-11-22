@@ -8,6 +8,7 @@ import {
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { HeldWriteStorageError } from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import { setOrderDisposition } from '@/order-decisions/api';
@@ -149,15 +150,24 @@ export function DecisionForm({
       setProblem(returnedReviewMessage);
       return;
     }
+    let action: DecisionWrite;
+    try {
+      action = beginAction<DecisionWrite>(subject, (requestId) => ({
+        requestId,
+        orderId: row.orderId,
+        decision: choice,
+        token: row.token,
+        reason: flipping ? reasonText : null,
+        returned: clearing ? [] : parsed?.ok === true ? parsed.lines : null,
+      }));
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        setProblem(failure.message);
+        return;
+      }
+      throw failure;
+    }
     noteDecisionOrder(row.orderId);
-    const action = beginAction<DecisionWrite>(subject, (requestId) => ({
-      requestId,
-      orderId: row.orderId,
-      decision: choice,
-      token: row.token,
-      reason: flipping ? reasonText : null,
-      returned: clearing ? [] : parsed?.ok === true ? parsed.lines : null,
-    }));
     void finish(action);
   }
 

@@ -32,6 +32,7 @@ import {
 import {
   beginAction,
   createSubject,
+  firstUnknownItemCreate,
   hasAction,
   hasItemConfigurationAction,
   lossSubject,
@@ -59,6 +60,7 @@ import {
   type ItemSave,
 } from '@/items/types';
 
+import { HeldWriteStorageError } from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { cairoDateTimeLocalToIso } from '@/purchases/time';
 import {
@@ -200,10 +202,13 @@ export function ItemForm({
     editingId === undefined || heldNow < 0
       ? null
       : unknownAction<PriceAction>(priceSubject(editingId));
+  const restoredCreateDraft =
+    editingId !== undefined || heldNow < 0 ? null : firstUnknownItemCreate();
+  const activeCreateDraft = submittedDraft ?? restoredCreateDraft;
   const createHeld =
-    submittedDraft === null || heldNow < 0
+    activeCreateDraft === null || heldNow < 0
       ? null
-      : unknownAction<string>(createSubject(submittedDraft));
+      : unknownAction<string>(createSubject(activeCreateDraft));
   const lossBlocked = lossHeld !== null;
   const priceBlocked = priceHeld !== null;
   const createBlocked = createHeld !== null;
@@ -429,16 +434,18 @@ export function ItemForm({
 
   function retryCreate() {
     if (
-      !submittedDraft ||
+      !activeCreateDraft ||
       submitting ||
       locked ||
       !isOnline() ||
       createFlight.current
     )
       return;
-    if (unknownAction<string>(createSubject(submittedDraft)) === null) return;
+    if (unknownAction<string>(createSubject(activeCreateDraft)) === null)
+      return;
     createFlight.current = true;
-    void onSubmit({ kind: 'create', draft: submittedDraft })
+    setSubmittedDraft(activeCreateDraft);
+    void onSubmit({ kind: 'create', draft: activeCreateDraft })
       .catch(() => undefined)
       .finally(() => {
         createFlight.current = false;
@@ -567,10 +574,19 @@ export function ItemForm({
         return;
       }
     }
-    const action = beginAction(lossSubject(editingId), (requestId) => ({
-      lossPct,
-      write: { ...built.write, requestId },
-    }));
+    let action: LossAction;
+    try {
+      action = beginAction(lossSubject(editingId), (requestId) => ({
+        lossPct,
+        write: { ...built.write, requestId },
+      }));
+    } catch (error) {
+      if (error instanceof HeldWriteStorageError) {
+        setExtraError(error.message);
+        return;
+      }
+      throw error;
+    }
     void finishLoss(action);
   }
 
@@ -623,13 +639,22 @@ export function ItemForm({
       return;
     }
     const reason = price === '0' ? priceReason.trim() : null;
-    const action = beginAction(priceSubject(editingId), (requestId) => ({
-      price,
-      reason,
-      expectedId: editing?.openingPriceId ?? null,
-      identity,
-      requestId,
-    }));
+    let action: PriceAction;
+    try {
+      action = beginAction(priceSubject(editingId), (requestId) => ({
+        price,
+        reason,
+        expectedId: editing?.openingPriceId ?? null,
+        identity,
+        requestId,
+      }));
+    } catch (error) {
+      if (error instanceof HeldWriteStorageError) {
+        setPriceError(error.message);
+        return;
+      }
+      throw error;
+    }
     void finishPrice(action);
   }
 

@@ -6,12 +6,15 @@ import {
 } from '@/items/errors';
 import {
   beginAction,
+  clearActionPostedReload,
   hasAction,
+  markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { HeldWriteStorageError } from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { updateRecipe, type RecipeUpdate } from '@/recipes/api';
 import { recipeKindLabels } from '@/recipes/labels';
@@ -72,8 +75,11 @@ export function RecipeDetails({
     setNotice(null);
     try {
       await updateRecipe(action.recipeId, action.update);
-      settleAction(subject, action.update.requestId);
+      markActionPostedReload(subject, action.update.requestId, subject);
       const fresh = await onReload();
+      if (fresh !== null) {
+        clearActionPostedReload(subject, subject);
+      }
       adopt(
         fresh ?? {
           ...expected,
@@ -111,16 +117,25 @@ export function RecipeDetails({
       setNotice('مفيش تغيير للحفظ');
       return;
     }
-    const action = beginAction<DetailsAction>(subject, (requestId) => ({
-      recipeId: recipe.id,
-      update: {
-        requestId,
-        name,
-        active,
-        expectedName: expected.name,
-        expectedActive: expected.active,
-      },
-    }));
+    let action: DetailsAction;
+    try {
+      action = beginAction<DetailsAction>(subject, (requestId) => ({
+        recipeId: recipe.id,
+        update: {
+          requestId,
+          name,
+          active,
+          expectedName: expected.name,
+          expectedActive: expected.active,
+        },
+      }));
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        setError(failure.message);
+        return;
+      }
+      throw failure;
+    }
     void finish(action);
   }
 

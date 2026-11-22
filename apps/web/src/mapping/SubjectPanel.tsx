@@ -3,7 +3,9 @@ import { currentMinuteMs, type SchedulePoint } from '@/items/effective';
 import { messageFrom } from '@/items/errors';
 import {
   beginAction,
+  clearActionPostedReload,
   hasAction,
+  markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
@@ -11,6 +13,7 @@ import {
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatCairo } from '@/lib/cairo';
+import { HeldWriteStorageError } from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import {
@@ -382,7 +385,7 @@ export function SubjectPanel({
         if (action.kind === 'mapping') await setBaseMapping(action.write);
         else if (action.kind === 'policy') await setOptionPolicy(action.write);
         else await setException(action.write);
-        settleAction(subject, requestId);
+        markActionPostedReload(subject, requestId, subject);
         setResetEpoch((value) => value + 1);
       } catch (failure) {
         settleAction(subject, requestId, failure);
@@ -391,6 +394,7 @@ export function SubjectPanel({
         return;
       }
       await onReload();
+      clearActionPostedReload(subject, subject);
       setNotice(
         action.kind === 'mapping'
           ? savedMappingMessage
@@ -627,16 +631,25 @@ function BaseMappingForm({
       return;
     }
     onError(null);
-    const action = beginAction<BaseHeld>(subject, (requestId) => ({
-      kind: 'mapping',
-      write: {
-        ...dated.write,
-        requestId,
-        posItemId: base.posItemId,
-        sizeKey: base.sizeKey,
-        target: target.target,
-      },
-    }));
+    let action: BaseHeld;
+    try {
+      action = beginAction<BaseHeld>(subject, (requestId) => ({
+        kind: 'mapping',
+        write: {
+          ...dated.write,
+          requestId,
+          posItemId: base.posItemId,
+          sizeKey: base.sizeKey,
+          target: target.target,
+        },
+      }));
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        onError(failure.message);
+        return;
+      }
+      throw failure;
+    }
     onFinish(action);
   }
 
@@ -772,16 +785,25 @@ function PolicyForm({
       return;
     }
     onError(null);
-    const action = beginAction<BaseHeld>(subject, (requestId) => ({
-      kind: 'policy',
-      write: {
-        ...dated.write,
-        requestId,
-        posItemId: base.posItemId,
-        sizeKey: base.sizeKey,
-        policy: policy === '' ? null : policy,
-      },
-    }));
+    let action: BaseHeld;
+    try {
+      action = beginAction<BaseHeld>(subject, (requestId) => ({
+        kind: 'policy',
+        write: {
+          ...dated.write,
+          requestId,
+          posItemId: base.posItemId,
+          sizeKey: base.sizeKey,
+          policy: policy === '' ? null : policy,
+        },
+      }));
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        onError(failure.message);
+        return;
+      }
+      throw failure;
+    }
     onFinish(action);
   }
 
@@ -904,16 +926,25 @@ function ExceptionForm({
       return;
     }
     onError(null);
-    const action = beginAction<BaseHeld>(subject, (requestId) => ({
-      kind: 'exception',
-      write: {
-        ...dated.write,
-        requestId,
-        posItemId: base.posItemId,
-        sizeKey: base.sizeKey,
-        exceptionReason: trimmed.length === 0 ? null : trimmed,
-      },
-    }));
+    let action: BaseHeld;
+    try {
+      action = beginAction<BaseHeld>(subject, (requestId) => ({
+        kind: 'exception',
+        write: {
+          ...dated.write,
+          requestId,
+          posItemId: base.posItemId,
+          sizeKey: base.sizeKey,
+          exceptionReason: trimmed.length === 0 ? null : trimmed,
+        },
+      }));
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        onError(failure.message);
+        return;
+      }
+      throw failure;
+    }
     onFinish(action);
   }
 
@@ -1098,7 +1129,7 @@ function OptionMappingForm({
     try {
       try {
         await setOptionMapping(write);
-        settleAction(subject, write.requestId);
+        markActionPostedReload(subject, write.requestId, subject);
         setDirty(false);
       } catch (failure) {
         settleAction(subject, write.requestId, failure);
@@ -1107,6 +1138,7 @@ function OptionMappingForm({
         return;
       }
       await onReload();
+      clearActionPostedReload(subject, subject);
       setNotice(savedOptionMessage);
     } catch (failure) {
       setError(messageFrom(failure));
@@ -1148,15 +1180,24 @@ function OptionMappingForm({
       setError(target.error);
       return;
     }
-    const action = beginAction<OptionMappingWrite>(subject, (requestId) => ({
-      ...dated.write,
-      requestId,
-      scope,
-      posItemId: scope === 'item' ? base.posItemId : null,
-      sizeKey: scope === 'item' ? base.sizeKey : null,
-      optionValue,
-      target: target.target,
-    }));
+    let action: OptionMappingWrite;
+    try {
+      action = beginAction<OptionMappingWrite>(subject, (requestId) => ({
+        ...dated.write,
+        requestId,
+        scope,
+        posItemId: scope === 'item' ? base.posItemId : null,
+        sizeKey: scope === 'item' ? base.sizeKey : null,
+        optionValue,
+        target: target.target,
+      }));
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        setError(failure.message);
+        return;
+      }
+      throw failure;
+    }
     void finish(action);
   }
 

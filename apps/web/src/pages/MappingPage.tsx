@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
+import { clearActionPostedReload } from '@/items/request-id';
 import { cairoDateIso, formatCairo } from '@/lib/cairo';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import {
@@ -17,7 +18,9 @@ import {
   subjectTitle,
 } from '@/mapping/format';
 import { statusLabel } from '@/mapping/labels';
+import { baseSubject, optionSubject } from '@/mapping/subjects';
 import { SubjectPanel } from '@/mapping/SubjectPanel';
+import { basePackagingSubject } from '@/packaging/subjects';
 import type {
   Coverage,
   MappingCatalog,
@@ -29,6 +32,22 @@ import {
   cairoNextDateStartIso,
   dateRangeError,
 } from '@/purchases/time';
+
+function clearMappingReloads(base: ObservedBase, detail: SubjectDetail): void {
+  const baseSubj = baseSubject(base.posItemId, base.sizeKeyText);
+  clearActionPostedReload(baseSubj, baseSubj);
+  const packSubj = basePackagingSubject(base.posItemId, base.sizeKeyText);
+  clearActionPostedReload(packSubj, packSubj);
+  for (const binding of detail.optionBindings) {
+    const optSubj = optionSubject(
+      binding.scope,
+      binding.scope === 'item' ? base.posItemId : '',
+      binding.scope === 'item' ? base.sizeKeyText : '',
+      binding.optionValue,
+    );
+    clearActionPostedReload(optSubj, optSubj);
+  }
+}
 
 function baseKey(base: ObservedBase): string {
   return `${base.posItemId}\n${base.sizeKeyText}`;
@@ -124,6 +143,7 @@ export function MappingPage() {
         }
         setDetail({ key, value: next });
         setDetailError(null);
+        clearMappingReloads(current, next);
       } catch (error) {
         if (
           cancelled ||
@@ -160,6 +180,7 @@ export function MappingPage() {
     }
     setDetail({ key: keyAtStart, value: next });
     setDetailError(null);
+    clearMappingReloads(current, next);
   }
 
   const shown = sortBases(bases ?? []).filter((base) =>

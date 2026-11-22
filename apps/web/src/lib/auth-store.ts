@@ -3,7 +3,9 @@ import {
   clearHeldWritesForUser,
   resetHeldWritesStore,
   setHeldWriteUser,
+  setWritesLocked,
 } from '@/lib/held-writes';
+import { setPwaAuthResolved } from '@/lib/pwa';
 import { supabase } from '@/lib/supabase';
 import type { AuthStatus } from '@/lib/auth-context';
 
@@ -23,6 +25,7 @@ const listeners = new Set<() => void>();
 function emit(next: Snapshot) {
   if (snapshot.status === next.status && snapshot.email === next.email) return;
   snapshot = next;
+  setPwaAuthResolved(next.status !== 'loading' && next.status !== 'checking');
   for (const listener of listeners) listener();
 }
 
@@ -68,6 +71,7 @@ export function startAuth() {
     const previousUserId = currentSession?.user.id ?? lastUserId;
     currentSession = session;
     if (!session) {
+      setWritesLocked(true);
       if (event === 'SIGNED_OUT' && previousUserId) {
         clearHeldWritesForUser(previousUserId);
       }
@@ -78,6 +82,7 @@ export function startAuth() {
       return;
     }
     lastUserId = session.user.id;
+    setWritesLocked(false);
     setHeldWriteUser(session.user.id);
     checkOwner(session);
   });
@@ -97,6 +102,10 @@ export function getAuthSnapshot(): Snapshot {
   return snapshot;
 }
 
+export function isAuthResolved(): boolean {
+  return snapshot.status !== 'loading' && snapshot.status !== 'checking';
+}
+
 export async function signIn(
   email: string,
   password: string,
@@ -112,12 +121,17 @@ export async function signOut() {
   const client = supabase;
   if (!client) return;
   const userId = currentSession?.user.id ?? lastUserId;
+  // Lock all writes and drop active session immediately, BEFORE clearing keys
+  // or awaiting the network sign-out call.
+  setWritesLocked(true);
+  currentSession = null;
+  checkId += 1;
+  emit({ status: 'signed-out', email: null });
   if (userId) {
     clearHeldWritesForUser(userId);
   }
   lastUserId = null;
   setHeldWriteUser(null);
-  checkId += 1;
   await client.auth.signOut();
 }
 
@@ -135,6 +149,7 @@ export function resetAuthStore() {
   unsubscribeAuth = null;
   started = false;
   snapshot = { status: 'loading', email: null };
+  setPwaAuthResolved(false);
   listeners.clear();
   resetHeldWritesStore({ clearStorage: false, resetUser: true });
 }

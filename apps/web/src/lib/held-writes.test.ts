@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   beginHeldWrite,
-  clearHeldWrite,
   clearHeldWritesForUser,
   clearPostedReload,
+  createHeldWriteStore,
   getHeldWrite,
   hasAnyHeldWrite,
   hasPostedReload,
@@ -16,7 +16,12 @@ import {
   updateHeldWritePayload,
   userStoragePrefix,
 } from '@/lib/held-writes';
-import { resetAuthStore, signOut, startAuth } from '@/lib/auth-store';
+import {
+  getAuthSnapshot,
+  resetAuthStore,
+  signOut,
+  startAuth,
+} from '@/lib/auth-store';
 
 type Session = { user: { id: string; email: string } } | null;
 
@@ -219,7 +224,9 @@ describe('held-writes store', () => {
     ).toBe(false);
   });
 
-  it('degrades safely when localStorage throws or contains corrupt data', () => {
+  it('P2-4: degrades safely on reads when localStorage throws or has corrupt data, and reports write failure so writers refuse to send', async () => {
+    const { HeldWriteStorageError, tryPutHeldWrite } =
+      await import('@/lib/held-writes');
     setHeldWriteUser('user-a');
     localStorage.setItem(
       `${userStoragePrefix('user-a')}corrupt`,
@@ -245,15 +252,50 @@ describe('held-writes store', () => {
       throw new DOMException('SecurityError');
     });
 
-    const created = beginHeldWrite('count:daily', (requestId) => ({
-      requestId,
-      qty: '5',
-    }));
-    expect(getHeldWrite('count:daily')?.requestId).toBe(created.requestId);
-    setHeldWritePhase('count:daily', created.requestId, 'unknown');
-    expect(getHeldWrite('count:daily')?.phase).toBe('unknown');
-    clearHeldWrite('count:daily', created.requestId);
+    // Reads never throw.
+    expect(() => getHeldWrite('count:daily')).not.toThrow();
+    expect(hasAnyHeldWrite()).toBe(false);
+
+    // Durable write creation reports failure instead of silently dropping protection.
+    expect(() =>
+      beginHeldWrite('count:daily', (requestId) => ({
+        requestId,
+        qty: '5',
+      })),
+    ).toThrow(HeldWriteStorageError);
+    expect(
+      tryPutHeldWrite('count:daily', {
+        requestId: 'req-fail',
+        payload: { qty: '5' },
+        phase: 'inflight',
+      }),
+    ).toEqual({ ok: false, reason: 'storage' });
     expect(getHeldWrite('count:daily')).toBeNull();
+  });
+
+  it('P2-3: disables __local__ fallback when allowTestLocalUser is false (production build behavior)', async () => {
+    const { createHeldWriteStore } = await import('@/lib/held-writes');
+    const prodStore = createHeldWriteStore({ allowTestLocalUser: false });
+    try {
+      expect(
+        prodStore.tryBeginHeldWrite('count:daily', (requestId) => ({
+          requestId,
+        })),
+      ).toEqual({ ok: false, reason: 'signed_out' });
+      expect(prodStore.getHeldWrite('count:daily')).toBeNull();
+      expect(localStorage.length).toBe(0);
+
+      prodStore.setHeldWriteUser('real-user-id');
+      const started = prodStore.tryBeginHeldWrite(
+        'count:daily',
+        (requestId) => ({
+          requestId,
+        }),
+      );
+      expect(started.ok).toBe(true);
+    } finally {
+      prodStore.dispose();
+    }
   });
 
   it('provides an extension point with kind and payload updates for future pins', () => {
@@ -277,5 +319,106 @@ describe('held-writes store', () => {
       phase: 'unknown',
       payload: { clientId: pin.requestId, step: 2 },
     });
+  });
+
+  it('P1-1: two tabs sharing localStorage cannot overwrite or clear each other pins and sync on storage event', () => {
+    const tab1 = createHeldWriteStore();
+    const tab2 = createHeldWriteStore();
+    const tab3 = createHeldWriteStore();
+    try {
+      tab1.setHeldWriteUser('user-a');
+      tab2.setHeldWriteUser('user-a');
+
+      // Tab 1 writes and marks a purchase pin unknown.
+      const pin1 = tab1.putHeldWrite('purchase:new', {
+        requestId: 'req-tab-1',
+        payload: { requestId: 'req-tab-1', supplier: 'مورد 1' },
+        phase: 'unknown',
+        kind: 'purchase',
+      });
+      expect(pin1.requestId).toBe('req-tab-1');
+
+      // Stale Tab 2 (not yet refreshed) tries to overwrite with a new requestId: must NOT overwrite.
+      const conflict = tab2.tryPutHeldWrite('purchase:new', {
+        requestId: 'req-tab-2',
+        payload: { requestId: 'req-tab-2', supplier: 'مورد 2' },
+        phase: 'inflight',
+        kind: 'purchase',
+      });
+      expect(conflict).toMatchObject({ ok: false, reason: 'conflict' });
+
+      const rawAfterPut = localStorage.getItem(
+        `${userStoragePrefix('user-a')}${encodeURIComponent('purchase:new')}`,
+      );
+      expect(JSON.parse(rawAfterPut ?? '{}')).toMatchObject({
+        requestId: 'req-tab-1',
+        phase: 'unknown',
+      });
+
+      // Stale Tab 2 tries to clear with its own requestId: must NOT remove Tab 1's pin.
+      tab2.clearHeldWrite('purchase:new', 'req-tab-2');
+      const rawAfterClear = localStorage.getItem(
+        `${userStoragePrefix('user-a')}${encodeURIComponent('purchase:new')}`,
+      );
+      expect(rawAfterClear).not.toBeNull();
+      expect(JSON.parse(rawAfterClear ?? '{}')).toMatchObject({
+        requestId: 'req-tab-1',
+      });
+
+      // Tab 3 hydrates empty, then Tab 1 writes a count pin and clears purchase pin.
+      tab1.clearHeldWrite('purchase:new', 'req-tab-1');
+      tab3.setHeldWriteUser('user-a');
+      expect(tab3.hasAnyHeldWrite()).toBe(false);
+      tab1.putHeldWrite('count:daily', {
+        requestId: 'req-count-1',
+        payload: { requestId: 'req-count-1' },
+        phase: 'unknown',
+        kind: 'count',
+      });
+      // Tab 3 checks hasAnyHeldWrite against storage directly even before storage event.
+      expect(tab3.hasAnyHeldWrite()).toBe(true);
+
+      // Storage event refreshes Tab 3's in-memory view without needing rehydrate.
+      const listener = vi.fn();
+      const unsub = tab3.subscribeHeldWritesStore(listener);
+      window.dispatchEvent(
+        new StorageEvent('storage', {
+          key: `${userStoragePrefix('user-a')}${encodeURIComponent('count:daily')}`,
+        }),
+      );
+      expect(listener).toHaveBeenCalled();
+      expect(tab3.getHeldWrite('count:daily')?.requestId).toBe('req-count-1');
+      unsub();
+    } finally {
+      tab1.dispose();
+      tab2.dispose();
+      tab3.dispose();
+    }
+  });
+
+  it('P2-3: signOut locks writes immediately before async auth.signOut resolves', async () => {
+    let resolveSignOut: () => void = () => undefined;
+    const supabaseMod = await import('@/lib/supabase');
+    const signOutSpy = vi
+      .spyOn(supabaseMod.supabase!.auth, 'signOut')
+      .mockImplementationOnce(
+        () =>
+          new Promise<{ error: null }>((resolve) => {
+            resolveSignOut = () => resolve({ error: null });
+          }),
+      );
+
+    authMock.session = { user: { id: 'user-a', email: 'a@theshark.test' } };
+    startAuth();
+
+    const pending = signOut();
+    // Immediately after calling signOut (before Supabase resolves), auth must already be signed out and writes locked.
+    expect(getAuthSnapshot().status).toBe('signed-out');
+    beginHeldWrite('count:daily', (requestId) => ({ requestId, qty: '1' }));
+    expect(getHeldWrite('count:daily')).toBeNull();
+
+    resolveSignOut();
+    await pending;
+    signOutSpy.mockRestore();
   });
 });

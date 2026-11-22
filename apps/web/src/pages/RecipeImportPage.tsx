@@ -3,13 +3,20 @@ import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import {
   beginAction,
+  clearActionPostedReload,
   hasAction,
+  markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
+import {
+  canDispatchWriteFor,
+  captureWriteSession,
+  hasPostedReload,
+} from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
 import {
@@ -115,7 +122,9 @@ function Workspace({
   const [fileError, setFileError] = useState<string | null>(null);
   const [showIssues, setShowIssues] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [stale, setStale] = useState(false);
+  const [stale, setStale] = useState(() =>
+    hasPostedReload(recipeImportSubject),
+  );
   const [reloadError, setReloadError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ImportResult | null>(null);
@@ -184,6 +193,7 @@ function Workspace({
     setReloadError(null);
     try {
       await reload();
+      clearActionPostedReload(recipeImportSubject, recipeImportSubject);
       setStale(false);
     } catch (failure) {
       setReloadError(messageFrom(failure) || genericCatalogError);
@@ -196,7 +206,7 @@ function Workspace({
     let outcome: ImportResult;
     try {
       outcome = await commitRecipeImport(action);
-      settleAction(subject, action.requestId);
+      markActionPostedReload(subject, action.requestId, recipeImportSubject);
     } catch (failure) {
       settleAction(subject, action.requestId, failure);
       setError(messageFrom(failure));
@@ -236,6 +246,7 @@ function Workspace({
       return;
     }
     setError(null);
+    const initiatingUser = captureWriteSession();
     flight.current = true;
     setSaving(true);
     let action: ImportAction;
@@ -243,6 +254,12 @@ function Workspace({
       const tokens = await fetchImportTokens(
         requiredTokens(loaded.review, loaded.parsed),
       );
+      if (!canDispatchWriteFor(initiatingUser)) {
+        flight.current = false;
+        setSaving(false);
+        setError(offlineWriteMessage);
+        return;
+      }
       const payload = buildImportPayload({
         review: loaded.review,
         parsed: loaded.parsed,
@@ -259,6 +276,12 @@ function Workspace({
       flight.current = false;
       setSaving(false);
       setError(messageFrom(failure) || genericCatalogError);
+      return;
+    }
+    if (!canDispatchWriteFor(initiatingUser)) {
+      flight.current = false;
+      setSaving(false);
+      setError(offlineWriteMessage);
       return;
     }
     await run(action);
@@ -453,6 +476,7 @@ export function RecipeImportPage() {
         if (cancelled) return;
         setCtx(next);
         setLoadError(null);
+        clearActionPostedReload(recipeImportSubject, recipeImportSubject);
       } catch (failure) {
         if (!cancelled) setLoadError(messageFrom(failure));
       } finally {

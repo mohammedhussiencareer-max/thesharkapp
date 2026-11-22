@@ -15,12 +15,14 @@ import {
   hasAction,
   activationReviewReloadPending,
   heldAction,
+  heldRequestId,
   pinActivationReviewReload,
   replaceActivationPayload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
+import { HeldWriteStorageError } from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { reloadFailedMessage } from '@/waste/useWasteAction';
 
@@ -132,7 +134,9 @@ export function useActivationAction(
     const current = heldAction<ActivationWrite>(ACTIVATION_SUBJECT);
     const unknownHeld = unknownAction<ActivationWrite>(ACTIVATION_SUBJECT);
     if (reloadPending) {
-      const requestId = (unknownHeld ?? current)?.requestId;
+      const requestId =
+        heldRequestId(ACTIVATION_SUBJECT) ??
+        (unknownHeld ?? current)?.requestId;
       if (!requestId) return;
       flight.current = true;
       setSaving(true);
@@ -147,19 +151,31 @@ export function useActivationAction(
     }
 
     let action: ActivationWrite;
-    if (unknownHeld) {
-      action = unknownHeld;
-    } else if (current && !activationReviewReloadPending(ACTIVATION_SUBJECT)) {
-      action = { ...current, explicitZeroItemIds: zerosOf(checked) };
-      replaceActivationPayload(ACTIVATION_SUBJECT, action.requestId, action);
-    } else {
-      if (hasAction(ACTIVATION_SUBJECT) || !review.openingManifestHash) return;
-      const manifestHash = review.openingManifestHash;
-      action = beginAction(ACTIVATION_SUBJECT, (requestId) => ({
-        requestId,
-        manifestHash,
-        explicitZeroItemIds: zerosOf(checked),
-      }));
+    try {
+      if (unknownHeld) {
+        action = unknownHeld;
+      } else if (
+        current &&
+        !activationReviewReloadPending(ACTIVATION_SUBJECT)
+      ) {
+        action = { ...current, explicitZeroItemIds: zerosOf(checked) };
+        replaceActivationPayload(ACTIVATION_SUBJECT, action.requestId, action);
+      } else {
+        if (hasAction(ACTIVATION_SUBJECT) || !review.openingManifestHash)
+          return;
+        const manifestHash = review.openingManifestHash;
+        action = beginAction(ACTIVATION_SUBJECT, (requestId) => ({
+          requestId,
+          manifestHash,
+          explicitZeroItemIds: zerosOf(checked),
+        }));
+      }
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        setNotice(failure.message);
+        return;
+      }
+      throw failure;
     }
 
     flight.current = true;

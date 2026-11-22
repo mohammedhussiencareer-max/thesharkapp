@@ -7,6 +7,7 @@ import type { ItemDraft } from '@/items/types';
 import {
   beginHeldWrite,
   clearHeldWrite,
+  clearPostedReload,
   getHeldWrite,
   listHeldWritesByPrefix,
   resetHeldWritesStore,
@@ -41,9 +42,11 @@ export function conversionSubject(itemId: string, unit: string): string {
   return `conversion:${JSON.stringify([itemId, unit])}`;
 }
 
+const createPrefix = 'create:';
+
 /** One create action per submitted draft. */
 export function createSubject(draft: ItemDraft): string {
-  return `create:${JSON.stringify({
+  return `${createPrefix}${JSON.stringify({
     name: draft.name.trim(),
     kind: draft.kind,
     baseUnit: draft.baseUnit,
@@ -52,6 +55,37 @@ export function createSubject(draft: ItemDraft): string {
     lossPct: draft.lossPct,
     active: draft.active,
   })}`;
+}
+
+/**
+ * Restore any persisted unknown item-create draft from localStorage after a
+ * reload without relying on in-memory form state.
+ */
+export function firstUnknownItemCreate(): ItemDraft | null {
+  for (const record of listHeldWritesByPrefix(createPrefix)) {
+    if (record.phase !== 'unknown') continue;
+    try {
+      const parsed = JSON.parse(
+        record.subject.slice(createPrefix.length),
+      ) as Partial<ItemDraft> | null;
+      if (
+        parsed &&
+        typeof parsed.name === 'string' &&
+        typeof parsed.kind === 'string' &&
+        typeof parsed.baseUnit === 'string' &&
+        typeof parsed.countFrequency === 'string' &&
+        (parsed.parentItemId === null ||
+          typeof parsed.parentItemId === 'string') &&
+        (parsed.lossPct === null || typeof parsed.lossPct === 'string') &&
+        typeof parsed.active === 'boolean'
+      ) {
+        return parsed as ItemDraft;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 /**
@@ -90,6 +124,24 @@ export function hasItemConfigurationAction(itemId: string): boolean {
   return false;
 }
 
+/** List all unknown conversion actions belonging to a specific item. */
+export function listUnknownConversionsForItem<T>(itemId: string): T[] {
+  const found: T[] = [];
+  for (const record of listHeldWritesByPrefix<T>(conversionPrefix)) {
+    if (record.phase !== 'unknown') continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(record.subject.slice(conversionPrefix.length));
+    } catch {
+      continue;
+    }
+    if (Array.isArray(parsed) && parsed[0] === itemId) {
+      found.push(record.payload);
+    }
+  }
+  return found;
+}
+
 /** The payload whose outcome is still unknown. Null while a send is in flight. */
 export function unknownAction<T>(subject: string): T | null {
   const current = getHeldWrite<T>(subject);
@@ -113,6 +165,13 @@ export function heldAction<T>(subject: string): T | null {
     return null;
   }
   return current.payload;
+}
+
+/** Returns the persisted request id for any non-posted_reload record, including reload-restored activation pins. */
+export function heldRequestId(subject: string): string | null {
+  const current = getHeldWrite(subject);
+  if (!current || current.phase === 'posted_reload') return null;
+  return current.requestId;
 }
 
 /** True while this request must reload the review before it can send again. */
@@ -180,6 +239,26 @@ export function beginAction<T>(
     clearHeldWrite(subject, existing.requestId);
   }
   return beginHeldWrite<T>(subject, create, { kind: 'action' }).payload;
+}
+
+/**
+ * Move a confirmed RPC write to `posted_reload` until its post-write read
+ * covering `readTarget` succeeds.
+ */
+export function markActionPostedReload(
+  subject: string,
+  requestId: string,
+  readTarget: string,
+): void {
+  setHeldWritePhase(subject, requestId, 'posted_reload', { readTarget });
+}
+
+/** Clear a `posted_reload` pin only after a read covering `readTarget` succeeds. */
+export function clearActionPostedReload(
+  subject: string,
+  readTarget?: string,
+): void {
+  clearPostedReload(subject, readTarget);
 }
 
 /**

@@ -27,8 +27,11 @@ import {
   beginAction,
   conversionSubject,
   hasAction,
+  listUnknownConversionsForItem,
   settleAction,
+  subscribeHeldWrites,
   unknownAction,
+  unknownSaveMessage,
   updateActionPayload,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
@@ -47,7 +50,12 @@ import {
 } from '@/items/types';
 import { validateConversion } from '@/items/validation';
 import { formatCairo } from '@/lib/cairo';
-import { isOnline, useOnline } from '@/lib/online';
+import {
+  canDispatchWriteFor,
+  captureWriteSession,
+  HeldWriteStorageError,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 
 const noVersions: readonly CostingVersion[] = [];
 
@@ -179,9 +187,18 @@ function ConversionRow({
       return;
     }
     setError(null);
-    const action = beginAction(subject, (requestId) =>
-      create({ ...built.write, requestId }),
-    );
+    let action: ConversionAction;
+    try {
+      action = beginAction(subject, (requestId) =>
+        create({ ...built.write, requestId }),
+      );
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        setError(failure.message);
+        return;
+      }
+      throw failure;
+    }
     void finish(action);
   }
 
@@ -359,7 +376,30 @@ export function ConversionsPanel({
     addSubject.length === 0 || actionEpoch < 0
       ? null
       : unknownAction<ConversionAction>(addSubject);
+  const detachedUnknown =
+    actionEpoch < 0
+      ? []
+      : listUnknownConversionsForItem<ConversionAction>(item.id).filter(
+          (candidate) => {
+            const candidateSubject = actionSubject(candidate);
+            if (addHeld !== null && candidateSubject === addSubject) {
+              return false;
+            }
+            if (
+              candidate.kind !== 'create_unit_then_conversion' &&
+              (rows ?? []).some((row) => row.unit === candidate.unit)
+            ) {
+              return false;
+            }
+            return true;
+          },
+        );
   const addBlocked = addHeld !== null;
+
+  useEffect(
+    () => subscribeHeldWrites(() => setActionEpoch((value) => value + 1)),
+    [],
+  );
   const addDisabled = controlsDisabled || addBlocked;
   const addTiming = useDatedTiming(
     item.id,
@@ -539,8 +579,12 @@ export function ConversionsPanel({
         );
         return;
       case 'create_unit_then_conversion': {
+        const initiatingUser = captureWriteSession();
         let unitCode = action.createdCode;
         if (unitCode === null) {
+          if (!canDispatchWriteFor(initiatingUser)) {
+            throw new Error(offlineWriteMessage);
+          }
           unitCode = await addCustomUnit(
             action.inputCode,
             action.label,
@@ -557,12 +601,18 @@ export function ConversionsPanel({
             inputCode: action.inputCode,
             label: action.label,
           });
+          if (!canDispatchWriteFor(initiatingUser)) {
+            throw new Error(offlineWriteMessage);
+          }
           const options = await listUnitOptions();
           setMeta((current) =>
             current && current.itemId === action.itemId
               ? { ...current, unitOptions: options }
               : current,
           );
+        }
+        if (!canDispatchWriteFor(initiatingUser)) {
+          throw new Error(offlineWriteMessage);
         }
         await addConversion(
           action.itemId,
@@ -662,38 +712,47 @@ export function ConversionsPanel({
       return;
     }
     const snapshotBaseUnit = baseUnit;
-    const action = beginAction(subject, (requestId) => {
-      const write = { ...built.write, requestId };
-      if (freshUnit) {
-        const createdCode =
-          createdUnit &&
-          createdUnit.inputCode === code &&
-          createdUnit.label === label
-            ? createdUnit.code
-            : null;
+    let action: ConversionAction;
+    try {
+      action = beginAction(subject, (requestId) => {
+        const write = { ...built.write, requestId };
+        if (freshUnit) {
+          const createdCode =
+            createdUnit &&
+            createdUnit.inputCode === code &&
+            createdUnit.label === label
+              ? createdUnit.code
+              : null;
+          return {
+            kind: 'create_unit_then_conversion' as const,
+            itemId: item.id,
+            inputCode: code,
+            label,
+            createdCode,
+            unitRequestId: crypto.randomUUID(),
+            factor: parsed.factor,
+            baseUnit: snapshotBaseUnit,
+            write,
+          };
+        }
         return {
-          kind: 'create_unit_then_conversion' as const,
+          kind: 'set_conversion' as const,
+          via: 'add' as const,
           itemId: item.id,
-          inputCode: code,
-          label,
-          createdCode,
-          unitRequestId: crypto.randomUUID(),
+          unit: code,
           factor: parsed.factor,
+          expectedFactor: parsed.factor,
           baseUnit: snapshotBaseUnit,
           write,
         };
+      });
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        setActionError(failure.message);
+        return;
       }
-      return {
-        kind: 'set_conversion' as const,
-        via: 'add' as const,
-        itemId: item.id,
-        unit: code,
-        factor: parsed.factor,
-        expectedFactor: parsed.factor,
-        baseUnit: snapshotBaseUnit,
-        write,
-      };
-    });
+      throw failure;
+    }
     send(action);
   }
 
@@ -787,6 +846,35 @@ export function ConversionsPanel({
               </div>
             ),
           )}
+        </div>
+      ) : null}
+      {detachedUnknown.length > 0 ? (
+        <div
+          className="flex flex-col gap-2"
+          aria-label="تحويلات مش متأكد إنها اتسجلت"
+        >
+          {detachedUnknown.map((pendingAction) => {
+            const label =
+              pendingAction.kind === 'create_unit_then_conversion'
+                ? pendingAction.label
+                : pendingAction.unit;
+            return (
+              <div
+                key={actionSubject(pendingAction)}
+                className="flex flex-col gap-2 rounded border border-neutral-300 p-2"
+              >
+                <p role="alert">{`تحويل ${label} — ${unknownSaveMessage}`}</p>
+                <button
+                  className={secondaryButton}
+                  type="button"
+                  disabled={busy || locked || !online}
+                  onClick={() => send(pendingAction)}
+                >
+                  إعادة المحاولة
+                </button>
+              </div>
+            );
+          })}
         </div>
       ) : null}
       <form

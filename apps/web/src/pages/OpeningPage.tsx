@@ -5,9 +5,10 @@ import {
   clearHeldWrite,
   clearPostedReload,
   getHeldWrite,
-  putHeldWrite,
   setHeldWritePhase,
+  storageWriteFailedMessage,
   subscribeHeldWritesStore,
+  tryPutHeldWrite,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { isPayloadRefusal, isUnknownOutcome } from '@/lib/write-outcome';
@@ -114,12 +115,18 @@ export function OpeningPage() {
       prior !== null &&
       prior.requestId === draft.requestId &&
       prior.phase === 'unknown';
-    putHeldWrite(OPENING_SUBJECT, {
+    const pin = tryPutHeldWrite(OPENING_SUBJECT, {
       requestId: draft.requestId,
       payload: draft,
       phase: 'inflight',
       kind: 'opening',
     });
+    if (!pin.ok) {
+      if (pin.reason === 'storage') {
+        setServerError(storageWriteFailedMessage);
+      }
+      return;
+    }
     setSaving(true);
     setServerError(null);
     setSuccess(null);

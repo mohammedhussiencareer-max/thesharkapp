@@ -1,4 +1,6 @@
-import { useSyncExternalStore } from 'react';
+import { useContext, useSyncExternalStore } from 'react';
+import { AuthContext } from '@/lib/auth-context';
+import { getAuthSnapshot, subscribeAuth } from '@/lib/auth-store';
 import { hasAnyHeldWrite, subscribeHeldWritesStore } from '@/lib/held-writes';
 import { primaryButton } from '@/lib/page-style';
 import {
@@ -12,6 +14,15 @@ export function UpdateBanner({
 }: {
   onReload?: () => void;
 } = {}) {
+  const authContext = useContext(AuthContext);
+  const authStore = useSyncExternalStore(
+    subscribeAuth,
+    getAuthSnapshot,
+    getAuthSnapshot,
+  );
+  const authStatus = authContext?.status ?? authStore.status;
+  const authResolved = authStatus !== 'loading' && authStatus !== 'checking';
+
   const update = useSyncExternalStore(
     subscribePwaUpdate,
     getPwaUpdateSnapshot,
@@ -24,6 +35,8 @@ export function UpdateBanner({
   );
 
   if (!update.waiting) return null;
+
+  const disabled = !authResolved || pinned;
 
   return (
     <aside
@@ -39,9 +52,9 @@ export function UpdateBanner({
       <button
         className={primaryButton}
         type="button"
-        disabled={pinned}
+        disabled={disabled}
         onClick={() => {
-          applyPwaUpdate(onReload);
+          applyPwaUpdate(onReload, { authResolved });
         }}
       >
         تحديث التطبيق

@@ -31,12 +31,16 @@ import { cairoMonthInput, formatCairo, formatMonth } from '@/lib/cairo';
 import {
   clearHeldWrite,
   clearPostedReload,
+  clearReloadMarker,
   getHeldWrite,
-  hasPostedReload,
+  getReloadMarker,
+  hasReloadMarker,
   listHeldWritesByPrefix,
-  putHeldWrite,
   setHeldWritePhase,
+  setReloadMarker,
+  storageWriteFailedMessage,
   subscribeHeldWritesStore,
+  tryPutHeldWrite,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
@@ -63,12 +67,34 @@ function voidSubject(id: string): string {
   return `${EXPENSE_VOID_PREFIX}${id}`;
 }
 
-function clearExpensePostedReloads(): void {
-  clearPostedReload(EXPENSE_NEW_SUBJECT);
-  clearPostedReload(EXPENSE_RELOAD_SUBJECT);
+function expenseTargetMonth(
+  draft: ExpenseDraft,
+  fallbackMonth: string,
+): string {
+  if (draft.periodMonth) return draft.periodMonth;
+  if (draft.expenseDate && draft.expenseDate.length >= 7) {
+    return `${draft.expenseDate.slice(0, 7)}-01`;
+  }
+  return `${fallbackMonth}-01`;
+}
+
+function voidTargetMonth(
+  entry: ExpenseLine | null,
+  fallbackMonth: string,
+): string {
+  if (entry?.periodMonth) return entry.periodMonth;
+  if (entry?.expenseDate && entry.expenseDate.length >= 7) {
+    return `${entry.expenseDate.slice(0, 7)}-01`;
+  }
+  return `${fallbackMonth}-01`;
+}
+
+function clearExpensePostedReloads(loadedMonthStart: string): void {
+  clearPostedReload(EXPENSE_NEW_SUBJECT, loadedMonthStart);
+  clearReloadMarker(EXPENSE_RELOAD_SUBJECT, loadedMonthStart);
   for (const record of listHeldWritesByPrefix(EXPENSE_VOID_PREFIX)) {
     if (record.phase === 'posted_reload') {
-      clearPostedReload(record.subject);
+      clearPostedReload(record.subject, loadedMonthStart);
     }
   }
 }
@@ -158,16 +184,42 @@ export function ExpensesPage() {
   const inflightVoid = storedVoids.some(
     (record) => record.phase === 'inflight',
   );
+  const reloadMarker =
+    heldEpoch < 0 ? null : getReloadMarker(EXPENSE_RELOAD_SUBJECT);
   const postedReload =
     heldEpoch >= 0 &&
     (storedExpense?.phase === 'posted_reload' ||
-      hasPostedReload(EXPENSE_RELOAD_SUBJECT) ||
+      hasReloadMarker(EXPENSE_RELOAD_SUBJECT) ||
       storedVoids.some((record) => record.phase === 'posted_reload'));
 
-  const needsReload = localNeedsReload || postedReload;
   const monthStart = `${month}-01`;
+  const postedReloadForCurrentMonth =
+    heldEpoch >= 0 &&
+    ((storedExpense?.phase === 'posted_reload' &&
+      (!storedExpense.readTarget ||
+        storedExpense.readTarget === '*' ||
+        storedExpense.readTarget === monthStart)) ||
+      (reloadMarker !== null &&
+        (!reloadMarker.target ||
+          reloadMarker.target === '*' ||
+          reloadMarker.target === monthStart)) ||
+      storedVoids.some(
+        (record) =>
+          record.phase === 'posted_reload' &&
+          (!record.readTarget ||
+            record.readTarget === '*' ||
+            record.readTarget === monthStart),
+      ));
+
+  const needsReload = localNeedsReload || postedReload;
   const ready = data !== null && data.monthStart === monthStart;
   const writeLocked = saving || inflightExpense || inflightVoid || needsReload;
+  const monthPickerDisabled =
+    saving ||
+    inflightExpense ||
+    inflightVoid ||
+    localNeedsReload ||
+    postedReloadForCurrentMonth;
   const busy = writeLocked || readLoads > 0;
   const writeDisabled = busy || !online;
 
@@ -195,7 +247,7 @@ export function ExpensesPage() {
         if (cancelled || !next) return;
         setData(next);
         setLoadError(null);
-        clearExpensePostedReloads();
+        clearExpensePostedReloads(next.monthStart);
         needsReloadRef.current = false;
         setLocalNeedsReload(false);
       } catch (error) {
@@ -215,7 +267,12 @@ export function ExpensesPage() {
   }
 
   function changeMonth(next: string) {
-    if (savingRef.current || needsReloadRef.current || postedReload) return;
+    if (
+      savingRef.current ||
+      needsReloadRef.current ||
+      postedReloadForCurrentMonth
+    )
+      return;
     if (!/^\d{4}-\d{2}$/.test(next) || next === monthRef.current) return;
     monthRef.current = next;
     setLoadError(null);
@@ -252,7 +309,7 @@ export function ExpensesPage() {
         if (next) {
           setData(next);
           setLoadError(null);
-          clearExpensePostedReloads();
+          clearExpensePostedReloads(next.monthStart);
           needsReloadRef.current = false;
           setLocalNeedsReload(false);
         }
@@ -279,14 +336,23 @@ export function ExpensesPage() {
       prior !== null &&
       prior.requestId === draft.requestId &&
       prior.phase === 'unknown';
+    const targetMonth = expenseTargetMonth(draft, monthRef.current);
+    let pinBlocked = false;
     const result = await runWrite(
       () => {
-        putHeldWrite(EXPENSE_NEW_SUBJECT, {
+        const pin = tryPutHeldWrite(EXPENSE_NEW_SUBJECT, {
           requestId: draft.requestId,
           payload: draft,
           phase: 'inflight',
           kind: 'expense',
         });
+        if (!pin.ok) {
+          pinBlocked = true;
+          if (pin.reason === 'storage') {
+            setFormError(storageWriteFailedMessage);
+          }
+          return Promise.reject(new Error('__pin_blocked__'));
+        }
         return addExpenseEntry(draft);
       },
       setFormError,
@@ -295,10 +361,24 @@ export function ExpensesPage() {
           EXPENSE_NEW_SUBJECT,
           draft.requestId,
           'posted_reload',
+          { readTarget: targetMonth },
         );
         setFormEpoch((value) => value + 1);
       },
     );
+    if (pinBlocked) {
+      if (
+        formError === null &&
+        result.error instanceof Error &&
+        result.error.message === '__pin_blocked__'
+      ) {
+        // Error was already set when reason === 'storage'; clear internal sentinel otherwise.
+      }
+      setFormError((current) =>
+        current === '__pin_blocked__' ? null : current,
+      );
+      return;
+    }
     if (result.saved) return;
     // Not sent: the form stays editable and nothing is pinned.
     if (!result.error) return;
@@ -339,24 +419,41 @@ export function ExpensesPage() {
         return next;
       });
     };
+    const targetMonth = voidTargetMonth(visible, monthRef.current);
+    let pinBlocked = false;
     const result = await runWrite(
       () => {
-        if (visible) setVoidSnapshot({ ...visible });
-        putHeldWrite<StoredVoidPayload>(subject, {
+        const pin = tryPutHeldWrite<StoredVoidPayload>(subject, {
           requestId,
           payload: { id, requestId, reason },
           phase: 'inflight',
           kind: 'expense_void',
         });
+        if (!pin.ok) {
+          pinBlocked = true;
+          if (pin.reason === 'storage') {
+            setListError(storageWriteFailedMessage);
+          }
+          return Promise.reject(new Error('__pin_blocked__'));
+        }
+        if (visible) setVoidSnapshot({ ...visible });
         return voidExpenseEntry(id, reason, requestId);
       },
       setListError,
       () => {
         voidRequestIdsRef.current.delete(id);
         setVoidSnapshot(null);
-        setHeldWritePhase(subject, requestId, 'posted_reload');
+        setHeldWritePhase(subject, requestId, 'posted_reload', {
+          readTarget: targetMonth,
+        });
       },
     );
+    if (pinBlocked) {
+      setListError((current) =>
+        current === '__pin_blocked__' ? null : current,
+      );
+      return;
+    }
     if (result.saved) return;
     // Not sent: leave an existing pin alone, and do not store this attempt.
     if (!result.error) return;
@@ -393,7 +490,7 @@ export function ExpensesPage() {
           className={fieldClass}
           type="month"
           value={month}
-          disabled={writeLocked}
+          disabled={monthPickerDisabled}
           onChange={(event) => changeMonth(event.target.value)}
         />
         {/* This picker still moves the list and the allocation while a save
@@ -438,12 +535,7 @@ export function ExpensesPage() {
                     setMonthExpenseComplete(monthStart, event.target.checked),
                   setListError,
                   () => {
-                    putHeldWrite(EXPENSE_RELOAD_SUBJECT, {
-                      requestId: crypto.randomUUID(),
-                      payload: null,
-                      phase: 'posted_reload',
-                      kind: 'expense',
-                    });
+                    setReloadMarker(EXPENSE_RELOAD_SUBJECT, monthStart);
                   },
                 )
               }

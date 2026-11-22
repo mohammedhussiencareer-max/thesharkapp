@@ -228,7 +228,10 @@ export function CountForm({
       <div className="flex flex-col gap-3">
         {pinned
           ? pinned.lines.map((line) => {
-              const name = line.itemName ?? line.itemId;
+              const name =
+                items.find((item) => item.id === line.itemId)?.name ??
+                line.itemName ??
+                line.itemId;
               return (
                 <div
                   key={line.itemId}

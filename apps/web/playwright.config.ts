@@ -1,6 +1,11 @@
 import { defineConfig, devices } from '@playwright/test';
 
-const browser = { ...devices['Desktop Chrome'] };
+const browser = {
+  ...devices['Desktop Chrome'],
+  // Block service workers by default so request-interception specs deterministically
+  // see every fetch; the dedicated pwa-shell project opts in with workers allowed.
+  serviceWorkers: 'block' as const,
+};
 
 // Ledger writers and the accounting worker share advisory lock
 // 7342750000000000001. Activation is append-only, so dormancy runs before
@@ -62,11 +67,18 @@ export default defineConfig({
       use: browser,
     },
     {
+      name: 'pwa-shell',
+      testMatch: '**/pwa-shell.spec.ts',
+      workers: 1,
+      use: { ...devices['Desktop Chrome'], serviceWorkers: 'allow' },
+    },
+    {
       name: 'chromium',
       testIgnore: [
         '**/processing-dormant.spec.ts',
         '**/activate-accounting.spec.ts',
         '**/processing-panel.spec.ts',
+        '**/pwa-shell.spec.ts',
         ...ledgerSpecs,
       ],
       use: browser,

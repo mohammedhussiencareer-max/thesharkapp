@@ -1,9 +1,4 @@
-import {
-  callFailedMessage,
-  mapActivationError,
-  readError,
-  writeError,
-} from '@/accounting/errors';
+import { mapActivationError, readError, writeError } from '@/accounting/errors';
 import {
   runAccountingWork,
   RUN_BUDGET_MS,
@@ -54,6 +49,7 @@ import {
 } from '@/accounting/types';
 import { genericCatalogError } from '@/items/errors';
 import { exactDecimal } from '@/lib/decimal';
+import { canDispatchWriteFor, captureWriteSession } from '@/lib/held-writes';
 import { supabase } from '@/lib/supabase';
 
 const openingPageSize = 100;
@@ -838,22 +834,26 @@ export function webAccountingDb(): AccountingDb {
 
 export async function runDeductions(
   onBoundAttempt?: (report: AttemptReport) => void,
+  onFailureClassified?: (report: AttemptReport) => void,
 ): Promise<RunOutcome> {
+  const initiatingUser = captureWriteSession();
   return runAccountingWork(webAccountingDb(), {
     budgetMs: RUN_BUDGET_MS,
     clock: () => Date.now(),
     newAttemptId: () => crypto.randomUUID(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     onBoundAttempt,
+    onFailureClassified,
+    canContinue: () => canDispatchWriteFor(initiatingUser),
   });
 }
 
 export async function recordRunFailure(
   report: AttemptReport,
 ): Promise<FailureReport> {
-  if (report.failureKind === null) {
-    throw new Error(callFailedMessage);
-  }
+  // When a page reloads mid-bound-call, failureKind is null; reconcile the
+  // interrupted attempt via record_accounting_call_failure (the existing
+  // recovery path) using the persisted attemptId + order binding.
   return failureReportOf(
     await writeRpc(
       report.failureKind === 'recompute_timeout'

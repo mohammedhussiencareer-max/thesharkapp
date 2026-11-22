@@ -35,6 +35,7 @@ import {
   updateActionPayload,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { HeldWriteStorageError } from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { isDefiniteRefusal } from '@/lib/write-outcome';
 import { primaryButton, secondaryButton } from '@/lib/page-style';
@@ -154,10 +155,13 @@ export function ProcessingPanel({
     try {
       let outcome: RunOutcome;
       try {
-        outcome = await runDeductions((report: AttemptReport) => {
-          action.report = report;
-          updateActionPayload(accountingRunSubject, action.requestId, action);
-        });
+        const persistAttempt = (report: AttemptReport) => {
+          action.report = { ...report };
+          updateActionPayload(accountingRunSubject, action.requestId, {
+            ...action,
+          });
+        };
+        outcome = await runDeductions(persistAttempt, persistAttempt);
       } catch (error) {
         updateActionPayload(accountingRunSubject, action.requestId, action);
         settleAction(accountingRunSubject, action.requestId, error);
@@ -261,10 +265,19 @@ export function ProcessingPanel({
       hasAction(accountingRunSubject)
     )
       return;
-    const action = beginAction<RunHeld>(accountingRunSubject, (requestId) => ({
-      requestId,
-      report: null,
-    }));
+    let action: RunHeld;
+    try {
+      action = beginAction<RunHeld>(accountingRunSubject, (requestId) => ({
+        requestId,
+        report: null,
+      }));
+    } catch (error) {
+      if (error instanceof HeldWriteStorageError) {
+        setNotice(error.message);
+        return;
+      }
+      throw error;
+    }
     void finishFresh(action);
   }
 
@@ -276,10 +289,19 @@ export function ProcessingPanel({
   function retryOrder(order: ParkedOrder): void {
     const subject = accountingRetrySubject(order.orderId);
     if (flight.current || running || !isOnline() || hasAction(subject)) return;
-    const action = beginAction<RetryHeld>(subject, (requestId) => ({
-      requestId,
-      orderId: order.orderId,
-    }));
+    let action: RetryHeld;
+    try {
+      action = beginAction<RetryHeld>(subject, (requestId) => ({
+        requestId,
+        orderId: order.orderId,
+      }));
+    } catch (error) {
+      if (error instanceof HeldWriteStorageError) {
+        setNotice(error.message);
+        return;
+      }
+      throw error;
+    }
     noteRetryOrder(order.orderId);
     void finishRetry(action);
   }

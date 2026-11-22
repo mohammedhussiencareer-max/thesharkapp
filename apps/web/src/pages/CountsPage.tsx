@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { CountForm } from '@/counts/CountForm';
 import { CountList } from '@/counts/CountList';
-import { PendingCounts } from '@/counts/PendingCounts';
+import { PendingCounts, type PendingCountEntry } from '@/counts/PendingCounts';
 import {
   listCounts,
   listDailyItems,
@@ -32,9 +32,10 @@ import {
   clearPostedReload,
   getHeldWrite,
   listHeldWritesByPrefix,
-  putHeldWrite,
   setHeldWritePhase,
+  storageWriteFailedMessage,
   subscribeHeldWritesStore,
+  tryPutHeldWrite,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
@@ -56,6 +57,59 @@ function requestIdOf(payload: Json): string | null {
   }
   const requestId = (payload as { request_id?: unknown }).request_id;
   return typeof requestId === 'string' ? requestId : null;
+}
+
+/** Strip display-only fields before persisting a count draft to localStorage. */
+function toStoredCountDraft(draft: CountDraft): CountDraft {
+  return {
+    requestId: draft.requestId,
+    countedAt: draft.countedAt,
+    note: draft.note,
+    lines: draft.lines.map((line) => ({
+      itemId: line.itemId,
+      countedQty: line.countedQty,
+      expectedBaseUnit: line.expectedBaseUnit,
+    })),
+  };
+}
+
+/** Re-attach live or session-cached display names for UI rendering without storing them in localStorage. */
+function hydrateCountDraft(
+  draft: CountDraft | null,
+  items: readonly CountItem[],
+  knownNames: ReadonlyMap<string, string>,
+): CountDraft | null {
+  if (!draft) return null;
+  const byId = new Map<string, string>(knownNames);
+  for (const item of items) byId.set(item.id, item.name);
+  if (byId.size === 0) return draft;
+  return {
+    ...draft,
+    lines: draft.lines.map((line) => {
+      const liveName = byId.get(line.itemId);
+      return liveName ? { ...line, itemName: liveName } : line;
+    }),
+  };
+}
+
+function storedPinToPendingEntry(
+  requestId: string,
+  payload: Json,
+): PendingCountEntry {
+  const obj =
+    payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? (payload as { counted_at?: unknown; lines?: unknown })
+      : {};
+  const countedAt = typeof obj.counted_at === 'string' ? obj.counted_at : '';
+  const itemCount = Array.isArray(obj.lines) ? obj.lines.length : 0;
+  return {
+    requestId,
+    preparedAt: countedAt,
+    countedAt,
+    itemCount,
+    payload,
+    unknown: true,
+  };
 }
 
 function clearCountPostedReloads(): void {
@@ -85,26 +139,55 @@ export function CountsPage() {
   const [success, setSuccess] = useState<string | null>(null);
   const [formEpoch, setFormEpoch] = useState(0);
   const [requestKey, setRequestKey] = useState(0);
+  // In-memory-only item names so a refresh that removes an item still displays
+  // its name on a pinned count; never written to localStorage.
+  const [knownNames, setKnownNames] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
   const seqRef = useRef(0);
   const loadsRef = useRef(0);
+
+  function rememberItemNames(
+    list: readonly { id: string; name?: string }[],
+  ): void {
+    setKnownNames((current) => {
+      let changed = false;
+      const next = new Map(current);
+      for (const entry of list) {
+        if (entry.name && next.get(entry.id) !== entry.name) {
+          next.set(entry.id, entry.name);
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }
 
   useEffect(
     () => subscribeHeldWritesStore(() => setHeldEpoch((value) => value + 1)),
     [],
   );
 
+  const items = snapshot?.items ?? [];
   const storedDaily =
     heldEpoch < 0 ? null : getHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
-  const pending = storedDaily?.phase === 'unknown' ? storedDaily.payload : null;
-  const waiting =
-    storedDaily?.phase === 'waiting_for_sync' ? storedDaily.payload : null;
+  const pending = hydrateCountDraft(
+    storedDaily?.phase === 'unknown' ? storedDaily.payload : null,
+    items,
+    knownNames,
+  );
+  const waiting = hydrateCountDraft(
+    storedDaily?.phase === 'waiting_for_sync' ? storedDaily.payload : null,
+    items,
+    knownNames,
+  );
   const inflightDaily = storedDaily?.phase === 'inflight';
+  const storedCountPins =
+    heldEpoch < 0 ? [] : listHeldWritesByPrefix<Json>(COUNT_STORED_PREFIX);
   const postedReload =
     heldEpoch >= 0 &&
     (storedDaily?.phase === 'posted_reload' ||
-      listHeldWritesByPrefix(COUNT_STORED_PREFIX).some(
-        (record) => record.phase === 'posted_reload',
-      ));
+      storedCountPins.some((record) => record.phase === 'posted_reload'));
 
   const needsReload = localNeedsReload || postedReload;
   const editingLocked = saving || inflightDaily || needsReload;
@@ -140,6 +223,7 @@ export function CountsPage() {
         const next = await readSnapshot();
         if (cancelled || next.status === 'stale') return;
         setSnapshot(next.snapshot);
+        rememberItemNames(next.snapshot.items);
         setLoadError(null);
         clearCountPostedReloads();
         setLocalNeedsReload(false);
@@ -290,13 +374,23 @@ export function CountsPage() {
       (prior.phase === 'unknown' || prior.phase === 'waiting_for_sync')
         ? prior.phase
         : null;
-    // Persist BEFORE sending so a reload during transmission restores `unknown`.
-    putHeldWrite(COUNT_DAILY_SUBJECT, {
+    rememberItemNames(
+      draft.lines.map((line) => ({ id: line.itemId, name: line.itemName })),
+    );
+    // Persist BEFORE sending (without display-only fields) so a reload during
+    // transmission restores `unknown`. Refuse to send if storage fails.
+    const pin = tryPutHeldWrite(COUNT_DAILY_SUBJECT, {
       requestId: draft.requestId,
-      payload: draft,
+      payload: toStoredCountDraft(draft),
       phase: 'inflight',
       kind: 'count',
     });
+    if (!pin.ok) {
+      if (pin.reason === 'storage') {
+        setServerError(storageWriteFailedMessage);
+      }
+      return;
+    }
     setSaving(true);
     setServerError(null);
     setCardError(null);
@@ -324,12 +418,18 @@ export function CountsPage() {
     const storedSubject =
       requestId !== null ? `${COUNT_STORED_PREFIX}${requestId}` : null;
     if (storedSubject && requestId !== null) {
-      putHeldWrite(storedSubject, {
+      const pin = tryPutHeldWrite(storedSubject, {
         requestId,
         payload,
         phase: 'inflight',
         kind: 'count_stored',
       });
+      if (!pin.ok) {
+        if (pin.reason === 'storage') {
+          setCardError(storageWriteFailedMessage);
+        }
+        return;
+      }
     }
     setSaving(true);
     setServerError(null);
@@ -374,7 +474,35 @@ export function CountsPage() {
     }
   }
 
-  const items = snapshot?.items ?? [];
+  const localUnknownStored = new Map<string, Json>();
+  for (const record of storedCountPins) {
+    if (record.phase === 'unknown' && record.payload !== null) {
+      localUnknownStored.set(record.requestId, record.payload);
+    }
+  }
+
+  const serverPendingIds = new Set<string>();
+  const visiblePendingCounts: PendingCountEntry[] = [];
+  for (const row of snapshot?.pendingCounts ?? []) {
+    if (row.requestId === waiting?.requestId) continue;
+    serverPendingIds.add(row.requestId);
+    const localPayload = localUnknownStored.get(row.requestId);
+    visiblePendingCounts.push(
+      localPayload !== undefined
+        ? { ...row, payload: localPayload, unknown: true }
+        : row,
+    );
+  }
+  for (const [requestId, payload] of localUnknownStored.entries()) {
+    if (
+      serverPendingIds.has(requestId) ||
+      requestId === waiting?.requestId ||
+      requestId === pending?.requestId
+    ) {
+      continue;
+    }
+    visiblePendingCounts.push(storedPinToPendingEntry(requestId, payload));
+  }
 
   return (
     <main className={pageShell}>
@@ -444,9 +572,7 @@ export function CountsPage() {
           )}
           {cardError ? <p role="alert">{cardError}</p> : null}
           <PendingCounts
-            counts={snapshot.pendingCounts.filter(
-              (row) => row.requestId !== waiting?.requestId,
-            )}
+            counts={visiblePendingCounts}
             disabled={writeLocked}
             onResend={(payload) => void handleStored(payload)}
           />

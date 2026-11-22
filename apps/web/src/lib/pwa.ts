@@ -8,7 +8,16 @@ let snapshot: PwaUpdateSnapshot = { waiting: false };
 let waitingWorker: ServiceWorker | null = null;
 let started = false;
 let reloadRequested = false;
+let authResolvedState = false;
 const listeners = new Set<() => void>();
+
+export function setPwaAuthResolved(resolved: boolean): void {
+  authResolvedState = resolved;
+}
+
+export function isPwaAuthResolved(): boolean {
+  return authResolvedState;
+}
 
 function emit(): void {
   for (const listener of listeners) listener();
@@ -38,13 +47,17 @@ export function subscribePwaUpdate(listener: () => void): () => void {
 }
 
 /**
- * Activate a waiting service worker and reload, ONLY when the owner explicitly
- * asks and NO held write pin is active. Returns false if blocked or no update.
+ * Activate a waiting service worker and reload, ONLY when auth has resolved,
+ * the owner explicitly asks, and NO held write pin is active in storage or
+ * memory. Returns false if blocked or no update.
  */
 export function applyPwaUpdate(
   reload: () => void = () => window.location.reload(),
+  options?: { authResolved?: boolean },
 ): boolean {
   if (!waitingWorker) return false;
+  const resolved = options?.authResolved ?? authResolvedState;
+  if (!resolved) return false;
   if (hasAnyHeldWrite()) return false;
   reloadRequested = true;
   waitingWorker.postMessage({ type: 'SKIP_WAITING' });
@@ -72,7 +85,10 @@ export function initPwa(
   const container = navigator.serviceWorker;
   container.addEventListener('controllerchange', () => {
     if (!reloadRequested) return;
-    if (hasAnyHeldWrite()) return;
+    if (hasAnyHeldWrite()) {
+      reloadRequested = false;
+      return;
+    }
     reloadRequested = false;
     reload();
   });
@@ -107,6 +123,7 @@ export function resetPwaState(): void {
   waitingWorker = null;
   started = false;
   reloadRequested = false;
+  authResolvedState = false;
   snapshot = { waiting: false };
   listeners.clear();
 }

@@ -599,4 +599,22 @@ describe('accounting mappers', () => {
       p_order_id: 'order-1',
     });
   });
+
+  it('P1-3: recordRunFailure reconciles an interrupted attempt with null failureKind via record_accounting_call_failure instead of throwing', async () => {
+    const { recordRunFailure } = await import('@/accounting/api');
+    mocks.rpc.mockResolvedValueOnce(ok({ status: 'committed' }));
+    await expect(
+      recordRunFailure({
+        attemptId: 'attempt-interrupted',
+        orderId: 'order-9',
+        workGeneration: 4,
+        failureKind: null,
+      }),
+    ).resolves.toBe('committed');
+    expect(mocks.rpc).toHaveBeenCalledWith('record_accounting_call_failure', {
+      p_attempt_id: 'attempt-interrupted',
+      p_order_id: 'order-9',
+      p_work_generation: 4,
+    });
+  });
 });

@@ -3,7 +3,11 @@ import {
   CostingChangedError,
   genericCatalogError,
 } from '@/items/errors';
-import { beginAction, settleAction } from '@/items/request-id';
+import {
+  beginAction,
+  markActionPostedReload,
+  settleAction,
+} from '@/items/request-id';
 import { isStockKind } from '@/items/types';
 import {
   keysAfterFilter,
@@ -205,7 +209,7 @@ export async function createRecipe(
     if (typeof recipeId !== 'string' || recipeId.length === 0) {
       throw new Error(genericCatalogError);
     }
-    settleAction(subject, requestId);
+    markActionPostedReload(subject, requestId, recipeId);
     return recipeId;
   } catch (failure) {
     settleAction(subject, requestId, failure);

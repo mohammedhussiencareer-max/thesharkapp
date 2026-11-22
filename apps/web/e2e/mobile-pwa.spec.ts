@@ -9,7 +9,10 @@ import { localServiceRoleKey, ownerEmail, ownerPassword } from './.test-owner';
 import { expect, test } from './fixtures';
 import { assertLocalSupabaseUrl } from './local-guard';
 
-test.use({ viewport: { width: 390, height: 844 } });
+test.use({
+  viewport: { width: 390, height: 844 },
+  serviceWorkers: 'block',
+});
 
 async function expectNoHorizontalOverflow(page: {
   evaluate: <T>(expression: string) => Promise<T>;
@@ -236,9 +239,22 @@ test('daily count retries the exact request id and payload across a reload at 39
   await page.getByLabel('ملاحظة').fill(stamp);
 
   // Drop the first write reply to simulate a lost connection, then reload.
+  // Match ONLY the exact loopback RPC URL and never continue non-loopback hosts.
+  assertLocalSupabaseUrl(supabaseUrl);
+  const recordCountUrl = new URL(
+    '/rest/v1/rpc/record_count',
+    supabaseUrl,
+  ).toString();
   const sentBodies: string[] = [];
   let dropNext = true;
-  await page.route('**/rest/v1/rpc/record_count', async (route) => {
+  await page.route(recordCountUrl, async (route) => {
+    const requestUrl = route.request().url();
+    try {
+      assertLocalSupabaseUrl(requestUrl);
+    } catch {
+      await route.abort('blockedbyclient');
+      return;
+    }
     const body = route.request().postData() ?? '';
     sentBodies.push(body);
     if (dropNext) {
@@ -265,12 +281,12 @@ test('daily count retries the exact request id and payload across a reload at 39
   expect(sentBodies).toHaveLength(2);
   expect(sentBodies[1]).toBe(sentBodies[0]);
 
-  await page.unroute('**/rest/v1/rpc/record_count');
+  await page.unroute(recordCountUrl);
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     await coverCountTime(supabaseUrl);
-    const response = page.waitForResponse((candidate) =>
-      candidate.url().includes('/rpc/record_count'),
+    const response = page.waitForResponse(
+      (candidate) => candidate.url() === recordCountUrl,
     );
     await page.getByRole('button', { name: 'سجّل الجرد' }).click();
     const body = (await (await response).json()) as { status?: string };

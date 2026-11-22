@@ -2,7 +2,9 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import {
   beginAction,
+  clearActionPostedReload,
   hasAction,
+  markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
@@ -11,6 +13,7 @@ import { UnknownSave } from '@/items/UnknownSave';
 import { currentMinuteMs } from '@/items/effective';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatCairo } from '@/lib/cairo';
+import { HeldWriteStorageError } from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import { coverAt, quantityError } from '@/mapping/format';
@@ -471,7 +474,7 @@ export function PackagingEditor({
           };
           await setBasePackaging(baseWrite);
         }
-        settleAction(subjectKey, requestId);
+        markActionPostedReload(subjectKey, requestId, subjectKey);
       } catch (failure) {
         settleAction(subjectKey, requestId, failure);
         setError(messageFrom(failure));
@@ -479,6 +482,7 @@ export function PackagingEditor({
         return;
       }
       await onReload();
+      clearActionPostedReload(subjectKey, subjectKey);
       setNotice('التغليف اتحفظ');
     } catch (failure) {
       setError(messageFrom(failure));
@@ -494,14 +498,23 @@ export function PackagingEditor({
     reason: string | null;
     policy: PackagingPolicy | null;
   }) {
-    const write = beginAction(subjectKey, (requestId) => ({
-      requestId,
-      effectiveFrom: timing.effectiveFrom,
-      effectiveTo: timing.effectiveTo,
-      token: schedule.token,
-      reason: timing.reason,
-      policy: timing.policy,
-    }));
+    let write: PackagingWrite;
+    try {
+      write = beginAction(subjectKey, (requestId) => ({
+        requestId,
+        effectiveFrom: timing.effectiveFrom,
+        effectiveTo: timing.effectiveTo,
+        token: schedule.token,
+        reason: timing.reason,
+        policy: timing.policy,
+      }));
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        setError(failure.message);
+        return;
+      }
+      throw failure;
+    }
     void finish(write);
   }
 

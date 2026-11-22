@@ -377,8 +377,26 @@ describe('held writes and offline behavior across writers', () => {
     expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(sent);
   });
 
-  it('a committed post whose reply was lost retries with the same id and payload after reload', async () => {
-    vi.mocked(recordCount).mockRejectedValueOnce(new Error(retrySafeMessage));
+  it('a committed post whose reply was lost retries with the same id and payload after reload and stores exactly one result', async () => {
+    const serverLedger = new Map<
+      string,
+      { countId: string; payload: unknown }
+    >();
+    let firstReplyDropped = false;
+    vi.mocked(recordCount).mockImplementation((draft) => {
+      const existing = serverLedger.get(draft.requestId);
+      const countId =
+        existing?.countId ?? `count-${String(serverLedger.size + 1)}`;
+      if (!existing) {
+        serverLedger.set(draft.requestId, { countId, payload: draft });
+      }
+      if (!firstReplyDropped) {
+        firstReplyDropped = true;
+        return Promise.reject(new Error(retrySafeMessage));
+      }
+      return Promise.resolve({ status: 'posted', countId });
+    });
+
     const view = render(
       <MemoryRouter>
         <CountsPage />
@@ -394,6 +412,7 @@ describe('held writes and offline behavior across writers', () => {
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
     expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
     const first = vi.mocked(recordCount).mock.calls[0]?.[0];
+    expect(serverLedger.size).toBe(1);
 
     view.unmount();
     rehydrateHeldWrites();
@@ -409,6 +428,8 @@ describe('held writes and offline behavior across writers', () => {
       expect(recordCount).toHaveBeenCalledTimes(2);
     });
     expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(first);
+    expect(serverLedger.size).toBe(1);
+    expect(serverLedger.has(first!.requestId)).toBe(true);
   });
 
   it('reopening while offline keeps the ledger button disabled until back online', async () => {
@@ -686,26 +707,32 @@ describe('held writes and offline behavior across writers', () => {
     expect(vi.mocked(setBaseMapping).mock.calls[1]?.[0]).toEqual(first);
   });
 
-  it('a throwing localStorage does not break the form', async () => {
-    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
-      throw new DOMException('SecurityError');
-    });
-    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
-      throw new DOMException('QuotaExceededError');
-    });
-    vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
-      throw new DOMException('SecurityError');
-    });
-    vi.spyOn(Storage.prototype, 'key').mockImplementation(() => {
+  it('P2-4: a throwing localStorage refuses to send a ledger write, shows Arabic error, keeps retry usable, and leaves reads working', async () => {
+    const getSpy = vi
+      .spyOn(Storage.prototype, 'getItem')
+      .mockImplementation(() => {
+        throw new DOMException('SecurityError');
+      });
+    const setSpy = vi
+      .spyOn(Storage.prototype, 'setItem')
+      .mockImplementation(() => {
+        throw new DOMException('QuotaExceededError');
+      });
+    const removeSpy = vi
+      .spyOn(Storage.prototype, 'removeItem')
+      .mockImplementation(() => {
+        throw new DOMException('SecurityError');
+      });
+    const keySpy = vi.spyOn(Storage.prototype, 'key').mockImplementation(() => {
       throw new DOMException('SecurityError');
     });
 
-    vi.mocked(recordCount).mockRejectedValueOnce(new Error(retrySafeMessage));
     render(
       <MemoryRouter>
         <CountsPage />
       </MemoryRouter>,
     );
+    // Reads and non-ledger UI still load without storage.
     expect(await screen.findByLabelText('وقت الجرد')).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('وقت الجرد'), {
       target: { value: '2026-10-22T12:00' },
@@ -714,15 +741,24 @@ describe('held writes and offline behavior across writers', () => {
       target: { value: '7' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
-    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    // Must NOT send the write without durable pin protection.
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'مش قادر أحفظ العملية على الجهاز، جرّب تاني',
+    );
+    expect(recordCount).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+
+    // Once storage recovers, the same button works to send.
+    getSpy.mockRestore();
+    setSpy.mockRestore();
+    removeSpy.mockRestore();
+    keySpy.mockRestore();
 
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
     await waitFor(() => {
-      expect(recordCount).toHaveBeenCalledTimes(2);
+      expect(recordCount).toHaveBeenCalledTimes(1);
     });
-    expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(
-      vi.mocked(recordCount).mock.calls[0]?.[0],
-    );
   });
 
   it('disables ledger buttons across screens while navigator.onLine is false', async () => {
@@ -792,24 +828,91 @@ describe('held writes and offline behavior across writers', () => {
     activationView.unmount();
   });
 
-  it('UpdateBanner waits for owner reload and never reloads while a pin is held', () => {
-    const postMessage = vi.fn();
-    const reload = vi.fn();
-    setTestWaitingWorker({ postMessage } as unknown as ServiceWorker);
-    const held = beginHeldWrite('count:daily', (requestId) => ({ requestId }));
-
-    render(<UpdateBanner onReload={reload} />);
-    const button = screen.getByRole('button', { name: 'تحديث التطبيق' });
-    expect(button).toBeDisabled();
-    fireEvent.click(button);
-    expect(postMessage).not.toHaveBeenCalled();
-    expect(reload).not.toHaveBeenCalled();
-
-    act(() => {
-      clearHeldWrite('count:daily', held.requestId);
+  it('UpdateBanner waits for owner reload, never reloads while a pin is held, and blocks controllerchange if a pin appears in between', async () => {
+    const controllerListeners: Array<() => void> = [];
+    const originalSw = Object.getOwnPropertyDescriptor(
+      navigator,
+      'serviceWorker',
+    );
+    Object.defineProperty(navigator, 'serviceWorker', {
+      configurable: true,
+      value: {
+        controller: {},
+        register: vi.fn(() =>
+          Promise.resolve({
+            waiting: null,
+            installing: null,
+            addEventListener: vi.fn(),
+          }),
+        ),
+        addEventListener: (event: string, cb: () => void) => {
+          if (event === 'controllerchange') controllerListeners.push(cb);
+        },
+      },
     });
-    expect(button).toBeEnabled();
-    fireEvent.click(button);
-    expect(postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
+    try {
+      const postMessage = vi.fn();
+      const reload = vi.fn();
+      const { initPwa } = await import('@/lib/pwa');
+      vi.stubEnv('PROD', true);
+      initPwa(reload);
+      setTestWaitingWorker({ postMessage } as unknown as ServiceWorker);
+      const held = beginHeldWrite('count:daily', (requestId) => ({
+        requestId,
+      }));
+
+      const { AuthContext } = await import('@/lib/auth-context');
+      render(
+        <AuthContext.Provider
+          value={{
+            status: 'owner',
+            email: 'owner@theshark.test',
+            signIn: () => Promise.resolve('ok'),
+            signOut: () => Promise.resolve(),
+            retry: () => undefined,
+          }}
+        >
+          <UpdateBanner onReload={reload} />
+        </AuthContext.Provider>,
+      );
+      const button = screen.getByRole('button', { name: 'تحديث التطبيق' });
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+      expect(postMessage).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
+
+      // Clear pin -> owner approves update.
+      act(() => {
+        clearHeldWrite('count:daily', held.requestId);
+      });
+      expect(button).toBeEnabled();
+      fireEvent.click(button);
+      expect(postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
+
+      // A pin appears AFTER approval and BEFORE controllerchange fires -> NO reload!
+      act(() => {
+        beginHeldWrite('purchase:new', (requestId) => ({ requestId }));
+      });
+      for (const listener of controllerListeners) listener();
+      expect(reload).not.toHaveBeenCalled();
+
+      // Also verify controllerchange DOES reload when no pin is held and approved again.
+      const held2 = beginHeldWrite('purchase:new', (requestId) => ({
+        requestId,
+      }));
+      act(() => {
+        clearHeldWrite('purchase:new', held2.requestId);
+      });
+      fireEvent.click(button);
+      for (const listener of controllerListeners) listener();
+      expect(reload).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllEnvs();
+      if (originalSw) {
+        Object.defineProperty(navigator, 'serviceWorker', originalSw);
+      } else {
+        delete (navigator as { serviceWorker?: unknown }).serviceWorker;
+      }
+    }
   });
 });

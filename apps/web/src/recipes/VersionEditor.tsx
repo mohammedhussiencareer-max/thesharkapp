@@ -3,13 +3,16 @@ import { currentMinuteMs } from '@/items/effective';
 import { messageFrom } from '@/items/errors';
 import {
   beginAction,
+  clearActionPostedReload,
   hasAction,
+  markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
+import { HeldWriteStorageError } from '@/lib/held-writes';
 import { isOnline, useOnline } from '@/lib/online';
 import { setRecipeVersion } from '@/recipes/api';
 import { sourceChangedMessage } from '@/recipes/labels';
@@ -53,8 +56,8 @@ export function VersionEditor({
   /** Another section of the page is saving. */
   locked: boolean;
   onBusyChange: (busy: boolean) => void;
-  /** Re-reads the schedule. Never rejects; the page shows its own load error. */
-  onReload: () => Promise<void>;
+  /** Re-reads the schedule. Returning false or rejecting keeps `posted_reload` held. */
+  onReload: () => Promise<boolean | void>;
 }) {
   const online = useOnline();
   const subject = recipeVersionSubject(recipe.id);
@@ -107,9 +110,11 @@ export function VersionEditor({
     onBusyChange(true);
     setError(null);
     setNotice(null);
+    let saved = false;
     try {
       await setRecipeVersion(action.recipeId, action.write);
-      settleAction(subject, action.write.requestId);
+      saved = true;
+      markActionPostedReload(subject, action.write.requestId, subject);
       setDirty(false);
       setConfirmStop(false);
       timing.refreshClock();
@@ -118,11 +123,16 @@ export function VersionEditor({
           ? 'الوصفة اتوقفت من الوقت ده'
           : 'نسخة الوصفة اتحفظت',
       );
-      await onReload();
+      const reloaded = await onReload();
+      if (reloaded !== false) {
+        clearActionPostedReload(subject, subject);
+      }
     } catch (failure) {
-      settleAction(subject, action.write.requestId, failure);
+      if (!saved) {
+        settleAction(subject, action.write.requestId, failure);
+      }
       setError(messageFrom(failure));
-      if (!hasAction(subject)) await onReload();
+      if (!saved && !hasAction(subject)) await onReload();
     } finally {
       flight.current = false;
       setSaving(false);
@@ -157,19 +167,28 @@ export function VersionEditor({
       return;
     }
     setError(null);
-    const action = beginAction<VersionAction>(subject, (requestId) => ({
-      recipeId: recipe.id,
-      write: {
-        requestId,
-        effectiveFrom: built.write.effectiveFrom,
-        effectiveTo: built.write.effectiveTo,
-        batchQty: batch?.batchQty ?? null,
-        batchUnit: batch?.batchUnit ?? null,
-        lines,
-        reason: built.write.reason,
-        token: built.write.token,
-      },
-    }));
+    let action: VersionAction;
+    try {
+      action = beginAction<VersionAction>(subject, (requestId) => ({
+        recipeId: recipe.id,
+        write: {
+          requestId,
+          effectiveFrom: built.write.effectiveFrom,
+          effectiveTo: built.write.effectiveTo,
+          batchQty: batch?.batchQty ?? null,
+          batchUnit: batch?.batchUnit ?? null,
+          lines,
+          reason: built.write.reason,
+          token: built.write.token,
+        },
+      }));
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        setError(failure.message);
+        return;
+      }
+      throw failure;
+    }
     void finish(action);
   }
 

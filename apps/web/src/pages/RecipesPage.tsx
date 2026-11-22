@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
-import { subscribeHeldWrites, unknownAction } from '@/items/request-id';
+import {
+  clearActionPostedReload,
+  subscribeHeldWrites,
+  unknownAction,
+} from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import { listHeldWritesByPrefix } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
 import { createRecipe, listRecipes } from '@/recipes/api';
@@ -22,7 +27,31 @@ import { validateRecipeName } from '@/recipes/validation';
 
 const fieldClass = 'w-full rounded border border-neutral-300 px-3 py-2';
 
+const recipeCreatePrefix = 'recipe-create:';
+
 type Draft = { name: string; kind: RecipeKind };
+
+function firstUnknownRecipeCreate(): Draft | null {
+  for (const record of listHeldWritesByPrefix(recipeCreatePrefix)) {
+    if (record.phase !== 'unknown') continue;
+    try {
+      const parsed: unknown = JSON.parse(
+        record.subject.slice(recipeCreatePrefix.length),
+      );
+      if (
+        Array.isArray(parsed) &&
+        typeof parsed[0] === 'string' &&
+        typeof parsed[1] === 'string' &&
+        isRecipeKind(parsed[1])
+      ) {
+        return { name: parsed[0], kind: parsed[1] };
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
 
 function isKindFilter(value: string): value is 'all' | RecipeKind {
   return value === 'all' || isRecipeKind(value);
@@ -44,11 +73,13 @@ export function RecipesPage() {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const flight = useRef(false);
+  const restored = heldEpoch < 0 ? null : firstUnknownRecipeCreate();
+  const activeDraft = submitted ?? restored;
   const held =
-    submitted === null || heldEpoch < 0
+    activeDraft === null || heldEpoch < 0
       ? null
       : unknownAction<string>(
-          recipeCreateSubject(submitted.name, submitted.kind),
+          recipeCreateSubject(activeDraft.name, activeDraft.kind),
         );
   const formDisabled = creating || held !== null || !online;
 
@@ -65,6 +96,11 @@ export function RecipesPage() {
         if (cancelled) return;
         setRecipes(next);
         setLoadError(null);
+        for (const pin of listHeldWritesByPrefix(recipeCreatePrefix)) {
+          if (pin.phase === 'posted_reload') {
+            clearActionPostedReload(pin.subject);
+          }
+        }
       } catch (error) {
         if (!cancelled) setLoadError(messageFrom(error));
       } finally {
@@ -190,10 +226,10 @@ export function RecipesPage() {
                 ))}
               </select>
             </label>
-            {held && submitted ? (
+            {held && activeDraft ? (
               <UnknownSave
                 disabled={creating}
-                onRetry={() => void send(submitted)}
+                onRetry={() => void send(activeDraft)}
               />
             ) : null}
             {createError ? <p role="alert">{createError}</p> : null}

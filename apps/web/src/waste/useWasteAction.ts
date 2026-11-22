@@ -7,6 +7,7 @@ import {
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
+import { HeldWriteStorageError } from '@/lib/held-writes';
 import { isOnline } from '@/lib/online';
 import { recordWaste } from '@/waste/api';
 import { MissingCostBasisError } from '@/waste/errors';
@@ -88,7 +89,17 @@ export function useWasteAction(
   /** Starts a new action, or does nothing while one is outstanding. */
   function send(create: (requestId: string) => WasteWrite): void {
     if (flight.current || saving || !isOnline() || hasAction(subject)) return;
-    void finish(beginAction<WasteWrite>(subject, create));
+    let action: WasteWrite;
+    try {
+      action = beginAction<WasteWrite>(subject, create);
+    } catch (failure) {
+      if (failure instanceof HeldWriteStorageError) {
+        setNotice({ kind: 'failed', message: failure.message });
+        return;
+      }
+      throw failure;
+    }
+    void finish(action);
   }
 
   function retry(): void {

@@ -259,4 +259,74 @@ describe('runAccountingWork', () => {
     expect(result.report).toBe('not_needed');
     expect(result.calls).toBe(0);
   });
+
+  it('P1-3: persists failureKind via callback BEFORE sending the recorder request', async () => {
+    const events: string[] = [];
+    const db = harness({
+      runAccountingWork: vi.fn(() =>
+        Promise.reject(Object.assign(new Error('timeout'), { code: '57014' })),
+      ),
+      recordAccountingRecomputeTimeout: vi.fn(() => {
+        events.push('recorder_called');
+        return Promise.resolve('recorded' as const);
+      }),
+    });
+    const result = await runAccountingWork(db, {
+      clock: () => 0,
+      sleep: noSleep,
+      newAttemptId: () => 'attempt-classify',
+      onBoundAttempt: (report) => {
+        events.push(`bound:${String(report.failureKind)}`);
+      },
+      onFailureClassified: (report) => {
+        events.push(`classified:${String(report.failureKind)}`);
+      },
+    });
+    expect(result.report).toBe('recorded');
+    expect(events).toEqual([
+      'bound:null',
+      'classified:recompute_timeout',
+      'recorder_called',
+    ]);
+  });
+
+  it('P2-3: stops before dispatching a recorder call after sleep when navigator.onLine becomes false', async () => {
+    const originalOnLine = Object.getOwnPropertyDescriptor(navigator, 'onLine');
+    const setNavOnline = (value: boolean) => {
+      Object.defineProperty(navigator, 'onLine', {
+        configurable: true,
+        get: () => value,
+      });
+    };
+    setNavOnline(true);
+    try {
+      const recordCall = vi
+        .fn()
+        .mockResolvedValueOnce('busy' as const)
+        .mockResolvedValueOnce('recorded' as const);
+      const db = harness({
+        runAccountingWork: vi.fn(() => Promise.reject(new Error('network'))),
+        recordAccountingCallFailure: recordCall,
+      });
+      const result = await runAccountingWork(db, {
+        budgetMs: 5_000,
+        clock: () => 0,
+        sleep: async () => {
+          setNavOnline(false);
+          await Promise.resolve();
+        },
+      });
+      expect(recordCall).toHaveBeenCalledTimes(1);
+      expect(result.report).toBe('unreported');
+    } finally {
+      if (originalOnLine) {
+        Object.defineProperty(navigator, 'onLine', originalOnLine);
+      } else {
+        Object.defineProperty(navigator, 'onLine', {
+          configurable: true,
+          get: () => true,
+        });
+      }
+    }
+  });
 });

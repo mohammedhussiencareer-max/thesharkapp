@@ -24,12 +24,13 @@ import {
 import { groupCatalog } from '@/items/group';
 import { ItemForm } from '@/items/ItemForm';
 import { ItemList } from '@/items/ItemList';
+import { firstUnknownItemCreate } from '@/items/request-id';
 import type { CatalogItem, ItemSave } from '@/items/types';
 import { emptyItemForm, itemToFormValues } from '@/items/validation';
 import {
-  clearPostedReload,
-  hasPostedReload,
-  putHeldWrite,
+  clearReloadMarker,
+  hasReloadMarker,
+  setReloadMarker,
   subscribeHeldWritesStore,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
@@ -64,7 +65,9 @@ export function ItemsPage() {
   const [loadId, setLoadId] = useState(0);
   const [showInactive, setShowInactive] = useState(false);
   const [conversionsBusy, setConversionsBusy] = useState(false);
-  const [formMode, setFormMode] = useState<ItemEditor | null>(null);
+  const [formMode, setFormMode] = useState<ItemEditor | null>(() =>
+    firstUnknownItemCreate() !== null ? { type: 'create' } : null,
+  );
   const [formEpoch, setFormEpoch] = useState(0);
   const [formIdentityDirty, setFormIdentityDirty] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -76,7 +79,7 @@ export function ItemsPage() {
   // reload after it) is in flight, nothing that edits data or remounts a panel
   // can start, so no editor or panel ever opens on stale data.
   const [catalogLoads, setCatalogLoads] = useState(0);
-  const postedReload = heldEpoch >= 0 && hasPostedReload(ITEMS_RELOAD_SUBJECT);
+  const postedReload = heldEpoch >= 0 && hasReloadMarker(ITEMS_RELOAD_SUBJECT);
   const needsReload = localNeedsReload || postedReload;
   const busy = saving || conversionsBusy || needsReload || catalogLoads > 0;
   const writeLocked = busy || !online;
@@ -88,7 +91,7 @@ export function ItemsPage() {
   const [openConversionsId, setOpenConversionsId] = useState<string | null>(
     null,
   );
-  const formModeRef = useRef<ItemEditor | null>(null);
+  const formModeRef = useRef<ItemEditor | null>(formMode);
   const expectedRef = useRef<ItemExpectation | null>(null);
   const catalogSeqRef = useRef(0);
   const catalogLoadsRef = useRef(0);
@@ -121,7 +124,7 @@ export function ItemsPage() {
     if (!next) return;
     setItems(next);
     setLoadError(null);
-    clearPostedReload(ITEMS_RELOAD_SUBJECT);
+    clearReloadMarker(ITEMS_RELOAD_SUBJECT);
     setLocalNeedsReload(false);
     const editing = formModeRef.current;
     if (staleItemId && editing?.type === 'edit' && editing.id === staleItemId) {
@@ -137,12 +140,7 @@ export function ItemsPage() {
   // A landed conversion can configure the item. Stay locked until the catalog
   // says so; a failed read leaves the lock and the retry button in place.
   async function refreshAfterConversion() {
-    putHeldWrite(ITEMS_RELOAD_SUBJECT, {
-      requestId: crypto.randomUUID(),
-      payload: null,
-      phase: 'posted_reload',
-      kind: 'action',
-    });
+    setReloadMarker(ITEMS_RELOAD_SUBJECT);
     setLocalNeedsReload(true);
     try {
       await reloadCatalog();
@@ -159,7 +157,7 @@ export function ItemsPage() {
         if (cancelled || !next) return;
         setItems(next);
         setLoadError(null);
-        clearPostedReload(ITEMS_RELOAD_SUBJECT);
+        clearReloadMarker(ITEMS_RELOAD_SUBJECT);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -228,12 +226,7 @@ export function ItemsPage() {
       saved = true;
       // Locked from the moment the save lands until fresh rows are applied.
       // The editor stays open so a sibling section keeps its pending value.
-      putHeldWrite(ITEMS_RELOAD_SUBJECT, {
-        requestId: crypto.randomUUID(),
-        payload: null,
-        phase: 'posted_reload',
-        kind: 'action',
-      });
+      setReloadMarker(ITEMS_RELOAD_SUBJECT);
       setLocalNeedsReload(true);
       if (
         action.kind === 'create' &&
@@ -245,7 +238,7 @@ export function ItemsPage() {
       if (next) {
         setItems(next);
         setLoadError(null);
-        clearPostedReload(ITEMS_RELOAD_SUBJECT);
+        clearReloadMarker(ITEMS_RELOAD_SUBJECT);
         setLocalNeedsReload(false);
       }
     } catch (error) {

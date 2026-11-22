@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
+import { clearActionPostedReload } from '@/items/request-id';
 import { cairoDateIso, formatCairo } from '@/lib/cairo';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { orderCoverageText } from '@/mapping/format';
@@ -121,6 +122,8 @@ export function PackagingPage() {
         }
         setDetail({ key, value: next });
         setDetailError(null);
+        const packSubj = orderTypePackagingSubject(current.key);
+        clearActionPostedReload(packSubj, packSubj);
       } catch (error) {
         if (
           cancelled ||
@@ -157,6 +160,8 @@ export function PackagingPage() {
     }
     setDetail({ key: keyAtStart, value: next });
     setDetailError(null);
+    const packSubj = orderTypePackagingSubject(current.key);
+    clearActionPostedReload(packSubj, packSubj);
   }
 
   return (
