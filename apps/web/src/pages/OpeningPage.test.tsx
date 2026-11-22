@@ -17,7 +17,6 @@ import {
   recordOpeningStock,
 } from '@/purchases/api';
 import { OpeningPage } from '@/pages/OpeningPage';
-import { cairoDateTimeLocalToIso } from '@/purchases/time';
 import type { StockChoice, UnitOption } from '@/purchases/types';
 
 vi.mock('@/purchases/api', () => ({
@@ -76,11 +75,14 @@ describe('OpeningPage', () => {
     // stays disabled until the lookup for the form's instant has resolved.
     let releaseUnits: (rows: Record<string, UnitOption[]>) => void = () =>
       undefined;
-    vi.mocked(listUnitsAt).mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          releaseUnits = resolve;
-        }),
+    // A fixed instant distinct from the default current minute.
+    const fixedAt = '2026-07-15T09:00:00.000Z';
+    vi.mocked(listUnitsAt).mockImplementation((_ids, at) =>
+      at === fixedAt
+        ? new Promise((resolve) => {
+            releaseUnits = resolve;
+          })
+        : Promise.resolve({}),
     );
     render(
       <MemoryRouter>
@@ -88,18 +90,18 @@ describe('OpeningPage', () => {
       </MemoryRouter>,
     );
     expect(await screen.findByLabelText('كمية زيت')).toBeInTheDocument();
+    // Enabled before entry, so the disabled check after save is not vacuous.
+    expect(screen.getByLabelText('كمية زيت')).toBeEnabled();
+    fireEvent.change(screen.getByLabelText('وقت الرصيد'), {
+      target: { value: '2026-07-15T12:00' },
+    });
     fireEvent.change(screen.getByLabelText('كمية زيت'), {
       target: { value: '4' },
     });
     fireEvent.change(screen.getByLabelText('تكلفة زيت'), {
       target: { value: '12.5' },
     });
-    const stampIso = cairoDateTimeLocalToIso(
-      screen.getByLabelText<HTMLInputElement>('وقت الرصيد').value,
-    );
-    expect(stampIso).not.toBeNull();
-    expect(listUnitsAt).toHaveBeenCalledTimes(1);
-    expect(listUnitsAt).toHaveBeenCalledWith(['oil'], stampIso);
+    expect(listUnitsAt).toHaveBeenLastCalledWith(['oil'], fixedAt);
     expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
     await act(async () => {
       releaseUnits({});
@@ -125,7 +127,7 @@ describe('OpeningPage', () => {
         expectedFactor: '1',
       },
     ]);
-    expect(payload?.occurredAt).toBe(stampIso);
+    expect(payload?.occurredAt).toBe(fixedAt);
     expect(payload?.requestId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
     );
