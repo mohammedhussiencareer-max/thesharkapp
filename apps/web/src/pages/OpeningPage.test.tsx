@@ -71,6 +71,16 @@ describe('OpeningPage', () => {
         releaseSave = () => resolve();
       }),
     );
+    // Hold the dated unit lookup so the click below can never race it: save
+    // stays disabled until the lookup for the form's instant has resolved.
+    let releaseUnits: (rows: Record<string, UnitOption[]>) => void = () =>
+      undefined;
+    vi.mocked(listUnitsAt).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseUnits = resolve;
+        }),
+    );
     render(
       <MemoryRouter>
         <OpeningPage />
@@ -82,6 +92,15 @@ describe('OpeningPage', () => {
     });
     fireEvent.change(screen.getByLabelText('تكلفة زيت'), {
       target: { value: '12.5' },
+    });
+    expect(listUnitsAt).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+    await act(async () => {
+      releaseUnits({});
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
     });
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
 
