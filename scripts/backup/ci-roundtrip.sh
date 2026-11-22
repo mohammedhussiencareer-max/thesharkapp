@@ -425,8 +425,9 @@ run_full() {
     "begin read write; delete from storage.buckets where false; rollback"
   expect_denied "storage.objects" 42501 "select 1 from storage.objects limit 1"
   expect_denied "vault.secrets" '42501|3F000' "select 1 from vault.secrets limit 1"
-  # pg_cron and pg_net are absent here (the drift guard fails if either is
-  # installed), so a missing table also proves the reader cannot read it.
+  # This local stack does not install pg_cron or pg_net. The drift guard allows
+  # both. A missing relation or schema (42P01 or 3F000) still proves the reader
+  # cannot read the job table; 42501 proves it when the extension exists.
   expect_denied "cron.job" '42501|3F000|42P01' "select 1 from cron.job limit 1"
   expect_denied "net.http_request_queue" '42501|3F000|42P01' "select 1 from net.http_request_queue limit 1"
   expect_denied "pg_authid" 42501 "select rolpassword from pg_catalog.pg_authid limit 1"

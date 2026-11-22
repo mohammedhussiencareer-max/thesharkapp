@@ -21,6 +21,7 @@ The database holds the only copy of the owner's stock ledger, costs and expenses
 | `retention.mjs --input <list.json> --dry-run`           | Plans deletions: 14 daily, 8 weekly, 24 monthly, never fewer than the 7 newest verified |
 | `ci-roundtrip.sh full / restore-archive <archive>`      | The CI proof, and the restore step of the private workflow                              |
 | `provision-backup-reader.sql`                           | Creates the read-only role (no password)                                                |
+| `ensure-scheduler.mjs`                                  | Creates missing `pg_cron` and `pg_net`, then checks both rows and schemas               |
 
 Retention keeps the newest 7 verified backups no matter what, deletes at most 5 per run, and deletes nothing when the current run failed. A backup that is not verified is never counted.
 
@@ -34,7 +35,7 @@ Retention keeps the newest 7 verified backups no matter what, deletes at most 5 
 
 - `auth.users` and everything else in `auth`: the owner's login. After a disaster the owner signs in to the new project, which creates a user; the restore then uses `remap` to point the data at that user. Passwords and sessions are not restored.
 - Dashboard settings: signups disabled, Data API exposed schemas (`app` must be exposed), network restrictions, SMTP, JWT settings, API keys.
-- Storage objects, Edge Function code and secrets, cron jobs. They cannot be silently missing: the drift guard fails the backup if `pg_cron` or `pg_net` is installed (the app uses neither; a future need must update this design first), and fails it if `storage.buckets` has any row. The guard counts the buckets as `backup_reader`, which can read the `id` column of `storage.buckets` and nothing else in `storage`. A count that cannot be read is a failure, never a pass (see "Storage buckets").
+- Storage objects, Edge Function code and secrets, and cron jobs (`cron.job`). The jobs stay out of the dump. `pg_cron` and `pg_net` are platform extensions: the drift guard allows them, and restore preparation does not create them. A restored database therefore has neither extension until the database owner runs `scripts/backup/ensure-scheduler.mjs` (after the app is usable, before any Vault secret and before `cron.schedule`). That script creates each missing extension, then fails if either `pg_extension` row or the `cron` or `net` schema is missing. `backup_reader` still has no access to `auth`, `vault`, `cron`, or `net`. The backup workflow must pin the commit that allows these extensions before either one is created on the hosted project. That pin is an owner action; nothing in this repo edits a hosted project. The drift guard still fails if `storage.buckets` has any row. The guard counts the buckets as `backup_reader`, which can read the `id` column of `storage.buckets` and nothing else in `storage`. A count that cannot be read is a failure, never a pass (see "Storage buckets").
 - `supabase_migrations` rows (only each version, name and an md5 of its normalised statements are saved, as metadata; the SQL text itself is not).
 - Roles and passwords (only placeholder `NOLOGIN` roles are created so ACLs match).
 - Anything outside `app` and `ledger_scratch`. The drift guard fails the backup when it finds an application-owned table, view, materialized view, sequence or function in any schema that is not dumped (`public`, `extensions` and every other schema), an application schema, or an unknown extension. Objects that belong to a recognised extension (`pg_depend` type `e`) or are owned by a platform role are ignored. Update `scripts/backup/config.mjs` and this page, then run again.
@@ -60,6 +61,8 @@ Server text is never printed by a production run, including `ci-roundtrip.sh res
 | `OWNER_MISSING`, `REMAP_SUBSET`                     | The owner user is missing in the target, or the owner id is not the only value replaced. |
 | `COMPARE_DIFF`                                      | The restored database differs from the manifest. `DIFF` lines name the objects.          |
 | `FUNCTIONAL_FAILED`                                 | After the restore, the owner is not `app.is_owner()` or anon can read `app.stock_items`.  |
+| `SCHEDULER_NOT_READY`                               | `pg_cron` or `pg_net` has no `pg_extension` row, or schema `cron` or `net` is missing. |
+| `SCHEDULER_QUERY_FAILED`                            | `ensure-scheduler.mjs` could not run its SQL (psql exit status and SQLSTATE only).        |
 
 A restore that fails after its first step leaves a partial restore. Drop schemas `app` and `ledger_scratch` in the target and start again (the runbook has the command). The scripts never do this on their own because the target may be a real project.
 
@@ -181,6 +184,7 @@ A free project pauses after a period without activity, and a paused project cann
 - Build the app at the revision that matches the restored schema (above): the backup's `appCommit` by default.
 - If the project changed, rebuild and reinstall the desktop app (next section). Updating `.env.production` alone does nothing for the installed app.
 - Run the app's own checks as the owner: stock levels, a purchase preview, the expense month.
+- After the installed app is reading that restored data, install the scheduler extensions and recreate the minute job (see "Scheduler after the app is usable") before any function secret or Vault secret.
 
 ### Point the desktop app at the restored project
 
@@ -192,6 +196,18 @@ The installed desktop app has the project URL and the public key compiled in at 
 4. Verify the endpoint before trusting it: open the app, sign in as the owner, and check that a stock level matches the restored data. If the page stays empty or the sign-in fails with a network error, the CSP or the URL is still the old one. Do not enter new data until this works.
 
 Commit the `.env.production` and `tauri.conf.json` changes on the restore branch. To keep them on `main`, carry the same two edits there only after `main`'s migrations have been applied to the restored project and verified; do not merge the restore branch into `main`.
+
+### Scheduler after the app is usable
+
+Do this only after the installed app is reading the restored data, and before any Vault secret or `cron.schedule`. The backup has no cron jobs and no function secrets. Restore preparation does not install `pg_cron` or `pg_net`.
+
+The backup workflow must pin the commit that allows these extensions before `pg_cron` or `pg_net` is created on the hosted project. That pin is an owner action. These commands do not edit a hosted project by themselves; the owner runs them against the restore target.
+
+1. Use the same connection variables as the restore, with `PGUSER` set to the database owner (`postgres.<project ref>`), not `backup_reader`. A non-loopback run needs `BACKUP_RESTORE_CONFIRM=RESTORE-INTO-EMPTY-PROJECT` and `PGSSLMODE=verify-full` (or `verify-ca`), the same rule as a restore, because this command writes extensions. It does not load rows and it does not empty the database.
+2. `node scripts/backup/ensure-scheduler.mjs`. It creates each extension that is missing (`pg_cron` before `pg_net` when both are missing) and then checks both `pg_extension` rows and schemas `cron` and `net`. Success prints `scheduler ready`. If a row or a schema is missing it exits non-zero with `SCHEDULER_NOT_READY`. Stop: do not write Vault secrets and do not create the job.
+3. Redeploy the Edge Function from the manifest commit (`metadata.appCommit`), the same revision the app was built from.
+4. Re-enter the function secrets by hand. They are not in the archive.
+5. Recreate the cron job from the name and function path committed in that revision. The expression is `* * * * *`. Do not copy `cron.job` out of the backup. If that revision has not committed a job name and a function path, stop after `scheduler ready`. Do not invent them.
 
 ## CI proof
 
@@ -222,7 +238,7 @@ These could not be run in the sandbox where this was written; the first CI run o
 - The platform extension and schema allowlists in `config.mjs` cover the hosted project (a false `DRIFT` on the first hosted run is expected to be fixed by adding an entry).
 - ACLs and default privileges are identical between the hosted origin and a local target; whether policies and RLS flags land in pre-data or post-data in `pg_dump`.
 - The synthetic seed inside the round trip. It ran clean once on the local database after the costing cutover (`add_custom_unit`, `set_item_conversion`, `set_item_loss`, the six-argument `set_item_opening_price`, the POS payload shape); the seed must follow any later change to those RPCs.
-- The drift query's lists of platform-owned objects (`PLATFORM_OBJECT_OWNERS`, `PLATFORM_POSTGRES_OBJECTS` in `config.mjs`) against a live local and hosted stack; a false `DRIFT` names the object to add. The local stack must not install `pg_net` or `pg_cron`.
+- The drift query's lists of platform-owned objects (`PLATFORM_OBJECT_OWNERS`, `PLATFORM_POSTGRES_OBJECTS` in `config.mjs`) against a live local and hosted stack; a false `DRIFT` names the object to add. `pg_cron` and `pg_net` are allowed platform extensions. The local CI stack still does not install them. The hosted project must not gain them until the backup workflow pins the commit that allows them.
 - `psql` with `VERBOSITY=sqlstate` prints `ERROR:  <code>` as the denial checks and the failure messages expect.
 - Stack A runs `storage-api` (CI needs a real `storage.buckets`), and the background expense writer is accepted by `app.add_expense_entry`.
 - The `postgres` role (local and hosted) can grant `usage` on schema `storage` and `select (id)` on `storage.buckets` to `backup_reader`. Provisioning fails loudly if the grant does not take effect.

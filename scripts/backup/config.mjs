@@ -70,8 +70,10 @@ export const PLATFORM_SCHEMAS = [
 // Every owner column the restore may remap.
 export const OWNER_COLUMNS = [...OWNER_FK_COLUMNS, ...OWNER_AUDIT_COLUMNS];
 
-// The application uses neither: their jobs and queues live outside the dump.
-export const FORBIDDEN_EXTENSIONS = ['pg_cron', 'pg_net'];
+// Extensions whose presence fails the backup with their own message. Empty:
+// pg_cron and pg_net are platform extensions. Their jobs stay outside the
+// dump. backup_reader still has no usage on auth, cron, net, or vault.
+export const FORBIDDEN_EXTENSIONS = [];
 
 // Schemas backup_reader must not be able to enter. storage is not listed: the
 // drift guard reads storage.buckets(id), so the role has usage on it, and the
@@ -86,7 +88,9 @@ export const FORBIDDEN_USAGE_SCHEMAS = ['auth', 'cron', 'net', 'vault'];
 export const READER_EXECUTE_ALLOWLIST = [];
 
 export const PLATFORM_EXTENSIONS = [
+  'pg_cron',
   'pg_graphql',
+  'pg_net',
   'pg_stat_statements',
   'pgcrypto',
   'pgjwt',

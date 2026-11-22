@@ -29,6 +29,12 @@ export function evaluateDrift(facts) {
   }
   const extensions = new Set([...PLATFORM_EXTENSIONS, ...APP_EXTENSIONS]);
   for (const extension of list(facts.extensions)) {
+    // Platform extensions are allowed, including pg_cron and pg_net. Their
+    // jobs are not dumped. A forbidden name that is not a platform extension
+    // still fails with its own message.
+    if (PLATFORM_EXTENSIONS.includes(extension)) {
+      continue;
+    }
     if (FORBIDDEN_EXTENSIONS.includes(extension)) {
       violations.push(
         `extension ${extension} is installed; its data is outside the backup`,
