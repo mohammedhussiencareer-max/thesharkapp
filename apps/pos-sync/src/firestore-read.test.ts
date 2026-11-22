@@ -66,6 +66,29 @@ describe('assertFirestoreReadAllowed', () => {
       `${ROOT}/custody_shifts/shift-test-1/transactions?pageSize=1&orderBy=timestamp`,
     ],
     ['GET', `${ROOT}/custody_shifts/not safe/transactions?pageSize=1`],
+    ['GET', `${ROOT}/items`],
+    ['GET', `${ROOT}/items?pageSize=0`],
+    ['GET', `${ROOT}/items?pageSize=301`],
+    ['GET', `${ROOT}/items?pageSize=1&pageToken=`],
+    ['GET', `${ROOT}/items?pageSize=1&orderBy=opening_time`],
+    ['GET', `${ROOT}/items?pageSize=1&orderBy=name`],
+    ['GET', `${ROOT}/items?pageSize=1&mask.fieldPaths=price`],
+    ['GET', `${ROOT}/items/item-test-1`],
+    ['GET', `${ROOT}/items/item-test-1/sub?pageSize=1`],
+    ['GET', `${ROOT}/items/../customers?pageSize=1`],
+    ['POST', `${ROOT}/items?pageSize=1`],
+    ['PATCH', `${ROOT}/items/item-test-1`],
+    ['DELETE', `${ROOT}/items/item-test-1`],
+    ['PUT', `${ROOT}/items/item-test-1`],
+    ['GET', `${ROOT}/optionGroups`],
+    ['GET', `${ROOT}/optionGroups?pageSize=301`],
+    ['GET', `${ROOT}/optionGroups?pageSize=1&orderBy=opening_time`],
+    ['GET', `${ROOT}/optionGroups/group-test-1`],
+    ['GET', `${ROOT}/optionGroups/group-test-1/values?pageSize=1`],
+    ['GET', `${ROOT}/optionGroups/../customers?pageSize=1`],
+    ['POST', `${ROOT}/optionGroups?pageSize=1`],
+    ['PATCH', `${ROOT}/optionGroups/group-test-1`],
+    ['DELETE', `${ROOT}/optionGroups/group-test-1`],
   ] as const;
 
   it('refuses writes and other URLs before any request', async () => {
@@ -126,6 +149,37 @@ describe('assertFirestoreReadAllowed', () => {
         },
       }),
     ).toThrow(/Firestore read refused/);
+    expect(() =>
+      assertFirestoreReadAllowed('POST', firestoreRunQueryUrl(), {
+        structuredQuery: {
+          from: [{ collectionId: 'items' }],
+          limit: 1,
+        },
+      }),
+    ).toThrow(/Firestore read refused/);
+    expect(() =>
+      assertFirestoreReadAllowed('POST', firestoreRunQueryUrl(), {
+        structuredQuery: {
+          from: [{ collectionId: 'optionGroups' }],
+          limit: 1,
+        },
+      }),
+    ).toThrow(/Firestore read refused/);
+  });
+
+  it('allows a paged list of items and optionGroups', () => {
+    const itemsUrl = firestoreListUrl('items', {
+      pageSize: 300,
+      pageToken: 'items-page-2',
+    });
+    expect(itemsUrl).toBe(`${ROOT}/items?pageSize=300&pageToken=items-page-2`);
+    expect(() => assertFirestoreReadAllowed('GET', itemsUrl)).not.toThrow();
+
+    const groupsUrl = firestoreListUrl('optionGroups', {
+      pageSize: 50,
+    });
+    expect(groupsUrl).toBe(`${ROOT}/optionGroups?pageSize=50`);
+    expect(() => assertFirestoreReadAllowed('GET', groupsUrl)).not.toThrow();
   });
 
   it('allows a paged list of one shift transaction subcollection', () => {
@@ -209,6 +263,44 @@ describe('firestoreFetch', () => {
     );
   });
 
+  it('lists items and optionGroups through createPosFirestore', async () => {
+    const urls: string[] = [];
+    const client = createPosFirestore('test-token', async (url) => {
+      urls.push(url);
+      if (url.includes('/items?')) {
+        return jsonResponse({
+          documents: [
+            {
+              name: 'projects/thesharkrestaurant/databases/(default)/documents/items/item-test-1',
+              updateTime: '2026-11-20T10:00:00Z',
+              fields: {},
+            },
+          ],
+          nextPageToken: 'next-items',
+        });
+      }
+      return jsonResponse({
+        documents: [
+          {
+            name: 'projects/thesharkrestaurant/databases/(default)/documents/optionGroups/group-test-1',
+            updateTime: '2026-11-20T09:00:00Z',
+            fields: {},
+          },
+        ],
+      });
+    });
+    const itemsPage = await client.list('items', { pageSize: 300 });
+    expect(itemsPage.documents).toHaveLength(1);
+    expect(itemsPage.nextPageToken).toBe('next-items');
+    const groupsPage = await client.list('optionGroups', { pageSize: 50 });
+    expect(groupsPage.documents).toHaveLength(1);
+    expect(groupsPage.nextPageToken).toBeUndefined();
+    expect(urls).toEqual([
+      `${ROOT}/items?pageSize=300`,
+      `${ROOT}/optionGroups?pageSize=50`,
+    ]);
+  });
+
   it('hides error bodies and treats 404 as a missing shift', async () => {
     const missing = createPosFirestore(
       'test-token',
@@ -279,6 +371,15 @@ describe('parsers', () => {
     expect(
       parseListResponse({ documents: [{ name: orderName }] }).documents,
     ).toHaveLength(1);
+    const itemName =
+      'projects/thesharkrestaurant/databases/(default)/documents/items/item-test-1';
+    const groupName =
+      'projects/thesharkrestaurant/databases/(default)/documents/optionGroups/group-test-1';
+    expect(
+      parseListResponse({
+        documents: [{ name: itemName }, { name: groupName }],
+      }).documents,
+    ).toEqual([{ name: itemName }, { name: groupName }]);
     const txName =
       'projects/thesharkrestaurant/databases/(default)/documents/custody_shifts/shift-test-1/transactions/tx-test-1';
     expect(

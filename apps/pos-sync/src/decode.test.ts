@@ -41,12 +41,22 @@ describe('decodeFirestoreValue', () => {
 });
 
 describe('splitDocumentName', () => {
-  it('reads an order id from the document name', () => {
+  it('reads an order, item, or optionGroup id from the document name', () => {
     expect(
       splitDocumentName(
         'projects/thesharkrestaurant/databases/(default)/documents/orders/order-test-1',
       ),
     ).toEqual({ collection: 'orders', id: 'order-test-1' });
+    expect(
+      splitDocumentName(
+        'projects/thesharkrestaurant/databases/(default)/documents/items/item-test-1',
+      ),
+    ).toEqual({ collection: 'items', id: 'item-test-1' });
+    expect(
+      splitDocumentName(
+        'projects/thesharkrestaurant/databases/(default)/documents/optionGroups/group-test-1',
+      ),
+    ).toEqual({ collection: 'optionGroups', id: 'group-test-1' });
   });
 
   it('rejects other projects and subcollections', () => {

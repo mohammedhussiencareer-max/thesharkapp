@@ -6,6 +6,7 @@ import {
 } from './decode.ts';
 import type {
   FirestoreRestDocument,
+  ListCollection,
   ListPage,
   ListQuery,
   PosFirestore,
@@ -18,6 +19,7 @@ const DOCUMENT_PATH =
 const RUN_QUERY_PATH = `${DOCUMENT_PATH}:runQuery`;
 
 const COLLECTIONS = new Set(['orders', 'custody_shifts']);
+const CATALOG_COLLECTIONS = new Set(['items', 'optionGroups']);
 const FIELD_PATHS = new Set(['shiftId', 'timestamp', '__name__']);
 const FILTER_OPS = new Set(['IN', 'GREATER_THAN_OR_EQUAL', 'LESS_THAN']);
 const VALUE_KINDS = new Set([
@@ -31,7 +33,7 @@ const VALUE_KINDS = new Set([
 ]);
 
 export function firestoreListUrl(
-  collection: 'orders' | 'custody_shifts',
+  collection: ListCollection,
   query: ListQuery,
 ): string {
   const url = new URL(`${ORIGIN}${DOCUMENT_PATH}/${collection}`);
@@ -124,9 +126,18 @@ export function assertFirestoreReadAllowed(
   }
   const segments = parsed.pathname.slice(DOCUMENT_PATH.length + 1).split('/');
   if (segments.length === 1) {
-    assertCollection(segments[0]);
-    assertListParams(parsed.searchParams);
-    return;
+    const collection = segments[0];
+    if (collection !== undefined && COLLECTIONS.has(collection)) {
+      assertListParams(parsed.searchParams);
+      return;
+    }
+    // List only: top-level catalog collections `items` and `optionGroups`.
+    // Single-document GETs, subcollections, orderBy, and runQuery stay refused.
+    if (collection !== undefined && CATALOG_COLLECTIONS.has(collection)) {
+      assertPagedListParams(parsed.searchParams);
+      return;
+    }
+    throw new Error('Firestore read refused');
   }
   if (segments.length === 2) {
     assertCollection(segments[0]);
@@ -148,7 +159,7 @@ export function assertFirestoreReadAllowed(
     ) {
       throw new Error('Firestore read refused');
     }
-    assertTransactionListParams(parsed.searchParams);
+    assertPagedListParams(parsed.searchParams);
     return;
   }
   throw new Error('Firestore read refused');
@@ -160,7 +171,7 @@ function assertCollection(collection: string | undefined): void {
   }
 }
 
-function assertTransactionListParams(params: URLSearchParams): void {
+function assertPagedListParams(params: URLSearchParams): void {
   for (const key of params.keys()) {
     if (key !== 'pageSize' && key !== 'pageToken') {
       throw new Error('Firestore read refused');

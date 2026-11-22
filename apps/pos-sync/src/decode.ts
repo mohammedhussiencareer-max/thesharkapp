@@ -99,8 +99,18 @@ export function isSafeDocumentId(id: string): boolean {
   return !/[/%:?#\\\s]/.test(id);
 }
 
+export type PosCollection =
+  'orders' | 'custody_shifts' | 'items' | 'optionGroups';
+
+const POS_COLLECTIONS = new Set<string>([
+  'orders',
+  'custody_shifts',
+  'items',
+  'optionGroups',
+]);
+
 export function splitDocumentName(name: string): {
-  collection: 'orders' | 'custody_shifts';
+  collection: PosCollection;
   id: string;
 } {
   if (!name.startsWith(DOCUMENT_PREFIX)) {
@@ -114,13 +124,14 @@ export function splitDocumentName(name: string): {
   const collection = parts[0];
   const id = parts[1];
   if (
-    (collection !== 'orders' && collection !== 'custody_shifts') ||
+    collection === undefined ||
+    !POS_COLLECTIONS.has(collection) ||
     id === undefined ||
     !isSafeDocumentId(id)
   ) {
     throw new Error('Firestore document name is invalid');
   }
-  return { collection, id };
+  return { collection: collection as PosCollection, id };
 }
 
 /** `custody_shifts/{shiftId}/transactions/{txId}` under the POS project. */

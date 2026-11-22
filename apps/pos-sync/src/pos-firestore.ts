@@ -20,11 +20,11 @@ export type TransactionListQuery = {
   pageToken?: string;
 };
 
+export type ListCollection =
+  'orders' | 'custody_shifts' | 'items' | 'optionGroups';
+
 export type PosFirestore = {
-  list(
-    collection: 'orders' | 'custody_shifts',
-    query: ListQuery,
-  ): Promise<ListPage>;
+  list(collection: ListCollection, query: ListQuery): Promise<ListPage>;
   listShiftTransactions(
     shiftId: string,
     query: TransactionListQuery,
