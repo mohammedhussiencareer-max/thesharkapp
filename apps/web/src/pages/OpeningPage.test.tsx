@@ -71,17 +71,44 @@ describe('OpeningPage', () => {
         releaseSave = () => resolve();
       }),
     );
+    // Hold the dated unit lookup so the click below can never race it: save
+    // stays disabled until the lookup for the form's instant has resolved.
+    let releaseUnits: (rows: Record<string, UnitOption[]>) => void = () =>
+      undefined;
+    // A fixed instant distinct from the default current minute.
+    const fixedAt = '2026-07-15T09:00:00.000Z';
+    vi.mocked(listUnitsAt).mockImplementation((_ids, at) =>
+      at === fixedAt
+        ? new Promise((resolve) => {
+            releaseUnits = resolve;
+          })
+        : Promise.resolve({}),
+    );
     render(
       <MemoryRouter>
         <OpeningPage />
       </MemoryRouter>,
     );
     expect(await screen.findByLabelText('كمية زيت')).toBeInTheDocument();
+    // Enabled before entry, so the disabled check after save is not vacuous.
+    expect(screen.getByLabelText('كمية زيت')).toBeEnabled();
+    fireEvent.change(screen.getByLabelText('وقت الرصيد'), {
+      target: { value: '2026-07-15T12:00' },
+    });
     fireEvent.change(screen.getByLabelText('كمية زيت'), {
       target: { value: '4' },
     });
     fireEvent.change(screen.getByLabelText('تكلفة زيت'), {
       target: { value: '12.5' },
+    });
+    expect(listUnitsAt).toHaveBeenLastCalledWith(['oil'], fixedAt);
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+    await act(async () => {
+      releaseUnits({});
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
     });
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
 
@@ -100,6 +127,7 @@ describe('OpeningPage', () => {
         expectedFactor: '1',
       },
     ]);
+    expect(payload?.occurredAt).toBe(fixedAt);
     expect(payload?.requestId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
     );
@@ -119,6 +147,8 @@ describe('OpeningPage', () => {
       expect(listStockChoices).toHaveBeenCalledTimes(2);
     });
     expect(screen.getByLabelText('كمية زيت')).toHaveValue('');
+    // The page lock, not only the remounted grid's unit lookup, holds the form.
+    expect(screen.getByLabelText('كمية زيت')).toBeDisabled();
     expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
 
     releaseReload([{ ...oil, hasMovements: true }]);
