@@ -2,7 +2,11 @@ import {
   assertNoPriceShapedKeys,
   hasCustomerShapedSchemaKey,
 } from './catalog-refusals.ts';
-import { isRecord, isSafeDocumentId, splitDocumentName } from './decode.ts';
+import {
+  isRecord,
+  isSafeCatalogDocumentId,
+  splitDocumentName,
+} from './decode.ts';
 import { canonicalJson, compareId, sha256Canonical } from './hash.ts';
 import { normalizeOptionalText } from './mapper.ts';
 import type { FirestoreRestDocument } from './pos-firestore.ts';
@@ -218,7 +222,7 @@ function readSharedOptionGroupIds(raw: unknown): string[] {
       throw new MalformedCatalogFieldError('duplicate shared option label');
     }
     const groupId = readStringValue(rawGroupId);
-    if (!isSafeDocumentId(groupId)) {
+    if (!isSafeCatalogDocumentId(groupId)) {
       throw new MalformedCatalogFieldError('unsafe shared option group id');
     }
     labels.add(label);

@@ -173,25 +173,30 @@ export function hasCustomerShapedSchemaKey(
   return false;
 }
 
-function isItemOptionGroupLabelMapPath(segments: readonly string[]): boolean {
+const ARRAY_STEP = Symbol('array-step');
+const LABEL_STEP = Symbol('label-step');
+
+type PathStep = string | typeof ARRAY_STEP | typeof LABEL_STEP;
+
+function isItemOptionGroupLabelMapPath(segments: readonly PathStep[]): boolean {
   return (
     segments.length === 3 &&
     segments[0] === 'items' &&
-    segments[1] === '[]' &&
+    segments[1] === ARRAY_STEP &&
     segments[2] === 'item_option_groups'
   );
 }
 
 function walkPayloadForPriceKey(
   value: unknown,
-  segments: readonly string[],
+  segments: readonly PathStep[],
   depth: number,
 ): void {
   if (depth > MAX_CATALOG_WALK_DEPTH) {
     throw new Error('Catalog payload refused: excessive nesting');
   }
   if (Array.isArray(value)) {
-    const nextSegments = [...segments, '[]'];
+    const nextSegments: readonly PathStep[] = [...segments, ARRAY_STEP];
     for (const entry of value) {
       walkPayloadForPriceKey(entry, nextSegments, depth + 1);
     }
@@ -207,7 +212,7 @@ function walkPayloadForPriceKey(
     }
     walkPayloadForPriceKey(
       child,
-      [...segments, keysAreLabels ? '<label>' : key],
+      [...segments, keysAreLabels ? LABEL_STEP : key],
       depth + 1,
     );
   }

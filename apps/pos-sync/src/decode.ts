@@ -89,6 +89,8 @@ export function decodeFields(fields: unknown): Record<string, unknown> {
 const DOCUMENT_PREFIX =
   'projects/thesharkrestaurant/databases/(default)/documents/';
 
+const UNICODE_CONTROL_CHAR = /\p{Cc}/u;
+
 export function isSafeDocumentId(id: string): boolean {
   if (id.length === 0 || id.length > 1500) {
     return false;
@@ -96,13 +98,12 @@ export function isSafeDocumentId(id: string): boolean {
   if (id === '.' || id === '..' || id.includes('..')) {
     return false;
   }
-  for (let index = 0; index < id.length; index += 1) {
-    const code = id.charCodeAt(index);
-    if (code <= 0x1f || code === 0x7f) {
-      return false;
-    }
-  }
   return !/[/%:?#\\\s]/.test(id);
+}
+
+/** Stricter id check for catalog document ids and sharedOptionGroupIds references. */
+export function isSafeCatalogDocumentId(id: string): boolean {
+  return isSafeDocumentId(id) && !UNICODE_CONTROL_CHAR.test(id);
 }
 
 export type PosCollection =
@@ -132,9 +133,15 @@ export function splitDocumentName(name: string): {
   if (
     collection === undefined ||
     !POS_COLLECTIONS.has(collection) ||
-    id === undefined ||
-    !isSafeDocumentId(id)
+    id === undefined
   ) {
+    throw new Error('Firestore document name is invalid');
+  }
+  const validId =
+    collection === 'items' || collection === 'optionGroups'
+      ? isSafeCatalogDocumentId(id)
+      : isSafeDocumentId(id);
+  if (!validId) {
     throw new Error('Firestore document name is invalid');
   }
   return { collection: collection as PosCollection, id };

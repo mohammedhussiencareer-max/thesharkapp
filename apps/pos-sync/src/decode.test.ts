@@ -79,11 +79,26 @@ describe('splitDocumentName', () => {
         'projects/thesharkrestaurant/databases/(default)/documents/customers/a',
       ),
     ).toThrow(/invalid/);
-    expect(isSafeDocumentId('item\0id')).toBe(false);
-    expect(() =>
+    expect(isSafeDocumentId('order\u0001compat')).toBe(true);
+    expect(
       splitDocumentName(
-        'projects/thesharkrestaurant/databases/(default)/documents/items/item\0id',
+        'projects/thesharkrestaurant/databases/(default)/documents/orders/order\u0001compat',
       ),
-    ).toThrow(/invalid/);
+    ).toEqual({ collection: 'orders', id: 'order\u0001compat' });
+  });
+
+  it('rejects C0, DEL, and C1 Unicode control characters in catalog document ids', () => {
+    for (const control of ['\u0000', '\u0001', '\u007f', '\u0085']) {
+      expect(() =>
+        splitDocumentName(
+          `projects/thesharkrestaurant/databases/(default)/documents/items/item${control}id`,
+        ),
+      ).toThrow(/invalid/);
+      expect(() =>
+        splitDocumentName(
+          `projects/thesharkrestaurant/databases/(default)/documents/optionGroups/group${control}id`,
+        ),
+      ).toThrow(/invalid/);
+    }
   });
 });

@@ -114,8 +114,11 @@ export function assertFirestoreReadAllowed(
     throw new Error('Firestore read refused');
   }
   // Refuse dot-segment or backslash traversal even when URL normalization
-  // resolves to an allowed collection path (e.g. /items/../optionGroups).
-  const rawPathMatch = /^https:\/\/[^/?#\s]+(\/[^?#]*)(?:[?#]|$)/i.exec(url);
+  // resolves to an allowed collection path (e.g. /items/../optionGroups or
+  // authority backslashes).
+  const rawPathMatch = /^https:\/\/[^/?#\\\s]+(\/[^?#\\]*)(?:[?#]|$)/i.exec(
+    url,
+  );
   if (rawPathMatch === null || rawPathMatch[1] !== parsed.pathname) {
     throw new Error('Firestore read refused');
   }

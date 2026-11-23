@@ -80,6 +80,15 @@ describe('assertFirestoreReadAllowed', () => {
     ['GET', `${ROOT}/customers/../items?pageSize=1`],
     ['GET', `${ROOT}/optionGroups/../items?pageSize=1`],
     ['GET', `${ROOT}/items/./?pageSize=1`],
+    [
+      'GET',
+      'https://firestore.googleapis.com\\ignored\\../v1/projects/thesharkrestaurant/databases/(default)/documents/items?pageSize=1',
+    ],
+    [
+      'GET',
+      'https://firestore.googleapis.com\\..\\v1/projects/thesharkrestaurant/databases/(default)/documents/items?pageSize=1',
+    ],
+    ['GET', `${ROOT}/items\\..\\optionGroups?pageSize=1`],
     ['POST', `${ROOT}/items?pageSize=1`],
     ['PATCH', `${ROOT}/items/item-test-1`],
     ['DELETE', `${ROOT}/items/item-test-1`],

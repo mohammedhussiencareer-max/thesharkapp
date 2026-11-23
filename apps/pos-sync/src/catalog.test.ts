@@ -624,6 +624,9 @@ describe('refusals', () => {
       {
         items: [{ item_option_groups: { 'Price Specials': [{ fee: 1 }] } }],
       },
+      {
+        items: { '[]': { item_option_groups: { price: 10 } } },
+      },
     ]) {
       expect(
         () => assertNoPriceShapedKeys(forged),
@@ -730,46 +733,69 @@ describe('refusals', () => {
     expect(JSON.stringify(rawGroupPage)).not.toContain('01111111111');
   });
 
-  it('rejects impossible updateTime calendar dates and NUL bytes in ids', () => {
-    expect(
-      parseCatalogItemDocument(
-        itemDoc(
-          'item-syn-feb30',
-          { name: str('Synthetic Dish Feb 30') },
-          '2026-02-30T10:00:00Z',
+  it('rejects impossible updateTime calendar dates and Unicode control characters in catalog ids while keeping order id compatibility', () => {
+    for (const badTime of ['2026-02-30T10:00:00Z', '0000-01-01T00:00:00Z']) {
+      expect(
+        parseCatalogItemDocument(
+          itemDoc(
+            'item-syn-bad-time',
+            { name: str('Synthetic Dish Bad Time') },
+            badTime,
+          ),
         ),
-      ),
-    ).toEqual({
-      outcome: 'rejected',
-      pos_item_id: 'item-syn-feb30',
+        badTime,
+      ).toEqual({
+        outcome: 'rejected',
+        pos_item_id: 'item-syn-bad-time',
+      });
+    }
+
+    // Order path compatibility: a non-NUL control character in an order id still parses.
+    const order = mapOrderDocument({
+      name: `${DOC_ROOT}/orders/order\u0001compat`,
+      updateTime: '2026-11-20T10:00:00Z',
+      fields: {
+        status: str('complete'),
+        shiftId: str('shift-syn-1'),
+        timestamp: { timestampValue: '2026-11-20T10:00:00Z' },
+        subtotalAmount: dbl(10),
+        discountAmount: dbl(0),
+        taxTotalAmount: dbl(0),
+        serviceTaxAmount: dbl(0),
+        totalAmount: dbl(10),
+      },
     });
+    expect(order.id).toBe('order\u0001compat');
 
-    expect(() =>
-      parseCatalog(
-        [
-          {
-            name: `${DOC_ROOT}/items/item-syn\0nul`,
-            updateTime: '2026-11-20T10:00:00Z',
-            fields: { name: str('NUL Doc Id') },
-          },
-        ],
-        [],
-      ),
-    ).toThrow();
+    // Catalog ids reject C0, DEL, and C1 Unicode control characters (\p{Cc}).
+    for (const control of ['\u0000', '\u0001', '\u007f', '\u0085']) {
+      expect(() =>
+        parseCatalog(
+          [
+            {
+              name: `${DOC_ROOT}/items/item-syn${control}ctrl`,
+              updateTime: '2026-11-20T10:00:00Z',
+              fields: { name: str('Control Doc Id') },
+            },
+          ],
+          [],
+        ),
+      ).toThrow();
 
-    expect(
-      parseCatalogItemDocument(
-        itemDoc('item-syn-nul-shared', {
-          name: str('NUL Shared Group Id'),
-          sharedOptionGroupIds: map({
-            'Synthetic Prep': str('group-syn\0nul'),
+      expect(
+        parseCatalogItemDocument(
+          itemDoc('item-syn-ctrl-shared', {
+            name: str('Control Shared Group Id'),
+            sharedOptionGroupIds: map({
+              'Synthetic Prep': str(`group-syn${control}ctrl`),
+            }),
           }),
-        }),
-      ),
-    ).toEqual({
-      outcome: 'rejected',
-      pos_item_id: 'item-syn-nul-shared',
-    });
+        ),
+      ).toEqual({
+        outcome: 'rejected',
+        pos_item_id: 'item-syn-ctrl-shared',
+      });
+    }
   });
 });
 

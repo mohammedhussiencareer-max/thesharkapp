@@ -30,6 +30,12 @@ describe('normalizeTimestamp', () => {
     expect(() => normalizeTimestamp('2026-04-31T10:00:00Z')).toThrow(
       /invalid timestamp/,
     );
+    expect(() => normalizeTimestamp('0000-01-01T00:00:00Z')).toThrow(
+      /invalid timestamp/,
+    );
+    expect(normalizeTimestamp('0001-01-01T00:00:00Z')).toBe(
+      '0001-01-01T00:00:00.000000Z',
+    );
     expect(normalizeTimestamp('2024-02-29T10:00:00Z')).toBe(
       '2024-02-29T10:00:00.000000Z',
     );

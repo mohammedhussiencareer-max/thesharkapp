@@ -30,6 +30,7 @@ export function normalizeTimestamp(value: string): string {
   const minute = Number(minuteText);
   const second = Number(secondText);
   if (
+    year < 1 ||
     month < 1 ||
     month > 12 ||
     day < 1 ||
