@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { CATALOG_REJECTED_FIELDS } from './catalog-allowlist.ts';
+import {
+  CATALOG_ITEM_FIELDS,
+  CATALOG_OPTION_GROUP_FIELDS,
+  CATALOG_REJECTED_FIELDS,
+} from './catalog-allowlist.ts';
 import { isCustomerShapedKey, isPriceShapedKey } from './catalog-refusals.ts';
 import {
   assertNoPriceShapedKeys,
@@ -8,6 +12,9 @@ import {
   parseCatalogItemDocument,
   parseCatalogOptionGroupDocument,
   posSizeKey,
+  projectAllowedItemFields,
+  projectAllowedOptionGroupFields,
+  resolveCatalogFieldSelectors,
 } from './catalog.ts';
 import { parseListResponse } from './firestore-read.ts';
 import { mapOrderDocument } from './mapper.ts';
@@ -548,6 +555,223 @@ describe('parseCatalog fixtures', () => {
       parseCatalog([], [FIXTURE_SHARED_GROUP, FIXTURE_SHARED_GROUP]),
     ).toThrow(/duplicate catalog option group id/);
   });
+
+  it('preserves constructor, prototype, and __proto__ option-group labels through projection and hashing', () => {
+    const optionsFields = Object.create(null) as Record<string, unknown>;
+    optionsFields['constructor'] = arr([map({ value: str('Alpha') })]);
+    optionsFields['prototype'] = arr([map({ value: str('Beta') })]);
+    optionsFields['__proto__'] = arr([map({ value: str('Gamma') })]);
+
+    const sharedFields = Object.create(null) as Record<string, unknown>;
+    sharedFields['constructor'] = str('group-syn-ctor');
+    sharedFields['prototype'] = str('group-syn-proto');
+    sharedFields['__proto__'] = str('group-syn-dunder');
+
+    const doc = itemDoc('item-syn-proto-labels', {
+      name: str('Synthetic Dish Proto Labels'),
+      options: { mapValue: { fields: optionsFields } },
+      sharedOptionGroupIds: { mapValue: { fields: sharedFields } },
+    });
+
+    const payload = parseCatalog([doc], []);
+    expect(payload.presence).toEqual([
+      { pos_item_id: 'item-syn-proto-labels', outcome: 'accepted' },
+    ]);
+    expect(payload.items).toHaveLength(1);
+    const item = payload.items[0];
+    if (item === undefined) {
+      throw new Error('expected accepted item');
+    }
+    expect(Object.getPrototypeOf(item.item_option_groups)).toBeNull();
+    expect(Object.keys(item.item_option_groups)).toEqual([
+      '__proto__',
+      'constructor',
+      'prototype',
+    ]);
+    expect(item.item_option_groups['constructor']).toEqual(['Alpha']);
+    expect(item.item_option_groups['prototype']).toEqual(['Beta']);
+    expect(item.item_option_groups['__proto__']).toEqual(['Gamma']);
+    expect(item.shared_option_group_ids).toEqual([
+      'group-syn-ctor',
+      'group-syn-dunder',
+      'group-syn-proto',
+    ]);
+
+    // Changing the __proto__ label's value changes the content hash.
+    const changedOptions = Object.create(null) as Record<string, unknown>;
+    changedOptions['constructor'] = arr([map({ value: str('Alpha') })]);
+    changedOptions['prototype'] = arr([map({ value: str('Beta') })]);
+    changedOptions['__proto__'] = arr([map({ value: str('Delta') })]);
+    const changed = parseCatalogItemDocument(
+      itemDoc('item-syn-proto-labels', {
+        name: str('Synthetic Dish Proto Labels'),
+        options: { mapValue: { fields: changedOptions } },
+        sharedOptionGroupIds: { mapValue: { fields: sharedFields } },
+      }),
+    );
+    expect(changed.outcome).toBe('accepted');
+    if (changed.outcome !== 'accepted') {
+      throw new Error('expected accepted');
+    }
+    expect(changed.item.content_hash).not.toBe(item.content_hash);
+  });
+
+  it('derives selectors from catalog-allowlist.ts and reads exactly CATALOG_ITEM_FIELDS and CATALOG_OPTION_GROUP_FIELDS', () => {
+    expect(() =>
+      resolveCatalogFieldSelectors(
+        [...CATALOG_ITEM_FIELDS, 'extraField'],
+        CATALOG_OPTION_GROUP_FIELDS,
+      ),
+    ).toThrow(/allowlist/i);
+    expect(() =>
+      resolveCatalogFieldSelectors(['name'], CATALOG_OPTION_GROUP_FIELDS),
+    ).toThrow(/allowlist/i);
+    expect(() =>
+      resolveCatalogFieldSelectors(CATALOG_ITEM_FIELDS, [
+        ...CATALOG_OPTION_GROUP_FIELDS,
+        'extraGroupField',
+      ]),
+    ).toThrow(/allowlist/i);
+
+    function traceFields(
+      target: Record<string, unknown>,
+      prefix: string,
+      recorded: Set<string>,
+      isLabelMap = false,
+    ): Record<string, unknown> {
+      return new Proxy(target, {
+        get(obj, prop, receiver) {
+          if (typeof prop === 'string') {
+            const segment = isLabelMap ? '<label>' : prop;
+            const path = prefix === '' ? segment : `${prefix}.${segment}`;
+            recorded.add(path);
+          }
+          return Reflect.get(obj, prop, receiver) as unknown;
+        },
+      });
+    }
+
+    const itemReads = new Set<string>();
+    const itemFields = traceFields(
+      {
+        name: str('Synthetic Contract Item'),
+        categoryId: str('cat-drop'),
+        description: str('desc-drop'),
+        imageUrl: str('https://example.invalid/drop.png'),
+        name_lowercase: str('synthetic contract item'),
+        pluCode: str('12345'),
+        pricingType: str('fixed'),
+        scaleSizeName: str('scale-drop'),
+        weightedUnit: str('kg'),
+        sizes: arr([
+          {
+            mapValue: {
+              fields: traceFields(
+                {
+                  name: str('Large'),
+                  price: dbl(99),
+                  costPrice: dbl(40),
+                  pricingBaseQuantity: int(1),
+                  recipe: arr([]),
+                },
+                'sizes[]',
+                itemReads,
+              ),
+            },
+          },
+        ]),
+        options: {
+          mapValue: {
+            fields: traceFields(
+              {
+                'Synthetic Prep': arr([
+                  {
+                    mapValue: {
+                      fields: traceFields(
+                        {
+                          value: str('Baked'),
+                          price: dbl(15),
+                          costPrice: dbl(5),
+                          pricingBaseQuantity: int(1),
+                          pricingType: str('fixed'),
+                          recipe: arr([]),
+                        },
+                        'options.<label>[]',
+                        itemReads,
+                      ),
+                    },
+                  },
+                ]),
+              },
+              'options',
+              itemReads,
+              true,
+            ),
+          },
+        },
+        sharedOptionGroupIds: {
+          mapValue: {
+            fields: traceFields(
+              { 'Synthetic Prep': str('group-syn-prep') },
+              'sharedOptionGroupIds',
+              itemReads,
+              true,
+            ),
+          },
+        },
+      },
+      '',
+      itemReads,
+    );
+
+    projectAllowedItemFields(itemFields);
+    // Container keys (`sizes`, `options`, `sharedOptionGroupIds`) are read to reach leaf allowlist paths.
+    const itemLeafReads = [...itemReads]
+      .filter(
+        (path) =>
+          ![
+            'sizes',
+            'options',
+            'sharedOptionGroupIds',
+            'options.<label>',
+          ].includes(path),
+      )
+      .sort();
+    expect(itemLeafReads).toEqual([...CATALOG_ITEM_FIELDS].sort());
+
+    const groupReads = new Set<string>();
+    const groupFields = traceFields(
+      {
+        name: str('Synthetic Contract Group'),
+        pricingType: str('fixed'),
+        values: arr([
+          {
+            mapValue: {
+              fields: traceFields(
+                {
+                  value: str('Roasted'),
+                  price: dbl(20),
+                  costPrice: dbl(6),
+                  pricingBaseQuantity: int(1),
+                  pricingType: str('fixed'),
+                  recipe: arr([]),
+                },
+                'values[]',
+                groupReads,
+              ),
+            },
+          },
+        ]),
+      },
+      '',
+      groupReads,
+    );
+    projectAllowedOptionGroupFields(groupFields);
+    const groupLeafReads = [...groupReads]
+      .filter((path) => path !== 'values')
+      .sort();
+    expect(groupLeafReads).toEqual([...CATALOG_OPTION_GROUP_FIELDS].sort());
+  });
 });
 
 describe('refusals', () => {
@@ -882,6 +1106,74 @@ describe('refusals', () => {
       ).toEqual({
         outcome: 'rejected',
         pos_item_id: 'item-syn-ctrl-shared',
+      });
+    }
+  });
+
+  it('rejects catalog documents whose stored strings or labels contain U+0000', () => {
+    const nulCases: Array<[string, FirestoreRestDocument]> = [
+      [
+        'item-syn-nul-name',
+        itemDoc('item-syn-nul-name', { name: str('Dish\u0000Bad') }),
+      ],
+      [
+        'item-syn-nul-size',
+        itemDoc('item-syn-nul-size', {
+          name: str('Dish'),
+          sizes: arr([map({ name: str('Small\u0000X') })]),
+        }),
+      ],
+      [
+        'item-syn-nul-opt-label',
+        itemDoc('item-syn-nul-opt-label', {
+          name: str('Dish'),
+          options: map({
+            'Sauce\u0000Bad': arr([map({ value: str('Herb') })]),
+          }),
+        }),
+      ],
+      [
+        'item-syn-nul-opt-val',
+        itemDoc('item-syn-nul-opt-val', {
+          name: str('Dish'),
+          options: map({
+            Sauce: arr([map({ value: str('Herb\u0000Bad') })]),
+          }),
+        }),
+      ],
+      [
+        'item-syn-nul-shared-label',
+        itemDoc('item-syn-nul-shared-label', {
+          name: str('Dish'),
+          sharedOptionGroupIds: map({
+            'Prep\u0000Bad': str('group-syn-prep'),
+          }),
+        }),
+      ],
+    ];
+    for (const [id, doc] of nulCases) {
+      expect(parseCatalogItemDocument(doc), id).toEqual({
+        outcome: 'rejected',
+        pos_item_id: id,
+      });
+    }
+
+    for (const [id, doc] of [
+      [
+        'group-syn-nul-name',
+        groupDoc('group-syn-nul-name', { name: str('Group\u0000Bad') }),
+      ],
+      [
+        'group-syn-nul-val',
+        groupDoc('group-syn-nul-val', {
+          name: str('Group'),
+          values: arr([map({ value: str('Val\u0000Bad') })]),
+        }),
+      ],
+    ] as const) {
+      expect(parseCatalogOptionGroupDocument(doc), id).toEqual({
+        outcome: 'rejected',
+        group_id: id,
       });
     }
   });

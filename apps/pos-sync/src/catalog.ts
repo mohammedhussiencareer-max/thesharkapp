@@ -1,4 +1,8 @@
 import {
+  CATALOG_ITEM_FIELDS,
+  CATALOG_OPTION_GROUP_FIELDS,
+} from './catalog-allowlist.ts';
+import {
   assertNoPriceShapedKeys,
   hasCustomerShapedSchemaKey,
 } from './catalog-refusals.ts';
@@ -65,7 +69,149 @@ export type ParsedCatalogOptionGroup =
   | { outcome: 'accepted'; option_group: PosCatalogOptionGroupIngest }
   | { outcome: 'rejected'; group_id: string };
 
-const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+export type CatalogFieldSelectors = {
+  itemName: string;
+  sizesArray: string;
+  sizeName: string;
+  optionsMap: string;
+  optionValue: string;
+  sharedOptionGroupIdsMap: string;
+  groupName: string;
+  groupValuesArray: string;
+  groupOptionValue: string;
+};
+
+const SCALAR_PATH = /^([A-Za-z_]\w*)$/;
+const ARRAY_FIELD_PATH = /^([A-Za-z_]\w*)\[\]\.([A-Za-z_]\w*)$/;
+const LABELED_ARRAY_FIELD_PATH =
+  /^([A-Za-z_]\w*)\.<label>\[\]\.([A-Za-z_]\w*)$/;
+const LABELED_SCALAR_PATH = /^([A-Za-z_]\w*)\.<label>$/;
+
+/**
+ * Derives parser field selectors directly from `CATALOG_ITEM_FIELDS` and
+ * `CATALOG_OPTION_GROUP_FIELDS`, failing fast on any allowlist drift.
+ */
+export function resolveCatalogFieldSelectors(
+  itemFields: readonly string[],
+  optionGroupFields: readonly string[],
+): CatalogFieldSelectors {
+  let itemName: string | undefined;
+  let sizesArray: string | undefined;
+  let sizeName: string | undefined;
+  let optionsMap: string | undefined;
+  let optionValue: string | undefined;
+  let sharedOptionGroupIdsMap: string | undefined;
+
+  for (const path of itemFields) {
+    const scalar = SCALAR_PATH.exec(path);
+    if (scalar?.[1] !== undefined) {
+      if (itemName !== undefined) {
+        throw new Error(
+          `Catalog allowlist mismatch: unexpected item path ${path}`,
+        );
+      }
+      itemName = scalar[1];
+      continue;
+    }
+    const arrayField = ARRAY_FIELD_PATH.exec(path);
+    if (arrayField?.[1] !== undefined && arrayField[2] !== undefined) {
+      if (sizesArray !== undefined) {
+        throw new Error(
+          `Catalog allowlist mismatch: unexpected item path ${path}`,
+        );
+      }
+      sizesArray = arrayField[1];
+      sizeName = arrayField[2];
+      continue;
+    }
+    const labeledArray = LABELED_ARRAY_FIELD_PATH.exec(path);
+    if (labeledArray?.[1] !== undefined && labeledArray[2] !== undefined) {
+      if (optionsMap !== undefined) {
+        throw new Error(
+          `Catalog allowlist mismatch: unexpected item path ${path}`,
+        );
+      }
+      optionsMap = labeledArray[1];
+      optionValue = labeledArray[2];
+      continue;
+    }
+    const labeledScalar = LABELED_SCALAR_PATH.exec(path);
+    if (labeledScalar?.[1] !== undefined) {
+      if (sharedOptionGroupIdsMap !== undefined) {
+        throw new Error(
+          `Catalog allowlist mismatch: unexpected item path ${path}`,
+        );
+      }
+      sharedOptionGroupIdsMap = labeledScalar[1];
+      continue;
+    }
+    throw new Error(
+      `Catalog allowlist mismatch: unsupported item path ${path}`,
+    );
+  }
+
+  let groupName: string | undefined;
+  let groupValuesArray: string | undefined;
+  let groupOptionValue: string | undefined;
+
+  for (const path of optionGroupFields) {
+    const scalar = SCALAR_PATH.exec(path);
+    if (scalar?.[1] !== undefined) {
+      if (groupName !== undefined) {
+        throw new Error(
+          `Catalog allowlist mismatch: unexpected optionGroup path ${path}`,
+        );
+      }
+      groupName = scalar[1];
+      continue;
+    }
+    const arrayField = ARRAY_FIELD_PATH.exec(path);
+    if (arrayField?.[1] !== undefined && arrayField[2] !== undefined) {
+      if (groupValuesArray !== undefined) {
+        throw new Error(
+          `Catalog allowlist mismatch: unexpected optionGroup path ${path}`,
+        );
+      }
+      groupValuesArray = arrayField[1];
+      groupOptionValue = arrayField[2];
+      continue;
+    }
+    throw new Error(
+      `Catalog allowlist mismatch: unsupported optionGroup path ${path}`,
+    );
+  }
+
+  if (
+    itemName === undefined ||
+    sizesArray === undefined ||
+    sizeName === undefined ||
+    optionsMap === undefined ||
+    optionValue === undefined ||
+    sharedOptionGroupIdsMap === undefined ||
+    groupName === undefined ||
+    groupValuesArray === undefined ||
+    groupOptionValue === undefined
+  ) {
+    throw new Error('Catalog allowlist mismatch: missing required selector');
+  }
+
+  return {
+    itemName,
+    sizesArray,
+    sizeName,
+    optionsMap,
+    optionValue,
+    sharedOptionGroupIdsMap,
+    groupName,
+    groupValuesArray,
+    groupOptionValue,
+  };
+}
+
+const SELECTORS = resolveCatalogFieldSelectors(
+  CATALOG_ITEM_FIELDS,
+  CATALOG_OPTION_GROUP_FIELDS,
+);
 
 class MalformedCatalogFieldError extends Error {}
 
@@ -115,6 +261,10 @@ function readStringValue(value: unknown): string {
     typeof value.stringValue !== 'string'
   ) {
     throw new MalformedCatalogFieldError('expected Firestore stringValue');
+  }
+  // PostgreSQL jsonb rejects U+0000 in stored strings; reject only this doc.
+  if (value.stringValue.includes('\0')) {
+    throw new MalformedCatalogFieldError('string contains NUL');
   }
   return value.stringValue;
 }
@@ -187,7 +337,7 @@ function readSizes(raw: unknown): PosCatalogSize[] {
   const byKey = new Map<string, PosCatalogSize>();
   for (const entry of entries) {
     const sizeFields = readMapFields(entry);
-    const rawName = field(sizeFields, 'name');
+    const rawName = field(sizeFields, SELECTORS.sizeName);
     let sizeKey: PosSizeKey;
     if (rawName === undefined || isNullValue(rawName)) {
       sizeKey = posSizeKey(null);
@@ -218,7 +368,7 @@ function readSharedOptionGroupIds(raw: unknown): string[] {
   // occur in a Firestore document; this duplicate check is only a defensive
   // guard for non-Firestore input.
   for (const [label, rawGroupId] of Object.entries(mapFields)) {
-    if (label.length === 0 || RESERVED_KEYS.has(label)) {
+    if (label.length === 0 || label.includes('\0')) {
       throw new MalformedCatalogFieldError('invalid shared option label');
     }
     if (labels.has(label)) {
@@ -234,12 +384,12 @@ function readSharedOptionGroupIds(raw: unknown): string[] {
   return [...ids].sort(compareId);
 }
 
-function readOptionValues(raw: unknown): string[] {
+function readOptionValues(raw: unknown, valueField: string): string[] {
   const entries = readArrayValues(raw);
   const values = new Set<string>();
   for (const entry of entries) {
     const entryFields = readMapFields(entry);
-    values.add(readRequiredTrimmedString(field(entryFields, 'value')));
+    values.add(readRequiredTrimmedString(field(entryFields, valueField)));
   }
   return [...values].sort(compareId);
 }
@@ -247,29 +397,27 @@ function readOptionValues(raw: unknown): string[] {
 /**
  * Preserves every inline option group on the item (including copies of shared
  * groups) so item-scoped option subjects remain available even when the text
- * matches a global option group value. Labels stay exactly as stored.
- * Firestore map keys are unique, so byte-identical duplicate labels cannot
- * occur in a Firestore document; the duplicate check is only a defensive
- * guard for non-Firestore input.
+ * matches a global option group value. Uses a null-prototype object so labels
+ * like `constructor`, `prototype`, and `__proto__` survive safely.
  */
 function readItemOptionGroups(raw: unknown): Record<string, string[]> {
+  const sorted = Object.create(null) as Record<string, string[]>;
   if (raw === undefined || isNullValue(raw)) {
-    return {};
+    return sorted;
   }
   const mapFields = readMapFields(raw);
   const seenLabels = new Set<string>();
   const groups = new Map<string, string[]>();
   for (const [label, rawGroup] of Object.entries(mapFields)) {
-    if (label.length === 0 || RESERVED_KEYS.has(label)) {
+    if (label.length === 0 || label.includes('\0')) {
       throw new MalformedCatalogFieldError('invalid option group label');
     }
     if (seenLabels.has(label)) {
       throw new MalformedCatalogFieldError('duplicate option group label');
     }
     seenLabels.add(label);
-    groups.set(label, readOptionValues(rawGroup));
+    groups.set(label, readOptionValues(rawGroup, SELECTORS.optionValue));
   }
-  const sorted: Record<string, string[]> = {};
   for (const label of [...groups.keys()].sort(compareId)) {
     const values = groups.get(label);
     if (values !== undefined) {
@@ -279,11 +427,50 @@ function readItemOptionGroups(raw: unknown): Record<string, string[]> {
   return sorted;
 }
 
+/** Projects only the fields listed in `CATALOG_ITEM_FIELDS`. */
+export function projectAllowedItemFields(fields: Record<string, unknown>): {
+  name: string;
+  sizes: PosCatalogSize[];
+  item_option_groups: Record<string, string[]>;
+  shared_option_group_ids: string[];
+} {
+  const name = readRequiredTrimmedString(field(fields, SELECTORS.itemName));
+  const sizes = readSizes(field(fields, SELECTORS.sizesArray));
+  const shared_option_group_ids = readSharedOptionGroupIds(
+    field(fields, SELECTORS.sharedOptionGroupIdsMap),
+  );
+  const item_option_groups = readItemOptionGroups(
+    field(fields, SELECTORS.optionsMap),
+  );
+  return {
+    name,
+    sizes,
+    item_option_groups,
+    shared_option_group_ids,
+  };
+}
+
+/** Projects only the fields listed in `CATALOG_OPTION_GROUP_FIELDS`. */
+export function projectAllowedOptionGroupFields(
+  fields: Record<string, unknown>,
+): {
+  name: string;
+  values: string[];
+} {
+  const name = readRequiredTrimmedString(field(fields, SELECTORS.groupName));
+  const rawValues = field(fields, SELECTORS.groupValuesArray);
+  const values =
+    rawValues === undefined || isNullValue(rawValues)
+      ? []
+      : readOptionValues(rawValues, SELECTORS.groupOptionValue);
+  return { name, values };
+}
+
 function normalizedHashBody(item: StoredCatalogItem): StoredCatalogItem {
   const sizes = [...item.sizes].sort((left, right) =>
     compareId(canonicalJson(left.size_key), canonicalJson(right.size_key)),
   );
-  const groups: Record<string, string[]> = {};
+  const groups = Object.create(null) as Record<string, string[]>;
   for (const label of Object.keys(item.item_option_groups).sort(compareId)) {
     const values = item.item_option_groups[label];
     if (values !== undefined) {
@@ -336,20 +523,10 @@ export function parseCatalogItemDocument(
     return { outcome: 'rejected', pos_item_id: posItemId };
   }
   try {
-    const name = readRequiredTrimmedString(field(document.fields, 'name'));
-    const sizes = readSizes(field(document.fields, 'sizes'));
-    const sharedOptionGroupIds = readSharedOptionGroupIds(
-      field(document.fields, 'sharedOptionGroupIds'),
-    );
-    const itemOptionGroups = readItemOptionGroups(
-      field(document.fields, 'options'),
-    );
+    const projected = projectAllowedItemFields(document.fields);
     const stored: StoredCatalogItem = {
       pos_item_id: posItemId,
-      name,
-      sizes,
-      item_option_groups: itemOptionGroups,
-      shared_option_group_ids: sharedOptionGroupIds,
+      ...projected,
     };
     return {
       outcome: 'accepted',
@@ -400,18 +577,12 @@ export function parseCatalogOptionGroupDocument(
     }
   }
   try {
-    const name = readRequiredTrimmedString(field(document.fields, 'name'));
-    const rawValues = field(document.fields, 'values');
-    const values =
-      rawValues === undefined || isNullValue(rawValues)
-        ? []
-        : readOptionValues(rawValues);
+    const projected = projectAllowedOptionGroupFields(document.fields);
     return {
       outcome: 'accepted',
       option_group: {
         group_id: groupId,
-        name,
-        values,
+        ...projected,
       },
     };
   } catch (error) {

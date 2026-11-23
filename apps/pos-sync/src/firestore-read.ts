@@ -680,24 +680,13 @@ export async function firestoreFetch(
   body: unknown,
   fetchImpl: FetchLike = googleFetch,
 ): Promise<unknown> {
-  assertFirestoreReadAllowed(method, url, body);
   let requestBody: string | undefined;
   if (method === 'POST') {
-    try {
-      const text = JSON.stringify(body);
-      if (typeof text !== 'string') {
-        throw new Error('Firestore read failed: network');
-      }
-      requestBody = text;
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        error.message === 'Firestore read failed: network'
-      ) {
-        throw error;
-      }
-      throw new Error('Firestore read failed: network', { cause: error });
-    }
+    const snapshot = snapshotJson(body);
+    assertFirestoreReadAllowed(method, url, snapshot.value);
+    requestBody = snapshot.serialized;
+  } else {
+    assertFirestoreReadAllowed(method, url);
   }
   return readFirestoreResponse(method, url, token, requestBody, fetchImpl);
 }

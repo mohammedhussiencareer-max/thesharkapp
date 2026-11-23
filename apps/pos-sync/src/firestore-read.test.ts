@@ -469,6 +469,68 @@ describe('firestoreFetch', () => {
     expect(docs).toEqual([orderDoc]);
   });
 
+  it('serializes POST bodies once in firestoreFetch and validates the serialized payload before sending', async () => {
+    const forgedToJson = {
+      structuredQuery: {
+        from: [{ collectionId: 'orders' }],
+        limit: 1,
+      },
+    };
+    Object.defineProperty(forgedToJson, 'toJSON', {
+      enumerable: false,
+      value: () => ({ writes: [] }),
+    });
+    let called = 0;
+    await expect(
+      firestoreFetch(
+        'POST',
+        firestoreRunQueryUrl(),
+        'test-token',
+        forgedToJson,
+        async () => {
+          called += 1;
+          return jsonResponse([]);
+        },
+      ),
+    ).rejects.toThrow(/Firestore read refused/);
+    expect(called).toBe(0);
+
+    let reads = 0;
+    const mutatingFrom = {};
+    Object.defineProperty(mutatingFrom, 'collectionId', {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? 'orders' : 'customers';
+      },
+    });
+    let sentBody = '';
+    await firestoreFetch(
+      'POST',
+      firestoreRunQueryUrl(),
+      'test-token',
+      {
+        structuredQuery: {
+          from: [mutatingFrom],
+          limit: 1,
+        },
+      },
+      async (_url, init) => {
+        sentBody = typeof init.body === 'string' ? init.body : '';
+        return jsonResponse([{ readTime: '2026-10-16T00:00:00Z' }]);
+      },
+    );
+    expect(reads).toBe(1);
+    expect(sentBody).toBe(
+      JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: 'orders' }],
+          limit: 1,
+        },
+      }),
+    );
+  });
+
   it('hides error bodies and treats 404 as a missing shift', async () => {
     const missing = createPosFirestore(
       'test-token',
