@@ -37,8 +37,12 @@ describe('catalog allowlist', () => {
         );
       }
     }
-    expect(CATALOG_REJECTED_FIELDS as readonly string[]).toContain(
+    for (const path of [
       'pricingType',
-    );
+      'options.<label>[].pricingType',
+      'values[].pricingType',
+    ]) {
+      expect(CATALOG_REJECTED_FIELDS as readonly string[]).toContain(path);
+    }
   });
 });
