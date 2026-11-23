@@ -9,10 +9,13 @@ import {
   checkRestoreTarget,
   clientMajor,
   diagnosticsAllowed,
+  FORBIDDEN_EXTENSIONS,
+  FORBIDDEN_USAGE_SCHEMAS,
   formatError,
   isLoopbackAddress,
   parseDbPort,
   parsePinnedMajor,
+  PLATFORM_EXTENSIONS,
   repoRoot,
   RESTORE_CONFIRM,
   serverMajor,
@@ -183,6 +186,16 @@ test('dump refuses loopback unless BACKUP_ALLOW_LOOPBACK=1', () => {
     BACKUP_FORCE_ROLE_CHECK: '1',
   });
   assert.equal(forced.enforceRole, true);
+  // A reader dump always runs the role check, even through a loopback tunnel
+  // with local-test mode on; the hosted pooler user is backup_reader.<ref>.
+  for (const PGUSER of ['backup_reader', 'backup_reader.abcdefghijklmnop']) {
+    const reader = checkDumpTarget({
+      ...local,
+      PGUSER,
+      BACKUP_ALLOW_LOOPBACK: '1',
+    });
+    assert.equal(reader.enforceRole, true, PGUSER);
+  }
 });
 
 test('dump to a remote host needs verified TLS and enforces the role check', () => {
@@ -201,6 +214,82 @@ test('dump to a remote host needs verified TLS and enforces the role check', () 
   assert.doesNotThrow(() =>
     checkDumpTarget({ ...remote, PGSSLMODE: 'verify-ca' }),
   );
+});
+
+test('mixed loopback and remote target lists enforce the role check and verified TLS', () => {
+  for (const mixed of [
+    {
+      ...local,
+      PGHOST: '127.0.0.1,aws-0-eu-central-1.pooler.supabase.com',
+      PGSSLMODE: 'verify-full',
+      BACKUP_ALLOW_LOOPBACK: '1',
+    },
+    {
+      ...local,
+      PGHOST: '127.0.0.1',
+      PGHOSTADDR: '203.0.113.10',
+      PGSSLMODE: 'verify-full',
+      BACKUP_ALLOW_LOOPBACK: '1',
+    },
+    {
+      ...remote,
+      PGHOSTADDR: '127.0.0.1',
+      PGSSLMODE: 'verify-full',
+      BACKUP_ALLOW_LOOPBACK: '1',
+    },
+    {
+      ...local,
+      PGHOST: 'localhost,db.example.com',
+      PGHOSTADDR: '127.0.0.1,203.0.113.10',
+      PGSSLMODE: 'verify-ca',
+      BACKUP_ALLOW_LOOPBACK: '1',
+    },
+  ]) {
+    assert.deepEqual(
+      checkDumpTarget(mixed),
+      { loopback: false, enforceRole: true },
+      JSON.stringify({ PGHOST: mixed.PGHOST, PGHOSTADDR: mixed.PGHOSTADDR }),
+    );
+  }
+  assert.equal(
+    codeOf(() =>
+      checkDumpTarget({
+        ...local,
+        PGHOST: '127.0.0.1,db.example.com',
+        PGSSLMODE: 'disable',
+        BACKUP_ALLOW_LOOPBACK: '1',
+      }),
+    ),
+    'SSLMODE_WEAK',
+  );
+  assert.deepEqual(
+    checkDumpTarget({
+      ...local,
+      PGHOST: '127.0.0.1,localhost',
+      PGHOSTADDR: '127.0.0.1,::1',
+      BACKUP_ALLOW_LOOPBACK: '1',
+    }),
+    { loopback: true, enforceRole: false },
+  );
+});
+
+test('parseProjectId reads top-level project_id from config.toml', async () => {
+  const mod = await import('./config.mjs');
+  assert.equal(typeof mod.parseProjectId, 'function');
+  assert.equal(
+    mod.parseProjectId('project_id = "thesharkapp" # comment\n[db]\nport = 1'),
+    'thesharkapp',
+  );
+  assert.equal(
+    codeOf(() => mod.parseProjectId('[db]\nproject_id = "wrong"\n')),
+    'CONFIG',
+  );
+  assert.equal(
+    codeOf(() => mod.parseProjectId('project_id = "bad id!"\n')),
+    'CONFIG',
+  );
+  const toml = readFileSync(join(repoRoot, 'supabase', 'config.toml'), 'utf8');
+  assert.equal(mod.parseProjectId(toml), 'thesharkapp');
 });
 
 test('connection env is required and PGSERVICE is forbidden', () => {
@@ -279,6 +368,88 @@ test('an error message is always one line, so no line can pose as a second error
   assert.ok(out.startsWith('backup: error [X]: first '));
 });
 
+test('diagnostics stay off when any effective host is remote', () => {
+  const base = {
+    BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
+    BACKUP_ALLOW_LOOPBACK: '1',
+    PGHOST: '127.0.0.1',
+  };
+  assert.equal(
+    diagnosticsAllowed({ ...base, PGHOSTADDR: '203.0.113.10' }),
+    false,
+  );
+  assert.equal(
+    formatError(new Error('PRIVATE-SERVER-TEXT'), {
+      ...base,
+      PGHOSTADDR: '203.0.113.10',
+    }),
+    'backup: error [INTERNAL]: an internal error occurred',
+  );
+  assert.equal(diagnosticsAllowed({ ...base, PGSERVICE: 'prod' }), false);
+  assert.equal(
+    diagnosticsAllowed({
+      ...base,
+      PGDATABASE: 'postgresql://backup_reader@db.example.com/postgres',
+    }),
+    false,
+  );
+  assert.equal(diagnosticsAllowed(base), true);
+});
+
+test('diagnostics stay off when a URI lists 127.0.0.1:5432 and then a remote host', () => {
+  const base = {
+    BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
+    BACKUP_ALLOW_LOOPBACK: '1',
+    PGHOST: '127.0.0.1',
+  };
+  assert.equal(
+    diagnosticsAllowed({
+      ...base,
+      PGDATABASE: 'postgresql://127.0.0.1:5432,db.example.com/postgres',
+    }),
+    false,
+  );
+  assert.equal(
+    diagnosticsAllowed({
+      ...base,
+      PGDATABASE: 'host=127.0.0.1:5432,db.example.com dbname=postgres',
+    }),
+    false,
+  );
+});
+
+test('diagnostics stay off when a URI has a remote hostaddr parameter', () => {
+  assert.equal(
+    diagnosticsAllowed({
+      BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
+      BACKUP_ALLOW_LOOPBACK: '1',
+      PGHOST: '127.0.0.1',
+      DATABASE_URL: 'postgresql://127.0.0.1/postgres?hostaddr=203.0.113.10',
+    }),
+    false,
+  );
+});
+
+test('diagnostics stay off when PGDATABASE is service=fixture', () => {
+  const base = {
+    BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
+    BACKUP_ALLOW_LOOPBACK: '1',
+    PGHOST: '127.0.0.1',
+  };
+  assert.deepEqual(
+    {
+      service: diagnosticsAllowed({ ...base, PGDATABASE: 'service=fixture' }),
+      url: diagnosticsAllowed({ ...base, DATABASE_URL: 'service=fixture' }),
+      scheme: diagnosticsAllowed({
+        ...base,
+        DATABASE_URL: 'socket://127.0.0.1/postgres',
+      }),
+      name: diagnosticsAllowed({ ...base, PGDATABASE: 'postgres' }),
+    },
+    { service: false, url: false, scheme: false, name: true },
+  );
+});
+
 test('internal error text is printed only for the synthetic loopback round trip', () => {
   const synthetic = {
     BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
@@ -305,6 +476,18 @@ test('internal error text is printed only for the synthetic loopback round trip'
       'backup: error [INTERNAL]: an internal error occurred',
     );
   }
+});
+
+test('pg_cron and pg_net stay platform extensions and are not forbidden', () => {
+  // Kept after ensure-scheduler stopped installing extensions.
+  assert.equal(FORBIDDEN_EXTENSIONS.includes('pg_cron'), false);
+  assert.equal(FORBIDDEN_EXTENSIONS.includes('pg_net'), false);
+  assert.equal(PLATFORM_EXTENSIONS.includes('pg_cron'), true);
+  assert.equal(PLATFORM_EXTENSIONS.includes('pg_net'), true);
+  assert.deepEqual(
+    [...FORBIDDEN_USAGE_SCHEMAS],
+    ['auth', 'cron', 'net', 'vault'],
+  );
 });
 
 test('sanitizeStderr keeps only error lines and masks hosts and values', () => {

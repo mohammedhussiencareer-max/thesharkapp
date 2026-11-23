@@ -70,8 +70,10 @@ export const PLATFORM_SCHEMAS = [
 // Every owner column the restore may remap.
 export const OWNER_COLUMNS = [...OWNER_FK_COLUMNS, ...OWNER_AUDIT_COLUMNS];
 
-// The application uses neither: their jobs and queues live outside the dump.
-export const FORBIDDEN_EXTENSIONS = ['pg_cron', 'pg_net'];
+// Extensions whose presence fails the backup with their own message. Empty:
+// pg_cron and pg_net are platform extensions. Their jobs stay outside the
+// dump. backup_reader still has no usage on auth, cron, net, or vault.
+export const FORBIDDEN_EXTENSIONS = [];
 
 // Schemas backup_reader must not be able to enter. storage is not listed: the
 // drift guard reads storage.buckets(id), so the role has usage on it, and the
@@ -86,7 +88,9 @@ export const FORBIDDEN_USAGE_SCHEMAS = ['auth', 'cron', 'net', 'vault'];
 export const READER_EXECUTE_ALLOWLIST = [];
 
 export const PLATFORM_EXTENSIONS = [
+  'pg_cron',
   'pg_graphql',
+  'pg_net',
   'pg_stat_statements',
   'pgcrypto',
   'pgjwt',
@@ -146,14 +150,60 @@ export class BackupError extends Error {
   }
 }
 
-// Server text may be printed only by the synthetic round trip against a
-// loopback database. Every other run prints fixed messages and SQLSTATE codes.
+// Any "=" is keyword conninfo (service, host, hostaddr, and the rest). Any URI
+// scheme is a connection string. A plain database name has neither, so this
+// does not keep a list of keywords.
+function connectionDisablesDiagnostics(value) {
+  const text = String(value ?? '').trim();
+  if (text.includes('=')) {
+    return true;
+  }
+  return /^[a-z][a-z0-9+.-]*:/i.test(text);
+}
+
+// The synthetic gate is the address 127.0.0.1, not a hostname. "localhost"
+// stays off: the round-trip test treats it as a production path.
+function diagnosticHost(raw) {
+  let host = String(raw ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\.$/, '');
+  if (host.startsWith('[') && host.endsWith(']')) {
+    host = host.slice(1, -1);
+  }
+  return host === '127.0.0.1';
+}
+
+// Server text may be printed only by the synthetic round trip. Every effective
+// host has to be 127.0.0.1: libpq prefers PGHOSTADDR over PGHOST. A service
+// file, or any "=" or URI scheme in PGDATABASE or DATABASE_URL, turns this
+// off. An unset host is not accepted.
 export function diagnosticsAllowed(env = process.env) {
-  return (
-    env.BACKUP_SYNTHETIC_DIAGNOSTICS === '1' &&
-    env.BACKUP_ALLOW_LOOPBACK === '1' &&
-    env.PGHOST === '127.0.0.1'
-  );
+  if (
+    env.BACKUP_SYNTHETIC_DIAGNOSTICS !== '1' ||
+    env.BACKUP_ALLOW_LOOPBACK !== '1'
+  ) {
+    return false;
+  }
+  const hosts = [];
+  for (const key of ['PGHOSTADDR', 'PGHOST']) {
+    const value = env[key];
+    if (value !== undefined && value !== '') {
+      hosts.push(...String(value).split(','));
+    }
+  }
+  if (hosts.length === 0 || !hosts.every(diagnosticHost)) {
+    return false;
+  }
+  for (const key of ['PGDATABASE', 'DATABASE_URL']) {
+    if (connectionDisablesDiagnostics(env[key])) {
+      return false;
+    }
+  }
+  if (env.PGSERVICE) {
+    return false;
+  }
+  return true;
 }
 
 export function formatError(error, env = process.env) {
@@ -217,6 +267,23 @@ export function parseDbPort(toml) {
     throw new BackupError('CONFIG', 'port not found in [db] of config.toml');
   }
   return Number(value);
+}
+
+export function parseProjectId(toml) {
+  for (const raw of toml.split(/\r?\n/)) {
+    const line = raw.replace(/#.*$/, '').trim();
+    if (/^\[/.test(line)) {
+      break;
+    }
+    const match = /^project_id\s*=\s*"([A-Za-z0-9._-]+)"$/.exec(line);
+    if (match) {
+      return match[1];
+    }
+  }
+  throw new BackupError(
+    'CONFIG',
+    'project_id not found at the top level of config.toml',
+  );
 }
 
 export function readPinnedMajor(env = process.env) {
@@ -347,9 +414,17 @@ export function checkDumpTarget(env) {
   if (!allLoopback) {
     requireVerifiedTls(env);
   }
+  // A reader dump always runs the role check: a loopback host can be a tunnel
+  // to the hosted project. The pooler user is backup_reader.<project ref>.
+  const user = String(env.PGUSER ?? '')
+    .trim()
+    .toLowerCase();
+  const readerDump =
+    user === 'backup_reader' || user.startsWith('backup_reader.');
   return {
-    loopback: anyLoopback,
-    enforceRole: !anyLoopback || env.BACKUP_FORCE_ROLE_CHECK === '1',
+    loopback: allLoopback,
+    enforceRole:
+      readerDump || !allLoopback || env.BACKUP_FORCE_ROLE_CHECK === '1',
   };
 }
 

@@ -39,10 +39,10 @@ if [ "${CI:-}" != true ] && [ "${BACKUP_ROUNDTRIP_CONFIRM:-}" != "$confirm_value
 fi
 
 require_tools node tar gzip sha256sum awk sed
+unset PGSERVICE PGSERVICEFILE PGHOSTADDR PGSSLROOTCERT PGSSLCERT PGSSLKEY PGOPTIONS PGPASSFILE BACKUP_CONFIG_TOML
 setup_pg_path
 require_tools psql pg_dump pg_restore
 
-unset PGSERVICE PGSERVICEFILE PGHOSTADDR PGSSLROOTCERT PGSSLCERT PGSSLKEY PGOPTIONS PGPASSFILE
 PGHOST=127.0.0.1
 PGPORT=$(guard db-port)
 PGUSER=postgres
@@ -109,6 +109,23 @@ stack_start() {
     fail STACK_START "supabase start failed"
   fi
   wait_db
+}
+
+stack_db_container() {
+  local project_id container running mapped
+  [ "$PGHOST" = 127.0.0.1 ] ||
+    fail SCHEDULER_INSTALL "PGHOST must be 127.0.0.1"
+  project_id=$(guard project-id)
+  container="supabase_db_${project_id}"
+  command -v docker >/dev/null 2>&1 ||
+    fail TOOL_MISSING "docker is not installed"
+  running=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)
+  [ "$running" = true ] ||
+    fail SCHEDULER_INSTALL "the disposable stack container $container is not running"
+  mapped=$(docker port "$container" 5432/tcp 2>/dev/null || true)
+  printf '%s\n' "$mapped" | grep -Eq ":${PGPORT}$" ||
+    fail SCHEDULER_INSTALL "the disposable stack container $container does not expose port $PGPORT"
+  printf '%s\n' "$container"
 }
 
 make_empty_project() {
@@ -424,11 +441,9 @@ run_full() {
   expect_denied "storage.buckets delete" 42501 \
     "begin read write; delete from storage.buckets where false; rollback"
   expect_denied "storage.objects" 42501 "select 1 from storage.objects limit 1"
-  expect_denied "vault.secrets" '42501|3F000' "select 1 from vault.secrets limit 1"
-  # pg_cron and pg_net are absent here (the drift guard fails if either is
-  # installed), so a missing table also proves the reader cannot read it.
-  expect_denied "cron.job" '42501|3F000|42P01' "select 1 from cron.job limit 1"
-  expect_denied "net.http_request_queue" '42501|3F000|42P01' "select 1 from net.http_request_queue limit 1"
+  # vault.secrets is proved on this fresh stack, before pg_net exists.
+  # cron.job is proved after this script creates the extensions with psql.
+  # net tables are not read: readable net access is what the later guarded dump must refuse.
   expect_denied "pg_authid" 42501 "select rolpassword from pg_catalog.pg_authid limit 1"
   expect_denied "write under the read-only default" 25006 \
     "update app.stock_items set name = name where false"
@@ -555,6 +570,79 @@ run_full() {
     env PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
     "$here/dump.sh" "$neg_dir/out"
   sql "grant select (id) on storage.buckets to backup_reader"
+
+  step "stack A: guarded backup without pg_net"
+  local net_installed present guarded_archive scheduler_report
+  net_installed=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c \
+    "select exists (select 1 from pg_catalog.pg_extension where extname = 'pg_net')")
+  [ "$net_installed" = f ] || fail SCHEDULER_PRESENT "pg_net is installed before the guarded backup"
+  scheduler_report=$(node_cli node "$here/ensure-scheduler.mjs") ||
+    fail SCHEDULER_CHECK "ensure-scheduler failed while pg_net was absent"
+  case "$scheduler_report" in
+    *"scheduler check:"*"pg_net absent"*) ;;
+    *) fail SCHEDULER_CHECK "ensure-scheduler did not report pg_net absent" ;;
+  esac
+  case "$scheduler_report" in
+    *created*) fail SCHEDULER_CHECK "ensure-scheduler created an extension before the guarded backup" ;;
+  esac
+  guarded_archive=$(PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
+    "$here/dump.sh" "$archives/without-net" 2>&3) ||
+    fail SCHEDULER_DUMP "the guarded backup failed while pg_net was absent"
+  [ -n "$guarded_archive" ] || fail SCHEDULER_DUMP "the guarded backup produced no archive"
+  mkdir -p "$work_dir/without-net-list"
+  tar -xzf "$guarded_archive" -C "$work_dir/without-net-list" --no-same-owner db.dump
+  pg_restore -l "$work_dir/without-net-list/db.dump" >"$work_dir/without-net.list"
+  if grep -E 'SCHEMA - (cron|net|vault)( |$)| (cron|net|vault) ' "$work_dir/without-net.list"; then
+    fail SCHEDULER_DUMP "the guarded backup lists scheduler objects"
+  fi
+  info "guarded backup ok without pg_net"
+  present=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c "select to_regclass('vault.secrets') is not null")
+  [ "$present" = t ] || fail SCHEDULER_VAULT "vault.secrets does not exist"
+  expect_denied "vault.secrets" 42501 "select 1 from vault.secrets limit 1"
+
+  step "stack A: disposable stack installs pg_net and the read-only check fails closed"
+  local db_container
+  db_container=$(stack_db_container)
+  docker exec -e PGPASSWORD=postgres -e PGSSLMODE=disable "$db_container" \
+    psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -X -q -v ON_ERROR_STOP=1 \
+    -c 'create extension if not exists "pg_cron";' >/dev/null ||
+    fail SCHEDULER_INSTALL "the disposable stack could not create pg_cron"
+  docker exec -e PGPASSWORD=postgres -e PGSSLMODE=disable "$db_container" \
+    psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -X -q -v ON_ERROR_STOP=1 \
+    -c 'create extension if not exists "pg_net";' >/dev/null ||
+    fail SCHEDULER_INSTALL "the disposable stack could not create pg_net"
+  local scheduler_rc=0
+  node "$here/ensure-scheduler.mjs" \
+    >"$work_dir/scheduler.out" 2>"$work_dir/scheduler.err" || scheduler_rc=$?
+  if [ "$scheduler_rc" -eq 0 ]; then
+    fail SCHEDULER_UNSAFE "the read-only check passed after pg_net was installed"
+  fi
+  if ! grep -F '[SCHEDULER_NET_UNSAFE]' "$work_dir/scheduler.err"; then
+    node "$backup_dir/sanitize.mjs" "$work_dir/scheduler.err" 2>&3 || true
+    fail SCHEDULER_UNSAFE "ensure-scheduler did not fail closed with SCHEDULER_NET_UNSAFE"
+  fi
+  net_installed=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c \
+    "select exists (select 1 from pg_catalog.pg_extension where extname = 'pg_net')")
+  [ "$net_installed" = t ] || fail SCHEDULER_INSTALL "pg_net was not created on the disposable stack"
+  present=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c "select to_regclass('cron.job') is not null")
+  [ "$present" = t ] || fail SCHEDULER_CRON "cron.job does not exist after the local create"
+  expect_denied "cron.job" 42501 "select 1 from cron.job limit 1"
+  expect_denied "vault.secrets" 42501 "select 1 from vault.secrets limit 1"
+  rm -rf "$archives/after-net"
+  expect_fail "reader dump after pg_net" "[ROLE_UNSAFE]: role can enter platform schemas: net" \
+    env PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
+    "$here/dump.sh" "$archives/after-net"
+  if [ -s "$work_dir/neg.out" ]; then
+    fail SCHEDULER_DUMP "the refused dump after pg_net printed an archive path"
+  fi
+  if [ -d "$archives/after-net" ]; then
+    if [ -n "$(ls -A "$archives/after-net")" ]; then
+      fail SCHEDULER_DUMP "the refused dump after pg_net produced an archive"
+    fi
+  elif [ -e "$archives/after-net" ]; then
+    fail SCHEDULER_DUMP "the refused dump after pg_net produced unexpected output"
+  fi
+  info "a backup with unsafe net access was refused"
 
   step "stack B: empty project"
   make_empty_project "$work_dir/stack-b"
