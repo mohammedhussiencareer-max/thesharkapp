@@ -6,6 +6,13 @@ import {
   splitTransactionName,
   type PosCollection,
 } from './decode.ts';
+import {
+  assertProjectedDocument,
+  FIRESTORE_FIELD_PATHS,
+  matchesProjection,
+  TRANSACTION_FIELD_PATHS,
+  transactionResponseKeysAllowed,
+} from './firestore-projection.ts';
 import type {
   FirestoreRestDocument,
   ListCollection,
@@ -20,8 +27,7 @@ const DOCUMENT_PATH =
   '/v1/projects/thesharkrestaurant/databases/(default)/documents';
 const RUN_QUERY_PATH = `${DOCUMENT_PATH}:runQuery`;
 
-const COLLECTIONS = new Set(['orders', 'custody_shifts']);
-const CATALOG_COLLECTIONS = new Set(['items', 'optionGroups']);
+const MASK_FIELD_PATHS = 'mask.fieldPaths';
 const FIELD_PATHS = new Set(['shiftId', 'timestamp', '__name__']);
 const FILTER_OPS = new Set(['IN', 'GREATER_THAN_OR_EQUAL', 'LESS_THAN']);
 const VALUE_KINDS = new Set([
@@ -34,13 +40,36 @@ const VALUE_KINDS = new Set([
   'arrayValue',
 ]);
 
+type AccountingCollection = 'orders' | 'custody_shifts';
+type ReadTarget =
+  | { kind: 'list'; collection: ListCollection | 'transactions' }
+  | { kind: 'get' | 'query'; collection: AccountingCollection };
+
+function isAccountingCollection(
+  collection: string | undefined,
+): collection is AccountingCollection {
+  return collection === 'orders' || collection === 'custody_shifts';
+}
+
+function isCatalogCollection(
+  collection: string | undefined,
+): collection is 'items' | 'optionGroups' {
+  return collection === 'items' || collection === 'optionGroups';
+}
+
+function appendMask(url: URL, fields: readonly string[]): void {
+  for (const field of fields) {
+    url.searchParams.append(MASK_FIELD_PATHS, field);
+  }
+}
+
 export function firestoreListUrl(
   collection: ListCollection,
   query: ListQuery,
 ): string {
   // An allowlisted name only. URL construction would resolve `items/../orders`
   // into a permitted orders list before the path check could see the traversal.
-  if (!COLLECTIONS.has(collection) && !CATALOG_COLLECTIONS.has(collection)) {
+  if (!isAccountingCollection(collection) && !isCatalogCollection(collection)) {
     throw new Error('Firestore read refused');
   }
   const url = new URL(`${ORIGIN}${DOCUMENT_PATH}/${collection}`);
@@ -51,19 +80,24 @@ export function firestoreListUrl(
   if (query.orderBy !== undefined) {
     url.searchParams.set('orderBy', query.orderBy);
   }
+  appendMask(url, FIRESTORE_FIELD_PATHS[collection]);
   const text = url.toString();
   assertFirestoreReadAllowed('GET', text);
   return text;
 }
 
 export function firestoreGetUrl(
-  collection: 'orders' | 'custody_shifts',
+  collection: AccountingCollection,
   id: string,
 ): string {
-  if (!isSafeDocumentId(id)) {
+  if (!isAccountingCollection(collection) || !isSafeDocumentId(id)) {
     throw new Error('Firestore read refused');
   }
-  const text = `${ORIGIN}${DOCUMENT_PATH}/${collection}/${encodeURIComponent(id)}`;
+  const url = new URL(
+    `${ORIGIN}${DOCUMENT_PATH}/${collection}/${encodeURIComponent(id)}`,
+  );
+  appendMask(url, FIRESTORE_FIELD_PATHS[collection]);
+  const text = url.toString();
   assertFirestoreReadAllowed('GET', text);
   return text;
 }
@@ -86,6 +120,7 @@ export function firestoreTransactionsUrl(
   if (query.pageToken !== undefined) {
     url.searchParams.set('pageToken', query.pageToken);
   }
+  appendMask(url, TRANSACTION_FIELD_PATHS);
   const text = url.toString();
   assertFirestoreReadAllowed('GET', text);
   return text;
@@ -96,6 +131,14 @@ export function assertFirestoreReadAllowed(
   url: string,
   body?: unknown,
 ): void {
+  firestoreReadTarget(method, url, body);
+}
+
+function firestoreReadTarget(
+  method: string,
+  url: string,
+  body?: unknown,
+): ReadTarget {
   const verb = method.trim().toUpperCase();
   if (verb !== 'GET' && verb !== 'POST') {
     throw new Error('Firestore read refused');
@@ -131,8 +174,7 @@ export function assertFirestoreReadAllowed(
     if (parsed.pathname !== RUN_QUERY_PATH || parsed.search !== '') {
       throw new Error('Firestore read refused');
     }
-    assertRunQueryBody(body);
-    return;
+    return { kind: 'query', collection: assertRunQueryBody(body) };
   }
   if (parsed.pathname.includes(':')) {
     throw new Error('Firestore read refused');
@@ -141,27 +183,32 @@ export function assertFirestoreReadAllowed(
     throw new Error('Firestore read refused');
   }
   const segments = parsed.pathname.slice(DOCUMENT_PATH.length + 1).split('/');
+  const collection = segments[0];
   if (segments.length === 1) {
-    const collection = segments[0];
-    if (collection !== undefined && COLLECTIONS.has(collection)) {
-      assertListParams(parsed.searchParams);
-      return;
-    }
     // List only: top-level catalog collections `items` and `optionGroups`.
     // Single-document GETs, subcollections, orderBy, and runQuery stay refused.
-    if (collection !== undefined && CATALOG_COLLECTIONS.has(collection)) {
-      assertPagedListParams(parsed.searchParams);
-      return;
+    if (isAccountingCollection(collection) || isCatalogCollection(collection)) {
+      assertListParams(
+        parsed.searchParams,
+        collection,
+        isAccountingCollection(collection),
+      );
+      return { kind: 'list', collection };
     }
     throw new Error('Firestore read refused');
   }
   if (segments.length === 2) {
-    assertCollection(segments[0]);
     const id = segments[1];
-    if (id === undefined || !isSafeDocumentId(id) || parsed.search !== '') {
+    if (
+      !isAccountingCollection(collection) ||
+      id === undefined ||
+      !isSafeDocumentId(id) ||
+      [...parsed.searchParams.keys()].some((key) => key !== MASK_FIELD_PATHS)
+    ) {
       throw new Error('Firestore read refused');
     }
-    return;
+    assertMask(parsed.searchParams, collection);
+    return { kind: 'get', collection };
   }
   // List only: custody_shifts/{shiftId}/transactions. A single transaction
   // document, any other subcollection, and anything deeper are refused.
@@ -175,26 +222,55 @@ export function assertFirestoreReadAllowed(
     ) {
       throw new Error('Firestore read refused');
     }
-    assertPagedListParams(parsed.searchParams);
-    return;
+    assertListParams(parsed.searchParams, 'transactions', false);
+    return { kind: 'list', collection: 'transactions' };
   }
   throw new Error('Firestore read refused');
 }
 
-function assertCollection(collection: string | undefined): void {
-  if (collection === undefined || !COLLECTIONS.has(collection)) {
+function assertMask(
+  params: URLSearchParams,
+  collection: ReadTarget['collection'],
+): void {
+  if (
+    !matchesProjection(
+      params.getAll(MASK_FIELD_PATHS),
+      FIRESTORE_FIELD_PATHS[collection],
+    )
+  ) {
     throw new Error('Firestore read refused');
   }
 }
 
-function assertPagedListParams(params: URLSearchParams): void {
+function assertListParams(
+  params: URLSearchParams,
+  collection: ReadTarget['collection'],
+  allowOrderBy: boolean,
+): void {
   for (const key of params.keys()) {
-    if (key !== 'pageSize' && key !== 'pageToken') {
+    if (
+      key !== 'pageSize' &&
+      key !== 'pageToken' &&
+      key !== MASK_FIELD_PATHS &&
+      !(allowOrderBy && key === 'orderBy')
+    ) {
       throw new Error('Firestore read refused');
     }
   }
   assertPageSize(params);
   assertPageToken(params);
+  assertMask(params, collection);
+  const orderBy = params.getAll('orderBy');
+  const direction = orderBy[0];
+  if (
+    orderBy.length > 1 ||
+    (direction !== undefined &&
+      direction !== 'opening_time' &&
+      direction !== 'opening_time asc' &&
+      direction !== 'opening_time desc')
+  ) {
+    throw new Error('Firestore read refused');
+  }
 }
 
 function assertPageSize(params: URLSearchParams): void {
@@ -221,34 +297,11 @@ function assertPageToken(params: URLSearchParams): void {
   }
 }
 
-function assertListParams(params: URLSearchParams): void {
-  for (const key of params.keys()) {
-    if (key !== 'pageSize' && key !== 'pageToken' && key !== 'orderBy') {
-      throw new Error('Firestore read refused');
-    }
-  }
-  assertPageSize(params);
-  assertPageToken(params);
-  const orderBy = params.getAll('orderBy');
-  if (orderBy.length > 1) {
-    throw new Error('Firestore read refused');
-  }
-  const direction = orderBy[0];
-  if (
-    direction !== undefined &&
-    direction !== 'opening_time' &&
-    direction !== 'opening_time asc' &&
-    direction !== 'opening_time desc'
-  ) {
-    throw new Error('Firestore read refused');
-  }
-}
-
 function isOneElement(value: unknown): value is readonly [unknown] {
   return Array.isArray(value) && value.length === 1;
 }
 
-function assertRunQueryBody(body: unknown): void {
+function assertRunQueryBody(body: unknown): AccountingCollection {
   if (
     !isRecord(body) ||
     Object.keys(body).length !== 1 ||
@@ -258,7 +311,12 @@ function assertRunQueryBody(body: unknown): void {
   }
   const query = body.structuredQuery;
   for (const key of Object.keys(query)) {
-    if (key !== 'from' && key !== 'where' && key !== 'limit') {
+    if (
+      key !== 'from' &&
+      key !== 'where' &&
+      key !== 'limit' &&
+      key !== 'select'
+    ) {
       throw new Error('Firestore read refused');
     }
   }
@@ -269,10 +327,12 @@ function assertRunQueryBody(body: unknown): void {
   if (
     !isRecord(from) ||
     Object.keys(from).length !== 1 ||
-    (from.collectionId !== 'orders' && from.collectionId !== 'custody_shifts')
+    typeof from.collectionId !== 'string' ||
+    !isAccountingCollection(from.collectionId)
   ) {
     throw new Error('Firestore read refused');
   }
+  assertQueryProjection(query.select, from.collectionId);
   if (query.where !== undefined) {
     assertFilter(query.where);
   }
@@ -282,6 +342,31 @@ function assertRunQueryBody(body: unknown): void {
     query.limit < 1 ||
     query.limit > 2000
   ) {
+    throw new Error('Firestore read refused');
+  }
+  return from.collectionId;
+}
+
+function assertQueryProjection(
+  projection: unknown,
+  collection: AccountingCollection,
+): void {
+  if (
+    !isRecord(projection) ||
+    Object.keys(projection).length !== 1 ||
+    !Object.hasOwn(projection, 'fields') ||
+    !Array.isArray(projection.fields)
+  ) {
+    throw new Error('Firestore read refused');
+  }
+  const fieldPaths = projection.fields.map((field: unknown) =>
+    isRecord(field) &&
+    Object.keys(field).length === 1 &&
+    Object.hasOwn(field, 'fieldPath')
+      ? field.fieldPath
+      : undefined,
+  );
+  if (!matchesProjection(fieldPaths, FIRESTORE_FIELD_PATHS[collection])) {
     throw new Error('Firestore read refused');
   }
 }
@@ -563,10 +648,8 @@ function requireDocument(
   let collection: PosCollection | 'transactions';
   try {
     collection = assertKnownDocumentName(value.name);
-  } catch (error) {
-    throw new Error('Firestore read failed: invalid response', {
-      cause: error,
-    });
+  } catch {
+    throw new Error('Firestore read failed: invalid response');
   }
   if (collection !== expected) {
     throw new Error('Firestore read failed: invalid response');
@@ -598,21 +681,6 @@ function requireDocument(
   return document;
 }
 
-function requestedQueryCollection(body: unknown): 'orders' | 'custody_shifts' {
-  if (!isRecord(body) || !isRecord(body.structuredQuery)) {
-    throw new Error('Firestore read failed: invalid response');
-  }
-  const from: unknown = body.structuredQuery.from;
-  if (!isOneElement(from) || !isRecord(from[0])) {
-    throw new Error('Firestore read failed: invalid response');
-  }
-  const collectionId = from[0].collectionId;
-  if (collectionId !== 'orders' && collectionId !== 'custody_shifts') {
-    throw new Error('Firestore read failed: invalid response');
-  }
-  return collectionId;
-}
-
 type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
 async function googleFetch(
@@ -629,11 +697,27 @@ function snapshotJson(body: unknown): { serialized: string; value: unknown } {
       throw new Error('Firestore read refused');
     }
     return { serialized: text, value: JSON.parse(text) as unknown };
-  } catch (error) {
-    if (error instanceof Error && error.message === 'Firestore read refused') {
-      throw error;
+  } catch {
+    throw new Error('Firestore read refused');
+  }
+}
+
+function assertResponseProjection(payload: unknown, target: ReadTarget): void {
+  const fields = FIRESTORE_FIELD_PATHS[target.collection];
+  if (target.kind === 'get') {
+    assertProjectedDocument(payload, fields);
+  } else if (target.kind === 'list') {
+    if (isRecord(payload) && Array.isArray(payload.documents)) {
+      for (const document of payload.documents) {
+        assertProjectedDocument(document, fields);
+      }
     }
-    throw new Error('Firestore read refused', { cause: error });
+  } else if (Array.isArray(payload)) {
+    for (const entry of payload) {
+      if (isRecord(entry)) {
+        assertProjectedDocument(entry.document, fields);
+      }
+    }
   }
 }
 
@@ -643,6 +727,7 @@ async function readFirestoreResponse(
   token: string,
   requestBody: string | undefined,
   fetchImpl: FetchLike,
+  target: ReadTarget,
 ): Promise<unknown> {
   let response: Response;
   try {
@@ -660,14 +745,23 @@ async function readFirestoreResponse(
   }
   if (!response.ok) {
     try {
-      await response.text();
+      await response.body?.cancel();
     } catch {
       // The status is enough. Never surface the body.
     }
     throw new Error(`Firestore read failed: HTTP ${response.status}`);
   }
   try {
-    return JSON.parse(await response.text()) as unknown;
+    const text = await response.text();
+    if (
+      target.collection === 'transactions' &&
+      !transactionResponseKeysAllowed(text)
+    ) {
+      throw new Error('Firestore read failed: invalid response');
+    }
+    const payload: unknown = JSON.parse(text);
+    assertResponseProjection(payload, target);
+    return payload;
   } catch {
     throw new Error('Firestore read failed: invalid response');
   }
@@ -680,15 +774,16 @@ export async function firestoreFetch(
   body: unknown,
   fetchImpl: FetchLike = googleFetch,
 ): Promise<unknown> {
-  let requestBody: string | undefined;
-  if (method === 'POST') {
-    const snapshot = snapshotJson(body);
-    assertFirestoreReadAllowed(method, url, snapshot.value);
-    requestBody = snapshot.serialized;
-  } else {
-    assertFirestoreReadAllowed(method, url);
-  }
-  return readFirestoreResponse(method, url, token, requestBody, fetchImpl);
+  const snapshot = method === 'POST' ? snapshotJson(body) : undefined;
+  const target = firestoreReadTarget(method, url, snapshot?.value);
+  return readFirestoreResponse(
+    method,
+    url,
+    token,
+    snapshot?.serialized,
+    fetchImpl,
+    target,
+  );
 }
 
 export function createPosFirestore(
@@ -745,16 +840,19 @@ export function createPosFirestore(
     async queryOrders(body) {
       const snapshot = snapshotJson(body);
       const url = firestoreRunQueryUrl();
-      assertFirestoreReadAllowed('POST', url, snapshot.value);
-      const collection = requestedQueryCollection(snapshot.value);
+      const target = firestoreReadTarget('POST', url, snapshot.value);
+      if (target.kind !== 'query') {
+        throw new Error('Firestore read refused');
+      }
       const payload = await readFirestoreResponse(
         'POST',
         url,
         token,
         snapshot.serialized,
         fetchImpl,
+        target,
       );
-      return parseRunQueryResponse(payload, collection);
+      return parseRunQueryResponse(payload, target.collection);
     },
   };
 }

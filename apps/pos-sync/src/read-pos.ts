@@ -1,3 +1,4 @@
+import { ORDER_FIELD_PATHS } from './firestore-projection.ts';
 import { compareId } from './hash.ts';
 import {
   mapOrderDocument,
@@ -36,9 +37,14 @@ export type PosSnapshot = {
   missingShiftIds: string[];
 };
 
+function orderProjection() {
+  return { fields: ORDER_FIELD_PATHS.map((fieldPath) => ({ fieldPath })) };
+}
+
 export function recentOrdersQuery(shiftIds: string[]): unknown {
   return {
     structuredQuery: {
+      select: orderProjection(),
       from: [{ collectionId: 'orders' }],
       where: {
         fieldFilter: {
@@ -63,6 +69,7 @@ export function timestampRangeQuery(
 ): unknown {
   return {
     structuredQuery: {
+      select: orderProjection(),
       from: [{ collectionId: 'orders' }],
       where: {
         compositeFilter: {
@@ -93,6 +100,7 @@ export function timestampRangeQuery(
 export function timestampProbeQuery(start: string): unknown {
   return {
     structuredQuery: {
+      select: orderProjection(),
       from: [{ collectionId: 'orders' }],
       where: {
         fieldFilter: {

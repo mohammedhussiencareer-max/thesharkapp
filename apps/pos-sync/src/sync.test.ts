@@ -378,20 +378,25 @@ describe('runPosSync', () => {
           { status: 200 },
         );
       }
+      const mask = new URL(url).searchParams.getAll('mask.fieldPaths');
+      const project = (fields: Record<string, unknown>) =>
+        Object.fromEntries(
+          Object.entries(fields).filter(([key]) => mask.includes(key)),
+        );
       if (url.includes('/transactions')) {
         return new Response(
           JSON.stringify({
             documents: [
               {
                 name: `${doc}/custody_shifts/shift-test-1/transactions/tx-test-1`,
-                fields: {
+                fields: project({
                   type: { integerValue: '3' },
                   amount: { integerValue: '15' },
                   orderId: { stringValue: 'order-test-1' },
                   timestamp: { timestampValue: '2026-10-15T15:00:00Z' },
                   description: { stringValue: sentinel },
                   operationKey: { stringValue: 'op-should-drop' },
-                },
+                }),
               },
             ],
           }),
@@ -404,14 +409,14 @@ describe('runPosSync', () => {
             {
               name: `${doc}/custody_shifts/shift-test-1`,
               updateTime: '2026-10-15T18:00:00Z',
-              fields: {
+              fields: project({
                 id: { stringValue: 'shift-test-1' },
                 opening_time: { timestampValue: '2026-10-15T09:00:00Z' },
                 isActive: { booleanValue: false },
                 cash_payments_net: { doubleValue: 10.5 },
                 credit_payments: { integerValue: '4' },
                 difference: { doubleValue: -1 },
-              },
+              }),
             },
           ],
         }),

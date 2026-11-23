@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseCatalog } from './catalog.ts';
+import { ORDER_FIELD_PATHS } from './firestore-projection.ts';
 import {
   assertFirestoreReadAllowed,
   createPosFirestore,
@@ -15,6 +16,17 @@ import type { ListCollection } from './pos-firestore.ts';
 import { recentOrdersQuery } from './read-pos.ts';
 
 const ROOT = firestoreRunQueryUrl().replace(':runQuery', '');
+const ORDER_SELECT = {
+  fields: ORDER_FIELD_PATHS.map((fieldPath) => ({ fieldPath })),
+};
+const ORDER_MASK = ORDER_FIELD_PATHS.map(
+  (path) => `mask.fieldPaths=${path}`,
+).join('&');
+const TX_MASK =
+  'mask.fieldPaths=orderId&mask.fieldPaths=type&mask.fieldPaths=amount&mask.fieldPaths=timestamp';
+const ITEM_MASK =
+  'mask.fieldPaths=name&mask.fieldPaths=sizes&mask.fieldPaths=options&mask.fieldPaths=sharedOptionGroupIds';
+const GROUP_MASK = 'mask.fieldPaths=name&mask.fieldPaths=values';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status });
@@ -41,15 +53,15 @@ describe('assertFirestoreReadAllowed', () => {
     ['GET', firestoreRunQueryUrl()],
     [
       'GET',
-      'http://firestore.googleapis.com/v1/projects/thesharkrestaurant/databases/(default)/documents/orders?pageSize=1',
+      `http://firestore.googleapis.com/v1/projects/thesharkrestaurant/databases/(default)/documents/orders?pageSize=1&${ORDER_MASK}`,
     ],
     [
       'GET',
-      'https://firestore.googleapis.com.evil/v1/projects/thesharkrestaurant/databases/(default)/documents/orders?pageSize=1',
+      `https://firestore.googleapis.com.evil/v1/projects/thesharkrestaurant/databases/(default)/documents/orders?pageSize=1&${ORDER_MASK}`,
     ],
     [
       'GET',
-      'https://firestore.googleapis.com/v1/projects/other/databases/(default)/documents/orders?pageSize=1',
+      `https://firestore.googleapis.com/v1/projects/other/databases/(default)/documents/orders?pageSize=1&${ORDER_MASK}`,
     ],
     ['GET', `${ROOT}/customers?pageSize=1`],
     ['GET', `${ROOT}/orders/order-test-1/items/item-test-1`],
@@ -58,7 +70,7 @@ describe('assertFirestoreReadAllowed', () => {
     ['POST', `${firestoreRunQueryUrl()}?pageSize=1`],
     [
       'GET',
-      'https://user:pass@firestore.googleapis.com/v1/projects/thesharkrestaurant/databases/(default)/documents/orders?pageSize=1',
+      `https://user:pass@firestore.googleapis.com/v1/projects/thesharkrestaurant/databases/(default)/documents/orders?pageSize=1&${ORDER_MASK}`,
     ],
     ['GET', `${ROOT}/orders/../customers?pageSize=1`],
     ['GET', `${ROOT}/custody_shifts/shift-test-1/orders?pageSize=1`],
@@ -73,39 +85,42 @@ describe('assertFirestoreReadAllowed', () => {
     ['PUT', `${ROOT}/custody_shifts/shift-test-1/transactions?pageSize=1`],
     [
       'GET',
-      `${ROOT}/custody_shifts/shift-test-1/transactions?pageSize=1&orderBy=timestamp`,
+      `${ROOT}/custody_shifts/shift-test-1/transactions?pageSize=1&orderBy=timestamp&${TX_MASK}`,
     ],
     ['GET', `${ROOT}/custody_shifts/not safe/transactions?pageSize=1`],
-    ['GET', `${ROOT}/items`],
-    ['GET', `${ROOT}/items?pageSize=0`],
-    ['GET', `${ROOT}/items?pageSize=301`],
-    ['GET', `${ROOT}/items?pageSize=1&pageToken=`],
-    ['GET', `${ROOT}/items?pageSize=1&orderBy=opening_time`],
-    ['GET', `${ROOT}/items?pageSize=1&orderBy=name`],
+    ['GET', `${ROOT}/items?${ITEM_MASK}`],
+    ['GET', `${ROOT}/items?pageSize=0&${ITEM_MASK}`],
+    ['GET', `${ROOT}/items?pageSize=301&${ITEM_MASK}`],
+    ['GET', `${ROOT}/items?pageSize=1&pageToken=&${ITEM_MASK}`],
+    ['GET', `${ROOT}/items?pageSize=1&orderBy=opening_time&${ITEM_MASK}`],
+    ['GET', `${ROOT}/items?pageSize=1&orderBy=name&${ITEM_MASK}`],
     ['GET', `${ROOT}/items?pageSize=1&mask.fieldPaths=price`],
     ['GET', `${ROOT}/items/item-test-1`],
     ['GET', `${ROOT}/items/item-test-1/sub?pageSize=1`],
     ['GET', `${ROOT}/items/../customers?pageSize=1`],
-    ['GET', `${ROOT}/items/../optionGroups?pageSize=1`],
-    ['GET', `${ROOT}/customers/../items?pageSize=1`],
-    ['GET', `${ROOT}/optionGroups/../items?pageSize=1`],
-    ['GET', `${ROOT}/items/./?pageSize=1`],
+    ['GET', `${ROOT}/items/../optionGroups?pageSize=1&${GROUP_MASK}`],
+    ['GET', `${ROOT}/customers/../items?pageSize=1&${ITEM_MASK}`],
+    ['GET', `${ROOT}/optionGroups/../items?pageSize=1&${ITEM_MASK}`],
+    ['GET', `${ROOT}/items/./?pageSize=1&${ITEM_MASK}`],
     [
       'GET',
-      'https://firestore.googleapis.com\\ignored\\../v1/projects/thesharkrestaurant/databases/(default)/documents/items?pageSize=1',
+      `https://firestore.googleapis.com\\ignored\\../v1/projects/thesharkrestaurant/databases/(default)/documents/items?pageSize=1&${ITEM_MASK}`,
     ],
     [
       'GET',
-      'https://firestore.googleapis.com\\..\\v1/projects/thesharkrestaurant/databases/(default)/documents/items?pageSize=1',
+      `https://firestore.googleapis.com\\..\\v1/projects/thesharkrestaurant/databases/(default)/documents/items?pageSize=1&${ITEM_MASK}`,
     ],
-    ['GET', `${ROOT}/items\\..\\optionGroups?pageSize=1`],
+    ['GET', `${ROOT}/items\\..\\optionGroups?pageSize=1&${GROUP_MASK}`],
     ['POST', `${ROOT}/items?pageSize=1`],
     ['PATCH', `${ROOT}/items/item-test-1`],
     ['DELETE', `${ROOT}/items/item-test-1`],
     ['PUT', `${ROOT}/items/item-test-1`],
-    ['GET', `${ROOT}/optionGroups`],
-    ['GET', `${ROOT}/optionGroups?pageSize=301`],
-    ['GET', `${ROOT}/optionGroups?pageSize=1&orderBy=opening_time`],
+    ['GET', `${ROOT}/optionGroups?${GROUP_MASK}`],
+    ['GET', `${ROOT}/optionGroups?pageSize=301&${GROUP_MASK}`],
+    [
+      'GET',
+      `${ROOT}/optionGroups?pageSize=1&orderBy=opening_time&${GROUP_MASK}`,
+    ],
     ['GET', `${ROOT}/optionGroups/group-test-1`],
     ['GET', `${ROOT}/optionGroups/group-test-1/values?pageSize=1`],
     ['GET', `${ROOT}/optionGroups/../customers?pageSize=1`],
@@ -143,6 +158,7 @@ describe('assertFirestoreReadAllowed', () => {
     expect(() =>
       assertFirestoreReadAllowed('POST', firestoreRunQueryUrl(), {
         structuredQuery: {
+          select: ORDER_SELECT,
           from: [{ collectionId: 'orders' }],
           where: {
             fieldFilter: {
@@ -158,6 +174,7 @@ describe('assertFirestoreReadAllowed', () => {
     expect(() =>
       assertFirestoreReadAllowed('POST', firestoreRunQueryUrl(), {
         structuredQuery: {
+          select: ORDER_SELECT,
           from: [{ collectionId: 'orders' }],
           limit: 1,
         },
@@ -214,13 +231,15 @@ describe('assertFirestoreReadAllowed', () => {
       pageSize: 300,
       pageToken: 'items-page-2',
     });
-    expect(itemsUrl).toBe(`${ROOT}/items?pageSize=300&pageToken=items-page-2`);
+    expect(itemsUrl).toBe(
+      `${ROOT}/items?pageSize=300&pageToken=items-page-2&${ITEM_MASK}`,
+    );
     expect(() => assertFirestoreReadAllowed('GET', itemsUrl)).not.toThrow();
 
     const groupsUrl = firestoreListUrl('optionGroups', {
       pageSize: 50,
     });
-    expect(groupsUrl).toBe(`${ROOT}/optionGroups?pageSize=50`);
+    expect(groupsUrl).toBe(`${ROOT}/optionGroups?pageSize=50&${GROUP_MASK}`);
     expect(() => assertFirestoreReadAllowed('GET', groupsUrl)).not.toThrow();
   });
 
@@ -230,7 +249,7 @@ describe('assertFirestoreReadAllowed', () => {
       pageToken: 'page-2',
     });
     expect(url).toBe(
-      `${ROOT}/custody_shifts/shift-test-1/transactions?pageSize=300&pageToken=page-2`,
+      `${ROOT}/custody_shifts/shift-test-1/transactions?pageSize=300&pageToken=page-2&${TX_MASK}`,
     );
     expect(() => assertFirestoreReadAllowed('GET', url)).not.toThrow();
   });
@@ -338,8 +357,8 @@ describe('firestoreFetch', () => {
     expect(groupsPage.documents).toHaveLength(1);
     expect(groupsPage.nextPageToken).toBeUndefined();
     expect(urls).toEqual([
-      `${ROOT}/items?pageSize=300`,
-      `${ROOT}/optionGroups?pageSize=50`,
+      `${ROOT}/items?pageSize=300&${ITEM_MASK}`,
+      `${ROOT}/optionGroups?pageSize=50&${GROUP_MASK}`,
     ]);
   });
 
@@ -433,6 +452,7 @@ describe('firestoreFetch', () => {
   it('validates queryOrders against the collection serialized before the request', async () => {
     const body = {
       structuredQuery: {
+        select: ORDER_SELECT,
         from: [{ collectionId: 'orders' }],
         limit: 1,
       },
@@ -461,6 +481,7 @@ describe('firestoreFetch', () => {
     expect(sent).toBe(
       JSON.stringify({
         structuredQuery: {
+          select: ORDER_SELECT,
           from: [{ collectionId: 'orders' }],
           limit: 1,
         },
@@ -472,6 +493,7 @@ describe('firestoreFetch', () => {
   it('serializes POST bodies once in firestoreFetch and validates the serialized payload before sending', async () => {
     const forgedToJson = {
       structuredQuery: {
+        select: ORDER_SELECT,
         from: [{ collectionId: 'orders' }],
         limit: 1,
       },
@@ -511,6 +533,7 @@ describe('firestoreFetch', () => {
       'test-token',
       {
         structuredQuery: {
+          select: ORDER_SELECT,
           from: [mutatingFrom],
           limit: 1,
         },
@@ -524,6 +547,7 @@ describe('firestoreFetch', () => {
     expect(sentBody).toBe(
       JSON.stringify({
         structuredQuery: {
+          select: ORDER_SELECT,
           from: [{ collectionId: 'orders' }],
           limit: 1,
         },
