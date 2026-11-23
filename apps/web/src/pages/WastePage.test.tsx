@@ -14,6 +14,8 @@ import {
   resetHeldWrites,
   unknownSaveMessage,
 } from '@/items/request-id';
+import { putHeldWrite } from '@/lib/held-writes';
+import { makeAuditedLocks } from '@/test/held-write-locks';
 import { WastePage } from '@/pages/WastePage';
 import { listStockChoices } from '@/purchases/api';
 import { loadHistoryPage, recordWaste } from '@/waste/api';
@@ -145,6 +147,31 @@ describe('WastePage', () => {
     vi.mocked(recordWaste).mockReset();
     vi.mocked(listStockChoices).mockResolvedValue([stockChoice()]);
     vi.mocked(loadHistoryPage).mockResolvedValue({ entries: [], next: null });
+  });
+
+  it('R14-2: definitive waste rejection releases its lock before another waste pin is cleaned', async () => {
+    const { locks, nested } = makeAuditedLocks();
+    vi.stubGlobal('navigator', { onLine: true, locks });
+    try {
+      vi.mocked(recordWaste).mockImplementationOnce(() => {
+        const other = documentSubject('synthetic-waste');
+        putHeldWrite(other, {
+          requestId: 'other-waste',
+          payload: null,
+          phase: 'posted_reload',
+          readTarget: other,
+        });
+        return Promise.reject(new MissingCostBasisError([itemA]));
+      });
+      renderPage();
+      const { submit } = await fillNew();
+      fireEvent.click(submit);
+      expect(await screen.findByRole('alert')).toHaveTextContent('مفيش تكلفة');
+      expect(loadHistoryPage).toHaveBeenCalledTimes(2);
+      expect(nested).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('shows the form, the empty history and the way back home', async () => {

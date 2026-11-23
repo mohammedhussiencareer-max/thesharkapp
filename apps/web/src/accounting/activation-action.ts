@@ -14,7 +14,8 @@ import {
   canDispatchAction,
   claimFreshAction,
   claimReplayAction,
-  clearActionPostedReload,
+  clearActionPostedReloadSnapshot,
+  snapshotActionPostedReloads,
   hasAction,
   hasDurableAction,
   activationReviewReloadPending,
@@ -33,6 +34,7 @@ import {
   acquireHeldWriteLock,
   captureWriteSession,
   clearHeldWrite,
+  hasPostedReload,
   readLockedHeldWrite,
   setHeldWritePhase,
   type HeldWriteRecord,
@@ -80,7 +82,10 @@ export function useActivationAction(
 
   const unknown =
     heldEpoch < 0 ? null : unknownAction<ActivationWrite>(ACTIVATION_SUBJECT);
+  const posted =
+    heldEpoch >= 0 && hasPostedReload(ACTIVATION_SUBJECT, ACTIVATION_SUBJECT);
   const reloadPending =
+    posted ||
     reloadBlocked ||
     (heldEpoch >= 0 && activationReviewReloadPending(ACTIVATION_SUBJECT));
 
@@ -160,11 +165,28 @@ export function useActivationAction(
     setNotice(manifestChangedMessage);
   }
 
+  async function verifyPostedActivation(): Promise<void> {
+    const pins = snapshotActionPostedReloads({ subject: ACTIVATION_SUBJECT });
+    const next = await reloadReview();
+    if (!next) return;
+    if (!next.activated) {
+      setReloadBlocked(true);
+      setNotice(reloadFailedMessage);
+      return;
+    }
+    onReview(next);
+    await clearActionPostedReloadSnapshot(pins, ACTIVATION_SUBJECT);
+    setReloadBlocked(false);
+    setNotice(null);
+  }
+
   async function activate(): Promise<void> {
     if (!review || flight.current || !isOnline()) return;
     const current = heldAction<ActivationWrite>(ACTIVATION_SUBJECT);
     const unknownHeld = unknownAction<ActivationWrite>(ACTIVATION_SUBJECT);
-    if (reloadPending) {
+    const isPosted =
+      posted || hasPostedReload(ACTIVATION_SUBJECT, ACTIVATION_SUBJECT);
+    if (reloadPending || isPosted) {
       const reviewWasPending =
         activationReviewReloadPending(ACTIVATION_SUBJECT);
       const requestId =
@@ -174,6 +196,10 @@ export function useActivationAction(
       setSaving(true);
       let releaseReloadLock = () => {};
       try {
+        if (isPosted) {
+          await verifyPostedActivation();
+          return;
+        }
         const lock = await acquireHeldWriteLock(ACTIVATION_SUBJECT);
         if (!lock.acquired) return;
         releaseReloadLock = lock.release;
@@ -238,7 +264,11 @@ export function useActivationAction(
       if (!claim.ok) {
         if (claim.reason === 'conflict') {
           setReloadBlocked(true);
-          setNotice(unknownSaveMessage);
+          setNotice(
+            claim.existing?.phase === 'posted_reload'
+              ? reloadFailedMessage
+              : unknownSaveMessage,
+          );
         } else if (claim.reason === 'missing' || claim.reason === 'storage') {
           setNotice(storageWriteFailedMessage);
         } else if (claim.reason === 'session_invalid' && !isOnline()) {
@@ -262,7 +292,11 @@ export function useActivationAction(
       if (!claim.ok) {
         if (claim.reason === 'conflict') {
           setReloadBlocked(true);
-          setNotice(unknownSaveMessage);
+          setNotice(
+            claim.existing?.phase === 'posted_reload'
+              ? reloadFailedMessage
+              : unknownSaveMessage,
+          );
         } else if (claim.reason === 'missing' || claim.reason === 'storage') {
           setNotice(storageWriteFailedMessage);
         } else if (claim.reason === 'session_invalid' && !isOnline()) {
@@ -285,7 +319,13 @@ export function useActivationAction(
         { session },
       );
       if (!claim.ok) {
-        if (claim.reason === 'storage') {
+        if (
+          claim.reason === 'conflict' &&
+          claim.existing?.phase === 'posted_reload'
+        ) {
+          setReloadBlocked(true);
+          setNotice(reloadFailedMessage);
+        } else if (claim.reason === 'storage') {
           setNotice(storageWriteFailedMessage);
         } else if (claim.reason === 'session_invalid' && !isOnline()) {
           setNotice(offlineWriteMessage);
@@ -359,6 +399,8 @@ export function useActivationAction(
         }
         if (!persisted) {
           settleAction(ACTIVATION_SUBJECT, action.requestId, failure);
+        } else {
+          setReloadBlocked(true);
         }
         setNotice(messageFrom(failure));
         return;
@@ -366,13 +408,7 @@ export function useActivationAction(
         releaseLock();
       }
       try {
-        onReview(await loadOpeningReview());
-        await clearActionPostedReload(
-          ACTIVATION_SUBJECT,
-          ACTIVATION_SUBJECT,
-          action.requestId,
-        );
-        setNotice(null);
+        await verifyPostedActivation();
       } catch {
         setNotice(reloadFailedMessage);
       }

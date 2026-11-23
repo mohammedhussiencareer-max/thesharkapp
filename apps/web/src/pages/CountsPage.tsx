@@ -29,7 +29,6 @@ import { messageFrom } from '@/items/errors';
 import type { Json } from '@/lib/database.types';
 import {
   abortClaimBeforeDispatch,
-  acquireHeldWriteLock,
   canDispatchHeldWrite,
   canDispatchWriteFor,
   captureWriteSession,
@@ -37,10 +36,13 @@ import {
   claimReplayHeldWrite,
   clearHeldWrite,
   clearPostedReloadSnapshot,
+  COUNT_DAILY_SUBJECT,
+  COUNT_STORED_PREFIX,
   getHeldWrite,
   hasDurableHeldWrite,
   listHeldWritesByPrefix,
   readLockedHeldWrite,
+  readLockedPostedWrite,
   setHeldWritePhase,
   snapshotPostedReloads,
   storageWriteFailedMessage,
@@ -56,9 +58,6 @@ import {
   useReconnectReload,
 } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
-
-const COUNT_DAILY_SUBJECT = 'count:daily';
-const COUNT_STORED_PREFIX = 'count:stored:';
 
 type Snapshot = {
   items: CountItem[];
@@ -381,17 +380,21 @@ export function CountsPage() {
     applyPosted(requestId, draft !== null, storedSubject, daily);
     // The readback may cover pins owned by other count writers.
     release();
+    await reloadPostedCounts(captureWriteSession());
+    return true;
+  }
+
+  async function reloadPostedCounts(
+    session: WriteSession | null,
+  ): Promise<void> {
     const pendingReloads = snapshotCountPostedReloads();
     const next = await readSnapshot();
     if (next.status === 'ready') {
       setSnapshot(next.snapshot);
       setLoadError(null);
-      await clearPostedReloadSnapshot(pendingReloads);
-      setLocalNeedsReload(false);
-    } else {
-      setLocalNeedsReload(false);
+      await clearPostedReloadSnapshot(pendingReloads, undefined, session);
     }
-    return true;
+    setLocalNeedsReload(false);
   }
 
   async function handleSubmit(draft: CountDraft) {
@@ -410,20 +413,39 @@ export function CountsPage() {
     // Persist BEFORE sending (without display-only fields) so a reload during
     // transmission restores `unknown`. Refuse to send if storage fails.
     const storedDraft = toStoredCountDraft(draft);
+    const storedSubject = `${COUNT_STORED_PREFIX}${draft.requestId}`;
+    const checkConflict = () =>
+      readLockedPostedWrite(COUNT_DAILY_SUBJECT, draft.requestId) ??
+      readLockedPostedWrite(storedSubject, draft.requestId);
     const claim =
       priorPhase !== null
         ? await claimReplayHeldWrite<CountDraft>(
             COUNT_DAILY_SUBJECT,
             draft.requestId,
-            { session },
+            { session, checkConflict },
           )
         : await claimFreshHeldWrite<CountDraft>(
             COUNT_DAILY_SUBJECT,
             () => storedDraft,
-            { requestId: draft.requestId, kind: 'count', session },
+            {
+              requestId: draft.requestId,
+              kind: 'count',
+              session,
+              checkConflict,
+            },
           );
     if (!claim.ok) {
-      if (claim.reason === 'storage' || claim.reason === 'missing') {
+      if (
+        claim.reason === 'conflict' &&
+        claim.existing?.phase === 'posted_reload'
+      ) {
+        setLocalNeedsReload(true);
+        try {
+          await reloadPostedCounts(session);
+        } catch (error) {
+          setLoadError(messageFrom(error));
+        }
+      } else if (claim.reason === 'storage' || claim.reason === 'missing') {
         setServerError(storageWriteFailedMessage);
       } else if (claim.reason === 'session_invalid' && !isOnline()) {
         setServerError(offlineWriteMessage);
@@ -475,43 +497,12 @@ export function CountsPage() {
     if (busy || loadsRef.current > 0 || !isOnline()) return;
     const requestId = requestIdOf(payload);
     const session = captureWriteSession();
-    if (requestId === null) {
-      await replayStored(payload, requestId, null, session);
-      return;
-    }
-    // Take the daily lock first, then the stored-card lock. A server card
-    // can represent the same request as a daily write in another tab.
-    const dailyLock = await acquireHeldWriteLock(COUNT_DAILY_SUBJECT);
-    if (!dailyLock.acquired) return;
-    try {
-      if (!canDispatchWriteFor(session)) return;
-      const daily = readLockedHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
-      await replayStored(
-        payload,
-        requestId,
-        daily?.requestId === requestId && daily.phase !== 'posted_reload'
-          ? daily
-          : null,
-        session,
-        dailyLock.release,
-      );
-    } catch (error) {
-      setCardError(messageFrom(error));
-    } finally {
-      dailyLock.release();
-    }
-  }
-
-  async function replayStored(
-    payload: Json,
-    requestId: string | null,
-    daily: HeldWriteRecord<CountDraft> | null,
-    session: WriteSession | null,
-    releaseDailyLock: () => void = () => {},
-  ) {
     const storedSubject =
       requestId !== null ? `${COUNT_STORED_PREFIX}${requestId}` : null;
     let releaseLock = () => {};
+    const matchingDaily: { record: HeldWriteRecord<CountDraft> | null } = {
+      record: null,
+    };
     let isLocalReplay = false;
     if (storedSubject && requestId !== null) {
       const prior = getHeldWrite<Json>(storedSubject);
@@ -519,17 +510,55 @@ export function CountsPage() {
         prior !== null &&
         prior.requestId === requestId &&
         prior.phase === 'unknown';
+      // Daily writes and stored cards share the daily lock, even though their
+      // pins occupy separate storage keys.
+      const checkConflict = () => {
+        const dailyPosted = readLockedPostedWrite(
+          COUNT_DAILY_SUBJECT,
+          requestId,
+        );
+        const cardPosted = readLockedPostedWrite(storedSubject, requestId);
+        const current = readLockedHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
+        if (
+          current?.requestId === requestId &&
+          current.phase !== 'posted_reload'
+        ) {
+          matchingDaily.record = current;
+        }
+        if (dailyPosted) {
+          const staleCard = readLockedHeldWrite(storedSubject);
+          if (
+            staleCard?.requestId === requestId &&
+            staleCard.phase !== 'posted_reload'
+          ) {
+            clearHeldWrite(storedSubject, requestId, staleCard);
+          }
+        }
+        return dailyPosted ?? cardPosted;
+      };
       const claim = isLocalReplay
         ? await claimReplayHeldWrite<Json>(storedSubject, requestId, {
             session,
+            checkConflict,
           })
         : await claimFreshHeldWrite<Json>(storedSubject, () => payload, {
             requestId,
             kind: 'count_stored',
             session,
+            checkConflict,
           });
       if (!claim.ok) {
-        if (claim.reason === 'storage' || claim.reason === 'missing') {
+        if (
+          claim.reason === 'conflict' &&
+          claim.existing?.phase === 'posted_reload'
+        ) {
+          setLocalNeedsReload(true);
+          try {
+            await reloadPostedCounts(session);
+          } catch (error) {
+            setLoadError(messageFrom(error));
+          }
+        } else if (claim.reason === 'storage' || claim.reason === 'missing') {
           setCardError(storageWriteFailedMessage);
         } else if (claim.reason === 'session_invalid' && !isOnline()) {
           setCardError(offlineWriteMessage);
@@ -561,6 +590,7 @@ export function CountsPage() {
       else if (!isOnline()) setCardError(offlineWriteMessage);
       return;
     }
+    const daily = matchingDaily.record;
     setSaving(true);
     setServerError(null);
     setCardError(null);
@@ -569,10 +599,14 @@ export function CountsPage() {
     try {
       const result = await recordStoredCount(payload);
       if (result.status === 'posted') saved = true;
-      await finishWrite(result, null, requestId, storedSubject, daily, () => {
-        releaseLock();
-        releaseDailyLock();
-      });
+      await finishWrite(
+        result,
+        null,
+        requestId,
+        storedSubject,
+        daily,
+        releaseLock,
+      );
     } catch (error) {
       if (!saved) {
         setCardError(reportedCountError(error));

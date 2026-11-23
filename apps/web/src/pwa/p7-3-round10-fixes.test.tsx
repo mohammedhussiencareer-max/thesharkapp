@@ -72,6 +72,7 @@ import { ActivationPage } from '@/pages/ActivationPage';
 import { CountsPage } from '@/pages/CountsPage';
 import { ExpensesPage } from '@/pages/ExpensesPage';
 import { ItemsPage } from '@/pages/ItemsPage';
+import { makeAuditedLocks } from '@/test/held-write-locks';
 
 vi.mock('@/items/api', () => ({
   ITEMS_RELOAD_SUBJECT: 'items:reload',
@@ -1259,6 +1260,296 @@ describe('P7-3 round-10 review fixes', () => {
       releaseLock();
       other.dispose();
       vi.unstubAllGlobals();
+    }
+  });
+
+  it('R14-1: queued sign-out follows a captured claim into the posted slot and respects session and newer-claim guards', async () => {
+    const { client, nested } = makeAuditedLocks();
+    const writer = createHeldWriteStore({ getLocks: () => client('writer-1') });
+    const writerNewer = createHeldWriteStore({
+      getLocks: () => client('writer-2'),
+    });
+    const signer = createHeldWriteStore({
+      getLocks: () => client('signing-out tab'),
+    });
+    const subject = lossSubject('oil');
+    const subjectNewer = lossSubject('box');
+    const subjectResign = lossSubject('resign');
+    const owner = 'owner-r10';
+    writer.setHeldWriteUser(owner);
+    writerNewer.setHeldWriteUser(owner);
+    signer.setHeldWriteUser(owner);
+    const claim = await writer.claimFreshHeldWrite(subject, () => ({
+      loss: '10',
+    }));
+    const claimNewer = await writerNewer.claimFreshHeldWrite(
+      subjectNewer,
+      () => ({ loss: '5' }),
+    );
+    if (!claim.ok || !claimNewer.ok) throw new Error('expected writer claims');
+    try {
+      signer.setWritesLocked(true);
+      signer.clearHeldWritesForUser(owner);
+      signer.setHeldWriteUser(null);
+      const { requestId } = claim.record;
+      writer.setHeldWritePhase(subject, requestId, 'posted_reload', {
+        readTarget: 'oil',
+      });
+      const prefix = userStoragePrefix(owner);
+      const posted = `${prefix}posted:${encodeURIComponent(subject)}:${encodeURIComponent(requestId)}`;
+      const newerActive = `${prefix}${encodeURIComponent(subjectNewer)}`;
+      expect(localStorage.getItem(posted)).not.toBeNull();
+
+      // Replace the second subject with a newer claim (new claimId) before the queued cleanup acquires the lock.
+      const existingNewer = JSON.parse(
+        localStorage.getItem(newerActive) ?? '{}',
+      ) as Record<string, unknown>;
+      localStorage.setItem(
+        newerActive,
+        JSON.stringify({ ...existingNewer, claimId: 'newer-claim-id' }),
+      );
+      claimNewer.release();
+
+      writer.dispose();
+      await waitFor(() => expect(localStorage.getItem(posted)).toBeNull(), {
+        timeout: 400,
+      });
+      // Newer claim (different claimId) must NOT be deleted by the older sign-out snapshot.
+      expect(localStorage.getItem(newerActive)).not.toBeNull();
+
+      // Session guard: if the same user signs back in before a queued cleanup runs, keep their pin.
+      signer.setHeldWriteUser(owner);
+      const writer2 = createHeldWriteStore({
+        getLocks: () => client('writer-3'),
+      });
+      writer2.setHeldWriteUser(owner);
+      const claimResign = await writer2.claimFreshHeldWrite(
+        subjectResign,
+        () => ({ price: '10' }),
+      );
+      if (!claimResign.ok) throw new Error('expected resign claim');
+      const resignKey = `${prefix}${encodeURIComponent(subjectResign)}`;
+      try {
+        signer.setWritesLocked(true);
+        signer.clearHeldWritesForUser(owner);
+        signer.setHeldWriteUser(null);
+        signer.setHeldWriteUser(owner);
+        claimResign.release();
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(localStorage.getItem(resignKey)).not.toBeNull();
+      } finally {
+        claimResign.release();
+        writer2.dispose();
+      }
+      expect(nested).toEqual([]);
+    } finally {
+      claim.release();
+      claimNewer.release();
+      writer.dispose();
+      writerNewer.dispose();
+      signer.dispose();
+    }
+  });
+
+  it('R14-3: a month snapshot waiting for cleanup cannot verify a later ambiguous category rename', async () => {
+    const { locks } = makeFakeLocks();
+    vi.stubGlobal('navigator', { onLine: true, locks });
+    const other = createHeldWriteStore({ getLocks: () => locks });
+    other.setHeldWriteUser('owner-r10');
+    const subject = 'expense:void:synthetic-void';
+    let release = () => {};
+    vi.mocked(loadExpenseMonth).mockImplementation((target) =>
+      Promise.resolve(r13ExpenseMonth(target)),
+    );
+    try {
+      render(
+        <MemoryRouter>
+          <ExpensesPage />
+        </MemoryRouter>,
+      );
+      await screen.findByRole('button', { name: 'حفظ اسم إيجار' });
+      const claim = await other.acquireHeldWriteLock(subject);
+      if (!claim.acquired) throw new Error('expected busy void subject');
+      release = claim.release;
+      act(() => {
+        putHeldWrite(subject, {
+          requestId: 'old-void',
+          phase: 'unknown',
+          payload: { id: 'synthetic-void' },
+        });
+      });
+      vi.mocked(loadExpenseMonth).mockResolvedValueOnce(
+        r13ExpenseMonth('2030-05-01', [
+          {
+            id: 'synthetic-void',
+            categoryId: 'rent',
+            categoryName: 'إيجار',
+            categoryKind: 'fixed_monthly',
+            amount: '100.00',
+            periodMonth: '2030-05-01',
+            expenseDate: null,
+            paidOn: null,
+            isEstimate: false,
+            note: 'إلغاء مستني التنضيف',
+            hours: null,
+            hourlyRate: null,
+            driverLabel: null,
+            createdAt: '2030-05-01T08:00:00Z',
+            voided: true,
+            voidReason: 'تكرار',
+            superseded: false,
+          },
+        ]),
+      );
+      fireEvent.change(screen.getByLabelText('الشهر'), {
+        target: { value: '2030-05' },
+      });
+      await screen.findByText('إلغاء مستني التنضيف');
+      vi.mocked(renameExpenseCategory).mockRejectedValueOnce(
+        new Error('rename reply lost'),
+      );
+      vi.mocked(loadExpenseMonth).mockRejectedValueOnce(
+        new Error('rename verification unavailable'),
+      );
+      fireEvent.change(screen.getByLabelText('اسم إيجار'), {
+        target: { value: 'إيجار جديد' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ اسم إيجار' }));
+      await screen.findByRole('button', { name: 'تحقق تاني' });
+      await act(async () => {
+        release();
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(getHeldWrite(subject)).toBeNull());
+      expect(
+        screen.getByRole('button', { name: 'تحقق تاني' }),
+      ).toBeInTheDocument();
+    } finally {
+      release();
+      other.dispose();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('R14-4: acknowledged activation offers read-only review when the posted write failed', async () => {
+    const review = makeReview('a'.repeat(32));
+    const activated = { ...review, activated: true, canActivate: false };
+    vi.mocked(loadOpeningReview)
+      .mockResolvedValueOnce(review)
+      .mockResolvedValue(activated);
+    vi.mocked(activateInventory).mockImplementationOnce(() => {
+      vi.spyOn(Storage.prototype, 'setItem').mockImplementationOnce(() => {
+        throw new Error('posted storage unavailable');
+      });
+      return Promise.resolve({
+        activated: true,
+        stockStartedAt: null,
+        openingManifestHash: review.openingManifestHash,
+      });
+    });
+    render(
+      <MemoryRouter>
+        <ActivationPage />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'تفعيل الخصم' }));
+    const readOnly = await screen.findByRole('button', {
+      name: 'إعادة تحميل المراجعة',
+    });
+    expect(
+      screen.queryByRole('button', { name: 'تفعيل الخصم' }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(readOnly);
+    await waitFor(() => expect(getHeldWrite(ACTIVATION_SUBJECT)).toBeNull());
+    expect(activateInventory).toHaveBeenCalledTimes(1);
+    expect(loadOpeningReview).toHaveBeenCalledTimes(2);
+  });
+
+  it('R14-4 store: an acknowledged claim refuses a direct replay before readback', async () => {
+    const tab = createHeldWriteStore();
+    tab.setHeldWriteUser('owner-r10');
+    const claim = await tab.claimFreshHeldWrite(ACTIVATION_SUBJECT, () => ({
+      activate: true,
+    }));
+    if (!claim.ok) throw new Error('expected fresh activation');
+    try {
+      const storage = vi
+        .spyOn(Storage.prototype, 'setItem')
+        .mockImplementationOnce(() => {
+          throw new Error('posted copy unavailable');
+        });
+      expect(() =>
+        tab.setHeldWritePhase(
+          ACTIVATION_SUBJECT,
+          claim.record.requestId,
+          'posted_reload',
+          { readTarget: ACTIVATION_SUBJECT },
+        ),
+      ).toThrow(HeldWriteStorageError);
+      storage.mockRestore();
+      claim.release();
+      const replay = await tab.claimReplayHeldWrite(
+        ACTIVATION_SUBJECT,
+        claim.record.requestId,
+      );
+      if (replay.ok) replay.release();
+      expect(replay).toMatchObject({ ok: false, reason: 'conflict' });
+    } finally {
+      claim.release();
+      tab.dispose();
+    }
+  });
+
+  it('R14-5: a stale stored card reads back an id posted by the daily form', async () => {
+    const requestId = 'd1900000-0000-4000-8000-000000000062';
+    const countedAt = '2026-10-22T10:00:00.000Z';
+    const payload = {
+      request_id: requestId,
+      frequency: 'daily',
+      counted_at: countedAt,
+      note: null,
+      lines: [],
+    };
+    vi.mocked(listDailyItems).mockResolvedValue([]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts)
+      .mockResolvedValueOnce([
+        { requestId, countedAt, preparedAt: countedAt, itemCount: 0, payload },
+      ])
+      .mockResolvedValue([]);
+    vi.mocked(recordStoredCount).mockResolvedValue({
+      status: 'posted',
+      countId: 'other',
+    });
+    render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole('button', { name: 'سجّل الجرد' });
+    const other = createHeldWriteStore();
+    other.setHeldWriteUser('owner-r10');
+    try {
+      other.putHeldWrite('count:daily', {
+        requestId,
+        payload: null,
+        phase: 'posted_reload',
+        kind: 'count',
+      });
+      await act(async () => {
+        fireEvent.click(card);
+        await Promise.resolve();
+      });
+      expect(recordStoredCount).not.toHaveBeenCalled();
+      await waitFor(() =>
+        expect(
+          screen.queryByRole('button', { name: 'سجّل الجرد' }),
+        ).not.toBeInTheDocument(),
+      );
+      expect(listPendingCounts).toHaveBeenCalledTimes(2);
+    } finally {
+      other.dispose();
     }
   });
 

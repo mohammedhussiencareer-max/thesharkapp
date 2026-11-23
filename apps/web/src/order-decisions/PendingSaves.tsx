@@ -112,11 +112,13 @@ export function PendingSaves({
       } else {
         settleAction(subject, write.requestId);
       }
+      releaseOnce();
       onSettled(write.orderId, { kind: 'saved', result: saved, warning: null });
     } catch (failure) {
       if (!persisted) {
         settleAction(subject, write.requestId, failure);
       }
+      releaseOnce();
       onSettled(write.orderId, {
         kind: 'failed',
         message: messageFrom(failure),

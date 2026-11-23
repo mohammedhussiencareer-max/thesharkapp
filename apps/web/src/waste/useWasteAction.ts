@@ -106,6 +106,7 @@ export function useWasteAction(
           setNotice({ kind: 'failed', message, itemIds });
           return;
         }
+        releaseLock();
         const warning = await reload();
         setNotice({
           kind: 'failed',

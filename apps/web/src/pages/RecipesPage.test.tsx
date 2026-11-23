@@ -247,10 +247,13 @@ describe('RecipesPage', () => {
         const claim = await claimFreshAction(subject, (id) => id);
         if (!claim.ok) throw new Error('claim failed');
         const requestId = claim.record.requestId;
-        claim.release();
         const failure = new Error('تعذر الاتصال');
-        settleAction(subject, requestId, failure);
-        throw failure;
+        try {
+          settleAction(subject, requestId, failure);
+          throw failure;
+        } finally {
+          claim.release();
+        }
       })
       .mockResolvedValueOnce('new-id');
     await renderList();

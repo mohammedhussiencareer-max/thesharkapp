@@ -249,10 +249,14 @@ export function ExpensesPage() {
   }
 
   const reconcileRequestlessVerifyOnMonth = useCallback(
-    (monthData: ExpenseMonth): void => {
-      const completeState = completeVerifyRef.current;
+    (
+      monthData: ExpenseMonth,
+      completeState: RequestlessVerifyState | null,
+      categoryState: RequestlessVerifyState | null,
+    ): void => {
       if (
         completeState &&
+        completeVerifyRef.current === completeState &&
         completeState.status !== 'verified' &&
         completeState.targetMonth === monthData.monthStart
       ) {
@@ -262,8 +266,11 @@ export function ExpensesPage() {
           readError: null,
         });
       }
-      const categoryState = categoryVerifyRef.current;
-      if (categoryState && categoryState.status !== 'verified') {
+      if (
+        categoryState &&
+        categoryVerifyRef.current === categoryState &&
+        categoryState.status !== 'verified'
+      ) {
         setCategoryVerifyState({
           targetMonth: monthData.monthStart,
           status: 'verified',
@@ -410,6 +417,8 @@ export function ExpensesPage() {
   useEffect(() => {
     let cancelled = false;
     const displayedMonthStart = `${month}-01`;
+    const completeAttempt = completeVerifyRef.current;
+    const categoryAttempt = categoryVerifyRef.current;
     const pendingReloads = snapshotExpensePostedReloads();
     void (async () => {
       try {
@@ -424,8 +433,12 @@ export function ExpensesPage() {
         dataSessionRef.current = result.readSession;
         setData(result.data);
         setLoadError(null);
+        reconcileRequestlessVerifyOnMonth(
+          result.data,
+          completeAttempt,
+          categoryAttempt,
+        );
         await reconcileCommittedVoids(result.data.entries);
-        reconcileRequestlessVerifyOnMonth(result.data);
         await clearPostedReloadSnapshot(pendingReloads, result.data.monthStart);
         needsReloadRef.current = false;
         setLocalNeedsReload(false);
@@ -495,6 +508,8 @@ export function ExpensesPage() {
       readError: null,
     };
     setVerify(attempt);
+    const completeAttempt = completeVerifyRef.current;
+    const categoryAttempt = categoryVerifyRef.current;
     const pendingReloads = snapshotExpensePostedReloads();
     try {
       const result = await readExpenseMonthTarget(
@@ -516,7 +531,11 @@ export function ExpensesPage() {
       );
       if (verifyRef.current !== attempt) return;
       setVerify({ targetMonth, status: 'verified', readError: null });
-      reconcileRequestlessVerifyOnMonth(fresh);
+      reconcileRequestlessVerifyOnMonth(
+        fresh,
+        completeAttempt,
+        categoryAttempt,
+      );
     } catch (readError) {
       if (verifyRef.current !== attempt) return;
       setVerify({

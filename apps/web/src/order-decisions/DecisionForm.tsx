@@ -214,6 +214,7 @@ export function DecisionForm({
           onNotice({ kind: 'failed', message });
           return;
         }
+        releaseLock();
         const warning = await reload();
         onNotice({
           kind: 'failed',

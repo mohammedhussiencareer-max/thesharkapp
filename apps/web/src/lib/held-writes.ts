@@ -304,6 +304,9 @@ function sameAcknowledgedClaim(
   );
 }
 
+export const COUNT_DAILY_SUBJECT = 'count:daily';
+export const COUNT_STORED_PREFIX = 'count:stored:';
+
 export type HeldWriteStoreOptions = {
   getStorage?: () => Storage | null;
   getProjectUrl?: () => string;
@@ -358,6 +361,17 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     projectUrl = getProjectUrl(),
   ): string {
     return `${userStoragePrefix(userId, projectUrl)}${encodeURIComponent(subject)}`;
+  }
+
+  function subjectLockKey(
+    subject: string,
+    userId: string,
+    projectUrl = getProjectUrl(),
+  ): string {
+    const lockSubject = subject.startsWith(COUNT_STORED_PREFIX)
+      ? COUNT_DAILY_SUBJECT
+      : subject;
+    return entryStorageKey(lockSubject, userId, projectUrl);
   }
 
   function postedSubjectPrefix(
@@ -563,21 +577,18 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
   }
 
-  function pruneStoredSnapshot(
-    key: string,
-    expectedRaw: string,
+  function pruneUnderSubjectLock(
     subjectLock: string,
+    prune: () => void,
     stillCurrent: () => boolean,
     queue = false,
   ): void {
-    const prune = () => {
-      if (!stillCurrent()) return;
-      const current = strictReadItem(key);
-      if (current.ok && current.value === expectedRaw) safeRemoveItem(key);
+    const pruneIfCurrent = () => {
+      if (stillCurrent()) prune();
     };
     const locks = getLocks();
     if (!locks || activeLockReleases.has(subjectLock)) {
-      prune();
+      pruneIfCurrent();
       return;
     }
     // Hydration probes once. Sign-out can queue without holding or awaiting another lock.
@@ -586,7 +597,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         subjectLock,
         { mode: 'exclusive', ...(queue ? {} : { ifAvailable: true }) },
         (lock) => {
-          if (lock) prune();
+          if (lock) pruneIfCurrent();
         },
       )
       .catch(() => {});
@@ -631,10 +642,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (!parsed) continue;
       // Discard orphaned pins left by retired request-less writers in earlier builds.
       if (isRetiredRequestlessRecord(parsed)) {
-        pruneStoredSnapshot(
-          key,
-          raw,
-          entryStorageKey(parsed.subject, userId, projectUrl),
+        pruneUnderSubjectLock(
+          subjectLockKey(parsed.subject, userId, projectUrl),
+          () => {
+            const current = strictReadItem(key);
+            if (current.ok && current.value === raw) safeRemoveItem(key);
+          },
           () => activeUserId() === userId && hydratedScopeKey === scopeKey,
         );
         continue;
@@ -716,7 +729,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     for (const expected of expectedRecords) {
       const { subject } = expected;
       if (activeUserId() !== userId || hydratedScopeKey !== scopeKey) return;
-      const lockName = entryStorageKey(subject, userId, projectUrl);
+      const lockName = subjectLockKey(subject, userId, projectUrl);
       if (heldNames.has(lockName) || activeLockReleases.has(lockName)) {
         continue;
       }
@@ -729,7 +742,9 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
             if (activeUserId() !== userId || hydratedScopeKey !== scopeKey) {
               return;
             }
-            const stored = readDurableRecord(lockName);
+            const stored = readDurableRecord(
+              entryStorageKey(subject, userId, projectUrl),
+            );
             if (!stored || !sameClaim(stored, expected)) return;
             const posted = readPostedCopy(stored, userId, projectUrl);
             if (posted) {
@@ -913,10 +928,44 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       const current = strictReadItem(key);
       if (!current.ok || current.value === null) continue;
       const record = parseRecord(current.value);
-      pruneStoredSnapshot(
-        key,
-        current.value,
-        record ? entryStorageKey(record.subject, trimmed, projectUrl) : key,
+      pruneUnderSubjectLock(
+        record ? subjectLockKey(record.subject, trimmed, projectUrl) : key,
+        () => {
+          if (!record || record.claimId === undefined) {
+            const latest = strictReadItem(key);
+            if (latest.ok && latest.value === current.value)
+              safeRemoveItem(key);
+            return;
+          }
+          const activeKey = entryStorageKey(
+            record.subject,
+            trimmed,
+            projectUrl,
+          );
+          const postedKey = postedStorageKey(
+            record.subject,
+            record.requestId,
+            trimmed,
+            projectUrl,
+          );
+          const matches = (copy: HeldWriteRecord | null) =>
+            copy?.subject === record.subject &&
+            copy.requestId === record.requestId &&
+            copy.claimId === record.claimId;
+          try {
+            if (matches(readDurableRecord(activeKey)))
+              safeRemoveItem(activeKey);
+          } catch {
+            // An unreadable active slot is not proof that the captured claim is absent.
+          }
+          try {
+            if (matches(readPostedCopy(record, trimmed, projectUrl))) {
+              safeRemoveItem(postedKey);
+            }
+          } catch {
+            // An unreadable posted slot is not proof that the captured claim is absent.
+          }
+        },
         () =>
           activeUserId() !== trimmed ||
           sessionGeneration === signedOutGeneration,
@@ -1060,6 +1109,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       requestId?: string;
       kind?: HeldWriteKind;
       session?: WriteSession | null;
+      checkConflict?: () => HeldWriteRecord | null;
     },
   ): Promise<ClaimHeldWriteResult<T>> {
     ensureHydrated();
@@ -1073,7 +1123,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
     const userId = session.userId;
     const key = entryStorageKey(subject, userId);
-    const lock = await acquireSubjectLock(key);
+    const lock = await acquireSubjectLock(subjectLockKey(subject, userId));
     if (!lock.acquired) {
       return { ok: false, reason: 'locked' };
     }
@@ -1081,6 +1131,17 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     try {
       if (!canDispatchWriteFor(session)) {
         return { ok: false, reason: 'session_invalid' };
+      }
+      try {
+        const conflict = opts?.checkConflict?.();
+        if (conflict) {
+          emit();
+          return { ok: false, reason: 'conflict', existing: conflict };
+        }
+      } catch (error) {
+        if (error instanceof HeldWriteStorageError)
+          return { ok: false, reason: 'storage' };
+        throw error;
       }
       const read = strictReadItem(key);
       if (!read.ok) {
@@ -1111,6 +1172,24 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         return { ok: false, reason: 'storage' };
       }
       if (stored) {
+        const acknowledged = acknowledgedInflight.get(subject);
+        if (
+          acknowledged &&
+          sameAcknowledgedClaim(stored, acknowledged.record)
+        ) {
+          return {
+            ok: false,
+            reason: 'conflict',
+            existing: {
+              ...stored,
+              payload: null,
+              phase: 'posted_reload',
+              ...(acknowledged.readTarget !== undefined
+                ? { readTarget: acknowledged.readTarget }
+                : {}),
+            },
+          };
+        }
         const preserved = preservePayloadIdentity(subject, stored);
         if (isUnresolvedPhase(stored.phase)) records.set(subject, preserved);
         emit();
@@ -1156,6 +1235,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       payload?: T;
       awaitingReviewReload?: boolean;
       session?: WriteSession | null;
+      checkConflict?: () => HeldWriteRecord | null;
     },
   ): Promise<ClaimHeldWriteResult<T>> {
     ensureHydrated();
@@ -1170,7 +1250,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const userId = session.userId;
     const key = entryStorageKey(subject, userId);
     const expected = records.get(subject);
-    const lock = await acquireSubjectLock(key);
+    const lock = await acquireSubjectLock(subjectLockKey(subject, userId));
     if (!lock.acquired) {
       return { ok: false, reason: 'locked' };
     }
@@ -1178,6 +1258,17 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     try {
       if (!canDispatchWriteFor(session)) {
         return { ok: false, reason: 'session_invalid' };
+      }
+      try {
+        const conflict = opts?.checkConflict?.();
+        if (conflict) {
+          emit();
+          return { ok: false, reason: 'conflict', existing: conflict };
+        }
+      } catch (error) {
+        if (error instanceof HeldWriteStorageError)
+          return { ok: false, reason: 'storage' };
+        throw error;
       }
       const read = strictReadItem(key);
       if (!read.ok) {
@@ -1201,6 +1292,21 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
           ok: false,
           reason: 'missing',
           ...(stored ? { existing: stored } : {}),
+        };
+      }
+      const acknowledged = acknowledgedInflight.get(subject);
+      if (acknowledged && sameAcknowledgedClaim(stored, acknowledged.record)) {
+        return {
+          ok: false,
+          reason: 'conflict',
+          existing: {
+            ...stored,
+            payload: null,
+            phase: 'posted_reload',
+            ...(acknowledged.readTarget !== undefined
+              ? { readTarget: acknowledged.readTarget }
+              : {}),
+          },
         };
       }
       try {
@@ -1416,7 +1522,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       (stored.subject !== subject ||
         !expected ||
         !sameClaim(stored, expected) ||
-        (getLocks() !== null && !activeLockReleases.has(key)))
+        (getLocks() !== null &&
+          !activeLockReleases.has(subjectLockKey(subject, userId))))
     ) {
       return { ok: false, reason: 'conflict', existing: stored };
     }
@@ -1495,8 +1602,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     if (userId === null) {
       return { acquired: false, reason: 'signed_out' };
     }
-    const key = entryStorageKey(subject, userId);
-    const lock = await acquireSubjectLock(key);
+    const lock = await acquireSubjectLock(subjectLockKey(subject, userId));
     if (!lock.acquired) {
       return { acquired: false, reason: 'locked' };
     }
@@ -1508,7 +1614,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     userId: string,
     mutate: () => void,
   ): void | Promise<void> {
-    const key = entryStorageKey(subject, userId);
+    const key = subjectLockKey(subject, userId);
     if (getLocks() === null || activeLockReleases.has(key)) {
       mutate();
       return;
@@ -1519,7 +1625,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       try {
         if (
           isCurrentWriteSession(session) &&
-          entryStorageKey(subject, userId) === key
+          subjectLockKey(subject, userId) === key
         )
           mutate();
       } finally {
@@ -1535,7 +1641,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const userId = activeUserId();
     if (userId === null) return null;
     const key = entryStorageKey(subject, userId);
-    if (getLocks() !== null && !activeLockReleases.has(key)) {
+    if (
+      getLocks() !== null &&
+      !activeLockReleases.has(subjectLockKey(subject, userId))
+    ) {
       throw new HeldWriteLockError();
     }
     const stored = readDurableRecord(key);
@@ -1552,6 +1661,35 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       }
     }
     return stored as HeldWriteRecord<T> | null;
+  }
+
+  function readLockedPostedWrite(
+    subject: string,
+    requestId: string,
+  ): HeldWriteRecord | null {
+    const userId = activeUserId();
+    if (userId === null) return null;
+    const active = readLockedHeldWrite(subject);
+    const posted = readPostedCopy({ subject, requestId }, userId);
+    const copy =
+      posted ??
+      (active?.requestId === requestId && active.phase === 'posted_reload'
+        ? active
+        : null);
+    if (copy) {
+      observePostedCopy(copy);
+      return copy;
+    }
+    if (active?.requestId !== requestId) return null;
+    const ack = acknowledgedInflight.get(subject);
+    return ack && sameAcknowledgedClaim(active, ack.record)
+      ? {
+          ...active,
+          phase: 'posted_reload',
+          payload: null,
+          readTarget: ack.readTarget,
+        }
+      : null;
   }
 
   function setHeldWritePhase(
@@ -2019,6 +2157,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     acquireHeldWriteLock,
     hasDurableHeldWrite,
     readLockedHeldWrite,
+    readLockedPostedWrite,
     canDispatchHeldWrite,
     abortClaimBeforeDispatch,
     tryBeginHeldWrite,
@@ -2062,6 +2201,7 @@ export const claimReplayHeldWrite = defaultStore.claimReplayHeldWrite;
 export const acquireHeldWriteLock = defaultStore.acquireHeldWriteLock;
 export const hasDurableHeldWrite = defaultStore.hasDurableHeldWrite;
 export const readLockedHeldWrite = defaultStore.readLockedHeldWrite;
+export const readLockedPostedWrite = defaultStore.readLockedPostedWrite;
 export const canDispatchHeldWrite = defaultStore.canDispatchHeldWrite;
 export const abortClaimBeforeDispatch = defaultStore.abortClaimBeforeDispatch;
 export const tryBeginHeldWrite = defaultStore.tryBeginHeldWrite;
