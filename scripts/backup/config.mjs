@@ -269,6 +269,23 @@ export function parseDbPort(toml) {
   return Number(value);
 }
 
+export function parseProjectId(toml) {
+  for (const raw of toml.split(/\r?\n/)) {
+    const line = raw.replace(/#.*$/, '').trim();
+    if (/^\[/.test(line)) {
+      break;
+    }
+    const match = /^project_id\s*=\s*"([A-Za-z0-9._-]+)"$/.exec(line);
+    if (match) {
+      return match[1];
+    }
+  }
+  throw new BackupError(
+    'CONFIG',
+    'project_id not found at the top level of config.toml',
+  );
+}
+
 export function readPinnedMajor(env = process.env) {
   return parsePinnedMajor(readFileSync(defaultConfigPath(env), 'utf8'));
 }
@@ -398,8 +415,8 @@ export function checkDumpTarget(env) {
     requireVerifiedTls(env);
   }
   return {
-    loopback: anyLoopback,
-    enforceRole: !anyLoopback || env.BACKUP_FORCE_ROLE_CHECK === '1',
+    loopback: allLoopback,
+    enforceRole: !allLoopback || env.BACKUP_FORCE_ROLE_CHECK === '1',
   };
 }
 

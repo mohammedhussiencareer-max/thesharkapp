@@ -39,10 +39,10 @@ if [ "${CI:-}" != true ] && [ "${BACKUP_ROUNDTRIP_CONFIRM:-}" != "$confirm_value
 fi
 
 require_tools node tar gzip sha256sum awk sed
+unset PGSERVICE PGSERVICEFILE PGHOSTADDR PGSSLROOTCERT PGSSLCERT PGSSLKEY PGOPTIONS PGPASSFILE BACKUP_CONFIG_TOML
 setup_pg_path
 require_tools psql pg_dump pg_restore
 
-unset PGSERVICE PGSERVICEFILE PGHOSTADDR PGSSLROOTCERT PGSSLCERT PGSSLKEY PGOPTIONS PGPASSFILE
 PGHOST=127.0.0.1
 PGPORT=$(guard db-port)
 PGUSER=postgres
@@ -109,6 +109,23 @@ stack_start() {
     fail STACK_START "supabase start failed"
   fi
   wait_db
+}
+
+stack_db_container() {
+  local project_id container running mapped
+  [ "$PGHOST" = 127.0.0.1 ] ||
+    fail SCHEDULER_INSTALL "PGHOST must be 127.0.0.1"
+  project_id=$(guard project-id)
+  container="supabase_db_${project_id}"
+  command -v docker >/dev/null 2>&1 ||
+    fail TOOL_MISSING "docker is not installed"
+  running=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)
+  [ "$running" = true ] ||
+    fail SCHEDULER_INSTALL "the disposable stack container $container is not running"
+  mapped=$(docker port "$container" 5432/tcp 2>/dev/null || true)
+  printf '%s\n' "$mapped" | grep -Eq ":${PGPORT}$" ||
+    fail SCHEDULER_INSTALL "the disposable stack container $container does not expose port $PGPORT"
+  printf '%s\n' "$container"
 }
 
 make_empty_project() {
@@ -584,9 +601,15 @@ run_full() {
   expect_denied "vault.secrets" 42501 "select 1 from vault.secrets limit 1"
 
   step "stack A: disposable stack installs pg_net and the read-only check fails closed"
-  psql -X -q -v ON_ERROR_STOP=1 -c 'create extension if not exists "pg_cron";' ||
+  local db_container
+  db_container=$(stack_db_container)
+  docker exec -e PGPASSWORD=postgres -e PGSSLMODE=disable "$db_container" \
+    psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -X -q -v ON_ERROR_STOP=1 \
+    -c 'create extension if not exists "pg_cron";' >/dev/null ||
     fail SCHEDULER_INSTALL "the disposable stack could not create pg_cron"
-  psql -X -q -v ON_ERROR_STOP=1 -c 'create extension if not exists "pg_net";' ||
+  docker exec -e PGPASSWORD=postgres -e PGSSLMODE=disable "$db_container" \
+    psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -X -q -v ON_ERROR_STOP=1 \
+    -c 'create extension if not exists "pg_net";' >/dev/null ||
     fail SCHEDULER_INSTALL "the disposable stack could not create pg_net"
   local scheduler_rc=0
   node "$here/ensure-scheduler.mjs" \
@@ -605,9 +628,20 @@ run_full() {
   [ "$present" = t ] || fail SCHEDULER_CRON "cron.job does not exist after the local create"
   expect_denied "cron.job" 42501 "select 1 from cron.job limit 1"
   expect_denied "vault.secrets" 42501 "select 1 from vault.secrets limit 1"
-  expect_fail "reader dump after pg_net" "[ROLE_UNSAFE]" \
+  rm -rf "$archives/after-net"
+  expect_fail "reader dump after pg_net" "[ROLE_UNSAFE]: role can enter platform schemas: net" \
     env PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
     "$here/dump.sh" "$archives/after-net"
+  if [ -s "$work_dir/neg.out" ]; then
+    fail SCHEDULER_DUMP "the refused dump after pg_net printed an archive path"
+  fi
+  if [ -d "$archives/after-net" ]; then
+    if [ -n "$(ls -A "$archives/after-net")" ]; then
+      fail SCHEDULER_DUMP "the refused dump after pg_net produced an archive"
+    fi
+  elif [ -e "$archives/after-net" ]; then
+    fail SCHEDULER_DUMP "the refused dump after pg_net produced unexpected output"
+  fi
   info "a backup with unsafe net access was refused"
 
   step "stack B: empty project"

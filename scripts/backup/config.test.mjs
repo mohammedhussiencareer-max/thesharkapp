@@ -206,6 +206,82 @@ test('dump to a remote host needs verified TLS and enforces the role check', () 
   );
 });
 
+test('mixed loopback and remote target lists enforce the role check and verified TLS', () => {
+  for (const mixed of [
+    {
+      ...local,
+      PGHOST: '127.0.0.1,aws-0-eu-central-1.pooler.supabase.com',
+      PGSSLMODE: 'verify-full',
+      BACKUP_ALLOW_LOOPBACK: '1',
+    },
+    {
+      ...local,
+      PGHOST: '127.0.0.1',
+      PGHOSTADDR: '203.0.113.10',
+      PGSSLMODE: 'verify-full',
+      BACKUP_ALLOW_LOOPBACK: '1',
+    },
+    {
+      ...remote,
+      PGHOSTADDR: '127.0.0.1',
+      PGSSLMODE: 'verify-full',
+      BACKUP_ALLOW_LOOPBACK: '1',
+    },
+    {
+      ...local,
+      PGHOST: 'localhost,db.example.com',
+      PGHOSTADDR: '127.0.0.1,203.0.113.10',
+      PGSSLMODE: 'verify-ca',
+      BACKUP_ALLOW_LOOPBACK: '1',
+    },
+  ]) {
+    assert.deepEqual(
+      checkDumpTarget(mixed),
+      { loopback: false, enforceRole: true },
+      JSON.stringify({ PGHOST: mixed.PGHOST, PGHOSTADDR: mixed.PGHOSTADDR }),
+    );
+  }
+  assert.equal(
+    codeOf(() =>
+      checkDumpTarget({
+        ...local,
+        PGHOST: '127.0.0.1,db.example.com',
+        PGSSLMODE: 'disable',
+        BACKUP_ALLOW_LOOPBACK: '1',
+      }),
+    ),
+    'SSLMODE_WEAK',
+  );
+  assert.deepEqual(
+    checkDumpTarget({
+      ...local,
+      PGHOST: '127.0.0.1,localhost',
+      PGHOSTADDR: '127.0.0.1,::1',
+      BACKUP_ALLOW_LOOPBACK: '1',
+    }),
+    { loopback: true, enforceRole: false },
+  );
+});
+
+test('parseProjectId reads top-level project_id from config.toml', async () => {
+  const mod = await import('./config.mjs');
+  assert.equal(typeof mod.parseProjectId, 'function');
+  assert.equal(
+    mod.parseProjectId('project_id = "thesharkapp" # comment\n[db]\nport = 1'),
+    'thesharkapp',
+  );
+  assert.equal(
+    codeOf(() => mod.parseProjectId('[db]\nproject_id = "wrong"\n')),
+    'CONFIG',
+  );
+  assert.equal(
+    codeOf(() => mod.parseProjectId('project_id = "bad id!"\n')),
+    'CONFIG',
+  );
+  const toml = readFileSync(join(repoRoot, 'supabase', 'config.toml'), 'utf8');
+  assert.equal(mod.parseProjectId(toml), 'thesharkapp');
+});
+
 test('connection env is required and PGSERVICE is forbidden', () => {
   for (const key of ['PGHOST', 'PGUSER', 'PGPASSWORD', 'PGDATABASE']) {
     const env = { ...remote };

@@ -528,3 +528,34 @@ test(
     }
   },
 );
+
+test(
+  'ci-roundtrip ignores an ambient BACKUP_CONFIG_TOML port override',
+  { skip },
+  () => {
+    const h = harness();
+    try {
+      const overrideToml = join(h.base, 'override.toml');
+      writeFileSync(
+        overrideToml,
+        'project_id = "evil"\n[db]\nport = 19999\nmajor_version = 17\n',
+      );
+      h.stub(
+        'supabase',
+        'printf \'%s|%s|%s\\n\' "$PGHOST" "$PGPORT" "$1" >>"$STUB_LOG"\nexit 1',
+      );
+      const result = h.run('ci-roundtrip.sh', ['full'], {
+        CI: 'true',
+        BACKUP_CONFIG_TOML: posix(overrideToml),
+      });
+      assert.equal(result.status, 1);
+      assert.ok(h.calls().length > 0);
+      for (const line of h.calls()) {
+        assert.match(line, /^127\.0\.0\.1\|55422\|/);
+      }
+      assert.deepEqual(h.leftovers(), []);
+    } finally {
+      rmSync(h.base, { recursive: true, force: true });
+    }
+  },
+);

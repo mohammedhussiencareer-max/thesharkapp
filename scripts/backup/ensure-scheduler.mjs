@@ -102,13 +102,19 @@ function assertReaderLockedOut(output) {
   const net = problems.filter(isNetProblem);
   const role = problems.filter((line) => !isNetProblem(line));
   if (net.length > 0) {
+    const missingReaderOnly = net.every((line) =>
+      line.startsWith('pg_net is installed and backup_reader does not exist'),
+    );
+    const prefix = missingReaderOnly
+      ? 'cannot verify pg_net isolation'
+      : 'pg_net exposes request data to backup_reader';
     const extra =
       role.length > 0
         ? `; backup_reader can enter cron or vault: ${role.join('; ')}`
         : '';
     throw new BackupError(
       'SCHEDULER_NET_UNSAFE',
-      `pg_net exposes request data to backup_reader: ${net.join('; ')}${extra}`,
+      `${prefix}: ${net.join('; ')}${extra}`,
     );
   }
   if (role.length > 0) {

@@ -491,7 +491,9 @@ test('the CI round trip proves a guarded backup, then fails closed after pg_net'
   const dumpAt = sh.indexOf('"$archives/without-net"');
   const createAt = sh.indexOf('create extension if not exists "pg_net"');
   const checkerAt = sh.indexOf('[SCHEDULER_NET_UNSAFE]');
-  const roleAt = sh.indexOf('"[ROLE_UNSAFE]"');
+  const roleAt = sh.indexOf(
+    '"[ROLE_UNSAFE]: role can enter platform schemas: net"',
+  );
   const vaultAt = sh.indexOf('expect_denied "vault.secrets" 42501 ');
   const cronAt = sh.indexOf('expect_denied "cron.job" 42501 ');
   assert.ok(dumpAt !== -1 && createAt > dumpAt);
@@ -565,4 +567,120 @@ test('restore docs defer scheduler activation and do not install pg_net', () => 
   }
   assert.equal(arabic.includes('CREATE EXTENSION'), false);
   assert.equal(arabic.includes('scheduler ready'), false);
+});
+
+test('p2: post-pg_net dump assertion names net and verifies no archive was produced', () => {
+  const sh = readFileSync(
+    new URL('./ci-roundtrip.sh', import.meta.url),
+    'utf8',
+  );
+  const start = sh.indexOf('expect_fail "reader dump after pg_net"');
+  const end = sh.indexOf('step "stack B: empty project"');
+  assert.ok(start !== -1 && end > start);
+  const block = sh.slice(start, end);
+  assert.doesNotMatch(
+    block,
+    /expect_fail "reader dump after pg_net" "\[ROLE_UNSAFE\]"/,
+  );
+  assert.match(
+    block,
+    /expect_fail "reader dump after pg_net" "\[ROLE_UNSAFE\]: role can enter platform schemas: net"/,
+  );
+  assert.match(block, /"\$archives\/after-net"/);
+  assert.match(block, /ls -A "\$archives\/after-net"/);
+});
+
+test('p2: ci-roundtrip binds disposable extension install to the started stack container', () => {
+  const sh = readFileSync(
+    new URL('./ci-roundtrip.sh', import.meta.url),
+    'utf8',
+  );
+  const unsetAt = sh.indexOf('BACKUP_CONFIG_TOML');
+  const setupAt = sh.indexOf('setup_pg_path');
+  const portAt = sh.indexOf('PGPORT=$(guard db-port)');
+  assert.ok(unsetAt !== -1 && unsetAt < setupAt && unsetAt < portAt);
+  assert.match(sh, /unset[^\n]*\bBACKUP_CONFIG_TOML\b/);
+  const installStart = sh.indexOf(
+    'step "stack A: disposable stack installs pg_net',
+  );
+  const checkStart = sh.indexOf('local scheduler_rc=0');
+  assert.ok(installStart !== -1 && checkStart > installStart);
+  const installBlock = sh.slice(installStart, checkStart);
+  assert.match(installBlock, /stack_db_container/);
+  assert.match(
+    installBlock,
+    /docker exec[^\n]*\n[^\n]*psql[^\n]*\n[^\n]*create extension if not exists "pg_cron";/,
+  );
+  assert.match(
+    installBlock,
+    /docker exec[^\n]*\n[^\n]*psql[^\n]*\n[^\n]*create extension if not exists "pg_net";/,
+  );
+  assert.match(sh, /docker inspect/);
+  assert.match(sh, /docker port/);
+});
+
+test('p2: docs state the P7-0 backup workflow pin rollout order before any hosted pg_cron/pg_net install', () => {
+  const backup = readFileSync(
+    new URL('../../docs/BACKUP.md', import.meta.url),
+    'utf8',
+  );
+  const section = backup.slice(
+    backup.indexOf('### Scheduler after the app is usable'),
+    backup.indexOf('\n## CI proof'),
+  );
+  assert.match(section, /pin[^\n]*P7-0/i);
+  assert.match(section, /older pin[^\n]*DRIFT|older pinned[^\n]*DRIFT/i);
+  const runbook = readFileSync(
+    new URL('../../docs/RESTORE-RUNBOOK.md', import.meta.url),
+    'utf8',
+  );
+  const arabic = runbook.slice(
+    runbook.indexOf('## 10.'),
+    runbook.indexOf('## تمرين الاستعادة'),
+  );
+  assert.match(arabic, /P7-0/);
+  assert.match(arabic, /DRIFT/);
+});
+
+test('p3: SCHEDULER_NET_UNSAFE docs and message distinguish missing backup_reader from proven net exposure', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const { query } = database({
+    extensions: ['pg_net'],
+    problems: 'pg_net is installed and backup_reader does not exist',
+  });
+  let thrown = null;
+  try {
+    ensureScheduler({ query, env: loopback });
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown);
+  assert.equal(thrown.code, 'SCHEDULER_NET_UNSAFE');
+  assert.match(thrown.message, /backup_reader does not exist/);
+  assert.doesNotMatch(thrown.message, /exposes request data to backup_reader/);
+
+  const backup = readFileSync(
+    new URL('../../docs/BACKUP.md', import.meta.url),
+    'utf8',
+  );
+  const section = backup.slice(
+    backup.indexOf('### Scheduler after the app is usable'),
+    backup.indexOf('\n## CI proof'),
+  );
+  const reportBlock = section.slice(section.indexOf('Success prints'));
+  assert.match(reportBlock, /backup_reader`? does not exist/);
+
+  const runbook = readFileSync(
+    new URL('../../docs/RESTORE-RUNBOOK.md', import.meta.url),
+    'utf8',
+  );
+  const arabic = runbook.slice(
+    runbook.indexOf('## 10.'),
+    runbook.indexOf('## تمرين الاستعادة'),
+  );
+  const bullet = arabic.slice(
+    arabic.indexOf('- لو الكود `SCHEDULER_NET_UNSAFE`'),
+  );
+  assert.match(bullet, /backup_reader/);
+  assert.match(bullet, /provision-backup-reader\.sql/);
 });
