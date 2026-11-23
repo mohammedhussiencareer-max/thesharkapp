@@ -46,6 +46,11 @@ export type HeldWriteRecord<T = unknown> = {
    */
   readTarget?: string;
   /**
+   * Multiple read targets that must ALL succeed before `posted_reload` clears
+   * (e.g. both a schedule read and a catalog refresh).
+   */
+  readTargets?: string[];
+  /**
    * Activation review reload pin: server confirmed `opening manifest changed`
    * (stored nothing), so the request id is kept but cannot send until a review
    * reload replaces the payload.
@@ -118,9 +123,38 @@ export type PostedReloadSnapshotItem = {
 export type PostedReloadSnapshot = ReadonlyArray<PostedReloadSnapshotItem>;
 
 const KEY_PREFIX = 'theshark:held:v1:';
+const LEGACY_RELOAD_PREFIX = 'theshark:reload:v1:';
 const POSTED_SEGMENT = 'posted:';
 const FALLBACK_PROJECT = 'default';
 const TEST_LOCAL_USER = '__local__';
+
+const RETIRED_REQUESTLESS_KINDS: ReadonlySet<string> = new Set([
+  'item_details',
+  'expense_complete',
+  'expense_category',
+]);
+
+const RETIRED_REQUESTLESS_SUBJECT_PREFIXES = [
+  'item:details:',
+  'expense:complete:',
+  'expense:category:',
+] as const;
+
+function isRetiredRequestlessRecord(record: HeldWriteRecord): boolean {
+  if (record.kind && RETIRED_REQUESTLESS_KINDS.has(record.kind)) {
+    return true;
+  }
+  return RETIRED_REQUESTLESS_SUBJECT_PREFIXES.some((prefix) =>
+    record.subject.startsWith(prefix),
+  );
+}
+
+function legacyReloadMarkerPrefix(
+  userId: string,
+  projectUrl = currentProjectUrl(),
+): string {
+  return `${LEGACY_RELOAD_PREFIX}${encodeURIComponent(projectUrl)}:${encodeURIComponent(userId)}:`;
+}
 
 const VALID_PHASES: ReadonlySet<string> = new Set<HeldWritePhase>([
   'inflight',
@@ -219,23 +253,39 @@ function parseRecord(raw: string): HeldWriteRecord | null {
   if (typeof row.readTarget === 'string' && row.readTarget.length > 0) {
     record.readTarget = row.readTarget;
   }
+  if (Array.isArray(row.readTargets)) {
+    const cleaned = row.readTargets.filter(
+      (item): item is string => typeof item === 'string' && item.length > 0,
+    );
+    if (cleaned.length > 0) {
+      record.readTargets = [...new Set(cleaned)];
+    }
+  }
   if (row.awaitingReviewReload === true) {
     record.awaitingReviewReload = true;
   }
   return record;
 }
 
+function recordTargets(record: HeldWriteRecord): string[] {
+  if (Array.isArray(record.readTargets) && record.readTargets.length > 0) {
+    return record.readTargets;
+  }
+  return record.readTarget !== undefined ? [record.readTarget] : [];
+}
+
 function matchesPostedTarget(
   record: HeldWriteRecord,
   expectedTarget: string | undefined,
 ): boolean {
-  if (record.readTarget === undefined || record.readTarget === '*') {
+  const targets = recordTargets(record);
+  if (targets.length === 0 || targets.includes('*')) {
     return true;
   }
   if (expectedTarget === undefined) {
     return false;
   }
-  return record.readTarget === expectedTarget;
+  return targets.includes(expectedTarget);
 }
 
 export type HeldWriteStoreOptions = {
@@ -489,7 +539,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     userId: string,
     promoteInflightSync: boolean,
   ): string[] {
-    const scopeKey = userStoragePrefix(userId, getProjectUrl());
+    const projectUrl = getProjectUrl();
+    const scopeKey = userStoragePrefix(userId, projectUrl);
     records.clear();
     postedReloads.clear();
     const inflightSubjects: string[] = [];
@@ -499,6 +550,11 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (raw === null) continue;
       const parsed = parseRecord(raw);
       if (!parsed) continue;
+      // Discard orphaned pins left by retired request-less writers in earlier builds.
+      if (isRetiredRequestlessRecord(parsed)) {
+        safeRemoveItem(key);
+        continue;
+      }
       if (parsed.phase === 'posted_reload') {
         postedReloads.set(
           postedMapKey(parsed.subject, parsed.requestId),
@@ -516,6 +572,13 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         }
       }
       records.set(parsed.subject, parsed);
+    }
+
+    // Discard legacy reload markers written by earlier builds for this user scope.
+    for (const key of safeListKeys(
+      legacyReloadMarkerPrefix(userId, projectUrl),
+    )) {
+      safeRemoveItem(key);
     }
 
     return inflightSubjects;
@@ -727,6 +790,11 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     for (const key of safeListKeys(prefix)) {
       safeRemoveItem(key);
     }
+    for (const key of safeListKeys(
+      legacyReloadMarkerPrefix(trimmed, projectUrl),
+    )) {
+      safeRemoveItem(key);
+    }
     if (
       activeUserId() === trimmed &&
       getProjectUrl() === projectUrl &&
@@ -798,7 +866,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const projectUrl = getProjectUrl();
     for (const key of safeListKeys(userStoragePrefix(userId, projectUrl))) {
       const raw = safeReadItem(key);
-      if (raw !== null && parseRecord(raw) !== null) return true;
+      const parsed = raw !== null ? parseRecord(raw) : null;
+      if (parsed !== null && !isRetiredRequestlessRecord(parsed)) return true;
     }
     return false;
   }
@@ -1211,7 +1280,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     subject: string,
     requestId: string,
     phase: HeldWritePhase,
-    phaseOptions?: { readTarget?: string },
+    phaseOptions?: { readTarget?: string; readTargets?: string[] },
   ): void {
     ensureHydrated();
     const userId = activeUserId();
@@ -1238,10 +1307,29 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       payload: phase === 'posted_reload' ? null : preservedPayload,
       phase,
     };
-    if (phase === 'posted_reload' && phaseOptions?.readTarget) {
-      next.readTarget = phaseOptions.readTarget;
-    } else if (phase !== 'posted_reload') {
+    if (phase === 'posted_reload') {
+      const normalizedTargets = [
+        ...new Set(
+          (phaseOptions?.readTargets ?? []).filter(
+            (target) => typeof target === 'string' && target.length > 0,
+          ),
+        ),
+      ];
+      if (normalizedTargets.length > 1) {
+        next.readTargets = normalizedTargets;
+        next.readTarget = normalizedTargets[0];
+      } else if (normalizedTargets.length === 1) {
+        next.readTarget = normalizedTargets[0];
+        delete next.readTargets;
+      } else if (phaseOptions?.readTarget) {
+        next.readTarget = phaseOptions.readTarget;
+        delete next.readTargets;
+      } else {
+        delete next.readTargets;
+      }
+    } else {
       delete next.readTarget;
+      delete next.readTargets;
     }
     if (phase !== 'unknown') {
       delete next.awaitingReviewReload;
@@ -1422,6 +1510,27 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (!matchesPostedTarget(entry, expectedTarget)) {
         continue;
       }
+      const targets = recordTargets(entry);
+      if (
+        expectedTarget !== undefined &&
+        targets.length > 1 &&
+        targets.includes(expectedTarget)
+      ) {
+        const remaining = targets.filter((target) => target !== expectedTarget);
+        const updated: HeldWriteRecord = {
+          ...entry,
+          readTarget: remaining[0],
+        };
+        if (remaining.length > 1) {
+          updated.readTargets = remaining;
+        } else {
+          delete updated.readTargets;
+        }
+        writeRecordToStorage(updated, userId);
+        postedReloads.set(k, updated);
+        changed = true;
+        continue;
+      }
       postedReloads.delete(k);
       removePostedFromStorage(entry.subject, entry.requestId, userId);
       changed = true;
@@ -1433,7 +1542,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   function hasPostedReloadForTarget(target: string): boolean {
     ensureHydrated();
     for (const entry of postedReloads.values()) {
-      if (entry.phase === 'posted_reload' && entry.readTarget === target) {
+      if (
+        entry.phase === 'posted_reload' &&
+        recordTargets(entry).includes(target)
+      ) {
         return true;
       }
     }
@@ -1447,7 +1559,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (
         parsed &&
         parsed.phase === 'posted_reload' &&
-        parsed.readTarget === target
+        recordTargets(parsed).includes(target)
       ) {
         return true;
       }
@@ -1478,7 +1590,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       }
       if (
         filter.readTarget !== undefined &&
-        entry.readTarget !== filter.readTarget
+        !recordTargets(entry).includes(filter.readTarget)
       ) {
         return;
       }

@@ -21,6 +21,7 @@ import type { ExpenseMonth } from '@/expenses/types';
 import {
   createItem,
   currentShiftStart,
+  getItemById,
   listCostingSchedule,
   listItems,
   setItemLoss,
@@ -47,6 +48,7 @@ import { ItemsPage } from '@/pages/ItemsPage';
 vi.mock('@/items/api', () => ({
   ITEMS_RELOAD_SUBJECT: 'items:reload',
   listItems: vi.fn(),
+  getItemById: vi.fn(),
   createItem: vi.fn(),
   updateItem: vi.fn(),
   setItemLoss: vi.fn(),
@@ -126,6 +128,7 @@ describe('P7-3 scope correction: request-less writers outside held-write store',
     setOnline(true);
 
     vi.mocked(listItems).mockResolvedValue([oilItem]);
+    vi.mocked(getItemById).mockResolvedValue(oilItem);
     vi.mocked(currentShiftStart).mockResolvedValue(null);
     vi.mocked(listCostingSchedule).mockResolvedValue({
       lossToken: 'tok-loss-1',
@@ -325,12 +328,13 @@ describe('P7-3 scope correction: request-less writers outside held-write store',
     expView.unmount();
   });
 
-  it('Rules 3 & 4 (ItemsPage): ambiguous updateItem shows "مش متأكد إنه اتحفظ", reads catalog, offers read-only "تحقق تاني" on read failure, unlocks after read succeeds, never writes localStorage, never auto-replays', async () => {
+  it('Rules 3 & 4 (ItemsPage): ambiguous updateItem shows "مش متأكد إنه اتحفظ", reads affected item by ID, offers read-only "تحقق تاني" on read failure, unlocks after read succeeds, never writes localStorage, never auto-replays', async () => {
     vi.mocked(listItems)
       .mockResolvedValueOnce([oilItem])
-      .mockRejectedValueOnce(new Error('catalog read down'))
-      .mockResolvedValueOnce([{ ...oilItem, name: 'زيت' }])
       .mockResolvedValueOnce([{ ...oilItem, name: 'زيت جديد' }]);
+    vi.mocked(getItemById)
+      .mockRejectedValueOnce(new Error('item read down'))
+      .mockResolvedValueOnce({ ...oilItem, name: 'زيت' });
     vi.mocked(updateItem)
       .mockRejectedValueOnce(new Error('network lost'))
       .mockResolvedValueOnce(undefined);
@@ -359,10 +363,10 @@ describe('P7-3 scope correction: request-less writers outside held-write store',
     expect(hasAnyHeldWrite()).toBe(false);
     expect(updateItem).toHaveBeenCalledTimes(1);
 
-    // Clicking "تحقق تاني" performs a READ ONLY (no replay of updateItem).
+    // Clicking "تحقق تاني" performs a READ ONLY by ID (no replay of updateItem).
     fireEvent.click(retryReadBtn);
     await waitFor(() => {
-      expect(listItems).toHaveBeenCalledTimes(3);
+      expect(getItemById).toHaveBeenCalledTimes(2);
     });
     expect(updateItem).toHaveBeenCalledTimes(1);
     expect(
@@ -391,8 +395,8 @@ describe('P7-3 scope correction: request-less writers outside held-write store',
     // Unmount/remount after an ambiguous failure leaves ZERO persisted state (page memory only).
     vi.mocked(listItems)
       .mockResolvedValueOnce([oilItem])
-      .mockRejectedValueOnce(new Error('read failed'))
       .mockResolvedValueOnce([oilItem]);
+    vi.mocked(getItemById).mockRejectedValueOnce(new Error('read failed'));
     vi.mocked(updateItem).mockRejectedValueOnce(new Error('network lost'));
     const view2 = render(
       <MemoryRouter>

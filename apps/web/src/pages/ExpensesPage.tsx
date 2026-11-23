@@ -183,7 +183,8 @@ export function ExpensesPage() {
     categoryVerify,
   );
   const dataSessionRef = useRef<WriteSession | null>(null);
-  const seqRef = useRef(0);
+  const monthSeqRef = useRef(new Map<string, number>());
+  const globalReadSeqRef = useRef(0);
   const readsRef = useRef(0);
   const savingRef = useRef(false);
   const needsReloadRef = useRef(false);
@@ -341,51 +342,82 @@ export function ExpensesPage() {
       !visibleEntries.some((line) => line.id === pin.id && !line.voided),
   );
 
-  async function readMonth(monthValue: string): Promise<ExpenseMonth | null> {
-    const seq = ++seqRef.current;
-    const readSession = captureWriteSession();
-    readsRef.current += 1;
-    setReadLoads(readsRef.current);
-    try {
-      const next = await loadExpenseMonth(`${monthValue}-01`);
-      if (seq !== seqRef.current) return null;
-      dataSessionRef.current = readSession;
-      return next;
-    } catch (error) {
-      if (seq !== seqRef.current) return null;
-      throw error;
-    } finally {
-      readsRef.current -= 1;
-      setReadLoads(readsRef.current);
-    }
-  }
+  const nextMonthSeq = useCallback((targetMonth: string): number => {
+    const next = (monthSeqRef.current.get(targetMonth) ?? 0) + 1;
+    monthSeqRef.current.set(targetMonth, next);
+    return next;
+  }, []);
 
-  async function readExactMonth(targetMonth: string): Promise<ExpenseMonth> {
-    const readSession = captureWriteSession();
-    readsRef.current += 1;
-    setReadLoads(readsRef.current);
-    try {
-      const next = await loadExpenseMonth(targetMonth);
-      dataSessionRef.current = readSession;
-      return next;
-    } finally {
-      readsRef.current -= 1;
+  const isLatestMonthSeq = useCallback(
+    (targetMonth: string, seq: number): boolean =>
+      monthSeqRef.current.get(targetMonth) === seq,
+    [],
+  );
+
+  type MonthReadResult = {
+    data: ExpenseMonth;
+    monthSeq: number;
+    globalSeq: number;
+    readSession: WriteSession | null;
+  };
+
+  /**
+   * Single read path for all expense-month reads (regular navigation, post-write
+   * reloads, and request-less verification). Uses a per-month sequence so an
+   * older read for a month can never overwrite a newer read for that same month.
+   */
+  const readExpenseMonthTarget = useCallback(
+    async (targetMonth: string): Promise<MonthReadResult | null> => {
+      const monthSeq = nextMonthSeq(targetMonth);
+      const globalSeq = ++globalReadSeqRef.current;
+      const readSession = captureWriteSession();
+      readsRef.current += 1;
       setReadLoads(readsRef.current);
+      try {
+        const next = await loadExpenseMonth(targetMonth);
+        if (!isLatestMonthSeq(targetMonth, monthSeq)) return null;
+        return { data: next, monthSeq, globalSeq, readSession };
+      } catch (error) {
+        if (!isLatestMonthSeq(targetMonth, monthSeq)) return null;
+        throw error;
+      } finally {
+        readsRef.current -= 1;
+        setReadLoads(readsRef.current);
+      }
+    },
+    [isLatestMonthSeq, nextMonthSeq],
+  );
+
+  async function readMonth(monthValue: string): Promise<ExpenseMonth | null> {
+    const targetMonth = `${monthValue}-01`;
+    const result = await readExpenseMonthTarget(targetMonth);
+    if (!result || result.data.monthStart !== `${monthRef.current}-01`) {
+      return null;
     }
+    dataSessionRef.current = result.readSession;
+    return result.data;
   }
 
   useEffect(() => {
     let cancelled = false;
+    const displayedMonthStart = `${month}-01`;
     const pendingReloads = snapshotExpensePostedReloads();
     void (async () => {
       try {
-        const next = await readMonth(month);
-        if (cancelled || !next) return;
-        setData(next);
+        const result = await readExpenseMonthTarget(displayedMonthStart);
+        if (
+          cancelled ||
+          !result ||
+          result.data.monthStart !== `${monthRef.current}-01`
+        ) {
+          return;
+        }
+        dataSessionRef.current = result.readSession;
+        setData(result.data);
         setLoadError(null);
-        reconcileCommittedVoids(next.entries);
-        reconcileRequestlessVerifyOnMonth(next);
-        clearPostedReloadSnapshot(pendingReloads, next.monthStart);
+        reconcileCommittedVoids(result.data.entries);
+        reconcileRequestlessVerifyOnMonth(result.data);
+        clearPostedReloadSnapshot(pendingReloads, result.data.monthStart);
         needsReloadRef.current = false;
         setLocalNeedsReload(false);
       } catch (error) {
@@ -396,7 +428,12 @@ export function ExpensesPage() {
     return () => {
       cancelled = true;
     };
-  }, [month, loadId, reconcileRequestlessVerifyOnMonth]);
+  }, [
+    month,
+    loadId,
+    readExpenseMonthTarget,
+    reconcileRequestlessVerifyOnMonth,
+  ]);
 
   function retry() {
     if (savingRef.current || readsRef.current > 0 || !isOnline()) return;
@@ -437,8 +474,18 @@ export function ExpensesPage() {
     setVerify({ targetMonth, status: 'verifying', readError: null });
     const pendingReloads = snapshotExpensePostedReloads();
     try {
-      const fresh = await readExactMonth(targetMonth);
+      const result = await readExpenseMonthTarget(targetMonth);
+      // Discard superseded reads so an older verification cannot overwrite newer month data or unlock writes from stale data.
+      if (!result) return;
+      if (
+        kind === 'category' &&
+        result.globalSeq !== globalReadSeqRef.current
+      ) {
+        return;
+      }
+      const fresh = result.data;
       if (fresh.monthStart === `${monthRef.current}-01`) {
+        dataSessionRef.current = result.readSession;
         setData(fresh);
         setLoadError(null);
         reconcileCommittedVoids(fresh.entries);
@@ -495,15 +542,18 @@ export function ExpensesPage() {
       setLocalNeedsReload(true);
       try {
         const pendingReloads = snapshotExpensePostedReloads();
-        const next = await readExactMonth(targetMonth);
-        if (next.monthStart === `${monthRef.current}-01`) {
-          setData(next);
-          setLoadError(null);
-          reconcileCommittedVoids(next.entries);
+        const result = await readExpenseMonthTarget(targetMonth);
+        if (result) {
+          if (result.data.monthStart === `${monthRef.current}-01`) {
+            dataSessionRef.current = result.readSession;
+            setData(result.data);
+            setLoadError(null);
+            reconcileCommittedVoids(result.data.entries);
+          }
+          clearPostedReloadSnapshot(pendingReloads, result.data.monthStart);
+          needsReloadRef.current = false;
+          setLocalNeedsReload(false);
         }
-        clearPostedReloadSnapshot(pendingReloads, next.monthStart);
-        needsReloadRef.current = false;
-        setLocalNeedsReload(false);
       } catch (readError) {
         setLoadError(messageFrom(readError));
       }
@@ -518,8 +568,17 @@ export function ExpensesPage() {
       setVerify({ targetMonth, status: 'verifying', readError: null });
       const pendingReloads = snapshotExpensePostedReloads();
       try {
-        const fresh = await readExactMonth(targetMonth);
+        const result = await readExpenseMonthTarget(targetMonth);
+        if (!result) return false;
+        if (
+          kind === 'category' &&
+          result.globalSeq !== globalReadSeqRef.current
+        ) {
+          return false;
+        }
+        const fresh = result.data;
         if (fresh.monthStart === `${monthRef.current}-01`) {
+          dataSessionRef.current = result.readSession;
           setData(fresh);
           setLoadError(null);
           reconcileCommittedVoids(fresh.entries);

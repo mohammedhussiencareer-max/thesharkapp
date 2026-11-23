@@ -14,6 +14,7 @@ import {
   clearPostedReloadSnapshot,
   getHeldWrite,
   hasDurableHeldWrite,
+  hasPostedReload,
   listHeldWritesByPrefix,
   resetHeldWritesStore,
   setHeldWritePhase,
@@ -25,6 +26,9 @@ import {
   type WriteSession,
 } from '@/lib/held-writes';
 import { isPayloadRefusal } from '@/lib/write-outcome';
+
+/** Shared readTarget for catalog-level post-write refreshes on ItemsPage. */
+export const ITEMS_RELOAD_SUBJECT = 'items:reload';
 
 /** Shown while the last save for a subject might already be stored. */
 export const unknownSaveMessage = 'آخر حفظ مش متأكد إنه اتسجل';
@@ -295,16 +299,32 @@ export function abortActionBeforeDispatch(
 }
 
 /**
- * Move a confirmed RPC write to `posted_reload` until its post-write read
- * covering `readTarget` succeeds. Throws `HeldWriteStorageError` (keeping the
- * old durable record intact) if storage cannot persist the replacement.
+ * Move a confirmed RPC write to `posted_reload` until its post-write read(s)
+ * covering `readTarget` (or every target in `readTarget`) succeed. Throws
+ * `HeldWriteStorageError` (keeping the old durable record intact) if storage
+ * cannot persist the replacement.
  */
 export function markActionPostedReload(
   subject: string,
   requestId: string,
-  readTarget: string,
+  readTarget: string | readonly string[],
 ): void {
-  setHeldWritePhase(subject, requestId, 'posted_reload', { readTarget });
+  if (typeof readTarget === 'string') {
+    setHeldWritePhase(subject, requestId, 'posted_reload', { readTarget });
+    return;
+  }
+  setHeldWritePhase(subject, requestId, 'posted_reload', {
+    readTargets: [...readTarget],
+  });
+}
+
+/** True while `(subject, requestId)` holds a `posted_reload` pin. */
+export function hasActionPostedReload(
+  subject: string,
+  readTarget?: string,
+  requestId?: string,
+): boolean {
+  return hasPostedReload(subject, readTarget, requestId);
 }
 
 /** Clear a `posted_reload` pin only after a read covering `readTarget` (and matching `requestId` when supplied) succeeds. */

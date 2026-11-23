@@ -39,6 +39,7 @@ import {
   createSubject,
   firstUnknownItemCreate,
   hasAction,
+  hasActionPostedReload,
   hasDurableAction,
   hasItemConfigurationAction,
   lossSubject,
@@ -439,7 +440,9 @@ export function ItemForm({
         return;
       }
       saved = true;
-      markActionPostedReload(subject, requestId, subject);
+      if (!hasActionPostedReload(subject, undefined, requestId)) {
+        markActionPostedReload(subject, requestId, subject);
+      }
       releaseLock();
       releaseLock = () => {};
       setDatedLoss(false);

@@ -29,10 +29,10 @@ import {
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
-  clearActionPostedReloadSnapshot,
   conversionSubject,
   hasAction,
   hasDurableAction,
+  ITEMS_RELOAD_SUBJECT,
   listUnknownConversionsForItem,
   markActionPostedReload,
   settleAction,
@@ -478,7 +478,9 @@ export function ConversionsPanel({
         requestId,
         () => false,
       );
-      clearActionPostedReloadSnapshot(pendingReloads);
+      for (const entry of pendingReloads) {
+        clearActionPostedReload(entry.subject, entry.subject, entry.requestId);
+      }
       return true;
     } catch (error) {
       await failLoad(item.id, error, requestId, () => false);
@@ -510,7 +512,13 @@ export function ConversionsPanel({
           requestId,
           () => cancelled,
         );
-        clearActionPostedReloadSnapshot(pendingReloads);
+        for (const entry of pendingReloads) {
+          clearActionPostedReload(
+            entry.subject,
+            entry.subject,
+            entry.requestId,
+          );
+        }
       } catch (error) {
         await failLoad(item.id, error, requestId, () => cancelled);
       }
@@ -722,7 +730,11 @@ export function ConversionsPanel({
           try {
             await perform(action, session);
             saved = true;
-            markActionPostedReload(subject, requestId, subject);
+            markActionPostedReload(
+              subject,
+              requestId,
+              onConversionSaved ? [subject, ITEMS_RELOAD_SUBJECT] : subject,
+            );
             clearSubmittedAdd(action);
           } catch (error) {
             if (

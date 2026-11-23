@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import * as itemsApi from '@/items/api';
 import {
   addConversion,
   addCustomUnit,
@@ -15,6 +16,7 @@ import {
 } from '@/items/api';
 import type { ItemExpectation } from '@/items/expectation';
 import {
+  ConfirmedRefusalError,
   CostingChangedError,
   costingChangedMessage,
   StaleWriteError,
@@ -785,6 +787,68 @@ describe('catalog api', () => {
     );
     expect(rpc.mock.calls[3]?.[1]).toEqual(
       expect.objectContaining({ p_code: 'a', p_label_ar: 'b:c' }),
+    );
+  });
+
+  it('R8-4b: getItemById fetches a single stock item by id and updateItem preserves SQLSTATE 23505 on duplicate-name error', async () => {
+    const getItemById = (
+      itemsApi as { getItemById?: (id: string) => Promise<unknown> }
+    ).getItemById;
+    expect(typeof getItemById).toBe('function');
+
+    const found = query({
+      data: {
+        id: 'oil',
+        name: 'زيت',
+        kind: 'ingredient',
+        base_unit: 'liter',
+        count_frequency: 'daily',
+        parent_item_id: null,
+        active: true,
+        item_balances: {
+          on_hand_qty: '10',
+          avg_cost: '50',
+          on_hand_value: '500',
+        },
+        item_loss_versions: [],
+        item_conversion_versions: [],
+        item_opening_prices: [],
+      },
+      error: null,
+    });
+    const missing = query({ data: null, error: null });
+    const dupUpdate = query({
+      data: null,
+      error: {
+        code: '23505',
+        message: 'duplicate key value violates unique constraint',
+      },
+    });
+    let fromCall = 0;
+    mocks.schema.mockReturnValue({
+      from() {
+        fromCall += 1;
+        if (fromCall === 1) return found.chain;
+        if (fromCall === 2) return missing.chain;
+        return dupUpdate.chain;
+      },
+    });
+
+    await expect(getItemById!('oil')).resolves.toMatchObject({
+      id: 'oil',
+      name: 'زيت',
+      baseUnit: 'liter',
+    });
+    expect(found.captured.filters).toEqual([
+      { op: 'eq', column: 'id', value: 'oil' },
+    ]);
+    await expect(getItemById!('missing-id')).resolves.toBeNull();
+
+    await expect(updateItem('oil', draft, expectedItem)).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof ConfirmedRefusalError &&
+        error.message === 'الاسم ده موجود قبل كده' &&
+        (error as { code?: string }).code === '23505',
     );
   });
 });

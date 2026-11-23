@@ -23,9 +23,17 @@ export class StaleWriteError extends Error {
 
 /** The server refused this payload and its request id stored nothing. */
 export class ConfirmedRefusalError extends Error {
-  constructor(message: string) {
-    super(message);
+  readonly code?: string;
+
+  constructor(message: string, options?: { code?: string; cause?: unknown }) {
+    super(
+      message,
+      options?.cause !== undefined ? { cause: options.cause } : undefined,
+    );
     this.name = 'ConfirmedRefusalError';
+    if (options?.code) {
+      this.code = options.code;
+    }
   }
 }
 
