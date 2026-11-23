@@ -405,6 +405,70 @@ describe('firestoreFetch', () => {
     ).rejects.toThrow(invalid);
   });
 
+  it('rejects a transaction whose parent shift is not the shift that was requested', async () => {
+    const prefix = 'projects/thesharkrestaurant/databases/(default)/documents';
+    const same = {
+      name: `${prefix}/custody_shifts/shift-test-1/transactions/tx-test-1`,
+      fields: {},
+    };
+    const other = {
+      name: `${prefix}/custody_shifts/shift-test-other/transactions/tx-test-2`,
+      fields: {},
+    };
+    await expect(
+      createPosFirestore('test-token', async () =>
+        jsonResponse({ documents: [same, other] }),
+      ).listShiftTransactions('shift-test-1', { pageSize: 2 }),
+    ).rejects.toThrow(/^Firestore read failed: invalid response$/);
+    await expect(
+      createPosFirestore('test-token', async () =>
+        jsonResponse({ documents: [same], nextPageToken: 'tx-page-2' }),
+      ).listShiftTransactions('shift-test-1', { pageSize: 1 }),
+    ).resolves.toEqual({
+      documents: [same],
+      nextPageToken: 'tx-page-2',
+    });
+  });
+
+  it('validates queryOrders against the collection serialized before the request', async () => {
+    const body = {
+      structuredQuery: {
+        from: [{ collectionId: 'orders' }],
+        limit: 1,
+      },
+    };
+    const orderDoc = {
+      name: 'projects/thesharkrestaurant/databases/(default)/documents/orders/order-test-1',
+      updateTime: '2026-10-15T12:00:00Z',
+      fields: {},
+    };
+    const from = body.structuredQuery.from[0];
+    if (from === undefined) {
+      throw new Error('expected a from clause');
+    }
+    let sent = '';
+    const docs = await createPosFirestore('test-token', async (_url, init) => {
+      if (typeof init.body !== 'string') {
+        throw new Error('expected a serialized query body');
+      }
+      sent = init.body;
+      from.collectionId = 'custody_shifts';
+      return jsonResponse([
+        { document: orderDoc, readTime: '2026-10-16T00:00:00Z' },
+      ]);
+    }).queryOrders(body);
+    expect(from.collectionId).toBe('custody_shifts');
+    expect(sent).toBe(
+      JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: 'orders' }],
+          limit: 1,
+        },
+      }),
+    );
+    expect(docs).toEqual([orderDoc]);
+  });
+
   it('hides error bodies and treats 404 as a missing shift', async () => {
     const missing = createPosFirestore(
       'test-token',

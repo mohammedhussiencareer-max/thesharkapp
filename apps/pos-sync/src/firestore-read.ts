@@ -622,14 +622,28 @@ async function googleFetch(
   return fetch(input, init);
 }
 
-export async function firestoreFetch(
+function snapshotJson(body: unknown): { serialized: string; value: unknown } {
+  try {
+    const text = JSON.stringify(body);
+    if (typeof text !== 'string') {
+      throw new Error('Firestore read refused');
+    }
+    return { serialized: text, value: JSON.parse(text) as unknown };
+  } catch (error) {
+    if (error instanceof Error && error.message === 'Firestore read refused') {
+      throw error;
+    }
+    throw new Error('Firestore read refused', { cause: error });
+  }
+}
+
+async function readFirestoreResponse(
   method: 'GET' | 'POST',
   url: string,
   token: string,
-  body: unknown,
-  fetchImpl: FetchLike = googleFetch,
+  requestBody: string | undefined,
+  fetchImpl: FetchLike,
 ): Promise<unknown> {
-  assertFirestoreReadAllowed(method, url, body);
   let response: Response;
   try {
     response = await fetchImpl(url, {
@@ -639,7 +653,7 @@ export async function firestoreFetch(
         Authorization: `Bearer ${token}`,
         ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
       },
-      body: method === 'POST' ? JSON.stringify(body) : undefined,
+      body: requestBody,
     });
   } catch {
     throw new Error('Firestore read failed: network');
@@ -657,6 +671,35 @@ export async function firestoreFetch(
   } catch {
     throw new Error('Firestore read failed: invalid response');
   }
+}
+
+export async function firestoreFetch(
+  method: 'GET' | 'POST',
+  url: string,
+  token: string,
+  body: unknown,
+  fetchImpl: FetchLike = googleFetch,
+): Promise<unknown> {
+  assertFirestoreReadAllowed(method, url, body);
+  let requestBody: string | undefined;
+  if (method === 'POST') {
+    try {
+      const text = JSON.stringify(body);
+      if (typeof text !== 'string') {
+        throw new Error('Firestore read failed: network');
+      }
+      requestBody = text;
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === 'Firestore read failed: network'
+      ) {
+        throw error;
+      }
+      throw new Error('Firestore read failed: network', { cause: error });
+    }
+  }
+  return readFirestoreResponse(method, url, token, requestBody, fetchImpl);
 }
 
 export function createPosFirestore(
@@ -682,7 +725,13 @@ export function createPosFirestore(
         undefined,
         fetchImpl,
       );
-      return parseListResponse(payload, 'transactions');
+      const page = parseListResponse(payload, 'transactions');
+      for (const document of page.documents) {
+        if (splitTransactionName(document.name).shiftId !== shiftId) {
+          throw new Error('Firestore read failed: invalid response');
+        }
+      }
+      return page;
     },
     async getShift(id) {
       try {
@@ -705,14 +754,18 @@ export function createPosFirestore(
       }
     },
     async queryOrders(body) {
-      const payload = await firestoreFetch(
+      const snapshot = snapshotJson(body);
+      const url = firestoreRunQueryUrl();
+      assertFirestoreReadAllowed('POST', url, snapshot.value);
+      const collection = requestedQueryCollection(snapshot.value);
+      const payload = await readFirestoreResponse(
         'POST',
-        firestoreRunQueryUrl(),
+        url,
         token,
-        body,
+        snapshot.serialized,
         fetchImpl,
       );
-      return parseRunQueryResponse(payload, requestedQueryCollection(body));
+      return parseRunQueryResponse(payload, collection);
     },
   };
 }

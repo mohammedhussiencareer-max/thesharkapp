@@ -214,6 +214,9 @@ function readSharedOptionGroupIds(raw: unknown): string[] {
   const labels = new Set<string>();
   const ids = new Set<string>();
   // Exact keys. Trimming would treat distinct labels as one group and reject the item.
+  // Firestore map keys are unique, so byte-identical duplicate labels cannot
+  // occur in a Firestore document; this duplicate check is only a defensive
+  // guard for non-Firestore input.
   for (const [label, rawGroupId] of Object.entries(mapFields)) {
     if (label.length === 0 || RESERVED_KEYS.has(label)) {
       throw new MalformedCatalogFieldError('invalid shared option label');
@@ -244,8 +247,10 @@ function readOptionValues(raw: unknown): string[] {
 /**
  * Preserves every inline option group on the item (including copies of shared
  * groups) so item-scoped option subjects remain available even when the text
- * matches a global option group value. Labels stay exactly as stored; only a
- * byte-identical label is a duplicate.
+ * matches a global option group value. Labels stay exactly as stored.
+ * Firestore map keys are unique, so byte-identical duplicate labels cannot
+ * occur in a Firestore document; the duplicate check is only a defensive
+ * guard for non-Firestore input.
  */
 function readItemOptionGroups(raw: unknown): Record<string, string[]> {
   if (raw === undefined || isNullValue(raw)) {
