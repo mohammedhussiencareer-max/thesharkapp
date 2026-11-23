@@ -150,14 +150,62 @@ export class BackupError extends Error {
   }
 }
 
-// Server text may be printed only by the synthetic round trip against a
-// loopback database. Every other run prints fixed messages and SQLSTATE codes.
+// Hosts named by a postgres URI in a connection variable. libpq uses that host
+// ahead of PGHOST when the value is a URI.
+function connectionUriHosts(value) {
+  const hosts = [];
+  const pattern =
+    /postgres(?:ql)?:\/\/(?:[^@/?#\s]*@)?(\[[^\]]+\]|[^:/?#\s]+)/gi;
+  for (const match of String(value ?? '').matchAll(pattern)) {
+    hosts.push(match[1]);
+  }
+  return hosts;
+}
+
+// The synthetic gate is the address 127.0.0.1, not a hostname. "localhost"
+// stays off: the round-trip test treats it as a production path.
+function diagnosticHost(raw) {
+  let host = String(raw ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\.$/, '');
+  if (host.startsWith('[') && host.endsWith(']')) {
+    host = host.slice(1, -1);
+  }
+  return host === '127.0.0.1';
+}
+
+// Server text may be printed only by the synthetic round trip. Every effective
+// host has to be 127.0.0.1: libpq prefers PGHOSTADDR over PGHOST, and a
+// service or a URI can name another host. An unset host is not accepted.
 export function diagnosticsAllowed(env = process.env) {
-  return (
-    env.BACKUP_SYNTHETIC_DIAGNOSTICS === '1' &&
-    env.BACKUP_ALLOW_LOOPBACK === '1' &&
-    env.PGHOST === '127.0.0.1'
-  );
+  if (
+    env.BACKUP_SYNTHETIC_DIAGNOSTICS !== '1' ||
+    env.BACKUP_ALLOW_LOOPBACK !== '1'
+  ) {
+    return false;
+  }
+  const hosts = [];
+  for (const key of ['PGHOSTADDR', 'PGHOST']) {
+    const value = env[key];
+    if (value !== undefined && value !== '') {
+      hosts.push(...String(value).split(','));
+    }
+  }
+  if (hosts.length === 0 || !hosts.every(diagnosticHost)) {
+    return false;
+  }
+  for (const key of ['PGDATABASE', 'DATABASE_URL']) {
+    for (const host of connectionUriHosts(env[key])) {
+      if (!diagnosticHost(host)) {
+        return false;
+      }
+    }
+  }
+  if (env.PGSERVICE) {
+    return false;
+  }
+  return true;
 }
 
 export function formatError(error, env = process.env) {

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
 import { test } from 'node:test';
 
 const loopback = {
@@ -219,6 +221,139 @@ test('an unsafe target is refused before any query', async () => {
     { code: 'SERVICE_FORBIDDEN' },
   );
   assert.deepEqual(calls, []);
+});
+
+test('the validated connection env is the env used for every query', async () => {
+  const bin = mkdtempSync(join(tmpdir(), 'pgbin-'));
+  const untouchedPath = join(tmpdir(), 'not-pg');
+  try {
+    const { ensureScheduler } = await loadScheduler();
+    const env = {
+      PGHOST: 'aws-0-eu-central-1.pooler.supabase.com',
+      PGUSER: 'postgres.example',
+      PGPASSWORD: 'synthetic-password',
+      PGDATABASE: 'postgres',
+      PGSSLMODE: 'verify-full',
+      BACKUP_RESTORE_CONFIRM: 'RESTORE-INTO-EMPTY-PROJECT',
+      BACKUP_PG_BIN: bin,
+      PATH: untouchedPath,
+      BACKUP_ENV_MARK: 'scheduler-connection',
+    };
+    const { query, calls } = scriptedQuery([
+      lines(['pg_cron', 'pg_net']),
+      lines(['pg_cron', 'pg_net']),
+      lines(['cron', 'net']),
+    ]);
+    ensureScheduler({ query, env });
+    assert.ok(calls.length >= 3);
+    for (const call of calls) {
+      assert.equal(call.env, calls[0].env);
+      assert.equal(call.env.BACKUP_ENV_MARK, 'scheduler-connection');
+      assert.equal(call.env.PGSSLMODE, 'verify-full');
+      assert.equal(call.env.PGPASSWORD, 'synthetic-password');
+      assert.equal(call.env.PATH.split(delimiter)[0], bin);
+    }
+    assert.equal(env.PATH, untouchedPath);
+  } finally {
+    rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+test('unset PGSSLMODE on a remote host is refused', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const calls = [];
+  assert.throws(
+    () =>
+      ensureScheduler({
+        query: (call) => {
+          calls.push(call);
+          return '';
+        },
+        env: {
+          PGHOST: 'aws-0-eu-central-1.pooler.supabase.com',
+          PGUSER: 'postgres.example',
+          PGPASSWORD: 'synthetic-password',
+          PGDATABASE: 'postgres',
+          BACKUP_RESTORE_CONFIRM: 'RESTORE-INTO-EMPTY-PROJECT',
+        },
+      }),
+    { code: 'SSLMODE_WEAK' },
+  );
+  assert.equal(calls.length, 0);
+});
+
+test('the CI round trip installs the scheduler on the real stack', () => {
+  const sh = readFileSync(
+    new URL('./ci-roundtrip.sh', import.meta.url),
+    'utf8',
+  );
+  assert.match(sh, /node "\$here\/ensure-scheduler\.mjs"/);
+  assert.doesNotMatch(sh, /42501\|3F000\|42P01/);
+  assert.match(sh, /expect_denied "cron\.job" 42501 /);
+  assert.match(sh, /expect_denied "vault\.secrets" 42501 /);
+  assert.match(sh, /to_regclass\('cron\.job'\)/);
+  assert.match(sh, /to_regclass\('net\.http_request_queue'\)/);
+  assert.match(sh, /to_regclass\('vault\.secrets'\)/);
+  assert.match(sh, /pg_restore -l/);
+  assert.match(sh, /scheduler_secret_and_job/);
+  assert.doesNotMatch(sh, /cron\.schedule/);
+  assert.match(sh, /\[ROLE_UNSAFE\]/);
+  assert.match(sh, /select count\(\*\) from net\.http_request_queue/);
+  const blocked = sh.indexOf('if scheduler_secret_and_job; then');
+  const install = sh.indexOf('node "$here/ensure-scheduler.mjs"');
+  const opened = sh.indexOf(
+    'scheduler_secret_and_job || fail SCHEDULER_GATE',
+    install,
+  );
+  assert.ok(blocked !== -1 && blocked < install);
+  assert.ok(opened > install);
+});
+
+test('restore docs run the scheduler from current main, in order', () => {
+  const backup = readFileSync(
+    new URL('../../docs/BACKUP.md', import.meta.url),
+    'utf8',
+  );
+  const schedulerAt = backup.indexOf('### Scheduler after the app is usable');
+  const ciAt = backup.indexOf('\n## CI proof');
+  assert.ok(schedulerAt !== -1 && ciAt > schedulerAt);
+  const section = backup.slice(schedulerAt, ciAt);
+  let at = -1;
+  for (const marker of [
+    'Confirm the installed app is reading the restored data',
+    'checkout of current `main`',
+    'ensure-scheduler.mjs',
+    'BACKUP_PG_BIN',
+    'defines the job name and the function path',
+    'Redeploy the Edge Function',
+    'function secrets and the Vault secrets',
+    'Schedule the job',
+    '* * * * *',
+  ]) {
+    const next = section.indexOf(marker, at + 1);
+    assert.ok(next > at, marker);
+    at = next;
+  }
+  assert.equal(backup.includes('install the scheduler extensions'), false);
+  const runbook = readFileSync(
+    new URL('../../docs/RESTORE-RUNBOOK.md', import.meta.url),
+    'utf8',
+  );
+  const arabic = runbook.slice(runbook.indexOf('## 10.'));
+  at = -1;
+  for (const marker of [
+    'checkout لـ `main` الحالي',
+    'BACKUP_PG_BIN',
+    'ensure-scheduler.mjs',
+    'اسم الوظيفة ومسار الدالة',
+    'انشر دالة الـ Edge',
+    'أسرار Vault',
+    '* * * * *',
+  ]) {
+    const next = arabic.indexOf(marker, at + 1);
+    assert.ok(next > at, marker);
+    at = next;
+  }
 });
 
 test('the scheduler script never mentions vault, cron.schedule, or cron.job', async () => {

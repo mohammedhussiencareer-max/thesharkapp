@@ -1,4 +1,12 @@
-import { BackupError, checkRestoreTarget, isMain, runCli } from './config.mjs';
+import { statSync } from 'node:fs';
+import { delimiter as pathDelimiter } from 'node:path';
+import {
+  BackupError,
+  checkRestoreTarget,
+  classifyTarget,
+  isMain,
+  runCli,
+} from './config.mjs';
 import { runPsql } from './psql.mjs';
 
 // Creates pg_cron and pg_net when they are missing, then checks that both
@@ -48,20 +56,56 @@ function assertReady({ extensions, schemas }) {
   }
 }
 
+const VERIFIED_TLS = new Set(['verify-full', 'verify-ca']);
+
+function clientDirectory(path) {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// One copy of the connection settings. Remote runs need the confirm phrase and
+// an explicit verified TLS mode: an unset PGSSLMODE is not verify-full here,
+// because the client would otherwise use its own default. The copy is what
+// every query receives, including the client directory on PATH.
+function connectionEnv(env) {
+  const connection = { ...env };
+  checkRestoreTarget(connection);
+  if (
+    !classifyTarget(connection).allLoopback &&
+    !VERIFIED_TLS.has(connection.PGSSLMODE)
+  ) {
+    throw new BackupError(
+      'SSLMODE_WEAK',
+      'a non-loopback host requires PGSSLMODE=verify-full or verify-ca',
+    );
+  }
+  const bin = connection.BACKUP_PG_BIN;
+  if (typeof bin === 'string' && bin !== '' && clientDirectory(bin)) {
+    const pathKey =
+      Object.keys(connection).find((name) => name.toLowerCase() === 'path') ??
+      'PATH';
+    const current = connection[pathKey] ?? '';
+    connection[pathKey] = current ? `${bin}${pathDelimiter}${current}` : bin;
+  }
+  return connection;
+}
+
 export function ensureScheduler({ query = runPsql, env = process.env } = {}) {
-  checkRestoreTarget(env);
-  const installed = readNames(query({ sql: EXTENSIONS_SQL, code: QUERY_CODE }));
+  const connection = connectionEnv(env);
+  const ask = (sql) => query({ sql, code: QUERY_CODE, env: connection });
+  const installed = readNames(ask(EXTENSIONS_SQL));
   const created = [];
   for (const name of SCHEDULER_EXTENSIONS) {
     if (!installed.includes(name)) {
-      query({ sql: CREATE_SQL[name], code: QUERY_CODE });
+      ask(CREATE_SQL[name]);
       created.push(name);
     }
   }
-  const extensions = readNames(
-    query({ sql: EXTENSIONS_SQL, code: QUERY_CODE }),
-  );
-  const schemas = readNames(query({ sql: SCHEMAS_SQL, code: QUERY_CODE }));
+  const extensions = readNames(ask(EXTENSIONS_SQL));
+  const schemas = readNames(ask(SCHEMAS_SQL));
   assertReady({ extensions, schemas });
   return { created };
 }

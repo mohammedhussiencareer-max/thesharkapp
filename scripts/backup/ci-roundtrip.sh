@@ -234,6 +234,21 @@ expect_reader_count() {
   info "allowed ok: $label"
 }
 
+# True when both scheduler extensions and their schemas exist.
+scheduler_installed() {
+  local ready
+  ready=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c \
+    "select (select count(*) from pg_catalog.pg_extension where extname in ('pg_cron', 'pg_net')) = 2 and (select count(*) from pg_catalog.pg_namespace where nspname in ('cron', 'net')) = 2")
+  [ "$ready" = t ]
+}
+
+# Stands in for secret entry and job creation. CI has no secret and this
+# revision has no committed job name, so the step cannot write either one.
+# It is refused until both extensions exist, and it never creates a job.
+scheduler_secret_and_job() {
+  scheduler_installed
+}
+
 extract_manifest() {
   mkdir -p "$2"
   tar -xzf "$1" -C "$2" --no-same-owner manifest.json
@@ -424,12 +439,9 @@ run_full() {
   expect_denied "storage.buckets delete" 42501 \
     "begin read write; delete from storage.buckets where false; rollback"
   expect_denied "storage.objects" 42501 "select 1 from storage.objects limit 1"
-  expect_denied "vault.secrets" '42501|3F000' "select 1 from vault.secrets limit 1"
-  # This local stack does not install pg_cron or pg_net. The drift guard allows
-  # both. A missing relation or schema (42P01 or 3F000) still proves the reader
-  # cannot read the job table; 42501 proves it when the extension exists.
-  expect_denied "cron.job" '42501|3F000|42P01' "select 1 from cron.job limit 1"
-  expect_denied "net.http_request_queue" '42501|3F000|42P01' "select 1 from net.http_request_queue limit 1"
+  # cron, net and vault are proved after ensure-scheduler, once the relations
+  # exist. Installing them here would make schema net readable and the reader
+  # dumps below would fail the role check.
   expect_denied "pg_authid" 42501 "select rolpassword from pg_catalog.pg_authid limit 1"
   expect_denied "write under the read-only default" 25006 \
     "update app.stock_items set name = name where false"
@@ -556,6 +568,57 @@ run_full() {
     env PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
     "$here/dump.sh" "$neg_dir/out"
   sql "grant select (id) on storage.buckets to backup_reader"
+
+  step "stack A: scheduler extensions on the fresh target"
+  if scheduler_secret_and_job; then
+    fail SCHEDULER_GATE "secret entry and job creation were allowed before ensure-scheduler"
+  fi
+  info "negative ok: secret entry and job creation are blocked before ensure-scheduler"
+  local scheduler_ready present net_rc=0 scoped
+  scheduler_ready=$(node_cli node "$here/ensure-scheduler.mjs") ||
+    fail SCHEDULER_INSTALL "ensure-scheduler failed"
+  printf '%s\n' "$scheduler_ready" | grep -F 'scheduler ready' >/dev/null ||
+    fail SCHEDULER_INSTALL "ensure-scheduler did not report ready"
+  grep -F 'create extension if not exists "pg_cron";' "$here/ensure-scheduler.mjs" >/dev/null ||
+    fail SCHEDULER_INSTALL "pg_cron is not created with a bare CREATE EXTENSION"
+  grep -F 'create extension if not exists "pg_net";' "$here/ensure-scheduler.mjs" >/dev/null ||
+    fail SCHEDULER_INSTALL "pg_net is not created with a bare CREATE EXTENSION"
+  if grep -F -i 'with schema' "$here/ensure-scheduler.mjs" >/dev/null; then
+    fail SCHEDULER_INSTALL "CREATE EXTENSION must not choose a schema"
+  fi
+  present=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c "select to_regclass('cron.job') is not null")
+  [ "$present" = t ] || fail SCHEDULER_INSTALL "cron.job does not exist after ensure-scheduler"
+  present=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c "select to_regclass('net.http_request_queue') is not null")
+  [ "$present" = t ] || fail SCHEDULER_INSTALL "net.http_request_queue does not exist after ensure-scheduler"
+  present=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c "select to_regclass('vault.secrets') is not null")
+  [ "$present" = t ] || fail SCHEDULER_INSTALL "vault.secrets does not exist after ensure-scheduler"
+  expect_denied "cron.job" 42501 "select 1 from cron.job limit 1"
+  expect_denied "vault.secrets" 42501 "select 1 from vault.secrets limit 1"
+  # pg_net grants schema net and net.http_request_queue to PUBLIC, so this
+  # select is not 42501 on the current image. A denial, if one appears, must
+  # still be 42501. When the select is allowed, the role check refuses the dump.
+  reader_psql -c "select count(*) from net.http_request_queue" >/dev/null 2>"$work_dir/net.err" || net_rc=$?
+  if [ "$net_rc" -ne 0 ]; then
+    grep -Eq '(^|[^0-9A-Za-z])42501([^0-9A-Za-z]|$)' "$work_dir/net.err" ||
+      fail DENIAL_WRONG "net.http_request_queue: expected SQLSTATE 42501"
+    info "denied ok: net.http_request_queue"
+  else
+    info "net.http_request_queue is readable through the extension PUBLIC grants"
+    expect_fail "reader dump while net is readable" "[ROLE_UNSAFE]" \
+      env PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
+      "$here/dump.sh" "$neg_dir/scheduler-refused"
+  fi
+  scoped="$work_dir/reader-scoped.dump"
+  PGUSER=backup_reader PGPASSWORD="$reader_password" pg_dump \
+    --format=custom --schema=app --schema=ledger_scratch \
+    --file="$scoped" || fail SCHEDULER_DUMP "the schema-scoped reader dump failed"
+  pg_restore -l "$scoped" >"$work_dir/reader-scoped.list"
+  if grep -E 'SCHEMA - (cron|net|vault)( |$)| (cron|net|vault) ' "$work_dir/reader-scoped.list"; then
+    fail SCHEDULER_DUMP "the reader dump lists scheduler objects"
+  fi
+  info "reader dump excludes scheduler objects"
+  scheduler_secret_and_job || fail SCHEDULER_GATE "ensure-scheduler did not open the following step"
+  info "secret entry and job creation stay manual: CI has no secret and no committed job name"
 
   step "stack B: empty project"
   make_empty_project "$work_dir/stack-b"

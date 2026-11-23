@@ -279,6 +279,34 @@ test('an error message is always one line, so no line can pose as a second error
   assert.ok(out.startsWith('backup: error [X]: first '));
 });
 
+test('diagnostics stay off when any effective host is remote', () => {
+  const base = {
+    BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
+    BACKUP_ALLOW_LOOPBACK: '1',
+    PGHOST: '127.0.0.1',
+  };
+  assert.equal(
+    diagnosticsAllowed({ ...base, PGHOSTADDR: '203.0.113.10' }),
+    false,
+  );
+  assert.equal(
+    formatError(new Error('PRIVATE-SERVER-TEXT'), {
+      ...base,
+      PGHOSTADDR: '203.0.113.10',
+    }),
+    'backup: error [INTERNAL]: an internal error occurred',
+  );
+  assert.equal(diagnosticsAllowed({ ...base, PGSERVICE: 'prod' }), false);
+  assert.equal(
+    diagnosticsAllowed({
+      ...base,
+      PGDATABASE: 'postgresql://backup_reader@db.example.com/postgres',
+    }),
+    false,
+  );
+  assert.equal(diagnosticsAllowed(base), true);
+});
+
 test('internal error text is printed only for the synthetic loopback round trip', () => {
   const synthetic = {
     BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
