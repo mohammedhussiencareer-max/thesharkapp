@@ -26,10 +26,8 @@ import type { ProcessingSummary } from '@/accounting/types';
 import {
   addExpenseEntry,
   loadExpenseMonth,
-  setMonthExpenseComplete,
   voidExpenseEntry,
 } from '@/expenses/api';
-import type { ExpenseMonth } from '@/expenses/types';
 import {
   addConversion,
   addCustomUnit,
@@ -38,7 +36,6 @@ import {
   listCostingSchedule,
   listItems,
   listUnitOptions,
-  updateItem,
 } from '@/items/api';
 import { ConversionsPanel } from '@/items/ConversionsPanel';
 import {
@@ -238,104 +235,6 @@ describe('P7-3 round-5 review fixes', () => {
 
   afterEach(() => {
     setNavigatorOnline(true);
-  });
-
-  it('R5-1a: ItemsPage details update and ExpensesPage month confirmation acquire Web Lock and durable pin before dispatch', async () => {
-    const mockLocks = installMockLocks();
-    try {
-      // Part 1: ItemsPage details update
-      vi.mocked(listItems).mockResolvedValue([oilItem]);
-      vi.mocked(listCostingSchedule).mockResolvedValue({
-        lossToken: 'tok-1',
-        emptyToken: 'tok-empty',
-        identity: 'liter|ingredient||',
-        lossVersions: [],
-        conversions: [],
-      });
-      let resolveUpdate!: () => void;
-      vi.mocked(updateItem).mockImplementation(
-        () =>
-          new Promise<void>((resolve) => {
-            resolveUpdate = resolve;
-          }),
-      );
-
-      const itemsView = render(
-        <MemoryRouter>
-          <ItemsPage />
-        </MemoryRouter>,
-      );
-      await screen.findByText('زيت');
-      fireEvent.click(screen.getByRole('button', { name: 'تعديل' }));
-      fireEvent.change(screen.getByLabelText('الاسم'), {
-        target: { value: 'زيت جديد' },
-      });
-      fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
-
-      await waitFor(() => {
-        expect(updateItem).toHaveBeenCalledTimes(1);
-      });
-      // Must hold a Web Lock and a durable pin while updateItem is in flight!
-      expect(mockLocks.held.size).toBeGreaterThan(0);
-      expect(hasHeldWrite('item:details:item-oil')).toBe(true);
-
-      await act(async () => {
-        resolveUpdate();
-        await Promise.resolve();
-      });
-      await waitFor(() => {
-        expect(mockLocks.held.size).toBe(0);
-      });
-      itemsView.unmount();
-
-      // Part 2: ExpensesPage month confirmation
-      const currentMonth = cairoMonthInput();
-      const currentMonthStart = `${currentMonth}-01`;
-      const monthData: ExpenseMonth = {
-        monthStart: currentMonthStart,
-        categories: [
-          { id: 'cat-1', name: 'إيجار', kind: 'fixed_monthly', active: true },
-        ],
-        entries: [],
-        days: [],
-        complete: false,
-        confirmedAt: null,
-      };
-      vi.mocked(loadExpenseMonth).mockResolvedValue(monthData);
-      let resolveComplete!: () => void;
-      vi.mocked(setMonthExpenseComplete).mockImplementation(
-        () =>
-          new Promise<void>((resolve) => {
-            resolveComplete = resolve;
-          }),
-      );
-
-      const expView = render(
-        <MemoryRouter>
-          <ExpensesPage />
-        </MemoryRouter>,
-      );
-      const checkbox = await screen.findByLabelText('مصاريف الشهر كاملة');
-      fireEvent.click(checkbox);
-
-      await waitFor(() => {
-        expect(setMonthExpenseComplete).toHaveBeenCalledTimes(1);
-      });
-      // Must hold a Web Lock and a durable pin while setMonthExpenseComplete is in flight!
-      expect(mockLocks.held.size).toBeGreaterThan(0);
-      expect(hasHeldWrite(`expense:complete:${currentMonthStart}`)).toBe(true);
-
-      await act(async () => {
-        resolveComplete();
-        await Promise.resolve();
-      });
-      await waitFor(() => {
-        expect(mockLocks.held.size).toBe(0);
-      });
-      expView.unmount();
-    } finally {
-      mockLocks.restore();
-    }
   });
 
   it('R5-2a: ProcessingPanel holds run and retry pins in posted_reload until loadProcessingSummary succeeds', async () => {

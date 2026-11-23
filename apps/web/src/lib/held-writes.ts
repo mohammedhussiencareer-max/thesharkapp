@@ -31,9 +31,6 @@ export type HeldWriteKind =
   | 'sort'
   | 'expense'
   | 'expense_void'
-  | 'expense_complete'
-  | 'expense_category'
-  | 'item_details'
   | (string & {});
 
 export type HeldWriteRecord<T = unknown> = {
@@ -54,20 +51,6 @@ export type HeldWriteRecord<T = unknown> = {
    * reload replaces the payload.
    */
   awaitingReviewReload?: boolean;
-};
-
-/**
- * Non-request-id post-write read marker for writers whose RPC has no client
- * request id (e.g. catalog update, month completion toggle). Stored separately
- * from held-write records with no `requestId`, keyed per claim by a unique
- * never-reused `id` so concurrent targets never overwrite each other and slow
- * reads cannot clear later markers.
- */
-export type ReloadMarkerRecord = {
-  v: 1;
-  subject: string;
-  id: string;
-  target?: string;
 };
 
 /** Captured auth identity + monotonic session generation for multi-step writes. */
@@ -130,13 +113,11 @@ export type PostedReloadSnapshotItem = {
   subject: string;
   requestId: string;
   readTarget?: string;
-  isMarker?: true;
 };
 
 export type PostedReloadSnapshot = ReadonlyArray<PostedReloadSnapshotItem>;
 
 const KEY_PREFIX = 'theshark:held:v1:';
-const RELOAD_PREFIX = 'theshark:reload:v1:';
 const POSTED_SEGMENT = 'posted:';
 const FALLBACK_PROJECT = 'default';
 const TEST_LOCAL_USER = '__local__';
@@ -202,19 +183,8 @@ export function userStoragePrefix(
   return `${KEY_PREFIX}${encodeURIComponent(projectUrl)}:${encodeURIComponent(userId)}:`;
 }
 
-export function reloadMarkerPrefix(
-  userId: string,
-  projectUrl = currentProjectUrl(),
-): string {
-  return `${RELOAD_PREFIX}${encodeURIComponent(projectUrl)}:${encodeURIComponent(userId)}:`;
-}
-
 function postedMapKey(subject: string, requestId: string): string {
   return `${subject}\0${requestId}`;
-}
-
-function markerMapKey(subject: string, id: string): string {
-  return `${subject}\0${id}`;
 }
 
 function parseRecord(raw: string): HeldWriteRecord | null {
@@ -253,36 +223,6 @@ function parseRecord(raw: string): HeldWriteRecord | null {
     record.awaitingReviewReload = true;
   }
   return record;
-}
-
-function parseReloadMarker(raw: string): ReloadMarkerRecord | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return null;
-  }
-  const row = parsed as Record<string, unknown>;
-  if (row.v !== 1) return null;
-  if (typeof row.subject !== 'string' || row.subject.length === 0) return null;
-  const id =
-    typeof row.id === 'string' && row.id.length > 0
-      ? row.id
-      : typeof row.version === 'number' && Number.isFinite(row.version)
-        ? `legacy-${row.version}`
-        : 'legacy';
-  const marker: ReloadMarkerRecord = {
-    v: 1,
-    subject: row.subject,
-    id,
-  };
-  if (typeof row.target === 'string' && row.target.length > 0) {
-    marker.target = row.target;
-  }
-  return marker;
 }
 
 function matchesPostedTarget(
@@ -324,7 +264,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   let hydrationPromise: Promise<void> = Promise.resolve();
   const records = new Map<string, HeldWriteRecord>();
   const postedReloads = new Map<string, HeldWriteRecord>();
-  const reloadMarkers = new Map<string, ReloadMarkerRecord>();
   const activeLockReleases = new Map<string, () => void>();
   let liveClaimCount = 0;
   const listeners = new Set<() => void>();
@@ -363,31 +302,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     projectUrl = getProjectUrl(),
   ): string {
     return `${postedSubjectPrefix(subject, userId, projectUrl)}${encodeURIComponent(requestId)}`;
-  }
-
-  function markerSubjectPrefix(
-    subject: string,
-    userId: string,
-    projectUrl = getProjectUrl(),
-  ): string {
-    return `${reloadMarkerPrefix(userId, projectUrl)}${encodeURIComponent(subject)}:`;
-  }
-
-  function markerStorageKey(
-    subject: string,
-    id: string,
-    userId: string,
-    projectUrl = getProjectUrl(),
-  ): string {
-    return `${markerSubjectPrefix(subject, userId, projectUrl)}${encodeURIComponent(id)}`;
-  }
-
-  function legacyMarkerStorageKey(
-    subject: string,
-    userId: string,
-    projectUrl = getProjectUrl(),
-  ): string {
-    return `${reloadMarkerPrefix(userId, projectUrl)}${encodeURIComponent(subject)}`;
   }
 
   function safeSetItem(key: string, value: string): boolean {
@@ -468,22 +382,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     return safeSetItem(key, serialized);
   }
 
-  function writeMarkerToStorage(
-    marker: ReloadMarkerRecord,
-    userId: string,
-  ): boolean {
-    let serialized: string;
-    try {
-      serialized = JSON.stringify(marker);
-    } catch {
-      return false;
-    }
-    return safeSetItem(
-      markerStorageKey(marker.subject, marker.id, userId),
-      serialized,
-    );
-  }
-
   function removeRecordFromStorage(subject: string, userId: string): void {
     safeRemoveItem(entryStorageKey(subject, userId));
   }
@@ -504,21 +402,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       parsed.requestId === requestId
     ) {
       safeRemoveItem(activeKey);
-    }
-  }
-
-  function removeMarkerFromStorage(
-    subject: string,
-    id: string,
-    userId: string,
-  ): void {
-    safeRemoveItem(markerStorageKey(subject, id, userId));
-    // Also clean up any legacy single-slot marker with matching id.
-    const legacyKey = legacyMarkerStorageKey(subject, userId);
-    const raw = safeReadItem(legacyKey);
-    const parsed = raw !== null ? parseReloadMarker(raw) : null;
-    if (parsed && parsed.id === id) {
-      safeRemoveItem(legacyKey);
     }
   }
 
@@ -607,10 +490,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     promoteInflightSync: boolean,
   ): string[] {
     const scopeKey = userStoragePrefix(userId, getProjectUrl());
-    const markerPrefix = reloadMarkerPrefix(userId, getProjectUrl());
     records.clear();
     postedReloads.clear();
-    reloadMarkers.clear();
     const inflightSubjects: string[] = [];
 
     for (const key of safeListKeys(scopeKey)) {
@@ -635,14 +516,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         }
       }
       records.set(parsed.subject, parsed);
-    }
-
-    for (const key of safeListKeys(markerPrefix)) {
-      const raw = safeReadItem(key);
-      if (raw === null) continue;
-      const parsed = parseReloadMarker(raw);
-      if (!parsed) continue;
-      reloadMarkers.set(markerMapKey(parsed.subject, parsed.id), parsed);
     }
 
     return inflightSubjects;
@@ -708,7 +581,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     if (userId === null) {
       if (records.size > 0) records.clear();
       if (postedReloads.size > 0) postedReloads.clear();
-      if (reloadMarkers.size > 0) reloadMarkers.clear();
       hydratedScopeKey = null;
       return;
     }
@@ -739,11 +611,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   }
 
   function onStorageEvent(event: StorageEvent): void {
-    if (
-      event.key !== null &&
-      !event.key.startsWith(KEY_PREFIX) &&
-      !event.key.startsWith(RELOAD_PREFIX)
-    ) {
+    if (event.key !== null && !event.key.startsWith(KEY_PREFIX)) {
       return;
     }
     syncFromStorage();
@@ -785,11 +653,9 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       // Keep any already-dispatched Web Lock held until its RPC settles;
       // locking writes blocks NEW dispatches only.
       hydratedScopeKey = null;
-      const had =
-        records.size > 0 || postedReloads.size > 0 || reloadMarkers.size > 0;
+      const had = records.size > 0 || postedReloads.size > 0;
       records.clear();
       postedReloads.clear();
-      reloadMarkers.clear();
       if (had) emit();
     }
   }
@@ -824,11 +690,9 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       // writer releases its lock when its HTTP call settles. Sign-out blocks
       // NEW dispatches via userScope + sessionGeneration.
       hydratedScopeKey = null;
-      const had =
-        records.size > 0 || postedReloads.size > 0 || reloadMarkers.size > 0;
+      const had = records.size > 0 || postedReloads.size > 0;
       records.clear();
       postedReloads.clear();
-      reloadMarkers.clear();
       if (had) emit();
       return;
     }
@@ -863,18 +727,13 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     for (const key of safeListKeys(prefix)) {
       safeRemoveItem(key);
     }
-    const markerPrefix = reloadMarkerPrefix(trimmed, projectUrl);
-    for (const key of safeListKeys(markerPrefix)) {
-      safeRemoveItem(key);
-    }
     if (
       activeUserId() === trimmed &&
       getProjectUrl() === projectUrl &&
-      (records.size > 0 || postedReloads.size > 0 || reloadMarkers.size > 0)
+      (records.size > 0 || postedReloads.size > 0)
     ) {
       records.clear();
       postedReloads.clear();
-      reloadMarkers.clear();
       emit();
     }
   }
@@ -883,7 +742,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     hydratedScopeKey = null;
     records.clear();
     postedReloads.clear();
-    reloadMarkers.clear();
     ensureHydrated();
     emit();
   }
@@ -922,17 +780,17 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   }
 
   /**
-   * True while any pin, post-write reload marker, or live claim lock is held
-   * in storage OR memory. Consults live claims even after sign-out clears user
-   * keys, and consults localStorage directly so another tab's pin blocks a PWA
-   * shell reload even before a storage event fires.
+   * True while any pin or live claim lock is held in storage OR memory.
+   * Consults live claims even after sign-out clears user keys, and consults
+   * localStorage directly so another tab's pin blocks a PWA shell reload even
+   * before a storage event fires.
    */
   function hasAnyHeldWrite(): boolean {
     if (hasLiveHeldWriteClaims()) {
       return true;
     }
     ensureHydrated();
-    if (records.size > 0 || postedReloads.size > 0 || reloadMarkers.size > 0) {
+    if (records.size > 0 || postedReloads.size > 0) {
       return true;
     }
     const userId = activeUserId();
@@ -941,10 +799,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     for (const key of safeListKeys(userStoragePrefix(userId, projectUrl))) {
       const raw = safeReadItem(key);
       if (raw !== null && parseRecord(raw) !== null) return true;
-    }
-    for (const key of safeListKeys(reloadMarkerPrefix(userId, projectUrl))) {
-      const raw = safeReadItem(key);
-      if (raw !== null && parseReloadMarker(raw) !== null) return true;
     }
     return false;
   }
@@ -1583,15 +1437,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         return true;
       }
     }
-    for (const marker of reloadMarkers.values()) {
-      if (
-        marker.subject === target ||
-        marker.target === target ||
-        (marker.target === undefined && marker.subject === target)
-      ) {
-        return true;
-      }
-    }
     const userId = activeUserId();
     if (userId === null) return false;
     for (const key of safeListKeys(
@@ -1664,59 +1509,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (legacyParsed) consider(legacyParsed);
     }
 
-    const considerMarker = (marker: ReloadMarkerRecord) => {
-      if (filter.subject !== undefined && marker.subject !== filter.subject) {
-        return;
-      }
-      if (
-        filter.prefix !== undefined &&
-        !marker.subject.startsWith(filter.prefix)
-      ) {
-        return;
-      }
-      if (
-        filter.readTarget !== undefined &&
-        marker.subject !== filter.readTarget &&
-        marker.target !== filter.readTarget
-      ) {
-        return;
-      }
-      seen.set(`marker:${markerMapKey(marker.subject, marker.id)}`, {
-        subject: marker.subject,
-        requestId: marker.id,
-        ...(marker.target !== undefined ? { readTarget: marker.target } : {}),
-        isMarker: true,
-      });
-    };
-
-    for (const marker of reloadMarkers.values()) {
-      considerMarker(marker);
-    }
-    // Always consult localStorage so cross-tab markers are included in the snapshot.
-    if (filter.subject !== undefined) {
-      for (const key of safeListKeys(
-        markerSubjectPrefix(filter.subject, userId),
-      )) {
-        const markerRaw = safeReadItem(key);
-        const parsedMarker =
-          markerRaw !== null ? parseReloadMarker(markerRaw) : null;
-        if (parsedMarker) considerMarker(parsedMarker);
-      }
-      const legacyRaw = safeReadItem(
-        legacyMarkerStorageKey(filter.subject, userId),
-      );
-      const legacyParsed =
-        legacyRaw !== null ? parseReloadMarker(legacyRaw) : null;
-      if (legacyParsed) considerMarker(legacyParsed);
-    } else {
-      for (const key of safeListKeys(reloadMarkerPrefix(userId))) {
-        const markerRaw = safeReadItem(key);
-        const parsedMarker =
-          markerRaw !== null ? parseReloadMarker(markerRaw) : null;
-        if (parsedMarker) considerMarker(parsedMarker);
-      }
-    }
-
     return [...seen.values()];
   }
 
@@ -1725,127 +1517,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     loadedTarget?: string,
   ): void {
     for (const item of snapshot) {
-      if (item.isMarker) {
-        clearReloadMarker(
-          item.subject,
-          loadedTarget ?? item.readTarget,
-          item.requestId,
-        );
-        continue;
-      }
       clearPostedReload(
         item.subject,
         loadedTarget ?? item.readTarget,
         item.requestId,
       );
     }
-  }
-
-  function setReloadMarker(
-    subject: string,
-    target?: string,
-    claimId?: string,
-  ): boolean {
-    ensureHydrated();
-    const userId = activeUserId();
-    if (userId === null) return false;
-    const id =
-      claimId && claimId.trim().length > 0
-        ? claimId.trim()
-        : crypto.randomUUID();
-    const marker: ReloadMarkerRecord = {
-      v: 1,
-      subject,
-      id,
-      ...(target ? { target } : {}),
-    };
-    const persisted = writeMarkerToStorage(marker, userId);
-    if (persisted) {
-      reloadMarkers.set(markerMapKey(subject, id), marker);
-      emit();
-    }
-    return persisted;
-  }
-
-  function listReloadMarkers(subject: string): ReloadMarkerRecord[] {
-    ensureHydrated();
-    const found: ReloadMarkerRecord[] = [];
-    for (const marker of reloadMarkers.values()) {
-      if (marker.subject === subject) {
-        found.push(marker);
-      }
-    }
-    return found;
-  }
-
-  function getReloadMarker(subject: string): ReloadMarkerRecord | null {
-    return listReloadMarkers(subject)[0] ?? null;
-  }
-
-  function hasAnyReloadMarker(subject: string): boolean {
-    return listReloadMarkers(subject).length > 0;
-  }
-
-  function hasReloadMarker(subject: string, expectedTarget?: string): boolean {
-    for (const marker of listReloadMarkers(subject)) {
-      if (marker.target === undefined || marker.target === '*') {
-        return true;
-      }
-      if (expectedTarget !== undefined && marker.target === expectedTarget) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function clearReloadMarker(
-    subject: string,
-    expectedTarget?: string,
-    expectedId?: string,
-  ): void {
-    ensureHydrated();
-    const userId = activeUserId();
-    if (userId === null) return;
-    const candidates = new Map<string, ReloadMarkerRecord>();
-    for (const [k, marker] of reloadMarkers.entries()) {
-      if (marker.subject === subject) {
-        candidates.set(k, marker);
-      }
-    }
-    for (const key of safeListKeys(markerSubjectPrefix(subject, userId))) {
-      const raw = safeReadItem(key);
-      const parsed = raw !== null ? parseReloadMarker(raw) : null;
-      if (parsed && parsed.subject === subject) {
-        candidates.set(markerMapKey(parsed.subject, parsed.id), parsed);
-      }
-    }
-    const legacyRaw = safeReadItem(legacyMarkerStorageKey(subject, userId));
-    const legacyParsed =
-      legacyRaw !== null ? parseReloadMarker(legacyRaw) : null;
-    if (legacyParsed && legacyParsed.subject === subject) {
-      candidates.set(
-        markerMapKey(legacyParsed.subject, legacyParsed.id),
-        legacyParsed,
-      );
-    }
-
-    let changed = false;
-    for (const [k, marker] of candidates.entries()) {
-      if (expectedId !== undefined && marker.id !== expectedId) {
-        continue;
-      }
-      if (
-        marker.target !== undefined &&
-        marker.target !== '*' &&
-        marker.target !== expectedTarget
-      ) {
-        continue;
-      }
-      reloadMarkers.delete(k);
-      removeMarkerFromStorage(marker.subject, marker.id, userId);
-      changed = true;
-    }
-    if (changed) emit();
   }
 
   function resetHeldWritesStore(resetOptions?: {
@@ -1861,18 +1538,11 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         for (const key of safeListKeys(userStoragePrefix(userId, projectUrl))) {
           safeRemoveItem(key);
         }
-        for (const key of safeListKeys(
-          reloadMarkerPrefix(userId, projectUrl),
-        )) {
-          safeRemoveItem(key);
-        }
       }
     }
-    const had =
-      records.size > 0 || postedReloads.size > 0 || reloadMarkers.size > 0;
+    const had = records.size > 0 || postedReloads.size > 0;
     records.clear();
     postedReloads.clear();
-    reloadMarkers.clear();
     hydratedScopeKey = null;
     writesLocked = false;
     if (resetOptions?.resetUser) {
@@ -1915,12 +1585,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     clearPostedReload,
     snapshotPostedReloads,
     clearPostedReloadSnapshot,
-    setReloadMarker,
-    listReloadMarkers,
-    getReloadMarker,
-    hasAnyReloadMarker,
-    hasReloadMarker,
-    clearReloadMarker,
     resetHeldWritesStore,
     dispose,
   };
@@ -1960,10 +1624,4 @@ export const hasPostedReloadForTarget = defaultStore.hasPostedReloadForTarget;
 export const clearPostedReload = defaultStore.clearPostedReload;
 export const snapshotPostedReloads = defaultStore.snapshotPostedReloads;
 export const clearPostedReloadSnapshot = defaultStore.clearPostedReloadSnapshot;
-export const setReloadMarker = defaultStore.setReloadMarker;
-export const listReloadMarkers = defaultStore.listReloadMarkers;
-export const getReloadMarker = defaultStore.getReloadMarker;
-export const hasAnyReloadMarker = defaultStore.hasAnyReloadMarker;
-export const hasReloadMarker = defaultStore.hasReloadMarker;
-export const clearReloadMarker = defaultStore.clearReloadMarker;
 export const resetHeldWritesStore = defaultStore.resetHeldWritesStore;

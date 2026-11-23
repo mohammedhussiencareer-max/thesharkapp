@@ -831,33 +831,6 @@ describe('held-writes store', () => {
     }
   });
 
-  it('R5-2c: an older read in Tab 1 cannot clear a newer reload marker written by Tab 2', () => {
-    const tab1 = createHeldWriteStore();
-    const tab2 = createHeldWriteStore();
-    try {
-      tab1.setHeldWriteUser('user-1');
-      tab2.setHeldWriteUser('user-1');
-
-      tab1.setReloadMarker('expense:reload', '2026-11-01');
-      const snapBeforeTab1Read = tab1.snapshotPostedReloads({
-        subject: 'expense:reload',
-      });
-
-      // Tab 2 performs a newer write and sets a newer reload marker while Tab 1's read is in flight.
-      tab2.setReloadMarker('expense:reload', '2026-11-01');
-
-      // Tab 1's older read finishes and attempts to clear its snapshot.
-      tab1.clearPostedReloadSnapshot(snapBeforeTab1Read, '2026-11-01');
-
-      // Tab 2's newer marker MUST still be held in storage!
-      tab2.rehydrateHeldWrites();
-      expect(tab2.hasReloadMarker('expense:reload', '2026-11-01')).toBe(true);
-    } finally {
-      tab1.dispose();
-      tab2.dispose();
-    }
-  });
-
   it('R5-7: claimFreshHeldWrite and claimReplayHeldWrite release the Web Lock if create or storage throws', async () => {
     const heldLocks = new Set<string>();
     const locks = {
@@ -903,38 +876,6 @@ describe('held-writes store', () => {
       expect(heldLocks.size).toBe(0);
     } finally {
       store.dispose();
-    }
-  });
-
-  it('R6-1a: reload marker ids never restart after deletion, so a slow read cannot clear a later marker', () => {
-    const tab1 = createHeldWriteStore();
-    const tab2 = createHeldWriteStore();
-    try {
-      tab1.setHeldWriteUser('user-1');
-      tab2.setHeldWriteUser('user-1');
-
-      // Marker #1 is written and snapshotted by a slow read in Tab 1.
-      tab1.setReloadMarker('expense:reload', '2026-01-01');
-      const slowSnap = tab1.snapshotPostedReloads({
-        subject: 'expense:reload',
-      });
-
-      // Another fast read clears marker #1 completely (deleting it from storage).
-      tab2.clearPostedReloadSnapshot(slowSnap, '2026-01-01');
-      expect(tab2.hasReloadMarker('expense:reload', '2026-01-01')).toBe(false);
-
-      // A later write creates marker #2 for the same subject + target.
-      tab2.setReloadMarker('expense:reload', '2026-01-01');
-
-      // Tab 1's slow read finally completes and attempts to clear its old snapshot.
-      tab1.clearPostedReloadSnapshot(slowSnap, '2026-01-01');
-
-      // Marker #2 MUST NOT have been cleared by slowSnap!
-      tab2.rehydrateHeldWrites();
-      expect(tab2.hasReloadMarker('expense:reload', '2026-01-01')).toBe(true);
-    } finally {
-      tab1.dispose();
-      tab2.dispose();
     }
   });
 

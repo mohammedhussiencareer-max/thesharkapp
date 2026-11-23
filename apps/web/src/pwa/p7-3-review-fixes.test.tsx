@@ -842,7 +842,8 @@ describe('P7-3 review fixes', () => {
     expect(storedCountRaw).not.toContain('بلطي');
     countView.unmount();
 
-    // 2. ItemsPage reload marker after updateItem + failed listItems must NOT store a requestId
+    // 2. Request-less writers (ItemsPage updateItem & ExpensesPage setMonthExpenseComplete)
+    // stay outside the held-write store and never write to localStorage.
     localStorage.clear();
     resetHeldWritesStore({ clearStorage: true });
     vi.mocked(listItems)
@@ -859,14 +860,10 @@ describe('P7-3 review fixes', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
     expect(await screen.findByText('catalog down')).toBeInTheDocument();
-    expect(hasAnyHeldWrite()).toBe(true);
-    const itemReloadRaw = Object.keys(localStorage)
-      .map((k) => localStorage.getItem(k) ?? '')
-      .join('\n');
-    expect(itemReloadRaw).not.toContain('"requestId"');
+    expect(hasAnyHeldWrite()).toBe(false);
+    expect(localStorage.length).toBe(0);
     itemsView.unmount();
 
-    // 3. ExpensesPage setMonthExpenseComplete reload marker must NOT store a requestId
     localStorage.clear();
     resetHeldWritesStore({ clearStorage: true });
     vi.mocked(loadExpenseMonth)
@@ -881,11 +878,8 @@ describe('P7-3 review fixes', () => {
       await screen.findByRole('checkbox', { name: 'مصاريف الشهر كاملة' }),
     );
     expect(await screen.findByText('expense reload down')).toBeInTheDocument();
-    expect(hasAnyHeldWrite()).toBe(true);
-    const expReloadRaw = Object.keys(localStorage)
-      .map((k) => localStorage.getItem(k) ?? '')
-      .join('\n');
-    expect(expReloadRaw).not.toContain('"requestId"');
+    expect(hasAnyHeldWrite()).toBe(false);
+    expect(localStorage.length).toBe(0);
     expView.unmount();
   });
 

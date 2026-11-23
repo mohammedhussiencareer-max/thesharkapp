@@ -1,8 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  addExpenseCategory,
   addExpenseEntry,
   instantKey,
   loadExpenseMonth,
+  renameExpenseCategory,
+  setExpenseCategoryActive,
+  setMonthExpenseComplete,
   voidExpenseEntry,
 } from '@/expenses/api';
 import {
@@ -12,6 +16,7 @@ import {
 } from '@/expenses/errors';
 import type { ExpenseDraft } from '@/expenses/types';
 import { genericCatalogError } from '@/items/errors';
+import { isRequestlessDefiniteRefusal } from '@/lib/write-outcome';
 
 const mocks = vi.hoisted(() => ({
   schema: vi.fn(),
@@ -535,5 +540,49 @@ describe('expense api', () => {
     expect(month.categories.filter((row) => row.id === 'c0000')).toEqual([
       expect.objectContaining({ name: 'zzzz-renamed' }),
     ]);
+  });
+
+  it('preserves SQLSTATE codes on request-less expense writes so definite refusals stay actionable', async () => {
+    const cases: Array<{
+      code: string;
+      message: string;
+      run: () => Promise<void>;
+    }> = [
+      {
+        code: '23505',
+        message: 'duplicate key value',
+        run: () => addExpenseCategory('غاز', 'daily'),
+      },
+      {
+        code: '22023',
+        message: 'invalid name',
+        run: () => renameExpenseCategory('cat-gas', 'غاز'),
+      },
+      {
+        code: '42501',
+        message: 'insufficient_privilege',
+        run: () => setExpenseCategoryActive('cat-gas', false),
+      },
+      {
+        code: '42501',
+        message: 'insufficient_privilege',
+        run: () => setMonthExpenseComplete('2030-04-01', true),
+      },
+    ];
+    for (const item of cases) {
+      install({
+        categories: query({ data: [], error: null }),
+        lines: query({ data: [], error: null }),
+        days: query({ data: [], error: null }),
+        status: query({ data: null, error: null }),
+        writeError: { code: item.code, message: item.message },
+      });
+      await expect(item.run()).rejects.toSatisfy(
+        (error: unknown) =>
+          error instanceof Error &&
+          (error as { code?: string }).code === item.code &&
+          isRequestlessDefiniteRefusal(error),
+      );
+    }
   });
 });

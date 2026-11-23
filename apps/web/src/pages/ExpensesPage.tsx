@@ -32,6 +32,7 @@ import { cairoMonthInput, formatCairo, formatMonth } from '@/lib/cairo';
 import {
   abortClaimBeforeDispatch,
   canDispatchHeldWrite,
+  canDispatchWriteFor,
   captureWriteSession,
   claimFreshHeldWrite,
   claimReplayHeldWrite,
@@ -40,19 +41,13 @@ import {
   getHeldWrite,
   hasDurableHeldWrite,
   listHeldWritesByPrefix,
-  listReloadMarkers,
   setHeldWritePhase,
   snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
-  type HeldWriteKind,
   type PostedReloadSnapshot,
   type WriteSession,
 } from '@/lib/held-writes';
-import {
-  createRequestlessReconciler,
-  type RequestlessPin,
-} from '@/lib/requestless-reconcile';
 import {
   isOnline,
   offlineMoneyMessage,
@@ -60,74 +55,16 @@ import {
   useReconnectReload,
 } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
+import { isRequestlessDefiniteRefusal } from '@/lib/write-outcome';
 
 const EXPENSE_NEW_SUBJECT = 'expense:new';
 const EXPENSE_VOID_PREFIX = 'expense:void:';
-const EXPENSE_COMPLETE_PREFIX = 'expense:complete:';
-const EXPENSE_CATEGORY_PREFIX = 'expense:category:';
-const EXPENSE_RELOAD_SUBJECT = 'expense:reload';
 
-/** Minimal intended state persisted for request-less expense mutations so ambiguous outcomes can be verified and explicitly replayed. */
-type StoredExpenseMutationIntent =
-  | { kind: 'complete'; monthStart: string; complete: boolean }
-  | { kind: 'category_add'; name: string; categoryKind: ExpenseKind }
-  | { kind: 'category_rename'; categoryId: string; name: string }
-  | { kind: 'category_active'; categoryId: string; active: boolean };
-
-function isStoredExpenseMutationIntent(
-  value: unknown,
-): value is StoredExpenseMutationIntent {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const row = value as Partial<StoredExpenseMutationIntent>;
-  if (row.kind === 'complete') {
-    return (
-      typeof row.monthStart === 'string' && typeof row.complete === 'boolean'
-    );
-  }
-  if (row.kind === 'category_add') {
-    return typeof row.name === 'string' && typeof row.categoryKind === 'string';
-  }
-  if (row.kind === 'category_rename') {
-    return typeof row.categoryId === 'string' && typeof row.name === 'string';
-  }
-  if (row.kind === 'category_active') {
-    return (
-      typeof row.categoryId === 'string' && typeof row.active === 'boolean'
-    );
-  }
-  return false;
-}
-
-function monthMatchesMutationIntent(
-  monthData: ExpenseMonth,
-  intent: StoredExpenseMutationIntent,
-): boolean {
-  if (intent.kind === 'complete') {
-    return (
-      monthData.monthStart === intent.monthStart &&
-      monthData.complete === intent.complete
-    );
-  }
-  if (intent.kind === 'category_add') {
-    const trimmed = intent.name.trim();
-    return monthData.categories.some(
-      (cat) => cat.name === trimmed && cat.kind === intent.categoryKind,
-    );
-  }
-  if (intent.kind === 'category_rename') {
-    const trimmed = intent.name.trim();
-    return monthData.categories.some(
-      (cat) => cat.id === intent.categoryId && cat.name === trimmed,
-    );
-  }
-  return monthData.categories.some(
-    (cat) => cat.id === intent.categoryId && cat.active === intent.active,
-  );
-}
-
-function targetOfExpenseMutation(intent: StoredExpenseMutationIntent): string {
-  return intent.kind === 'complete' ? intent.monthStart : '*';
-}
+type RequestlessVerifyState = {
+  targetMonth: string;
+  status: 'verifying' | 'read_failed' | 'verified';
+  readError: string | null;
+};
 
 /** Stored in localStorage for void retries: request id, reason, and target month (no cached money). */
 type StoredVoidPayload = {
@@ -178,10 +115,7 @@ function voidTargetMonth(
 function snapshotExpensePostedReloads(): PostedReloadSnapshot {
   return [
     ...snapshotPostedReloads({ subject: EXPENSE_NEW_SUBJECT }),
-    ...snapshotPostedReloads({ subject: EXPENSE_RELOAD_SUBJECT }),
     ...snapshotPostedReloads({ prefix: EXPENSE_VOID_PREFIX }),
-    ...snapshotPostedReloads({ prefix: EXPENSE_COMPLETE_PREFIX }),
-    ...snapshotPostedReloads({ prefix: EXPENSE_CATEGORY_PREFIX }),
   ];
 }
 
@@ -225,25 +159,16 @@ export function ExpensesPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [categoryError, setCategoryError] = useState<string | null>(null);
-  const [mutationNotice, setMutationNotice] = useState<string | null>(null);
+  const [completeVerify, setCompleteVerify] =
+    useState<RequestlessVerifyState | null>(null);
+  const [categoryVerify, setCategoryVerify] =
+    useState<RequestlessVerifyState | null>(null);
   const [saving, setSaving] = useState(false);
   const [localNeedsReload, setLocalNeedsReload] = useState(false);
   const [readLoads, setReadLoads] = useState(0);
   const [loadId, setLoadId] = useState(0);
   const [formEpoch, setFormEpoch] = useState(0);
   const [heldEpoch, setHeldEpoch] = useState(0);
-  const [reconcileEpoch, setReconcileEpoch] = useState(0);
-  const [mutationReconciler] = useState(() =>
-    createRequestlessReconciler<StoredExpenseMutationIntent, ExpenseMonth>({
-      prefixes: [EXPENSE_COMPLETE_PREFIX, EXPENSE_CATEGORY_PREFIX],
-      reloadSubject: EXPENSE_RELOAD_SUBJECT,
-      isIntent: isStoredExpenseMutationIntent,
-      targetOf: targetOfExpenseMutation,
-      markerTargetOf: targetOfExpenseMutation,
-      matchesServerState: monthMatchesMutationIntent,
-      onChange: () => setReconcileEpoch((value) => value + 1),
-    }),
-  );
   // In-memory snapshots of voided rows while switching months (never written to localStorage).
   const [voidSnapshots, setVoidSnapshots] = useState<
     ReadonlyMap<string, ExpenseLine>
@@ -251,10 +176,33 @@ export function ExpensesPage() {
   // Ids of voids that were sent and refused. A refusal is not stored, so a
   // correction reuses the id. Cleared once that void succeeds.
   const voidRequestIdsRef = useRef(new Map<string, string>());
+  const completeVerifyRef = useRef<RequestlessVerifyState | null>(
+    completeVerify,
+  );
+  const categoryVerifyRef = useRef<RequestlessVerifyState | null>(
+    categoryVerify,
+  );
+  const dataSessionRef = useRef<WriteSession | null>(null);
   const seqRef = useRef(0);
   const readsRef = useRef(0);
   const savingRef = useRef(false);
   const needsReloadRef = useRef(false);
+
+  const setCompleteVerifyState = useCallback(
+    (next: RequestlessVerifyState | null) => {
+      completeVerifyRef.current = next;
+      setCompleteVerify(next);
+    },
+    [],
+  );
+
+  const setCategoryVerifyState = useCallback(
+    (next: RequestlessVerifyState | null) => {
+      categoryVerifyRef.current = next;
+      setCategoryVerify(next);
+    },
+    [],
+  );
 
   const online = useReconnectReload(() => {
     if (!savingRef.current && readsRef.current === 0) {
@@ -296,22 +244,30 @@ export function ExpensesPage() {
     }
   }
 
-  const applyMutationRead = useCallback(
-    (
-      snapshot: ReturnType<typeof mutationReconciler.snapshotBeforeRead>,
-      monthData: ExpenseMonth,
-    ) => {
-      const outcome = mutationReconciler.applyReadResult(
-        snapshot,
-        monthData,
-        monthData.monthStart,
-      );
-      if (outcome.reconciledSubjects.size > 0) {
-        setMutationNotice('اتحفظ التعديل');
+  const reconcileRequestlessVerifyOnMonth = useCallback(
+    (monthData: ExpenseMonth): void => {
+      const completeState = completeVerifyRef.current;
+      if (
+        completeState &&
+        completeState.status !== 'verified' &&
+        completeState.targetMonth === monthData.monthStart
+      ) {
+        setCompleteVerifyState({
+          targetMonth: completeState.targetMonth,
+          status: 'verified',
+          readError: null,
+        });
       }
-      return outcome;
+      const categoryState = categoryVerifyRef.current;
+      if (categoryState && categoryState.status !== 'verified') {
+        setCategoryVerifyState({
+          targetMonth: monthData.monthStart,
+          status: 'verified',
+          readError: null,
+        });
+      }
     },
-    [mutationReconciler],
+    [setCategoryVerifyState, setCompleteVerifyState],
   );
 
   const storedExpense =
@@ -334,41 +290,12 @@ export function ExpensesPage() {
       entry: voidSnapshots.get(id) ?? null,
     });
   }
-  const storedCompletes =
-    heldEpoch < 0 ? [] : listHeldWritesByPrefix(EXPENSE_COMPLETE_PREFIX);
-  const storedCategories =
-    heldEpoch < 0 ? [] : listHeldWritesByPrefix(EXPENSE_CATEGORY_PREFIX);
-  const recoverableMutations =
-    heldEpoch < 0 || reconcileEpoch < 0
-      ? []
-      : mutationReconciler.listRecoverablePins();
-  const inflightVoid =
-    storedVoids.some((record) => record.phase === 'inflight') ||
-    storedCompletes.some(
-      (record) =>
-        record.phase === 'inflight' &&
-        !recoverableMutations.some(
-          (pin) =>
-            pin.acknowledged &&
-            pin.subject === record.subject &&
-            pin.requestId === record.requestId,
-        ),
-    ) ||
-    storedCategories.some(
-      (record) =>
-        record.phase === 'inflight' &&
-        !recoverableMutations.some(
-          (pin) =>
-            pin.acknowledged &&
-            pin.subject === record.subject &&
-            pin.requestId === record.requestId,
-        ),
-    );
-  const expenseReloadMarkers =
-    heldEpoch < 0 ? [] : listReloadMarkers(EXPENSE_RELOAD_SUBJECT);
+  const inflightVoid = storedVoids.some(
+    (record) => record.phase === 'inflight',
+  );
 
   function postedReloadForTarget(target: string): boolean {
-    if (heldEpoch < 0 || reconcileEpoch < 0) return false;
+    if (heldEpoch < 0) return false;
     const matchesTarget = (readTarget: string | undefined) =>
       target === '*' ||
       !readTarget ||
@@ -377,24 +304,22 @@ export function ExpensesPage() {
     return (
       (storedExpense?.phase === 'posted_reload' &&
         matchesTarget(storedExpense.readTarget)) ||
-      expenseReloadMarkers.some((marker) => matchesTarget(marker.target)) ||
       storedVoids.some(
         (record) =>
           record.phase === 'posted_reload' && matchesTarget(record.readTarget),
-      ) ||
-      storedCompletes.some(
-        (record) =>
-          record.phase === 'posted_reload' && matchesTarget(record.readTarget),
-      ) ||
-      storedCategories.some((record) => record.phase === 'posted_reload') ||
-      mutationReconciler.hasAcknowledgedClaim(
-        target === '*' ? undefined : target,
       )
     );
   }
 
   const monthStart = `${month}-01`;
   const postedReloadForCurrentMonth = postedReloadForTarget(monthStart);
+
+  const completeVerifyBlocked =
+    completeVerify !== null &&
+    completeVerify.status !== 'verified' &&
+    completeVerify.targetMonth === monthStart;
+  const categoryVerifyBlocked =
+    categoryVerify !== null && categoryVerify.status !== 'verified';
 
   const needsReload = localNeedsReload || postedReloadForCurrentMonth;
   const ready = data !== null && data.monthStart === monthStart;
@@ -418,11 +343,14 @@ export function ExpensesPage() {
 
   async function readMonth(monthValue: string): Promise<ExpenseMonth | null> {
     const seq = ++seqRef.current;
+    const readSession = captureWriteSession();
     readsRef.current += 1;
     setReadLoads(readsRef.current);
     try {
       const next = await loadExpenseMonth(`${monthValue}-01`);
-      return seq === seqRef.current ? next : null;
+      if (seq !== seqRef.current) return null;
+      dataSessionRef.current = readSession;
+      return next;
     } catch (error) {
       if (seq !== seqRef.current) return null;
       throw error;
@@ -432,12 +360,23 @@ export function ExpensesPage() {
     }
   }
 
+  async function readExactMonth(targetMonth: string): Promise<ExpenseMonth> {
+    const readSession = captureWriteSession();
+    readsRef.current += 1;
+    setReadLoads(readsRef.current);
+    try {
+      const next = await loadExpenseMonth(targetMonth);
+      dataSessionRef.current = readSession;
+      return next;
+    } finally {
+      readsRef.current -= 1;
+      setReadLoads(readsRef.current);
+    }
+  }
+
   useEffect(() => {
     let cancelled = false;
-    const displayedMonthStart = `${month}-01`;
     const pendingReloads = snapshotExpensePostedReloads();
-    const mutationSnap =
-      mutationReconciler.snapshotBeforeRead(displayedMonthStart);
     void (async () => {
       try {
         const next = await readMonth(month);
@@ -445,36 +384,11 @@ export function ExpensesPage() {
         setData(next);
         setLoadError(null);
         reconcileCommittedVoids(next.entries);
-        applyMutationRead(mutationSnap, next);
+        reconcileRequestlessVerifyOnMonth(next);
         clearPostedReloadSnapshot(pendingReloads, next.monthStart);
         needsReloadRef.current = false;
         setLocalNeedsReload(false);
-        // Resume any outstanding request-less target reads (reload markers,
-        // unknown pins, or acknowledged inflight claims targeting other months).
-        const otherTargets = mutationReconciler.outstandingTargets(
-          next.monthStart,
-        );
-        if (otherTargets.length > 0) {
-          await Promise.all(
-            otherTargets.map(async (targetMonth) => {
-              const targetReloads = snapshotExpensePostedReloads();
-              const targetPinSnap =
-                mutationReconciler.snapshotBeforeRead(targetMonth);
-              try {
-                const targeted = await loadExpenseMonth(targetMonth);
-                if (cancelled) return;
-                applyMutationRead(targetPinSnap, targeted);
-                clearPostedReloadSnapshot(targetReloads, targeted.monthStart);
-              } catch {
-                if (!cancelled) {
-                  mutationReconciler.applyReadFailure(targetPinSnap);
-                }
-              }
-            }),
-          );
-        }
       } catch (error) {
-        mutationReconciler.applyReadFailure(mutationSnap);
         if (cancelled) return;
         setLoadError(messageFrom(error));
       }
@@ -482,7 +396,7 @@ export function ExpensesPage() {
     return () => {
       cancelled = true;
     };
-  }, [month, loadId, applyMutationRead, mutationReconciler]);
+  }, [month, loadId, reconcileRequestlessVerifyOnMonth]);
 
   function retry() {
     if (savingRef.current || readsRef.current > 0 || !isOnline()) return;
@@ -498,9 +412,132 @@ export function ExpensesPage() {
     )
       return;
     if (!/^\d{4}-\d{2}$/.test(next) || next === monthRef.current) return;
+    if (completeVerifyRef.current?.status === 'verified') {
+      setCompleteVerifyState(null);
+    }
     monthRef.current = next;
     setLoadError(null);
     setMonth(next);
+  }
+
+  async function verifyRequestlessRead(
+    kind: 'complete' | 'category',
+  ): Promise<void> {
+    const state =
+      kind === 'complete'
+        ? completeVerifyRef.current
+        : categoryVerifyRef.current;
+    if (!state || savingRef.current || readsRef.current > 0 || !isOnline()) {
+      return;
+    }
+    const targetMonth =
+      kind === 'complete' ? state.targetMonth : `${monthRef.current}-01`;
+    const setVerify =
+      kind === 'complete' ? setCompleteVerifyState : setCategoryVerifyState;
+    setVerify({ targetMonth, status: 'verifying', readError: null });
+    const pendingReloads = snapshotExpensePostedReloads();
+    try {
+      const fresh = await readExactMonth(targetMonth);
+      if (fresh.monthStart === `${monthRef.current}-01`) {
+        setData(fresh);
+        setLoadError(null);
+        reconcileCommittedVoids(fresh.entries);
+      }
+      clearPostedReloadSnapshot(pendingReloads, fresh.monthStart);
+      setVerify({ targetMonth, status: 'verified', readError: null });
+      reconcileRequestlessVerifyOnMonth(fresh);
+    } catch (readError) {
+      setVerify({
+        targetMonth,
+        status: 'read_failed',
+        readError: messageFrom(readError),
+      });
+    }
+  }
+
+  async function runRequestlessExpenseWrite(options: {
+    kind: 'complete' | 'category';
+    targetMonth: string;
+    action: () => Promise<void>;
+    setError: (message: string | null) => void;
+  }): Promise<boolean> {
+    const { kind, targetMonth, action, setError } = options;
+    const blocked =
+      kind === 'complete'
+        ? completeVerifyRef.current !== null &&
+          completeVerifyRef.current.status !== 'verified' &&
+          completeVerifyRef.current.targetMonth === targetMonth
+        : categoryVerifyRef.current !== null &&
+          categoryVerifyRef.current.status !== 'verified';
+    if (
+      savingRef.current ||
+      needsReloadRef.current ||
+      postedReloadForTarget(targetMonth) ||
+      readsRef.current > 0 ||
+      blocked ||
+      !isOnline()
+    ) {
+      return false;
+    }
+    const session = dataSessionRef.current ?? captureWriteSession();
+    if (!canDispatchWriteFor(session)) {
+      if (!isOnline()) setError(offlineWriteMessage);
+      return false;
+    }
+    savingRef.current = true;
+    setSaving(true);
+    setError(null);
+    if (kind === 'complete') setCompleteVerifyState(null);
+    else setCategoryVerifyState(null);
+    try {
+      await action();
+      needsReloadRef.current = true;
+      setLocalNeedsReload(true);
+      try {
+        const pendingReloads = snapshotExpensePostedReloads();
+        const next = await readExactMonth(targetMonth);
+        if (next.monthStart === `${monthRef.current}-01`) {
+          setData(next);
+          setLoadError(null);
+          reconcileCommittedVoids(next.entries);
+        }
+        clearPostedReloadSnapshot(pendingReloads, next.monthStart);
+        needsReloadRef.current = false;
+        setLocalNeedsReload(false);
+      } catch (readError) {
+        setLoadError(messageFrom(readError));
+      }
+      return true;
+    } catch (error) {
+      if (isRequestlessDefiniteRefusal(error)) {
+        setError(messageFrom(error));
+        return false;
+      }
+      const setVerify =
+        kind === 'complete' ? setCompleteVerifyState : setCategoryVerifyState;
+      setVerify({ targetMonth, status: 'verifying', readError: null });
+      const pendingReloads = snapshotExpensePostedReloads();
+      try {
+        const fresh = await readExactMonth(targetMonth);
+        if (fresh.monthStart === `${monthRef.current}-01`) {
+          setData(fresh);
+          setLoadError(null);
+          reconcileCommittedVoids(fresh.entries);
+        }
+        clearPostedReloadSnapshot(pendingReloads, fresh.monthStart);
+        setVerify({ targetMonth, status: 'verified', readError: null });
+      } catch (readError) {
+        setVerify({
+          targetMonth,
+          status: 'read_failed',
+          readError: messageFrom(readError),
+        });
+      }
+      return false;
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
   }
 
   async function runWrite(
@@ -544,63 +581,15 @@ export function ExpensesPage() {
       setLocalNeedsReload(true);
       try {
         await onSaved?.();
-        // If the write targeted a different month than the one displayed (e.g.
-        // replaying January while viewing November), read the pin's OWN target
-        // first so its reload marker / acknowledged claim clears immediately.
-        if (
-          effectiveTarget !== '*' &&
-          effectiveTarget !== displayedMonthStart
-        ) {
-          const targetReloads = snapshotExpensePostedReloads();
-          const targetPinSnap =
-            mutationReconciler.snapshotBeforeRead(effectiveTarget);
-          try {
-            const targeted = await loadExpenseMonth(effectiveTarget);
-            applyMutationRead(targetPinSnap, targeted);
-            clearPostedReloadSnapshot(targetReloads, targeted.monthStart);
-          } catch (targetError) {
-            mutationReconciler.applyReadFailure(targetPinSnap);
-            throw targetError;
-          }
+        const pendingReloads = snapshotExpensePostedReloads();
+        const next = await readMonth(monthRef.current);
+        if (next) {
+          setData(next);
+          setLoadError(null);
+          reconcileCommittedVoids(next.entries);
+          clearPostedReloadSnapshot(pendingReloads, next.monthStart);
           needsReloadRef.current = false;
           setLocalNeedsReload(false);
-          // Best-effort refresh of the currently displayed month too.
-          const displayedReloads = snapshotExpensePostedReloads();
-          const displayedPinSnap =
-            mutationReconciler.snapshotBeforeRead(displayedMonthStart);
-          try {
-            const next = await readMonth(monthRef.current);
-            if (next) {
-              setData(next);
-              setLoadError(null);
-              reconcileCommittedVoids(next.entries);
-              applyMutationRead(displayedPinSnap, next);
-              clearPostedReloadSnapshot(displayedReloads, next.monthStart);
-            }
-          } catch (displayError) {
-            mutationReconciler.applyReadFailure(displayedPinSnap);
-            setLoadError(messageFrom(displayError));
-          }
-        } else {
-          const pendingReloads = snapshotExpensePostedReloads();
-          const pinSnap =
-            mutationReconciler.snapshotBeforeRead(displayedMonthStart);
-          let next: ExpenseMonth | null;
-          try {
-            next = await readMonth(monthRef.current);
-          } catch (readError) {
-            mutationReconciler.applyReadFailure(pinSnap);
-            throw readError;
-          }
-          if (next) {
-            setData(next);
-            setLoadError(null);
-            reconcileCommittedVoids(next.entries);
-            applyMutationRead(pinSnap, next);
-            clearPostedReloadSnapshot(pendingReloads, next.monthStart);
-            needsReloadRef.current = false;
-            setLocalNeedsReload(false);
-          }
         }
       } catch (error) {
         // The write is already stored. Stay locked until a later read applies,
@@ -617,145 +606,6 @@ export function ExpensesPage() {
       setSaving(false);
     }
     return { dispatched: true, saved, error: failure };
-  }
-
-  async function runClaimedMutation(
-    subject: string,
-    kind: HeldWriteKind,
-    readTarget: string,
-    intent: StoredExpenseMutationIntent,
-    action: () => Promise<void>,
-    setError: (message: string | null) => void,
-    replayPin?: RequestlessPin<StoredExpenseMutationIntent>,
-  ): Promise<boolean> {
-    if (
-      savingRef.current ||
-      needsReloadRef.current ||
-      postedReloadForTarget(readTarget) ||
-      readsRef.current > 0 ||
-      !isOnline()
-    ) {
-      return false;
-    }
-    setMutationNotice(null);
-    const session = captureWriteSession();
-    const claimed = replayPin
-      ? await mutationReconciler.claimReplay(replayPin, session)
-      : await mutationReconciler.claimFresh(subject, kind, intent, session);
-    if (!claimed.ok) {
-      if (claimed.reason === 'storage' || claimed.reason === 'missing') {
-        setError(storageWriteFailedMessage);
-      } else if (claimed.reason === 'session_invalid' && !isOnline()) {
-        setError(offlineWriteMessage);
-      }
-      return false;
-    }
-    const { requestId, attempt, releaseOnce } = claimed;
-    try {
-      const result = await runWrite(
-        action,
-        setError,
-        () => {
-          mutationReconciler.markAcknowledged(
-            subject,
-            requestId,
-            intent,
-            attempt,
-          );
-        },
-        { subject, requestId, session, readTarget },
-      );
-      if (!result.dispatched) {
-        abortClaimBeforeDispatch(
-          subject,
-          requestId,
-          replayPin ? 'unknown' : null,
-          releaseOnce,
-        );
-        return false;
-      }
-      if (!result.saved && result.error) {
-        const verifyMonth =
-          intent.kind === 'complete'
-            ? intent.monthStart
-            : `${monthRef.current}-01`;
-        const outcome = await mutationReconciler.settleFailure({
-          subject,
-          requestId,
-          target: readTarget,
-          error: result.error,
-          releaseOnce,
-          readState: () => loadExpenseMonth(verifyMonth),
-          onReadData: (fresh) => {
-            if (fresh.monthStart === `${monthRef.current}-01`) {
-              setData(fresh);
-              setLoadError(null);
-            }
-          },
-          loadedTargetOf: (fresh) => fresh.monthStart,
-        });
-        if (outcome.status === 'reconciled_saved') {
-          setError(null);
-          setMutationNotice('اتحفظ التعديل');
-          return true;
-        }
-        return false;
-      }
-      return result.saved;
-    } finally {
-      releaseOnce();
-    }
-  }
-
-  function replayUnknownMutation(
-    pin: RequestlessPin<StoredExpenseMutationIntent>,
-  ): void {
-    const intent = pin.intent;
-    if (intent.kind === 'complete') {
-      void runClaimedMutation(
-        pin.subject,
-        'expense_complete',
-        intent.monthStart,
-        intent,
-        () => setMonthExpenseComplete(intent.monthStart, intent.complete),
-        setListError,
-        pin,
-      );
-      return;
-    }
-    if (intent.kind === 'category_add') {
-      void runClaimedMutation(
-        pin.subject,
-        'expense_category',
-        '*',
-        intent,
-        () => addExpenseCategory(intent.name, intent.categoryKind),
-        setCategoryError,
-        pin,
-      );
-      return;
-    }
-    if (intent.kind === 'category_rename') {
-      void runClaimedMutation(
-        pin.subject,
-        'expense_category',
-        '*',
-        intent,
-        () => renameExpenseCategory(intent.categoryId, intent.name),
-        setCategoryError,
-        pin,
-      );
-      return;
-    }
-    void runClaimedMutation(
-      pin.subject,
-      'expense_category',
-      '*',
-      intent,
-      () => setExpenseCategoryActive(intent.categoryId, intent.active),
-      setCategoryError,
-      pin,
-    );
   }
 
   async function submitExpense(draft: ExpenseDraft) {
@@ -983,58 +833,50 @@ export function ExpensesPage() {
           <p role="status">{offlineMoneyMessage}</p>
         </>
       ) : null}
-      {mutationNotice ? <p role="status">{mutationNotice}</p> : null}
-      {recoverableMutations.length > 0 ? (
+      {completeVerify ? (
         <section
-          aria-label="تعديلات مصاريف مش متأكد إنها اتسجلت"
+          aria-label="حالة تأكيد الشهر"
           className="flex flex-col gap-2 rounded border border-neutral-300 p-3"
         >
-          {recoverableMutations.map((pin) => {
-            const replayReady = mutationReconciler.canReplay(pin);
-            const isComplete = pin.intent.kind === 'complete';
-            return (
-              <div key={pin.subject} className="flex flex-col gap-1">
-                <p role="status">
-                  {pin.acknowledged
-                    ? isComplete
-                      ? 'تأكيد الشهر اتحفظ وجاري التحقق من التحديث'
-                      : 'تعديل التصنيف اتحفظ وجاري التحقق من التحديث'
-                    : isComplete
-                      ? 'تأكيد الشهر مش متأكد إنه اتسجل'
-                      : 'تعديل التصنيف مش متأكد إنه اتسجل'}
-                </p>
-                {replayReady ? (
-                  <button
-                    className={secondaryButton}
-                    type="button"
-                    disabled={
-                      saving ||
-                      inflightExpense ||
-                      inflightVoid ||
-                      localNeedsReload ||
-                      postedReloadForTarget(pin.target) ||
-                      readLoads > 0 ||
-                      !online
-                    }
-                    onClick={() => replayUnknownMutation(pin)}
-                  >
-                    {isComplete
-                      ? 'إعادة محاولة تأكيد الشهر'
-                      : 'إعادة محاولة حفظ التصنيف'}
-                  </button>
-                ) : (
-                  <button
-                    className={secondaryButton}
-                    type="button"
-                    disabled={saving || readLoads > 0 || !online}
-                    onClick={retry}
-                  >
-                    التحقق من حالة الحفظ
-                  </button>
-                )}
-              </div>
-            );
-          })}
+          <p role="status">مش متأكد إنه اتحفظ</p>
+          {completeVerify.status === 'read_failed' ? (
+            <>
+              {completeVerify.readError ? (
+                <p role="alert">{completeVerify.readError}</p>
+              ) : null}
+              <button
+                className={secondaryButton}
+                type="button"
+                disabled={saving || readLoads > 0 || !online}
+                onClick={() => void verifyRequestlessRead('complete')}
+              >
+                تحقق تاني
+              </button>
+            </>
+          ) : null}
+        </section>
+      ) : null}
+      {categoryVerify ? (
+        <section
+          aria-label="حالة حفظ التصنيف"
+          className="flex flex-col gap-2 rounded border border-neutral-300 p-3"
+        >
+          <p role="status">مش متأكد إنه اتحفظ</p>
+          {categoryVerify.status === 'read_failed' ? (
+            <>
+              {categoryVerify.readError ? (
+                <p role="alert">{categoryVerify.readError}</p>
+              ) : null}
+              <button
+                className={secondaryButton}
+                type="button"
+                disabled={saving || readLoads > 0 || !online}
+                onClick={() => void verifyRequestlessRead('category')}
+              >
+                تحقق تاني
+              </button>
+            </>
+          ) : null}
         </section>
       ) : null}
       <p>{formatMonth(monthStart)}</p>
@@ -1106,17 +948,16 @@ export function ExpensesPage() {
             <input
               type="checkbox"
               checked={data.complete}
-              disabled={writeDisabled}
+              disabled={writeDisabled || completeVerifyBlocked}
               onChange={(event) => {
                 const nextChecked = event.target.checked;
-                void runClaimedMutation(
-                  `${EXPENSE_COMPLETE_PREFIX}${monthStart}`,
-                  'expense_complete',
-                  monthStart,
-                  { kind: 'complete', monthStart, complete: nextChecked },
-                  () => setMonthExpenseComplete(monthStart, nextChecked),
-                  setListError,
-                );
+                void runRequestlessExpenseWrite({
+                  kind: 'complete',
+                  targetMonth: monthStart,
+                  action: () =>
+                    setMonthExpenseComplete(monthStart, nextChecked),
+                  setError: setListError,
+                });
               }}
             />
             مصاريف الشهر كاملة
@@ -1150,37 +991,31 @@ export function ExpensesPage() {
           ) : null}
           <CategoryManager
             categories={data.categories}
-            disabled={writeDisabled}
+            disabled={writeDisabled || categoryVerifyBlocked}
             serverError={categoryError}
             onAdd={(name, kind: ExpenseKind) =>
-              runClaimedMutation(
-                `${EXPENSE_CATEGORY_PREFIX}add`,
-                'expense_category',
-                '*',
-                { kind: 'category_add', name, categoryKind: kind },
-                () => addExpenseCategory(name, kind),
-                setCategoryError,
-              )
+              runRequestlessExpenseWrite({
+                kind: 'category',
+                targetMonth: `${monthRef.current}-01`,
+                action: () => addExpenseCategory(name, kind),
+                setError: setCategoryError,
+              })
             }
             onRename={(id, name) =>
-              void runClaimedMutation(
-                `${EXPENSE_CATEGORY_PREFIX}rename:${id}`,
-                'expense_category',
-                '*',
-                { kind: 'category_rename', categoryId: id, name },
-                () => renameExpenseCategory(id, name),
-                setCategoryError,
-              )
+              void runRequestlessExpenseWrite({
+                kind: 'category',
+                targetMonth: `${monthRef.current}-01`,
+                action: () => renameExpenseCategory(id, name),
+                setError: setCategoryError,
+              })
             }
             onSetActive={(id, active) =>
-              void runClaimedMutation(
-                `${EXPENSE_CATEGORY_PREFIX}active:${id}`,
-                'expense_category',
-                '*',
-                { kind: 'category_active', categoryId: id, active },
-                () => setExpenseCategoryActive(id, active),
-                setCategoryError,
-              )
+              void runRequestlessExpenseWrite({
+                kind: 'category',
+                targetMonth: `${monthRef.current}-01`,
+                action: () => setExpenseCategoryActive(id, active),
+                setError: setCategoryError,
+              })
             }
           />
         </>

@@ -8,33 +8,13 @@ import {
 } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import {
-  addExpenseCategory,
-  loadExpenseMonth,
-  renameExpenseCategory,
-  setExpenseCategoryActive,
-  setMonthExpenseComplete,
-} from '@/expenses/api';
-import type { ExpenseMonth } from '@/expenses/types';
-import {
-  currentShiftStart,
-  listCostingSchedule,
-  listItems,
-  updateItem,
-} from '@/items/api';
 import { resetHeldWrites } from '@/items/request-id';
-import type { CatalogItem } from '@/items/types';
 import { AuthContext } from '@/lib/auth-context';
-import { cairoMonthInput } from '@/lib/cairo';
 import {
   claimFreshHeldWrite,
-  getHeldWrite,
   hasAnyHeldWrite,
-  hasReloadMarker,
-  rehydrateHeldWrites,
   resetHeldWritesStore,
   setHeldWriteUser,
-  setReloadMarker,
 } from '@/lib/held-writes';
 import {
   applyPwaUpdate,
@@ -48,36 +28,8 @@ import {
   loadUnlinkedRefunds,
 } from '@/order-decisions/api';
 import { queueRow } from '@/order-decisions/test-fixtures';
-import { ExpensesPage } from '@/pages/ExpensesPage';
-import { ItemsPage } from '@/pages/ItemsPage';
 import { OrderDecisionsPage } from '@/pages/OrderDecisionsPage';
 import { UpdateBanner } from '@/pwa/UpdateBanner';
-
-vi.mock('@/items/api', () => ({
-  addConversion: vi.fn(),
-  addCustomUnit: vi.fn(),
-  costingImpact: vi.fn(),
-  createItem: vi.fn(),
-  currentShiftStart: vi.fn(),
-  listConversions: vi.fn(),
-  listCostingSchedule: vi.fn(),
-  listItems: vi.fn(),
-  listUnitOptions: vi.fn(),
-  setItemLoss: vi.fn(),
-  setOpeningPrice: vi.fn(),
-  updateItem: vi.fn(),
-}));
-
-vi.mock('@/expenses/api', () => ({
-  addExpenseCategory: vi.fn(),
-  addExpenseEntry: vi.fn(),
-  loadExpenseEntryMonth: vi.fn(),
-  loadExpenseMonth: vi.fn(),
-  renameExpenseCategory: vi.fn(),
-  setExpenseCategoryActive: vi.fn(),
-  setMonthExpenseComplete: vi.fn(),
-  voidExpenseEntry: vi.fn(),
-}));
 
 vi.mock('@/order-decisions/api', () => ({
   loadQueuePage: vi.fn(),
@@ -85,38 +37,6 @@ vi.mock('@/order-decisions/api', () => ({
   loadUnlinkedRefunds: vi.fn(),
   setOrderDisposition: vi.fn(),
 }));
-
-const oilItem: CatalogItem = {
-  id: 'oil',
-  name: 'زيت',
-  kind: 'ingredient',
-  baseUnit: 'liter',
-  countFrequency: 'weekly',
-  lossPct: 0,
-  parentItemId: null,
-  active: true,
-  onHandQty: 0,
-  avgCost: 0,
-  onHandValue: 0,
-};
-
-function expenseMonth(
-  monthStart: string,
-  overrides: Partial<ExpenseMonth> = {},
-): ExpenseMonth {
-  return {
-    monthStart,
-    complete: false,
-    confirmedAt: null,
-    categories: [
-      { id: 'rent', name: 'إيجار', kind: 'fixed_monthly', active: true },
-      { id: 'gas', name: 'غاز', kind: 'daily', active: true },
-    ],
-    entries: [],
-    days: [],
-    ...overrides,
-  };
-}
 
 function setOnline(value: boolean) {
   Object.defineProperty(window.navigator, 'onLine', {
@@ -164,23 +84,6 @@ describe('P7-3 round-6 review fixes', () => {
     setPwaAuthResolved(true);
     installMockLocks();
 
-    vi.mocked(listItems).mockResolvedValue([oilItem]);
-    vi.mocked(updateItem).mockResolvedValue(undefined);
-    vi.mocked(currentShiftStart).mockResolvedValue(null);
-    vi.mocked(listCostingSchedule).mockResolvedValue({
-      lossToken: 'tok-loss-1',
-      emptyToken: 'tok-empty',
-      identity: 'liter|ingredient||',
-      lossVersions: [],
-      conversions: [],
-    });
-    vi.mocked(loadExpenseMonth).mockImplementation((monthStart) =>
-      Promise.resolve(expenseMonth(monthStart)),
-    );
-    vi.mocked(setMonthExpenseComplete).mockResolvedValue(undefined);
-    vi.mocked(addExpenseCategory).mockResolvedValue(undefined);
-    vi.mocked(renameExpenseCategory).mockResolvedValue(undefined);
-    vi.mocked(setExpenseCategoryActive).mockResolvedValue(undefined);
     vi.mocked(loadUnlinkedRefunds).mockResolvedValue([]);
     vi.mocked(loadQueueRow).mockResolvedValue(null);
   });
@@ -190,278 +93,6 @@ describe('P7-3 round-6 review fixes', () => {
     resetPwaState();
     localStorage.clear();
     setOnline(true);
-  });
-
-  it('R6-1b: confirming February does not overwrite or clear January reload verification marker', async () => {
-    // January was previously confirmed and its reload failed, leaving January's marker held.
-    setReloadMarker('expense:reload', '2026-01-01');
-    expect(hasReloadMarker('expense:reload', '2026-01-01')).toBe(true);
-
-    let febComplete = false;
-    vi.mocked(loadExpenseMonth).mockImplementation((monthStart) => {
-      if (monthStart === '2026-01-01') {
-        return Promise.reject(new Error('january reload still failing'));
-      }
-      if (monthStart === '2026-02-01') {
-        return Promise.resolve(
-          expenseMonth('2026-02-01', { complete: febComplete }),
-        );
-      }
-      return Promise.resolve(expenseMonth(monthStart, { complete: false }));
-    });
-    vi.mocked(setMonthExpenseComplete).mockImplementation(
-      (monthStart, next) => {
-        if (monthStart === '2026-02-01') {
-          febComplete = next;
-        }
-        return Promise.resolve();
-      },
-    );
-
-    render(
-      <MemoryRouter>
-        <ExpensesPage />
-      </MemoryRouter>,
-    );
-
-    // Switch picker to February (allowed because January's marker targets 2026-01-01, not current month).
-    const picker = await screen.findByLabelText('الشهر');
-    fireEvent.change(picker, { target: { value: '2026-02' } });
-    await waitFor(() => {
-      expect(loadExpenseMonth).toHaveBeenCalledWith('2026-02-01');
-    });
-
-    // Drive the REAL February confirmation via the checkbox and its following read.
-    const checkbox = screen.getByRole('checkbox', {
-      name: 'مصاريف الشهر كاملة',
-    });
-    await waitFor(() => {
-      expect(checkbox).toBeEnabled();
-    });
-    fireEvent.click(checkbox);
-
-    await waitFor(() => {
-      expect(setMonthExpenseComplete).toHaveBeenCalledWith('2026-02-01', true);
-    });
-    await waitFor(() => {
-      expect(
-        screen.getByRole('checkbox', { name: 'مصاريف الشهر كاملة' }),
-      ).toBeChecked();
-    });
-
-    // February's marker cleared after February's read succeeded, while January's marker REMAINS!
-    rehydrateHeldWrites();
-    expect(hasReloadMarker('expense:reload', '2026-02-01')).toBe(false);
-    expect(hasReloadMarker('expense:reload', '2026-01-01')).toBe(true);
-  });
-
-  it('R6-2a: ItemsPage updateItem verifies ambiguous outcomes via targeted read, reconciles if applied, and offers explicit replay after reload if not', async () => {
-    // Part 1: RPC committed on server, reply lost -> targeted read sees new name -> clears pin & shows saved.
-    vi.mocked(listItems)
-      .mockResolvedValueOnce([oilItem])
-      .mockResolvedValueOnce([{ ...oilItem, name: 'زيت ممتاز' }]);
-    vi.mocked(updateItem).mockRejectedValueOnce(new Error('network lost'));
-
-    const view1 = render(
-      <MemoryRouter>
-        <ItemsPage />
-      </MemoryRouter>,
-    );
-    fireEvent.click(await screen.findByRole('button', { name: 'تعديل' }));
-    fireEvent.change(screen.getByLabelText('الاسم'), {
-      target: { value: 'زيت ممتاز' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
-
-    await waitFor(() => {
-      expect(updateItem).toHaveBeenCalledTimes(1);
-    });
-    // Targeted read reconciled the committed update and cleared the pin.
-    expect(await screen.findByText('اتحفظت بيانات الصنف')).toBeInTheDocument();
-    expect(getHeldWrite('item:details:oil')).toBeNull();
-    view1.unmount();
-
-    // Part 2: RPC did NOT commit, reply lost -> pin stays unknown (never cleared without match),
-    // never auto-sends, and survives reload with an explicit retry button that replays the intent.
-    vi.resetAllMocks();
-    resetHeldWritesStore({ clearStorage: true });
-    setHeldWriteUser('owner-1');
-    vi.mocked(listItems).mockResolvedValue([oilItem]);
-    vi.mocked(currentShiftStart).mockResolvedValue(null);
-    vi.mocked(listCostingSchedule).mockResolvedValue({
-      lossToken: 'tok-loss-1',
-      emptyToken: 'tok-empty',
-      identity: 'liter|ingredient||',
-      lossVersions: [],
-      conversions: [],
-    });
-    vi.mocked(updateItem).mockRejectedValueOnce(new Error('network lost'));
-
-    const view2 = render(
-      <MemoryRouter>
-        <ItemsPage />
-      </MemoryRouter>,
-    );
-    fireEvent.click(await screen.findByRole('button', { name: 'تعديل' }));
-    fireEvent.change(screen.getByLabelText('الاسم'), {
-      target: { value: 'زيت تاني' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
-
-    await waitFor(() => {
-      expect(updateItem).toHaveBeenCalledTimes(1);
-    });
-    // Pin MUST remain unknown in localStorage (NOT cleared by the error handler).
-    await waitFor(() => {
-      expect(getHeldWrite('item:details:oil')?.phase).toBe('unknown');
-    });
-    // Never auto-sends.
-    expect(updateItem).toHaveBeenCalledTimes(1);
-    view2.unmount();
-
-    // Simulate reload: remount ItemsPage -> reads catalog -> still 'زيت' -> shows explicit retry!
-    rehydrateHeldWrites();
-    vi.mocked(updateItem).mockResolvedValueOnce(undefined);
-    vi.mocked(listItems)
-      .mockResolvedValueOnce([oilItem])
-      .mockResolvedValueOnce([{ ...oilItem, name: 'زيت تاني' }]);
-
-    render(
-      <MemoryRouter>
-        <ItemsPage />
-      </MemoryRouter>,
-    );
-
-    const retryBtn = await screen.findByRole('button', {
-      name: 'إعادة محاولة حفظ بيانات الصنف',
-    });
-    expect(updateItem).toHaveBeenCalledTimes(1); // still no auto-send after reload
-    fireEvent.click(retryBtn);
-
-    await waitFor(() => {
-      expect(updateItem).toHaveBeenCalledTimes(2);
-    });
-    expect(vi.mocked(updateItem).mock.calls[1]?.[0]).toBe('oil');
-    expect(vi.mocked(updateItem).mock.calls[1]?.[1]).toMatchObject({
-      name: 'زيت تاني',
-    });
-    await waitFor(() => {
-      expect(getHeldWrite('item:details:oil')).toBeNull();
-    });
-  });
-
-  it('R6-2b: ExpensesPage month confirmation and category writes verify ambiguous outcomes via read and offer explicit replay after reload', async () => {
-    const monthStart = `${cairoMonthInput()}-01`;
-
-    // Part 1: month confirmation lost reply, server ALREADY applied complete=true -> clears pin & shows saved.
-    vi.mocked(loadExpenseMonth)
-      .mockResolvedValueOnce(expenseMonth(monthStart, { complete: false }))
-      .mockResolvedValueOnce(expenseMonth(monthStart, { complete: true }));
-    vi.mocked(setMonthExpenseComplete).mockRejectedValueOnce(
-      new Error('network lost'),
-    );
-
-    const view1 = render(
-      <MemoryRouter>
-        <ExpensesPage />
-      </MemoryRouter>,
-    );
-    fireEvent.click(
-      await screen.findByRole('checkbox', { name: 'مصاريف الشهر كاملة' }),
-    );
-    await waitFor(() => {
-      expect(setMonthExpenseComplete).toHaveBeenCalledTimes(1);
-    });
-    expect(await screen.findByText('اتحفظ التعديل')).toBeInTheDocument();
-    expect(getHeldWrite(`expense:complete:${monthStart}`)).toBeNull();
-    view1.unmount();
-
-    // Part 2: month confirmation lost reply, server still complete=false -> pin stays unknown across reload,
-    // no auto-send, explicit retry button replays the exact stored intent!
-    vi.resetAllMocks();
-    resetHeldWritesStore({ clearStorage: true });
-    setHeldWriteUser('owner-1');
-    vi.mocked(loadExpenseMonth).mockResolvedValue(
-      expenseMonth(monthStart, { complete: false }),
-    );
-    vi.mocked(setMonthExpenseComplete).mockRejectedValueOnce(
-      new Error('network lost'),
-    );
-
-    const view2 = render(
-      <MemoryRouter>
-        <ExpensesPage />
-      </MemoryRouter>,
-    );
-    fireEvent.click(
-      await screen.findByRole('checkbox', { name: 'مصاريف الشهر كاملة' }),
-    );
-    await waitFor(() => {
-      expect(getHeldWrite(`expense:complete:${monthStart}`)?.phase).toBe(
-        'unknown',
-      );
-    });
-    expect(setMonthExpenseComplete).toHaveBeenCalledTimes(1);
-    view2.unmount();
-
-    // Reload -> targeted read sees complete=false -> shows explicit retry button.
-    rehydrateHeldWrites();
-    vi.mocked(setMonthExpenseComplete).mockResolvedValueOnce(undefined);
-    vi.mocked(loadExpenseMonth)
-      .mockResolvedValueOnce(expenseMonth(monthStart, { complete: false }))
-      .mockResolvedValueOnce(expenseMonth(monthStart, { complete: true }));
-
-    const view3 = render(
-      <MemoryRouter>
-        <ExpensesPage />
-      </MemoryRouter>,
-    );
-    const retryCompleteBtn = await screen.findByRole('button', {
-      name: 'إعادة محاولة تأكيد الشهر',
-    });
-    expect(setMonthExpenseComplete).toHaveBeenCalledTimes(1); // no auto-send
-    fireEvent.click(retryCompleteBtn);
-    await waitFor(() => {
-      expect(setMonthExpenseComplete).toHaveBeenCalledTimes(2);
-    });
-    expect(setMonthExpenseComplete).toHaveBeenLastCalledWith(monthStart, true);
-    await waitFor(() => {
-      expect(getHeldWrite(`expense:complete:${monthStart}`)).toBeNull();
-    });
-    view3.unmount();
-
-    // Part 3: category rename lost reply -> stays unknown, explicit retry replays renameExpenseCategory!
-    vi.resetAllMocks();
-    resetHeldWritesStore({ clearStorage: true });
-    setHeldWriteUser('owner-1');
-    vi.mocked(loadExpenseMonth).mockResolvedValue(expenseMonth(monthStart));
-    vi.mocked(renameExpenseCategory).mockRejectedValueOnce(
-      new Error('network lost'),
-    );
-
-    render(
-      <MemoryRouter>
-        <ExpensesPage />
-      </MemoryRouter>,
-    );
-    const renameInput = await screen.findByLabelText('اسم غاز');
-    fireEvent.change(renameInput, { target: { value: 'غاز طبيعي' } });
-    fireEvent.click(screen.getByRole('button', { name: 'حفظ اسم غاز' }));
-
-    await waitFor(() => {
-      expect(getHeldWrite('expense:category:rename:gas')?.phase).toBe(
-        'unknown',
-      );
-    });
-    vi.mocked(renameExpenseCategory).mockResolvedValueOnce(undefined);
-    const retryCatBtn = await screen.findByRole('button', {
-      name: 'إعادة محاولة حفظ التصنيف',
-    });
-    fireEvent.click(retryCatBtn);
-    await waitFor(() => {
-      expect(renameExpenseCategory).toHaveBeenCalledTimes(2);
-    });
-    expect(renameExpenseCategory).toHaveBeenLastCalledWith('gas', 'غاز طبيعي');
   });
 
   it('R6-3b: UpdateBanner stays disabled after sign-out while a live claim lock is held and re-enables only after release (still requiring click)', async () => {
