@@ -1,3 +1,4 @@
+import { flushSync } from 'react-dom';
 import {
   useCallback,
   useEffect,
@@ -19,6 +20,7 @@ import {
 import { emptyScheduleToken } from '@/items/effective';
 import {
   identityOutOfDateMessage,
+  genericCatalogError,
   messageFrom,
   saveDetailsFirstMessage,
   StaleWriteError,
@@ -339,6 +341,7 @@ export function ConversionsPanel({
   const aliveRef = useRef(false);
   const onItemStaleRef = useRef(onItemStale);
   const onRunItemReadRef = useRef(onRunItemRead);
+  const syncedConversionsRef = useRef(syncedData?.conversions);
   const itemBaseUnitRef = useRef(item.baseUnit);
   const identityKey = itemIdentity(item);
   const itemIdentityRef = useRef(identityKey);
@@ -347,9 +350,16 @@ export function ConversionsPanel({
   useEffect(() => {
     onItemStaleRef.current = onItemStale;
     onRunItemReadRef.current = onRunItemRead;
+    syncedConversionsRef.current = syncedData?.conversions;
     itemBaseUnitRef.current = item.baseUnit;
     itemIdentityRef.current = identityKey;
-  }, [identityKey, item.baseUnit, onItemStale, onRunItemRead]);
+  }, [
+    identityKey,
+    item.baseUnit,
+    onItemStale,
+    onRunItemRead,
+    syncedData?.conversions,
+  ]);
   const [localRows, setLocalRows] = useState<UnitConversion[] | null>(null);
   const [localBaseUnit, setLocalBaseUnit] = useState<BaseUnit | null>(null);
   const [localSchedule, setLocalSchedule] = useState<CostingSchedule | null>(
@@ -437,192 +447,118 @@ export function ConversionsPanel({
     addDisabled,
   );
 
-  const applySnapshot = useCallback(
-    async (
-      itemId: string,
-      next: ConversionList,
-      scheduleIdentity: string,
-      requestId: number,
-      cancelled: () => boolean,
-    ) => {
-      if (!aliveRef.current || cancelled() || requestId !== requestRef.current)
-        return;
-      setLocalRows(next.rows);
-      setLocalBaseUnit(next.baseUnit);
-      setLoadError(null);
-      if (
-        next.baseUnit !== itemBaseUnitRef.current ||
-        scheduleIdentity !== itemIdentityRef.current
-      ) {
-        await onItemStaleRef.current?.(itemId);
-      }
-    },
-    [],
-  );
+  const load = useCallback(
+    async (verify = true): Promise<boolean> => {
+      const requestId = ++requestRef.current;
+      const isCurrent = () =>
+        aliveRef.current && requestId === requestRef.current;
+      const pendingReloads = snapshotActionPostedReloads({
+        prefix: `conversion:[${JSON.stringify(item.id)},`,
+      });
+      const needsVerification = verify || pendingReloads.length > 0;
+      const readSession = captureWriteSession();
+      const runItemRead = onRunItemReadRef.current;
+      const initialConversions = syncedConversionsRef.current;
 
-  const failLoad = useCallback(
-    async (
-      itemId: string,
-      error: unknown,
-      requestId: number,
-      cancelled: () => boolean,
-    ) => {
-      if (!aliveRef.current || cancelled() || requestId !== requestRef.current)
-        return;
-      setLoadError(messageFrom(error));
-      if (error instanceof StaleWriteError) {
-        await onItemStaleRef.current?.(itemId);
-      }
-    },
-    [],
-  );
-
-  const load = useCallback(async (): Promise<boolean> => {
-    const requestId = ++requestRef.current;
-    const pendingReloads = snapshotActionPostedReloads({
-      prefix: `conversion:[${JSON.stringify(item.id)},`,
-    });
-    const runItemRead = onRunItemReadRef.current;
-    try {
-      if (runItemRead) {
-        const outcome = await runItemRead(item.id, {
-          kind: 'conversion',
-          snapshots: pendingReloads,
-        });
-        if (outcome.status === 'superseded') return false;
-        if (
-          !aliveRef.current ||
-          requestId !== requestRef.current ||
-          !outcome.conversions ||
-          !outcome.schedule
-        ) {
-          return true;
+      const applySnapshot = async (
+        conversions: ConversionList,
+        nextSchedule: CostingSchedule,
+        freshItem?: CatalogItem,
+      ) => {
+        if (!isCurrent()) return false;
+        const publish = () => {
+          setLocalSchedule(nextSchedule);
+          setLocalRows(conversions.rows);
+          setLocalBaseUnit(conversions.baseUnit);
+          setLoadError(null);
+        };
+        if (!runItemRead && pendingReloads.length > 0) {
+          flushSync(publish);
+          await clearCostingPinsForItem(pendingReloads, item.id, readSession);
+        } else {
+          publish();
         }
-        setLocalSchedule(outcome.schedule);
-        setLocalRows(outcome.conversions.rows);
-        setLocalBaseUnit(outcome.conversions.baseUnit);
-        setLoadError(null);
-        const appliedBaseUnit =
-          outcome.item?.baseUnit ?? itemBaseUnitRef.current;
-        const appliedIdentity = outcome.item
-          ? itemIdentity(outcome.item)
-          : itemIdentityRef.current;
         if (
-          outcome.conversions.baseUnit !== appliedBaseUnit ||
-          outcome.schedule.identity !== appliedIdentity
+          isCurrent() &&
+          (conversions.baseUnit !==
+            (freshItem?.baseUnit ?? itemBaseUnitRef.current) ||
+            nextSchedule.identity !==
+              (freshItem ? itemIdentity(freshItem) : itemIdentityRef.current))
         ) {
           await onItemStaleRef.current?.(item.id);
         }
         return true;
-      }
-      const verified = await verifyConversionItem(item.id);
-      await clearCostingPinsForItem(pendingReloads, item.id);
-      if (!aliveRef.current || requestId !== requestRef.current) return false;
-      setLocalSchedule(verified.schedule);
-      await applySnapshot(
-        item.id,
-        verified.conversions,
-        verified.schedule.identity,
-        requestId,
-        () => false,
-      );
-      return true;
-    } catch (error) {
-      await failLoad(item.id, error, requestId, () => false);
-      return false;
-    }
-  }, [applySnapshot, failLoad, item.id]);
+      };
 
-  useEffect(() => {
-    const requestId = ++requestRef.current;
-    let cancelled = false;
-    aliveRef.current = true;
-    const pendingReloads = snapshotActionPostedReloads({
-      prefix: `conversion:[${JSON.stringify(item.id)},`,
-    });
-    const runItemRead = onRunItemReadRef.current;
-
-    void (async () => {
       try {
         if (runItemRead) {
-          const outcome = await runItemRead(
-            item.id,
-            pendingReloads.length > 0
-              ? { kind: 'conversion', snapshots: pendingReloads }
-              : { kind: 'conversions_open' },
-          );
-          if (outcome.status === 'superseded') {
-            return;
-          }
-          if (
-            !aliveRef.current ||
-            cancelled ||
-            requestId !== requestRef.current ||
-            !outcome.conversions ||
-            !outcome.schedule
-          ) {
-            return;
-          }
-          setLocalSchedule(outcome.schedule);
-          setLocalRows(outcome.conversions.rows);
-          setLocalBaseUnit(outcome.conversions.baseUnit);
-          setLoadError(null);
-          const appliedBaseUnit =
-            outcome.item?.baseUnit ?? itemBaseUnitRef.current;
-          const appliedIdentity = outcome.item
-            ? itemIdentity(outcome.item)
-            : itemIdentityRef.current;
-          if (
-            outcome.conversions.baseUnit !== appliedBaseUnit ||
-            outcome.schedule.identity !== appliedIdentity
-          ) {
-            await onItemStaleRef.current?.(item.id);
-          }
-          return;
+          // The first verification can settle a write that finished after unmount.
+          do {
+            const outcome = await runItemRead(
+              item.id,
+              needsVerification
+                ? { kind: 'conversion', snapshots: pendingReloads }
+                : { kind: 'conversions_open' },
+            );
+            if (!isCurrent()) return false;
+            if (outcome.status === 'applied') {
+              if (!outcome.conversions || !outcome.schedule)
+                throw new Error(genericCatalogError);
+              return await applySnapshot(
+                outcome.conversions,
+                outcome.schedule,
+                outcome.item,
+              );
+            }
+            // A newer read may only cover the schedule. Give it time to publish,
+            // then replace this request if the mounted panel still needs rows.
+            await outcome.waitForLatest();
+            const synced = syncedConversionsRef.current;
+            if (
+              isCurrent() &&
+              !needsVerification &&
+              synced &&
+              synced !== initialConversions
+            ) {
+              setLoadError(null);
+              return true;
+            }
+          } while (isCurrent());
+          return false;
         }
-        if (pendingReloads.length > 0) {
+        if (needsVerification) {
           const verified = await verifyConversionItem(item.id);
-          await clearCostingPinsForItem(pendingReloads, item.id);
-          if (
-            !aliveRef.current ||
-            cancelled ||
-            requestId !== requestRef.current
-          )
-            return;
-          setLocalSchedule(verified.schedule);
-          await applySnapshot(
-            item.id,
-            verified.conversions,
-            verified.schedule.identity,
-            requestId,
-            () => cancelled,
-          );
-          return;
+          return await applySnapshot(verified.conversions, verified.schedule);
         }
-        const [next, nextSchedule] = await Promise.all([
+        const [conversions, nextSchedule] = await Promise.all([
           listConversions(item.id),
           listCostingSchedule(item.id),
         ]);
-        if (!aliveRef.current || cancelled || requestId !== requestRef.current)
-          return;
-        setLocalSchedule(nextSchedule);
-        await applySnapshot(
-          item.id,
-          next,
-          nextSchedule.identity,
-          requestId,
-          () => cancelled,
-        );
+        return await applySnapshot(conversions, nextSchedule);
       } catch (error) {
-        await failLoad(item.id, error, requestId, () => cancelled);
+        if (!isCurrent()) return false;
+        setLoadError(messageFrom(error));
+        if (error instanceof StaleWriteError)
+          await onItemStaleRef.current?.(item.id);
+        return false;
       }
-    })();
+    },
+    [item.id],
+  );
 
+  useEffect(() => {
+    let cancelled = false;
+    aliveRef.current = true;
+    void Promise.resolve().then(() => {
+      if (!cancelled) return load(false);
+      return false;
+    });
     return () => {
       cancelled = true;
       aliveRef.current = false;
+      requestRef.current += 1;
     };
-  }, [applySnapshot, failLoad, identityKey, item.id]);
+  }, [identityKey, load]);
 
   useEffect(() => {
     let cancelled = false;

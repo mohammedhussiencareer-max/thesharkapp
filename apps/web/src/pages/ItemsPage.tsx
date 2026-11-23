@@ -1,3 +1,4 @@
+import { flushSync } from 'react-dom';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
@@ -178,6 +179,7 @@ export function ItemsPage() {
   const catalogIssuedSeqRef = useRef(0);
   const itemIssuedSeqRef = useRef(new Map<string, number>());
   const itemAppliedSeqRef = useRef(new Map<string, number>());
+  const pendingReadRef = useRef(new Map<number, Promise<void>>());
   const catalogLoadsRef = useRef(0);
 
   const setDetailsVerifyState = useCallback(
@@ -192,26 +194,53 @@ export function ItemsPage() {
     formDetailsDirtyRef.current = dirty;
   }, []);
 
-  const beginCatalogRead = useCallback((): number => {
+  const beginRead = useCallback((itemId?: string) => {
     const token = ++readSeqRef.current;
-    catalogIssuedSeqRef.current = token;
-    return token;
+    if (itemId === undefined) {
+      catalogIssuedSeqRef.current = token;
+    } else {
+      itemIssuedSeqRef.current.set(itemId, token);
+    }
+    let resolveRead = () => {};
+    pendingReadRef.current.set(
+      token,
+      new Promise<void>((resolve) => {
+        resolveRead = resolve;
+      }),
+    );
+    return {
+      token,
+      finish: () => {
+        pendingReadRef.current.delete(token);
+        resolveRead();
+      },
+    };
   }, []);
 
-  const beginItemRead = useCallback((itemId: string): number => {
-    const token = ++readSeqRef.current;
-    itemIssuedSeqRef.current.set(itemId, token);
-    return token;
-  }, []);
-
-  const isLatestForItem = useCallback((itemId: string, token: number) => {
-    return (
+  const latestTokenForItem = useCallback(
+    (itemId: string) =>
       Math.max(
         itemIssuedSeqRef.current.get(itemId) ?? 0,
         catalogIssuedSeqRef.current,
-      ) === token
-    );
-  }, []);
+      ),
+    [],
+  );
+
+  const isLatestForItem = useCallback(
+    (itemId: string, token: number) => latestTokenForItem(itemId) === token,
+    [latestTokenForItem],
+  );
+
+  const waitForLatestItemRead = useCallback(
+    async (itemId: string) => {
+      let pending = pendingReadRef.current.get(latestTokenForItem(itemId));
+      while (pending) {
+        await pending;
+        pending = pendingReadRef.current.get(latestTokenForItem(itemId));
+      }
+    },
+    [latestTokenForItem],
+  );
 
   const syncFormBaseline = useCallback(
     (fresh: CatalogItem, opts?: { forceSyncBaseline?: boolean }) => {
@@ -240,7 +269,7 @@ export function ItemsPage() {
     rows: CatalogItem[];
     token: number;
   } | null> => {
-    const token = beginCatalogRead();
+    const { token, finish } = beginRead();
     const readSession = captureWriteSession();
     catalogLoadsRef.current += 1;
     setCatalogLoads(catalogLoadsRef.current);
@@ -253,10 +282,11 @@ export function ItemsPage() {
       if (token !== catalogIssuedSeqRef.current) return null;
       throw error;
     } finally {
+      finish();
       catalogLoadsRef.current -= 1;
       setCatalogLoads(catalogLoadsRef.current);
     }
-  }, [beginCatalogRead]);
+  }, [beginRead]);
 
   const applyCatalogRows = useCallback(
     (next: CatalogItem[], catalogToken: number) => {
@@ -304,7 +334,7 @@ export function ItemsPage() {
   // Targeted by-ID read sharing the same per-item read token sequence.
   const readItemById = useCallback(
     async (itemId: string): Promise<ItemByIdResult> => {
-      const token = beginItemRead(itemId);
+      const { token, finish } = beginRead(itemId);
       const readSession = captureWriteSession();
       catalogLoadsRef.current += 1;
       setCatalogLoads(catalogLoadsRef.current);
@@ -317,11 +347,12 @@ export function ItemsPage() {
         if (!isLatestForItem(itemId, token)) return { status: 'superseded' };
         throw error;
       } finally {
+        finish();
         catalogLoadsRef.current -= 1;
         setCatalogLoads(catalogLoadsRef.current);
       }
     },
-    [beginItemRead, isLatestForItem],
+    [beginRead, isLatestForItem],
   );
 
   const applyItemTransition = useCallback(
@@ -384,9 +415,27 @@ export function ItemsPage() {
       itemId: string,
       request: ItemReadRequest,
     ): Promise<ItemReadOutcome> => {
-      const token = beginItemRead(itemId);
+      const { token, finish } = beginRead(itemId);
       const isLatest = () => isLatestForItem(itemId, token);
-      if (request.kind === 'loss' || request.kind === 'conversion') {
+      const superseded = {
+        status: 'superseded' as const,
+        waitForLatest: () => waitForLatestItemRead(itemId),
+      };
+      let published = false;
+      try {
+        if (request.kind !== 'loss' && request.kind !== 'conversion') {
+          // Passive loads share the ordering without blocking details edits.
+          const [schedule, conversions] = await Promise.all([
+            listCostingSchedule(itemId),
+            request.kind === 'conversions_open'
+              ? listConversions(itemId)
+              : undefined,
+          ]);
+          if (!applyItemTransition(itemId, token, { schedule, conversions }))
+            return superseded;
+          return { status: 'applied', schedule, conversions };
+        }
+
         const readSession = captureWriteSession();
         catalogLoadsRef.current += 1;
         setCatalogLoads(catalogLoadsRef.current);
@@ -399,47 +448,34 @@ export function ItemsPage() {
             request.kind === 'loss'
               ? await verifyLossItem(itemId)
               : await verifyConversionItem(itemId);
-          if (!isLatest()) return { status: 'superseded' };
-          // Check the read token again under each subject lock. Finish
-          // verification before publishing an identity that starts new reads.
-          await clearCostingPinsForItem(
-            request.snapshots ?? [],
-            itemId,
-            isLatest,
-          );
-          if (!isLatest()) return { status: 'superseded' };
-          dataSessionRef.current = readSession;
-          applyItemTransition(itemId, token, verified);
-          return { status: 'applied', ...verified };
-        } catch (error) {
-          if (!isLatest()) {
-            return { status: 'superseded' };
+          if (!isLatest()) return superseded;
+          const snapshots = request.snapshots ?? [];
+          const publish = () => {
+            published = applyItemTransition(itemId, token, verified);
+            if (published) dataSessionRef.current = readSession;
+          };
+          if (snapshots.length > 0) {
+            // Commit the snapshot before any durable pin deletion is observable.
+            flushSync(publish);
+          } else {
+            publish();
           }
-          throw error;
+          if (!published) return superseded;
+          await clearCostingPinsForItem(snapshots, itemId, readSession);
+          return isLatest() ? { status: 'applied', ...verified } : superseded;
         } finally {
           catalogLoadsRef.current -= 1;
           setCatalogLoads(catalogLoadsRef.current);
         }
-      }
-
-      // Passive loads share the ordering without blocking details edits.
-      try {
-        const [schedule, conversions] = await Promise.all([
-          listCostingSchedule(itemId),
-          request.kind === 'conversions_open'
-            ? listConversions(itemId)
-            : undefined,
-        ]);
-        if (!applyItemTransition(itemId, token, { schedule, conversions })) {
-          return { status: 'superseded' };
-        }
-        return { status: 'applied', schedule, conversions };
       } catch (error) {
-        if (!isLatest()) return { status: 'superseded' };
+        // A failed cleanup still needs a retry after an accepted publication.
+        if (!published && !isLatest()) return superseded;
         throw error;
+      } finally {
+        finish();
       }
     },
-    [applyItemTransition, beginItemRead, isLatestForItem],
+    [applyItemTransition, beginRead, isLatestForItem, waitForLatestItemRead],
   );
 
   function setEditor(next: ItemEditor | null) {

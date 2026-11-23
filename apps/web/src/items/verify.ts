@@ -27,7 +27,7 @@ export type ItemReadOutcome =
       schedule?: CostingSchedule;
       conversions?: ConversionList;
     }
-  | { status: 'superseded' };
+  | { status: 'superseded'; waitForLatest: () => Promise<void> };
 
 export type RunItemRead = (
   itemId: string,

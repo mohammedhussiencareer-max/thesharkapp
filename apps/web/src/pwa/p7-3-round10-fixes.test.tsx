@@ -136,21 +136,29 @@ const boxItem: CatalogItem = {
 
 function makeFakeLocks() {
   const held = new Set<string>();
+  const waiters = new Map<string, Array<() => void>>();
   const locks = {
     async request<T>(
       name: string,
       options: { mode?: 'exclusive' | 'shared'; ifAvailable?: boolean },
       callback: (lock: { name: string; mode: string } | null) => Promise<T> | T,
     ): Promise<T> {
-      if (held.has(name)) {
+      while (held.has(name)) {
         if (options.ifAvailable) return await callback(null);
-        throw new Error('unexpected blocking lock');
+        await new Promise<void>((resolve) => {
+          const pending = waiters.get(name) ?? [];
+          pending.push(resolve);
+          waiters.set(name, pending);
+        });
       }
       held.add(name);
       try {
         return await callback({ name, mode: options.mode ?? 'exclusive' });
       } finally {
         held.delete(name);
+        const pending = waiters.get(name) ?? [];
+        waiters.delete(name);
+        for (const resume of pending) resume();
       }
     },
     query() {
@@ -299,7 +307,13 @@ describe('P7-3 round-10 review fixes', () => {
               replay.release();
               await Promise.resolve();
             }
-            await clearPostedReload(subject, 'oil', requestId);
+            const settled = clearPostedReload(subject, 'oil', requestId);
+            if (scenario === 'reclaimed') {
+              await Promise.resolve();
+              expect(localStorage.getItem(key)).toContain(requestId);
+              replay.release();
+            }
+            await settled;
             expect(localStorage.getItem(key)).not.toBeNull();
             expect(localStorage.getItem(key)).toContain(requestId);
           } finally {
@@ -423,6 +437,7 @@ describe('P7-3 round-10 review fixes', () => {
       target: { value: 'مسودة' },
     });
     fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+    await waitFor(() => expect(listConversions).toHaveBeenCalledWith('oil'));
     await act(async () => {
       resolvePanel({ baseUnit: 'kg', rows: [] });
       await Promise.resolve();
@@ -614,6 +629,229 @@ describe('P7-3 round-10 review fixes', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('R12-1: an editor schedule read cannot strand a mounted conversions panel', async () => {
+    let resolveFirst!: (
+      value: Awaited<ReturnType<typeof listConversions>>,
+    ) => void;
+    const fresh = {
+      baseUnit: 'liter' as const,
+      rows: [
+        { itemId: 'oil', unit: 'كرتونة', factorToBase: 3, storedFactor: '3' },
+      ],
+    };
+    vi.mocked(listConversions)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockResolvedValue(fresh);
+
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole('article', { name: 'زيت' });
+    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+    await waitFor(() => expect(listConversions).toHaveBeenCalledTimes(1));
+    fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
+    await waitFor(() => expect(listCostingSchedule).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      resolveFirst({ baseUnit: 'liter', rows: [] });
+      await Promise.resolve();
+    });
+    expect(
+      await within(card).findByText('1 كرتونة = 3 لتر'),
+    ).toBeInTheDocument();
+  });
+
+  it('R12-2: combined verification publishes the accepted item before clearing either pin', async () => {
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole('article', { name: 'زيت' });
+    fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
+    await waitFor(() =>
+      expect(listCostingSchedule).toHaveBeenCalledWith('oil'),
+    );
+
+    const loss = lossSubject('oil');
+    const conversion = conversionSubject('oil', 'كرتونة');
+    act(() => {
+      for (const subject of [loss, conversion]) {
+        putHeldWrite(subject, {
+          requestId: subject,
+          payload: null,
+          phase: 'posted_reload',
+          readTarget: 'oil',
+        });
+      }
+    });
+    const newName = 'زيت بعد التحقق';
+    vi.mocked(getItemById).mockResolvedValue({
+      ...oilItem,
+      name: newName,
+      baseUnit: 'kg',
+    });
+    vi.mocked(listConversions).mockResolvedValue({ baseUnit: 'kg', rows: [] });
+    vi.mocked(listCostingSchedule).mockResolvedValue({
+      lossToken: emptyScheduleToken,
+      identity: 'kg|ingredient||',
+      lossVersions: [],
+      conversions: [],
+    });
+    const field = screen.getByLabelText<HTMLInputElement>('الاسم');
+    const atRemoval: string[] = [];
+    const remove = localStorage.removeItem.bind(localStorage);
+    vi.spyOn(Storage.prototype, 'removeItem').mockImplementation((key) => {
+      if (key.includes('posted:')) atRemoval.push(field.value);
+      remove(key);
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'تحقق تاني' }));
+    await waitFor(() => {
+      expect(getHeldWrite(loss)).toBeNull();
+      expect(getHeldWrite(conversion)).toBeNull();
+    });
+    expect(atRemoval).toEqual([newName, newName]);
+    expect(listCostingSchedule).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(['hydrate', 'hydrate with Web Locks', 'settle'] as const)(
+    'R12-3: an interrupted posted transition uses the posted copy on %s',
+    async (stage) => {
+      const subject = lossSubject('oil');
+      const activeKey = `${userStoragePrefix('owner-r10')}${encodeURIComponent(subject)}`;
+      const { locks } = makeFakeLocks();
+      const options = {
+        getLocks: () => (stage === 'hydrate with Web Locks' ? locks : null),
+      };
+      const writer = createHeldWriteStore(options);
+      writer.setHeldWriteUser('owner-r10');
+      const claim = await writer.claimFreshHeldWrite(subject, () => ({
+        loss: '10',
+      }));
+      if (!claim.ok) throw new Error('expected a fresh claim');
+      const { requestId } = claim.record;
+      const removal = vi
+        .spyOn(Storage.prototype, 'removeItem')
+        .mockImplementationOnce(() => {
+          throw new Error('cannot remove active pin');
+        });
+      try {
+        expect(() =>
+          writer.setHeldWritePhase(subject, requestId, 'posted_reload', {
+            readTarget: 'oil',
+          }),
+        ).toThrow(HeldWriteStorageError);
+      } finally {
+        removal.mockRestore();
+        claim.release();
+      }
+      const tab = createHeldWriteStore(options);
+      try {
+        tab.setHeldWriteUser('owner-r10');
+        await tab.rehydrateHeldWritesAsync();
+        if (stage !== 'settle') {
+          expect(tab.getHeldWrite(subject)?.phase).toBe('posted_reload');
+          const replay = await tab.claimReplayHeldWrite(subject, requestId);
+          if (replay.ok) replay.release();
+          expect(replay.ok).toBe(false);
+          const fresh = await tab.claimFreshHeldWrite(subject, () => ({
+            loss: '20',
+          }));
+          if (fresh.ok) fresh.release();
+          expect(fresh.ok).toBe(false);
+          expect(tab.getHeldWrite(subject)?.phase).toBe('posted_reload');
+        } else {
+          const read = localStorage.getItem.bind(localStorage);
+          const postedKey = `${userStoragePrefix('owner-r10')}posted:${encodeURIComponent(subject)}:${encodeURIComponent(requestId)}`;
+          const broken = vi
+            .spyOn(Storage.prototype, 'getItem')
+            .mockImplementation((key) => {
+              if (key === postedKey) throw new Error('cannot read posted pin');
+              return read(key);
+            });
+          try {
+            await expect(
+              Promise.resolve().then(() =>
+                tab.clearPostedReload(subject, 'oil', requestId),
+              ),
+            ).rejects.toThrow(HeldWriteStorageError);
+            expect(read(activeKey)).not.toBeNull();
+            expect(read(postedKey)).not.toBeNull();
+          } finally {
+            broken.mockRestore();
+          }
+          await tab.clearPostedReload(subject, 'oil', requestId);
+          expect(localStorage.getItem(activeKey)).toBeNull();
+          expect(localStorage.getItem(postedKey)).toBeNull();
+          expect(tab.getHeldWrite(subject)).toBeNull();
+        }
+      } finally {
+        tab.dispose();
+        writer.dispose();
+      }
+    },
+  );
+
+  it.each(['same session', 'new session'] as const)(
+    'R12-4: a queued verified read respects the captured session (%s)',
+    async (session) => {
+      const { locks } = makeFakeLocks();
+      const writer = createHeldWriteStore({ getLocks: () => locks });
+      const reader = createHeldWriteStore({ getLocks: () => locks });
+      const subject = lossSubject('oil');
+      writer.setHeldWriteUser('owner-r10');
+      reader.setHeldWriteUser('owner-r10');
+      const claim = await writer.claimFreshHeldWrite(subject, () => ({
+        loss: '10',
+      }));
+      if (!claim.ok) throw new Error('expected a fresh claim');
+      const { requestId } = claim.record;
+      const postedKey = `${userStoragePrefix('owner-r10')}posted:${encodeURIComponent(subject)}:${encodeURIComponent(requestId)}`;
+      try {
+        writer.setHeldWritePhase(subject, requestId, 'posted_reload', {
+          readTarget: 'oil',
+        });
+        const another = conversionSubject('oil', 'كرتونة');
+        writer.putHeldWrite(another, {
+          requestId: 'another',
+          phase: 'posted_reload',
+          payload: null,
+          readTarget: 'oil',
+        });
+        const anotherKey = `${userStoragePrefix('owner-r10')}posted:${encodeURIComponent(another)}:another`;
+        const snapshot = [
+          ...reader.snapshotPostedReloads({ subject }),
+          ...reader.snapshotPostedReloads({ subject: another }),
+        ];
+        expect(snapshot).toHaveLength(2);
+        const settle = reader.clearPostedReloadSnapshot(snapshot, 'oil');
+        await Promise.resolve();
+        expect(localStorage.getItem(postedKey)).not.toBeNull();
+        if (session === 'new session') {
+          reader.setHeldWriteUser(null);
+          reader.setHeldWriteUser('owner-r10');
+        }
+        claim.release();
+        await settle;
+        expect([
+          localStorage.getItem(postedKey) === null,
+          localStorage.getItem(anotherKey) === null,
+        ]).toEqual(session === 'same session' ? [true, true] : [false, false]);
+      } finally {
+        claim.release();
+        reader.dispose();
+        writer.dispose();
+      }
+    },
+  );
 
   it('R10-Root-a: Older mount catalog listItems response cannot overwrite a row already applied by a newer combined by-id read', async () => {
     putHeldWrite(lossSubject('oil'), {

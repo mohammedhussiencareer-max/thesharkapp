@@ -471,6 +471,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
 
   async function acquireSubjectLock(
     lockName: string,
+    wait = false,
   ): Promise<{ acquired: boolean; release: () => void }> {
     const locks = getLocks();
     if (!locks) {
@@ -493,7 +494,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         void Promise.resolve(
           locks.request(
             lockName,
-            { mode: 'exclusive', ifAvailable: true },
+            { mode: 'exclusive', ...(wait ? {} : { ifAvailable: true }) },
             (lock) => {
               if (!lock) {
                 finish(false);
@@ -577,6 +578,28 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       .catch(() => {});
   }
 
+  function readPostedCopy(
+    active: HeldWriteRecord,
+    userId: string,
+    projectUrl = getProjectUrl(),
+  ): HeldWriteRecord | null {
+    const posted = readDurableRecord(
+      postedStorageKey(active.subject, active.requestId, userId, projectUrl),
+    );
+    return posted?.phase === 'posted_reload' &&
+      posted.subject === active.subject &&
+      posted.requestId === active.requestId
+      ? posted
+      : null;
+  }
+
+  function observePostedCopy(posted: HeldWriteRecord): void {
+    if (records.get(posted.subject)?.requestId === posted.requestId) {
+      records.delete(posted.subject);
+    }
+    postedReloads.set(postedMapKey(posted.subject, posted.requestId), posted);
+  }
+
   function loadScopeFromStorage(
     userId: string,
     promoteInflightSync: boolean,
@@ -609,16 +632,37 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         );
         continue;
       }
-      if (parsed.phase === 'inflight') {
-        if (promoteInflightSync) {
-          // Fallback when Web Locks API is absent: promote inflight -> unknown synchronously.
-          parsed.phase = 'unknown';
-          writeRecordToStorage(parsed, userId);
-        } else {
-          inflightRecords.push(parsed);
-        }
-      }
       records.set(parsed.subject, parsed);
+    }
+
+    // A posted copy can outlive a failed removal of the active slot.
+    // Resolve the pair after scanning both slots, regardless of key order.
+    for (const [subject, active] of records) {
+      const mapKey = postedMapKey(subject, active.requestId);
+      if (postedReloads.has(mapKey)) {
+        records.delete(subject);
+        continue;
+      }
+      if (active.phase !== 'inflight') continue;
+      if (!promoteInflightSync) {
+        inflightRecords.push(active);
+        continue;
+      }
+      try {
+        const key = entryStorageKey(subject, userId, projectUrl);
+        const stored = readDurableRecord(key);
+        if (!stored || !sameClaim(stored, active)) continue;
+        const posted = readPostedCopy(stored, userId, projectUrl);
+        if (posted) {
+          observePostedCopy(posted);
+          continue;
+        }
+        const promoted: HeldWriteRecord = { ...stored, phase: 'unknown' };
+        if (writeRecordToStorage(promoted, userId))
+          records.set(subject, promoted);
+      } catch {
+        // Keep the active record locked when the companion lookup is unreadable.
+      }
     }
 
     // Discard legacy reload markers written by earlier builds for this user scope.
@@ -673,9 +717,14 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
             }
             const stored = readDurableRecord(lockName);
             if (!stored || !sameClaim(stored, expected)) return;
-            const promoted: HeldWriteRecord = { ...stored, phase: 'unknown' };
-            writeRecordToStorage(promoted, userId);
-            records.set(subject, promoted);
+            const posted = readPostedCopy(stored, userId, projectUrl);
+            if (posted) {
+              observePostedCopy(posted);
+            } else {
+              const promoted: HeldWriteRecord = { ...stored, phase: 'unknown' };
+              if (!writeRecordToStorage(promoted, userId)) return;
+              records.set(subject, promoted);
+            }
             changed = true;
           },
         );
@@ -735,6 +784,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   }
 
   function dispose(): void {
+    sessionGeneration += 1;
     releaseAllLocks();
     if (
       typeof window !== 'undefined' &&
@@ -784,14 +834,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     return { userId, generation: sessionGeneration };
   }
 
-  function canDispatchWriteFor(session: WriteSession | null): boolean {
-    if (!isOnline() || writesLocked || session === null) return false;
-    const current = activeUserId();
+  function isCurrentWriteSession(session: WriteSession | null): boolean {
     return (
-      current !== null &&
-      current === session.userId &&
+      session !== null &&
+      activeUserId() === session.userId &&
       sessionGeneration === session.generation
     );
+  }
+
+  function canDispatchWriteFor(session: WriteSession | null): boolean {
+    return isOnline() && isCurrentWriteSession(session);
   }
 
   function setHeldWriteUser(userId: string | null): void {
@@ -1024,6 +1076,19 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         return { ok: false, reason: 'storage' };
       }
       if (stored) {
+        try {
+          const posted =
+            stored.phase === 'posted_reload'
+              ? stored
+              : readPostedCopy(stored, userId);
+          if (posted) {
+            observePostedCopy(posted);
+            emit();
+            return { ok: false, reason: 'conflict', existing: posted };
+          }
+        } catch {
+          return { ok: false, reason: 'storage' };
+        }
         const preserved = preservePayloadIdentity(subject, stored);
         if (isUnresolvedPhase(stored.phase)) records.set(subject, preserved);
         emit();
@@ -1115,6 +1180,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
           reason: 'missing',
           ...(stored ? { existing: stored } : {}),
         };
+      }
+      try {
+        const posted = readPostedCopy(stored, userId);
+        if (posted) {
+          observePostedCopy(posted);
+          emit();
+          return { ok: false, reason: 'conflict', existing: posted };
+        }
+      } catch {
+        return { ok: false, reason: 'storage' };
       }
       const preserved = preservePayloadIdentity<T>(subject, stored);
       if (
@@ -1417,13 +1492,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       return;
     }
     const session = captureWriteSession();
-    return acquireSubjectLock(key).then((lock) => {
-      if (!lock.acquired) return;
+    return acquireSubjectLock(key, true).then((lock) => {
+      if (!lock.acquired) throw new HeldWriteLockError();
       try {
         if (
-          session &&
-          activeUserId() === session.userId &&
-          session.generation === sessionGeneration
+          isCurrentWriteSession(session) &&
+          entryStorageKey(subject, userId) === key
         )
           mutate();
       } finally {
@@ -1533,18 +1607,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       return;
     }
     if (phase === 'posted_reload') {
-      postedReloads.set(postedMapKey(subject, requestId), next);
+      observePostedCopy(next);
+      acknowledgedInflight.delete(subject);
       try {
         removeDurableRecord(entryStorageKey(subject, userId));
-      } catch (error) {
-        acknowledge();
-        throw error;
+      } finally {
+        emit();
       }
-      records.delete(subject);
-      acknowledgedInflight.delete(subject);
-    } else {
-      records.set(subject, next);
+      return;
     }
+    records.set(subject, next);
     emit();
   }
 
@@ -1673,7 +1745,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     expectedTarget?: string,
     expectedRequestId?: string,
     snapshot?: PostedReloadSnapshotItem,
-    shouldClear?: () => boolean,
   ): void | Promise<void> {
     ensureHydrated();
     const userId = activeUserId();
@@ -1691,14 +1762,13 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     );
     const activeKey = entryStorageKey(subject, userId);
     return mutateUnderSubjectLock(subject, userId, () => {
-      if (shouldClear && !shouldClear()) return;
       const candidates =
         expectedRequestId !== undefined
           ? [postedStorageKey(subject, expectedRequestId, userId)]
           : safeListKeys(postedSubjectPrefix(subject, userId), true);
       let changed = false;
       try {
-        const active = readDurableRecord(activeKey);
+        let active = readDurableRecord(activeKey);
         for (const key of [...candidates, activeKey]) {
           const stored = key === activeKey ? active : readDurableRecord(key);
           if (
@@ -1712,7 +1782,19 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
               key !== postedStorageKey(subject, stored.requestId, userId))
           )
             continue;
-          removeDurableRecord(key);
+          // Clear the active duplicate first so a failed removal leaves the
+          // authoritative posted record available for another verification.
+          if (
+            active?.subject === subject &&
+            active.requestId === stored.requestId
+          ) {
+            removeDurableRecord(activeKey);
+            active = null;
+            if (records.get(subject)?.requestId === stored.requestId)
+              records.delete(subject);
+            changed = true;
+          }
+          if (key !== activeKey) removeDurableRecord(key);
           postedReloads.delete(postedMapKey(subject, stored.requestId));
           changed = true;
         }
@@ -1848,15 +1930,17 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   async function clearPostedReloadSnapshot(
     snapshot: PostedReloadSnapshot,
     loadedTarget?: string,
-    shouldClear?: () => boolean,
+    session = captureWriteSession(),
   ): Promise<void> {
+    const projectUrl = getProjectUrl();
     for (const item of snapshot) {
+      if (!isCurrentWriteSession(session) || getProjectUrl() !== projectUrl)
+        return;
       await clearPostedReload(
         item.subject,
         loadedTarget ?? item.readTarget,
         item.requestId,
         item,
-        shouldClear,
       );
     }
   }

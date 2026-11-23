@@ -1,3 +1,4 @@
+import { flushSync } from 'react-dom';
 import {
   useEffect,
   useId,
@@ -311,6 +312,7 @@ export function ItemForm({
     const subject = lossSubject(editingId);
     const pendingReloads = snapshotActionPostedReloads({ subject });
     const runItemRead = onRunItemReadRef.current;
+    const readSession = captureWriteSession();
     void (async () => {
       try {
         if (runItemRead) {
@@ -347,11 +349,14 @@ export function ItemForm({
             currentShiftStart(),
             verifyLossItem(editingId),
           ]);
-          await clearCostingPinsForItem(pendingReloads, editingId);
           if (cancelled || request !== scheduleLoad.current) return;
-          setShiftStart(shift);
-          setLocalSchedule(verified.schedule);
-          if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
+          flushSync(() => {
+            setShiftStart(shift);
+            setLocalSchedule(verified.schedule);
+            if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
+          });
+          await clearCostingPinsForItem(pendingReloads, editingId, readSession);
+          if (cancelled || request !== scheduleLoad.current) return;
           if (verified.schedule.identity !== editingIdentity) {
             void onItemStaleRef.current?.(editingId);
           }
@@ -389,6 +394,7 @@ export function ItemForm({
     const pendingReloads = snapshotActionPostedReloads({ subject });
     const includeItem = options?.includeItem ?? true;
     const runItemRead = onRunItemReadRef.current;
+    const readSession = captureWriteSession();
     try {
       if (runItemRead) {
         const outcome = await runItemRead(
@@ -414,10 +420,15 @@ export function ItemForm({
       let nextSchedule: CostingSchedule;
       if (includeItem || pendingReloads.length > 0) {
         const verified = await verifyLossItem(editingId);
-        await clearCostingPinsForItem(pendingReloads, editingId);
         if (request !== scheduleLoad.current) return false;
         nextSchedule = verified.schedule;
-        setLocalSchedule(nextSchedule);
+        if (pendingReloads.length > 0) {
+          flushSync(() => setLocalSchedule(verified.schedule));
+          await clearCostingPinsForItem(pendingReloads, editingId, readSession);
+          if (request !== scheduleLoad.current) return false;
+        } else {
+          setLocalSchedule(nextSchedule);
+        }
       } else {
         nextSchedule = await listCostingSchedule(editingId);
         if (request !== scheduleLoad.current) return false;

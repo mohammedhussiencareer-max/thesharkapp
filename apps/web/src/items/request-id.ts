@@ -369,22 +369,29 @@ export function listPostedCostingPins(): PostedCostingPin[] {
 export async function clearCostingPinsForItem(
   snapshot: PostedReloadSnapshot,
   itemId: string,
-  shouldClear?: () => boolean,
+  session?: WriteSession | null,
 ): Promise<void> {
   const legacyLossTarget = lossSubject(itemId);
-  for (const entry of snapshot) {
-    if (costingItemIdFromSubject(entry.subject)?.itemId !== itemId) continue;
+  const covered = snapshot.filter((entry) => {
+    if (costingItemIdFromSubject(entry.subject)?.itemId !== itemId)
+      return false;
     const target = entry.readTarget;
-    if (
+    return (
       target === undefined ||
       target === itemId ||
       target === ITEMS_RELOAD_SUBJECT ||
       target === entry.subject ||
       target === legacyLossTarget
-    ) {
-      await clearPostedReloadSnapshot([entry], target ?? itemId, shouldClear);
-    }
-  }
+    );
+  });
+  await clearPostedReloadSnapshot(
+    covered.map((entry) => ({
+      ...entry,
+      readTarget: entry.readTarget ?? itemId,
+    })),
+    undefined,
+    session,
+  );
 }
 
 /**
