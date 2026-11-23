@@ -414,9 +414,17 @@ export function checkDumpTarget(env) {
   if (!allLoopback) {
     requireVerifiedTls(env);
   }
+  // A reader dump always runs the role check: a loopback host can be a tunnel
+  // to the hosted project. The pooler user is backup_reader.<project ref>.
+  const user = String(env.PGUSER ?? '')
+    .trim()
+    .toLowerCase();
+  const readerDump =
+    user === 'backup_reader' || user.startsWith('backup_reader.');
   return {
     loopback: allLoopback,
-    enforceRole: !allLoopback || env.BACKUP_FORCE_ROLE_CHECK === '1',
+    enforceRole:
+      readerDump || !allLoopback || env.BACKUP_FORCE_ROLE_CHECK === '1',
   };
 }
 

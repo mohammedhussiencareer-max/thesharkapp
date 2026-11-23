@@ -186,6 +186,16 @@ test('dump refuses loopback unless BACKUP_ALLOW_LOOPBACK=1', () => {
     BACKUP_FORCE_ROLE_CHECK: '1',
   });
   assert.equal(forced.enforceRole, true);
+  // A reader dump always runs the role check, even through a loopback tunnel
+  // with local-test mode on; the hosted pooler user is backup_reader.<ref>.
+  for (const PGUSER of ['backup_reader', 'backup_reader.abcdefghijklmnop']) {
+    const reader = checkDumpTarget({
+      ...local,
+      PGUSER,
+      BACKUP_ALLOW_LOOPBACK: '1',
+    });
+    assert.equal(reader.enforceRole, true, PGUSER);
+  }
 });
 
 test('dump to a remote host needs verified TLS and enforces the role check', () => {
