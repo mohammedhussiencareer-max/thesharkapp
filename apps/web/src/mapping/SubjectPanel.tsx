@@ -439,6 +439,8 @@ export function SubjectPanel({
           settleAction(subject, requestId, failure);
         }
         setError(messageFrom(failure));
+        releaseLock();
+        releaseLock = () => {};
         if (!saved && !hasAction(subject)) await onReload(expectedBaseKey);
         return;
       } finally {
@@ -1208,6 +1210,8 @@ function OptionMappingForm({
           settleAction(subject, requestId, failure);
         }
         setError(messageFrom(failure));
+        releaseLock();
+        releaseLock = () => {};
         if (!saved && !hasAction(subject)) await onReload(expectedBaseKey);
         return;
       } finally {

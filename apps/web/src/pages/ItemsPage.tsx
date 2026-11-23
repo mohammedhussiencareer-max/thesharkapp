@@ -37,8 +37,10 @@ import {
   firstUnknownItemCreate,
   ITEMS_RELOAD_SUBJECT,
   listPostedCostingPins,
+  lossSubject,
   markActionPostedReload,
   priceSubject,
+  settleAction,
 } from '@/items/request-id';
 import {
   verifyConversionItem,
@@ -799,7 +801,10 @@ export function ItemsPage() {
     setFormError(null);
   }
 
-  async function handleSubmit(action: ItemSave): Promise<boolean> {
+  async function handleSubmit(
+    action: ItemSave,
+    releaseAfterSettlement?: () => void,
+  ): Promise<boolean> {
     const started = formModeRef.current;
     if (
       !started ||
@@ -955,11 +960,15 @@ export function ItemsPage() {
           action.identity,
         );
         saved = true;
-        markActionPostedReload(
-          priceSubject(started.id),
-          action.requestId,
-          ITEMS_RELOAD_SUBJECT,
-        );
+        try {
+          markActionPostedReload(
+            priceSubject(started.id),
+            action.requestId,
+            ITEMS_RELOAD_SUBJECT,
+          );
+        } finally {
+          releaseAfterSettlement?.();
+        }
       }
       // Locked from the moment the save lands until fresh rows are applied.
       // The editor stays open so a sibling section keeps its pending value.
@@ -987,6 +996,21 @@ export function ItemsPage() {
         sameEditor(formModeRef.current, started)
       ) {
         try {
+          if (releaseAfterSettlement) {
+            try {
+              if (action.kind === 'loss') {
+                settleAction(
+                  lossSubject(started.id),
+                  action.write.requestId,
+                  error,
+                );
+              } else if (action.kind === 'price') {
+                settleAction(priceSubject(started.id), action.requestId, error);
+              }
+            } finally {
+              releaseAfterSettlement();
+            }
+          }
           await reloadCatalog(
             started.id,
             error instanceof CostingChangedError
@@ -1159,7 +1183,7 @@ export function ItemsPage() {
                   })
               }
               onRunItemRead={runItemRead}
-              onSubmit={(action) => handleSubmit(action)}
+              onSubmit={handleSubmit}
               onCancel={() => {
                 if (busy) return;
                 setEditor(null);

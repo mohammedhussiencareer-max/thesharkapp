@@ -361,6 +361,7 @@ export function CountsPage() {
     requestId: string | null,
     storedSubject: string | null,
     daily: HeldWriteRecord<CountDraft> | null,
+    release: () => void,
   ): Promise<boolean> {
     if (result.status === 'waiting_for_sync') {
       if (daily && requestId === daily.requestId) {
@@ -373,10 +374,13 @@ export function CountsPage() {
       }
       setWaitNotice(requestId ?? draft?.requestId ?? null);
       setSuccess(null);
+      release();
       await refreshAfterWait();
       return false;
     }
     applyPosted(requestId, draft !== null, storedSubject, daily);
+    // The readback may cover pins owned by other count writers.
+    release();
     const pendingReloads = snapshotCountPostedReloads();
     const next = await readSnapshot();
     if (next.status === 'ready') {
@@ -446,7 +450,14 @@ export function CountsPage() {
     try {
       const result = await recordCount(draft);
       if (result.status === 'posted') saved = true;
-      await finishWrite(result, draft, draft.requestId, null, claim.record);
+      await finishWrite(
+        result,
+        draft,
+        draft.requestId,
+        null,
+        claim.record,
+        claim.release,
+      );
     } catch (error) {
       if (!saved) {
         holdUnknown(draft, error, priorPhase);
@@ -482,6 +493,7 @@ export function CountsPage() {
           ? daily
           : null,
         session,
+        dailyLock.release,
       );
     } catch (error) {
       setCardError(messageFrom(error));
@@ -495,6 +507,7 @@ export function CountsPage() {
     requestId: string | null,
     daily: HeldWriteRecord<CountDraft> | null,
     session: WriteSession | null,
+    releaseDailyLock: () => void = () => {},
   ) {
     const storedSubject =
       requestId !== null ? `${COUNT_STORED_PREFIX}${requestId}` : null;
@@ -556,7 +569,10 @@ export function CountsPage() {
     try {
       const result = await recordStoredCount(payload);
       if (result.status === 'posted') saved = true;
-      await finishWrite(result, null, requestId, storedSubject, daily);
+      await finishWrite(result, null, requestId, storedSubject, daily, () => {
+        releaseLock();
+        releaseDailyLock();
+      });
     } catch (error) {
       if (!saved) {
         setCardError(reportedCountError(error));

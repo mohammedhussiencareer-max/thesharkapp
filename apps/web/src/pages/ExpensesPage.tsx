@@ -478,17 +478,30 @@ export function ExpensesPage() {
     }
     const targetMonth =
       kind === 'complete' ? state.targetMonth : `${monthRef.current}-01`;
-    const setVerify =
-      kind === 'complete' ? setCompleteVerifyState : setCategoryVerifyState;
-    setVerify({ targetMonth, status: 'verifying', readError: null });
+    await readRequestlessVerification(kind, targetMonth);
+  }
+
+  async function readRequestlessVerification(
+    kind: 'complete' | 'category',
+    targetMonth: string,
+  ): Promise<void> {
+    const [verifyRef, setVerify] =
+      kind === 'complete'
+        ? ([completeVerifyRef, setCompleteVerifyState] as const)
+        : ([categoryVerifyRef, setCategoryVerifyState] as const);
+    const attempt: RequestlessVerifyState = {
+      targetMonth,
+      status: 'verifying',
+      readError: null,
+    };
+    setVerify(attempt);
     const pendingReloads = snapshotExpensePostedReloads();
     try {
       const result = await readExpenseMonthTarget(
         targetMonth,
         kind === 'category' ? 'global' : 'month',
       );
-      // Discard superseded reads so an older verification cannot overwrite newer month data or unlock writes from stale data.
-      if (!result) return;
+      if (!result || verifyRef.current !== attempt) return;
       const fresh = result.data;
       if (fresh.monthStart === `${monthRef.current}-01`) {
         dataSessionRef.current = result.readSession;
@@ -496,10 +509,16 @@ export function ExpensesPage() {
         setLoadError(null);
         await reconcileCommittedVoids(fresh.entries);
       }
-      await clearPostedReloadSnapshot(pendingReloads, fresh.monthStart);
+      await clearPostedReloadSnapshot(
+        pendingReloads,
+        fresh.monthStart,
+        result.readSession,
+      );
+      if (verifyRef.current !== attempt) return;
       setVerify({ targetMonth, status: 'verified', readError: null });
       reconcileRequestlessVerifyOnMonth(fresh);
     } catch (readError) {
+      if (verifyRef.current !== attempt) return;
       setVerify({
         targetMonth,
         status: 'read_failed',
@@ -572,32 +591,7 @@ export function ExpensesPage() {
         setError(messageFrom(error));
         return false;
       }
-      const setVerify =
-        kind === 'complete' ? setCompleteVerifyState : setCategoryVerifyState;
-      setVerify({ targetMonth, status: 'verifying', readError: null });
-      const pendingReloads = snapshotExpensePostedReloads();
-      try {
-        const result = await readExpenseMonthTarget(
-          targetMonth,
-          kind === 'category' ? 'global' : 'month',
-        );
-        if (!result) return false;
-        const fresh = result.data;
-        if (fresh.monthStart === `${monthRef.current}-01`) {
-          dataSessionRef.current = result.readSession;
-          setData(fresh);
-          setLoadError(null);
-          await reconcileCommittedVoids(fresh.entries);
-        }
-        await clearPostedReloadSnapshot(pendingReloads, fresh.monthStart);
-        setVerify({ targetMonth, status: 'verified', readError: null });
-      } catch (readError) {
-        setVerify({
-          targetMonth,
-          status: 'read_failed',
-          readError: messageFrom(readError),
-        });
-      }
+      await readRequestlessVerification(kind, targetMonth);
       return false;
     } finally {
       savingRef.current = false;
@@ -608,12 +602,13 @@ export function ExpensesPage() {
   async function runWrite(
     action: () => Promise<void>,
     setError: (message: string | null) => void,
-    onSaved: (() => void | Promise<void>) | undefined,
+    onSaved: () => void | Promise<void>,
     guard: {
       subject: string;
       requestId: string;
       session: WriteSession | null;
       readTarget?: string;
+      release: () => void;
     },
   ): Promise<WriteResult> {
     const displayedMonthStart = `${monthRef.current}-01`;
@@ -645,7 +640,11 @@ export function ExpensesPage() {
       needsReloadRef.current = true;
       setLocalNeedsReload(true);
       try {
-        await onSaved?.();
+        try {
+          await onSaved();
+        } finally {
+          guard.release();
+        }
         const pendingReloads = snapshotExpensePostedReloads();
         const next = await readMonth(monthRef.current);
         if (next) {
@@ -731,7 +730,12 @@ export function ExpensesPage() {
           );
           setFormEpoch((value) => value + 1);
         },
-        { subject: EXPENSE_NEW_SUBJECT, requestId: draft.requestId, session },
+        {
+          subject: EXPENSE_NEW_SUBJECT,
+          requestId: draft.requestId,
+          session,
+          release: releaseOnce,
+        },
       );
       if (!result.dispatched) {
         abortClaimBeforeDispatch(
@@ -851,7 +855,7 @@ export function ExpensesPage() {
             setHeldWritePhase(subject, requestId, 'unknown');
           }
         },
-        { subject, requestId, session },
+        { subject, requestId, session, release: releaseOnce },
       );
       if (!result.dispatched) {
         abortClaimBeforeDispatch(

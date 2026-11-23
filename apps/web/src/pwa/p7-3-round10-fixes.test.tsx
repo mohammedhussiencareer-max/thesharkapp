@@ -34,6 +34,12 @@ import {
   updateConversion,
   updateItem,
 } from '@/items/api';
+import {
+  addExpenseEntry,
+  loadExpenseMonth,
+  renameExpenseCategory,
+} from '@/expenses/api';
+import type { ExpenseMonth } from '@/expenses/types';
 import { ConfirmedRefusalError } from '@/items/errors';
 import { emptyScheduleToken } from '@/items/effective';
 import {
@@ -64,6 +70,7 @@ import {
 } from '@/lib/pwa';
 import { ActivationPage } from '@/pages/ActivationPage';
 import { CountsPage } from '@/pages/CountsPage';
+import { ExpensesPage } from '@/pages/ExpensesPage';
 import { ItemsPage } from '@/pages/ItemsPage';
 
 vi.mock('@/items/api', () => ({
@@ -97,6 +104,32 @@ vi.mock('@/counts/api', () => ({
   recordCount: vi.fn(),
   recordStoredCount: vi.fn(),
 }));
+
+vi.mock('@/expenses/api', () => ({
+  loadExpenseMonth: vi.fn(),
+  addExpenseEntry: vi.fn(),
+  voidExpenseEntry: vi.fn(),
+  addExpenseCategory: vi.fn(),
+  renameExpenseCategory: vi.fn(),
+  setExpenseCategoryActive: vi.fn(),
+  setMonthExpenseComplete: vi.fn(),
+}));
+
+function r13ExpenseMonth(
+  monthStart: string,
+  entries: ExpenseMonth['entries'] = [],
+): ExpenseMonth {
+  return {
+    monthStart,
+    categories: [
+      { id: 'rent', name: 'إيجار', kind: 'fixed_monthly', active: true },
+    ],
+    entries,
+    days: [],
+    complete: false,
+    confirmedAt: null,
+  };
+}
 
 const oilItem: CatalogItem = {
   id: 'oil',
@@ -852,6 +885,382 @@ describe('P7-3 round-10 review fixes', () => {
       }
     },
   );
+
+  it('R13-1: two expense tabs finish month cleanup after releasing their write locks', async () => {
+    const { locks } = makeFakeLocks();
+    vi.stubGlobal('navigator', { onLine: true, locks });
+    const other = createHeldWriteStore({ getLocks: () => locks });
+    other.setHeldWriteUser('owner-r10');
+    let releaseOther = () => {};
+    let completeSave: () => void = () => {};
+    let settleRead: (() => void) | undefined;
+    let partnerCleanup: Promise<void> | undefined;
+    const prefix = userStoragePrefix('owner-r10');
+    const month = '2030-04-01';
+    const otherSubject = 'expense:void:synthetic-void';
+    const otherId = 'synthetic-void-request';
+    const postedKey = (subject: string, id: string) =>
+      `${prefix}posted:${encodeURIComponent(subject)}:${encodeURIComponent(id)}`;
+    vi.mocked(loadExpenseMonth).mockImplementation((target) =>
+      Promise.resolve(r13ExpenseMonth(target)),
+    );
+    vi.mocked(addExpenseEntry).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          completeSave = resolve;
+        }),
+    );
+    try {
+      render(
+        <MemoryRouter>
+          <ExpensesPage />
+        </MemoryRouter>,
+      );
+      const picker = await screen.findByLabelText('الشهر');
+      fireEvent.change(picker, { target: { value: '2030-04' } });
+      await waitFor(() =>
+        expect(screen.getByLabelText('التصنيف')).toBeEnabled(),
+      );
+      fireEvent.change(screen.getByLabelText('التصنيف'), {
+        target: { value: 'rent' },
+      });
+      fireEvent.change(screen.getByLabelText('المبلغ'), {
+        target: { value: '1000' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+      await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(1));
+      const draft = vi.mocked(addExpenseEntry).mock.calls[0]?.[0];
+      if (!draft) throw new Error('expected expense draft');
+
+      const voidClaim = await other.claimFreshHeldWrite(
+        otherSubject,
+        () => ({ id: 'synthetic-void' }),
+        { requestId: otherId },
+      );
+      if (!voidClaim.ok)
+        throw new Error('expected the second tab to hold the void lock');
+      releaseOther = voidClaim.release;
+      other.setHeldWritePhase(otherSubject, otherId, 'posted_reload', {
+        readTarget: month,
+      });
+      vi.mocked(loadExpenseMonth).mockImplementationOnce(
+        (target) =>
+          new Promise((resolve) => {
+            settleRead = () => resolve(r13ExpenseMonth(target));
+          }),
+      );
+      await act(async () => {
+        completeSave();
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(settleRead).toBeDefined());
+
+      const bothPins = [
+        ...other.snapshotPostedReloads({ subject: 'expense:new' }),
+        ...other.snapshotPostedReloads({ subject: otherSubject }),
+      ];
+      expect(bothPins).toHaveLength(2);
+      partnerCleanup = other
+        .clearPostedReloadSnapshot(bothPins, month)
+        .finally(releaseOther);
+      await act(async () => {
+        settleRead?.();
+        await Promise.resolve();
+      });
+
+      await waitFor(
+        () => {
+          expect(
+            [
+              localStorage.getItem(
+                postedKey('expense:new', draft.requestId),
+              ) === null,
+              localStorage.getItem(postedKey(otherSubject, otherId)) === null,
+            ],
+            'concurrent month cleanup must finish without a lock cycle',
+          ).toEqual([true, true]);
+        },
+        { timeout: 800 },
+      );
+    } finally {
+      releaseOther();
+      other.dispose();
+      await partnerCleanup;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('R13-2: readback settles an acknowledged claim promoted by another tab', async () => {
+    const { locks } = makeFakeLocks();
+    const writer = createHeldWriteStore({ getLocks: () => locks });
+    const reader = createHeldWriteStore({ getLocks: () => locks });
+    const subject = lossSubject('oil');
+    const owner = 'owner-r10';
+    writer.setHeldWriteUser(owner);
+    const claim = await writer.claimFreshHeldWrite(subject, () => ({
+      loss: '10',
+    }));
+    if (!claim.ok) throw new Error('expected fresh claim');
+    const { requestId, claimId } = claim.record;
+    const key = `${userStoragePrefix(owner)}${encodeURIComponent(subject)}`;
+    try {
+      const write = vi
+        .spyOn(Storage.prototype, 'setItem')
+        .mockImplementationOnce(() => {
+          throw new Error('cannot persist acknowledgement');
+        });
+      expect(() =>
+        writer.setHeldWritePhase(subject, requestId, 'posted_reload', {
+          readTarget: 'oil',
+        }),
+      ).toThrow(HeldWriteStorageError);
+      write.mockRestore();
+      claim.release();
+      await Promise.resolve();
+      reader.setHeldWriteUser(owner);
+      await reader.rehydrateHeldWritesAsync();
+      expect(reader.getHeldWrite(subject)).toMatchObject({
+        requestId,
+        claimId,
+        phase: 'unknown',
+      });
+
+      await writer.clearPostedReloadSnapshot(
+        writer.snapshotPostedReloads({ subject }),
+        'oil',
+      );
+      expect(localStorage.getItem(key)).toBeNull();
+    } finally {
+      claim.release();
+      reader.dispose();
+      writer.dispose();
+    }
+  });
+
+  it('R13-3: sign-out removes an unchanged pin when the other tab closes', async () => {
+    const { locks } = makeFakeLocks();
+    const writer = createHeldWriteStore({ getLocks: () => locks });
+    const signingOut = createHeldWriteStore({ getLocks: () => locks });
+    const owner = 'owner-r10';
+    const subject = lossSubject('oil');
+    const key = `${userStoragePrefix(owner)}${encodeURIComponent(subject)}`;
+    writer.setHeldWriteUser(owner);
+    signingOut.setHeldWriteUser(owner);
+    const claim = await writer.claimFreshHeldWrite(subject, () => ({
+      loss: '10',
+    }));
+    if (!claim.ok) throw new Error('expected fresh claim');
+    try {
+      signingOut.setWritesLocked(true);
+      signingOut.clearHeldWritesForUser(owner);
+      signingOut.setHeldWriteUser(null);
+      await Promise.resolve();
+      expect(localStorage.getItem(key)).not.toBeNull();
+      writer.dispose();
+      await waitFor(() => expect(localStorage.getItem(key)).toBeNull(), {
+        timeout: 400,
+      });
+    } finally {
+      claim.release();
+      signingOut.dispose();
+      writer.dispose();
+    }
+  });
+
+  it('R13-4: a stale count card cannot repost a request with a posted copy and empty active slot', async () => {
+    const requestId = 'd1900000-0000-4000-8000-000000000061';
+    const countedAt = '2026-10-22T10:00:00.000Z';
+    const subject = `count:stored:${requestId}`;
+    const payload = {
+      request_id: requestId,
+      frequency: 'daily',
+      counted_at: countedAt,
+      note: null,
+      lines: [],
+    };
+    vi.mocked(listDailyItems).mockResolvedValue([]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([
+      { requestId, countedAt, preparedAt: countedAt, itemCount: 0, payload },
+    ]);
+    vi.mocked(recordStoredCount).mockResolvedValue({
+      status: 'posted',
+      countId: 'other',
+    });
+    render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    const button = await screen.findByRole('button', { name: 'سجّل الجرد' });
+
+    // Another tab recorded this id after the card was loaded, before its storage event was delivered.
+    const tab = createHeldWriteStore();
+    tab.setHeldWriteUser('owner-r10');
+    try {
+      tab.putHeldWrite(subject, {
+        requestId,
+        payload: null,
+        phase: 'posted_reload',
+        kind: 'count_stored',
+      });
+      expect(
+        localStorage.getItem(
+          `${userStoragePrefix('owner-r10')}${encodeURIComponent(subject)}`,
+        ),
+      ).toBeNull();
+      await act(async () => {
+        fireEvent.click(button);
+        await Promise.resolve();
+      });
+      expect(recordStoredCount).not.toHaveBeenCalled();
+    } finally {
+      tab.dispose();
+    }
+  });
+
+  it('R13-5: superseded schedule still supplies the editor open shift timing', async () => {
+    let finishSchedule!: (
+      schedule: Awaited<ReturnType<typeof listCostingSchedule>>,
+    ) => void;
+    const schedule = {
+      lossToken: emptyScheduleToken,
+      identity: 'liter|ingredient||',
+      lossVersions: [],
+      conversions: [],
+    };
+    vi.mocked(currentShiftStart).mockResolvedValueOnce(
+      '2020-01-01T00:00:00.000Z',
+    );
+    vi.mocked(listCostingSchedule).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishSchedule = resolve;
+        }),
+    );
+    vi.mocked(costingImpact).mockResolvedValue({
+      orders: 2,
+      shifts: 1,
+      movements: 0,
+    });
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole('article', { name: 'زيت' });
+    fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
+    await waitFor(() => expect(listCostingSchedule).toHaveBeenCalledTimes(1));
+    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+    await waitFor(() => expect(listCostingSchedule).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      finishSchedule(schedule);
+      await Promise.resolve();
+    });
+    fireEvent.change(screen.getByLabelText('نسبة الفاقد'), {
+      target: { value: '10' },
+    });
+    expect(
+      await screen.findByText('ممكن يأثر على 2 طلب في 1 وردية (تقدير)'),
+    ).toBeInTheDocument();
+  });
+
+  it('R13-6: an older cleanup failure cannot relock verified expense categories', async () => {
+    const { locks } = makeFakeLocks();
+    vi.stubGlobal('navigator', { onLine: true, locks });
+    const other = createHeldWriteStore({ getLocks: () => locks });
+    other.setHeldWriteUser('owner-r10');
+    const subject = 'expense:void:synthetic-void';
+    const key = `${userStoragePrefix('owner-r10')}${encodeURIComponent(subject)}`;
+    let releaseLock = () => {};
+    vi.mocked(loadExpenseMonth).mockImplementation((target) =>
+      Promise.resolve(r13ExpenseMonth(target)),
+    );
+    vi.mocked(renameExpenseCategory).mockRejectedValueOnce(
+      new Error('response lost'),
+    );
+    try {
+      render(
+        <MemoryRouter>
+          <ExpensesPage />
+        </MemoryRouter>,
+      );
+      const picker = await screen.findByLabelText('الشهر');
+      fireEvent.change(picker, { target: { value: '2030-04' } });
+      const rename = await screen.findByLabelText('اسم إيجار');
+      vi.mocked(loadExpenseMonth).mockRejectedValueOnce(
+        new Error('first verification failed'),
+      );
+      fireEvent.change(rename, { target: { value: 'إيجار جديد' } });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ اسم إيجار' }));
+      const retry = await screen.findByRole('button', { name: 'تحقق تاني' });
+
+      const claim = await other.acquireHeldWriteLock(subject);
+      if (!claim.acquired) throw new Error('expected a busy void subject');
+      releaseLock = claim.release;
+      act(() => {
+        putHeldWrite(subject, {
+          requestId: 'void-request',
+          phase: 'unknown',
+          payload: { id: 'synthetic-void' },
+        });
+      });
+      const older = r13ExpenseMonth('2030-04-01', [
+        {
+          id: 'synthetic-void',
+          categoryId: 'rent',
+          categoryName: 'إيجار',
+          categoryKind: 'fixed_monthly',
+          amount: '100.00',
+          periodMonth: '2030-04-01',
+          expenseDate: null,
+          paidOn: null,
+          isEstimate: false,
+          note: 'إلغاء قديم',
+          hours: null,
+          hourlyRate: null,
+          driverLabel: null,
+          createdAt: '2030-04-01T08:00:00Z',
+          voided: true,
+          voidReason: 'تكرار',
+          superseded: false,
+        },
+      ]);
+      vi.mocked(loadExpenseMonth).mockResolvedValueOnce(older);
+      fireEvent.click(retry);
+      await screen.findByText('إلغاء قديم');
+      fireEvent.change(picker, { target: { value: '2030-05' } });
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'ضيف تصنيف' })).toBeEnabled(),
+      );
+
+      const read = localStorage.getItem.bind(localStorage);
+      const failedRead = vi
+        .spyOn(Storage.prototype, 'getItem')
+        .mockImplementation((candidate) => {
+          if (candidate === key)
+            throw new Error('delayed cleanup storage failure');
+          return read(candidate);
+        });
+      try {
+        await act(async () => {
+          releaseLock();
+          await Promise.resolve();
+        });
+        expect(failedRead).toHaveBeenCalledWith(key);
+        expect(screen.getByRole('button', { name: 'ضيف تصنيف' })).toBeEnabled();
+        expect(
+          screen.queryByRole('button', { name: 'تحقق تاني' }),
+        ).not.toBeInTheDocument();
+      } finally {
+        failedRead.mockRestore();
+      }
+    } finally {
+      releaseLock();
+      other.dispose();
+      vi.unstubAllGlobals();
+    }
+  });
 
   it('R10-Root-a: Older mount catalog listItems response cannot overwrite a row already applied by a newer combined by-id read', async () => {
     putHeldWrite(lossSubject('oil'), {

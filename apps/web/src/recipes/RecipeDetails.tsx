@@ -145,6 +145,8 @@ export function RecipeDetails({
         settleAction(subject, requestId, failure);
       }
       if (!saved && failure instanceof StaleWriteError) {
+        releaseLock();
+        releaseLock = () => {};
         const fresh = await onReload();
         if (fresh) adopt(fresh);
         setError(staleWriteMessage);

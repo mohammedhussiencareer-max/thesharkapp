@@ -182,6 +182,8 @@ export function VersionEditor({
         settleAction(subject, requestId, failure);
       }
       setError(messageFrom(failure));
+      releaseLock();
+      releaseLock = () => {};
       if (!saved && requestId !== null && !hasAction(subject)) await onReload();
     } finally {
       releaseLock();

@@ -541,6 +541,8 @@ export function PackagingEditor({
           settleAction(subjectKey, requestId, failure);
         }
         setError(messageFrom(failure));
+        releaseLock();
+        releaseLock = () => {};
         if (!saved && !hasAction(subjectKey)) await onReload(expectedKey);
         return;
       } finally {

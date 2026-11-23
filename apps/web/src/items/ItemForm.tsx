@@ -142,7 +142,10 @@ export function ItemForm({
   locked?: boolean;
   serverError: string | null;
   onClearServerError: () => void;
-  onSubmit: (action: ItemSave) => Promise<boolean>;
+  onSubmit: (
+    action: ItemSave,
+    releaseAfterSettlement?: () => void,
+  ) => Promise<boolean>;
   onCancel: () => void;
   /** Bumped after a stale details reload or clean sync. Resets details only. */
   detailsKey?: number;
@@ -315,9 +318,14 @@ export function ItemForm({
     const readSession = captureWriteSession();
     void (async () => {
       try {
+        const shiftRead = currentShiftStart().then((shift) => {
+          if (cancelled) return;
+          setShiftStart(shift);
+          if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
+        });
         if (runItemRead) {
-          const [shift, outcome] = await Promise.all([
-            currentShiftStart(),
+          const [, outcome] = await Promise.all([
+            shiftRead,
             runItemRead(
               editingId,
               pendingReloads.length > 0
@@ -333,9 +341,7 @@ export function ItemForm({
           ) {
             return;
           }
-          setShiftStart(shift);
           setLocalSchedule(outcome.schedule);
-          if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
           const appliedIdentity = outcome.item
             ? itemIdentity(outcome.item)
             : editingIdentity;
@@ -345,16 +351,12 @@ export function ItemForm({
           return;
         }
         if (pendingReloads.length > 0) {
-          const [shift, verified] = await Promise.all([
-            currentShiftStart(),
+          const [, verified] = await Promise.all([
+            shiftRead,
             verifyLossItem(editingId),
           ]);
           if (cancelled || request !== scheduleLoad.current) return;
-          flushSync(() => {
-            setShiftStart(shift);
-            setLocalSchedule(verified.schedule);
-            if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
-          });
+          flushSync(() => setLocalSchedule(verified.schedule));
           await clearCostingPinsForItem(pendingReloads, editingId, readSession);
           if (cancelled || request !== scheduleLoad.current) return;
           if (verified.schedule.identity !== editingIdentity) {
@@ -362,14 +364,12 @@ export function ItemForm({
           }
           return;
         }
-        const [shift, nextSchedule] = await Promise.all([
-          currentShiftStart(),
+        const [, nextSchedule] = await Promise.all([
+          shiftRead,
           listCostingSchedule(editingId),
         ]);
         if (cancelled || request !== scheduleLoad.current) return;
-        setShiftStart(shift);
         setLocalSchedule(nextSchedule);
-        if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
         if (nextSchedule.identity !== editingIdentity) {
           void onItemStaleRef.current?.(editingId);
         }
@@ -531,6 +531,12 @@ export function ItemForm({
     onClearServerError();
     setExtraError(null);
     let releaseLock = () => {};
+    let settledByPage = false;
+    const releaseAfterSettlement = () => {
+      settledByPage = true;
+      releaseLock();
+      releaseLock = () => {};
+    };
     let saved = false;
     let requestId: string | null = null;
     try {
@@ -568,11 +574,14 @@ export function ItemForm({
         else if (missingPin) setExtraError(storageWriteFailedMessage);
         return;
       }
-      const accepted = await onSubmit({
-        kind: 'loss',
-        lossPct: action.lossPct,
-        write: action.write,
-      });
+      const accepted = await onSubmit(
+        {
+          kind: 'loss',
+          lossPct: action.lossPct,
+          write: action.write,
+        },
+        releaseAfterSettlement,
+      );
       // A refused send never reached the database. A retry whose page is
       // busy still has an unknown outcome and must keep its payload.
       if (accepted !== true) {
@@ -599,12 +608,14 @@ export function ItemForm({
       setDatedLoss(false);
       await reloadLossSchedule();
     } catch (error) {
-      if (!saved && requestId !== null) {
+      if (!settledByPage && !saved && requestId !== null) {
         settleAction(subject, requestId, error);
       }
       if (saved) {
         setExtraError(messageFrom(error));
       } else if (isConfirmedConfigurationChange(error)) {
+        releaseLock();
+        releaseLock = () => {};
         await reloadLossSchedule(undefined, { includeItem: false });
       }
     } finally {
@@ -627,6 +638,12 @@ export function ItemForm({
     onClearServerError();
     setPriceError(null);
     let releaseLock = () => {};
+    let settledByPage = false;
+    const releaseAfterSettlement = () => {
+      settledByPage = true;
+      releaseLock();
+      releaseLock = () => {};
+    };
     let saved = false;
     let requestId: string | null = null;
     try {
@@ -664,14 +681,17 @@ export function ItemForm({
         else if (missingPin) setPriceError(storageWriteFailedMessage);
         return;
       }
-      const accepted = await onSubmit({
-        kind: 'price',
-        price: action.price,
-        reason: action.reason,
-        expectedId: action.expectedId,
-        identity: action.identity,
-        requestId: action.requestId,
-      });
+      const accepted = await onSubmit(
+        {
+          kind: 'price',
+          price: action.price,
+          reason: action.reason,
+          expectedId: action.expectedId,
+          identity: action.identity,
+          requestId: action.requestId,
+        },
+        releaseAfterSettlement,
+      );
       if (accepted !== true) {
         abortActionBeforeDispatch(
           subject,
@@ -685,16 +705,18 @@ export function ItemForm({
       saved = true;
       // ItemsPage transitions `price:<id>` to `posted_reload` until its catalog
       // readback succeeds; only settle here if the caller did not manage it.
-      if (hasDurableAction(subject, requestId)) {
+      if (!settledByPage && hasDurableAction(subject, requestId)) {
         settleAction(subject, requestId);
       }
     } catch (error) {
-      if (!saved && requestId !== null) {
+      if (!settledByPage && !saved && requestId !== null) {
         settleAction(subject, requestId, error);
       }
       if (saved) {
         setPriceError(messageFrom(error));
       } else if (isConfirmedConfigurationChange(error)) {
+        releaseLock();
+        releaseLock = () => {};
         // The held price keeps the identity it was submitted with. A confirmed
         // conflict retires that hold; the next fresh action reads this reload.
         await reloadLossSchedule(undefined, { includeItem: false });

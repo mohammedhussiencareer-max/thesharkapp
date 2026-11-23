@@ -291,6 +291,19 @@ function sameClaim(
   );
 }
 
+function sameAcknowledgedClaim(
+  stored: HeldWriteRecord,
+  acknowledged: HeldWriteRecord,
+): boolean {
+  return (
+    sameClaim(stored, acknowledged) ||
+    (acknowledged.claimId !== undefined &&
+      acknowledged.phase === 'inflight' &&
+      stored.phase === 'unknown' &&
+      sameClaim({ ...stored, phase: 'inflight' }, acknowledged))
+  );
+}
+
 export type HeldWriteStoreOptions = {
   getStorage?: () => Storage | null;
   getProjectUrl?: () => string;
@@ -554,10 +567,11 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     key: string,
     expectedRaw: string,
     subjectLock: string,
-    stillCurrent?: () => boolean,
+    stillCurrent: () => boolean,
+    queue = false,
   ): void {
     const prune = () => {
-      if (stillCurrent && !stillCurrent()) return;
+      if (!stillCurrent()) return;
       const current = strictReadItem(key);
       if (current.ok && current.value === expectedRaw) safeRemoveItem(key);
     };
@@ -566,11 +580,11 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       prune();
       return;
     }
-    // Hydration and sign-out cleanup must leave a competing tab's live pin alone.
+    // Hydration probes once. Sign-out can queue without holding or awaiting another lock.
     void locks
       .request(
         subjectLock,
-        { mode: 'exclusive', ifAvailable: true },
+        { mode: 'exclusive', ...(queue ? {} : { ifAvailable: true }) },
         (lock) => {
           if (lock) prune();
         },
@@ -579,7 +593,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   }
 
   function readPostedCopy(
-    active: HeldWriteRecord,
+    active: Pick<HeldWriteRecord, 'subject' | 'requestId'>,
     userId: string,
     projectUrl = getProjectUrl(),
   ): HeldWriteRecord | null {
@@ -906,6 +920,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         () =>
           activeUserId() !== trimmed ||
           sessionGeneration === signedOutGeneration,
+        true,
       );
     }
     for (const key of safeListKeys(
@@ -1075,20 +1090,27 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (read.value !== null && (!stored || stored.subject !== subject)) {
         return { ok: false, reason: 'storage' };
       }
-      if (stored) {
-        try {
-          const posted =
-            stored.phase === 'posted_reload'
-              ? stored
-              : readPostedCopy(stored, userId);
-          if (posted) {
-            observePostedCopy(posted);
-            emit();
-            return { ok: false, reason: 'conflict', existing: posted };
-          }
-        } catch {
-          return { ok: false, reason: 'storage' };
+      try {
+        const requestedPosted =
+          opts?.requestId === undefined
+            ? null
+            : readPostedCopy({ subject, requestId: opts.requestId }, userId);
+        const posted =
+          requestedPosted ??
+          (stored?.phase === 'posted_reload'
+            ? stored
+            : stored && stored.requestId !== opts?.requestId
+              ? readPostedCopy(stored, userId)
+              : null);
+        if (posted) {
+          observePostedCopy(posted);
+          emit();
+          return { ok: false, reason: 'conflict', existing: posted };
         }
+      } catch {
+        return { ok: false, reason: 'storage' };
+      }
+      if (stored) {
         const preserved = preservePayloadIdentity(subject, stored);
         if (isUnresolvedPhase(stored.phase)) records.set(subject, preserved);
         emit();
@@ -1800,17 +1822,17 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         }
 
         if (ack && matchesAck && acknowledgedInflight.get(subject) === ack) {
-          if (active && sameClaim(active, ack.record)) {
+          if (active && sameAcknowledgedClaim(active, ack.record)) {
             removeDurableRecord(activeKey);
           }
           // A different claim owns the active slot. Retire only this tab's
           // acknowledgement so it cannot settle that claim on a later read.
           acknowledgedInflight.delete(subject);
           const current = records.get(subject);
-          if (current && sameClaim(current, ack.record)) {
+          if (current && sameAcknowledgedClaim(current, ack.record)) {
             if (
               active &&
-              !sameClaim(active, ack.record) &&
+              !sameAcknowledgedClaim(active, ack.record) &&
               isUnresolvedPhase(active.phase)
             ) {
               records.set(subject, active);
