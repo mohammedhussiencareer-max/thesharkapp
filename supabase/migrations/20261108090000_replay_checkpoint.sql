@@ -101,12 +101,34 @@ where
   )
   and batch_id is not null;
 
+-- Range scans of one item's sort rows after a certified cut. A batch_id
+-- null check is redundant and can disappear before partial index matching.
+create index stock_movements_sort_time_idx on app.stock_movements (item_id, occurred_at, id)
+where
+  movement_type in (
+    'sort_out'::app.movement_type,
+    'sort_in'::app.movement_type,
+    'sort_loss'::app.movement_type
+  );
+
 create index stock_movements_cover_pair_idx on app.stock_movements (
   cover_inflow_movement_id,
   cover_deficit_movement_id
 )
 where
   cover_inflow_movement_id is not null;
+
+create index stock_movements_opening_idx on app.stock_movements (item_id, occurred_at)
+where
+  movement_type = 'opening'::app.movement_type;
+
+create index stock_movements_item_reversal_time_idx on app.stock_movements (item_id, occurred_at, id)
+where
+  reverses_movement_id is not null;
+
+create index stock_movements_item_reversal_id_idx on app.stock_movements (item_id, id)
+where
+  reverses_movement_id is not null;
 
 alter table app.period_revisions
 drop constraint period_revisions_bucket_check;
@@ -585,33 +607,42 @@ lock table app.accounting_queue_stats in exclusive mode;
 -- (anon, authenticated, service_role) can execute the reader, and a value
 -- they set is ignored because their session user is authenticator. No other
 -- function reads the pin directly.
-create function app.test_clock_pin () returns timestamptz language sql stable security invoker
+create function app.test_clock_pin () returns timestamptz language plpgsql stable security invoker
 set
   search_path = '' as $$
-  select
-    case
-      when coalesce(pg_catalog.current_setting('app.test_clock', true), '') = '' then null::timestamptz
-      when exists (
-        select
-          1
-        from
-          pg_catalog.pg_roles role
-          join pg_catalog.pg_database db on db.datdba = role.oid
-        where
-          db.datname = pg_catalog.current_database ()
-          and role.rolname = session_user::text
-      )
-      or exists (
-        select
-          1
-        from
-          pg_catalog.pg_roles role
-        where
-          role.rolname = session_user::text
-          and role.rolsuper
-      ) then pg_catalog.current_setting('app.test_clock', true)::timestamptz
-      else null::timestamptz
-    end;
+declare
+  v_raw text;
+begin
+  v_raw := coalesce(pg_catalog.current_setting('app.test_clock', true), '');
+
+  if v_raw = '' then
+    return null::timestamptz;
+  end if;
+
+  if exists (
+    select
+      1
+    from
+      pg_catalog.pg_roles role
+      join pg_catalog.pg_database db on db.datdba = role.oid
+    where
+      db.datname = pg_catalog.current_database ()
+      and role.rolname = session_user::text
+  )
+  or exists (
+    select
+      1
+    from
+      pg_catalog.pg_roles role
+    where
+      role.rolname = session_user::text
+      and role.rolsuper
+  ) then
+    return v_raw::timestamptz;
+  end if;
+
+  return null::timestamptz;
+end;
 $$;
 
 comment on function app.test_clock_pin () is 'The app.test_clock pin when the connected session user owns this database or is a superuser. A production owner session can set the pin; it is privileged, not test-only by construction. No application role can execute this reader, and a value they set is ignored.';
@@ -1118,38 +1149,744 @@ from
   authenticated,
   service_role;
 
-create function app.replay_posted_sort_siblings (p_members uuid[], p_pending_ids uuid[]) returns uuid[] language sql stable security definer
+-- Literals, not a joined cut. A runtime cut makes the planner hash every
+-- sort row; each arm below is an item_id plus occurred_at/id range.
+create function app.replay_sort_edge_sql (
+  p_item_id uuid,
+  p_after_at timestamptz,
+  p_after_id bigint,
+  p_before_at timestamptz,
+  p_before_id bigint,
+  p_sibling_ids uuid[]
+) returns text language plpgsql stable security definer
 set
   search_path = '' as $$
+declare
+  v_siblings text;
+  v_join text;
+  v_where text;
+  v_after_id bigint := coalesce(p_after_id, 0);
+  v_before_id bigint := coalesce(p_before_id, 0);
+begin
+  if p_item_id is null
+  or p_sibling_ids is null
+  or coalesce(pg_catalog.cardinality(p_sibling_ids), 0) = 0 then
+    return $none$select null::uuid, null::timestamptz, null::bigint where false$none$;
+  end if;
+
+  if p_after_at is not null
+  and p_before_at is not null
+  and (
+    p_after_at > p_before_at
+    or (
+      p_after_at = p_before_at
+      and v_after_id >= v_before_id
+    )
+  ) then
+    return $none$select null::uuid, null::timestamptz, null::bigint where false$none$;
+  end if;
+
   select
-    coalesce(
-      pg_catalog.array_agg(distinct sibling.item_id),
-      '{}'::uuid[]
-    )
+    'array[' || pg_catalog.string_agg(
+      pg_catalog.quote_literal(sib.id::text) || '::uuid',
+      ','
+    ) || ']::uuid[]'
+  into v_siblings
   from
-    app.stock_movements edge
-    join app.stock_movements sibling on sibling.batch_id = edge.batch_id
-    and sibling.item_id <> edge.item_id
-    and sibling.movement_type in (
-      'sort_out'::app.movement_type,
-      'sort_in'::app.movement_type,
-      'sort_loss'::app.movement_type
-    )
-  where
-    edge.item_id = any (p_members)
-    and edge.batch_id is not null
+    (
+      select distinct
+        sib.id
+      from
+        pg_catalog.unnest(p_sibling_ids) as sib (id)
+      where
+        sib.id is not null
+        and sib.id <> p_item_id
+    ) sib;
+
+  if v_siblings is null then
+    return $none$select null::uuid, null::timestamptz, null::bigint where false$none$;
+  end if;
+
+  v_where := pg_catalog.format(
+    $w$
+    edge.item_id = %L::uuid
     and edge.movement_type in (
       'sort_out'::app.movement_type,
       'sort_in'::app.movement_type,
       'sort_loss'::app.movement_type
     )
-    and sibling.item_id = any (p_pending_ids)
-    and sibling.item_id <> all (p_members);
+    $w$,
+    p_item_id
+  );
+
+  -- Keep the sibling lookup dependent on a qualifying edge. Materializing
+  -- the edge alone does not stop the planner from scanning the sibling first.
+  v_join := pg_catalog.format(
+    $j$
+    cross join lateral (
+      select sibling.item_id
+      from app.stock_movements sibling
+      where sibling.item_id = any (%s)
+        and sibling.item_id <> edge.item_id
+        and sibling.batch_id = edge.batch_id
+        and sibling.movement_type in (
+          'sort_out'::app.movement_type,
+          'sort_in'::app.movement_type,
+          'sort_loss'::app.movement_type
+        )
+      offset 0
+    ) sibling
+    $j$,
+    v_siblings
+  );
+
+  -- Use the full chronological key as an index bound, including rows that
+  -- share a timestamp with either cut.
+  if p_after_at is not null then
+    v_where := v_where || pg_catalog.format(
+      ' and (edge.occurred_at, edge.id) > (%L::timestamptz, %L::bigint)',
+      p_after_at,
+      v_after_id
+    );
+  end if;
+
+  if p_before_at is not null then
+    v_where := v_where || pg_catalog.format(
+      ' and (edge.occurred_at, edge.id) <= (%L::timestamptz, %L::bigint)',
+      p_before_at,
+      v_before_id
+    );
+  end if;
+
+  return pg_catalog.format(
+    $q$
+    with edge as materialized (
+      select edge.item_id, edge.batch_id, edge.occurred_at, edge.id
+      from app.stock_movements edge
+      where %s
+    )
+    select sibling.item_id, edge.occurred_at, edge.id
+    from edge %s
+    $q$,
+    v_where,
+    v_join
+  );
+end;
 $$;
 
-comment on function app.replay_posted_sort_siblings (uuid[], uuid[]) is 'Posted sort siblings of p_members that also appear in the pending set. Reads only the sort-edge index, not the item''s full history.';
+comment on function app.replay_sort_edge_sql (
+  uuid,
+  timestamptz,
+  bigint,
+  timestamptz,
+  bigint,
+  uuid[]
+) is 'SQL for one item''s sort edges in (after key, before key], sibling item_id bound. Null after is no lower bound. Null before is no upper bound. Cuts are literals so the planner range-scans.';
+
+revoke all on function app.replay_sort_edge_sql (
+  uuid,
+  timestamptz,
+  bigint,
+  timestamptz,
+  bigint,
+  uuid[]
+)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.replay_bounded_sort_edges (
+  p_item_id uuid,
+  p_after_at timestamptz,
+  p_after_id bigint,
+  p_before_at timestamptz,
+  p_before_id bigint,
+  p_sibling_ids uuid[]
+) returns table (
+  sibling_id uuid,
+  occurred_at timestamptz,
+  edge_id bigint
+) language plpgsql stable security definer
+set
+  search_path = '' as $$
+begin
+  sibling_id := null;
+  occurred_at := null;
+  edge_id := null;
+
+  return query execute app.replay_sort_edge_sql (
+    p_item_id,
+    p_after_at,
+    p_after_id,
+    p_before_at,
+    p_before_id,
+    p_sibling_ids
+  );
+end;
+$$;
+
+comment on function app.replay_bounded_sort_edges (
+  uuid,
+  timestamptz,
+  bigint,
+  timestamptz,
+  bigint,
+  uuid[]
+) is 'Sort siblings of one item inside the key window. Both sides are bound by item_id. A cut after every sort reads no frozen edge.';
+
+revoke all on function app.replay_bounded_sort_edges (
+  uuid,
+  timestamptz,
+  bigint,
+  timestamptz,
+  bigint,
+  uuid[]
+)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.sort_family_ids (p_item_id uuid) returns uuid[] language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    coalesce(
+      pg_catalog.array_agg(distinct family.id),
+      '{}'::uuid[]
+    )
+  from
+    app.stock_items seed
+    join app.stock_items family on family.id <> seed.id
+    and (
+      family.id = seed.parent_item_id
+      or family.parent_item_id = seed.id
+      or (
+        seed.parent_item_id is not null
+        and family.parent_item_id = seed.parent_item_id
+      )
+    )
+  where
+    seed.id = p_item_id;
+$$;
+
+comment on function app.sort_family_ids (uuid) is 'Mixed parent and size siblings of one fish item. Posted sorts stay inside this family.';
+
+revoke all on function app.sort_family_ids (uuid)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+-- Earliest other resume cut. Null means some partner has no cut, so the
+-- lower bound is open. Infinity means there is no partner and nothing to read.
+create function app.replay_sort_after_key (p_item_id uuid) returns table (after_at timestamptz, after_id bigint) language plpgsql volatile security definer
+set
+  search_path = '' as $$
+begin
+  if not exists (
+    select
+      1
+    from
+      ledger_scratch.replay_resume other
+    where
+      other.item_id <> p_item_id
+  ) then
+    after_at := 'infinity'::timestamptz;
+    after_id := 0;
+    return next;
+    return;
+  end if;
+
+  if exists (
+    select
+      1
+    from
+      ledger_scratch.replay_resume other
+    where
+      other.item_id <> p_item_id
+      and other.checkpoint_id is null
+  ) then
+    after_at := null;
+    after_id := null;
+    return next;
+    return;
+  end if;
+
+  select
+    other.cut_occurred_at,
+    other.max_movement_id
+  into
+    after_at,
+    after_id
+  from
+    ledger_scratch.replay_resume other
+  where
+    other.item_id <> p_item_id
+    and other.checkpoint_id is not null
+  order by
+    other.cut_occurred_at,
+    other.max_movement_id,
+    other.item_id
+  limit
+    1;
+
+  return next;
+end;
+$$;
+
+comment on function app.replay_sort_after_key (uuid) is 'Lower key for sort edges that can still straddle a resume cut. Frozen edges before every partner cut are not read.';
+
+revoke all on function app.replay_sort_after_key (uuid)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.replay_cut_has_straddle (p_item_id uuid, p_cut_at timestamptz) returns boolean language plpgsql volatile security definer
+set
+  search_path = '' as $$
+declare
+  v_partners uuid[];
+  v_after_at timestamptz;
+  v_open bigint := 9223372036854775807;
+begin
+  if p_item_id is null or p_cut_at is null then
+    return false;
+  end if;
+
+  select
+    coalesce(
+      pg_catalog.array_agg(other.item_id),
+      '{}'::uuid[]
+    )
+  into v_partners
+  from
+    ledger_scratch.replay_resume other
+  where
+    other.item_id <> p_item_id;
+
+  if coalesce(pg_catalog.cardinality(v_partners), 0) = 0 then
+    return false;
+  end if;
+
+  select
+    bound.after_at
+  into
+    v_after_at
+  from
+    app.replay_sort_after_key (p_item_id) bound;
+
+  -- A sort straddles on its timestamp: the same instant is inside every cut
+  -- taken at that sort. The id separates a later suffix row, not the sort's
+  -- own legs.
+  return exists (
+    select
+      1
+    from
+      app.replay_bounded_sort_edges (
+        p_item_id,
+        v_after_at,
+        case
+          when v_after_at is null then null
+          else v_open
+        end,
+        p_cut_at,
+        v_open,
+        v_partners
+      ) edge
+      join ledger_scratch.replay_resume other on other.item_id = edge.sibling_id
+    where
+      other.checkpoint_id is null
+      or edge.occurred_at > other.cut_occurred_at
+  );
+end;
+$$;
+
+comment on function app.replay_cut_has_straddle (uuid, timestamptz) is 'True when a sort on p_item_id is inside this cut and after a partner''s cut. The partner is the sibling, bound by item_id. The cut timestamp covers every leg of a sort posted at that instant.';
+
+revoke all on function app.replay_cut_has_straddle (uuid, timestamptz)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.replay_untracked_sort_siblings (p_item_id uuid, p_cut_at timestamptz) returns uuid[] language plpgsql volatile security definer
+set
+  search_path = '' as $$
+declare
+  v_missing uuid[];
+  v_after_at timestamptz;
+  v_found uuid[];
+  v_open bigint := 9223372036854775807;
+begin
+  select
+    coalesce(
+      pg_catalog.array_agg(family.item_id),
+      '{}'::uuid[]
+    )
+  into v_missing
+  from
+    pg_catalog.unnest(app.sort_family_ids (p_item_id)) as family (item_id)
+  where
+    not exists (
+      select
+        1
+      from
+        ledger_scratch.replay_resume present
+      where
+        present.item_id = family.item_id
+    );
+
+  if coalesce(pg_catalog.cardinality(v_missing), 0) = 0
+  or p_cut_at is null then
+    return '{}'::uuid[];
+  end if;
+
+  select
+    bound.after_at
+  into
+    v_after_at
+  from
+    app.replay_sort_after_key (p_item_id) bound;
+
+  select
+    coalesce(
+      pg_catalog.array_agg(distinct edge.sibling_id),
+      '{}'::uuid[]
+    )
+  into v_found
+  from
+    app.replay_bounded_sort_edges (
+      p_item_id,
+      v_after_at,
+      case
+        when v_after_at is null then null
+        else v_open
+      end,
+      p_cut_at,
+      v_open,
+      v_missing
+    ) edge
+  where
+    exists (
+      select
+        1
+      from
+        ledger_scratch.replay_resume other
+      where
+        other.item_id <> p_item_id
+        and (
+          other.checkpoint_id is null
+          or edge.occurred_at > other.cut_occurred_at
+        )
+    );
+
+  return coalesce(v_found, '{}'::uuid[]);
+end;
+$$;
+
+comment on function app.replay_untracked_sort_siblings (uuid, timestamptz) is 'Family items on a sort that is exposed by a partner cut and are not in the resume set yet.';
+
+revoke all on function app.replay_untracked_sort_siblings (uuid, timestamptz)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.replay_posted_sort_siblings (p_members uuid[], p_pending_ids uuid[]) returns uuid[] language plpgsql stable security definer
+set
+  search_path = '' as $$
+declare
+  v_member uuid;
+  v_cut_at timestamptz;
+  v_cut_id bigint;
+  v_targets uuid[];
+  v_found uuid[] := '{}'::uuid[];
+  v_add uuid[];
+begin
+  if p_members is null or p_pending_ids is null then
+    return '{}'::uuid[];
+  end if;
+
+  select
+    coalesce(
+      pg_catalog.array_agg(distinct t.item_id),
+      '{}'::uuid[]
+    )
+  into v_targets
+  from
+    pg_catalog.unnest(p_pending_ids) as t (item_id)
+  where
+    t.item_id is not null
+    and t.item_id <> all (p_members);
+
+  if coalesce(pg_catalog.cardinality(v_targets), 0) = 0 then
+    return '{}'::uuid[];
+  end if;
+
+  for v_member in
+    select distinct
+      t.item_id
+    from
+      pg_catalog.unnest(p_members) as t (item_id)
+    where
+      t.item_id is not null
+  loop
+    v_cut_at := null;
+    v_cut_id := null;
+
+    select
+      checkpoint.cut_occurred_at,
+      checkpoint.max_movement_id
+    into
+      v_cut_at,
+      v_cut_id
+    from
+      app.replay_checkpoints checkpoint
+    where
+      checkpoint.item_id = v_member
+      and not exists (
+        select
+          1
+        from
+          app.replay_checkpoint_invalidations invalidation
+        where
+          invalidation.checkpoint_id = checkpoint.id
+      )
+    order by
+      checkpoint.cut_occurred_at desc,
+      checkpoint.id desc
+    limit
+      1;
+
+    select
+      coalesce(
+        pg_catalog.array_agg(distinct edge.sibling_id),
+        '{}'::uuid[]
+      )
+    into v_add
+    from
+      app.replay_bounded_sort_edges (
+        v_member,
+        v_cut_at,
+        v_cut_id,
+        null::timestamptz,
+        null::bigint,
+        v_targets
+      ) edge
+    where
+      edge.sibling_id <> all (p_members);
+
+    v_found := v_found || coalesce(v_add, '{}'::uuid[]);
+  end loop;
+
+  select
+    coalesce(
+      pg_catalog.array_agg(distinct t.item_id),
+      '{}'::uuid[]
+    )
+  into v_found
+  from
+    pg_catalog.unnest(v_found) as t (item_id)
+  where
+    t.item_id is not null;
+
+  return v_found;
+end;
+$$;
+
+comment on function app.replay_posted_sort_siblings (uuid[], uuid[]) is 'Posted sort siblings of p_members that also appear in the pending set. Reads only sort edges after each member''s latest valid certified cut, bound by item_id.';
 
 revoke all on function app.replay_posted_sort_siblings (uuid[], uuid[])
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create or replace function app.recompute_item_set (p_item_ids uuid[]) returns uuid[] language plpgsql stable security definer
+set
+  search_path = '' as $$
+declare
+  v_set uuid[];
+  v_next uuid[];
+  v_guard integer := 0;
+  v_seed uuid;
+  v_family uuid[];
+  v_cut_at timestamptz;
+  v_cut_id bigint;
+  v_sort_add uuid[];
+begin
+  select
+    coalesce(
+      pg_catalog.array_agg(
+        distinct t.item_id
+        order by
+          t.item_id
+      ),
+      '{}'::uuid[]
+    )
+  into v_set
+  from
+    pg_catalog.unnest(p_item_ids) as t (item_id)
+  where
+    t.item_id is not null;
+
+  loop
+    v_guard := v_guard + 1;
+
+    if v_guard > 1000 then
+      raise exception 'recompute result is out of range'
+        using errcode = '22023';
+    end if;
+
+    select
+      coalesce(
+        pg_catalog.array_agg(
+          distinct found.item_id
+          order by
+            found.item_id
+        ),
+        '{}'::uuid[]
+      )
+    into v_next
+    from
+      (
+        select
+          si.parent_item_id as item_id
+        from
+          pg_catalog.unnest(v_set) as seed (item_id)
+          join app.stock_items si on si.id = seed.item_id
+        where
+          si.parent_item_id is not null
+        union
+        select
+          child.id
+        from
+          pg_catalog.unnest(v_set) as seed (item_id)
+          join app.stock_items si on si.id = seed.item_id
+          join app.stock_items child on child.parent_item_id = coalesce(
+            si.parent_item_id,
+            case
+              when si.kind = 'fish_mixed' then si.id
+              else null
+            end
+          )
+      ) as found
+    where
+      found.item_id is not null;
+
+    -- Sort partners after each seed's certified cut. The cut is a literal
+    -- inside replay_bounded_sort_edges, so frozen edges are not scanned.
+    for v_seed in
+      select
+        t.item_id
+      from
+        pg_catalog.unnest(v_set) as t (item_id)
+    loop
+      select
+        coalesce(
+          pg_catalog.array_agg(f.item_id),
+          '{}'::uuid[]
+        )
+      into v_family
+      from
+        pg_catalog.unnest(app.sort_family_ids (v_seed)) as f (item_id)
+      where
+        f.item_id <> all (v_set)
+        and f.item_id <> all (v_next);
+
+      if coalesce(pg_catalog.cardinality(v_family), 0) = 0 then
+        continue;
+      end if;
+
+      v_cut_at := null;
+      v_cut_id := null;
+
+      select
+        checkpoint.cut_occurred_at,
+        checkpoint.max_movement_id
+      into
+        v_cut_at,
+        v_cut_id
+      from
+        app.replay_checkpoints checkpoint
+      where
+        checkpoint.item_id = v_seed
+        and not exists (
+          select
+            1
+          from
+            app.replay_checkpoint_invalidations invalidation
+          where
+            invalidation.checkpoint_id = checkpoint.id
+        )
+      order by
+        checkpoint.cut_occurred_at desc,
+        checkpoint.id desc
+      limit
+        1;
+
+      select
+        coalesce(
+          pg_catalog.array_agg(distinct edge.sibling_id),
+          '{}'::uuid[]
+        )
+      into v_sort_add
+      from
+        app.replay_bounded_sort_edges (
+          v_seed,
+          v_cut_at,
+          v_cut_id,
+          null::timestamptz,
+          null::bigint,
+          v_family
+        ) edge;
+
+      v_next := v_next || coalesce(v_sort_add, '{}'::uuid[]);
+    end loop;
+
+    exit when v_next <@ v_set;
+
+    select
+      coalesce(
+        pg_catalog.array_agg(
+          distinct grown.item_id
+          order by
+            grown.item_id
+        ),
+        '{}'::uuid[]
+      )
+    into v_set
+    from
+      (
+        select
+          t.item_id
+        from
+          pg_catalog.unnest(v_set) as t (item_id)
+        union
+        select
+          t.item_id
+        from
+          pg_catalog.unnest(v_next) as t (item_id)
+      ) as grown;
+  end loop;
+
+  return v_set;
+end;
+$$;
+
+comment on function app.recompute_item_set (uuid[]) is 'Catalog parent/child plus posted sort edges after each item''s latest valid certified cut. Sibling sorts are bound by item_id and the cut key, so frozen history is not scanned.';
+
+revoke all on function app.recompute_item_set (uuid[])
 from
   public,
   anon,
@@ -1247,6 +1984,11 @@ declare
   v_members uuid[];
   v_pending_ids uuid[];
   v_component_plan text := '';
+  v_guard integer := 0;
+  v_found boolean;
+  v_cut_at timestamptz;
+  v_cut_id bigint;
+  v_edge_sql text;
 begin
   v_frozen := coalesce(pg_catalog.current_setting('app.replay_frozen', true), '') = '1';
 
@@ -1271,8 +2013,8 @@ begin
     where
       (elem.value ->> 'item_id')::uuid is not null;
 
-    -- SECURITY DEFINER SQL is not inlined. Explain the helper body with
-    -- the same members the first traversal call uses, default planner.
+    -- Explain the production sort-edge statement. The cut is a literal so
+    -- the plan is the range scan replay_posted_sort_siblings runs.
     select
       t.item_id
     into v_item
@@ -1285,40 +2027,43 @@ begin
     limit
       1;
 
-    v_members := array[v_item];
+    v_cut_at := null;
+    v_cut_id := null;
 
-    for v_line in execute pg_catalog.format(
-      $explain$
-      explain (analyze, buffers)
-      select
-        coalesce(
-          pg_catalog.array_agg(distinct sibling.item_id),
-          '{}'::uuid[]
-        )
-      from
-        app.stock_movements edge
-        join app.stock_movements sibling on sibling.batch_id = edge.batch_id
-        and sibling.item_id <> edge.item_id
-        and sibling.movement_type in (
-          'sort_out'::app.movement_type,
-          'sort_in'::app.movement_type,
-          'sort_loss'::app.movement_type
-        )
-      where
-        edge.item_id = any (%L::uuid[])
-        and edge.batch_id is not null
-        and edge.movement_type in (
-          'sort_out'::app.movement_type,
-          'sort_in'::app.movement_type,
-          'sort_loss'::app.movement_type
-        )
-        and sibling.item_id = any (%L::uuid[])
-        and sibling.item_id <> all (%L::uuid[])
-      $explain$,
-      v_members,
-      v_pending_ids,
-      v_members
-    )
+    select
+      checkpoint.cut_occurred_at,
+      checkpoint.max_movement_id
+    into
+      v_cut_at,
+      v_cut_id
+    from
+      app.replay_checkpoints checkpoint
+    where
+      checkpoint.item_id = v_item
+      and not exists (
+        select
+          1
+        from
+          app.replay_checkpoint_invalidations invalidation
+        where
+          invalidation.checkpoint_id = checkpoint.id
+      )
+    order by
+      checkpoint.cut_occurred_at desc,
+      checkpoint.id desc
+    limit
+      1;
+
+    v_edge_sql := app.replay_sort_edge_sql (
+      v_item,
+      v_cut_at,
+      v_cut_id,
+      null::timestamptz,
+      null::bigint,
+      v_pending_ids
+    );
+
+    for v_line in execute 'explain (analyze, buffers) ' || v_edge_sql
     loop
       v_component_plan := v_component_plan || v_line || e'\n';
     end loop;
@@ -1557,128 +2302,164 @@ begin
   -- A sort output can resume while its input cannot: the new purchase is on
   -- the input, before the sort, so the output's own suffix is empty. Walking
   -- only the input reprices the sort and leaves the output at the old value.
-  -- Move only a cut that straddles an affected sort (the sort is at or
-  -- before the cut, and a sibling will reprice it) to the latest earlier
-  -- certified cut that does not straddle it. Cuts already before every
-  -- affected sort stay; both legs then reprice the sort in a short suffix.
-  for v_item in
-    select
-      resume.item_id
+  -- Repeat demotion until no sort straddles any cut in the component. A newly
+  -- exposed sort adds every item it touches to the candidates. Each fallback
+  -- cut must pass the same suffix watermark as the bind loop.
+  loop
+    exit when not exists (
+      select
+        1
+      from
+        ledger_scratch.replay_resume a
+        join ledger_scratch.replay_resume b on b.item_id <> a.item_id
+      where
+        a.checkpoint_id is not null
+        and (
+          b.checkpoint_id is null
+          or a.cut_occurred_at > b.cut_occurred_at
+        )
+    );
+
+    v_guard := v_guard + 1;
+
+    if v_guard > 1000 then
+      raise exception 'recompute result is out of range'
+        using errcode = '22023';
+    end if;
+
+    insert into
+      ledger_scratch.replay_resume (item_id)
+    select distinct
+      sibling.item_id
     from
       ledger_scratch.replay_resume resume
+      cross join lateral pg_catalog.unnest(
+        app.replay_untracked_sort_siblings (
+          resume.item_id,
+          resume.cut_occurred_at
+        )
+      ) as sibling (item_id)
     where
       resume.checkpoint_id is not null
-      and exists (
-        select
-          1
-        from
-          app.stock_movements edge
-          join app.stock_movements walker on walker.batch_id = edge.batch_id
-          and walker.movement_type in (
-            'sort_out'::app.movement_type,
-            'sort_in'::app.movement_type,
-            'sort_loss'::app.movement_type
-          )
-          join ledger_scratch.replay_resume other on other.item_id = walker.item_id
-        where
-          edge.item_id = resume.item_id
-          and edge.batch_id is not null
-          and edge.movement_type in (
-            'sort_out'::app.movement_type,
-            'sort_in'::app.movement_type,
-            'sort_loss'::app.movement_type
-          )
-          and resume.cut_occurred_at >= edge.occurred_at
-          and (
-            other.checkpoint_id is null
-            or edge.occurred_at > other.cut_occurred_at
-          )
-      )
-  loop
-    v_use := false;
-    v_checkpoint := null;
+    on conflict (item_id) do nothing;
 
-    for v_checkpoint in
+    v_found := false;
+
+    for v_item in
       select
-        checkpoint.*
+        resume.item_id
       from
-        app.replay_checkpoints checkpoint
+        ledger_scratch.replay_resume resume
       where
-        checkpoint.item_id = v_item
-        and not exists (
-          select
-            1
-          from
-            app.replay_checkpoint_invalidations invalidation
-          where
-            invalidation.checkpoint_id = checkpoint.id
+        resume.checkpoint_id is not null
+        and app.replay_cut_has_straddle (
+          resume.item_id,
+          resume.cut_occurred_at
         )
-        and not exists (
-          select
-            1
-          from
-            app.stock_movements edge
-            join app.stock_movements walker on walker.batch_id = edge.batch_id
-            and walker.movement_type in (
-              'sort_out'::app.movement_type,
-              'sort_in'::app.movement_type,
-              'sort_loss'::app.movement_type
-            )
-            join ledger_scratch.replay_resume other on other.item_id = walker.item_id
-          where
-            edge.item_id = v_item
-            and edge.batch_id is not null
-            and edge.movement_type in (
-              'sort_out'::app.movement_type,
-              'sort_in'::app.movement_type,
-              'sort_loss'::app.movement_type
-            )
-            and checkpoint.cut_occurred_at >= edge.occurred_at
-            and (
-              other.checkpoint_id is null
-              or edge.occurred_at > other.cut_occurred_at
-            )
-        )
-      order by
-        checkpoint.cut_occurred_at desc,
-        checkpoint.id desc
     loop
-      select
-        min((elem.value ->> 'occurred_at')::timestamptz)
-      into v_pending_min
-      from
-        pg_catalog.jsonb_array_elements(coalesce(p_pending, '[]'::jsonb)) as elem (value)
-      where
-        (elem.value ->> 'item_id')::uuid = v_item;
+      v_found := true;
+      v_use := false;
+      v_checkpoint := null;
 
-      if v_pending_min is not null
-      and v_checkpoint.cut_occurred_at >= v_pending_min then
-        continue;
-      end if;
+      for v_checkpoint in
+        select
+          checkpoint.*
+        from
+          app.replay_checkpoints checkpoint
+        where
+          checkpoint.item_id = v_item
+          and not exists (
+            select
+              1
+            from
+              app.replay_checkpoint_invalidations invalidation
+            where
+              invalidation.checkpoint_id = checkpoint.id
+          )
+          and not app.replay_cut_has_straddle (
+            v_item,
+            checkpoint.cut_occurred_at
+          )
+        order by
+          checkpoint.cut_occurred_at desc,
+          checkpoint.id desc
+      loop
+        select
+          min((elem.value ->> 'occurred_at')::timestamptz)
+        into v_pending_min
+        from
+          pg_catalog.jsonb_array_elements(coalesce(p_pending, '[]'::jsonb)) as elem (value)
+        where
+          (elem.value ->> 'item_id')::uuid = v_item;
 
-      if v_frozen
-      and v_order_at is not null
-      and v_checkpoint.cut_occurred_at >= v_order_at then
-        continue;
-      end if;
+        if v_pending_min is not null
+        and v_checkpoint.cut_occurred_at >= v_pending_min then
+          continue;
+        end if;
 
-      select
-        count(*)
-      into v_anchor_count
-      from
-        app.stock_count_anchors anchor
-      where
-        anchor.item_id = v_item
-        and anchor.economic
-        and anchor.counted_at <= v_checkpoint.cut_occurred_at;
+        if v_frozen
+        and v_order_at is not null
+        and v_checkpoint.cut_occurred_at >= v_order_at then
+          continue;
+        end if;
 
-      if v_anchor_count is distinct from v_checkpoint.anchor_count then
-        continue;
-      end if;
+        select
+          count(*)
+        into v_anchor_count
+        from
+          app.stock_count_anchors anchor
+        where
+          anchor.item_id = v_item
+          and anchor.economic
+          and anchor.counted_at <= v_checkpoint.cut_occurred_at;
 
-      v_use := true;
-      exit;
-    end loop;
+        if v_anchor_count is distinct from v_checkpoint.anchor_count then
+          continue;
+        end if;
+
+        select
+          least(move_min.at, id_min.at, anchor_min.at)
+        into v_suffix_min
+        from
+          (
+            select
+              min(sm.occurred_at) as at
+            from
+              app.stock_movements sm
+            where
+              sm.item_id = v_item
+              and sm.occurred_at > v_checkpoint.cut_occurred_at
+              and sm.movement_type <> 'cost_adjustment'::app.movement_type
+          ) as move_min,
+          (
+            select
+              min(sm.occurred_at) as at
+            from
+              app.stock_movements sm
+            where
+              sm.item_id = v_item
+              and sm.id > v_checkpoint.max_movement_id
+              and sm.movement_type <> 'cost_adjustment'::app.movement_type
+          ) as id_min,
+          (
+            select
+              min(anchor.counted_at) as at
+            from
+              app.stock_count_anchors anchor
+            where
+              anchor.item_id = v_item
+              and anchor.economic
+              and anchor.counted_at > v_checkpoint.cut_occurred_at
+          ) as anchor_min;
+
+        if v_suffix_min is not null
+        and v_suffix_min <= v_checkpoint.cut_occurred_at then
+          continue;
+        end if;
+
+        v_use := true;
+        exit;
+      end loop;
 
     delete from ledger_scratch.replay_restore_plan stored
     where
@@ -1801,11 +2582,14 @@ begin
       where
         item_id = v_item;
     end if;
+    end loop;
+
+    exit when not v_found;
   end loop;
 end;
 $$;
 
-comment on function app.replay_bind_resume (uuid[], jsonb) is 'Choose one usable checkpoint per item whose cut is strictly before that item''s own effect. The effect is the earliest pending row in the item''s sort component. Empty pending skips historical sort edges. Posted sort edges join only pending items, through the sort-edge index. A checkpoint that fails the anchor count or the suffix test is skipped. A cut that straddles an affected posted sort moves to the latest earlier certified cut that does not; a cut already before every affected sort stays.';
+comment on function app.replay_bind_resume (uuid[], jsonb) is 'Choose one usable checkpoint per item whose cut is strictly before that item''s own effect. The effect is the earliest pending row in the item''s sort component. Empty pending skips historical sort edges. Posted sort edges join only pending items after each member''s certified cut, bound by item_id. A checkpoint that fails the anchor count or the suffix test is skipped. Demotion repeats until no sort straddles a cut in the component, reading only edges after the earliest partner cut. Each newly exposed sort adds its items to the candidates. Each fallback cut passes the same suffix watermark as the bind loop.';
 
 revoke all on function app.replay_bind_resume (uuid[], jsonb)
 from
@@ -2234,44 +3018,51 @@ declare
   v_xfer_shift text;
   v_xfer_event bigint;
   v_xfer_piece integer;
+  v_walked_ids bigint[];
 begin
   v_cause := coalesce(p_cause, pg_catalog.gen_random_uuid ());
 
+  select
+    coalesce(
+      pg_catalog.array_agg(walked.movement_id),
+      '{}'::bigint[]
+    )
+  into v_walked_ids
+  from
+    ledger_scratch.recompute_row walked
+  where
+    not walked.is_pending
+    and walked.movement_id is not null;
+
   -- A pair this walk no longer requires posts its negation. P0 inserted
   -- before P1 leaves the old P1 cover at zero and posts the new cover at P0.
-  insert into
-    ledger_scratch.recompute_cover_pair (
-      inflow_movement_id,
-      deficit_movement_id,
-      covered_qty,
-      value_adj
-    )
-  select
-    posted.cover_inflow_movement_id,
-    posted.cover_deficit_movement_id,
-    0,
-    0
-  from
-    (
-      select distinct
-        sm.cover_inflow_movement_id,
-        sm.cover_deficit_movement_id
-      from
-        app.stock_movements sm
-      where
-        sm.movement_type = 'closed_period'::app.movement_type
-        and sm.cover_inflow_movement_id is not null
-        and exists (
-          select
-            1
-          from
-            ledger_scratch.recompute_row walked
-          where
-            walked.movement_id = sm.cover_inflow_movement_id
-            and not walked.is_pending
-        )
-    ) as posted
-  on conflict (inflow_movement_id, deficit_movement_id) do nothing;
+  if coalesce(pg_catalog.cardinality(v_walked_ids), 0) > 0 then
+    insert into
+      ledger_scratch.recompute_cover_pair (
+        inflow_movement_id,
+        deficit_movement_id,
+        covered_qty,
+        value_adj
+      )
+    select
+      posted.cover_inflow_movement_id,
+      posted.cover_deficit_movement_id,
+      0,
+      0
+    from
+      (
+        select distinct
+          sm.cover_inflow_movement_id,
+          sm.cover_deficit_movement_id
+        from
+          app.stock_movements sm
+        where
+          sm.movement_type = 'closed_period'::app.movement_type
+          and sm.cover_inflow_movement_id is not null
+          and sm.cover_inflow_movement_id = any (v_walked_ids)
+      ) as posted
+    on conflict (inflow_movement_id, deficit_movement_id) do nothing;
+  end if;
 
   -- A cover is the fact (deficit, inflow, quantity, value), not the age of
   -- the inflow. Posted cost adjustments are those facts in posting order.
@@ -2498,11 +3289,13 @@ begin
     perform app.note_recognized_cover (v_pair.deficit_movement_id, - v_delta);
 
     -- A later transfer of this source still holds the value that was in
-    -- force when it posted. Move the new cover across both legs so the
-    -- day of the reclass reports the live contribution.
+    -- force when it posted. The required amount is this deficit's balance
+    -- up to that transfer's first leg. Only that transfer's own legs are
+    -- reconciled, so another closed row on the item does not move it.
     for v_xfer in
       select
         pair.occurred_at,
+        pair.transfer_id,
         pair.from_bucket,
         pair.to_bucket,
         pair.source_kind,
@@ -2511,6 +3304,7 @@ begin
         (
           select
             later.occurred_at,
+            min(later.id) as transfer_id,
             max(later.closed_bucket) filter (
               where
                 later.total_cost > 0
@@ -2563,30 +3357,70 @@ begin
         pair.occurred_at
     loop
       select
-        coalesce(sum(sm.total_cost), 0)
+        coalesce(src.total_cost, 0)
+        + coalesce(
+          (
+            select
+              sum(ca.total_cost)
+            from
+              app.stock_movements ca
+            where
+              ca.adjusts_movement_id = v_pair.deficit_movement_id
+              and ca.movement_type = 'cost_adjustment'::app.movement_type
+              and (
+                ca.occurred_at < v_xfer.occurred_at
+                or (
+                  ca.occurred_at = v_xfer.occurred_at
+                  and ca.id < v_xfer.transfer_id
+                )
+              )
+          ),
+          0
+        )
+        + coalesce(
+          (
+            select
+              sum(car.total_cost)
+            from
+              app.stock_movements car
+            where
+              car.cover_deficit_movement_id = v_pair.deficit_movement_id
+              and car.cover_inflow_movement_id is not null
+              and car.movement_type = 'closed_period'::app.movement_type
+              and (
+                car.occurred_at < v_xfer.occurred_at
+                or (
+                  car.occurred_at = v_xfer.occurred_at
+                  and car.id < v_xfer.transfer_id
+                )
+              )
+          ),
+          0
+        )
       into v_before
       from
-        app.stock_movements sm
+        app.stock_movements src
       where
-        sm.item_id = v_inflow.item_id
-        and sm.movement_type = 'closed_period'::app.movement_type
-        and sm.closed_bucket = v_xfer.from_bucket
-        and sm.occurred_at < v_xfer.occurred_at;
+        src.id = v_pair.deficit_movement_id;
 
-      v_required := -v_before;
+      v_required := -coalesce(v_before, 0);
 
       select
         coalesce(sum(sm.total_cost), 0)
       into v_posted_from
       from
         app.stock_movements sm
+        join app.closed_period_sources xfer_src on xfer_src.movement_id = sm.id
       where
         sm.item_id = v_inflow.item_id
         and sm.movement_type = 'closed_period'::app.movement_type
         and sm.closed_bucket = v_xfer.from_bucket
         and sm.occurred_at = v_xfer.occurred_at
+        and sm.id >= v_xfer.transfer_id
         and sm.quantity = 0
-        and sm.cover_inflow_movement_id is null;
+        and sm.cover_inflow_movement_id is null
+        and xfer_src.source_kind = v_xfer.source_kind
+        and xfer_src.source_id = v_xfer.source_id;
 
       v_extra := v_required - v_posted_from;
 
@@ -4329,6 +5163,7 @@ declare
   v_out_value numeric := 0;
   v_left_value numeric := 0;
   v_share numeric := 0;
+  v_as_of record;
 begin
   v_change := app.note_change_instant ();
 
@@ -4378,15 +5213,28 @@ begin
     ) line;
 
   if v_taken_qty > 0 then
-    v_unit := app.closed_unit_cost (v_mixed);
+    select
+      state.*
+    into v_as_of
+    from
+      app.closed_as_of_state (v_mixed) as state;
 
-    if v_unit is null then
-      raise exception 'missing_cost_basis'
-        using errcode = 'P0001',
-        detail = 'missing_cost_basis';
+    if v_as_of.on_hand_qty > 0 then
+      v_taken_value := pg_catalog.round(
+        v_as_of.on_hand_value * v_taken_qty / v_as_of.on_hand_qty,
+        2
+      );
+    else
+      v_unit := app.closed_unit_cost (v_mixed);
+
+      if v_unit is null then
+        raise exception 'missing_cost_basis'
+          using errcode = 'P0001',
+          detail = 'missing_cost_basis';
+      end if;
+
+      v_taken_value := pg_catalog.round(v_taken_qty * v_unit, 2);
     end if;
-
-    v_taken_value := pg_catalog.round(v_taken_qty * v_unit, 2);
 
     if v_loss_qty > 0 then
       v_loss_value := pg_catalog.round(v_taken_value * v_loss_qty / v_taken_qty, 2);
@@ -5211,17 +6059,70 @@ create or replace function app.replay_prepare_tables () returns void language pl
 set
   search_path = '' as $$
 begin
-  truncate ledger_scratch.recompute_row,
-  ledger_scratch.recompute_bal,
-  ledger_scratch.recompute_def,
-  ledger_scratch.recompute_effect,
-  ledger_scratch.recompute_piece,
-  ledger_scratch.recompute_override,
-  ledger_scratch.recompute_seq,
-  ledger_scratch.recompute_anchor,
-  ledger_scratch.replay_resume,
-  ledger_scratch.recompute_cover_pair,
-  ledger_scratch.replay_restore_plan;
+  -- Truncate recompute_row when a user BEFORE TRUNCATE trigger is attached or
+  -- its heap grew past 32 KB; otherwise DELETE avoids relfilenode churn and
+  -- relcache invalidation on short resumed walks.
+  if pg_catalog.pg_relation_size('ledger_scratch.recompute_row'::regclass) > 32768
+  or exists (
+    select
+      1
+    from
+      pg_catalog.pg_trigger trg
+    where
+      trg.tgrelid = 'ledger_scratch.recompute_row'::regclass
+      and not trg.tgisinternal
+  ) then
+    truncate ledger_scratch.recompute_row;
+  elsif pg_catalog.pg_relation_size('ledger_scratch.recompute_row'::regclass) > 0 then
+    delete from ledger_scratch.recompute_row;
+  end if;
+
+  if pg_catalog.pg_relation_size('ledger_scratch.recompute_def'::regclass) > 65536
+  or pg_catalog.pg_relation_size('ledger_scratch.recompute_effect'::regclass) > 65536
+  or pg_catalog.pg_relation_size('ledger_scratch.recompute_override'::regclass) > 65536
+  or pg_catalog.pg_relation_size('ledger_scratch.recompute_anchor'::regclass) > 65536 then
+    truncate ledger_scratch.recompute_bal,
+    ledger_scratch.recompute_def,
+    ledger_scratch.recompute_effect,
+    ledger_scratch.recompute_piece,
+    ledger_scratch.recompute_override,
+    ledger_scratch.recompute_seq,
+    ledger_scratch.recompute_anchor,
+    ledger_scratch.replay_resume,
+    ledger_scratch.recompute_cover_pair,
+    ledger_scratch.replay_restore_plan;
+  else
+    if pg_catalog.pg_relation_size('ledger_scratch.recompute_bal'::regclass) > 0 then
+      delete from ledger_scratch.recompute_bal;
+    end if;
+    if pg_catalog.pg_relation_size('ledger_scratch.recompute_def'::regclass) > 0 then
+      delete from ledger_scratch.recompute_def;
+    end if;
+    if pg_catalog.pg_relation_size('ledger_scratch.recompute_effect'::regclass) > 0 then
+      delete from ledger_scratch.recompute_effect;
+    end if;
+    if pg_catalog.pg_relation_size('ledger_scratch.recompute_piece'::regclass) > 0 then
+      delete from ledger_scratch.recompute_piece;
+    end if;
+    if pg_catalog.pg_relation_size('ledger_scratch.recompute_override'::regclass) > 0 then
+      delete from ledger_scratch.recompute_override;
+    end if;
+    if pg_catalog.pg_relation_size('ledger_scratch.recompute_seq'::regclass) > 0 then
+      delete from ledger_scratch.recompute_seq;
+    end if;
+    if pg_catalog.pg_relation_size('ledger_scratch.recompute_anchor'::regclass) > 0 then
+      delete from ledger_scratch.recompute_anchor;
+    end if;
+    if pg_catalog.pg_relation_size('ledger_scratch.replay_resume'::regclass) > 0 then
+      delete from ledger_scratch.replay_resume;
+    end if;
+    if pg_catalog.pg_relation_size('ledger_scratch.recompute_cover_pair'::regclass) > 0 then
+      delete from ledger_scratch.recompute_cover_pair;
+    end if;
+    if pg_catalog.pg_relation_size('ledger_scratch.replay_restore_plan'::regclass) > 0 then
+      delete from ledger_scratch.replay_restore_plan;
+    end if;
+  end if;
 end;
 $$;
 
@@ -5599,138 +6500,159 @@ from
   authenticated,
   service_role;
 
-create function app.replay_replace_movement_ids (p_item_ids uuid[]) returns bigint[] language sql stable security definer
+create function app.replay_replace_movement_ids (p_item_ids uuid[]) returns bigint[] language plpgsql stable security definer
 set
   search_path = '' as $$
-  select
-    coalesce(
-      pg_catalog.array_agg(distinct touched.movement_id),
-      '{}'::bigint[]
-    )
-  from
-    (
-      select
-        walked.movement_id
-      from
-        ledger_scratch.recompute_row walked
-      where
-        walked.item_id = any (p_item_ids)
+declare
+  v_resume record;
+  v_arms text[] := '{}'::text[];
+  v_ids bigint[];
+begin
+  if p_item_ids is null
+  or coalesce(pg_catalog.cardinality(p_item_ids), 0) = 0 then
+    return '{}'::bigint[];
+  end if;
+
+  v_arms := pg_catalog.array_append(
+    v_arms,
+    pg_catalog.format(
+      $arm$
+      select walked.movement_id
+      from ledger_scratch.recompute_row walked
+      where walked.item_id = any (%L::uuid[])
         and not walked.is_pending
         and walked.movement_id is not null
-      union
-      select
-        rebuilt.movement_id
-      from
-        ledger_scratch.recompute_def rebuilt
-      where
-        rebuilt.item_id = any (p_item_ids)
+      $arm$,
+      p_item_ids
+    )
+  );
+
+  v_arms := pg_catalog.array_append(
+    v_arms,
+    pg_catalog.format(
+      $arm$
+      select rebuilt.movement_id
+      from ledger_scratch.recompute_def rebuilt
+      where rebuilt.item_id = any (%L::uuid[])
         and rebuilt.movement_id is not null
-      union
-      select
-        sm.id
-      from
-        ledger_scratch.replay_resume resume
-        join app.stock_movements sm on sm.item_id = resume.item_id
-        and sm.occurred_at > resume.cut_occurred_at
-      where
-        resume.checkpoint_id is not null
-        and resume.item_id = any (p_item_ids)
-        and sm.reverses_movement_id is not null
-      union
-      select
-        sm.id
-      from
-        ledger_scratch.replay_resume resume
-        join app.stock_movements sm on sm.item_id = resume.item_id
-        and sm.occurred_at > resume.cut_occurred_at
-      where
-        resume.checkpoint_id is not null
-        and resume.item_id = any (p_item_ids)
-        and sm.movement_type in (
-          'sale_reversal'::app.movement_type,
-          'waste_reversal'::app.movement_type
+      $arm$,
+      p_item_ids
+    )
+  );
+
+  for v_resume in
+    select
+      resume.item_id,
+      resume.checkpoint_id,
+      resume.cut_occurred_at,
+      resume.max_movement_id
+    from
+      ledger_scratch.replay_resume resume
+    where
+      resume.item_id = any (p_item_ids)
+    order by
+      resume.item_id
+  loop
+    if v_resume.checkpoint_id is not null then
+      v_arms := pg_catalog.array_append(
+        v_arms,
+        pg_catalog.format(
+          $arm$
+          select sm.id
+          from app.stock_movements sm
+          where sm.item_id = %1$L::uuid
+            and sm.occurred_at > %2$L::timestamptz
+            and sm.reverses_movement_id is not null
+          $arm$,
+          v_resume.item_id,
+          v_resume.cut_occurred_at
         )
-      union
-      select
-        sm.id
-      from
-        ledger_scratch.replay_resume resume
-        join app.stock_movements sm on sm.item_id = resume.item_id
-        and sm.occurred_at > resume.cut_occurred_at
-        join app.stock_movements rev on rev.reverses_movement_id = sm.id
-      where
-        resume.checkpoint_id is not null
-        and resume.item_id = any (p_item_ids)
-      union
-      select
-        sm.id
-      from
-        ledger_scratch.replay_resume resume
-        join app.stock_movements sm on sm.item_id = resume.item_id
-        and sm.id > resume.max_movement_id
-      where
-        resume.checkpoint_id is not null
-        and resume.item_id = any (p_item_ids)
-        and sm.reverses_movement_id is not null
-      union
-      select
-        sm.id
-      from
-        ledger_scratch.replay_resume resume
-        join app.stock_movements sm on sm.item_id = resume.item_id
-        and sm.id > resume.max_movement_id
-      where
-        resume.checkpoint_id is not null
-        and resume.item_id = any (p_item_ids)
-        and sm.movement_type in (
-          'sale_reversal'::app.movement_type,
-          'waste_reversal'::app.movement_type
+      );
+
+      v_arms := pg_catalog.array_append(
+        v_arms,
+        pg_catalog.format(
+          $arm$
+          select sm.id
+          from app.stock_movements sm
+          where sm.item_id = %1$L::uuid
+            and sm.id > %2$L::bigint
+            and sm.reverses_movement_id is not null
+          $arm$,
+          v_resume.item_id,
+          v_resume.max_movement_id
         )
-      union
-      select
-        sm.id
-      from
-        ledger_scratch.replay_resume resume
-        join app.stock_movements sm on sm.item_id = resume.item_id
-        and sm.id > resume.max_movement_id
-        join app.stock_movements rev on rev.reverses_movement_id = sm.id
-      where
-        resume.checkpoint_id is not null
-        and resume.item_id = any (p_item_ids)
-      union
-      select
-        sm.id
-      from
-        ledger_scratch.replay_resume resume
-        join app.stock_movements sm on sm.item_id = resume.item_id
-      where
-        resume.checkpoint_id is null
-        and resume.item_id = any (p_item_ids)
-        and sm.reverses_movement_id is not null
-      union
-      select
-        sm.id
-      from
-        ledger_scratch.replay_resume resume
-        join app.stock_movements sm on sm.item_id = resume.item_id
-      where
-        resume.checkpoint_id is null
-        and resume.item_id = any (p_item_ids)
-        and sm.movement_type in (
-          'sale_reversal'::app.movement_type,
-          'waste_reversal'::app.movement_type
+      );
+
+      v_arms := pg_catalog.array_append(
+        v_arms,
+        pg_catalog.format(
+          $arm$
+          select sm.id
+          from app.stock_movements sm
+          join app.stock_movements rev on rev.reverses_movement_id = sm.id
+          where sm.item_id = %1$L::uuid
+            and sm.occurred_at > %2$L::timestamptz
+            and rev.item_id = %1$L::uuid
+            and rev.reverses_movement_id is not null
+          $arm$,
+          v_resume.item_id,
+          v_resume.cut_occurred_at
         )
-      union
-      select
-        sm.id
-      from
-        ledger_scratch.replay_resume resume
-        join app.stock_movements sm on sm.item_id = resume.item_id
-        join app.stock_movements rev on rev.reverses_movement_id = sm.id
-      where
-        resume.checkpoint_id is null
-        and resume.item_id = any (p_item_ids)
-    ) touched;
+      );
+
+      v_arms := pg_catalog.array_append(
+        v_arms,
+        pg_catalog.format(
+          $arm$
+          select sm.id
+          from app.stock_movements sm
+          join app.stock_movements rev on rev.reverses_movement_id = sm.id
+          where sm.item_id = %1$L::uuid
+            and sm.id > %2$L::bigint
+            and rev.item_id = %1$L::uuid
+            and rev.reverses_movement_id is not null
+          $arm$,
+          v_resume.item_id,
+          v_resume.max_movement_id
+        )
+      );
+    else
+      v_arms := pg_catalog.array_append(
+        v_arms,
+        pg_catalog.format(
+          $arm$
+          select sm.id
+          from app.stock_movements sm
+          where sm.item_id = %1$L::uuid
+            and sm.reverses_movement_id is not null
+          $arm$,
+          v_resume.item_id
+        )
+      );
+
+      v_arms := pg_catalog.array_append(
+        v_arms,
+        pg_catalog.format(
+          $arm$
+          select sm.id
+          from app.stock_movements sm
+          join app.stock_movements rev on rev.reverses_movement_id = sm.id
+          where sm.item_id = %1$L::uuid
+            and rev.item_id = %1$L::uuid
+            and rev.reverses_movement_id is not null
+          $arm$,
+          v_resume.item_id
+        )
+      );
+    end if;
+  end loop;
+
+  execute 'select coalesce(pg_catalog.array_agg(distinct touched.movement_id), ''{}''::bigint[]) from (' || pg_catalog.array_to_string(v_arms, ' union ') || ') touched'
+  into v_ids;
+
+  return coalesce(v_ids, '{}'::bigint[]);
+end;
 $$;
 
 comment on function app.replay_replace_movement_ids (uuid[]) is 'Movement ids whose deficits this walk recomputed. A resume uses the two suffix index ranges. A full walk reads that item''s reversals. The frozen prefix of a resumed item is not scanned.';
@@ -5792,6 +6714,11 @@ declare
   v_balance_plan text := '';
   v_resume record;
   v_seqscan text;
+  v_stored_total numeric(14, 2);
+  v_stored_unit numeric(20, 6);
+  v_fx_at timestamptz;
+  v_fx_bucket text;
+  v_walked_ids bigint[];
 begin
   if p_pending is null then
     p_pending := '[]'::jsonb;
@@ -6154,7 +7081,9 @@ begin
       or anchor.counted_at > resume.cut_occurred_at
     );
 
-  perform app.replay_capture_read (p_item_ids);
+  if coalesce(pg_catalog.current_setting('app.replay_probe', true), '') = '1' then
+    perform app.replay_capture_read (p_item_ids);
+  end if;
 
   for r in
     select
@@ -6539,15 +7468,29 @@ begin
       fx.movement_type,
       fx.base_total,
       fx.unit_cost as replay_unit,
-      fx.cover_total,
-      sm.total_cost as stored_total,
-      sm.unit_cost as stored_unit,
-      sm.occurred_at,
-      sm.closed_bucket
+      fx.cover_total
     from
       ledger_scratch.recompute_effect fx
-      join app.stock_movements sm on sm.id = fx.movement_id
   loop
+    select
+      sm.total_cost,
+      sm.unit_cost,
+      sm.occurred_at,
+      sm.closed_bucket
+    into
+      v_stored_total,
+      v_stored_unit,
+      v_fx_at,
+      v_fx_bucket
+    from
+      app.stock_movements sm
+    where
+      sm.id = e.movement_id;
+
+    if not found then
+      continue;
+    end if;
+
     select
       coalesce(sum(ca.total_cost), 0)
     into v_old
@@ -6558,12 +7501,12 @@ begin
       and ca.movement_type = 'cost_adjustment';
 
     v_required := e.base_total + e.cover_total;
-    v_existing := e.stored_total + v_old;
+    v_existing := v_stored_total + v_old;
     v_diff := v_required - v_existing;
 
     if v_diff <> 0 then
       v_diff := app.assert_recompute_range (v_diff, 2, true);
-      v_unit_diff := app.assert_recompute_range (e.replay_unit - e.stored_unit, 6, true);
+      v_unit_diff := app.assert_recompute_range (e.replay_unit - v_stored_unit, 6, true);
       v_shift := app.shift_for_target (e.movement_id);
 
       insert into
@@ -6586,7 +7529,7 @@ begin
           p_cause,
           e.item_id,
           'cost_adjustment',
-          e.occurred_at,
+          v_fx_at,
           0,
           v_unit_diff,
           v_diff,
@@ -6602,7 +7545,7 @@ begin
       perform app.note_period_revision (
         v_new_id,
         v_shift,
-        coalesce(app.profit_bucket (e.movement_type), e.closed_bucket),
+        coalesce(app.profit_bucket (e.movement_type), v_fx_bucket),
         v_diff,
         e.item_id,
         p_cause
@@ -6610,16 +7553,55 @@ begin
 
       perform app.note_recognized_cover (e.movement_id, - v_diff);
 
-      perform app.invalidate_checkpoints_from (e.item_id, e.occurred_at, 'cost_adjustment');
+      perform app.invalidate_checkpoints_from (e.item_id, v_fx_at, 'cost_adjustment');
     end if;
   end loop;
 
-  perform app.settle_count_anchors (p_cause, p_item_ids);
+  if exists (
+    select
+      1
+    from
+      ledger_scratch.recompute_anchor
+  ) then
+    perform app.settle_count_anchors (p_cause, p_item_ids);
+  end if;
 
   -- A deficit from before the window is carried by a closed_period row at the
   -- inflow. The walk already added that adjustment once. Post the delta here,
   -- before the ledger-sum check, so the carrier is part of the same cut.
-  perform app.replay_write_cover_pairs (p_cause);
+  select
+    coalesce(
+      pg_catalog.array_agg(walked.movement_id),
+      '{}'::bigint[]
+    )
+  into v_walked_ids
+  from
+    ledger_scratch.recompute_row walked
+  where
+    not walked.is_pending
+    and walked.movement_id is not null;
+
+  if exists (
+    select
+      1
+    from
+      ledger_scratch.recompute_cover_pair
+  )
+  or (
+    coalesce(pg_catalog.cardinality(v_walked_ids), 0) > 0
+    and exists (
+      select
+        1
+      from
+        app.stock_movements sm
+      where
+        sm.movement_type = 'closed_period'::app.movement_type
+        and sm.cover_inflow_movement_id is not null
+        and sm.cover_inflow_movement_id = any (v_walked_ids)
+    )
+  ) then
+    perform app.replay_write_cover_pairs (p_cause);
+  end if;
 
   -- Replace only the deficits this walk recomputed. The frozen prefix is
   -- not in the suffix and not in the rebuilt set, so those settled rows are
@@ -6868,10 +7850,11 @@ begin
     select
       1
     from
-      app.stock_movements target
-      join app.stock_movements rev on rev.reverses_movement_id = target.id
+      app.stock_movements rev
+      join app.stock_movements target on target.id = rev.reverses_movement_id
     where
-      target.item_id = any (p_item_ids)
+      rev.item_id = any (p_item_ids)
+      and rev.reverses_movement_id is not null
       and (
         target.quantity + rev.quantity <> 0
         or target.total_cost + rev.total_cost + coalesce(
@@ -6890,8 +7873,6 @@ begin
   ) then
     perform app.raise_recompute_failure ('critical');
   end if;
-
-  perform app.replay_write_cover_pairs (p_cause);
 
   -- A resumed item's checkpoint already holds the prefix totals. The check
   -- adds only the suffix, so a long frozen history is not aggregated again.
@@ -7072,7 +8053,35 @@ begin
 
   perform app.replay_publish_checkpoints (p_item_ids);
 
-  perform app.replay_note_probe_ms ();
+  if coalesce(pg_catalog.current_setting('app.replay_probe', true), '') = '1' then
+    perform app.replay_note_probe_ms ();
+  end if;
+
+  -- Reclaim large scratch heaps at the end of a write walk so the next short
+  -- resumed walk does not pay to clean up a prior full walk. Keep recompute_row
+  -- intact when a user trigger is inspecting it.
+  if pg_catalog.pg_relation_size('ledger_scratch.recompute_row'::regclass) > 32768
+  and not exists (
+    select
+      1
+    from
+      pg_catalog.pg_trigger trg
+    where
+      trg.tgrelid = 'ledger_scratch.recompute_row'::regclass
+      and not trg.tgisinternal
+  ) then
+    truncate ledger_scratch.recompute_row;
+  end if;
+
+  if pg_catalog.pg_relation_size('ledger_scratch.recompute_def'::regclass) > 32768
+  or pg_catalog.pg_relation_size('ledger_scratch.recompute_effect'::regclass) > 32768
+  or pg_catalog.pg_relation_size('ledger_scratch.recompute_override'::regclass) > 32768
+  or pg_catalog.pg_relation_size('ledger_scratch.recompute_anchor'::regclass) > 32768 then
+    truncate ledger_scratch.recompute_def,
+    ledger_scratch.recompute_effect,
+    ledger_scratch.recompute_override,
+    ledger_scratch.recompute_anchor;
+  end if;
 exception
   when numeric_value_out_of_range then
     perform app.raise_recompute_failure ('critical');
@@ -7574,6 +8583,74 @@ begin
   perform app.replay_touch_deficit_flag (p_item_id);
 end;
 $$;
+
+create function app.closed_as_of_state (p_item_id uuid) returns table (
+  on_hand_qty numeric,
+  on_hand_value numeric,
+  avg_cost numeric,
+  has_uncovered_deficit boolean
+) language plpgsql volatile security definer
+set
+  search_path = '' as $$
+declare
+  v_at timestamptz;
+  v_qty numeric;
+  v_value numeric;
+begin
+  v_at := app.note_change_instant ();
+
+  select
+    coalesce(
+      sum(sm.quantity) filter (
+        where
+          sm.movement_type <> 'cost_adjustment'::app.movement_type
+      ),
+      0
+    ),
+    coalesce(sum(sm.total_cost), 0)
+  into
+    v_qty,
+    v_value
+  from
+    app.stock_movements sm
+  where
+    sm.item_id = p_item_id
+    and sm.occurred_at <= v_at;
+
+  on_hand_qty := v_qty;
+  on_hand_value := v_value;
+
+  if v_qty > 0 then
+    avg_cost := pg_catalog.round(v_value / v_qty, 6);
+  else
+    avg_cost := 0;
+  end if;
+
+  has_uncovered_deficit := v_qty < 0
+  or exists (
+    select
+      1
+    from
+      app.provisional_deficits pd
+      join app.stock_movements deficit on deficit.id = pd.movement_id
+    where
+      pd.item_id = p_item_id
+      and pd.qty_uncovered > 0
+      and deficit.occurred_at <= v_at
+  );
+
+  return next;
+end;
+$$;
+
+comment on function app.closed_as_of_state (uuid) is 'Quantity, value, average, and uncovered-deficit state of one item at t_change, excluding later-dated movements.';
+
+revoke all on function app.closed_as_of_state (uuid)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
 
 create function app.closed_unit_cost (p_item_id uuid) returns numeric language sql stable security definer
 set
@@ -12495,6 +13572,7 @@ declare
   v_window timestamptz;
   v_closed_pending jsonb := '[]'::jsonb;
   v_open_pending jsonb := '[]'::jsonb;
+  v_pure_purchase boolean := false;
 begin
   perform app.assert_ledger_write_allowed ();
 
@@ -12570,6 +13648,73 @@ begin
   perform app.prepare_balance_locks (v_set);
 
   perform app.assert_not_before_opening (v_seed, v_times, v_types);
+
+  select
+    coalesce(
+      bool_and(
+        elem.value ->> 'movement_type' = 'purchase'
+        and coalesce((elem.value ->> 'quantity')::numeric, 0) > 0
+        and coalesce((elem.value ->> 'is_input_total')::boolean, false)
+        and (elem.value ->> 'unit_cost') is not null
+        and (elem.value ->> 'total_cost') is not null
+      ),
+      false
+    )
+  into v_pure_purchase
+  from
+    pg_catalog.jsonb_array_elements(p_pending) as elem (value);
+
+  -- A pure purchase batch has fixed input costs and never splits into pieces,
+  -- so it inserts directly and runs one confirming walk instead of dry+write.
+  if v_pure_purchase then
+    for e in
+      select
+        elem.value
+      from
+        pg_catalog.jsonb_array_elements(p_pending) as elem (value)
+      order by
+        (elem.value ->> 'line_key')::integer asc
+    loop
+      insert into
+        app.stock_movements (
+          batch_id,
+          item_id,
+          movement_type,
+          occurred_at,
+          quantity,
+          unit_cost,
+          total_cost,
+          is_provisional,
+          shift_id,
+          source_type,
+          source_id,
+          note
+        )
+      values
+        (
+          p_batch_id,
+          (e.value ->> 'item_id')::uuid,
+          'purchase'::app.movement_type,
+          (e.value ->> 'occurred_at')::timestamptz,
+          (e.value ->> 'quantity')::numeric,
+          app.assert_recompute_range ((e.value ->> 'unit_cost')::numeric, 6, false),
+          app.assert_recompute_range ((e.value ->> 'total_cost')::numeric, 2, false),
+          false,
+          e.value ->> 'shift_id',
+          e.value ->> 'source_type',
+          e.value ->> 'source_id',
+          e.value ->> 'note'
+        )
+      returning
+        id into v_id;
+
+      v_ids := v_ids || v_id;
+    end loop;
+
+    perform app.replay_execute (v_set, '[]'::jsonb, p_batch_id, true);
+
+    return v_ids;
+  end if;
 
   -- Count lines are anchors inside replay_execute. There is no count barrier.
   perform app.replay_execute (v_set, p_pending, p_batch_id, false);
@@ -14080,8 +15225,7 @@ declare
   v_check_types text[] := '{}'::text[];
   v_pending jsonb := '[]'::jsonb;
   v_key integer := 0;
-  v_change timestamptz;
-  v_later_qty numeric(20, 6);
+  v_as_of record;
 begin
   perform app.assert_ledger_write_allowed ();
 
@@ -14328,50 +15472,22 @@ begin
       );
     end loop;
   else
-    -- Closed legs post at t_change against the live mixed balance.
-    -- An in-window backdated sort still walks history at occurred_at.
+    -- Closed legs post at t_change against the as-of mixed state. An
+    -- in-window backdated sort still walks history at occurred_at.
     if p_occurred_at < app.restatement_window_start (app.note_change_instant ()) then
       perform app.prepare_balance_locks (array[p_mixed_item]);
 
       select
-        ib.*
-      into v_mixed_bal
+        state.*
+      into v_as_of
       from
-        app.item_balances ib
-      where
-        ib.item_id = p_mixed_item;
+        app.closed_as_of_state (p_mixed_item) as state;
 
-      -- Live stock includes later-dated movements. Availability of a closed
-      -- sort is stock as of t_change when the item tail is after that key.
-      v_change := app.note_change_instant ();
-
-      if exists (
-        select
-          1
-        from
-          app.stock_movements sm
-        where
-          sm.item_id = p_mixed_item
-          and sm.occurred_at > v_change
-      ) then
-        select
-          coalesce(sum(sm.quantity), 0)
-        into v_later_qty
-        from
-          app.stock_movements sm
-        where
-          sm.item_id = p_mixed_item
-          and sm.occurred_at > v_change
-          and sm.movement_type <> 'cost_adjustment'::app.movement_type;
-
-        v_mixed_bal.on_hand_qty := v_mixed_bal.on_hand_qty - coalesce(v_later_qty, 0);
-      end if;
-
-      if v_mixed_bal.has_uncovered_deficit
-      or v_mixed_bal.on_hand_qty <= 0
-      or v_qty_taken > v_mixed_bal.on_hand_qty then
+      if v_as_of.has_uncovered_deficit
+      or v_as_of.on_hand_qty <= 0
+      or v_qty_taken > v_as_of.on_hand_qty then
         raise exception 'not enough stock to sort: on_hand_qty %, requested %',
-          v_mixed_bal.on_hand_qty,
+          v_as_of.on_hand_qty,
           v_qty_taken
           using errcode = '22023';
       end if;

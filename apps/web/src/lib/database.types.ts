@@ -2434,6 +2434,11 @@ isOneToOne: true
 "closed_allocation":
 { Args: { "p_affected_qty": number,"p_change": string,"p_doc_at": string,"p_document_id": number,"p_item_id": string,"p_qty_delta": number,"p_value_delta": number }; Returns: Json
                            },
+"closed_as_of_state":
+{ Args: { "p_item_id": string }; Returns: {
+              "avg_cost": number,"has_uncovered_deficit": boolean,"on_hand_qty": number,"on_hand_value": number
+            }[]
+                           },
 "closed_bucket_weights":
 { Args: { "p_change": string,"p_doc_at": string,"p_item_id": string }; Returns: (number)[]
                            },
@@ -3004,6 +3009,11 @@ isOneToOne: true
 "replay_bind_resume":
 { Args: { "p_item_ids": (string)[],"p_pending": Json }; Returns: undefined
                            },
+"replay_bounded_sort_edges":
+{ Args: { "p_after_at": string,"p_after_id": number,"p_before_at": string,"p_before_id": number,"p_item_id": string,"p_sibling_ids": (string)[] }; Returns: {
+              "edge_id": number,"occurred_at": string,"sibling_id": string
+            }[]
+                           },
 "replay_cap_waived":
 { Args: { "p_item_ids": (string)[] }; Returns: boolean
                            },
@@ -3017,6 +3027,9 @@ isOneToOne: true
 { Args: { "p_item_ids": (string)[] }; Returns: {
               "member_ids": (string)[]
             }[]
+                           },
+"replay_cut_has_straddle":
+{ Args: { "p_cut_at": string,"p_item_id": string }; Returns: boolean
                            },
 "replay_execute":
 { Args: { "p_cause": string,"p_item_ids": (string)[],"p_pending": Json,"p_write": boolean }; Returns: undefined
@@ -3054,11 +3067,22 @@ isOneToOne: true
 "replay_replace_movement_ids":
 { Args: { "p_item_ids": (string)[] }; Returns: (number)[]
                            },
+"replay_sort_after_key":
+{ Args: { "p_item_id": string }; Returns: {
+              "after_at": string,"after_id": number
+            }[]
+                           },
+"replay_sort_edge_sql":
+{ Args: { "p_after_at": string,"p_after_id": number,"p_before_at": string,"p_before_id": number,"p_item_id": string,"p_sibling_ids": (string)[] }; Returns: string
+                           },
 "replay_sort_members":
 { Args: { "p_item_id": string,"p_pending": Json }; Returns: (string)[]
                            },
 "replay_touch_deficit_flag":
 { Args: { "p_item_id": string }; Returns: undefined
+                           },
+"replay_untracked_sort_siblings":
+{ Args: { "p_cut_at": string,"p_item_id": string }; Returns: (string)[]
                            },
 "replay_write_cover_pairs":
 { Args: { "p_cause": string }; Returns: undefined
@@ -3160,6 +3184,9 @@ isOneToOne: true
                            },
 "shift_page_order_coverage":
 { Args: { "p_opening": string,"p_shift_ids": (string)[] }; Returns: Json
+                           },
+"sort_family_ids":
+{ Args: { "p_item_id": string }; Returns: (string)[]
                            },
 "split_money":
 { Args: { "p_total": number,"p_weights": (number)[] }; Returns: (number)[]

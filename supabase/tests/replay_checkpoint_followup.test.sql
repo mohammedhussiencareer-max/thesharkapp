@@ -7742,47 +7742,78 @@ select
   set_config('app.replay_probe', '', true);
 
 select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.replay_bounded_sort_edges (
+          'f6e00000-0000-4000-8000-000000000039',
+          (
+            select
+              anchor.at + interval '1 hour'
+            from
+              f6_anchor anchor
+          ),
+          0,
+          null,
+          null,
+          array['f6e00000-0000-4000-8000-00000000003a']::uuid[]
+        )
+    ),
+    0::bigint,
+    'a cut after the posted sort reads no frozen sort sibling'
+  );
+
+select
+  ok (
+    (
+      select
+        count(*)
+      from
+        app.replay_bounded_sort_edges (
+          'f6e00000-0000-4000-8000-000000000039',
+          (
+            select
+              anchor.at - interval '1 hour'
+            from
+              f6_anchor anchor
+          ),
+          0,
+          null,
+          null,
+          array['f6e00000-0000-4000-8000-00000000003a']::uuid[]
+        )
+    ) >= 1,
+    'a cut before the posted sort still reads that sort sibling'
+  );
+
+select
   set_config('enable_seqscan', 'off', true);
 
 create function pg_temp.explain_sort_edge () returns text language plpgsql as $$
 declare
   v_plan text := '';
   v_line text;
+  v_sql text;
+  v_after timestamptz;
 begin
-  for v_line in execute
-    $q$
-    explain (format text)
-    select
-      sibling.item_id
-    from
-      app.stock_movements edge
-      join app.stock_movements sibling on sibling.batch_id = edge.batch_id
-      and sibling.item_id <> edge.item_id
-      and sibling.movement_type in (
-        'sort_out'::app.movement_type,
-        'sort_in'::app.movement_type,
-        'sort_loss'::app.movement_type
-      )
-    where
-      edge.item_id = any (
-        array['f6e00000-0000-4000-8000-000000000039']::uuid[]
-      )
-      and edge.batch_id is not null
-      and edge.movement_type in (
-        'sort_out'::app.movement_type,
-        'sort_in'::app.movement_type,
-        'sort_loss'::app.movement_type
-      )
-      and sibling.item_id = any (
-        array[
-          'f6e00000-0000-4000-8000-000000000039',
-          'f6e00000-0000-4000-8000-00000000003a'
-        ]::uuid[]
-      )
-      and sibling.item_id <> all (
-        array['f6e00000-0000-4000-8000-000000000039']::uuid[]
-      )
-    $q$
+  select
+    anchor.at - interval '1 hour'
+  into v_after
+  from
+    f6_anchor anchor;
+
+  v_sql := app.replay_sort_edge_sql (
+    'f6e00000-0000-4000-8000-000000000039',
+    v_after,
+    0,
+    null,
+    null,
+    array['f6e00000-0000-4000-8000-00000000003a']::uuid[]
+  );
+
+  for v_line in execute 'explain (analyze, buffers) ' || v_sql
   loop
     v_plan := v_plan || v_line || e'\n';
   end loop;
@@ -7796,7 +7827,11 @@ select
     (
       select
         plan.plan like '%Index%'
-        and plan.plan like '%stock_movements_sort_edge%'
+        and (
+          plan.plan like '%stock_movements_sort_edge%'
+          or plan.plan like '%stock_movements_sort_time%'
+          or plan.plan like '%stock_movements_item_occurred%'
+        )
         and plan.plan not like '%Seq Scan on stock_movements%'
       from
         (
@@ -12105,6 +12140,1688 @@ select
         p25_after_cover after
     ),
     'replay of a count deficit covered before aging is stable'
+  );
+
+-- P2-1h. Three-item B1 demotion must reach a fixed point. Raw B has an
+-- earlier sort B->C and a later sort B->A. A's cut exposes B->A, so B
+-- moves to its only earlier cut (before B->C). C kept the old cut and is
+-- not in the first candidate set, so B->C straddles until C is demoted.
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config(
+    'app.test_clock',
+    (
+      select
+        anchor.at::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+create temp table p21h_days as
+select
+  anchor.at - interval '20 days' as opening_at,
+  anchor.at - interval '18 days' as sort_bc,
+  anchor.at - interval '12 days' as sort_ba,
+  anchor.at - interval '10 days' as later_at
+from
+  f6_anchor anchor;
+
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    parent_item_id
+  )
+values
+  (
+    'f6e00000-0000-4000-8000-000000000056',
+    'p21h mixed B',
+    'fish_mixed',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    'f6e00000-0000-4000-8000-000000000057',
+    'p21h size C',
+    'fish_size',
+    'kg',
+    'daily',
+    'f6e00000-0000-4000-8000-000000000056'
+  ),
+  (
+    'f6e00000-0000-4000-8000-000000000058',
+    'p21h size A',
+    'fish_size',
+    'kg',
+    'daily',
+    'f6e00000-0000-4000-8000-000000000056'
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000056',
+        'movement_type',
+        'opening',
+        'occurred_at',
+        (
+          select
+            days.opening_at
+          from
+            p21h_days days
+        ),
+        'quantity',
+        20,
+        'unit_cost',
+        10
+      )
+    )
+  );
+
+select
+  app.replay_execute (
+    array['f6e00000-0000-4000-8000-000000000056']::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-00000000057b',
+    true
+  );
+
+select
+  app.post_sort (
+    'f6e00000-0000-4000-8000-000000000056',
+    (
+      select
+        days.sort_bc
+      from
+        p21h_days days
+    ),
+    4,
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000057',
+        'quantity',
+        4
+      )
+    )
+  );
+
+select
+  app.post_sort (
+    'f6e00000-0000-4000-8000-000000000056',
+    (
+      select
+        days.sort_ba
+      from
+        p21h_days days
+    ),
+    3,
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000058',
+        'quantity',
+        3
+      )
+    )
+  );
+
+select
+  app.replay_execute (
+    array[
+      'f6e00000-0000-4000-8000-000000000056',
+      'f6e00000-0000-4000-8000-000000000057',
+      'f6e00000-0000-4000-8000-000000000058'
+    ]::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-00000000057c',
+    true
+  );
+
+-- A newest in-window purchase skips replay unless it covers an open
+-- deficit. Oversell A after B->A, then drop A's cuts so the covering
+-- purchase still binds and A's walk exposes B->A.
+select
+  app.post_engine_outflows (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000058',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        (
+          select
+            days.sort_ba + interval '1 hour'
+          from
+            p21h_days days
+        ),
+        'quantity',
+        4
+      )
+    )
+  );
+
+insert into
+  app.replay_checkpoint_invalidations (checkpoint_id, reason)
+select
+  checkpoint.id,
+  'p21h-expose-a'
+from
+  app.replay_checkpoints
+checkpoint
+where
+  checkpoint.item_id = 'f6e00000-0000-4000-8000-000000000058'
+  and not exists (
+    select
+      1
+    from
+      app.replay_checkpoint_invalidations invalidation
+    where
+      invalidation.checkpoint_id = checkpoint.id
+  );
+
+select
+  set_config('app.replay_probe', '1', true);
+
+delete from app.replay_read_probe;
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000058',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            days.later_at
+          from
+            p21h_days days
+        ),
+        'quantity',
+        1,
+        'unit_cost',
+        20
+      )
+    )
+  );
+
+select
+  set_config('app.replay_probe', '', true);
+
+create temp table p21h_resume as
+select
+  balance.item_id,
+  balance.on_hand_qty,
+  balance.on_hand_value
+from
+  app.item_balances balance
+where
+  balance.item_id in (
+    'f6e00000-0000-4000-8000-000000000056',
+    'f6e00000-0000-4000-8000-000000000057',
+    'f6e00000-0000-4000-8000-000000000058'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.replay_read_probe probe,
+        lateral pg_catalog.jsonb_array_elements (probe.resume_detail) as detail
+      where
+        probe.id = (
+          select
+            max(latest.id)
+          from
+            app.replay_read_probe latest
+        )
+        and detail ->> 'item_id' = 'f6e00000-0000-4000-8000-000000000056'
+        and (
+          (detail ->> 'checkpoint_id') is null
+          or (detail ->> 'cut_occurred_at')::timestamptz < (
+            select
+              days.sort_bc
+            from
+              p21h_days days
+          )
+        )
+    )
+    and exists (
+      select
+        1
+      from
+        app.replay_read_probe probe,
+        lateral pg_catalog.jsonb_array_elements (probe.resume_detail) as detail
+      where
+        probe.id = (
+          select
+            max(latest.id)
+          from
+            app.replay_read_probe latest
+        )
+        and detail ->> 'item_id' = 'f6e00000-0000-4000-8000-000000000057'
+        and (
+          (detail ->> 'checkpoint_id') is null
+          or (detail ->> 'cut_occurred_at')::timestamptz < (
+            select
+              days.sort_bc
+            from
+              p21h_days days
+          )
+        )
+    ),
+    'B and C both resume before the earlier sort B->C'
+  );
+
+select
+  ok (
+    not exists (
+      select
+        1
+      from
+        app.stock_movements edge
+        join app.stock_movements walker on walker.batch_id = edge.batch_id
+        and walker.item_id <> edge.item_id
+        and walker.movement_type in (
+          'sort_out'::app.movement_type,
+          'sort_in'::app.movement_type,
+          'sort_loss'::app.movement_type
+        )
+        join app.replay_read_probe probe on probe.id = (
+          select
+            max(latest.id)
+          from
+            app.replay_read_probe latest
+        )
+        join lateral pg_catalog.jsonb_array_elements (probe.resume_detail) as edge_detail on edge_detail ->> 'item_id' = edge.item_id::text
+        join lateral pg_catalog.jsonb_array_elements (probe.resume_detail) as walk_detail on walk_detail ->> 'item_id' = walker.item_id::text
+      where
+        edge.item_id in (
+          'f6e00000-0000-4000-8000-000000000056',
+          'f6e00000-0000-4000-8000-000000000057',
+          'f6e00000-0000-4000-8000-000000000058'
+        )
+        and edge.movement_type in (
+          'sort_out'::app.movement_type,
+          'sort_in'::app.movement_type,
+          'sort_loss'::app.movement_type
+        )
+        and (edge_detail ->> 'checkpoint_id') is not null
+        and edge.occurred_at <= (edge_detail ->> 'cut_occurred_at')::timestamptz
+        and (
+          (walk_detail ->> 'checkpoint_id') is null
+          or edge.occurred_at > (walk_detail ->> 'cut_occurred_at')::timestamptz
+        )
+    ),
+    'three-item demotion reaches a fixed point: no sort straddles a cut'
+  );
+
+insert into
+  app.replay_checkpoint_invalidations (checkpoint_id, reason)
+select
+  checkpoint.id,
+  'p21h-full'
+from
+  app.replay_checkpoints
+checkpoint
+where
+  checkpoint.item_id in (
+    'f6e00000-0000-4000-8000-000000000056',
+    'f6e00000-0000-4000-8000-000000000057',
+    'f6e00000-0000-4000-8000-000000000058'
+  )
+  and not exists (
+    select
+      1
+    from
+      app.replay_checkpoint_invalidations invalidation
+    where
+      invalidation.checkpoint_id = checkpoint.id
+  );
+
+select
+  app.replay_execute (
+    array[
+      'f6e00000-0000-4000-8000-000000000056',
+      'f6e00000-0000-4000-8000-000000000057',
+      'f6e00000-0000-4000-8000-000000000058'
+    ]::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-00000000057d',
+    true
+  );
+
+select
+  results_eq (
+    $$select item_id::text, on_hand_qty::text, on_hand_value::text
+      from app.item_balances
+      where item_id in (
+        'f6e00000-0000-4000-8000-000000000056',
+        'f6e00000-0000-4000-8000-000000000057',
+        'f6e00000-0000-4000-8000-000000000058'
+      )
+      order by item_id$$,
+    $$select item_id::text, on_hand_qty::text, on_hand_value::text
+      from p21h_resume
+      order by item_id$$,
+    'the three-item resumed walk equals a forced full walk'
+  );
+
+-- P2-2h. Closed-sort availability uses as-of uncovered-deficit at t_change.
+-- 10 at noon, a later waste of 11 leaves a tail deficit; noon quantity is
+-- still 10, so a noon sort of 5 must post.
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    parent_item_id
+  )
+values
+  (
+    'f6e00000-0000-4000-8000-000000000059',
+    'p22h mixed deficit',
+    'fish_mixed',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    'f6e00000-0000-4000-8000-00000000005a',
+    'p22h size deficit',
+    'fish_size',
+    'kg',
+    'daily',
+    'f6e00000-0000-4000-8000-000000000059'
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000059',
+        'movement_type',
+        'opening',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '60 days'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        10,
+        'unit_cost',
+        10
+      )
+    )
+  );
+
+select
+  app.post_engine_outflows (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000059',
+        'movement_type',
+        'waste',
+        'occurred_at',
+        (
+          select
+            anchor.at + interval '1 hour'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        11
+      )
+    )
+  );
+
+select
+  lives_ok (
+    $$select app.post_sort(
+      'f6e00000-0000-4000-8000-000000000059',
+      (select at - interval '50 days' from f6_anchor),
+      5,
+      jsonb_build_array(
+        jsonb_build_object(
+          'item_id',
+          'f6e00000-0000-4000-8000-00000000005a',
+          'quantity',
+          5
+        )
+      )
+    )$$,
+    'a closed sort of 5 posts when only a later-dated waste created the live deficit'
+  );
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-000000000059'
+        and sm.movement_type in (
+          'sort_out'::app.movement_type,
+          'closed_period'::app.movement_type
+        )
+        and sm.quantity < 0
+    )
+    and exists (
+      select
+        1
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-00000000005a'
+        and sm.movement_type in (
+          'sort_in'::app.movement_type,
+          'closed_period'::app.movement_type
+        )
+        and sm.quantity > 0
+    ),
+    'the as-of-available closed sort writes both legs'
+  );
+
+-- P2-3h. Closed sort pricing uses the same as-of state. 10/100 at noon and
+-- a 10/1000 receipt at 13:00: a noon sort of 5 transfers 50, not 275.
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    parent_item_id
+  )
+values
+  (
+    'f6e00000-0000-4000-8000-00000000005b',
+    'p22h mixed price',
+    'fish_mixed',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    'f6e00000-0000-4000-8000-00000000005c',
+    'p22h size price',
+    'fish_size',
+    'kg',
+    'daily',
+    'f6e00000-0000-4000-8000-00000000005b'
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000005b',
+        'movement_type',
+        'opening',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '60 days'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        10,
+        'unit_cost',
+        10
+      )
+    )
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000005b',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at + interval '1 hour'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        10,
+        'unit_cost',
+        100
+      )
+    )
+  );
+
+select
+  app.post_sort (
+    'f6e00000-0000-4000-8000-00000000005b',
+    (
+      select
+        anchor.at - interval '50 days'
+      from
+        f6_anchor anchor
+    ),
+    5,
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000005c',
+        'quantity',
+        5
+      )
+    )
+  );
+
+select
+  is (
+    (
+      select
+        balance.on_hand_qty::text || '/' || balance.on_hand_value::text
+      from
+        app.item_balances balance
+      where
+        balance.item_id = 'f6e00000-0000-4000-8000-00000000005c'
+    ),
+    '5.000000/50.00',
+    'a closed noon sort of 5 transfers the as-of 50, not the live 275'
+  );
+
+select
+  is (
+    (
+      select
+        balance.on_hand_qty::text || '/' || balance.on_hand_value::text
+      from
+        app.item_balances balance
+      where
+        balance.item_id = 'f6e00000-0000-4000-8000-00000000005b'
+    ),
+    '15.000000/1050.00',
+    'the mixed item keeps the as-of remainder after the closed noon sort'
+  );
+
+select
+  app.replay_execute (
+    array[
+      'f6e00000-0000-4000-8000-00000000005b',
+      'f6e00000-0000-4000-8000-00000000005c'
+    ]::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-00000000057e',
+    true
+  );
+
+select
+  is (
+    (
+      select
+        balance.on_hand_qty::text || '/' || balance.on_hand_value::text
+      from
+        app.item_balances balance
+      where
+        balance.item_id = 'f6e00000-0000-4000-8000-00000000005c'
+    ),
+    '5.000000/50.00',
+    'replay keeps the as-of closed sort transfer of 50'
+  );
+
+insert into
+  app.replay_checkpoint_invalidations (checkpoint_id, reason)
+select
+  checkpoint.id,
+  'p22h-price-full'
+from
+  app.replay_checkpoints
+checkpoint
+where
+  checkpoint.item_id in (
+    'f6e00000-0000-4000-8000-00000000005b',
+    'f6e00000-0000-4000-8000-00000000005c'
+  )
+  and not exists (
+    select
+      1
+    from
+      app.replay_checkpoint_invalidations invalidation
+    where
+      invalidation.checkpoint_id = checkpoint.id
+  );
+
+select
+  app.replay_execute (
+    array[
+      'f6e00000-0000-4000-8000-00000000005b',
+      'f6e00000-0000-4000-8000-00000000005c'
+    ]::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-00000000057f',
+    true
+  );
+
+select
+  is (
+    (
+      select
+        balance.on_hand_qty::text || '/' || balance.on_hand_value::text
+      from
+        app.item_balances balance
+      where
+        balance.item_id = 'f6e00000-0000-4000-8000-00000000005c'
+    ),
+    '5.000000/50.00',
+    'forced full replay keeps the as-of closed sort transfer of 50'
+  );
+
+-- P2-4h. Cover transfer reconciliation uses the exact source. Ordinary
+-- 5/50 sale deficit, a late -50 cover, then a reclass must move that
+-- source; an unrelated closed -50 on the same item must not inflate it.
+insert into
+  app.stock_items (id, name, kind, base_unit, count_frequency)
+values
+  (
+    'f6e00000-0000-4000-8000-00000000005d',
+    'p24h ordinary cover',
+    'seafood',
+    'kg',
+    'daily'
+  ),
+  (
+    'f6e00000-0000-4000-8000-00000000005e',
+    'p24h unrelated closed',
+    'seafood',
+    'kg',
+    'daily'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-000000000580',
+    'f6e00000-0000-4000-8000-00000000005d',
+    10,
+    null,
+    null,
+    'kg|seafood||'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-000000000581',
+    'f6e00000-0000-4000-8000-00000000005e',
+    10,
+    null,
+    null,
+    'kg|seafood||'
+  );
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+select
+  'p24h-sale',
+  anchor.at - interval '40 days',
+  anchor.at - interval '40 days' + interval '8 hours',
+  false,
+  anchor.at - interval '40 days'
+from
+  f6_anchor anchor;
+
+insert into
+  app.pos_shifts (
+    id,
+    opened_at,
+    closed_at,
+    is_active,
+    pos_update_time
+  )
+select
+  'p24h-reclass',
+  anchor.at - interval '16 days',
+  anchor.at - interval '9 days',
+  false,
+  anchor.at - interval '16 days'
+from
+  f6_anchor anchor;
+
+select
+  app.post_engine_outflows (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000005d',
+        'movement_type',
+        'sale',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '40 days' + interval '1 hour'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        5,
+        'source_id',
+        'p24h-order',
+        'shift_id',
+        'p24h-sale'
+      )
+    )
+  );
+
+insert into
+  app.pos_orders (
+    id,
+    shift_id,
+    status,
+    order_type,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    missing_from_pos
+  )
+select
+  'p24h-order',
+  'p24h-sale',
+  'complete',
+  'hall',
+  anchor.at - interval '40 days' + interval '1 hour',
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  anchor.at - interval '40 days' + interval '1 hour',
+  rpad(md5('p24h-order'), 64, 'a'),
+  false
+from
+  f6_anchor anchor;
+
+select
+  app.append_pos_cost_input ('p24h-order', null, 'sync');
+
+insert into
+  app.order_cost_applications (
+    order_id,
+    cost_input_id,
+    snapshot_id,
+    receipt_kind,
+    disposition,
+    occurred_at,
+    shift_id,
+    signature,
+    requirements,
+    work_generation
+  )
+select
+  'p24h-order',
+  input.id,
+  input.snapshot_id,
+  'posting',
+  'sale',
+  (
+    select
+      anchor.at - interval '40 days' + interval '1 hour'
+    from
+      f6_anchor anchor
+  ),
+  'p24h-sale',
+  md5('p24h-order-app'),
+  '[]'::jsonb,
+  1
+from
+  app.pos_cost_inputs input
+where
+  input.order_id = 'p24h-order';
+
+insert into
+  app.order_cost_state (
+    order_id,
+    latest_input_id,
+    latest_application_id,
+    owner_application_id,
+    disposition,
+    signature
+  )
+select
+  'p24h-order',
+  input.id,
+  application.id,
+  application.id,
+  'sale',
+  md5('p24h-order-app')
+from
+  app.pos_cost_inputs input
+  join app.order_cost_applications application on application.order_id = input.order_id
+where
+  input.order_id = 'p24h-order';
+
+insert into
+  app.order_cost_movement_links (movement_id, application_id, order_id, item_id)
+select
+  movement.id,
+  application.id,
+  'p24h-order',
+  movement.item_id
+from
+  app.stock_movements movement
+  join app.order_cost_applications application on application.order_id = 'p24h-order'
+where
+  movement.item_id = 'f6e00000-0000-4000-8000-00000000005d'
+  and movement.movement_type = 'sale';
+
+select
+  app.seed_order_recognized ('p24h-order');
+
+select
+  set_config('app.t_change_chosen', '1', true);
+
+select
+  set_config(
+    'app.t_change',
+    (
+      select
+        (anchor.at - interval '10 days')::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+select
+  app.post_closed_order_difference (
+    'p24h-order',
+    jsonb_build_array(
+      jsonb_build_object(
+        'stock_item_id',
+        'f6e00000-0000-4000-8000-00000000005d',
+        'quantity',
+        5
+      )
+    ),
+    'waste',
+    'waste'
+  );
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000005d',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '11 days'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        5,
+        'unit_cost',
+        20
+      )
+    )
+  );
+
+select
+  is (
+    (
+      select
+        coalesce(
+          sum(sm.total_cost) filter (
+            where
+              sm.movement_type = 'sale'
+              or sm.closed_bucket = 'cogs'
+              or (
+                sm.movement_type = 'cost_adjustment'
+                and exists (
+                  select
+                    1
+                  from
+                    app.stock_movements sale
+                  where
+                    sale.id = sm.adjusts_movement_id
+                    and sale.movement_type = 'sale'
+                )
+              )
+          ),
+          0
+        )::text
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-00000000005d'
+    ),
+    '0.00',
+    'an ordinary covered sale reclass leaves no residual in COGS'
+  );
+
+select
+  results_eq (
+    $$select (sm.occurred_at at time zone 'Africa/Cairo')::date,
+             sm.closed_bucket,
+             sum(sm.total_cost)::text
+      from app.stock_movements sm
+      where sm.item_id = 'f6e00000-0000-4000-8000-00000000005d'
+        and sm.movement_type = 'closed_period'
+      group by 1, 2
+      order by 1, 2$$,
+    $$select *
+      from (
+        values
+          (
+            ((select at - interval '11 days' from f6_anchor) at time zone 'Africa/Cairo')::date,
+            'cogs',
+            '-50.00'
+          ),
+          (
+            ((select at - interval '10 days' from f6_anchor) at time zone 'Africa/Cairo')::date,
+            'cogs',
+            '100.00'
+          ),
+          (
+            ((select at - interval '10 days' from f6_anchor) at time zone 'Africa/Cairo')::date,
+            'waste',
+            '-100.00'
+          )
+      ) as expected (day, bucket, total)
+      order by 1, 2$$,
+    'ordinary-deficit cover transfer keeps per-day bucket totals'
+  );
+
+-- Unrelated closed -50 on the same item as a covered closed sale. The
+-- source sale is first so the covering purchase attaches to it; the
+-- unrelated row must not inflate that source's transfer.
+select
+  set_config('app.t_change_chosen', '1', true);
+
+select
+  set_config(
+    'app.t_change',
+    (
+      select
+        (
+          anchor.at - interval '40 days' + interval '1 hour'
+        )::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+select
+  app.post_closed_order_difference (
+    'p24h-order-b',
+    jsonb_build_array(
+      jsonb_build_object(
+        'stock_item_id',
+        'f6e00000-0000-4000-8000-00000000005e',
+        'quantity',
+        5
+      )
+    ),
+    'cogs',
+    'sale'
+  );
+
+select
+  set_config('app.t_change_chosen', '1', true);
+
+select
+  set_config(
+    'app.t_change',
+    (
+      select
+        (
+          anchor.at - interval '40 days' + interval '2 hours'
+        )::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+select
+  app.post_closed_order_difference (
+    'p24h-unrelated',
+    jsonb_build_array(
+      jsonb_build_object(
+        'stock_item_id',
+        'f6e00000-0000-4000-8000-00000000005e',
+        'quantity',
+        5
+      )
+    ),
+    'cogs',
+    'sale'
+  );
+
+select
+  set_config('app.t_change_chosen', '1', true);
+
+select
+  set_config(
+    'app.t_change',
+    (
+      select
+        (anchor.at - interval '10 days')::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+select
+  app.post_closed_order_difference (
+    'p24h-order-b',
+    jsonb_build_array(
+      jsonb_build_object(
+        'stock_item_id',
+        'f6e00000-0000-4000-8000-00000000005e',
+        'quantity',
+        5
+      )
+    ),
+    'waste',
+    'waste'
+  );
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000005e',
+        'movement_type',
+        'purchase',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '11 days'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        5,
+        'unit_cost',
+        20
+      )
+    )
+  );
+
+select
+  is (
+    (
+      select
+        coalesce(
+          sum(sm.total_cost) filter (
+            where
+              sm.closed_bucket = 'cogs'
+              and not exists (
+                select
+                  1
+                from
+                  app.closed_period_sources src
+                where
+                  src.movement_id = sm.id
+                  and src.source_id = 'p24h-unrelated'
+              )
+          ),
+          0
+        )::text
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-00000000005e'
+    ),
+    '0.00',
+    'an unrelated closed -50 does not inflate the ordinary source transfer'
+  );
+
+select
+  results_eq (
+    $$select (sm.occurred_at at time zone 'Africa/Cairo')::date,
+             sm.closed_bucket,
+             sum(sm.total_cost)::text
+      from app.stock_movements sm
+      where sm.item_id = 'f6e00000-0000-4000-8000-00000000005e'
+        and sm.movement_type = 'closed_period'
+      group by 1, 2
+      order by 1, 2$$,
+    $$select *
+      from (
+        values
+          (
+            ((select at - interval '40 days' + interval '1 hour' from f6_anchor) at time zone 'Africa/Cairo')::date,
+            'cogs',
+            '-100.00'
+          ),
+          (
+            ((select at - interval '11 days' from f6_anchor) at time zone 'Africa/Cairo')::date,
+            'cogs',
+            '-50.00'
+          ),
+          (
+            ((select at - interval '10 days' from f6_anchor) at time zone 'Africa/Cairo')::date,
+            'cogs',
+            '100.00'
+          ),
+          (
+            ((select at - interval '10 days' from f6_anchor) at time zone 'Africa/Cairo')::date,
+            'waste',
+            '-100.00'
+          )
+      ) as expected (day, bucket, total)
+      order by 1, 2$$,
+    'unrelated closed row keeps its own day total and does not inflate the reclass'
+  );
+
+-- Item 5. Backdated record_purchase behind valid certified cuts with frozen
+-- sort history must bound sort-edge reads, stay below 5000 shared buffers,
+-- and match a forced full walk identically.
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config(
+    'app.test_clock',
+    (
+      select
+        anchor.at::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    parent_item_id
+  )
+values
+  (
+    'f6e00000-0000-4000-8000-00000000005f',
+    'p5 sort bound mixed',
+    'fish_mixed',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    'f6e00000-0000-4000-8000-000000000060',
+    'p5 sort bound size',
+    'fish_size',
+    'kg',
+    'daily',
+    'f6e00000-0000-4000-8000-00000000005f'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-000000000590',
+    'f6e00000-0000-4000-8000-00000000005f',
+    10,
+    null,
+    null,
+    'kg|fish_mixed||'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-000000000591',
+    'f6e00000-0000-4000-8000-000000000060',
+    10,
+    null,
+    null,
+    'kg|fish_size|f6e00000-0000-4000-8000-00000000005f|'
+  );
+
+select
+  app.record_opening_stock (
+    (
+      select
+        anchor.at - interval '28 days'
+      from
+        f6_anchor anchor
+    ),
+    pg_catalog.jsonb_build_array (
+      pg_catalog.jsonb_build_object (
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000005f',
+        'quantity',
+        '1000',
+        'unit',
+        'kg',
+        'unit_cost',
+        '10',
+        'expected_base_unit',
+        'kg',
+        'expected_factor',
+        '1'
+      )
+    ),
+    'f6e00000-0000-4000-8000-000000000592'
+  );
+
+do $$
+declare
+  d integer;
+  v_anchor timestamptz := (select anchor.at from f6_anchor anchor);
+begin
+  for d in 0..39 loop
+    perform app.post_sort (
+      'f6e00000-0000-4000-8000-00000000005f',
+      v_anchor - interval '25 days' + d * interval '12 hours',
+      1,
+      pg_catalog.jsonb_build_array (
+        pg_catalog.jsonb_build_object (
+          'item_id',
+          'f6e00000-0000-4000-8000-000000000060',
+          'quantity',
+          1
+        )
+      ),
+      null
+    );
+  end loop;
+end
+$$;
+
+select
+  app.replay_execute (
+    array[
+      'f6e00000-0000-4000-8000-00000000005f',
+      'f6e00000-0000-4000-8000-000000000060'
+    ]::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-000000000593',
+    true
+  );
+
+select
+  app.record_purchase (
+    pg_catalog.jsonb_build_object (
+      'purchased_at',
+      to_char(
+        (
+          (
+            select
+              anchor.at + interval '14 hours'
+            from
+              f6_anchor anchor
+          ) at time zone 'UTC'
+        ),
+        'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+      ),
+      'request_id',
+      'f6e00000-0000-4000-8000-000000000594',
+      'lines',
+      pg_catalog.jsonb_build_array (
+        pg_catalog.jsonb_build_object (
+          'item_id',
+          'f6e00000-0000-4000-8000-00000000005f',
+          'quantity',
+          '1',
+          'unit',
+          'kg',
+          'amount_paid',
+          '10.00',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '1'
+        )
+      )
+    )
+  );
+
+create function pg_temp.explain_post_cut_sort_edge () returns jsonb language plpgsql as $$
+declare
+  v_cut_at timestamptz;
+  v_cut_id bigint;
+  v_sql text;
+  v_plan jsonb;
+begin
+  select
+    checkpoint.cut_occurred_at,
+    checkpoint.max_movement_id
+  into
+    v_cut_at,
+    v_cut_id
+  from
+    app.replay_checkpoints checkpoint
+  where
+    checkpoint.item_id = 'f6e00000-0000-4000-8000-000000000060'
+    and not exists (
+      select
+        1
+      from
+        app.replay_checkpoint_invalidations invalidation
+      where
+        invalidation.checkpoint_id = checkpoint.id
+    )
+  order by
+    checkpoint.cut_occurred_at desc,
+    checkpoint.id desc
+  limit
+    1;
+
+  v_sql := app.replay_sort_edge_sql (
+    'f6e00000-0000-4000-8000-000000000060',
+    v_cut_at,
+    v_cut_id,
+    null,
+    null,
+    array['f6e00000-0000-4000-8000-00000000005f']::uuid[]
+  );
+
+  execute 'explain (analyze, buffers, format json) ' || v_sql into v_plan;
+
+  return v_plan -> 0 -> 'Plan';
+end;
+$$;
+
+with recursive
+  plan_nodes (node) as (
+    select
+      pg_temp.explain_post_cut_sort_edge ()
+    union all
+    select
+      child.node
+    from
+      plan_nodes parent
+      cross join lateral jsonb_array_elements(parent.node -> 'Plans') child (node)
+  )
+select
+  ok (
+    count(*) filter (
+      where
+        node ->> 'Node Type' = 'Seq Scan'
+    ) = 0
+    and count(*) filter (
+      where
+        node ->> 'Node Type' in ('Index Scan', 'Index Only Scan')
+        and node ->> 'Index Name' = 'stock_movements_sort_time_idx'
+        and node ->> 'Index Cond' like '%item_id = %'
+        and node ->> 'Index Cond' like '%ROW(occurred_at, id) > ROW(%'
+        and (node ->> 'Actual Loops')::bigint = 1
+        and (node ->> 'Actual Rows')::bigint = 0
+        and coalesce((node ->> 'Rows Removed by Filter')::bigint, 0) = 0
+    ) = 1
+    and count(*) filter (
+      where
+        (node ->> 'Actual Loops')::bigint > 0
+        or (node ->> 'Actual Rows')::bigint > 0
+        or (node ->> 'Shared Hit Blocks')::bigint > 0
+        or (node ->> 'Shared Read Blocks')::bigint > 0
+    ) = 1,
+    'post-cut sort-edge scan uses the full cut as an index bound and reads no frozen sorts'
+  )
+from
+  plan_nodes
+where
+  node ->> 'Relation Name' = 'stock_movements';
+
+create temp table p5_item_set_resumed as
+select
+  app.recompute_item_set (
+    array['f6e00000-0000-4000-8000-00000000005f']::uuid[]
+  ) as items;
+
+select
+  set_config('app.replay_probe', '1', true);
+
+delete from app.replay_read_probe;
+
+create function pg_temp.explain_backdated_sort_purchase () returns text language plpgsql as $$
+declare
+  v_at text;
+  v_line text;
+  v_plan text := '';
+begin
+  select
+    to_char (
+      (anchor.at + interval '13 hours') at time zone 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+    )
+  into v_at
+  from
+    f6_anchor anchor;
+
+  for v_line in execute pg_catalog.format(
+    $ex$
+    explain (analyze, buffers)
+    select app.record_purchase(pg_catalog.jsonb_build_object(
+      'purchased_at', %L,
+      'request_id', 'f6e00000-0000-4000-8000-000000000595',
+      'lines', pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+        'item_id', 'f6e00000-0000-4000-8000-00000000005f',
+        'quantity', '1',
+        'unit', 'kg',
+        'amount_paid', '15.00',
+        'expected_base_unit', 'kg',
+        'expected_factor', '1'
+      ))
+    ))
+    $ex$,
+    v_at
+  )
+  loop
+    v_plan := v_plan || v_line || e'\n';
+  end loop;
+
+  return v_plan;
+end;
+$$;
+
+select
+  ok (
+    app.replay_plan_shared_buffers (pg_temp.explain_backdated_sort_purchase ()) < 5000,
+    'backdated record_purchase behind certified sort cuts stays under 5000 shared buffers'
+  );
+
+select
+  set_config('app.replay_probe', '', true);
+
+select
+  is (
+    (
+      select
+        probe.prefix_rows
+      from
+        app.replay_read_probe probe
+      order by
+        probe.id desc
+      limit
+        1
+    ),
+    0::bigint,
+    'backdated record_purchase behind certified sort cuts reads zero prefix rows'
+  );
+
+create temp table p5_resumed_balances as
+select
+  balance.item_id,
+  balance.on_hand_qty,
+  balance.on_hand_value,
+  balance.avg_cost,
+  balance.has_uncovered_deficit
+from
+  app.item_balances balance
+where
+  balance.item_id in (
+    'f6e00000-0000-4000-8000-00000000005f',
+    'f6e00000-0000-4000-8000-000000000060'
+  );
+
+create temp table p5_resumed_ledger as
+select
+  sm.item_id,
+  sum(sm.quantity) as total_qty,
+  sum(sm.total_cost) as total_cost
+from
+  app.stock_movements sm
+where
+  sm.item_id in (
+    'f6e00000-0000-4000-8000-00000000005f',
+    'f6e00000-0000-4000-8000-000000000060'
+  )
+group by
+  sm.item_id;
+
+insert into
+  app.replay_checkpoint_invalidations (checkpoint_id, reason)
+select
+  checkpoint.id,
+  'p5-sort-bound-full'
+from
+  app.replay_checkpoints
+checkpoint
+where
+  checkpoint.item_id in (
+    'f6e00000-0000-4000-8000-00000000005f',
+    'f6e00000-0000-4000-8000-000000000060'
+  )
+  and not exists (
+    select
+      1
+    from
+      app.replay_checkpoint_invalidations invalidation
+    where
+      invalidation.checkpoint_id = checkpoint.id
+  );
+
+select
+  is (
+    (
+      select
+        items
+      from
+        p5_item_set_resumed
+    ),
+    app.recompute_item_set (
+      array['f6e00000-0000-4000-8000-00000000005f']::uuid[]
+    ),
+    'recompute_item_set with certified cuts matches an uncheckpointed full walk'
+  );
+
+select
+  app.replay_execute (
+    array[
+      'f6e00000-0000-4000-8000-00000000005f',
+      'f6e00000-0000-4000-8000-000000000060'
+    ]::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-000000000596',
+    true
+  );
+
+select
+  results_eq (
+    $$select item_id::text, on_hand_qty::text, on_hand_value::text, avg_cost::text, has_uncovered_deficit
+      from app.item_balances
+      where item_id in (
+        'f6e00000-0000-4000-8000-00000000005f',
+        'f6e00000-0000-4000-8000-000000000060'
+      )
+      order by item_id$$,
+    $$select item_id::text, on_hand_qty::text, on_hand_value::text, avg_cost::text, has_uncovered_deficit
+      from p5_resumed_balances
+      order by item_id$$,
+    'backdated record_purchase behind certified sort cuts matches a forced full walk balance'
+  );
+
+select
+  results_eq (
+    $$select sm.item_id::text, sum(sm.quantity)::text, sum(sm.total_cost)::text
+      from app.stock_movements sm
+      where sm.item_id in (
+        'f6e00000-0000-4000-8000-00000000005f',
+        'f6e00000-0000-4000-8000-000000000060'
+      )
+      group by sm.item_id
+      order by sm.item_id$$,
+    $$select item_id::text, total_qty::text, total_cost::text
+      from p5_resumed_ledger
+      order by item_id$$,
+    'backdated record_purchase behind certified sort cuts matches a forced full walk ledger'
   );
 
 select

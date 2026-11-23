@@ -9,6 +9,19 @@
 // a checkpoint cut on every measured call, a frozen prefix that is not walked,
 // and shared hit+read pages below SHARED_HIT_READ_LIMIT. The suffix arms of the
 // measured order must be index scans on their own.
+//
+// --resume continues an interrupted history build or pending late fixtures.
+// It is supported only before measurement starts. Before enqueueing another
+// late order or touching measurement fixtures, a committed measurement
+// (selective or large-restore items, the fill item, or a posted late order)
+// is refused: run `pnpm db:reset` and rerun.
+//
+// The sort-traversal case holds the suffix and open deficits fixed while a
+// frozen mixed/size sort history grows (35-day, 1-year, 2-year, at least one
+// sort per day, all behind certified cuts). The measured call is a backdated
+// record_purchase on one item inside that suffix. Its gate is the whole RPC
+// shared hit+read pages below SHARED_HIT_READ_LIMIT and 2 seconds. Those
+// buffers must stay flat as the frozen sort history grows.
 
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -81,6 +94,46 @@ const histories = [
     agedPurchaseRequest: 'b9e00000-0000-4000-8000-000000000741',
   },
 ];
+
+// Frozen mixed/size sort histories. Suffix (one later purchase) and open
+// deficits stay fixed; only the certified sort prefix grows.
+const sortHistories = [
+  {
+    name: '35-day sorts',
+    prefix: 's35',
+    days: 35,
+    mixed: 'b9e00000-0000-4000-8000-00000000a035',
+    size: 'b9e00000-0000-4000-8000-00000000a036',
+    openingRequest: 'b9e00000-0000-4000-8000-00000000a135',
+    activationRequest: 'b9e00000-0000-4000-8000-00000000a235',
+    suffixPurchaseRequest: 'b9e00000-0000-4000-8000-00000000a335',
+    purchaseRequest: 'b9e00000-0000-4000-8000-00000000a435',
+  },
+  {
+    name: '1-year sorts',
+    prefix: 's365',
+    days: 365,
+    mixed: 'b9e00000-0000-4000-8000-00000000a365',
+    size: 'b9e00000-0000-4000-8000-00000000a366',
+    openingRequest: 'b9e00000-0000-4000-8000-00000000a375',
+    activationRequest: 'b9e00000-0000-4000-8000-00000000a376',
+    suffixPurchaseRequest: 'b9e00000-0000-4000-8000-00000000a377',
+    purchaseRequest: 'b9e00000-0000-4000-8000-00000000a378',
+  },
+  {
+    name: '2-year sorts',
+    prefix: 's730',
+    days: 730,
+    mixed: 'b9e00000-0000-4000-8000-00000000a730',
+    size: 'b9e00000-0000-4000-8000-00000000a731',
+    openingRequest: 'b9e00000-0000-4000-8000-00000000a732',
+    activationRequest: 'b9e00000-0000-4000-8000-00000000a733',
+    suffixPurchaseRequest: 'b9e00000-0000-4000-8000-00000000a734',
+    purchaseRequest: 'b9e00000-0000-4000-8000-00000000a735',
+  },
+];
+
+const SORT_OPENING_QTY = 10000;
 
 function dockerText(args) {
   return new Promise((resolve, reject) => {
@@ -627,6 +680,311 @@ where not exists (
 );
 commit;
 select '${history.name} late order queued';
+`;
+}
+
+function measurementFixturesCommittedSql(history) {
+  const late = `${history.prefix}-late`;
+  return `
+select exists (
+  select 1
+  from app.stock_items item
+  where item.id in (
+    md5('bench-sel-${history.prefix}')::uuid,
+    md5('bench-large-${history.prefix}')::uuid,
+    md5('bench-fill-${history.prefix}')::uuid
+  )
+)
+or exists (
+  select 1
+  from app.pos_orders o
+  where (o.id = '${late}' or o.id like '${late}-%')
+    and exists (
+      select 1
+      from app.pos_cost_inputs input
+      join app.order_cost_applications application
+        on application.cost_input_id = input.id
+      where input.order_id = o.id
+        and application.receipt_kind = 'posting'
+    )
+) as started;
+`;
+}
+
+function resumeGuardSql(history) {
+  const late = `${history.prefix}-late`;
+  return `
+do $$
+begin
+  if exists (
+    select 1
+    from app.stock_items item
+    where item.id in (
+      md5('bench-sel-${history.prefix}')::uuid,
+      md5('bench-large-${history.prefix}')::uuid,
+      md5('bench-fill-${history.prefix}')::uuid
+    )
+  )
+  or exists (
+    select 1
+    from app.pos_orders o
+    where (o.id = '${late}' or o.id like '${late}-%')
+      and exists (
+        select 1
+        from app.pos_cost_inputs input
+        join app.order_cost_applications application
+          on application.cost_input_id = input.id
+        where input.order_id = o.id
+          and application.receipt_kind = 'posting'
+      )
+  ) then
+    raise exception '--resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun.';
+  end if;
+end
+$$;
+`;
+}
+
+function sortAt(anchor, days, dayIndex) {
+  return `timestamptz '${anchor}' - ${days} * interval '1 day' + interval '12 hours' + ${dayIndex} * interval '1 day'`;
+}
+
+function sortBuildSql(history, anchor) {
+  return `
+begin;
+set statement_timeout = 0;
+set lock_timeout = 0;
+${claims()}
+-- Pin before any ledger write. note_change_instant locks t_change on the
+-- first write; a later pin cannot move the restatement window.
+select set_config(
+  'app.test_clock',
+  (${openingAt(anchor, history.days)})::text,
+  true
+);
+insert into app.stock_items (id, name, kind, base_unit, count_frequency, parent_item_id)
+values
+  ('${history.mixed}', 'bench ${history.name} mixed', 'fish_mixed', 'kg', 'daily', null),
+  ('${history.size}', 'bench ${history.name} size', 'fish_size', 'kg', 'daily', '${history.mixed}');
+select app.set_item_loss(
+  md5('loss|${history.prefix}')::uuid,
+  '${history.mixed}',
+  0,
+  '2020-01-01 00:00:00+00',
+  null,
+  (select app.schedule_token('loss', '${history.mixed}', null)),
+  'fixture'
+);
+select app.set_item_opening_price(
+  md5('price-mixed|${history.prefix}')::uuid,
+  '${history.mixed}',
+  10,
+  null,
+  null,
+  'kg|fish_mixed||'
+);
+select app.set_item_opening_price(
+  md5('price-size|${history.prefix}')::uuid,
+  '${history.size}',
+  10,
+  null,
+  null,
+  'kg|fish_size|${history.mixed}|'
+);
+insert into app.inventory_activation (
+  stock_started_at, approved_by, request_id, opening_manifest_hash
+)
+select
+  timestamptz '${anchor}' - interval '800 days',
+  '${owner}',
+  '${history.activationRequest}',
+  md5('${history.prefix}-manifest')
+where not exists (select 1 from app.inventory_activation);
+update app.accounting_rederive_spans
+set completed_at = pg_catalog.clock_timestamp()
+where completed_at is null;
+select app.record_opening_stock(
+  ${openingAt(anchor, history.days)},
+  jsonb_build_array(jsonb_build_object(
+    'item_id', '${history.mixed}',
+    'quantity', '${SORT_OPENING_QTY}',
+    'unit', 'kg',
+    'unit_cost', '10',
+    'expected_base_unit', 'kg',
+    'expected_factor', '1'
+  )),
+  '${history.openingRequest}'
+);
+do $$
+declare
+  d integer;
+  v_at timestamptz;
+begin
+  for d in 0..${history.days - 1} loop
+    v_at := ${sortAt(anchor, history.days, 0)} + d * interval '1 day';
+    perform app.post_sort(
+      '${history.mixed}',
+      v_at,
+      1,
+      jsonb_build_array(jsonb_build_object(
+        'item_id', '${history.size}',
+        'quantity', 1
+      )),
+      null
+    );
+    if (d + 1) % 100 = 0 then
+      raise notice 'built ${history.name} sorts %', d + 1;
+    end if;
+  end loop;
+end
+$$;
+commit;
+begin;
+set statement_timeout = 0;
+set lock_timeout = 0;
+${claims()}
+select app.replay_execute(
+  array['${history.mixed}', '${history.size}']::uuid[],
+  '[]'::jsonb,
+  pg_catalog.gen_random_uuid(),
+  true
+);
+select app.record_purchase(pg_catalog.jsonb_build_object(
+  'purchased_at', to_char(
+    (timestamptz '${anchor}' + interval '14 hours') at time zone 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+  ),
+  'request_id', '${history.suffixPurchaseRequest}',
+  'lines', pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+    'item_id', '${history.mixed}',
+    'quantity', '1',
+    'unit', 'kg',
+    'amount_paid', '10.00',
+    'expected_base_unit', 'kg',
+    'expected_factor', '1'
+  ))
+));
+commit;
+select '${history.name} frozen sorts committed ${history.days}';
+`;
+}
+
+function sortMeasureSql(history, anchor) {
+  return `
+begin;
+set statement_timeout = 0;
+set lock_timeout = 0;
+${claims()}
+do $$
+declare
+  v_plan text := '';
+  v_rec record;
+  v_t0 timestamptz;
+  v_t1 timestamptz;
+  v_buffers bigint;
+  v_seconds numeric;
+  v_resumed boolean;
+  v_sorts bigint;
+  v_suffix bigint;
+  v_deficits bigint;
+  v_pass boolean;
+  v_cut timestamptz;
+  v_last_sort timestamptz;
+begin
+  select count(*)
+  into v_sorts
+  from app.stock_movements movement
+  where movement.item_id = '${history.mixed}'
+    and movement.movement_type = 'sort_out';
+
+  select max(movement.occurred_at)
+  into v_last_sort
+  from app.stock_movements movement
+  where movement.item_id = '${history.mixed}'
+    and movement.movement_type = 'sort_out';
+
+  select count(*)
+  into v_suffix
+  from app.stock_movements movement
+  where movement.item_id = '${history.mixed}'
+    and movement.occurred_at > v_last_sort
+    and movement.movement_type <> 'cost_adjustment';
+
+  select count(*)
+  into v_deficits
+  from app.replay_checkpoint_deficits;
+
+  select checkpoint.cut_occurred_at
+  into v_cut
+  from app.replay_checkpoints checkpoint
+  where checkpoint.item_id = '${history.mixed}'
+    and not exists (
+      select 1
+      from app.replay_checkpoint_invalidations invalidation
+      where invalidation.checkpoint_id = checkpoint.id
+    )
+    and checkpoint.cut_occurred_at < timestamptz '${anchor}' + interval '13 hours'
+  order by checkpoint.cut_occurred_at desc, checkpoint.id desc
+  limit 1;
+
+  perform set_config('statement_timeout', '6s', true);
+  v_t0 := pg_catalog.clock_timestamp();
+  for v_rec in
+    execute $ex$
+      explain (analyze, buffers)
+      select app.record_purchase(pg_catalog.jsonb_build_object(
+        'purchased_at', to_char(
+          (timestamptz '${anchor}' + interval '13 hours') at time zone 'UTC',
+          'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+        ),
+        'request_id', '${history.purchaseRequest}',
+        'lines', pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+          'item_id', '${history.mixed}',
+          'quantity', '1',
+          'unit', 'kg',
+          'amount_paid', '10.00',
+          'expected_base_unit', 'kg',
+          'expected_factor', '1'
+        ))
+      ))
+    $ex$
+  loop
+    v_plan := v_plan || v_rec."QUERY PLAN" || chr(10);
+  end loop;
+  v_t1 := pg_catalog.clock_timestamp();
+  perform set_config('statement_timeout', '0', true);
+
+  v_buffers := app.replay_plan_shared_buffers(v_plan);
+  v_seconds := round(extract(epoch from (v_t1 - v_t0))::numeric, 3);
+  v_resumed := v_cut is not null
+    and v_last_sort is not null
+    and v_cut >= v_last_sort
+    and v_sorts = ${history.days};
+
+  v_pass := v_resumed
+    and coalesce(v_buffers, 0) > 0
+    and coalesce(v_buffers, 0) < ${SHARED_HIT_READ_LIMIT}
+    and v_seconds <= 2
+    and v_seconds <= 6
+    and v_sorts = ${history.days};
+
+  raise notice 'MEASURE %', pg_catalog.jsonb_build_object(
+    'kind', 'sort-traversal',
+    'name', '${history.name}',
+    'days', ${history.days},
+    'sorts', v_sorts,
+    'suffix_movements', v_suffix,
+    'open_deficits', v_deficits,
+    'resumed', v_resumed,
+    'buffer_limit', ${SHARED_HIT_READ_LIMIT},
+    'buffers', coalesce(v_buffers, 0),
+    'seconds', v_seconds,
+    'crossed_2s', v_seconds > 2,
+    'pass', v_pass
+  );
+end
+$$;
+commit;
 `;
 }
 
@@ -1235,7 +1593,26 @@ function parseMeasure(stderr) {
   return JSON.parse(match[1]);
 }
 
+function formatSortResult(row) {
+  return [
+    `## ${row.name}`,
+    '',
+    `- days: ${row.days}`,
+    `- frozen sorts: ${row.sorts}`,
+    `- suffix movements: ${row.suffix_movements}`,
+    `- open deficits: ${row.open_deficits}`,
+    `- resumed from checkpoint: ${row.resumed}`,
+    `- shared hit+read limit: ${row.buffer_limit ?? SHARED_HIT_READ_LIMIT}`,
+    `- rpc buffers: ${row.buffers}`,
+    `- rpc seconds: ${row.seconds}`,
+    `- crossed 2s: ${row.crossed_2s}`,
+    `- gate: ${row.pass ? 'PASS' : 'FAIL'}`,
+    '',
+  ].join('\n');
+}
+
 function formatResult(row) {
+  if (row.kind === 'sort-traversal') return formatSortResult(row);
   const lines = [
     `## ${row.name}`,
     '',
@@ -1323,6 +1700,24 @@ function existingResultRows() {
         const parsed = Number(raw);
         return Number.isFinite(parsed) ? parsed : undefined;
       };
+      if (value('rpc buffers') != null && value('frozen sorts') != null) {
+        const seconds = Number(value('rpc seconds'));
+        if (!Number.isFinite(seconds)) return null;
+        return {
+          kind: 'sort-traversal',
+          name,
+          days: Number(value('days')),
+          sorts: Number(value('frozen sorts')),
+          suffix_movements: Number(value('suffix movements')),
+          open_deficits: Number(value('open deficits')),
+          resumed: value('resumed from checkpoint') === 'true',
+          buffer_limit: maybeNumber('shared hit+read limit'),
+          buffers: Number(value('rpc buffers')),
+          seconds,
+          crossed_2s: value('crossed 2s') === 'true',
+          pass: value('gate') === 'PASS',
+        };
+      }
       const seconds = Number(value('wall clock seconds'));
       if (!Number.isFinite(seconds)) return null;
       return {
@@ -1409,7 +1804,14 @@ function existingResultRows() {
 function writeResults(rows, note) {
   const byName = new Map(existingResultRows().map((row) => [row.name, row]));
   for (const row of rows) byName.set(row.name, row);
-  const order = ['35-day', '1-year', '2-year'];
+  const order = [
+    '35-day',
+    '1-year',
+    '2-year',
+    '35-day sorts',
+    '1-year sorts',
+    '2-year sorts',
+  ];
   const merged = [
     ...order.filter((name) => byName.has(name)).map((name) => byName.get(name)),
     ...[...byName.values()].filter((row) => !order.includes(row.name)),
@@ -1423,7 +1825,7 @@ function writeResults(rows, note) {
   const body = [
     '# Accounting history benchmark',
     '',
-    'Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. Every measured call must resume from a checkpoint. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), shared hit plus read pages below 5000, and a frozen prefix that is not walked. The measured order suffix arms must be index scans on their own. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk.',
+    'Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. Every measured call must resume from a checkpoint. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), shared hit plus read pages below 5000, and a frozen prefix that is not walked. The measured order suffix arms must be index scans on their own. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk. --resume is supported only before measurement starts; a committed measurement needs `pnpm db:reset` and a rerun. The sort-traversal case holds suffix and open deficits fixed while a frozen mixed/size sort history grows (35-day, 1-year, 2-year, at least one sort per day). Its gate is the whole RPC shared hit plus read pages below 5000 and 2 seconds, and those buffers must stay flat as the frozen history grows.',
     '',
     ...merged.map((row) =>
       row.error
@@ -1525,6 +1927,53 @@ async function catalogReady(history) {
   }
 }
 
+async function sortCatalogReady(history) {
+  try {
+    const result = await psqlCaptured(
+      `select count(*)::text from app.stock_items where id = '${history.mixed}';`,
+    );
+    return firstInteger(result.out) > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function sortMeasured(history) {
+  try {
+    const result = await psqlCaptured(
+      `select count(*)::text from app.purchases where request_id = '${history.purchaseRequest}';`,
+    );
+    return firstInteger(result.out) > 0;
+  } catch {
+    return false;
+  }
+}
+
+function sortBuffersNote(rows) {
+  const names = ['35-day sorts', '1-year sorts', '2-year sorts'];
+  const sorts = names
+    .map((name) => rows.find((row) => row.name === name))
+    .filter(Boolean);
+  if (sorts.length === 0) return '';
+  const numbers = sorts
+    .map((row) => `${row.name} ${row.buffers} buffers / ${row.seconds}s`)
+    .join('; ');
+  if (sorts.length < 2) {
+    return `Sort-traversal RPC: ${numbers}.`;
+  }
+  const first = sorts[0].buffers;
+  const grew = sorts.some(
+    (row) =>
+      Number.isFinite(row.buffers) &&
+      Number.isFinite(first) &&
+      row.buffers > first + 50 &&
+      row.buffers > first * 1.25,
+  );
+  return grew
+    ? `Sort-traversal RPC buffers grew with frozen history: ${numbers}. Production was not changed.`
+    : `Sort-traversal RPC buffers stayed flat: ${numbers}.`;
+}
+
 async function run() {
   containerNameCached = await containerName();
   const rows = [];
@@ -1534,6 +1983,7 @@ async function run() {
       : null;
   const skipBuild = process.argv.includes('--skip-build') ? startName : null;
   const resume = process.argv.includes('--resume');
+  const sortOnly = process.argv.includes('--sort-only');
   let started = startName === null;
   const anchorResult = await psqlCaptured(
     `select to_char((date_trunc('day', pg_catalog.clock_timestamp() at time zone 'Africa/Cairo') at time zone 'Africa/Cairo'), 'YYYY-MM-DD HH24:MI:SSOF');`,
@@ -1547,6 +1997,54 @@ async function run() {
   const anchor = anchorMatch[0];
   process.stderr.write(`cairo day ${anchor}\n`);
   await psqlCaptured(setupSql(anchor));
+  let sortFailed = false;
+  for (const history of sortHistories) {
+    process.stderr.write(`\nbuilding ${history.name}\n`);
+    try {
+      const haveCatalog = await sortCatalogReady(history);
+      if (!haveCatalog) await psqlCaptured(sortBuildSql(history, anchor));
+      if (await sortMeasured(history)) {
+        process.stderr.write(`skip ${history.name}: already measured\n`);
+        continue;
+      }
+      const measured = await psqlCaptured(sortMeasureSql(history, anchor));
+      const row = parseMeasure(measured.err);
+      if (!row) {
+        throw new Error('the sort session did not report a result');
+      }
+      rows.push(row);
+      writeResults(rows);
+      process.stderr.write(
+        `${history.name} buffers=${row.buffers} seconds=${row.seconds} resumed=${row.resumed} pass=${row.pass}\n`,
+      );
+      if (!row.pass) sortFailed = true;
+    } catch (error) {
+      sortFailed = true;
+      rows.push({
+        name: history.name,
+        kind: 'sort-traversal',
+        error: String(error.message ?? error)
+          .replace(/\s+/g, ' ')
+          .slice(0, 500),
+      });
+      writeResults(rows);
+      process.stderr.write(`${history.name} failed: ${error.message}\n`);
+    }
+  }
+  if (sortOnly) {
+    const sortNote = sortBuffersNote(rows);
+    writeResults(
+      rows,
+      [
+        '--resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun.',
+        sortNote,
+      ]
+        .filter(Boolean)
+        .join(' '),
+    );
+    if (sortFailed) process.exitCode = 1;
+    return;
+  }
   for (const history of histories) {
     if (!started) {
       if (history.name !== startName) continue;
@@ -1574,6 +2072,7 @@ async function run() {
             }),
           );
         }
+        if (resume) await psqlCaptured(resumeGuardSql(history));
         await psqlCaptured(lateSql(history, anchor));
       }
       const measured = await psqlCaptured(measureSql(history, anchor));
@@ -1609,10 +2108,16 @@ async function run() {
       return;
     }
   }
-  writeResults(
-    rows,
+  const sortNote = sortBuffersNote(rows);
+  const closing = [
     'The 35-day, 1-year, and 2-year histories passed the gate.',
-  );
+    '--resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun.',
+    sortNote,
+  ]
+    .filter(Boolean)
+    .join(' ');
+  writeResults(rows, closing);
+  if (sortFailed) process.exitCode = 1;
 }
 
 if (
@@ -1625,4 +2130,10 @@ if (
   });
 }
 
-export { setupSql, histories, lateSql };
+export {
+  setupSql,
+  histories,
+  lateSql,
+  resumeGuardSql,
+  measurementFixturesCommittedSql,
+};

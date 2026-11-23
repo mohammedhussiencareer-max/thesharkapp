@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { setupSql, lateSql } from './accounting-history.mjs';
+import { setupSql, lateSql, resumeGuardSql } from './accounting-history.mjs';
 
 function psql(sql) {
   return new Promise((resolve, reject) => {
@@ -149,4 +149,39 @@ where input.order_id = '${history.prefix}-late';
   );
   assert.equal(orders, '2');
   assert.equal(unprocessed, '1');
+});
+
+test('--resume refuses after committed measurement fixtures', async () => {
+  const anchor = await psql(
+    `select to_char((date_trunc('day', pg_catalog.clock_timestamp() at time zone 'Africa/Cairo') at time zone 'Africa/Cairo'), 'YYYY-MM-DD HH24:MI:SSOF');`,
+  );
+  const history = {
+    name: 'resume-guard',
+    prefix: `bguard${Date.now().toString(36)}`,
+  };
+  await psql(setupSql(anchor));
+  await psql(resumeGuardSql(history));
+  await psql(`
+insert into app.pos_shifts (id, opened_at, is_active, pos_update_time)
+values (
+  '${history.prefix}-shift',
+  timestamptz '${anchor}',
+  false,
+  timestamptz '${anchor}'
+)
+on conflict (id) do nothing;
+`);
+  await psql(lateSql(history, anchor));
+  await psql(resumeGuardSql(history));
+  await psql(`
+insert into app.stock_items (id, name, kind, base_unit, count_frequency)
+values (
+  md5('bench-sel-${history.prefix}')::uuid,
+  'bench sel ${history.prefix}',
+  'seafood',
+  'kg',
+  'daily'
+);
+`);
+  await assert.rejects(() => psql(resumeGuardSql(history)), /pnpm db:reset/);
 });
