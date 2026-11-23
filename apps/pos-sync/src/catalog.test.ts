@@ -4,7 +4,11 @@ import {
   CATALOG_OPTION_GROUP_FIELDS,
   CATALOG_REJECTED_FIELDS,
 } from './catalog-allowlist.ts';
-import { isCustomerShapedKey, isPriceShapedKey } from './catalog-refusals.ts';
+import {
+  MAX_CATALOG_WALK_DEPTH,
+  isCustomerShapedKey,
+  isPriceShapedKey,
+} from './catalog-refusals.ts';
 import {
   assertNoPriceShapedKeys,
   catalogItemContentHash,
@@ -771,6 +775,310 @@ describe('parseCatalog fixtures', () => {
       .filter((path) => path !== 'values')
       .sort();
     expect(groupLeafReads).toEqual([...CATALOG_OPTION_GROUP_FIELDS].sort());
+
+    // Whole-pipeline scalar read contract (reader + customer-key scan + parser):
+    // wrap every scalar leaf value wrapper in a getter trap and prove only
+    // allowlisted paths' scalar values are ever read.
+    function traceScalar<K extends string, V>(
+      kind: K,
+      value: V,
+      path: string,
+      recorded: Set<string>,
+    ): Record<K, V> {
+      const wrapper = {} as Record<K, V>;
+      Object.defineProperty(wrapper, kind, {
+        enumerable: true,
+        get() {
+          recorded.add(path);
+          return value;
+        },
+      });
+      return wrapper;
+    }
+
+    const pipelineItemScalarReads = new Set<string>();
+    const rawItemDoc = {
+      name: `${DOC_ROOT}/items/item-syn-pipeline-contract`,
+      updateTime: '2026-11-20T10:00:00Z',
+      fields: {
+        name: traceScalar(
+          'stringValue',
+          'Synthetic Pipeline Item',
+          'name',
+          pipelineItemScalarReads,
+        ),
+        categoryId: traceScalar(
+          'stringValue',
+          'cat-drop',
+          'categoryId',
+          pipelineItemScalarReads,
+        ),
+        description: traceScalar(
+          'stringValue',
+          'desc-drop',
+          'description',
+          pipelineItemScalarReads,
+        ),
+        imageUrl: traceScalar(
+          'stringValue',
+          'https://example.invalid/drop.png',
+          'imageUrl',
+          pipelineItemScalarReads,
+        ),
+        name_lowercase: traceScalar(
+          'stringValue',
+          'synthetic pipeline item',
+          'name_lowercase',
+          pipelineItemScalarReads,
+        ),
+        pluCode: traceScalar(
+          'stringValue',
+          '90009',
+          'pluCode',
+          pipelineItemScalarReads,
+        ),
+        pricingType: traceScalar(
+          'stringValue',
+          'fixed',
+          'pricingType',
+          pipelineItemScalarReads,
+        ),
+        scaleSizeName: traceScalar(
+          'stringValue',
+          'scale-drop',
+          'scaleSizeName',
+          pipelineItemScalarReads,
+        ),
+        weightedUnit: traceScalar(
+          'stringValue',
+          'kg',
+          'weightedUnit',
+          pipelineItemScalarReads,
+        ),
+        sizes: arr([
+          map({
+            name: traceScalar(
+              'stringValue',
+              'Large',
+              'sizes[].name',
+              pipelineItemScalarReads,
+            ),
+            price: traceScalar(
+              'doubleValue',
+              199.5,
+              'sizes[].price',
+              pipelineItemScalarReads,
+            ),
+            costPrice: traceScalar(
+              'doubleValue',
+              85.25,
+              'sizes[].costPrice',
+              pipelineItemScalarReads,
+            ),
+            pricingBaseQuantity: traceScalar(
+              'integerValue',
+              '1',
+              'sizes[].pricingBaseQuantity',
+              pipelineItemScalarReads,
+            ),
+            recipe: arr([
+              map({
+                ingredientId: traceScalar(
+                  'stringValue',
+                  'ing-syn-1',
+                  'sizes[].recipe[].ingredientId',
+                  pipelineItemScalarReads,
+                ),
+                qty: traceScalar(
+                  'doubleValue',
+                  0.5,
+                  'sizes[].recipe[].qty',
+                  pipelineItemScalarReads,
+                ),
+              }),
+            ]),
+          }),
+        ]),
+        options: map({
+          'Synthetic Prep': arr([
+            map({
+              value: traceScalar(
+                'stringValue',
+                'Baked',
+                'options.<label>[].value',
+                pipelineItemScalarReads,
+              ),
+              price: traceScalar(
+                'doubleValue',
+                20,
+                'options.<label>[].price',
+                pipelineItemScalarReads,
+              ),
+              costPrice: traceScalar(
+                'doubleValue',
+                5,
+                'options.<label>[].costPrice',
+                pipelineItemScalarReads,
+              ),
+              pricingBaseQuantity: traceScalar(
+                'integerValue',
+                '1',
+                'options.<label>[].pricingBaseQuantity',
+                pipelineItemScalarReads,
+              ),
+              pricingType: traceScalar(
+                'stringValue',
+                'fixed',
+                'options.<label>[].pricingType',
+                pipelineItemScalarReads,
+              ),
+              recipe: arr([
+                map({
+                  ingredientId: traceScalar(
+                    'stringValue',
+                    'ing-syn-2',
+                    'options.<label>[].recipe[].ingredientId',
+                    pipelineItemScalarReads,
+                  ),
+                }),
+              ]),
+            }),
+          ]),
+        }),
+        sharedOptionGroupIds: map({
+          'Synthetic Prep': traceScalar(
+            'stringValue',
+            'group-syn-pipeline',
+            'sharedOptionGroupIds.<label>',
+            pipelineItemScalarReads,
+          ),
+        }),
+      },
+    };
+
+    const pipelineGroupScalarReads = new Set<string>();
+    const rawGroupDoc = {
+      name: `${DOC_ROOT}/optionGroups/group-syn-pipeline`,
+      updateTime: '2026-11-20T09:00:00Z',
+      fields: {
+        name: traceScalar(
+          'stringValue',
+          'Synthetic Prep',
+          'name',
+          pipelineGroupScalarReads,
+        ),
+        values: arr([
+          map({
+            value: traceScalar(
+              'stringValue',
+              'Baked',
+              'values[].value',
+              pipelineGroupScalarReads,
+            ),
+            price: traceScalar(
+              'doubleValue',
+              20,
+              'values[].price',
+              pipelineGroupScalarReads,
+            ),
+            costPrice: traceScalar(
+              'doubleValue',
+              5,
+              'values[].costPrice',
+              pipelineGroupScalarReads,
+            ),
+            pricingBaseQuantity: traceScalar(
+              'integerValue',
+              '1',
+              'values[].pricingBaseQuantity',
+              pipelineGroupScalarReads,
+            ),
+            pricingType: traceScalar(
+              'stringValue',
+              'fixed',
+              'values[].pricingType',
+              pipelineGroupScalarReads,
+            ),
+            recipe: arr([
+              map({
+                ingredientId: traceScalar(
+                  'stringValue',
+                  'ing-syn-3',
+                  'values[].recipe[].ingredientId',
+                  pipelineGroupScalarReads,
+                ),
+              }),
+            ]),
+          }),
+        ]),
+      },
+    };
+
+    const itemPage = parseListResponse({ documents: [rawItemDoc] }, 'items');
+    const groupPage = parseListResponse(
+      { documents: [rawGroupDoc] },
+      'optionGroups',
+    );
+    const pipelinePayload = parseCatalog(
+      itemPage.documents,
+      groupPage.documents,
+    );
+    expect(pipelinePayload.items).toHaveLength(1);
+    expect(pipelinePayload.option_groups).toHaveLength(1);
+    expect([...pipelineItemScalarReads].sort()).toEqual(
+      [...CATALOG_ITEM_FIELDS].sort(),
+    );
+    expect([...pipelineGroupScalarReads].sort()).toEqual(
+      [...CATALOG_OPTION_GROUP_FIELDS].sort(),
+    );
+  });
+
+  it('accepts 15 and 20 nested Firestore maps during customer-key scan and rejects beyond the walk cap', () => {
+    function nestedMap(levels: number): unknown {
+      let current: unknown = str('leaf');
+      for (let level = 0; level < levels; level += 1) {
+        current = map({ next: current });
+      }
+      return current;
+    }
+
+    for (const levels of [15, 20]) {
+      const id = `item-syn-nested-${levels}`;
+      const page = parseListResponse(
+        {
+          documents: [
+            itemDoc(id, {
+              name: str(`Synthetic Nested ${levels}`),
+              meta: nestedMap(levels),
+            }),
+          ],
+        },
+        'items',
+      );
+      const payload = parseCatalog(page.documents, []);
+      expect(payload.presence, `levels=${levels}`).toEqual([
+        { pos_item_id: id, outcome: 'accepted' },
+      ]);
+      expect(payload.items).toHaveLength(1);
+    }
+
+    const tooDeepId = 'item-syn-nested-too-deep';
+    const tooDeepPage = parseListResponse(
+      {
+        documents: [
+          itemDoc(tooDeepId, {
+            name: str('Synthetic Too Deep'),
+            meta: nestedMap(MAX_CATALOG_WALK_DEPTH + 1),
+          }),
+        ],
+      },
+      'items',
+    );
+    const tooDeepPayload = parseCatalog(tooDeepPage.documents, []);
+    expect(tooDeepPayload.items).toEqual([]);
+    expect(tooDeepPayload.presence).toEqual([
+      { pos_item_id: tooDeepId, outcome: 'rejected' },
+    ]);
   });
 });
 

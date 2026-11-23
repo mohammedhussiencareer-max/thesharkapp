@@ -15,6 +15,22 @@ export const CUSTOMER_SHAPED_KEY =
 
 export const MAX_CATALOG_WALK_DEPTH = 32;
 
+/**
+ * Firestore REST scalar value wrapper keys whose values are leaf primitives.
+ * The customer-key scan inspects only keys and structural wrappers
+ * (`mapValue.fields`, `arrayValue.values`) and never reads these scalar leaves.
+ */
+const FIRESTORE_SCALAR_VALUE_KEYS = new Set([
+  'nullValue',
+  'booleanValue',
+  'integerValue',
+  'doubleValue',
+  'timestampValue',
+  'stringValue',
+  'bytesValue',
+  'referenceValue',
+]);
+
 export type CatalogCollection = 'items' | 'optionGroups';
 
 /** True when an original schema key is price-shaped. */
@@ -27,11 +43,6 @@ export function isCustomerShapedKey(key: string): boolean {
   return CUSTOMER_SHAPED_KEY.test(key);
 }
 
-function isOnlyKey(record: Record<string, unknown>, key: string): boolean {
-  const keys = Object.keys(record);
-  return keys.length === 1 && keys[0] === key;
-}
-
 function walkArbitraryForCustomerKey(value: unknown, depth: number): boolean {
   if (depth > MAX_CATALOG_WALK_DEPTH) {
     return true;
@@ -42,10 +53,10 @@ function walkArbitraryForCustomerKey(value: unknown, depth: number): boolean {
   if (!isRecord(value)) {
     return false;
   }
-  for (const [key, child] of Object.entries(value)) {
+  for (const key of Object.keys(value)) {
     if (
       isCustomerShapedKey(key) ||
-      walkArbitraryForCustomerKey(child, depth + 1)
+      walkArbitraryForCustomerKey(value[key], depth + 1)
     ) {
       return true;
     }
@@ -69,49 +80,74 @@ function walkFirestoreValueForCustomerKey(
   if (!isRecord(value)) {
     return false;
   }
-  if (isOnlyKey(value, 'mapValue') && isRecord(value.mapValue)) {
-    for (const [mapKey, mapChild] of Object.entries(value.mapValue)) {
-      if (mapKey === 'fields' && isRecord(mapChild)) {
-        if (
-          walkFirestoreFieldsForCustomerKey(
-            mapChild,
-            false,
-            dynamicLabelMap,
-            depth + 1,
-          )
+  const keys = Object.keys(value);
+  if (keys.length === 1) {
+    const onlyKey = keys[0];
+    if (onlyKey !== undefined && FIRESTORE_SCALAR_VALUE_KEYS.has(onlyKey)) {
+      return false;
+    }
+    if (onlyKey === 'mapValue') {
+      const mapValue = value.mapValue;
+      if (!isRecord(mapValue)) {
+        return walkArbitraryForCustomerKey(mapValue, depth + 1);
+      }
+      for (const mapKey of Object.keys(mapValue)) {
+        if (mapKey === 'fields') {
+          const mapFields = mapValue.fields;
+          if (isRecord(mapFields)) {
+            if (
+              walkFirestoreFieldsForCustomerKey(
+                mapFields,
+                false,
+                dynamicLabelMap,
+                depth + 1,
+              )
+            ) {
+              return true;
+            }
+          } else if (walkArbitraryForCustomerKey(mapFields, depth + 1)) {
+            return true;
+          }
+        } else if (
+          isCustomerShapedKey(mapKey) ||
+          walkArbitraryForCustomerKey(mapValue[mapKey], depth + 1)
         ) {
           return true;
         }
-      } else if (
-        isCustomerShapedKey(mapKey) ||
-        walkArbitraryForCustomerKey(mapChild, depth + 1)
-      ) {
-        return true;
       }
+      return false;
     }
-    return false;
-  }
-  if (isOnlyKey(value, 'arrayValue') && isRecord(value.arrayValue)) {
-    for (const [arrKey, arrChild] of Object.entries(value.arrayValue)) {
-      if (arrKey === 'values' && Array.isArray(arrChild)) {
-        for (const entry of arrChild) {
-          if (walkFirestoreValueForCustomerKey(entry, false, depth + 1)) {
+    if (onlyKey === 'arrayValue') {
+      const arrayValue = value.arrayValue;
+      if (!isRecord(arrayValue)) {
+        return walkArbitraryForCustomerKey(arrayValue, depth + 1);
+      }
+      for (const arrKey of Object.keys(arrayValue)) {
+        if (arrKey === 'values') {
+          const arrValues = arrayValue.values;
+          if (Array.isArray(arrValues)) {
+            for (const entry of arrValues) {
+              if (walkFirestoreValueForCustomerKey(entry, false, depth + 1)) {
+                return true;
+              }
+            }
+          } else if (walkArbitraryForCustomerKey(arrValues, depth + 1)) {
             return true;
           }
+        } else if (
+          isCustomerShapedKey(arrKey) ||
+          walkArbitraryForCustomerKey(arrayValue[arrKey], depth + 1)
+        ) {
+          return true;
         }
-      } else if (
-        isCustomerShapedKey(arrKey) ||
-        walkArbitraryForCustomerKey(arrChild, depth + 1)
-      ) {
-        return true;
       }
+      return false;
     }
-    return false;
   }
-  for (const [key, child] of Object.entries(value)) {
+  for (const key of keys) {
     if (
       isCustomerShapedKey(key) ||
-      walkArbitraryForCustomerKey(child, depth + 1)
+      walkArbitraryForCustomerKey(value[key], depth + 1)
     ) {
       return true;
     }
@@ -128,13 +164,13 @@ function walkFirestoreFieldsForCustomerKey(
   if (depth > MAX_CATALOG_WALK_DEPTH) {
     return true;
   }
-  for (const [key, value] of Object.entries(fields)) {
+  for (const key of Object.keys(fields)) {
     if (!keysAreLabels && isCustomerShapedKey(key)) {
       return true;
     }
     const childIsLabelMap =
       isItemRoot && (key === 'options' || key === 'sharedOptionGroupIds');
-    if (walkFirestoreValueForCustomerKey(value, childIsLabelMap, depth + 1)) {
+    if (walkFirestoreValueForCustomerKey(fields[key], childIsLabelMap, depth)) {
       return true;
     }
   }
@@ -146,22 +182,24 @@ function walkFirestoreFieldsForCustomerKey(
  * fields) for customer-shaped schema keys. Dynamic map labels under an item's
  * `options` and `sharedOptionGroupIds` are treated as data labels, not schema
  * keys, while nested keys inside their values are still scanned as schema keys.
+ * Depth counts real map/array nesting levels rather than REST wrapper objects.
  */
 export function hasCustomerShapedSchemaKey(
   rawDocument: Record<string, unknown>,
   collection: CatalogCollection,
 ): boolean {
-  for (const [key, value] of Object.entries(rawDocument)) {
+  for (const key of Object.keys(rawDocument)) {
     if (isCustomerShapedKey(key)) {
       return true;
     }
+    const value = rawDocument[key];
     if (key === 'fields' && isRecord(value)) {
       if (
         walkFirestoreFieldsForCustomerKey(
           value,
           collection === 'items',
           false,
-          1,
+          0,
         )
       ) {
         return true;
