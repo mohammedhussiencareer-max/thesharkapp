@@ -1,3 +1,4 @@
+import { PosSyncError } from './safe-error.ts';
 import { execFile } from 'node:child_process';
 
 export type TokenCommandOptions = {
@@ -32,7 +33,7 @@ function runGcloud(
       },
       (error, stdout) => {
         if (error) {
-          reject(error instanceof Error ? error : new Error('gcloud failed'));
+          reject(new PosSyncError('gcloudFailed', { cause: error }));
           return;
         }
         resolve({ stdout: String(stdout) });
@@ -60,7 +61,7 @@ function gcloudLaunch(
 function tokenFromOutput(stdout: string): string {
   const token = stdout.trim();
   if (token.length === 0 || /\s/.test(token)) {
-    throw new Error('empty token');
+    throw new PosSyncError('emptyToken');
   }
   return token;
 }
@@ -85,6 +86,6 @@ export async function loadAccessToken(
     });
     return tokenFromOutput(result.stdout);
   } catch {
-    throw new Error('Could not obtain a Google access token');
+    throw new PosSyncError('googleTokenUnavailable');
   }
 }

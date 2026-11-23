@@ -1,3 +1,4 @@
+import { PosSyncError, type FieldLabel } from './safe-error.ts';
 import {
   decodeFirestoreValue,
   isRecord,
@@ -57,15 +58,15 @@ function isArrayValue(
   );
 }
 
-function mapFields(value: unknown, label: string): Record<string, unknown> {
+function mapFields(value: unknown, label: FieldLabel): Record<string, unknown> {
   if (!isMapValue(value)) {
-    throw new Error(`unexpected ${label}`);
+    throw new PosSyncError('unexpectedField', label);
   }
   if (value.mapValue.fields === undefined) {
     return {};
   }
   if (!isRecord(value.mapValue.fields)) {
-    throw new Error(`unexpected ${label}`);
+    throw new PosSyncError('unexpectedField', label);
   }
   return value.mapValue.fields;
 }
@@ -75,7 +76,7 @@ function documentFields(fields: unknown): Record<string, unknown> {
     return {};
   }
   if (!isRecord(fields)) {
-    throw new Error('invalid Firestore document');
+    throw new PosSyncError('invalidFirestoreDocument');
   }
   return fields;
 }
@@ -86,7 +87,7 @@ export function normalizeOptionalText(value: string): string | null {
   return trimmed.length === 0 ? null : trimmed;
 }
 
-function optionalString(value: unknown, label: string): string | null {
+function optionalString(value: unknown, label: FieldLabel): string | null {
   if (value === undefined || isNullValue(value)) {
     return null;
   }
@@ -95,20 +96,20 @@ function optionalString(value: unknown, label: string): string | null {
     return null;
   }
   if (typeof decoded !== 'string') {
-    throw new Error(`unexpected ${label}`);
+    throw new PosSyncError('unexpectedField', label);
   }
   return normalizeOptionalText(decoded);
 }
 
-function requiredString(value: unknown, label: string): string {
+function requiredString(value: unknown, label: FieldLabel): string {
   const text = optionalString(value, label);
   if (text === null) {
-    throw new Error(`${label} is required`);
+    throw new PosSyncError('requiredField', label);
   }
   return text;
 }
 
-function optionalNumber(value: unknown, label: string): number | null {
+function optionalNumber(value: unknown, label: FieldLabel): number | null {
   if (value === undefined || isNullValue(value)) {
     return null;
   }
@@ -117,39 +118,39 @@ function optionalNumber(value: unknown, label: string): number | null {
     return null;
   }
   if (typeof decoded !== 'number') {
-    throw new Error(`unexpected ${label}`);
+    throw new PosSyncError('unexpectedField', label);
   }
   return decoded;
 }
 
-function requiredNumber(value: unknown, label: string): number {
+function requiredNumber(value: unknown, label: FieldLabel): number {
   const parsed = optionalNumber(value, label);
   if (parsed === null) {
-    throw new Error(`${label} is required`);
+    throw new PosSyncError('requiredField', label);
   }
   return parsed;
 }
 
-function optionalInt(value: unknown, label: string): number | null {
+function optionalInt(value: unknown, label: FieldLabel): number | null {
   const parsed = optionalNumber(value, label);
   if (parsed === null) {
     return null;
   }
   if (!Number.isSafeInteger(parsed)) {
-    throw new Error(`unexpected ${label}`);
+    throw new PosSyncError('unexpectedField', label);
   }
   return parsed;
 }
 
-function requiredInt(value: unknown, label: string): number {
+function requiredInt(value: unknown, label: FieldLabel): number {
   const parsed = requiredNumber(value, label);
   if (!Number.isSafeInteger(parsed)) {
-    throw new Error(`unexpected ${label}`);
+    throw new PosSyncError('unexpectedField', label);
   }
   return parsed;
 }
 
-function optionalMoney(value: unknown, label: string): string | null {
+function optionalMoney(value: unknown, label: FieldLabel): string | null {
   const parsed = optionalNumber(value, label);
   if (parsed === null) {
     return null;
@@ -157,23 +158,23 @@ function optionalMoney(value: unknown, label: string): string | null {
   return moneyFromNumber(parsed);
 }
 
-function requiredBool(value: unknown, label: string): boolean {
+function requiredBool(value: unknown, label: FieldLabel): boolean {
   if (value === undefined || isNullValue(value)) {
-    throw new Error(`${label} is required`);
+    throw new PosSyncError('requiredField', label);
   }
   const decoded = decodeFirestoreValue(value);
   if (typeof decoded !== 'boolean') {
-    throw new Error(`unexpected ${label}`);
+    throw new PosSyncError('unexpectedField', label);
   }
   return decoded;
 }
 
-function requiredTime(value: unknown, label: string): string {
+function requiredTime(value: unknown, label: FieldLabel): string {
   const text = requiredString(value, label);
   return normalizeTimestamp(text);
 }
 
-function optionalTime(value: unknown, label: string): string | null {
+function optionalTime(value: unknown, label: FieldLabel): string | null {
   const text = optionalString(value, label);
   if (text === null) {
     return null;
@@ -181,7 +182,7 @@ function optionalTime(value: unknown, label: string): string | null {
   return normalizeTimestamp(text);
 }
 
-function optionalDecimal(value: unknown, label: string): string | null {
+function optionalDecimal(value: unknown, label: FieldLabel): string | null {
   const parsed = optionalNumber(value, label);
   if (parsed === null) {
     return null;
@@ -189,7 +190,7 @@ function optionalDecimal(value: unknown, label: string): string | null {
   return decimalFromNumber(parsed);
 }
 
-function requiredDecimal(value: unknown, label: string): string {
+function requiredDecimal(value: unknown, label: FieldLabel): string {
   return decimalFromNumber(requiredNumber(value, label));
 }
 
@@ -226,7 +227,7 @@ function readSizeName(fields: Record<string, unknown>): string | null {
   if (isMapValue(size)) {
     return optionalString(field(mapFields(size, 'size'), 'name'), 'size name');
   }
-  throw new Error('unexpected size');
+  throw new PosSyncError('unexpectedField', 'size');
 }
 
 function readOptions(value: unknown): PosLineOptionIngest[] {
@@ -234,14 +235,14 @@ function readOptions(value: unknown): PosLineOptionIngest[] {
     return [];
   }
   if (!isArrayValue(value)) {
-    throw new Error('unexpected selectedOptions');
+    throw new PosSyncError('unexpectedField', 'selectedOptions');
   }
   const values = value.arrayValue.values;
   if (values === undefined) {
     return [];
   }
   if (!Array.isArray(values)) {
-    throw new Error('unexpected selectedOptions');
+    throw new PosSyncError('unexpectedField', 'selectedOptions');
   }
   return values.map((entry) => {
     const optionFields = mapFields(entry, 'selectedOptions');
@@ -265,20 +266,20 @@ function readLines(value: unknown): PosLineIngest[] {
     return [];
   }
   if (!isArrayValue(value)) {
-    throw new Error('unexpected items');
+    throw new PosSyncError('unexpectedField', 'items');
   }
   const values = value.arrayValue.values;
   if (values === undefined) {
     return [];
   }
   if (!Array.isArray(values)) {
-    throw new Error('unexpected items');
+    throw new PosSyncError('unexpectedField', 'items');
   }
   const lines = values.map((entry) => readLine(entry));
   const seen = new Set<string>();
   for (const line of lines) {
     if (seen.has(line.line_id)) {
-      throw new Error('duplicate line id');
+      throw new PosSyncError('duplicateLine');
     }
     seen.add(line.line_id);
   }
@@ -292,16 +293,16 @@ function readLine(value: unknown): PosLineIngest {
     'weightedQuantity',
   );
   if (weightedRaw !== null && weightedRaw < 0) {
-    throw new Error('weighted quantity must be >= 0');
+    throw new PosSyncError('negativeWeightedQuantity');
   }
   const weighted = weightedRaw !== null && weightedRaw > 0;
   const weightedQty = weighted ? decimalFromNumber(weightedRaw) : null;
   if (weightedQty !== null && qtyText(weightedQty) === '0') {
-    throw new Error('weighted quantity must be > 0');
+    throw new PosSyncError('nonPositiveWeightedQuantity');
   }
   const quantity = requiredDecimal(field(fields, 'quantity'), 'quantity');
   if (parseDecimal(quantity).sign < 0) {
-    throw new Error('quantity must be >= 0');
+    throw new PosSyncError('negativeQuantity');
   }
   return {
     line_id: requiredString(field(fields, 'orderItemId'), 'line id'),
@@ -327,7 +328,7 @@ function projectOption(option: PosLineOptionIngest): PosLineOptionIngest {
     option.pricingBaseQuantity !== null &&
     parseDecimal(option.pricingBaseQuantity).sign < 0
   ) {
-    throw new Error('option pricingBaseQuantity must be >= 0');
+    throw new PosSyncError('negativeOptionPricingBase');
   }
   return {
     value: option.value,
@@ -343,14 +344,14 @@ function projectOption(option: PosLineOptionIngest): PosLineOptionIngest {
 /** Stored accounting shape. Line prices here are rounded the way Postgres stores them. */
 export function projectLine(line: PosLineIngest): StoredLine {
   if (parseDecimal(line.quantity).sign < 0) {
-    throw new Error('quantity must be >= 0');
+    throw new PosSyncError('negativeQuantity');
   }
   const weightedQty = line.weighted_qty;
   if (
     weightedQty !== null &&
     (parseDecimal(weightedQty).sign < 0 || qtyText(weightedQty) === '0')
   ) {
-    throw new Error('weighted quantity must be > 0');
+    throw new PosSyncError('nonPositiveWeightedQuantity');
   }
   const unitPrice = moneyText(line.unit_price);
   return {
@@ -412,7 +413,7 @@ export function storedProjection(order: {
 
 function requireUpdateTime(updateTime: string | undefined): string {
   if (updateTime === undefined || updateTime.trim().length === 0) {
-    throw new Error('updateTime is required');
+    throw new PosSyncError('updateTimeRequired');
   }
   return normalizeTimestamp(updateTime);
 }
@@ -422,7 +423,7 @@ function requireStatus(value: unknown): PosOrderIngest['status'] {
   if (status === 'complete' || status === 'canceled' || status === 'active') {
     return status;
   }
-  throw new Error('unexpected status');
+  throw new PosSyncError('unexpectedField', 'status');
 }
 
 export function mapShiftDocument(document: {
@@ -431,16 +432,16 @@ export function mapShiftDocument(document: {
   fields?: unknown;
 }): PosShiftIngest {
   if (typeof document.name !== 'string') {
-    throw new Error('Firestore document name is invalid');
+    throw new PosSyncError('invalidDocumentName');
   }
   const { collection, id } = splitDocumentName(document.name);
   if (collection !== 'custody_shifts') {
-    throw new Error('expected a shift document');
+    throw new PosSyncError('expectedShift');
   }
   const fields = documentFields(document.fields);
   const fieldId = optionalString(field(fields, 'id'), 'id');
   if (fieldId !== null && fieldId !== id) {
-    throw new Error('shift id does not match document id');
+    throw new PosSyncError('shiftIdMismatch');
   }
   return {
     id,
@@ -474,11 +475,11 @@ export function mapShiftTransaction(
   document: { name?: string; fields?: unknown },
 ): PosShiftTransactionIngest {
   if (typeof document.name !== 'string') {
-    throw new Error('Firestore document name is invalid');
+    throw new PosSyncError('invalidDocumentName');
   }
   const parsed = splitTransactionName(document.name);
   if (parsed.shiftId !== shiftId) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   const fields = documentFields(document.fields);
   const row: PosShiftTransactionIngest = {
@@ -493,7 +494,7 @@ export function mapShiftTransaction(
     keys.length !== TRANSACTION_KEYS.length ||
     TRANSACTION_KEYS.some((key) => !keys.includes(key))
   ) {
-    throw new Error('unexpected transaction shape');
+    throw new PosSyncError('unexpectedTransactionShape');
   }
   return row;
 }
@@ -508,7 +509,7 @@ export function mapShiftTransactions(
   const seen = new Set<string>();
   for (const row of rows) {
     if (seen.has(row.tx_id)) {
-      throw new Error('duplicate tx id');
+      throw new PosSyncError('duplicateTransaction');
     }
     seen.add(row.tx_id);
   }
@@ -521,11 +522,11 @@ export function mapOrderDocument(document: {
   fields?: unknown;
 }): PosOrderIngest {
   if (typeof document.name !== 'string') {
-    throw new Error('Firestore document name is invalid');
+    throw new PosSyncError('invalidDocumentName');
   }
   const { collection, id } = splitDocumentName(document.name);
   if (collection !== 'orders') {
-    throw new Error('expected an order document');
+    throw new PosSyncError('expectedOrder');
   }
   const fields = documentFields(document.fields);
   const status = requireStatus(field(fields, 'status'));

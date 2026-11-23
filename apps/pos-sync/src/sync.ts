@@ -6,7 +6,11 @@ import {
 import { compareId } from './hash.ts';
 import { assertLocalSupabaseUrl } from './local-guard.ts';
 import type { PosSnapshot } from './read-pos.ts';
-import { safeErrorMessage } from './safe-error.ts';
+import {
+  classifySyncError,
+  PosSyncCombinedError,
+  safeErrorMessage,
+} from './safe-error.ts';
 import { planIngestCalls } from './scope.ts';
 import {
   createSupabaseDb,
@@ -97,7 +101,7 @@ export async function runPosSync(input: {
     );
     counts.read = orders.length;
     input.logger?.(
-      `pos sync read mode=${input.mode} shifts=${shifts.length} orders=${orders.length} transactions=${transactionCount} shift_ids=${shifts.map((shift) => shift.id).join(',')} missing_shifts=${read.missingShiftIds.join(',')}`,
+      `pos sync read mode=${input.mode} shifts=${shifts.length} orders=${orders.length} transactions=${transactionCount} missing_shifts=${read.missingShiftIds.length}`,
     );
     const calls = planIngestCalls({ shifts, orders, scope: read.scope });
     for (const call of calls) {
@@ -126,15 +130,18 @@ export async function runPosSync(input: {
     if (runId === undefined) {
       throw error;
     }
-    const reported = safeErrorMessage(error);
+    const failure = classifySyncError(error);
     try {
-      await db.finishRun(runId, 'failed', { ...counts }, reported);
+      await db.finishRun(
+        runId,
+        'failed',
+        { ...counts },
+        safeErrorMessage(failure),
+      );
     } catch (finishError) {
-      throw new Error(`${reported}; ${safeErrorMessage(finishError)}`, {
-        cause: finishError,
-      });
+      throw new PosSyncCombinedError(failure, finishError);
     }
-    throw new Error(reported, { cause: error });
+    throw failure;
   }
   if (accountingDb !== undefined) {
     await drainAfterSync(accountingDb, input.logger, input.accountingOptions);

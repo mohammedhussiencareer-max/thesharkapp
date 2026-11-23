@@ -1,5 +1,10 @@
 import { assertLocalSupabaseUrl } from './local-guard.ts';
 import { isRecord, isSafeDocumentId } from './decode.ts';
+import {
+  POS_SYNC_ALREADY_RUNNING,
+  PosSyncError,
+  SupabaseRpcError,
+} from './safe-error.ts';
 import type {
   IngestCounts,
   PosOrderIngest,
@@ -26,26 +31,7 @@ function localFetch(input: string, init: RequestInit): Promise<Response> {
   return fetch(input, init);
 }
 
-export type RpcFailureKind = 'network' | 'http' | 'response';
-
-export class SupabaseRpcError extends Error {
-  readonly kind: RpcFailureKind;
-  readonly status: number | null;
-  readonly sqlstate: string | null;
-
-  constructor(
-    message: string,
-    kind: RpcFailureKind,
-    status: number | null = null,
-    sqlstate: string | null = null,
-  ) {
-    super(message);
-    this.name = 'SupabaseRpcError';
-    this.kind = kind;
-    this.status = status;
-    this.sqlstate = sqlstate;
-  }
-}
+export { SupabaseRpcError, type RpcFailureKind } from './safe-error.ts';
 
 // True when the call may have reached the database and its outcome is not
 // known: no reply, a server error, a statement timeout, or a reply that cannot
@@ -146,7 +132,7 @@ export function createSupabaseDb(
 ): PosDb & AccountingDb {
   assertLocalSupabaseUrl(supabaseUrl);
   if (serviceRoleKey.trim().length === 0) {
-    throw new Error('Supabase service role key is required');
+    throw new PosSyncError('supabaseKeyRequired');
   }
 
   async function rpc(
@@ -177,7 +163,7 @@ export function createSupabaseDb(
           : { signal: AbortSignal.timeout(timeoutMs) }),
       });
     } catch {
-      throw new SupabaseRpcError('Supabase RPC failed: network', 'network');
+      throw new SupabaseRpcError('network');
     }
     if (!response.ok) {
       let text: string;
@@ -187,14 +173,9 @@ export function createSupabaseDb(
         text = '';
       }
       if (name === 'start_pos_sync_run' && isAnotherPosSyncRunning(text)) {
-        throw new Error('another POS sync is running');
+        throw new PosSyncError('syncAlreadyRunning');
       }
-      throw new SupabaseRpcError(
-        `Supabase RPC failed: HTTP ${response.status}`,
-        'http',
-        response.status,
-        errorSqlstate(text),
-      );
+      throw new SupabaseRpcError('http', response.status, errorSqlstate(text));
     }
     const text = await readBody(response);
     if (text.trim().length === 0) {
@@ -278,10 +259,7 @@ export function createSupabaseDb(
 }
 
 function unexpectedResponse(): SupabaseRpcError {
-  return new SupabaseRpcError(
-    'Supabase RPC failed: unexpected response',
-    'response',
-  );
+  return new SupabaseRpcError('response');
 }
 
 async function readBody(response: Response): Promise<string> {
@@ -300,7 +278,7 @@ function rpcUrl(base: string, name: string): string {
     url.origin !== baseUrl.origin ||
     url.pathname !== `/rest/v1/rpc/${name}`
   ) {
-    throw new Error('Refusing non-local Supabase URL');
+    throw new PosSyncError('nonLocalSupabase');
   }
   return url.toString();
 }
@@ -315,7 +293,7 @@ function isAnotherPosSyncRunning(body: string): boolean {
   return (
     isRecord(parsed) &&
     parsed.code === '55P03' &&
-    parsed.message === 'another POS sync is running'
+    parsed.message === POS_SYNC_ALREADY_RUNNING
   );
 }
 

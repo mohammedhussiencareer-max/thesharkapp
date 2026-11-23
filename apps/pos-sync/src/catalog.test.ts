@@ -1039,6 +1039,15 @@ describe('parseCatalog fixtures', () => {
     );
   });
 
+  it('reports catalog allowlist drift without echoing the input selector', () => {
+    expect(() =>
+      resolveCatalogFieldSelectors(
+        [...CATALOG_ITEM_FIELDS, 'SyntheticMarker7f3a'],
+        CATALOG_OPTION_GROUP_FIELDS,
+      ),
+    ).toThrow(/^Catalog allowlist mismatch: unexpected item path$/);
+  });
+
   it('accepts 15 and 20 nested Firestore maps during customer-key scan and rejects beyond the walk cap', () => {
     function nestedMap(levels: number): unknown {
       let current: unknown = str('leaf');

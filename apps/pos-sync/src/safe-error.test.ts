@@ -1,22 +1,23 @@
-import { readdirSync, readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { localServiceRoleKey } from './local-supabase.ts';
 import { assertLocalSupabaseUrl } from './local-guard.ts';
-import { STATIC_ERROR_MESSAGES, safeErrorMessage } from './safe-error.ts';
-import { SupabaseRpcError } from './supabase-write.ts';
+import {
+  PosSyncError,
+  safeErrorMessage,
+  SupabaseRpcError,
+  type FieldLabel,
+} from './safe-error.ts';
 
-const MARKER = 'SYNTHETIC-MARKER-7f3a';
+const MARKER = 'SyntheticMarker7f3a';
 
 describe('safeErrorMessage', () => {
   it('redacts access tokens and JWTs and truncates', () => {
+    const fakeJwt = 'eyJhbGciOiJub25lIn0.eyJzeW50aGV0aWMiOnRydWV9.synthetic';
     const error = new Error(
-      `failed ya29.super-secret-token Bearer ${localServiceRoleKey} ${'x'.repeat(400)}`,
+      `failed ya29.super-secret-token Bearer ${fakeJwt} ${'x'.repeat(400)}`,
     );
     const message = safeErrorMessage(error);
     expect(message).not.toContain('ya29.');
-    expect(message).not.toContain(localServiceRoleKey);
+    expect(message).not.toContain(fakeJwt);
     expect(message.length).toBeLessThanOrEqual(300);
     expect(safeErrorMessage('nope')).toBe('sync failed');
   });
@@ -30,28 +31,60 @@ describe('safeErrorMessage', () => {
   it('drops a JSON parse error that quotes response text', () => {
     let parseError: unknown;
     try {
-      JSON.parse(`{"name": "${MARKER}"`);
+      JSON.parse(MARKER);
     } catch (error) {
       parseError = error;
     }
+    expect(parseError).toBeInstanceOf(SyntaxError);
+    expect(parseError).toHaveProperty(
+      'message',
+      expect.stringContaining(MARKER),
+    );
     expect(safeErrorMessage(parseError)).toBe('sync failed');
   });
 
-  it('keeps the static messages this package throws', () => {
-    for (const message of [
-      'Firestore read refused',
+  it.each([
+    'unexpected SyntheticMarker7f3a',
+    'SyntheticMarker7f3a is required',
+    'duplicate SyntheticMarker7f3a id',
+    'unexpected orderNumber',
+    'Unknown mode',
+    'Firestore read failed: HTTP 404',
+  ])('rejects a plain Error that looks package-owned (%s)', (message) => {
+    expect(safeErrorMessage(new Error(message))).toBe('sync failed');
+  });
+
+  it.each([
+    [new PosSyncError('firestoreReadRefused'), 'Firestore read refused'],
+    [
+      new PosSyncError('firestoreInvalidResponse'),
       'Firestore read failed: invalid response',
-      'Firestore read failed: network',
-      'Firestore read failed: HTTP 404',
-      'another POS sync is running',
-      'Unknown mode',
+    ],
+    [new PosSyncError('firestoreNetwork'), 'Firestore read failed: network'],
+    [new PosSyncError('firestoreHttp', 404), 'Firestore read failed: HTTP 404'],
+    [new PosSyncError('syncAlreadyRunning'), 'another POS sync is running'],
+    [new PosSyncError('unknownMode'), 'Unknown mode'],
+    [
+      new PosSyncError('unexpectedField', 'orderNumber'),
       'unexpected orderNumber',
-      'timestamp is required',
-      'duplicate order id',
-      'Refusing non-local Supabase URL',
-    ]) {
-      expect(safeErrorMessage(new Error(message))).toBe(message);
-    }
+    ],
+    [new PosSyncError('requiredField', 'timestamp'), 'timestamp is required'],
+    [new PosSyncError('duplicateOrder'), 'duplicate order id'],
+    [new PosSyncError('nonLocalSupabase'), 'Refusing non-local Supabase URL'],
+  ])(
+    'renders %s from its package diagnostic even if message text changes',
+    (error, expected) => {
+      expect(error.message).toBe(expected);
+      error.message = MARKER;
+      expect(safeErrorMessage(error)).toBe(expected);
+    },
+  );
+
+  it('checks diagnostic labels against the closed set at runtime', () => {
+    const label: string = MARKER;
+    const error = new PosSyncError('requiredField', label as FieldLabel);
+    expect(error.message).toBe('sync failed');
+    expect(safeErrorMessage(error)).toBe('sync failed');
   });
 
   it('refuses template messages that carry free text', () => {
@@ -67,38 +100,15 @@ describe('safeErrorMessage', () => {
   });
 
   it('reports a Supabase RPC failure by kind, status and SQLSTATE only', () => {
-    const error = new SupabaseRpcError(
-      `Supabase RPC failed: HTTP 400 ${MARKER}`,
-      'http',
-      400,
-      '23505',
-    );
+    const error = new SupabaseRpcError('http', 400, '23505');
+    error.message = `Supabase RPC failed: HTTP 400 ${MARKER}`;
     expect(safeErrorMessage(error)).toBe('Supabase RPC failed: HTTP 400 23505');
-    expect(safeErrorMessage(new SupabaseRpcError(MARKER, 'network'))).toBe(
-      'Supabase RPC failed: network',
-    );
+    const networkError = new SupabaseRpcError('network');
+    networkError.message = MARKER;
+    expect(safeErrorMessage(networkError)).toBe('Supabase RPC failed: network');
     expect(
-      safeErrorMessage(new SupabaseRpcError(MARKER, 'http', 502, `${MARKER}x`)),
+      safeErrorMessage(new SupabaseRpcError('http', 502, `${MARKER}x`)),
     ).toBe('Supabase RPC failed: HTTP 502');
-  });
-});
-
-describe('STATIC_ERROR_MESSAGES', () => {
-  it('lists every literal message this package throws', () => {
-    const dir = path.dirname(fileURLToPath(import.meta.url));
-    const thrown = new Set<string>();
-    for (const name of readdirSync(dir)) {
-      if (!name.endsWith('.ts') || name.endsWith('.test.ts')) continue;
-      const source = readFileSync(path.join(dir, name), 'utf8');
-      for (const match of source.matchAll(
-        /new (?:Error|SupabaseRpcError)\(\s*'([^']*)'/g,
-      )) {
-        thrown.add(match[1] as string);
-      }
-    }
-    expect(thrown.size).toBeGreaterThan(40);
-    const missing = [...thrown].filter((m) => !STATIC_ERROR_MESSAGES.has(m));
-    expect(missing).toEqual([]);
   });
 });
 

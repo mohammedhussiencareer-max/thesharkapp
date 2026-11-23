@@ -137,7 +137,7 @@ describe('drainAccountingWork', () => {
     const { db, runs, reports } = fakeDb(
       [],
       'recorded',
-      new SupabaseRpcError('Supabase RPC failed: network', 'network'),
+      new SupabaseRpcError('network'),
     );
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('call_failed');
@@ -208,7 +208,7 @@ describe('drainAccountingWork', () => {
     const { db, runs, reports } = fakeDb(
       [
         run('processed', { remaining: 1 }, orderC),
-        new SupabaseRpcError('Supabase RPC failed: network', 'network'),
+        new SupabaseRpcError('network'),
       ],
       'recorded',
       { status: 'empty', head: null },
@@ -270,7 +270,7 @@ describe('drainAccountingWork', () => {
     expect(reports).toEqual([]);
   });
 
-  it('stops on critical and names the order', async () => {
+  it('reports critical status without logging the order id', async () => {
     const { db } = fakeDb([
       run('critical', { failed: 1 }, null, {
         orderId: 'order-crit',
@@ -279,9 +279,35 @@ describe('drainAccountingWork', () => {
     ]);
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('critical');
-    expect(outcome.criticalOrderId).toBe('order-crit');
-    expect(formatDrain(outcome)).toContain('critical_order=order-crit');
+    expect(formatDrain(outcome)).toContain('stop=critical');
+    expect.soft(formatDrain(outcome)).not.toContain('order-crit');
+    expect(JSON.stringify(outcome)).not.toContain('order-crit');
   });
+
+  it.each(['peek', 'worker', 'recorder'] as const)(
+    'drops an arbitrary %s error from the drain report',
+    async (stage) => {
+      const marker = 'SyntheticMarker7f3a';
+      const error = new Error(`unexpected ${marker}`);
+      const rpc = new SupabaseRpcError('network');
+      const { db } =
+        stage === 'peek'
+          ? fakeDb([], 'recorded', error)
+          : stage === 'worker'
+            ? fakeDb([error])
+            : fakeDb([rpc], error);
+      const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+      expect(outcome.stop).toBe('call_failed');
+      expect
+        .soft(outcome.error)
+        .toBe(
+          stage === 'recorder'
+            ? 'Supabase RPC failed: network; sync failed'
+            : 'sync failed',
+        );
+      expect(formatDrain(outcome)).not.toContain(marker);
+    },
+  );
 
   it('stops when the order failed inside the call, without reporting', async () => {
     const { db, reports } = fakeDb([
@@ -313,10 +339,7 @@ describe('drainAccountingWork', () => {
   });
 
   it('reports an escaped failure with the same attempt id, naming only the bound order', async () => {
-    const timeout = new SupabaseRpcError(
-      'Supabase RPC failed: network',
-      'network',
-    );
+    const timeout = new SupabaseRpcError('network');
     const { db, runs, reports } = fakeDb(
       [
         run(
@@ -346,14 +369,7 @@ describe('drainAccountingWork', () => {
 
   it('reports a server error on the first call against the order the peek named', async () => {
     const { db, runs, reports, timeouts } = fakeDb(
-      [
-        new SupabaseRpcError(
-          'Supabase RPC failed: HTTP 500',
-          'http',
-          500,
-          '57014',
-        ),
-      ],
+      [new SupabaseRpcError('http', 500, '57014')],
       'committed',
     );
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
@@ -370,14 +386,7 @@ describe('drainAccountingWork', () => {
 
   it('retries a statement timeout on the timeout recorder only', async () => {
     const { db, reports, timeouts } = fakeDb(
-      [
-        new SupabaseRpcError(
-          'Supabase RPC failed: HTTP 500',
-          'http',
-          500,
-          '57014',
-        ),
-      ],
+      [new SupabaseRpcError('http', 500, '57014')],
       ['busy', 'recorded'],
     );
     const outcome = await drainAccountingWork(db, {
@@ -393,7 +402,7 @@ describe('drainAccountingWork', () => {
 
   it('makes no report when an unbound (maintenance) call fails, as it processed no order', async () => {
     const { db, reports } = fakeDb(
-      [new SupabaseRpcError('Supabase RPC failed: network', 'network')],
+      [new SupabaseRpcError('network')],
       'recorded',
       { status: 'empty', head: null },
     );
@@ -405,12 +414,7 @@ describe('drainAccountingWork', () => {
 
   it('does not report a refused call', async () => {
     const { db, reports } = fakeDb([
-      new SupabaseRpcError(
-        'Supabase RPC failed: HTTP 400',
-        'http',
-        400,
-        '22023',
-      ),
+      new SupabaseRpcError('http', 400, '22023'),
     ]);
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('call_failed');
@@ -420,8 +424,8 @@ describe('drainAccountingWork', () => {
 
   it('keeps going to a clean stop when the report itself fails', async () => {
     const { db } = fakeDb(
-      [new SupabaseRpcError('Supabase RPC failed: network', 'network')],
-      new SupabaseRpcError('Supabase RPC failed: network', 'network'),
+      [new SupabaseRpcError('network')],
+      new SupabaseRpcError('network'),
     );
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('call_failed');
@@ -432,10 +436,7 @@ describe('drainAccountingWork', () => {
   });
 
   describe('a failure report the ledger lock turns away', () => {
-    const lost = new SupabaseRpcError(
-      'Supabase RPC failed: network',
-      'network',
-    );
+    const lost = new SupabaseRpcError('network');
 
     function pauses(clockStart = 0) {
       let now = clockStart;
@@ -596,10 +597,7 @@ describe('drainAccountingWork', () => {
     it('ends unreported when a repeat itself fails, keeping the attempt id', async () => {
       const { db, runs, reports } = fakeDb(
         [lost],
-        [
-          'busy',
-          new SupabaseRpcError('Supabase RPC failed: network', 'network'),
-        ],
+        ['busy', new SupabaseRpcError('network')],
       );
       const pace = pauses();
       const outcome = await drainAccountingWork(db, {
@@ -616,7 +614,9 @@ describe('drainAccountingWork', () => {
 
   it('redacts secrets from a reported error', async () => {
     const { db } = fakeDb([
-      new SupabaseRpcError('boom Bearer ya29.SECRET-TOKEN', 'network'),
+      Object.assign(new SupabaseRpcError('network'), {
+        message: 'boom Bearer ya29.SECRET-TOKEN',
+      }),
     ]);
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(formatDrain(outcome)).not.toContain('SECRET-TOKEN');

@@ -1,3 +1,4 @@
+import { PosSyncError } from './safe-error.ts';
 import { hasCustomerShapedSchemaKey } from './catalog-refusals.ts';
 import {
   isRecord,
@@ -41,7 +42,7 @@ export function firestoreListUrl(
   // An allowlisted name only. URL construction would resolve `items/../orders`
   // into a permitted orders list before the path check could see the traversal.
   if (!COLLECTIONS.has(collection) && !CATALOG_COLLECTIONS.has(collection)) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   const url = new URL(`${ORIGIN}${DOCUMENT_PATH}/${collection}`);
   url.searchParams.set('pageSize', String(query.pageSize));
@@ -61,7 +62,7 @@ export function firestoreGetUrl(
   id: string,
 ): string {
   if (!isSafeDocumentId(id)) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   const text = `${ORIGIN}${DOCUMENT_PATH}/${collection}/${encodeURIComponent(id)}`;
   assertFirestoreReadAllowed('GET', text);
@@ -77,7 +78,7 @@ export function firestoreTransactionsUrl(
   query: TransactionListQuery,
 ): string {
   if (!isSafeDocumentId(shiftId)) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   const url = new URL(
     `${ORIGIN}${DOCUMENT_PATH}/custody_shifts/${encodeURIComponent(shiftId)}/transactions`,
@@ -98,25 +99,25 @@ export function assertFirestoreReadAllowed(
 ): void {
   const verb = method.trim().toUpperCase();
   if (verb !== 'GET' && verb !== 'POST') {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (parsed.username !== '' || parsed.password !== '' || parsed.hash !== '') {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (
     parsed.protocol !== 'https:' ||
     parsed.hostname !== 'firestore.googleapis.com'
   ) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (parsed.port !== '' && parsed.port !== '443') {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   // Refuse dot-segment or backslash traversal even when URL normalization
   // resolves to an allowed collection path (e.g. /items/../optionGroups or
@@ -125,20 +126,20 @@ export function assertFirestoreReadAllowed(
     url,
   );
   if (rawPathMatch === null || rawPathMatch[1] !== parsed.pathname) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (verb === 'POST') {
     if (parsed.pathname !== RUN_QUERY_PATH || parsed.search !== '') {
-      throw new Error('Firestore read refused');
+      throw new PosSyncError('firestoreReadRefused');
     }
     assertRunQueryBody(body);
     return;
   }
   if (parsed.pathname.includes(':')) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (!parsed.pathname.startsWith(`${DOCUMENT_PATH}/`)) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   const segments = parsed.pathname.slice(DOCUMENT_PATH.length + 1).split('/');
   if (segments.length === 1) {
@@ -153,13 +154,13 @@ export function assertFirestoreReadAllowed(
       assertPagedListParams(parsed.searchParams);
       return;
     }
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (segments.length === 2) {
     assertCollection(segments[0]);
     const id = segments[1];
     if (id === undefined || !isSafeDocumentId(id) || parsed.search !== '') {
-      throw new Error('Firestore read refused');
+      throw new PosSyncError('firestoreReadRefused');
     }
     return;
   }
@@ -173,24 +174,24 @@ export function assertFirestoreReadAllowed(
       shiftId === undefined ||
       !isSafeDocumentId(shiftId)
     ) {
-      throw new Error('Firestore read refused');
+      throw new PosSyncError('firestoreReadRefused');
     }
     assertPagedListParams(parsed.searchParams);
     return;
   }
-  throw new Error('Firestore read refused');
+  throw new PosSyncError('firestoreReadRefused');
 }
 
 function assertCollection(collection: string | undefined): void {
   if (collection === undefined || !COLLECTIONS.has(collection)) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
 }
 
 function assertPagedListParams(params: URLSearchParams): void {
   for (const key of params.keys()) {
     if (key !== 'pageSize' && key !== 'pageToken') {
-      throw new Error('Firestore read refused');
+      throw new PosSyncError('firestoreReadRefused');
     }
   }
   assertPageSize(params);
@@ -206,7 +207,7 @@ function assertPageSize(params: URLSearchParams): void {
     !/^[1-9]\d*$/.test(pageSize) ||
     Number(pageSize) > 300
   ) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
 }
 
@@ -217,21 +218,21 @@ function assertPageToken(params: URLSearchParams): void {
     tokens.length > 1 ||
     (tokens.length === 1 && (token === undefined || token.length === 0))
   ) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
 }
 
 function assertListParams(params: URLSearchParams): void {
   for (const key of params.keys()) {
     if (key !== 'pageSize' && key !== 'pageToken' && key !== 'orderBy') {
-      throw new Error('Firestore read refused');
+      throw new PosSyncError('firestoreReadRefused');
     }
   }
   assertPageSize(params);
   assertPageToken(params);
   const orderBy = params.getAll('orderBy');
   if (orderBy.length > 1) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   const direction = orderBy[0];
   if (
@@ -240,7 +241,7 @@ function assertListParams(params: URLSearchParams): void {
     direction !== 'opening_time asc' &&
     direction !== 'opening_time desc'
   ) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
 }
 
@@ -254,16 +255,16 @@ function assertRunQueryBody(body: unknown): void {
     Object.keys(body).length !== 1 ||
     !isRecord(body.structuredQuery)
   ) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   const query = body.structuredQuery;
   for (const key of Object.keys(query)) {
     if (key !== 'from' && key !== 'where' && key !== 'limit') {
-      throw new Error('Firestore read refused');
+      throw new PosSyncError('firestoreReadRefused');
     }
   }
   if (!isOneElement(query.from)) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   const from = query.from[0];
   if (
@@ -271,7 +272,7 @@ function assertRunQueryBody(body: unknown): void {
     Object.keys(from).length !== 1 ||
     (from.collectionId !== 'orders' && from.collectionId !== 'custody_shifts')
   ) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (query.where !== undefined) {
     assertFilter(query.where);
@@ -282,13 +283,13 @@ function assertRunQueryBody(body: unknown): void {
     query.limit < 1 ||
     query.limit > 2000
   ) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
 }
 
 function assertFilter(filter: unknown): void {
   if (!isRecord(filter) || Object.keys(filter).length !== 1) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (isRecord(filter.fieldFilter) && Object.keys(filter).length === 1) {
     assertFieldFilter(filter.fieldFilter);
@@ -298,7 +299,7 @@ function assertFilter(filter: unknown): void {
     assertComposite(filter.compositeFilter);
     return;
   }
-  throw new Error('Firestore read refused');
+  throw new PosSyncError('firestoreReadRefused');
 }
 
 function assertFieldFilter(filter: Record<string, unknown>): void {
@@ -309,19 +310,19 @@ function assertFieldFilter(filter: Record<string, unknown>): void {
     !keys.includes('op') ||
     !keys.includes('value')
   ) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (!isRecord(filter.field) || Object.keys(filter.field).length !== 1) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (
     typeof filter.field.fieldPath !== 'string' ||
     !FIELD_PATHS.has(filter.field.fieldPath)
   ) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (typeof filter.op !== 'string' || !FILTER_OPS.has(filter.op)) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   assertQueryValue(filter.value);
 }
@@ -332,10 +333,10 @@ function assertComposite(filter: Record<string, unknown>): void {
     !Array.isArray(filter.filters) ||
     Object.keys(filter).length !== 2
   ) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (filter.filters.length === 0) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   for (const entry of filter.filters) {
     assertFilter(entry);
@@ -344,15 +345,15 @@ function assertComposite(filter: Record<string, unknown>): void {
 
 function assertQueryValue(value: unknown): void {
   if (!isRecord(value) || Object.keys(value).length !== 1) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   const kind = Object.keys(value)[0];
   if (kind === undefined || !VALUE_KINDS.has(kind)) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   if (kind === 'stringValue' || kind === 'timestampValue') {
     if (typeof value[kind] !== 'string') {
-      throw new Error('Firestore read refused');
+      throw new PosSyncError('firestoreReadRefused');
     }
     return;
   }
@@ -361,7 +362,7 @@ function assertQueryValue(value: unknown): void {
       typeof value.integerValue !== 'string' ||
       !/^-?\d+$/.test(value.integerValue)
     ) {
-      throw new Error('Firestore read refused');
+      throw new PosSyncError('firestoreReadRefused');
     }
     return;
   }
@@ -370,13 +371,13 @@ function assertQueryValue(value: unknown): void {
       typeof value.doubleValue !== 'number' ||
       !Number.isFinite(value.doubleValue)
     ) {
-      throw new Error('Firestore read refused');
+      throw new PosSyncError('firestoreReadRefused');
     }
     return;
   }
   if (kind === 'booleanValue') {
     if (typeof value.booleanValue !== 'boolean') {
-      throw new Error('Firestore read refused');
+      throw new PosSyncError('firestoreReadRefused');
     }
     return;
   }
@@ -384,7 +385,7 @@ function assertQueryValue(value: unknown): void {
     return;
   }
   if (!isRecord(value.arrayValue)) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   const values = value.arrayValue.values;
   if (values === undefined) {
@@ -394,7 +395,7 @@ function assertQueryValue(value: unknown): void {
     !Array.isArray(values) ||
     Object.keys(value.arrayValue).some((key) => key !== 'values')
   ) {
-    throw new Error('Firestore read refused');
+    throw new PosSyncError('firestoreReadRefused');
   }
   for (const entry of values) {
     assertQueryValue(entry);
@@ -409,17 +410,17 @@ export function parseListResponse(
   expected: PosCollection | 'transactions',
 ): ListPage {
   if (!isRecord(payload)) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   for (const key of Object.keys(payload)) {
     if (!LIST_KEYS.has(key)) {
-      throw new Error('Firestore read failed: invalid response');
+      throw new PosSyncError('firestoreInvalidResponse');
     }
   }
   const documents: FirestoreRestDocument[] = [];
   if (payload.documents !== undefined) {
     if (!Array.isArray(payload.documents)) {
-      throw new Error('Firestore read failed: invalid response');
+      throw new PosSyncError('firestoreInvalidResponse');
     }
     for (const entry of payload.documents) {
       documents.push(requireDocument(entry, expected));
@@ -429,7 +430,7 @@ export function parseListResponse(
     payload.nextPageToken !== undefined &&
     typeof payload.nextPageToken !== 'string'
   ) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   const nextPageToken =
     typeof payload.nextPageToken === 'string' &&
@@ -453,7 +454,7 @@ export function parseRunQueryResponse(
   expected: 'orders' | 'custody_shifts',
 ): FirestoreRestDocument[] {
   if (!Array.isArray(payload) || payload.length === 0) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   const documents: FirestoreRestDocument[] = [];
   for (const entry of payload) {
@@ -467,24 +468,24 @@ function readRunQueryEntry(
   expected: 'orders' | 'custody_shifts',
 ): FirestoreRestDocument[] {
   if (!isRecord(entry)) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   for (const key of Object.keys(entry)) {
     if (!RUN_QUERY_KEYS.has(key)) {
-      throw new Error('Firestore read failed: invalid response');
+      throw new PosSyncError('firestoreInvalidResponse');
     }
   }
   if ('readTime' in entry && !isRfc3339(entry.readTime)) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   if ('transaction' in entry && typeof entry.transaction !== 'string') {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   if ('done' in entry && typeof entry.done !== 'boolean') {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   if ('explainMetrics' in entry && !isRecord(entry.explainMetrics)) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   if ('skippedResults' in entry) {
     const skipped = entry.skippedResults;
@@ -493,17 +494,17 @@ function readRunQueryEntry(
       !Number.isInteger(skipped) ||
       skipped < 0
     ) {
-      throw new Error('Firestore read failed: invalid response');
+      throw new PosSyncError('firestoreInvalidResponse');
     }
     if (skipped > 0) {
-      throw new Error('Firestore read failed: invalid response');
+      throw new PosSyncError('firestoreInvalidResponse');
     }
   }
   if ('document' in entry) {
     return [requireDocument(entry.document, expected)];
   }
   if (!isRfc3339(entry.readTime)) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   return [];
 }
@@ -558,18 +559,18 @@ function requireDocument(
   expected: PosCollection | 'transactions',
 ): FirestoreRestDocument {
   if (!isRecord(value) || typeof value.name !== 'string') {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   let collection: PosCollection | 'transactions';
   try {
     collection = assertKnownDocumentName(value.name);
   } catch (error) {
-    throw new Error('Firestore read failed: invalid response', {
+    throw new PosSyncError('firestoreInvalidResponse', {
       cause: error,
     });
   }
   if (collection !== expected) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   // Scan the raw catalog document (including any extra envelope properties)
   // before projection so customer-shaped keys cannot be stripped silently.
@@ -585,13 +586,13 @@ function requireDocument(
   const document: FirestoreRestDocument = { name: value.name };
   if (value.updateTime !== undefined) {
     if (typeof value.updateTime !== 'string') {
-      throw new Error('Firestore read failed: invalid response');
+      throw new PosSyncError('firestoreInvalidResponse');
     }
     document.updateTime = value.updateTime;
   }
   if (value.fields !== undefined) {
     if (!isRecord(value.fields)) {
-      throw new Error('Firestore read failed: invalid response');
+      throw new PosSyncError('firestoreInvalidResponse');
     }
     document.fields = value.fields;
   }
@@ -600,15 +601,15 @@ function requireDocument(
 
 function requestedQueryCollection(body: unknown): 'orders' | 'custody_shifts' {
   if (!isRecord(body) || !isRecord(body.structuredQuery)) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   const from: unknown = body.structuredQuery.from;
   if (!isOneElement(from) || !isRecord(from[0])) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   const collectionId = from[0].collectionId;
   if (collectionId !== 'orders' && collectionId !== 'custody_shifts') {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   return collectionId;
 }
@@ -625,16 +626,13 @@ async function googleFetch(
 function snapshotJson(body: unknown): { serialized: string; value: unknown } {
   try {
     const text = JSON.stringify(body);
-    if (typeof text !== 'string') {
-      throw new Error('Firestore read refused');
+    if (typeof text === 'string') {
+      return { serialized: text, value: JSON.parse(text) as unknown };
     }
-    return { serialized: text, value: JSON.parse(text) as unknown };
   } catch (error) {
-    if (error instanceof Error && error.message === 'Firestore read refused') {
-      throw error;
-    }
-    throw new Error('Firestore read refused', { cause: error });
+    throw new PosSyncError('firestoreReadRefused', { cause: error });
   }
+  throw new PosSyncError('firestoreReadRefused');
 }
 
 async function readFirestoreResponse(
@@ -656,7 +654,7 @@ async function readFirestoreResponse(
       body: requestBody,
     });
   } catch {
-    throw new Error('Firestore read failed: network');
+    throw new PosSyncError('firestoreNetwork');
   }
   if (!response.ok) {
     try {
@@ -664,12 +662,12 @@ async function readFirestoreResponse(
     } catch {
       // The status is enough. Never surface the body.
     }
-    throw new Error(`Firestore read failed: HTTP ${response.status}`);
+    throw new PosSyncError('firestoreHttp', response.status);
   }
   try {
     return JSON.parse(await response.text()) as unknown;
   } catch {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
 }
 
@@ -717,7 +715,7 @@ export function createPosFirestore(
       const page = parseListResponse(payload, 'transactions');
       for (const document of page.documents) {
         if (splitTransactionName(document.name).shiftId !== shiftId) {
-          throw new Error('Firestore read failed: invalid response');
+          throw new PosSyncError('firestoreInvalidResponse');
         }
       }
       return page;
@@ -733,10 +731,7 @@ export function createPosFirestore(
         );
         return requireDocument(payload, 'custody_shifts');
       } catch (error) {
-        if (
-          error instanceof Error &&
-          error.message === 'Firestore read failed: HTTP 404'
-        ) {
+        if (PosSyncError.hasHttpStatus(error, 404)) {
           return null;
         }
         throw error;

@@ -49,7 +49,7 @@ export async function main(deps: CliDeps): Promise<number> {
 
 function formatOk(result: SyncResult): string {
   const counts = result.counts;
-  return `pos sync ok mode=${result.mode} shift_ids=${result.shiftIds.join(',')} read=${counts.read} inserted=${counts.inserted} updated=${counts.updated} unchanged=${counts.unchanged} stale=${counts.stale} missing=${counts.missing} shifts=${counts.shifts_upserted}`;
+  return `pos sync ok mode=${result.mode} shifts_read=${result.shiftIds.length} read=${counts.read} inserted=${counts.inserted} updated=${counts.updated} unchanged=${counts.unchanged} stale=${counts.stale} missing=${counts.missing} shifts=${counts.shifts_upserted}`;
 }
 
 function isDirectRun(): boolean {

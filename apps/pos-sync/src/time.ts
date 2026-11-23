@@ -1,3 +1,4 @@
+import { PosSyncError } from './safe-error.ts';
 /**
  * Legacy order and shift timestamps. The text must match the UTC pattern and
  * `Date.parse` must accept it. Calendar overflow and `24:00:00` stay as stored.
@@ -8,16 +9,16 @@ export function normalizeTimestamp(value: string): string {
     value,
   );
   if (!match) {
-    throw new Error('invalid timestamp');
+    throw new PosSyncError('invalidTimestamp');
   }
   const base = match[1];
   if (base === undefined) {
-    throw new Error('invalid timestamp');
+    throw new PosSyncError('invalidTimestamp');
   }
   const micros = `${match[3] ?? ''}000000`.slice(0, 6);
   const iso = `${base}.${micros}Z`;
   if (!Number.isFinite(Date.parse(iso))) {
-    throw new Error('invalid timestamp');
+    throw new PosSyncError('invalidTimestamp');
   }
   return iso;
 }
@@ -29,7 +30,7 @@ export function normalizeCatalogTimestamp(value: string): string {
       value,
     );
   if (!match) {
-    throw new Error('invalid timestamp');
+    throw new PosSyncError('invalidTimestamp');
   }
   const yearText = match[1];
   const monthText = match[2];
@@ -45,7 +46,7 @@ export function normalizeCatalogTimestamp(value: string): string {
     minuteText === undefined ||
     secondText === undefined
   ) {
-    throw new Error('invalid timestamp');
+    throw new PosSyncError('invalidTimestamp');
   }
   const year = Number(yearText);
   const month = Number(monthText);
@@ -63,7 +64,7 @@ export function normalizeCatalogTimestamp(value: string): string {
     minute > 59 ||
     second > 59
   ) {
-    throw new Error('invalid timestamp');
+    throw new PosSyncError('invalidTimestamp');
   }
   const utc = new Date(0);
   utc.setUTCFullYear(year, month - 1, day);
@@ -76,7 +77,7 @@ export function normalizeCatalogTimestamp(value: string): string {
     utc.getUTCMinutes() !== minute ||
     utc.getUTCSeconds() !== second
   ) {
-    throw new Error('invalid timestamp');
+    throw new PosSyncError('invalidTimestamp');
   }
   const micros = `${match[7] ?? ''}000000`.slice(0, 6);
   return `${yearText}-${monthText}-${dayText}T${hourText}:${minuteText}:${secondText}.${micros}Z`;

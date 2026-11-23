@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { createPosFirestore } from './firestore-read.ts';
 import type { PosFirestore } from './pos-firestore.ts';
 import { createPosReader, type PosSnapshot } from './read-pos.ts';
+import { PosSyncError } from './safe-error.ts';
 import { runPosSync } from './sync.ts';
 import type { PosDb } from './supabase-write.ts';
 import type {
@@ -126,7 +127,10 @@ describe('runPosSync', () => {
       serviceRoleKey: 'local-test-key',
       reader: {
         async read() {
-          return snapshot(orders, { shift_ids: ['shift-test-1'] });
+          return {
+            ...snapshot(orders, { shift_ids: ['shift-test-1'] }),
+            missingShiftIds: ['shift-test-missing'],
+          };
         },
       },
       db,
@@ -142,11 +146,13 @@ describe('runPosSync', () => {
       inserted: 201,
       missing: 0,
     });
-    expect(logs.join('\n')).toContain('shift_ids=shift-test-1');
+    expect(logs).toEqual([
+      'pos sync read mode=recent shifts=1 orders=201 transactions=0 missing_shifts=1',
+    ]);
     expect(logs.join('\n')).not.toContain('content_hash');
   });
 
-  it('fails the run without a scope when the read throws', async () => {
+  it('fails the run without a scope and drops arbitrary reader errors', async () => {
     const ingestCalls: unknown[] = [];
     let finished: { status: string; error: string | null } | undefined;
     const db: PosDb = {
@@ -161,19 +167,18 @@ describe('runPosSync', () => {
         finished = { status, error };
       },
     };
-    await expect(
-      runPosSync({
-        mode: 'full',
-        supabaseUrl: 'http://127.0.0.1:55421',
-        serviceRoleKey: 'local-test-key',
-        reader: {
-          async read() {
-            throw new Error('boom ya29.SECRET-TOKEN');
-          },
+    const failed = runPosSync({
+      mode: 'full',
+      supabaseUrl: 'http://127.0.0.1:55421',
+      serviceRoleKey: 'local-test-key',
+      reader: {
+        async read() {
+          throw new Error('unexpected SyntheticMarker7f3a');
         },
-        db,
-      }),
-    ).rejects.toThrow(/^sync failed$/);
+      },
+      db,
+    });
+    await expect.soft(failed).rejects.toThrow(/^sync failed$/);
     expect(ingestCalls).toEqual([]);
     expect(finished).toEqual({ status: 'failed', error: 'sync failed' });
   });
@@ -541,7 +546,7 @@ describe('runPosSync', () => {
       async queryOrders(body) {
         const text = JSON.stringify(body);
         if (text.includes('"IN"')) {
-          throw new Error('Firestore read failed: invalid response');
+          throw new PosSyncError('firestoreInvalidResponse');
         }
         if ((text.match(/timestampValue/g) ?? []).length < 2) return [];
         return [

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { safeErrorMessage } from './safe-error.ts';
+import { PosSyncCombinedError, safeErrorMessage } from './safe-error.ts';
 import {
   isUnknownOutcome,
   SupabaseRpcError,
@@ -36,7 +36,6 @@ export type DrainOutcome = {
   stop: DrainStop;
   calls: number;
   counts: AccountingCounts;
-  criticalOrderId: string | null;
   report: FailureReport | 'not_needed' | 'unreported' | null;
   error: string | null;
 };
@@ -84,7 +83,6 @@ export async function drainAccountingWork(
   let calls = 0;
   let stale = 0;
   let binding: AccountingOrderRef | null;
-  let criticalOrderId: string | null = null;
 
   const done = (
     stop: DrainStop,
@@ -94,7 +92,6 @@ export async function drainAccountingWork(
     stop,
     calls,
     counts,
-    criticalOrderId,
     report,
     error,
   });
@@ -140,10 +137,6 @@ export async function drainAccountingWork(
     counts.failed += run.counts.failed;
     counts.remaining = run.counts.remaining;
     binding = run.head;
-    if (run.status === 'critical') {
-      criticalOrderId = run.critical?.orderId ?? null;
-      return done('critical');
-    }
     if (run.status !== 'processed') {
       return done(run.status);
     }
@@ -207,7 +200,7 @@ async function failedCall(
     return done(
       'call_failed',
       'unreported',
-      `${message}; ${safeErrorMessage(reportError)}`,
+      safeErrorMessage(new PosSyncCombinedError(error, reportError)),
     );
   }
 }
@@ -227,9 +220,6 @@ export function formatDrain(outcome: DrainOutcome): string {
     `failed=${c.failed}`,
     `remaining=${c.remaining}`,
   ];
-  if (outcome.criticalOrderId !== null) {
-    parts.push(`critical_order=${outcome.criticalOrderId}`);
-  }
   if (outcome.report !== null) {
     parts.push(`report=${outcome.report}`);
   }
