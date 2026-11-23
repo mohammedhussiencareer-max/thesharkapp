@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { parseCatalog } from './catalog.ts';
 import {
   assertFirestoreReadAllowed,
   createPosFirestore,
@@ -10,12 +11,21 @@ import {
   parseListResponse,
   parseRunQueryResponse,
 } from './firestore-read.ts';
+import type { ListCollection } from './pos-firestore.ts';
 import { recentOrdersQuery } from './read-pos.ts';
 
 const ROOT = firestoreRunQueryUrl().replace(':runQuery', '');
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status });
+}
+
+function listUrlResult(collection: string): string {
+  try {
+    return firestoreListUrl(collection as ListCollection, { pageSize: 1 });
+  } catch (error) {
+    return error instanceof Error ? error.message : 'thrown';
+  }
 }
 
 describe('assertFirestoreReadAllowed', () => {
@@ -180,6 +190,25 @@ describe('assertFirestoreReadAllowed', () => {
     ).toThrow(/Firestore read refused/);
   });
 
+  it('refuses a list collection that is not an allowlisted name before building the URL', () => {
+    const traversed = [
+      'items/../orders',
+      'orders/../customers',
+      'items/../items',
+      'optionGroups/../items',
+      'items/%2e%2e/orders',
+      './orders',
+      'custody_shifts/../orders',
+      'items/./../optionGroups',
+      'items\\../orders',
+    ];
+    for (const collection of traversed) {
+      expect(listUrlResult(collection), collection).toBe(
+        'Firestore read refused',
+      );
+    }
+  });
+
   it('allows a paged list of items and optionGroups', () => {
     const itemsUrl = firestoreListUrl('items', {
       pageSize: 300,
@@ -314,6 +343,68 @@ describe('firestoreFetch', () => {
     ]);
   });
 
+  it('rejects a response document from a different collection than the one requested', async () => {
+    const prefix = 'projects/thesharkrestaurant/databases/(default)/documents';
+    const itemDoc = {
+      name: `${prefix}/items/item-test-1`,
+      updateTime: '2026-11-20T10:00:00Z',
+      fields: {},
+    };
+    const groupDoc = {
+      name: `${prefix}/optionGroups/group-test-1`,
+      updateTime: '2026-11-20T09:00:00Z',
+      fields: {},
+    };
+    const orderDoc = {
+      name: orderName,
+      updateTime: '2026-10-15T12:00:00Z',
+      fields: {},
+    };
+    const shiftDoc = {
+      name: `${prefix}/custody_shifts/shift-test-1`,
+      updateTime: '2026-10-15T12:00:00Z',
+      fields: {},
+    };
+    const invalid = /^Firestore read failed: invalid response$/;
+    await expect(
+      createPosFirestore('test-token', async () =>
+        jsonResponse({ documents: [itemDoc] }),
+      ).list('orders', { pageSize: 1 }),
+    ).rejects.toThrow(invalid);
+    await expect(
+      createPosFirestore('test-token', async () =>
+        jsonResponse({ documents: [groupDoc] }),
+      ).list('custody_shifts', { pageSize: 1 }),
+    ).rejects.toThrow(invalid);
+    await expect(
+      createPosFirestore('test-token', async () =>
+        jsonResponse(itemDoc),
+      ).getShift('shift-test-1'),
+    ).rejects.toThrow(invalid);
+    await expect(
+      createPosFirestore('test-token', async () =>
+        jsonResponse([
+          { document: groupDoc, readTime: '2026-10-16T00:00:00Z' },
+        ]),
+      ).queryOrders(recentOrdersQuery(['shift-test-1'])),
+    ).rejects.toThrow(invalid);
+    await expect(
+      createPosFirestore('test-token', async () =>
+        jsonResponse({ documents: [orderDoc] }),
+      ).list('items', { pageSize: 1 }),
+    ).rejects.toThrow(invalid);
+    await expect(
+      createPosFirestore('test-token', async () =>
+        jsonResponse({ documents: [shiftDoc] }),
+      ).list('optionGroups', { pageSize: 1 }),
+    ).rejects.toThrow(invalid);
+    await expect(
+      createPosFirestore('test-token', async () =>
+        jsonResponse({ documents: [itemDoc] }),
+      ).listShiftTransactions('shift-test-1', { pageSize: 1 }),
+    ).rejects.toThrow(invalid);
+  });
+
   it('hides error bodies and treats 404 as a missing shift', async () => {
     const missing = createPosFirestore(
       'test-token',
@@ -343,88 +434,316 @@ const orderName =
 describe('parsers', () => {
   it('rejects a malformed list document instead of skipping it', () => {
     const invalid = /^Firestore read failed: invalid response$/;
-    expect(() => parseListResponse({ documents: [null] })).toThrow(invalid);
-    expect(() => parseListResponse({ documents: [{ readTime: 'x' }] })).toThrow(
-      invalid,
-    );
-    expect(() => parseListResponse({ documents: [{ name: 1 }] })).toThrow(
+    expect(() => parseListResponse({ documents: [null] }, 'orders')).toThrow(
       invalid,
     );
     expect(() =>
-      parseListResponse({
-        documents: [
-          {
-            name: 'projects/other/databases/(default)/documents/orders/order-test-1',
-          },
-        ],
-      }),
+      parseListResponse({ documents: [{ readTime: 'x' }] }, 'orders'),
     ).toThrow(invalid);
     expect(() =>
-      parseListResponse({
-        documents: [
-          {
-            name: 'projects/thesharkrestaurant/databases/(default)/documents/customers/customer-test-1',
-          },
-        ],
-      }),
+      parseListResponse({ documents: [{ name: 1 }] }, 'orders'),
     ).toThrow(invalid);
     expect(() =>
-      parseListResponse({
-        documents: [{ name: orderName, updateTime: 1 }],
-      }),
+      parseListResponse(
+        {
+          documents: [
+            {
+              name: 'projects/other/databases/(default)/documents/orders/order-test-1',
+            },
+          ],
+        },
+        'orders',
+      ),
     ).toThrow(invalid);
     expect(() =>
-      parseListResponse({
-        documents: [{ name: orderName, fields: 'nope' }],
-      }),
+      parseListResponse(
+        {
+          documents: [
+            {
+              name: 'projects/thesharkrestaurant/databases/(default)/documents/customers/customer-test-1',
+            },
+          ],
+        },
+        'orders',
+      ),
     ).toThrow(invalid);
     expect(() =>
-      parseListResponse({ error: { message: 'pii-customer-name' } }),
+      parseListResponse(
+        {
+          documents: [{ name: orderName, updateTime: 1 }],
+        },
+        'orders',
+      ),
+    ).toThrow(invalid);
+    expect(() =>
+      parseListResponse(
+        {
+          documents: [{ name: orderName, fields: 'nope' }],
+        },
+        'orders',
+      ),
+    ).toThrow(invalid);
+    expect(() =>
+      parseListResponse({ error: { message: 'pii-customer-name' } }, 'orders'),
     ).toThrow(invalid);
     expect(
-      parseListResponse({ documents: [{ name: orderName }] }).documents,
+      parseListResponse({ documents: [{ name: orderName }] }, 'orders')
+        .documents,
     ).toHaveLength(1);
     const itemName =
       'projects/thesharkrestaurant/databases/(default)/documents/items/item-test-1';
     const groupName =
       'projects/thesharkrestaurant/databases/(default)/documents/optionGroups/group-test-1';
     expect(
-      parseListResponse({
-        documents: [{ name: itemName }, { name: groupName }],
-      }).documents,
-    ).toEqual([{ name: itemName }, { name: groupName }]);
+      parseListResponse({ documents: [{ name: itemName }] }, 'items').documents,
+    ).toEqual([{ name: itemName }]);
+    expect(
+      parseListResponse({ documents: [{ name: groupName }] }, 'optionGroups')
+        .documents,
+    ).toEqual([{ name: groupName }]);
+    expect(() =>
+      parseListResponse({ documents: [{ name: itemName }] }, 'orders'),
+    ).toThrow(invalid);
+    expect(() =>
+      parseListResponse({ documents: [{ name: groupName }] }, 'custody_shifts'),
+    ).toThrow(invalid);
     const txName =
       'projects/thesharkrestaurant/databases/(default)/documents/custody_shifts/shift-test-1/transactions/tx-test-1';
     expect(
-      parseListResponse({ documents: [{ name: txName }] }).documents,
+      parseListResponse({ documents: [{ name: txName }] }, 'transactions')
+        .documents,
     ).toEqual([{ name: txName }]);
     expect(() =>
-      parseListResponse({
-        documents: [
-          {
-            name: 'projects/thesharkrestaurant/databases/(default)/documents/custody_shifts/shift-test-1/orders/order-test-1',
-          },
-        ],
-      }),
+      parseListResponse(
+        {
+          documents: [
+            {
+              name: 'projects/thesharkrestaurant/databases/(default)/documents/custody_shifts/shift-test-1/orders/order-test-1',
+            },
+          ],
+        },
+        'transactions',
+      ),
     ).toThrow(invalid);
     expect(() =>
-      parseListResponse({
+      parseListResponse(
+        {
+          documents: [
+            {
+              name: 'projects/thesharkrestaurant/databases/(default)/documents/custody_shifts/shift-test-1/transactions/tx-test-1/extra',
+            },
+          ],
+        },
+        'transactions',
+      ),
+    ).toThrow(invalid);
+  });
+
+  it('records a rejected catalog id when one document has malformed metadata and keeps the rest of the page', () => {
+    const prefix = 'projects/thesharkrestaurant/databases/(default)/documents';
+    const good = `${prefix}/items/item-syn-good`;
+    const badTime = `${prefix}/items/item-syn-bad-time`;
+    const badFields = `${prefix}/items/item-syn-bad-fields`;
+    const later = `${prefix}/items/item-syn-later`;
+    const page = parseListResponse(
+      {
         documents: [
           {
-            name: 'projects/thesharkrestaurant/databases/(default)/documents/custody_shifts/shift-test-1/transactions/tx-test-1/extra',
+            name: good,
+            updateTime: '2026-11-20T10:00:00Z',
+            fields: { name: { stringValue: 'Synthetic Dish Good' } },
+          },
+          {
+            name: badTime,
+            updateTime: 1,
+            fields: { name: { stringValue: 'syn-malformed-time' } },
+          },
+          {
+            name: badFields,
+            updateTime: '2026-11-20T10:00:00Z',
+            fields: 'syn-malformed-fields',
+          },
+          {
+            name: later,
+            updateTime: '2026-11-20T11:00:00Z',
+            fields: { name: { stringValue: 'Synthetic Dish Later' } },
           },
         ],
-      }),
+        nextPageToken: 'items-page-2',
+      },
+      'items',
+    );
+    expect(page.nextPageToken).toBe('items-page-2');
+    expect(page.documents).toEqual([
+      {
+        name: good,
+        updateTime: '2026-11-20T10:00:00Z',
+        fields: { name: { stringValue: 'Synthetic Dish Good' } },
+      },
+      { name: badTime, rejected: true },
+      { name: badFields, rejected: true },
+      {
+        name: later,
+        updateTime: '2026-11-20T11:00:00Z',
+        fields: { name: { stringValue: 'Synthetic Dish Later' } },
+      },
+    ]);
+    expect(JSON.stringify(page)).not.toContain('syn-malformed-time');
+    expect(JSON.stringify(page)).not.toContain('syn-malformed-fields');
+
+    const goodGroup = `${prefix}/optionGroups/group-syn-good`;
+    const badGroup = `${prefix}/optionGroups/group-syn-bad-time`;
+    const laterGroup = `${prefix}/optionGroups/group-syn-later`;
+    const groups = parseListResponse(
+      {
+        documents: [
+          {
+            name: goodGroup,
+            updateTime: '2026-11-20T09:00:00Z',
+            fields: { name: { stringValue: 'Synthetic Group Good' } },
+          },
+          {
+            name: badGroup,
+            updateTime: { seconds: 1 },
+            fields: [],
+          },
+          {
+            name: laterGroup,
+            updateTime: '2026-11-20T09:30:00Z',
+            fields: { name: { stringValue: 'Synthetic Group Later' } },
+          },
+        ],
+      },
+      'optionGroups',
+    );
+    expect(groups.documents).toEqual([
+      {
+        name: goodGroup,
+        updateTime: '2026-11-20T09:00:00Z',
+        fields: { name: { stringValue: 'Synthetic Group Good' } },
+      },
+      { name: badGroup, rejected: true },
+      {
+        name: laterGroup,
+        updateTime: '2026-11-20T09:30:00Z',
+        fields: { name: { stringValue: 'Synthetic Group Later' } },
+      },
+    ]);
+
+    const payload = parseCatalog(page.documents, groups.documents);
+    expect(payload.items.map((item) => item.pos_item_id)).toEqual([
+      'item-syn-good',
+      'item-syn-later',
+    ]);
+    expect(payload.presence).toEqual([
+      { pos_item_id: 'item-syn-bad-fields', outcome: 'rejected' },
+      { pos_item_id: 'item-syn-bad-time', outcome: 'rejected' },
+      { pos_item_id: 'item-syn-good', outcome: 'accepted' },
+      { pos_item_id: 'item-syn-later', outcome: 'accepted' },
+    ]);
+    expect(payload.option_groups.map((group) => group.group_id)).toEqual([
+      'group-syn-good',
+      'group-syn-later',
+    ]);
+    expect(payload.option_group_presence).toEqual([
+      { group_id: 'group-syn-bad-time', outcome: 'rejected' },
+      { group_id: 'group-syn-good', outcome: 'accepted' },
+      { group_id: 'group-syn-later', outcome: 'accepted' },
+    ]);
+  });
+
+  it('still rejects a catalog page when a document id is unsafe', () => {
+    const prefix = 'projects/thesharkrestaurant/databases/(default)/documents';
+    const invalid = /^Firestore read failed: invalid response$/;
+    expect(() =>
+      parseListResponse(
+        {
+          documents: [
+            {
+              name: `${prefix}/items/item-syn-good`,
+              updateTime: '2026-11-20T10:00:00Z',
+              fields: { name: { stringValue: 'Synthetic Dish Good' } },
+            },
+            {
+              name: `${prefix}/items/not safe`,
+              updateTime: '2026-11-20T10:00:00Z',
+              fields: {},
+            },
+          ],
+        },
+        'items',
+      ),
+    ).toThrow(invalid);
+    expect(() =>
+      parseListResponse(
+        {
+          documents: [
+            {
+              name: `${prefix}/optionGroups/group-syn${'\u0001'}ctrl`,
+              updateTime: '2026-11-20T09:00:00Z',
+              fields: {},
+            },
+          ],
+        },
+        'optionGroups',
+      ),
+    ).toThrow(invalid);
+  });
+
+  it('still rejects an orders or shifts page when metadata is malformed', () => {
+    const prefix = 'projects/thesharkrestaurant/databases/(default)/documents';
+    const invalid = /^Firestore read failed: invalid response$/;
+    expect(() =>
+      parseListResponse(
+        {
+          documents: [
+            {
+              name: `${prefix}/orders/order-test-1`,
+              updateTime: '2026-10-15T12:00:00Z',
+              fields: {},
+            },
+            {
+              name: `${prefix}/orders/order-test-2`,
+              updateTime: 1,
+              fields: {},
+            },
+          ],
+        },
+        'orders',
+      ),
+    ).toThrow(invalid);
+    expect(() =>
+      parseListResponse(
+        {
+          documents: [
+            {
+              name: `${prefix}/custody_shifts/shift-test-1`,
+              updateTime: '2026-10-15T12:00:00Z',
+              fields: {},
+            },
+            {
+              name: `${prefix}/custody_shifts/shift-test-2`,
+              fields: 'nope',
+            },
+          ],
+        },
+        'custody_shifts',
+      ),
     ).toThrow(invalid);
   });
 
   it('accepts only the documented list response keys', () => {
     const invalid = 'Firestore read failed: invalid response';
-    expect(() => parseListResponse({ message: 'failed' })).toThrow(invalid);
+    expect(() => parseListResponse({ message: 'failed' }, 'orders')).toThrow(
+      invalid,
+    );
     expect(() =>
-      parseListResponse({ documents: [], nextPageToken: '', extra: 1 }),
+      parseListResponse(
+        { documents: [], nextPageToken: '', extra: 1 },
+        'orders',
+      ),
     ).toThrow(invalid);
-    expect(parseListResponse({})).toEqual({
+    expect(parseListResponse({}, 'orders')).toEqual({
       documents: [],
       nextPageToken: undefined,
     });
@@ -432,52 +751,71 @@ describe('parsers', () => {
 
   it('accepts a runQuery page that is only a readTime', () => {
     expect(
-      parseRunQueryResponse([{ readTime: '2026-10-16T00:00:00Z' }]),
+      parseRunQueryResponse([{ readTime: '2026-10-16T00:00:00Z' }], 'orders'),
     ).toEqual([]);
     expect(
-      parseRunQueryResponse([
-        {
-          readTime: '2026-10-16T00:00:00.123456789Z',
-          skippedResults: 0,
-          done: true,
-          transaction: 'txn-test',
-          explainMetrics: {},
-        },
-      ]),
+      parseRunQueryResponse(
+        [
+          {
+            readTime: '2026-10-16T00:00:00.123456789Z',
+            skippedResults: 0,
+            done: true,
+            transaction: 'txn-test',
+            explainMetrics: {},
+          },
+        ],
+        'orders',
+      ),
     ).toEqual([]);
   });
 
   it('accepts documents followed by a trailing readTime entry', () => {
     expect(
-      parseRunQueryResponse([
-        {
-          document: { name: orderName },
-          readTime: '2026-10-16T00:00:00Z',
-          skippedResults: 0,
-        },
-        { readTime: '2026-10-16T00:00:00Z' },
-      ]),
+      parseRunQueryResponse(
+        [
+          {
+            document: { name: orderName },
+            readTime: '2026-10-16T00:00:00Z',
+            skippedResults: 0,
+          },
+          { readTime: '2026-10-16T00:00:00Z' },
+        ],
+        'orders',
+      ),
     ).toEqual([{ name: orderName }]);
   });
 
   it('rejects a runQuery page that is not a complete read', () => {
     const invalid = /^Firestore read failed: invalid response$/;
-    expect(() => parseRunQueryResponse([])).toThrow(invalid);
-    expect(() => parseRunQueryResponse([{}])).toThrow(invalid);
-    expect(() => parseRunQueryResponse([{ readTime: 7 }])).toThrow(invalid);
-    expect(() => parseRunQueryResponse([{ readTime: 'x' }])).toThrow(invalid);
+    expect(() => parseRunQueryResponse([], 'orders')).toThrow(invalid);
+    expect(() => parseRunQueryResponse([{}], 'orders')).toThrow(invalid);
+    expect(() => parseRunQueryResponse([{ readTime: 7 }], 'orders')).toThrow(
+      invalid,
+    );
+    expect(() => parseRunQueryResponse([{ readTime: 'x' }], 'orders')).toThrow(
+      invalid,
+    );
     expect(() =>
-      parseRunQueryResponse([{ readTime: '2026-10-16T00:00:00Z', extra: 1 }]),
+      parseRunQueryResponse(
+        [{ readTime: '2026-10-16T00:00:00Z', extra: 1 }],
+        'orders',
+      ),
     ).toThrow(invalid);
     expect(() =>
-      parseRunQueryResponse([
-        { readTime: '2026-10-16T00:00:00Z', skippedResults: 1 },
-      ]),
+      parseRunQueryResponse(
+        [{ readTime: '2026-10-16T00:00:00Z', skippedResults: 1 }],
+        'orders',
+      ),
     ).toThrow(invalid);
-    expect(() => parseRunQueryResponse([null])).toThrow(invalid);
-    expect(() => parseRunQueryResponse([{ document: null }])).toThrow(invalid);
+    expect(() => parseRunQueryResponse([null], 'orders')).toThrow(invalid);
+    expect(() => parseRunQueryResponse([{ document: null }], 'orders')).toThrow(
+      invalid,
+    );
     expect(() =>
-      parseRunQueryResponse([{ error: { message: 'pii-customer-name' } }]),
+      parseRunQueryResponse(
+        [{ error: { message: 'pii-customer-name' } }],
+        'orders',
+      ),
     ).toThrow(invalid);
   });
 });

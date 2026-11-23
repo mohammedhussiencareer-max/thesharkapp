@@ -1,5 +1,29 @@
-/** Normalize a Firestore timestamp to UTC with microsecond precision. */
+/**
+ * Legacy order and shift timestamps. The text must match the UTC pattern and
+ * `Date.parse` must accept it. Calendar overflow and `24:00:00` stay as stored.
+ * Catalog timestamps use `normalizeCatalogTimestamp`.
+ */
 export function normalizeTimestamp(value: string): string {
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.(\d{1,9}))?Z$/.exec(
+    value,
+  );
+  if (!match) {
+    throw new Error('invalid timestamp');
+  }
+  const base = match[1];
+  if (base === undefined) {
+    throw new Error('invalid timestamp');
+  }
+  const micros = `${match[3] ?? ''}000000`.slice(0, 6);
+  const iso = `${base}.${micros}Z`;
+  if (!Number.isFinite(Date.parse(iso))) {
+    throw new Error('invalid timestamp');
+  }
+  return iso;
+}
+
+/** Catalog timestamps: a real calendar date, year >= 0001, and hour <= 23. */
+export function normalizeCatalogTimestamp(value: string): string {
   const match =
     /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/.exec(
       value,

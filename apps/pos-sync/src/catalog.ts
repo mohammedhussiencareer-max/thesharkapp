@@ -10,7 +10,7 @@ import {
 import { canonicalJson, compareId, sha256Canonical } from './hash.ts';
 import { normalizeOptionalText } from './mapper.ts';
 import type { FirestoreRestDocument } from './pos-firestore.ts';
-import { normalizeTimestamp } from './time.ts';
+import { normalizeCatalogTimestamp } from './time.ts';
 
 export { assertNoPriceShapedKeys } from './catalog-refusals.ts';
 
@@ -213,8 +213,8 @@ function readSharedOptionGroupIds(raw: unknown): string[] {
   const mapFields = readMapFields(raw);
   const labels = new Set<string>();
   const ids = new Set<string>();
-  for (const [rawLabel, rawGroupId] of Object.entries(mapFields)) {
-    const label = rawLabel.trim();
+  // Exact keys. Trimming would treat distinct labels as one group and reject the item.
+  for (const [label, rawGroupId] of Object.entries(mapFields)) {
     if (label.length === 0 || RESERVED_KEYS.has(label)) {
       throw new MalformedCatalogFieldError('invalid shared option label');
     }
@@ -244,7 +244,8 @@ function readOptionValues(raw: unknown): string[] {
 /**
  * Preserves every inline option group on the item (including copies of shared
  * groups) so item-scoped option subjects remain available even when the text
- * matches a global option group value.
+ * matches a global option group value. Labels stay exactly as stored; only a
+ * byte-identical label is a duplicate.
  */
 function readItemOptionGroups(raw: unknown): Record<string, string[]> {
   if (raw === undefined || isNullValue(raw)) {
@@ -253,8 +254,7 @@ function readItemOptionGroups(raw: unknown): Record<string, string[]> {
   const mapFields = readMapFields(raw);
   const seenLabels = new Set<string>();
   const groups = new Map<string, string[]>();
-  for (const [rawLabel, rawGroup] of Object.entries(mapFields)) {
-    const label = rawLabel.trim();
+  for (const [label, rawGroup] of Object.entries(mapFields)) {
     if (label.length === 0 || RESERVED_KEYS.has(label)) {
       throw new MalformedCatalogFieldError('invalid option group label');
     }
@@ -326,7 +326,7 @@ export function parseCatalogItemDocument(
   }
   let updateTime: string;
   try {
-    updateTime = normalizeTimestamp(document.updateTime);
+    updateTime = normalizeCatalogTimestamp(document.updateTime);
   } catch {
     return { outcome: 'rejected', pos_item_id: posItemId };
   }
@@ -389,7 +389,7 @@ export function parseCatalogOptionGroupDocument(
       return { outcome: 'rejected', group_id: groupId };
     }
     try {
-      normalizeTimestamp(document.updateTime);
+      normalizeCatalogTimestamp(document.updateTime);
     } catch {
       return { outcome: 'rejected', group_id: groupId };
     }

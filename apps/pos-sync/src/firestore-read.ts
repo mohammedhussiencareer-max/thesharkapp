@@ -38,6 +38,11 @@ export function firestoreListUrl(
   collection: ListCollection,
   query: ListQuery,
 ): string {
+  // An allowlisted name only. URL construction would resolve `items/../orders`
+  // into a permitted orders list before the path check could see the traversal.
+  if (!COLLECTIONS.has(collection) && !CATALOG_COLLECTIONS.has(collection)) {
+    throw new Error('Firestore read refused');
+  }
   const url = new URL(`${ORIGIN}${DOCUMENT_PATH}/${collection}`);
   url.searchParams.set('pageSize', String(query.pageSize));
   if (query.pageToken !== undefined) {
@@ -399,7 +404,10 @@ function assertQueryValue(value: unknown): void {
 // ListDocumentsResponse has only these keys; an empty page is `{}`.
 const LIST_KEYS = new Set(['documents', 'nextPageToken']);
 
-export function parseListResponse(payload: unknown): ListPage {
+export function parseListResponse(
+  payload: unknown,
+  expected: PosCollection | 'transactions',
+): ListPage {
   if (!isRecord(payload)) {
     throw new Error('Firestore read failed: invalid response');
   }
@@ -414,7 +422,7 @@ export function parseListResponse(payload: unknown): ListPage {
       throw new Error('Firestore read failed: invalid response');
     }
     for (const entry of payload.documents) {
-      documents.push(requireDocument(entry));
+      documents.push(requireDocument(entry, expected));
     }
   }
   if (
@@ -442,18 +450,22 @@ const RUN_QUERY_KEYS = new Set([
 
 export function parseRunQueryResponse(
   payload: unknown,
+  expected: 'orders' | 'custody_shifts',
 ): FirestoreRestDocument[] {
   if (!Array.isArray(payload) || payload.length === 0) {
     throw new Error('Firestore read failed: invalid response');
   }
   const documents: FirestoreRestDocument[] = [];
   for (const entry of payload) {
-    documents.push(...readRunQueryEntry(entry));
+    documents.push(...readRunQueryEntry(entry, expected));
   }
   return documents;
 }
 
-function readRunQueryEntry(entry: unknown): FirestoreRestDocument[] {
+function readRunQueryEntry(
+  entry: unknown,
+  expected: 'orders' | 'custody_shifts',
+): FirestoreRestDocument[] {
   if (!isRecord(entry)) {
     throw new Error('Firestore read failed: invalid response');
   }
@@ -488,7 +500,7 @@ function readRunQueryEntry(entry: unknown): FirestoreRestDocument[] {
     }
   }
   if ('document' in entry) {
-    return [requireDocument(entry.document)];
+    return [requireDocument(entry.document, expected)];
   }
   if (!isRfc3339(entry.readTime)) {
     throw new Error('Firestore read failed: invalid response');
@@ -534,7 +546,17 @@ function assertKnownDocumentName(name: string): PosCollection | 'transactions' {
   return splitDocumentName(name).collection;
 }
 
-function requireDocument(value: unknown): FirestoreRestDocument {
+function catalogEnvelopeMalformed(value: Record<string, unknown>): boolean {
+  return (
+    (value.updateTime !== undefined && typeof value.updateTime !== 'string') ||
+    (value.fields !== undefined && !isRecord(value.fields))
+  );
+}
+
+function requireDocument(
+  value: unknown,
+  expected: PosCollection | 'transactions',
+): FirestoreRestDocument {
   if (!isRecord(value) || typeof value.name !== 'string') {
     throw new Error('Firestore read failed: invalid response');
   }
@@ -546,11 +568,17 @@ function requireDocument(value: unknown): FirestoreRestDocument {
       cause: error,
     });
   }
+  if (collection !== expected) {
+    throw new Error('Firestore read failed: invalid response');
+  }
   // Scan the raw catalog document (including any extra envelope properties)
   // before projection so customer-shaped keys cannot be stripped silently.
+  // A valid catalog id with a bad updateTime or fields type is a rejected
+  // presence entry (id only). An unsafe id already threw above.
   if (
     (collection === 'items' || collection === 'optionGroups') &&
-    hasCustomerShapedSchemaKey(value, collection)
+    (hasCustomerShapedSchemaKey(value, collection) ||
+      catalogEnvelopeMalformed(value))
   ) {
     return { name: value.name, rejected: true };
   }
@@ -568,6 +596,21 @@ function requireDocument(value: unknown): FirestoreRestDocument {
     document.fields = value.fields;
   }
   return document;
+}
+
+function requestedQueryCollection(body: unknown): 'orders' | 'custody_shifts' {
+  if (!isRecord(body) || !isRecord(body.structuredQuery)) {
+    throw new Error('Firestore read failed: invalid response');
+  }
+  const from: unknown = body.structuredQuery.from;
+  if (!isOneElement(from) || !isRecord(from[0])) {
+    throw new Error('Firestore read failed: invalid response');
+  }
+  const collectionId = from[0].collectionId;
+  if (collectionId !== 'orders' && collectionId !== 'custody_shifts') {
+    throw new Error('Firestore read failed: invalid response');
+  }
+  return collectionId;
 }
 
 type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
@@ -629,7 +672,7 @@ export function createPosFirestore(
         undefined,
         fetchImpl,
       );
-      return parseListResponse(payload);
+      return parseListResponse(payload, collection);
     },
     async listShiftTransactions(shiftId, query) {
       const payload = await firestoreFetch(
@@ -639,7 +682,7 @@ export function createPosFirestore(
         undefined,
         fetchImpl,
       );
-      return parseListResponse(payload);
+      return parseListResponse(payload, 'transactions');
     },
     async getShift(id) {
       try {
@@ -650,7 +693,7 @@ export function createPosFirestore(
           undefined,
           fetchImpl,
         );
-        return requireDocument(payload);
+        return requireDocument(payload, 'custody_shifts');
       } catch (error) {
         if (
           error instanceof Error &&
@@ -669,7 +712,7 @@ export function createPosFirestore(
         body,
         fetchImpl,
       );
-      return parseRunQueryResponse(payload);
+      return parseRunQueryResponse(payload, requestedQueryCollection(body));
     },
   };
 }

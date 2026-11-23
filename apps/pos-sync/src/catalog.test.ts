@@ -389,6 +389,69 @@ describe('parseCatalog fixtures', () => {
     expect(result.item.shared_option_group_ids).toEqual([]);
   });
 
+  it('keeps option-group labels that differ only by surrounding whitespace', () => {
+    const result = parseCatalogItemDocument(
+      itemDoc('item-syn-ws-labels', {
+        name: str('Synthetic Dish Whitespace Labels'),
+        options: map({
+          ' Sauce': arr([map({ value: str('  Herb  ') })]),
+          'Sauce ': arr([map({ value: str('Citrus') })]),
+          '  Sauce  ': arr([map({ value: str('Sharp') })]),
+          '   ': arr([map({ value: str('Plain') })]),
+        }),
+        sharedOptionGroupIds: map({
+          ' Sauce': str('group-syn-left'),
+          'Sauce ': str('group-syn-right'),
+          '   ': str('group-syn-space'),
+        }),
+      }),
+    );
+    expect(result.outcome).toBe('accepted');
+    if (result.outcome !== 'accepted') {
+      throw new Error('expected accepted');
+    }
+    expect(result.item.item_option_groups).toEqual({
+      '   ': ['Plain'],
+      '  Sauce  ': ['Sharp'],
+      ' Sauce': ['Herb'],
+      'Sauce ': ['Citrus'],
+    });
+    expect(result.item.shared_option_group_ids).toEqual([
+      'group-syn-left',
+      'group-syn-right',
+      'group-syn-space',
+    ]);
+  });
+
+  it('rejects an empty option-group label without trimming stored labels', () => {
+    expect(
+      parseCatalogItemDocument(
+        itemDoc('item-syn-empty-label', {
+          name: str('Synthetic Dish Empty Label'),
+          options: map({
+            '': arr([map({ value: str('Herb') })]),
+          }),
+        }),
+      ),
+    ).toEqual({
+      outcome: 'rejected',
+      pos_item_id: 'item-syn-empty-label',
+    });
+    expect(
+      parseCatalogItemDocument(
+        itemDoc('item-syn-empty-shared', {
+          name: str('Synthetic Dish Empty Shared'),
+          sharedOptionGroupIds: map({
+            '': str('group-syn-empty'),
+          }),
+        }),
+      ),
+    ).toEqual({
+      outcome: 'rejected',
+      pos_item_id: 'item-syn-empty-shared',
+    });
+  });
+
   it('preserves inline shared option copies in item scope alongside global optionGroups and shared_option_group_ids', () => {
     const payload = parseCatalog(
       [FIXTURE_SHARED_AND_LOCAL],
@@ -692,32 +755,38 @@ describe('refusals', () => {
   });
 
   it('rejects catalog documents carrying customer-shaped keys in extra raw document properties', () => {
-    const rawPage = parseListResponse({
-      documents: [
-        {
-          name: `${DOC_ROOT}/items/item-syn-raw-extra`,
-          updateTime: '2026-11-20T10:00:00Z',
-          fields: { name: str('Synthetic Dish Extra Prop') },
-          customerMeta: { phone: '01000000000' },
-        },
-        {
-          name: `${DOC_ROOT}/items/item-syn-raw-nested-recipient`,
-          updateTime: '2026-11-20T10:00:00Z',
-          fields: { name: str('Synthetic Dish Nested Extra') },
-          annotations: { recipientName: 'syn-person' },
-        },
-      ],
-    });
-    const rawGroupPage = parseListResponse({
-      documents: [
-        {
-          name: `${DOC_ROOT}/optionGroups/group-syn-raw-extra`,
-          updateTime: '2026-11-20T09:00:00Z',
-          fields: { name: str('Synthetic Group Extra') },
-          contactMeta: { phone: '01111111111' },
-        },
-      ],
-    });
+    const rawPage = parseListResponse(
+      {
+        documents: [
+          {
+            name: `${DOC_ROOT}/items/item-syn-raw-extra`,
+            updateTime: '2026-11-20T10:00:00Z',
+            fields: { name: str('Synthetic Dish Extra Prop') },
+            customerMeta: { phone: '01000000000' },
+          },
+          {
+            name: `${DOC_ROOT}/items/item-syn-raw-nested-recipient`,
+            updateTime: '2026-11-20T10:00:00Z',
+            fields: { name: str('Synthetic Dish Nested Extra') },
+            annotations: { recipientName: 'syn-person' },
+          },
+        ],
+      },
+      'items',
+    );
+    const rawGroupPage = parseListResponse(
+      {
+        documents: [
+          {
+            name: `${DOC_ROOT}/optionGroups/group-syn-raw-extra`,
+            updateTime: '2026-11-20T09:00:00Z',
+            fields: { name: str('Synthetic Group Extra') },
+            contactMeta: { phone: '01111111111' },
+          },
+        ],
+      },
+      'optionGroups',
+    );
     const payload = parseCatalog(rawPage.documents, rawGroupPage.documents);
     expect(payload.items).toEqual([]);
     expect(payload.presence).toEqual([
@@ -734,7 +803,13 @@ describe('refusals', () => {
   });
 
   it('rejects impossible updateTime calendar dates and Unicode control characters in catalog ids while keeping order id compatibility', () => {
-    for (const badTime of ['2026-02-30T10:00:00Z', '0000-01-01T00:00:00Z']) {
+    for (const badTime of [
+      '2026-02-30T10:00:00Z',
+      '2025-02-29T10:00:00Z',
+      '2026-04-31T10:00:00Z',
+      '0000-01-01T00:00:00Z',
+      '2026-10-15T24:00:00Z',
+    ]) {
       expect(
         parseCatalogItemDocument(
           itemDoc(
@@ -747,6 +822,19 @@ describe('refusals', () => {
       ).toEqual({
         outcome: 'rejected',
         pos_item_id: 'item-syn-bad-time',
+      });
+      expect(
+        parseCatalogOptionGroupDocument(
+          groupDoc(
+            'group-syn-bad-time',
+            { name: str('Synthetic Group Bad Time') },
+            badTime,
+          ),
+        ),
+        badTime,
+      ).toEqual({
+        outcome: 'rejected',
+        group_id: 'group-syn-bad-time',
       });
     }
 
