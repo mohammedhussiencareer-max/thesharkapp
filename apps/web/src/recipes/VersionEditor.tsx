@@ -175,7 +175,7 @@ export function VersionEditor({
       );
       const reloaded = await onReload();
       if (reloaded !== false) {
-        clearActionPostedReload(subject, subject, requestId);
+        await clearActionPostedReload(subject, subject, requestId);
       }
     } catch (failure) {
       if (!saved && requestId !== null) {

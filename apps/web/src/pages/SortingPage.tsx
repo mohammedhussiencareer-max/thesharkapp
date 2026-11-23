@@ -158,7 +158,7 @@ export function SortingPage() {
         }
         setSnapshot(next.snapshot);
         setLoadError(null);
-        clearPostedReloadSnapshot(pendingReloads);
+        await clearPostedReloadSnapshot(pendingReloads);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -262,7 +262,7 @@ export function SortingPage() {
       if (next.status === 'ready') {
         setSnapshot(next.snapshot);
         setLoadError(null);
-        clearPostedReload(SORT_SUBJECT, undefined, draft.requestId);
+        await clearPostedReload(SORT_SUBJECT, undefined, draft.requestId);
         setLocalNeedsReload(false);
       } else if (next.status === 'blocked') {
         setLoadError(next.message);

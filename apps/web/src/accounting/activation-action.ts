@@ -26,11 +26,16 @@ import {
   settleAction,
   subscribeHeldWrites,
   unknownAction,
+  unknownSaveMessage,
 } from '@/items/request-id';
 import {
   abortClaimBeforeDispatch,
   acquireHeldWriteLock,
   captureWriteSession,
+  clearHeldWrite,
+  readLockedHeldWrite,
+  setHeldWritePhase,
+  type HeldWriteRecord,
   HeldWriteStorageError,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
@@ -115,9 +120,13 @@ export function useActivationAction(
     }
   }
 
-  function acceptReloaded(requestId: string, next: OpeningReview): void {
+  function acceptReloaded(
+    expected: HeldWriteRecord<ActivationWrite>,
+    next: OpeningReview,
+  ): void {
+    const { requestId } = expected;
     if (next.activated) {
-      settleAction(ACTIVATION_SUBJECT, requestId);
+      clearHeldWrite(ACTIVATION_SUBJECT, requestId, expected);
       onReview(next);
       setReloadBlocked(false);
       setNotice(null);
@@ -129,19 +138,20 @@ export function useActivationAction(
       onReview(next);
       return;
     }
-    try {
-      replaceActivationPayload(ACTIVATION_SUBJECT, requestId, {
+    const replaced = replaceActivationPayload(
+      ACTIVATION_SUBJECT,
+      requestId,
+      {
         requestId,
         manifestHash: next.openingManifestHash,
         explicitZeroItemIds: [],
-      });
-    } catch (error) {
+      },
+      expected,
+    );
+    if (!replaced) {
       setReloadBlocked(true);
-      setNotice(
-        error instanceof HeldWriteStorageError
-          ? storageWriteFailedMessage
-          : messageFrom(error),
-      );
+      setNotice(reloadFailedMessage);
+      onReview(next);
       return;
     }
     setChecks({ hash: next.openingManifestHash, ids: new Set() });
@@ -155,10 +165,11 @@ export function useActivationAction(
     const current = heldAction<ActivationWrite>(ACTIVATION_SUBJECT);
     const unknownHeld = unknownAction<ActivationWrite>(ACTIVATION_SUBJECT);
     if (reloadPending) {
+      const reviewWasPending =
+        activationReviewReloadPending(ACTIVATION_SUBJECT);
       const requestId =
         heldRequestId(ACTIVATION_SUBJECT) ??
         (unknownHeld ?? current)?.requestId;
-      if (!requestId) return;
       flight.current = true;
       setSaving(true);
       let releaseReloadLock = () => {};
@@ -166,8 +177,45 @@ export function useActivationAction(
         const lock = await acquireHeldWriteLock(ACTIVATION_SUBJECT);
         if (!lock.acquired) return;
         releaseReloadLock = lock.release;
+        const durable = readLockedHeldWrite<ActivationWrite>(
+          ACTIVATION_SUBJECT,
+          { refresh: true },
+        );
+        if (
+          durable &&
+          durable.requestId === requestId &&
+          durable.awaitingReviewReload
+        ) {
+          const next = await reloadReview();
+          if (next) acceptReloaded(durable, next);
+          return;
+        }
+        if (reviewWasPending) {
+          // The durable request changed after this button was rendered.
+          setReloadBlocked(true);
+          setNotice(unknownSaveMessage);
+          return;
+        }
         const next = await reloadReview();
-        if (next) acceptReloaded(requestId, next);
+        if (!next) return;
+        if (durable && durable.phase !== 'posted_reload') {
+          if (next.activated) {
+            clearHeldWrite(ACTIVATION_SUBJECT, durable.requestId, durable);
+          } else if (durable.phase === 'inflight') {
+            setHeldWritePhase(
+              ACTIVATION_SUBJECT,
+              durable.requestId,
+              'unknown',
+              { expected: durable },
+            );
+          }
+        }
+        onReview(next);
+        setReloadBlocked(false);
+        setNotice(durable && !next.activated ? unknownSaveMessage : null);
+      } catch (error) {
+        setReloadBlocked(true);
+        setNotice(messageFrom(error));
       } finally {
         releaseReloadLock();
         flight.current = false;
@@ -188,7 +236,10 @@ export function useActivationAction(
         { session },
       );
       if (!claim.ok) {
-        if (claim.reason === 'missing' || claim.reason === 'storage') {
+        if (claim.reason === 'conflict') {
+          setReloadBlocked(true);
+          setNotice(unknownSaveMessage);
+        } else if (claim.reason === 'missing' || claim.reason === 'storage') {
           setNotice(storageWriteFailedMessage);
         } else if (claim.reason === 'session_invalid' && !isOnline()) {
           setNotice(offlineWriteMessage);
@@ -209,7 +260,10 @@ export function useActivationAction(
         { payload: nextPayload, awaitingReviewReload: false, session },
       );
       if (!claim.ok) {
-        if (claim.reason === 'missing' || claim.reason === 'storage') {
+        if (claim.reason === 'conflict') {
+          setReloadBlocked(true);
+          setNotice(unknownSaveMessage);
+        } else if (claim.reason === 'missing' || claim.reason === 'storage') {
           setNotice(storageWriteFailedMessage);
         } else if (claim.reason === 'session_invalid' && !isOnline()) {
           setNotice(offlineWriteMessage);
@@ -281,6 +335,17 @@ export function useActivationAction(
         if (!persisted && isOpeningManifestChange(failure)) {
           try {
             pinActivationReviewReload(ACTIVATION_SUBJECT, action.requestId);
+            const durable =
+              readLockedHeldWrite<ActivationWrite>(ACTIVATION_SUBJECT);
+            setReloadBlocked(true);
+            const next = await reloadReview();
+            if (
+              next &&
+              durable?.requestId === action.requestId &&
+              durable.awaitingReviewReload
+            ) {
+              acceptReloaded(durable, next);
+            }
           } catch (storageError) {
             setReloadBlocked(true);
             setNotice(
@@ -290,9 +355,6 @@ export function useActivationAction(
             );
             return;
           }
-          setReloadBlocked(true);
-          const next = await reloadReview();
-          if (next) acceptReloaded(action.requestId, next);
           return;
         }
         if (!persisted) {
@@ -305,7 +367,7 @@ export function useActivationAction(
       }
       try {
         onReview(await loadOpeningReview());
-        clearActionPostedReload(
+        await clearActionPostedReload(
           ACTIVATION_SUBJECT,
           ACTIVATION_SUBJECT,
           action.requestId,

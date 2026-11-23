@@ -447,7 +447,7 @@ export function SubjectPanel({
       }
       const reloaded = await onReload(expectedBaseKey);
       if (reloaded !== false) {
-        clearActionPostedReload(subject, subject, requestId);
+        await clearActionPostedReload(subject, subject, requestId);
       }
       setNotice(
         action.kind === 'mapping'
@@ -1216,7 +1216,7 @@ function OptionMappingForm({
       }
       const reloaded = await onReload(expectedBaseKey);
       if (reloaded !== false) {
-        clearActionPostedReload(subject, subject, requestId);
+        await clearActionPostedReload(subject, subject, requestId);
       }
       setNotice(savedOptionMessage);
     } catch (failure) {

@@ -241,7 +241,7 @@ export function PurchasesPage() {
         setSnapshot(next);
         rememberChoiceNames(next.choices);
         setLoadError(null);
-        clearPostedReloadSnapshot(pendingReloads);
+        await clearPostedReloadSnapshot(pendingReloads);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -358,7 +358,7 @@ export function PurchasesPage() {
         setSnapshot(next);
         rememberChoiceNames(next.choices);
         setLoadError(null);
-        clearPostedReload(PURCHASE_SUBJECT, undefined, draft.requestId);
+        await clearPostedReload(PURCHASE_SUBJECT, undefined, draft.requestId);
         setLocalNeedsReload(false);
       }
     } catch (error) {

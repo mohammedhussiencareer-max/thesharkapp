@@ -140,7 +140,7 @@ export function ProcessingPanel({
         if (cancelled || seq !== seqRef.current) return;
         setSummary(next);
         setLoadError(null);
-        clearActionPostedReloadSnapshot(pendingReloads);
+        await clearActionPostedReloadSnapshot(pendingReloads);
       } catch (error) {
         if (cancelled || seq !== seqRef.current) return;
         setLoadError(messageFrom(error));

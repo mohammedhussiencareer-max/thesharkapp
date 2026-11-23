@@ -127,7 +127,7 @@ export function PackagingPage() {
         }
         setDetail({ key, value: next });
         setDetailError(null);
-        clearActionPostedReloadSnapshot(pendingReloads, packSubj);
+        await clearActionPostedReloadSnapshot(pendingReloads, packSubj);
       } catch (error) {
         if (
           cancelled ||
@@ -171,7 +171,7 @@ export function PackagingPage() {
     }
     setDetail({ key: keyAtStart, value: next });
     setDetailError(null);
-    clearActionPostedReloadSnapshot(pendingReloads, packSubj);
+    await clearActionPostedReloadSnapshot(pendingReloads, packSubj);
     return true;
   }
 

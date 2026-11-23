@@ -8,9 +8,15 @@ import {
 } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { loadOpeningReview } from '@/accounting/api';
+import { activateInventory, loadOpeningReview } from '@/accounting/api';
 import { ACTIVATION_SUBJECT } from '@/accounting/activation-action';
 import type { OpeningReview } from '@/accounting/types';
+import {
+  listCounts,
+  listDailyItems,
+  listPendingCounts,
+  recordStoredCount,
+} from '@/counts/api';
 import {
   addConversion,
   addCustomUnit,
@@ -39,11 +45,14 @@ import {
 import type { CatalogItem, DatedWrite } from '@/items/types';
 import {
   createHeldWriteStore,
+  clearPostedReload,
+  claimFreshHeldWrite,
   getHeldWrite,
   hasAnyHeldWrite,
   HeldWriteStorageError,
   putHeldWrite,
   resetHeldWritesStore,
+  setHeldWritePhase,
   setHeldWriteUser,
   userStoragePrefix,
 } from '@/lib/held-writes';
@@ -54,6 +63,7 @@ import {
   setTestWaitingWorker,
 } from '@/lib/pwa';
 import { ActivationPage } from '@/pages/ActivationPage';
+import { CountsPage } from '@/pages/CountsPage';
 import { ItemsPage } from '@/pages/ItemsPage';
 
 vi.mock('@/items/api', () => ({
@@ -78,6 +88,14 @@ vi.mock('@/items/api', () => ({
 vi.mock('@/accounting/api', () => ({
   loadOpeningReview: vi.fn(),
   activateInventory: vi.fn(),
+}));
+
+vi.mock('@/counts/api', () => ({
+  listCounts: vi.fn(),
+  listDailyItems: vi.fn(),
+  listPendingCounts: vi.fn(),
+  recordCount: vi.fn(),
+  recordStoredCount: vi.fn(),
 }));
 
 const oilItem: CatalogItem = {
@@ -245,6 +263,356 @@ describe('P7-3 round-10 review fixes', () => {
     resetPwaState();
     localStorage.clear();
     setOnline(true);
+  });
+
+  it.each(['reclaimed', 'reclaimed and released', 'unreadable'] as const)(
+    'R11-1: acknowledgement cleanup preserves a %s inflight pin',
+    async (scenario) => {
+      const { locks } = makeFakeLocks();
+      vi.stubGlobal('navigator', { onLine: true, locks });
+      const other = createHeldWriteStore({ getLocks: () => locks });
+      other.setHeldWriteUser('owner-r10');
+      const subject = lossSubject('oil');
+      const key = `${userStoragePrefix('owner-r10')}${encodeURIComponent(subject)}`;
+      const claim = await claimFreshHeldWrite(subject, () => ({ loss: '10' }));
+      if (!claim.ok) throw new Error('expected a fresh claim');
+      const { requestId } = claim.record;
+      const write = vi
+        .spyOn(Storage.prototype, 'setItem')
+        .mockImplementationOnce(() => {
+          throw new Error('quota');
+        });
+      expect(() =>
+        setHeldWritePhase(subject, requestId, 'posted_reload', {
+          readTarget: 'oil',
+        }),
+      ).toThrow(HeldWriteStorageError);
+      write.mockRestore();
+      claim.release();
+      await Promise.resolve();
+      try {
+        if (scenario !== 'unreadable') {
+          const replay = await other.claimReplayHeldWrite(subject, requestId);
+          if (!replay.ok) throw new Error('expected another tab to reclaim');
+          try {
+            if (scenario === 'reclaimed and released') {
+              replay.release();
+              await Promise.resolve();
+            }
+            await clearPostedReload(subject, 'oil', requestId);
+            expect(localStorage.getItem(key)).not.toBeNull();
+            expect(localStorage.getItem(key)).toContain(requestId);
+          } finally {
+            replay.release();
+          }
+        } else {
+          const read = vi
+            .spyOn(Storage.prototype, 'getItem')
+            .mockImplementation(() => {
+              throw new Error('read failed');
+            });
+          try {
+            await expect(
+              Promise.resolve().then(() =>
+                clearPostedReload(subject, 'oil', requestId),
+              ),
+            ).rejects.toThrow(HeldWriteStorageError);
+          } finally {
+            read.mockRestore();
+          }
+          expect(localStorage.getItem(key)).toContain(requestId);
+        }
+      } finally {
+        other.dispose();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it('R11-2: an older conversion panel read cannot start a catalog reload during loss verification', async () => {
+    let resolvePanel!: (
+      value: Awaited<ReturnType<typeof listConversions>>,
+    ) => void;
+    let resolveVerify!: (value: CatalogItem) => void;
+    vi.mocked(listConversions).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolvePanel = resolve;
+        }),
+    );
+    vi.mocked(getItemById).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveVerify = resolve;
+        }),
+    );
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole('article', { name: 'زيت' });
+    fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
+    await waitFor(() =>
+      expect(listCostingSchedule).toHaveBeenCalledWith('oil'),
+    );
+    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+    fireEvent.change(screen.getByLabelText('نسبة الفاقد'), {
+      target: { value: '10' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    await waitFor(() => expect(getItemById).toHaveBeenCalledWith('oil'));
+    await act(async () => {
+      resolvePanel({ baseUnit: 'kg', rows: [] });
+      await Promise.resolve();
+    });
+    await act(async () => {
+      resolveVerify({ ...oilItem, lossPct: 0.1, lossFractionText: '0.1' });
+      await Promise.resolve();
+    });
+    expect(listItems).toHaveBeenCalledTimes(1);
+    expect(getHeldWrite(lossSubject('oil'))).toBeNull();
+  });
+
+  it('R11-3a: acknowledged details save displays the readback rename with its baseline', async () => {
+    const renamed = { ...oilItem, name: 'اسم من تبويب تاني' };
+    vi.mocked(getItemById).mockResolvedValue(renamed);
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole('article', { name: 'زيت' });
+    fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
+    const name = screen.getByLabelText('الاسم');
+    fireEvent.change(name, { target: { value: 'الاسم اللي اتبعت' } });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
+    await screen.findByRole('article', { name: renamed.name });
+    expect(name).toHaveValue(renamed.name);
+  });
+
+  it('R11-3b: background identity refresh preserves a dirty draft and its baseline', async () => {
+    let resolvePanel!: (
+      value: Awaited<ReturnType<typeof listConversions>>,
+    ) => void;
+    const renamed = {
+      ...oilItem,
+      name: 'اسم من السيرفر',
+      baseUnit: 'kg' as const,
+    };
+    vi.mocked(listConversions).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolvePanel = resolve;
+        }),
+    );
+    vi.mocked(listItems)
+      .mockResolvedValueOnce([oilItem])
+      .mockResolvedValue([renamed]);
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole('article', { name: 'زيت' });
+    fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
+    await waitFor(() =>
+      expect(listCostingSchedule).toHaveBeenCalledWith('oil'),
+    );
+    fireEvent.change(screen.getByLabelText('الاسم'), {
+      target: { value: 'مسودة' },
+    });
+    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+    await act(async () => {
+      resolvePanel({ baseUnit: 'kg', rows: [] });
+      await Promise.resolve();
+    });
+    await screen.findByRole('article', { name: renamed.name });
+    expect(screen.getByLabelText('الاسم')).toHaveValue('مسودة');
+    expect(screen.getByText(/نسخة أحدث/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
+    await waitFor(() => expect(updateItem).toHaveBeenCalled());
+    expect(vi.mocked(updateItem).mock.calls[0]?.[2]).toMatchObject({
+      name: oilItem.name,
+      baseUnit: oilItem.baseUnit,
+    });
+  });
+
+  it('R11-4: failed durable lookup after loss acknowledgement enables read-only recovery', async () => {
+    const originalRead = localStorage.getItem.bind(localStorage);
+    const key = `${userStoragePrefix('owner-r10')}${encodeURIComponent(lossSubject('oil'))}`;
+    let failRead = false;
+    const reads = vi
+      .spyOn(Storage.prototype, 'getItem')
+      .mockImplementation((readKey) => {
+        if (failRead && readKey === key)
+          throw new Error('cannot read active pin');
+        return originalRead(readKey);
+      });
+    vi.mocked(setItemLoss).mockImplementation(() => {
+      failRead = true;
+      return Promise.resolve();
+    });
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    fireEvent.click(
+      within(await screen.findByRole('article', { name: 'زيت' })).getByRole(
+        'button',
+        { name: 'تعديل' },
+      ),
+    );
+    await waitFor(() =>
+      expect(listCostingSchedule).toHaveBeenCalledWith('oil'),
+    );
+    fireEvent.change(screen.getByLabelText('نسبة الفاقد'), {
+      target: { value: '10' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
+    const verify = await screen.findByRole('button', { name: 'تحقق تاني' });
+    expect(originalRead(key)).toContain('inflight');
+    reads.mockRestore();
+    fireEvent.click(verify);
+    await waitFor(() => expect(localStorage.getItem(key)).toBeNull());
+    expect(setItemLoss).toHaveBeenCalledTimes(1);
+  });
+
+  it('R11-5: a legacy conversion pin targeting its subject clears after verification', async () => {
+    const subject = conversionSubject('box', 'كرتونة');
+    putHeldWrite(subject, {
+      requestId: 'legacy-conversion',
+      phase: 'posted_reload',
+      readTarget: subject,
+      payload: null,
+    });
+    render(
+      <MemoryRouter>
+        <ItemsPage />
+      </MemoryRouter>,
+    );
+    await screen.findByRole('article', { name: 'علبة' });
+    expect(getItemById).toHaveBeenCalledWith('box');
+    await waitFor(() => expect(getHeldWrite(subject)).toBeNull());
+  });
+
+  it('R11-7: a stale activation review cannot replace a payload dispatched by a different tab', async () => {
+    const { locks } = makeFakeLocks();
+    vi.stubGlobal('navigator', { onLine: true, locks });
+    const requestId = 'activation-review-race';
+    const a = 'a'.repeat(32);
+    const b = 'b'.repeat(32);
+    const key = `${userStoragePrefix('owner-r10')}${encodeURIComponent(ACTIVATION_SUBJECT)}`;
+    putHeldWrite(ACTIVATION_SUBJECT, {
+      requestId,
+      payload: { requestId, manifestHash: a, explicitZeroItemIds: [] },
+      phase: 'inflight',
+      awaitingReviewReload: true,
+    });
+    vi.mocked(loadOpeningReview)
+      .mockResolvedValueOnce(makeReview(a))
+      .mockResolvedValue(makeReview(b));
+    try {
+      render(
+        <MemoryRouter>
+          <ActivationPage />
+        </MemoryRouter>,
+      );
+      const button = await screen.findByRole('button', {
+        name: 'إعادة تحميل المراجعة',
+      });
+      await locks.request(key, { mode: 'exclusive' }, () => {
+        localStorage.setItem(
+          key,
+          JSON.stringify({
+            v: 1,
+            subject: ACTIVATION_SUBJECT,
+            requestId,
+            payload: {
+              requestId,
+              manifestHash: b,
+              explicitZeroItemIds: ['oil'],
+            },
+            phase: 'unknown',
+          }),
+        );
+      });
+      await act(async () => {
+        fireEvent.click(button);
+        await Promise.resolve();
+      });
+      expect(JSON.parse(localStorage.getItem(key) ?? '{}')).toMatchObject({
+        phase: 'unknown',
+        payload: { manifestHash: b, explicitZeroItemIds: ['oil'] },
+      });
+      const retryRead = screen.getByRole('button', {
+        name: 'إعادة تحميل المراجعة',
+      });
+      fireEvent.click(retryRead);
+      await screen.findByRole('button', { name: 'إعادة المحاولة' });
+      expect(JSON.parse(localStorage.getItem(key) ?? '{}')).toMatchObject({
+        phase: 'unknown',
+        payload: { explicitZeroItemIds: ['oil'] },
+      });
+      expect(activateInventory).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('R11-6: a stored count sharing the unknown daily request id settles and reloads after posting', async () => {
+    const { locks } = makeFakeLocks();
+    vi.stubGlobal('navigator', { onLine: true, locks });
+    const requestId = 'd1900000-0000-4000-8000-000000000060';
+    const countedAt = '2026-10-22T10:00:00.000Z';
+    const payload = {
+      request_id: requestId,
+      frequency: 'daily',
+      counted_at: countedAt,
+      note: null,
+      lines: [],
+    };
+    putHeldWrite('count:daily', {
+      requestId,
+      payload: {
+        requestId,
+        countedAt,
+        frequency: 'daily',
+        note: null,
+        lines: [],
+      },
+      phase: 'unknown',
+      kind: 'count',
+    });
+    vi.mocked(listDailyItems).mockResolvedValue([]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts)
+      .mockResolvedValueOnce([
+        { requestId, countedAt, preparedAt: countedAt, itemCount: 0, payload },
+      ])
+      .mockResolvedValue([]);
+    vi.mocked(recordStoredCount).mockResolvedValue({
+      status: 'posted',
+      countId: 'saved-count',
+    });
+    try {
+      render(
+        <MemoryRouter>
+          <CountsPage />
+        </MemoryRouter>,
+      );
+      const button = await screen.findByRole('button', { name: 'سجّل الجرد' });
+      await act(async () => {
+        fireEvent.click(button);
+        await Promise.resolve();
+      });
+      expect(recordStoredCount).toHaveBeenCalledWith(payload);
+      expect(listPendingCounts).toHaveBeenCalledTimes(2);
+      expect(getHeldWrite('count:daily')).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('R10-Root-a: Older mount catalog listItems response cannot overwrite a row already applied by a newer combined by-id read', async () => {
@@ -448,7 +816,7 @@ describe('P7-3 round-10 review fixes', () => {
     let listCalls = 0;
     vi.mocked(listItems).mockImplementation(() => {
       listCalls += 1;
-      if (listCalls === 1) return Promise.resolve([oilItem]);
+      if (listCalls === 1) return Promise.resolve([oilItem, boxItem]);
       return new Promise<CatalogItem[]>((_resolve, reject) => {
         rejectNewerCatalog = reject;
       });
@@ -485,8 +853,9 @@ describe('P7-3 round-10 review fixes', () => {
     await waitFor(() =>
       expect(listCostingSchedule).toHaveBeenCalledWith('oil'),
     );
-    // Also open ConversionsPanel (its initial listConversions stays pending without marking conversionsBusy).
-    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+    // The independently ordered box panel can still start a newer catalog read.
+    const box = screen.getByRole('article', { name: 'علبة' });
+    fireEvent.click(within(box).getByRole('button', { name: 'التحويلات' }));
 
     // Save loss -> post-save combined read #1 starts!
     fireEvent.change(screen.getByLabelText('نسبة الفاقد'), {
@@ -495,8 +864,7 @@ describe('P7-3 round-10 review fixes', () => {
     fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
     await waitFor(() => expect(byIdCalls).toBe(1));
 
-    // While combined read #1 is pending, ConversionsPanel's mount snapshot resolves with stale baseUnit 'kg'
-    // -> triggers onItemStale('oil') -> starts a NEWER catalog read (listCalls === 2)!
+    // The box panel observes a changed identity and starts a newer catalog read.
     await act(async () => {
       resolveConvMount({ baseUnit: 'kg', rows: [] });
       await Promise.resolve();

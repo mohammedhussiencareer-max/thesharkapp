@@ -61,7 +61,7 @@ export function WastePage() {
           setNext(page.next);
           loadedRef.current = page.entries.length;
           setMoreError(null);
-          clearActionPostedReloadSnapshot(pendingReloads);
+          await clearActionPostedReloadSnapshot(pendingReloads);
         }
       } catch (error) {
         if (cancelled || seq !== loadSeqRef.current) return;
@@ -120,7 +120,7 @@ export function WastePage() {
       setNext(page.next);
       loadedRef.current = page.entries.length;
       setMoreError(null);
-      clearActionPostedReloadSnapshot(pendingReloads);
+      await clearActionPostedReloadSnapshot(pendingReloads);
     } finally {
       setReloading((count) => count - 1);
     }

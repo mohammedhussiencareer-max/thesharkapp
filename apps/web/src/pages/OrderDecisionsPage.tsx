@@ -156,7 +156,7 @@ export function OrderDecisionsPage() {
             loadedSubjects.has(entry.subject) &&
             entry.readTarget === entry.subject,
         );
-        clearActionPostedReloadSnapshot(directlyCovered);
+        await clearActionPostedReloadSnapshot(directlyCovered);
         const unverified = pendingReloads.filter(
           (entry) =>
             !loadedSubjects.has(entry.subject) &&
@@ -170,7 +170,7 @@ export function OrderDecisionsPage() {
               try {
                 await loadQueueRow(orderId);
                 if (cancelled || seq !== seqRef.current) return;
-                clearActionPostedReloadSnapshot([pin], pin.subject);
+                await clearActionPostedReloadSnapshot([pin], pin.subject);
               } catch {
                 // Keep posted_reload held until a direct read for this order succeeds.
               }
@@ -283,7 +283,7 @@ export function OrderDecisionsPage() {
       const loadedSubjects = new Set(
         page.rows.map((row) => decisionSubject(row.orderId)),
       );
-      clearActionPostedReloadSnapshot(
+      await clearActionPostedReloadSnapshot(
         pendingReloads.filter(
           (entry) =>
             loadedSubjects.has(entry.subject) &&
@@ -301,7 +301,7 @@ export function OrderDecisionsPage() {
     const subj = decisionSubject(orderId);
     const pendingReloads = snapshotActionPostedReloads({ subject: subj });
     const row = await loadQueueRow(orderId);
-    clearActionPostedReloadSnapshot(pendingReloads, subj);
+    await clearActionPostedReloadSnapshot(pendingReloads, subj);
     setEntries((current) => {
       const updated =
         current === null

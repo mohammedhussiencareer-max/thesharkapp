@@ -95,7 +95,7 @@ export function OpeningPage() {
         if (cancelled || !next) return;
         setItems(next);
         setLoadError(null);
-        clearPostedReloadSnapshot(pendingReloads);
+        await clearPostedReloadSnapshot(pendingReloads);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -170,7 +170,7 @@ export function OpeningPage() {
       if (next) {
         setItems(next);
         setLoadError(null);
-        clearPostedReload(OPENING_SUBJECT, undefined, draft.requestId);
+        await clearPostedReload(OPENING_SUBJECT, undefined, draft.requestId);
         setLocalNeedsReload(false);
       }
     } catch (error) {

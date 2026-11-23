@@ -73,9 +73,9 @@ function RecipeEditor({ recipeId }: { recipeId: string }) {
         setSchedule(nextSchedule);
         setCatalog({ stock, itemUnits, units, batches, shiftStart });
         setLoadError(null);
-        clearActionPostedReloadSnapshot(pendingUpdate, updSubj);
-        clearActionPostedReloadSnapshot(pendingVersion, verSubj);
-        clearActionPostedReloadSnapshot(pendingCreate, recipeId);
+        await clearActionPostedReloadSnapshot(pendingUpdate, updSubj);
+        await clearActionPostedReloadSnapshot(pendingVersion, verSubj);
+        await clearActionPostedReloadSnapshot(pendingCreate, recipeId);
       } catch (error) {
         if (!cancelled) setLoadError(messageFrom(error));
       } finally {
@@ -96,7 +96,7 @@ function RecipeEditor({ recipeId }: { recipeId: string }) {
       if (seq !== scheduleSeq.current) return false;
       setSchedule(next);
       setLoadError(null);
-      clearActionPostedReloadSnapshot(pendingVersion, verSubj);
+      await clearActionPostedReloadSnapshot(pendingVersion, verSubj);
       return true;
     } catch (error) {
       if (seq === scheduleSeq.current) setLoadError(messageFrom(error));
@@ -117,7 +117,7 @@ function RecipeEditor({ recipeId }: { recipeId: string }) {
       }
       setRecipe(next);
       setLoadError(null);
-      clearActionPostedReloadSnapshot(pendingUpdate, updSubj);
+      await clearActionPostedReloadSnapshot(pendingUpdate, updSubj);
       return next;
     } catch (error) {
       if (seq === recipeSeq.current) setLoadError(messageFrom(error));

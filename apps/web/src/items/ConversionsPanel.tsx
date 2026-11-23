@@ -28,7 +28,6 @@ import {
   canDispatchAction,
   claimFreshAction,
   claimReplayAction,
-  clearActionPostedReload,
   clearCostingPinsForItem,
   conversionSubject,
   hasAction,
@@ -517,7 +516,7 @@ export function ConversionsPanel({
         return true;
       }
       const verified = await verifyConversionItem(item.id);
-      clearCostingPinsForItem(pendingReloads, item.id);
+      await clearCostingPinsForItem(pendingReloads, item.id);
       if (!aliveRef.current || requestId !== requestRef.current) return false;
       setLocalSchedule(verified.schedule);
       await applySnapshot(
@@ -583,7 +582,7 @@ export function ConversionsPanel({
         }
         if (pendingReloads.length > 0) {
           const verified = await verifyConversionItem(item.id);
-          clearCostingPinsForItem(pendingReloads, item.id);
+          await clearCostingPinsForItem(pendingReloads, item.id);
           if (
             !aliveRef.current ||
             cancelled ||
@@ -650,18 +649,14 @@ export function ConversionsPanel({
     setMetaAttempt((attempt) => attempt + 1);
   }
 
-  async function run(
-    work: () => Promise<void>,
-    onReloaded?: () => void,
-  ): Promise<boolean> {
+  async function run(work: () => Promise<void>): Promise<boolean> {
     if (busy || locked || !isOnline()) return false;
     setBusy(true);
     onBusyChange?.(true);
     setActionError(null);
     try {
       await work();
-      const reloaded = await load();
-      if (reloaded) onReloaded?.();
+      await load();
       return true;
     } catch (error) {
       setActionError(messageFrom(error));
@@ -819,40 +814,33 @@ export function ConversionsPanel({
         return;
       }
       let saved = false;
-      const accepted = await run(
-        async () => {
+      const accepted = await run(async () => {
+        try {
+          await perform(action, session);
+          saved = true;
           try {
-            await perform(action, session);
-            saved = true;
-            try {
-              markActionPostedReload(subject, requestId, item.id);
-            } catch (storageError) {
-              if (!(storageError instanceof HeldWriteStorageError)) {
-                throw storageError;
-              }
-              setActionError(messageFrom(storageError));
+            markActionPostedReload(subject, requestId, item.id);
+          } catch (storageError) {
+            if (!(storageError instanceof HeldWriteStorageError)) {
+              throw storageError;
             }
-            clearSubmittedAdd(action);
-          } catch (error) {
-            if (
-              !saved &&
-              !(error instanceof HeldWriteStorageError) &&
-              hasAction(subject)
-            ) {
-              settleAction(subject, requestId, error);
-            }
-            throw error;
-          } finally {
-            releaseLock();
-            releaseLock = () => {};
+            setActionError(messageFrom(storageError));
           }
-        },
-        () => {
-          if (!onRunItemReadRef.current) {
-            clearActionPostedReload(subject, item.id, requestId);
+          clearSubmittedAdd(action);
+        } catch (error) {
+          if (
+            !saved &&
+            !(error instanceof HeldWriteStorageError) &&
+            hasAction(subject)
+          ) {
+            settleAction(subject, requestId, error);
           }
-        },
-      );
+          throw error;
+        } finally {
+          releaseLock();
+          releaseLock = () => {};
+        }
+      });
       if (accepted === false) {
         abortActionBeforeDispatch(
           subject,

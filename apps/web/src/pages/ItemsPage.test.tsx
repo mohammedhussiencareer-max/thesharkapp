@@ -782,6 +782,10 @@ describe('ItemsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'ضيف صنف' }));
     expect(screen.getByLabelText('الاسم')).toHaveValue('بوري جديد');
 
+    const mixedId = catalog.find((row) => row.name === 'بوري مخلوط')?.id;
+    served = catalog.map((row) =>
+      row.id === mixedId ? { ...row, name: 'بوري جديد' } : row,
+    );
     resolveSave();
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
@@ -1248,12 +1252,19 @@ describe('ItemsPage', () => {
       baseUnit: 'kg',
       active: true,
     });
-    served = [oil];
+    const box = item({
+      id: 'box',
+      name: 'علبة',
+      kind: 'packaging',
+      baseUnit: 'piece',
+      active: true,
+    });
+    served = [oil, box];
     let resolveSaveRead: (value: CatalogItem | null) => void = () => undefined;
     let loads = 0;
     vi.mocked(listItems).mockImplementation(() => {
       loads += 1;
-      if (loads === 1) return Promise.resolve([oil]);
+      if (loads === 1) return Promise.resolve([oil, box]);
       return Promise.reject(new Error('حصل خطأ. حاول تاني.'));
     });
     let byIdLoads = 0;
@@ -1263,7 +1274,7 @@ describe('ItemsPage', () => {
         resolveSaveRead = resolve;
       });
     });
-    // The panel's snapshot read started before the save and lands after it.
+    // The independently ordered box panel can start a newer catalog read.
     let resolveSnapshot: (value: ReturnType<typeof listed>) => void = () =>
       undefined;
     vi.mocked(listConversions).mockReturnValueOnce(
@@ -1278,7 +1289,8 @@ describe('ItemsPage', () => {
       </MemoryRouter>,
     );
     const card = await screen.findByRole('article', { name: 'زيت' });
-    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+    const boxCard = screen.getByRole('article', { name: 'علبة' });
+    fireEvent.click(within(boxCard).getByRole('button', { name: 'التحويلات' }));
     fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
     fireEvent.change(screen.getByLabelText('الاسم'), {
       target: { value: 'زيت جديد' },

@@ -47,11 +47,11 @@ function snapshotMappingReloads(base: ObservedBase): PostedReloadSnapshot {
   ];
 }
 
-function clearMappingReloads(
+async function clearMappingReloads(
   snapshot: PostedReloadSnapshot,
   base: ObservedBase,
   detail: SubjectDetail,
-): void {
+): Promise<void> {
   const allowed = new Set<string>([
     baseSubject(base.posItemId, base.sizeKeyText),
     basePackagingSubject(base.posItemId, base.sizeKeyText),
@@ -66,7 +66,7 @@ function clearMappingReloads(
       ),
     );
   }
-  clearActionPostedReloadSnapshot(
+  await clearActionPostedReloadSnapshot(
     snapshot.filter(
       (entry) =>
         allowed.has(entry.subject) && entry.readTarget === entry.subject,
@@ -169,7 +169,7 @@ export function MappingPage() {
         }
         setDetail({ key, value: next });
         setDetailError(null);
-        clearMappingReloads(pendingReloads, current, next);
+        await clearMappingReloads(pendingReloads, current, next);
       } catch (error) {
         if (
           cancelled ||
@@ -212,7 +212,7 @@ export function MappingPage() {
     }
     setDetail({ key: keyAtStart, value: next });
     setDetailError(null);
-    clearMappingReloads(pendingReloads, current, next);
+    await clearMappingReloads(pendingReloads, current, next);
     return true;
   }
 

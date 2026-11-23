@@ -34,7 +34,6 @@ import {
   canDispatchAction,
   claimFreshAction,
   claimReplayAction,
-  clearActionPostedReload,
   clearCostingPinsForItem,
   createSubject,
   firstUnknownItemCreate,
@@ -348,7 +347,7 @@ export function ItemForm({
             currentShiftStart(),
             verifyLossItem(editingId),
           ]);
-          clearCostingPinsForItem(pendingReloads, editingId);
+          await clearCostingPinsForItem(pendingReloads, editingId);
           if (cancelled || request !== scheduleLoad.current) return;
           setShiftStart(shift);
           setLocalSchedule(verified.schedule);
@@ -415,7 +414,7 @@ export function ItemForm({
       let nextSchedule: CostingSchedule;
       if (includeItem || pendingReloads.length > 0) {
         const verified = await verifyLossItem(editingId);
-        clearCostingPinsForItem(pendingReloads, editingId);
+        await clearCostingPinsForItem(pendingReloads, editingId);
         if (request !== scheduleLoad.current) return false;
         nextSchedule = verified.schedule;
         setLocalSchedule(nextSchedule);
@@ -587,10 +586,7 @@ export function ItemForm({
       releaseLock();
       releaseLock = () => {};
       setDatedLoss(false);
-      const reloaded = await reloadLossSchedule();
-      if (reloaded && !onRunItemReadRef.current) {
-        clearActionPostedReload(subject, editingId, requestId);
-      }
+      await reloadLossSchedule();
     } catch (error) {
       if (!saved && requestId !== null) {
         settleAction(subject, requestId, error);

@@ -22,6 +22,7 @@ import {
   subscribeHeldWritesStore,
   updateHeldWritePayload,
   type ClaimHeldWriteResult,
+  type HeldWriteRecord,
   type PostedReloadSnapshot,
   type WriteSession,
 } from '@/lib/held-writes';
@@ -214,9 +215,12 @@ export function replaceActivationPayload<T extends { requestId: string }>(
   subject: string,
   requestId: string,
   next: T,
-): void {
-  if (next.requestId !== requestId) return;
-  updateHeldWritePayload(subject, requestId, next, {
+  expected: HeldWriteRecord,
+): boolean {
+  if (next.requestId !== requestId || !expected.awaitingReviewReload)
+    return false;
+  return updateHeldWritePayload(subject, requestId, next, {
+    expected,
     phase: 'inflight',
     awaitingReviewReload: false,
   });
@@ -360,12 +364,13 @@ export function listPostedCostingPins(): PostedCostingPin[] {
 
 /**
  * Clear captured loss/conversion pins for `itemId` after a combined read
- * applies, including legacy Round-8 targets (`items:reload`, `loss:<id>`).
+ * applies, including legacy Round-8 catalog and subject targets.
  */
-export function clearCostingPinsForItem(
+export async function clearCostingPinsForItem(
   snapshot: PostedReloadSnapshot,
   itemId: string,
-): void {
+  shouldClear?: () => boolean,
+): Promise<void> {
   const legacyLossTarget = lossSubject(itemId);
   for (const entry of snapshot) {
     if (costingItemIdFromSubject(entry.subject)?.itemId !== itemId) continue;
@@ -374,9 +379,10 @@ export function clearCostingPinsForItem(
       target === undefined ||
       target === itemId ||
       target === ITEMS_RELOAD_SUBJECT ||
+      target === entry.subject ||
       target === legacyLossTarget
     ) {
-      clearPostedReloadSnapshot([entry], target ?? itemId);
+      await clearPostedReloadSnapshot([entry], target ?? itemId, shouldClear);
     }
   }
 }
@@ -399,8 +405,8 @@ export function clearActionPostedReload(
   subject: string,
   readTarget?: string,
   requestId?: string,
-): void {
-  clearPostedReload(subject, readTarget, requestId);
+): void | Promise<void> {
+  return clearPostedReload(subject, readTarget, requestId);
 }
 
 /** Capture existing `posted_reload` pins before starting a read so only those pins can clear when it completes. */
@@ -415,8 +421,8 @@ export function snapshotActionPostedReloads(filter: {
 export function clearActionPostedReloadSnapshot(
   snapshot: PostedReloadSnapshot,
   loadedTarget?: string,
-): void {
-  clearPostedReloadSnapshot(snapshot, loadedTarget);
+): Promise<void> {
+  return clearPostedReloadSnapshot(snapshot, loadedTarget);
 }
 
 /**

@@ -29,6 +29,7 @@ import { messageFrom } from '@/items/errors';
 import type { Json } from '@/lib/database.types';
 import {
   abortClaimBeforeDispatch,
+  acquireHeldWriteLock,
   canDispatchHeldWrite,
   canDispatchWriteFor,
   captureWriteSession,
@@ -39,11 +40,14 @@ import {
   getHeldWrite,
   hasDurableHeldWrite,
   listHeldWritesByPrefix,
+  readLockedHeldWrite,
   setHeldWritePhase,
   snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
+  type HeldWriteRecord,
   type PostedReloadSnapshot,
+  type WriteSession,
 } from '@/lib/held-writes';
 import {
   isOnline,
@@ -244,7 +248,7 @@ export function CountsPage() {
         setSnapshot(next.snapshot);
         rememberItemNames(next.snapshot.items);
         setLoadError(null);
-        clearPostedReloadSnapshot(pendingReloads);
+        await clearPostedReloadSnapshot(pendingReloads);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -295,12 +299,14 @@ export function CountsPage() {
     requestId: string | null,
     fromForm: boolean,
     storedSubject: string | null,
+    daily: HeldWriteRecord<CountDraft> | null,
   ): void {
-    const daily = getHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
     const matchesDaily = requestId !== null && daily?.requestId === requestId;
     if (fromForm || matchesDaily) {
       if (daily && requestId !== null && daily.requestId === requestId) {
-        setHeldWritePhase(COUNT_DAILY_SUBJECT, requestId, 'posted_reload');
+        setHeldWritePhase(COUNT_DAILY_SUBJECT, requestId, 'posted_reload', {
+          expected: daily,
+        });
       }
       setFormEpoch((value) => value + 1);
     }
@@ -354,14 +360,13 @@ export function CountsPage() {
     draft: CountDraft | null,
     requestId: string | null,
     storedSubject: string | null,
+    daily: HeldWriteRecord<CountDraft> | null,
   ): Promise<boolean> {
     if (result.status === 'waiting_for_sync') {
-      if (draft) {
-        setHeldWritePhase(
-          COUNT_DAILY_SUBJECT,
-          draft.requestId,
-          'waiting_for_sync',
-        );
+      if (daily && requestId === daily.requestId) {
+        setHeldWritePhase(COUNT_DAILY_SUBJECT, requestId, 'waiting_for_sync', {
+          expected: daily,
+        });
       }
       if (storedSubject && requestId) {
         clearHeldWrite(storedSubject, requestId);
@@ -371,13 +376,13 @@ export function CountsPage() {
       await refreshAfterWait();
       return false;
     }
-    applyPosted(requestId, draft !== null, storedSubject);
+    applyPosted(requestId, draft !== null, storedSubject, daily);
     const pendingReloads = snapshotCountPostedReloads();
     const next = await readSnapshot();
     if (next.status === 'ready') {
       setSnapshot(next.snapshot);
       setLoadError(null);
-      clearPostedReloadSnapshot(pendingReloads);
+      await clearPostedReloadSnapshot(pendingReloads);
       setLocalNeedsReload(false);
     } else {
       setLocalNeedsReload(false);
@@ -441,7 +446,7 @@ export function CountsPage() {
     try {
       const result = await recordCount(draft);
       if (result.status === 'posted') saved = true;
-      await finishWrite(result, draft, draft.requestId, null);
+      await finishWrite(result, draft, draft.requestId, null, claim.record);
     } catch (error) {
       if (!saved) {
         holdUnknown(draft, error, priorPhase);
@@ -457,8 +462,40 @@ export function CountsPage() {
 
   async function handleStored(payload: Json) {
     if (busy || loadsRef.current > 0 || !isOnline()) return;
-    const session = captureWriteSession();
     const requestId = requestIdOf(payload);
+    const session = captureWriteSession();
+    if (requestId === null) {
+      await replayStored(payload, requestId, null, session);
+      return;
+    }
+    // Take the daily lock first, then the stored-card lock. A server card
+    // can represent the same request as a daily write in another tab.
+    const dailyLock = await acquireHeldWriteLock(COUNT_DAILY_SUBJECT);
+    if (!dailyLock.acquired) return;
+    try {
+      if (!canDispatchWriteFor(session)) return;
+      const daily = readLockedHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
+      await replayStored(
+        payload,
+        requestId,
+        daily?.requestId === requestId && daily.phase !== 'posted_reload'
+          ? daily
+          : null,
+        session,
+      );
+    } catch (error) {
+      setCardError(messageFrom(error));
+    } finally {
+      dailyLock.release();
+    }
+  }
+
+  async function replayStored(
+    payload: Json,
+    requestId: string | null,
+    daily: HeldWriteRecord<CountDraft> | null,
+    session: WriteSession | null,
+  ) {
     const storedSubject =
       requestId !== null ? `${COUNT_STORED_PREFIX}${requestId}` : null;
     let releaseLock = () => {};
@@ -519,7 +556,7 @@ export function CountsPage() {
     try {
       const result = await recordStoredCount(payload);
       if (result.status === 'posted') saved = true;
-      await finishWrite(result, null, requestId, storedSubject);
+      await finishWrite(result, null, requestId, storedSubject, daily);
     } catch (error) {
       if (!saved) {
         setCardError(reportedCountError(error));
@@ -533,7 +570,6 @@ export function CountsPage() {
             clearHeldWrite(storedSubject, requestId);
           }
         }
-        const daily = getHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
         if (
           requestId &&
           daily &&
@@ -542,7 +578,7 @@ export function CountsPage() {
           isPayloadRefusal(error)
         ) {
           setRequestKey((value) => value + 1);
-          clearHeldWrite(COUNT_DAILY_SUBJECT, requestId);
+          clearHeldWrite(COUNT_DAILY_SUBJECT, requestId, daily);
           setWaitNotice(null);
         }
       } else {

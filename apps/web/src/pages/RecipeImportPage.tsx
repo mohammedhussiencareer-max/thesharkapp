@@ -203,7 +203,10 @@ function Workspace({
     });
     try {
       await reload();
-      clearActionPostedReloadSnapshot(pendingReloads, recipeImportSubject);
+      await clearActionPostedReloadSnapshot(
+        pendingReloads,
+        recipeImportSubject,
+      );
       setStale(false);
     } catch (failure) {
       setReloadError(messageFrom(failure) || genericCatalogError);
@@ -535,7 +538,10 @@ export function RecipeImportPage() {
         if (cancelled) return;
         setCtx(next);
         setLoadError(null);
-        clearActionPostedReloadSnapshot(pendingReloads, recipeImportSubject);
+        await clearActionPostedReloadSnapshot(
+          pendingReloads,
+          recipeImportSubject,
+        );
       } catch (failure) {
         if (!cancelled) setLoadError(messageFrom(failure));
       } finally {

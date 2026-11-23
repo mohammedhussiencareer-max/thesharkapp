@@ -40,7 +40,10 @@ export function ActivationPage() {
         if (cancelled || seq !== seqRef.current) return;
         setReview(next);
         setLoadError(null);
-        clearActionPostedReloadSnapshot(pendingReloads, ACTIVATION_SUBJECT);
+        await clearActionPostedReloadSnapshot(
+          pendingReloads,
+          ACTIVATION_SUBJECT,
+        );
       } catch (error) {
         if (cancelled || seq !== seqRef.current) return;
         setLoadError(messageFrom(error));

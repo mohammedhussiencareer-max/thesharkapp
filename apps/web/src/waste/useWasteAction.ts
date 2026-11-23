@@ -118,7 +118,7 @@ export function useWasteAction(
       }
       const warning = await reload();
       if (warning === null) {
-        clearActionPostedReload(subject, subject, action.requestId);
+        await clearActionPostedReload(subject, subject, action.requestId);
       }
       options.onSaved?.(saved);
       setNotice({ kind: 'saved', result: saved, warning });

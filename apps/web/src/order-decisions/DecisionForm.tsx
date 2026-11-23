@@ -225,7 +225,7 @@ export function DecisionForm({
       }
       const warning = saved.status === 'ok' ? await reload() : null;
       if (saved.status === 'ok' && warning === null) {
-        clearActionPostedReload(subject, subject, action.requestId);
+        await clearActionPostedReload(subject, subject, action.requestId);
       }
       onNotice({ kind: 'saved', result: saved, warning });
     } finally {

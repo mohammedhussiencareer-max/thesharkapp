@@ -104,7 +104,7 @@ export function RecipesPage() {
         if (cancelled) return;
         setRecipes(next);
         setLoadError(null);
-        clearActionPostedReloadSnapshot(pendingReloads);
+        await clearActionPostedReloadSnapshot(pendingReloads);
       } catch (error) {
         if (!cancelled) setLoadError(messageFrom(error));
       } finally {

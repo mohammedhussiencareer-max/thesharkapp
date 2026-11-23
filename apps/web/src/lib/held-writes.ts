@@ -38,6 +38,8 @@ export type HeldWriteRecord<T = unknown> = {
   subject: string;
   kind?: HeldWriteKind;
   requestId: string;
+  /** Changes on every dispatch claim, including a replay of the same request. */
+  claimId?: string;
   payload: T;
   phase: HeldWritePhase;
   /**
@@ -119,6 +121,7 @@ export type ClaimHeldWriteResult<T> =
 export type PostedReloadSnapshotItem = {
   subject: string;
   requestId: string;
+  claimId?: string;
   readTarget?: string;
 };
 
@@ -252,6 +255,7 @@ function parseRecord(raw: string): HeldWriteRecord | null {
   if (typeof row.kind === 'string' && row.kind.length > 0) {
     record.kind = row.kind;
   }
+  if (typeof row.claimId === 'string') record.claimId = row.claimId;
   if (typeof row.readTarget === 'string' && row.readTarget.length > 0) {
     record.readTarget = row.readTarget;
   }
@@ -272,6 +276,19 @@ function matchesPostedTarget(
     return false;
   }
   return record.readTarget === expectedTarget;
+}
+
+function sameClaim(
+  stored: HeldWriteRecord,
+  expected: HeldWriteRecord,
+): boolean {
+  return (
+    stored.subject === expected.subject &&
+    stored.requestId === expected.requestId &&
+    stored.phase === expected.phase &&
+    stored.claimId === expected.claimId &&
+    stored.awaitingReviewReload === expected.awaitingReviewReload
+  );
 }
 
 export type HeldWriteStoreOptions = {
@@ -305,7 +322,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   // recovery can still settle that exact request id once its combined read wins.
   const acknowledgedInflight = new Map<
     string,
-    { requestId: string; readTarget?: string }
+    { record: HeldWriteRecord; requestId: string; readTarget?: string }
   >();
   const activeLockReleases = new Map<string, () => void>();
   let liveClaimCount = 0;
@@ -368,9 +385,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
   }
 
-  function safeListKeys(prefix: string): string[] {
+  function safeListKeys(prefix: string, strict = false): string[] {
     const storage = getStorage();
-    if (!storage) return [];
+    if (!storage) {
+      if (strict) throw new HeldWriteStorageError();
+      return [];
+    }
     const matched: string[] = [];
     try {
       const count = storage.length;
@@ -381,6 +401,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         }
       }
     } catch {
+      if (strict) throw new HeldWriteStorageError();
       return [];
     }
     return matched;
@@ -408,6 +429,25 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
   }
 
+  function readDurableRecord(key: string): HeldWriteRecord | null {
+    const read = strictReadItem(key);
+    if (!read.ok) throw new HeldWriteStorageError();
+    if (read.value === null) return null;
+    const record = parseRecord(read.value);
+    if (record === null) throw new HeldWriteStorageError();
+    return record;
+  }
+
+  function removeDurableRecord(key: string): void {
+    const storage = getStorage();
+    if (!storage) throw new HeldWriteStorageError();
+    try {
+      storage.removeItem(key);
+    } catch {
+      throw new HeldWriteStorageError();
+    }
+  }
+
   function writeRecordToStorage(
     record: HeldWriteRecord,
     userId: string,
@@ -427,25 +467,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
 
   function removeRecordFromStorage(subject: string, userId: string): void {
     safeRemoveItem(entryStorageKey(subject, userId));
-  }
-
-  function removePostedFromStorage(
-    subject: string,
-    requestId: string,
-    userId: string,
-  ): void {
-    safeRemoveItem(postedStorageKey(subject, requestId, userId));
-    // Also clean up any legacy active-slot posted_reload record matching requestId.
-    const activeKey = entryStorageKey(subject, userId);
-    const raw = safeReadItem(activeKey);
-    const parsed = raw !== null ? parseRecord(raw) : null;
-    if (
-      parsed &&
-      parsed.phase === 'posted_reload' &&
-      parsed.requestId === requestId
-    ) {
-      safeRemoveItem(activeKey);
-    }
   }
 
   async function acquireSubjectLock(
@@ -528,15 +549,43 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
   }
 
+  function pruneStoredSnapshot(
+    key: string,
+    expectedRaw: string,
+    subjectLock: string,
+    stillCurrent?: () => boolean,
+  ): void {
+    const prune = () => {
+      if (stillCurrent && !stillCurrent()) return;
+      const current = strictReadItem(key);
+      if (current.ok && current.value === expectedRaw) safeRemoveItem(key);
+    };
+    const locks = getLocks();
+    if (!locks || activeLockReleases.has(subjectLock)) {
+      prune();
+      return;
+    }
+    // Hydration and sign-out cleanup must leave a competing tab's live pin alone.
+    void locks
+      .request(
+        subjectLock,
+        { mode: 'exclusive', ifAvailable: true },
+        (lock) => {
+          if (lock) prune();
+        },
+      )
+      .catch(() => {});
+  }
+
   function loadScopeFromStorage(
     userId: string,
     promoteInflightSync: boolean,
-  ): string[] {
+  ): HeldWriteRecord[] {
     const projectUrl = getProjectUrl();
     const scopeKey = userStoragePrefix(userId, projectUrl);
     records.clear();
     postedReloads.clear();
-    const inflightSubjects: string[] = [];
+    const inflightRecords: HeldWriteRecord[] = [];
 
     for (const key of safeListKeys(scopeKey)) {
       const raw = safeReadItem(key);
@@ -545,7 +594,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (!parsed) continue;
       // Discard orphaned pins left by retired request-less writers in earlier builds.
       if (isRetiredRequestlessRecord(parsed)) {
-        safeRemoveItem(key);
+        pruneStoredSnapshot(
+          key,
+          raw,
+          entryStorageKey(parsed.subject, userId, projectUrl),
+          () => activeUserId() === userId && hydratedScopeKey === scopeKey,
+        );
         continue;
       }
       if (parsed.phase === 'posted_reload') {
@@ -561,7 +615,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
           parsed.phase = 'unknown';
           writeRecordToStorage(parsed, userId);
         } else {
-          inflightSubjects.push(parsed.subject);
+          inflightRecords.push(parsed);
         }
       }
       records.set(parsed.subject, parsed);
@@ -574,15 +628,15 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       safeRemoveItem(key);
     }
 
-    return inflightSubjects;
+    return inflightRecords;
   }
 
   async function promoteUnheldInflight(
     userId: string,
     projectUrl: string,
-    subjects: readonly string[],
+    expectedRecords: readonly HeldWriteRecord[],
   ): Promise<void> {
-    if (subjects.length === 0) return;
+    if (expectedRecords.length === 0) return;
     const locks = getLocks();
     if (!locks) return;
     const scopeKey = userStoragePrefix(userId, projectUrl);
@@ -601,7 +655,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
 
     let changed = false;
-    for (const subject of subjects) {
+    for (const expected of expectedRecords) {
+      const { subject } = expected;
       if (activeUserId() !== userId || hydratedScopeKey !== scopeKey) return;
       const lockName = entryStorageKey(subject, userId, projectUrl);
       if (heldNames.has(lockName) || activeLockReleases.has(lockName)) {
@@ -616,9 +671,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
             if (activeUserId() !== userId || hydratedScopeKey !== scopeKey) {
               return;
             }
-            const raw = safeReadItem(lockName);
-            const stored = raw !== null ? parseRecord(raw) : null;
-            if (!stored || stored.phase !== 'inflight') return;
+            const stored = readDurableRecord(lockName);
+            if (!stored || !sameClaim(stored, expected)) return;
             const promoted: HeldWriteRecord = { ...stored, phase: 'unknown' };
             writeRecordToStorage(promoted, userId);
             records.set(subject, promoted);
@@ -645,12 +699,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     if (hydratedScopeKey === scopeKey) return;
     hydratedScopeKey = scopeKey;
     const locksAvailable = getLocks() !== null;
-    const inflightSubjects = loadScopeFromStorage(userId, !locksAvailable);
-    if (locksAvailable && inflightSubjects.length > 0) {
+    const inflightRecords = loadScopeFromStorage(userId, !locksAvailable);
+    if (locksAvailable && inflightRecords.length > 0) {
       hydrationPromise = promoteUnheldInflight(
         userId,
         projectUrl,
-        inflightSubjects,
+        inflightRecords,
       );
     } else {
       hydrationPromise = Promise.resolve();
@@ -788,8 +842,19 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const trimmed = userId.trim();
     if (trimmed === '') return;
     const prefix = userStoragePrefix(trimmed, projectUrl);
+    const signedOutGeneration = sessionGeneration;
     for (const key of safeListKeys(prefix)) {
-      safeRemoveItem(key);
+      const current = strictReadItem(key);
+      if (!current.ok || current.value === null) continue;
+      const record = parseRecord(current.value);
+      pruneStoredSnapshot(
+        key,
+        current.value,
+        record ? entryStorageKey(record.subject, trimmed, projectUrl) : key,
+        () =>
+          activeUserId() !== trimmed ||
+          sessionGeneration === signedOutGeneration,
+      );
     }
     for (const key of safeListKeys(
       legacyReloadMarkerPrefix(trimmed, projectUrl),
@@ -863,7 +928,11 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       return true;
     }
     ensureHydrated();
-    if (records.size > 0 || postedReloads.size > 0) {
+    if (
+      records.size > 0 ||
+      postedReloads.size > 0 ||
+      acknowledgedInflight.size > 0
+    ) {
       return true;
     }
     const userId = activeUserId();
@@ -951,9 +1020,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         return { ok: false, reason: 'storage' };
       }
       const stored = read.value !== null ? parseRecord(read.value) : null;
-      if (stored && isUnresolvedPhase(stored.phase)) {
+      if (read.value !== null && (!stored || stored.subject !== subject)) {
+        return { ok: false, reason: 'storage' };
+      }
+      if (stored) {
         const preserved = preservePayloadIdentity(subject, stored);
-        records.set(subject, preserved);
+        if (isUnresolvedPhase(stored.phase)) records.set(subject, preserved);
         emit();
         return { ok: false, reason: 'conflict', existing: preserved };
       }
@@ -963,6 +1035,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         v: 1,
         subject,
         requestId,
+        claimId: crypto.randomUUID(),
         payload,
         phase: 'inflight',
         ...(opts?.kind ? { kind: opts.kind } : {}),
@@ -1009,6 +1082,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
     const userId = session.userId;
     const key = entryStorageKey(subject, userId);
+    const expected = records.get(subject);
     const lock = await acquireSubjectLock(key);
     if (!lock.acquired) {
       return { ok: false, reason: 'locked' };
@@ -1043,8 +1117,20 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         };
       }
       const preserved = preservePayloadIdentity<T>(subject, stored);
+      if (
+        stored.awaitingReviewReload ||
+        (opts?.payload !== undefined &&
+          (!expected ||
+            !sameClaim(stored, expected) ||
+            stored.phase !== 'inflight'))
+      ) {
+        records.set(subject, preserved);
+        emit();
+        return { ok: false, reason: 'conflict', existing: preserved };
+      }
       const next: HeldWriteRecord<T> = {
         ...preserved,
+        claimId: crypto.randomUUID(),
         payload: opts?.payload !== undefined ? opts.payload : preserved.payload,
         phase: 'inflight',
       };
@@ -1136,6 +1222,14 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       return { ok: false, reason: 'storage' };
     }
     const stored = read.value !== null ? parseRecord(read.value) : null;
+    if (
+      read.value !== null &&
+      (!stored ||
+        stored.subject !== subject ||
+        !isUnresolvedPhase(stored.phase))
+    ) {
+      return { ok: false, reason: 'storage' };
+    }
     if (stored && isUnresolvedPhase(stored.phase)) {
       const preserved = preservePayloadIdentity<T>(subject, stored);
       records.set(subject, preserved);
@@ -1203,11 +1297,13 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
     const key = entryStorageKey(subject, userId);
     const read = strictReadItem(key);
-    if (!read.ok && input.phase !== 'posted_reload') {
+    if (!read.ok) {
       return { ok: false, reason: 'storage' };
     }
-    const stored =
-      read.ok && read.value !== null ? parseRecord(read.value) : null;
+    const stored = read.value !== null ? parseRecord(read.value) : null;
+    if (read.value !== null && !stored) {
+      return { ok: false, reason: 'storage' };
+    }
     if (
       stored &&
       isUnresolvedPhase(stored.phase) &&
@@ -1215,6 +1311,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     ) {
       records.set(subject, stored);
       emit();
+      return { ok: false, reason: 'conflict', existing: stored };
+    }
+    const expected = records.get(subject);
+    if (
+      stored &&
+      (stored.subject !== subject ||
+        !expected ||
+        !sameClaim(stored, expected) ||
+        (getLocks() !== null && !activeLockReleases.has(key)))
+    ) {
       return { ok: false, reason: 'conflict', existing: stored };
     }
     const next: HeldWriteRecord<T> = {
@@ -1300,45 +1406,110 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     return { acquired: true, release: wrapClaimRelease(lock.release) };
   }
 
-  function setHeldWritePhase(
+  function mutateUnderSubjectLock(
     subject: string,
-    requestId: string,
-    phase: HeldWritePhase,
-    phaseOptions?: { readTarget?: string },
-  ): void {
-    ensureHydrated();
+    userId: string,
+    mutate: () => void,
+  ): void | Promise<void> {
+    const key = entryStorageKey(subject, userId);
+    if (getLocks() === null || activeLockReleases.has(key)) {
+      mutate();
+      return;
+    }
+    const session = captureWriteSession();
+    return acquireSubjectLock(key).then((lock) => {
+      if (!lock.acquired) return;
+      try {
+        if (
+          session &&
+          activeUserId() === session.userId &&
+          session.generation === sessionGeneration
+        )
+          mutate();
+      } finally {
+        lock.release();
+      }
+    });
+  }
+
+  function readLockedHeldWrite<T = unknown>(
+    subject: string,
+    options?: { refresh?: boolean },
+  ): HeldWriteRecord<T> | null {
     const userId = activeUserId();
-    if (userId === null) return;
+    if (userId === null) return null;
     const key = entryStorageKey(subject, userId);
     if (getLocks() !== null && !activeLockReleases.has(key)) {
       throw new HeldWriteLockError();
     }
-    const read = strictReadItem(key);
-    if (!read.ok) {
-      throw new HeldWriteStorageError();
+    const stored = readDurableRecord(key);
+    if (stored && stored.subject !== subject) throw new HeldWriteStorageError();
+    if (options?.refresh) {
+      const current = records.get(subject);
+      if (stored && isUnresolvedPhase(stored.phase)) {
+        if (!current || !sameClaim(stored, current)) {
+          records.set(subject, stored);
+          emit();
+        }
+      } else if (records.delete(subject)) {
+        emit();
+      }
     }
-    const stored = read.value !== null ? parseRecord(read.value) : null;
-    const inMemory = records.get(subject) ?? null;
-    if (!stored || stored.requestId !== requestId) {
-      if (stored === null && inMemory !== null) {
+    return stored as HeldWriteRecord<T> | null;
+  }
+
+  function setHeldWritePhase(
+    subject: string,
+    requestId: string,
+    phase: HeldWritePhase,
+    phaseOptions?: { readTarget?: string; expected?: HeldWriteRecord },
+  ): void {
+    ensureHydrated();
+    const userId = activeUserId();
+    if (userId === null) return;
+    const expected = phaseOptions?.expected ?? records.get(subject);
+    const acknowledge = () => {
+      if (phase !== 'posted_reload' || expected?.requestId !== requestId)
+        return;
+      acknowledgedInflight.set(subject, {
+        record: expected,
+        requestId,
+        ...(phaseOptions?.readTarget
+          ? { readTarget: phaseOptions.readTarget }
+          : {}),
+      });
+      emit();
+    };
+
+    let stored: HeldWriteRecord | null;
+    try {
+      stored = readLockedHeldWrite(subject);
+    } catch (error) {
+      if (error instanceof HeldWriteStorageError) acknowledge();
+      throw error;
+    }
+    if (!stored) {
+      if (
+        expected?.requestId === requestId &&
+        records.get(subject) === expected
+      ) {
         records.delete(subject);
         acknowledgedInflight.delete(subject);
-        emit();
-      } else if (stored && isUnresolvedPhase(stored.phase)) {
-        records.set(subject, stored);
         emit();
       }
       return;
     }
-    const preservedPayload =
-      inMemory &&
-      inMemory.requestId === stored.requestId &&
-      JSON.stringify(inMemory.payload) === JSON.stringify(stored.payload)
-        ? inMemory.payload
-        : stored.payload;
+    if (
+      !expected ||
+      expected.requestId !== requestId ||
+      !sameClaim(stored, expected)
+    )
+      return;
+
+    const preserved = preservePayloadIdentity(subject, stored);
     const next: HeldWriteRecord = {
-      ...stored,
-      payload: phase === 'posted_reload' ? null : preservedPayload,
+      ...preserved,
+      payload: phase === 'posted_reload' ? null : preserved.payload,
       phase,
     };
     if (phase === 'posted_reload' && phaseOptions?.readTarget) {
@@ -1349,29 +1520,28 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     if (phase !== 'unknown') {
       delete next.awaitingReviewReload;
     }
-    const wrote = writeRecordToStorage(next, userId);
-    if (!wrote) {
-      if (phase === 'posted_reload') {
-        // Keep the existing durable `inflight` record intact AND remember this
-        // acknowledgement so read-only recovery can settle the exact request id.
-        acknowledgedInflight.set(subject, {
-          requestId,
-          ...(phaseOptions?.readTarget
-            ? { readTarget: phaseOptions.readTarget }
-            : {}),
-        });
+    if (!writeRecordToStorage(next, userId)) {
+      acknowledge();
+      if (phase === 'unknown' && stored.phase === 'inflight') {
+        // Keep the exact durable inflight claim recoverable while allowing
+        // an explicit retry of its payload in this tab.
+        records.set(subject, next);
         emit();
+      } else {
         throw new HeldWriteStorageError();
       }
-      if (phase === 'inflight') {
-        throw new HeldWriteStorageError();
-      }
+      return;
     }
     if (phase === 'posted_reload') {
-      removeRecordFromStorage(subject, userId);
+      postedReloads.set(postedMapKey(subject, requestId), next);
+      try {
+        removeDurableRecord(entryStorageKey(subject, userId));
+      } catch (error) {
+        acknowledge();
+        throw error;
+      }
       records.delete(subject);
       acknowledgedInflight.delete(subject);
-      postedReloads.set(postedMapKey(subject, requestId), next);
     } else {
       records.set(subject, next);
     }
@@ -1382,105 +1552,75 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     subject: string,
     requestId: string,
     payload: T | undefined,
-    extra?: { phase?: HeldWritePhase; awaitingReviewReload?: boolean },
-  ): void {
+    extra?: {
+      phase?: HeldWritePhase;
+      awaitingReviewReload?: boolean;
+      expected?: HeldWriteRecord;
+    },
+  ): boolean {
     ensureHydrated();
     const userId = activeUserId();
-    if (userId === null) return;
-    const key = entryStorageKey(subject, userId);
-    if (getLocks() !== null && !activeLockReleases.has(key)) {
-      throw new HeldWriteLockError();
-    }
-    const read = strictReadItem(key);
-    if (!read.ok) {
-      throw new HeldWriteStorageError();
-    }
-    const stored = read.value !== null ? parseRecord(read.value) : null;
-    const inMemory = records.get(subject) ?? null;
-    if (!stored || stored.requestId !== requestId) {
-      if (stored === null && inMemory !== null) {
-        records.delete(subject);
-        acknowledgedInflight.delete(subject);
-        emit();
-      } else if (stored && isUnresolvedPhase(stored.phase)) {
-        records.set(subject, stored);
-        emit();
-      }
-      return;
-    }
-    const nextPhase = extra?.phase ?? stored.phase;
-    const nextPayload = (payload !== undefined ? payload : stored.payload) as T;
-    const next: HeldWriteRecord<T> = {
-      v: 1,
-      subject: stored.subject,
-      requestId: stored.requestId,
-      payload: nextPayload,
-      phase: nextPhase,
-      ...(stored.kind ? { kind: stored.kind } : {}),
+    if (userId === null) return false;
+    const expected = extra?.expected ?? records.get(subject);
+    const stored = readLockedHeldWrite(subject);
+    if (
+      !stored ||
+      !expected ||
+      expected.requestId !== requestId ||
+      !sameClaim(stored, expected)
+    )
+      return false;
+    const next: HeldWriteRecord = {
+      ...stored,
+      payload: payload !== undefined ? payload : stored.payload,
+      phase: extra?.phase ?? stored.phase,
     };
-    const awaiting =
-      extra?.awaitingReviewReload !== undefined
-        ? extra.awaitingReviewReload
-        : stored.awaitingReviewReload;
-    if (awaiting === true) {
+    if (extra?.awaitingReviewReload === true) {
       next.awaitingReviewReload = true;
+    } else if (extra?.awaitingReviewReload === false) {
+      delete next.awaitingReviewReload;
     }
-    const wrote = writeRecordToStorage(next, userId);
-    if (!wrote) {
+    if (!writeRecordToStorage(next, userId)) {
       throw new HeldWriteStorageError();
     }
     records.set(subject, next);
     emit();
+    return true;
   }
 
-  function clearHeldWrite(subject: string, requestId?: string): void {
+  function clearHeldWrite(
+    subject: string,
+    requestId?: string,
+    expected?: HeldWriteRecord,
+  ): void {
     ensureHydrated();
     const userId = activeUserId();
     if (userId === null) return;
-    let changed = false;
+    const captured = expected ?? records.get(subject);
+    if (
+      !captured ||
+      (requestId !== undefined && captured.requestId !== requestId)
+    )
+      return;
+    const stored = readLockedHeldWrite(subject);
+    if (stored && !sameClaim(stored, captured)) return;
+    if (stored) removeDurableRecord(entryStorageKey(subject, userId));
+    const current = records.get(subject);
+    if (current && sameClaim(current, captured)) records.delete(subject);
+    const ack = acknowledgedInflight.get(subject);
+    if (ack && sameClaim(ack.record, captured))
+      acknowledgedInflight.delete(subject);
+    emit();
+  }
 
-    const raw = safeReadItem(entryStorageKey(subject, userId));
-    const stored = raw !== null ? parseRecord(raw) : null;
-    if (stored) {
-      if (requestId !== undefined && stored.requestId !== requestId) {
-        if (isUnresolvedPhase(stored.phase)) {
-          records.set(subject, stored);
-          emit();
-        }
-      } else {
-        records.delete(subject);
-        acknowledgedInflight.delete(subject);
-        removeRecordFromStorage(subject, userId);
-        changed = true;
-      }
-    } else {
-      const current = records.get(subject);
-      if (
-        current &&
-        (requestId === undefined || current.requestId === requestId)
-      ) {
-        records.delete(subject);
-        acknowledgedInflight.delete(subject);
-        removeRecordFromStorage(subject, userId);
-        changed = true;
-      }
-    }
-
-    if (requestId !== undefined) {
-      const pKey = postedMapKey(subject, requestId);
-      if (postedReloads.has(pKey)) {
-        postedReloads.delete(pKey);
-        removePostedFromStorage(subject, requestId, userId);
-        changed = true;
-      } else if (
-        safeReadItem(postedStorageKey(subject, requestId, userId)) !== null
-      ) {
-        removePostedFromStorage(subject, requestId, userId);
-        changed = true;
-      }
-    }
-
-    if (changed) emit();
+  async function clearVerifiedHeldWrite(
+    record: HeldWriteRecord,
+  ): Promise<void> {
+    const userId = activeUserId();
+    if (userId === null) return;
+    await mutateUnderSubjectLock(record.subject, userId, () => {
+      clearHeldWrite(record.subject, record.requestId, record);
+    });
   }
 
   function matchesAckTarget(
@@ -1532,70 +1672,76 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     subject: string,
     expectedTarget?: string,
     expectedRequestId?: string,
-  ): void {
+    snapshot?: PostedReloadSnapshotItem,
+    shouldClear?: () => boolean,
+  ): void | Promise<void> {
     ensureHydrated();
     const userId = activeUserId();
     if (userId === null) return;
-    let changed = false;
-
-    const candidates = new Map<string, HeldWriteRecord>();
-    for (const [k, entry] of postedReloads.entries()) {
-      if (entry.subject === subject) {
-        candidates.set(k, entry);
-      }
-    }
-    for (const key of safeListKeys(postedSubjectPrefix(subject, userId))) {
-      const raw = safeReadItem(key);
-      const parsed = raw !== null ? parseRecord(raw) : null;
-      if (parsed && parsed.phase === 'posted_reload') {
-        candidates.set(postedMapKey(parsed.subject, parsed.requestId), parsed);
-      }
-    }
-    const legacyRaw = safeReadItem(entryStorageKey(subject, userId));
-    const legacyParsed = legacyRaw !== null ? parseRecord(legacyRaw) : null;
-    if (legacyParsed && legacyParsed.phase === 'posted_reload') {
-      candidates.set(
-        postedMapKey(legacyParsed.subject, legacyParsed.requestId),
-        legacyParsed,
-      );
-    }
-
-    for (const [k, entry] of candidates.entries()) {
-      if (
-        expectedRequestId !== undefined &&
-        entry.requestId !== expectedRequestId
-      ) {
-        continue;
-      }
-      if (!matchesPostedTarget(entry, expectedTarget)) {
-        continue;
-      }
-      postedReloads.delete(k);
-      removePostedFromStorage(entry.subject, entry.requestId, userId);
-      changed = true;
-    }
-
     const ack = acknowledgedInflight.get(subject);
-    if (
+    const matchesRequest = (requestId: string) =>
+      expectedRequestId === undefined || expectedRequestId === requestId;
+    const matchesSnapshot = (record: HeldWriteRecord) =>
+      !snapshot || record.claimId === snapshot.claimId;
+    const matchesAck = Boolean(
       ack &&
-      (expectedRequestId === undefined ||
-        ack.requestId === expectedRequestId) &&
-      matchesAckTarget(ack.readTarget, expectedTarget)
-    ) {
-      acknowledgedInflight.delete(subject);
-      const mem = records.get(subject);
-      if (mem && mem.requestId === ack.requestId) {
-        records.delete(subject);
-      }
-      const activeRaw = safeReadItem(entryStorageKey(subject, userId));
-      const activeParsed = activeRaw !== null ? parseRecord(activeRaw) : null;
-      if (!activeParsed || activeParsed.requestId === ack.requestId) {
-        removeRecordFromStorage(subject, userId);
-      }
-      changed = true;
-    }
+      matchesRequest(ack.requestId) &&
+      matchesSnapshot(ack.record) &&
+      matchesAckTarget(ack.readTarget, expectedTarget),
+    );
+    const activeKey = entryStorageKey(subject, userId);
+    return mutateUnderSubjectLock(subject, userId, () => {
+      if (shouldClear && !shouldClear()) return;
+      const candidates =
+        expectedRequestId !== undefined
+          ? [postedStorageKey(subject, expectedRequestId, userId)]
+          : safeListKeys(postedSubjectPrefix(subject, userId), true);
+      let changed = false;
+      try {
+        const active = readDurableRecord(activeKey);
+        for (const key of [...candidates, activeKey]) {
+          const stored = key === activeKey ? active : readDurableRecord(key);
+          if (
+            !stored ||
+            stored.subject !== subject ||
+            stored.phase !== 'posted_reload' ||
+            !matchesRequest(stored.requestId) ||
+            !matchesSnapshot(stored) ||
+            !matchesPostedTarget(stored, expectedTarget) ||
+            (key !== activeKey &&
+              key !== postedStorageKey(subject, stored.requestId, userId))
+          )
+            continue;
+          removeDurableRecord(key);
+          postedReloads.delete(postedMapKey(subject, stored.requestId));
+          changed = true;
+        }
 
-    if (changed) emit();
+        if (ack && matchesAck && acknowledgedInflight.get(subject) === ack) {
+          if (active && sameClaim(active, ack.record)) {
+            removeDurableRecord(activeKey);
+          }
+          // A different claim owns the active slot. Retire only this tab's
+          // acknowledgement so it cannot settle that claim on a later read.
+          acknowledgedInflight.delete(subject);
+          const current = records.get(subject);
+          if (current && sameClaim(current, ack.record)) {
+            if (
+              active &&
+              !sameClaim(active, ack.record) &&
+              isUnresolvedPhase(active.phase)
+            ) {
+              records.set(subject, active);
+            } else {
+              records.delete(subject);
+            }
+          }
+          changed = true;
+        }
+      } finally {
+        if (changed) emit();
+      }
+    });
   }
 
   function hasPostedReloadForTarget(target: string): boolean {
@@ -1646,6 +1792,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       subject: string,
       requestId: string,
       readTarget?: string,
+      claimId?: string,
     ) => {
       if (filter.subject !== undefined && subject !== filter.subject) {
         return;
@@ -1660,19 +1807,25 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         subject,
         requestId,
         ...(readTarget !== undefined ? { readTarget } : {}),
+        ...(claimId !== undefined ? { claimId } : {}),
       });
     };
 
     const consider = (entry: HeldWriteRecord) => {
       if (entry.phase !== 'posted_reload') return;
-      considerItem(entry.subject, entry.requestId, entry.readTarget);
+      considerItem(
+        entry.subject,
+        entry.requestId,
+        entry.readTarget,
+        entry.claimId,
+      );
     };
 
     for (const entry of postedReloads.values()) {
       consider(entry);
     }
     for (const [subject, ack] of acknowledgedInflight.entries()) {
-      considerItem(subject, ack.requestId, ack.readTarget);
+      considerItem(subject, ack.requestId, ack.readTarget, ack.record.claimId);
     }
     const listPrefix =
       filter.subject !== undefined
@@ -1692,15 +1845,18 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     return [...seen.values()];
   }
 
-  function clearPostedReloadSnapshot(
+  async function clearPostedReloadSnapshot(
     snapshot: PostedReloadSnapshot,
     loadedTarget?: string,
-  ): void {
+    shouldClear?: () => boolean,
+  ): Promise<void> {
     for (const item of snapshot) {
-      clearPostedReload(
+      await clearPostedReload(
         item.subject,
         loadedTarget ?? item.readTarget,
         item.requestId,
+        item,
+        shouldClear,
       );
     }
   }
@@ -1756,6 +1912,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     claimReplayHeldWrite,
     acquireHeldWriteLock,
     hasDurableHeldWrite,
+    readLockedHeldWrite,
     canDispatchHeldWrite,
     abortClaimBeforeDispatch,
     tryBeginHeldWrite,
@@ -1765,6 +1922,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     setHeldWritePhase,
     updateHeldWritePayload,
     clearHeldWrite,
+    clearVerifiedHeldWrite,
     hasPostedReload,
     hasPostedReloadForTarget,
     listPostedReloadRecords,
@@ -1797,6 +1955,7 @@ export const claimFreshHeldWrite = defaultStore.claimFreshHeldWrite;
 export const claimReplayHeldWrite = defaultStore.claimReplayHeldWrite;
 export const acquireHeldWriteLock = defaultStore.acquireHeldWriteLock;
 export const hasDurableHeldWrite = defaultStore.hasDurableHeldWrite;
+export const readLockedHeldWrite = defaultStore.readLockedHeldWrite;
 export const canDispatchHeldWrite = defaultStore.canDispatchHeldWrite;
 export const abortClaimBeforeDispatch = defaultStore.abortClaimBeforeDispatch;
 export const tryBeginHeldWrite = defaultStore.tryBeginHeldWrite;
@@ -1806,6 +1965,7 @@ export const putHeldWrite = defaultStore.putHeldWrite;
 export const setHeldWritePhase = defaultStore.setHeldWritePhase;
 export const updateHeldWritePayload = defaultStore.updateHeldWritePayload;
 export const clearHeldWrite = defaultStore.clearHeldWrite;
+export const clearVerifiedHeldWrite = defaultStore.clearVerifiedHeldWrite;
 export const hasPostedReload = defaultStore.hasPostedReload;
 export const hasPostedReloadForTarget = defaultStore.hasPostedReloadForTarget;
 export const listPostedReloadRecords = defaultStore.listPostedReloadRecords;

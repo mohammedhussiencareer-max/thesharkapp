@@ -549,7 +549,7 @@ export function PackagingEditor({
       }
       const reloaded = await onReload(expectedKey);
       if (reloaded !== false) {
-        clearActionPostedReload(subjectKey, subjectKey, requestId);
+        await clearActionPostedReload(subjectKey, subjectKey, requestId);
       }
       setNotice('التغليف اتحفظ');
     } catch (failure) {

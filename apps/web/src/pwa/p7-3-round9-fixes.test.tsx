@@ -388,7 +388,9 @@ describe('P7-3 round-9 review fixes', () => {
       claim.release();
 
       // Another tab clears the durable record from localStorage directly (before storage event fires in tab1).
-      tab2.clearHeldWrite('purchase:new', reqId);
+      const durable = tab2.readLockedHeldWrite('purchase:new');
+      expect(durable?.requestId).toBe(reqId);
+      tab2.clearHeldWrite('purchase:new', reqId, durable ?? undefined);
       expect(localStorage.length).toBe(0);
 
       // Tab 1 attempts to update phase or payload -> MUST re-read durable storage and skip (NOT resurrect!).
@@ -420,17 +422,23 @@ describe('P7-3 round-9 review fixes', () => {
     let rejectSupersedingCatalog!: (error: Error) => void;
 
     vi.mocked(updateItem).mockRejectedValueOnce(new StaleWriteError());
-    vi.mocked(listCostingSchedule).mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolveSchedule = resolve;
-        }),
+    vi.mocked(listCostingSchedule).mockImplementation((id) =>
+      id === 'box'
+        ? new Promise((resolve) => {
+            resolveSchedule = resolve;
+          })
+        : Promise.resolve({
+            lossToken: emptyScheduleToken,
+            identity: 'liter|ingredient||',
+            lossVersions: [],
+            conversions: [],
+          }),
     );
     let listCall = 0;
     vi.mocked(listItems).mockImplementation(() => {
       listCall += 1;
-      if (listCall === 1) return Promise.resolve([oilItem]);
-      // Superseding reloadCatalog('oil') triggered by onItemStale that will FAIL (no fresh row applied).
+      if (listCall === 1) return Promise.resolve([oilItem, boxItem]);
+      // Superseding reloadCatalog('box') triggered by onItemStale that will FAIL (no fresh row applied).
       return new Promise<CatalogItem[]>((_resolve, reject) => {
         rejectSupersedingCatalog = reject;
       });
@@ -451,15 +459,17 @@ describe('P7-3 round-9 review fixes', () => {
         <ItemsPage />
       </MemoryRouter>,
     );
-    fireEvent.click(await screen.findByRole('button', { name: 'تعديل' }));
+    const oil = await screen.findByRole('article', { name: 'زيت' });
+    const box = screen.getByRole('article', { name: 'علبة' });
+    fireEvent.click(within(box).getByRole('button', { name: 'التحويلات' }));
+    fireEvent.click(within(oil).getByRole('button', { name: 'تعديل' }));
     fireEvent.change(screen.getByLabelText('الاسم'), {
       target: { value: 'زيت قديم' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
 
     await waitFor(() => expect(byIdCall).toBe(1));
-    // While the stale refresh is in flight, ItemForm's schedule load reports a stale identity
-    // -> triggers reloadCatalog('oil'), superseding the in-flight stale refresh!
+    // A different item's panel observes stale identity and starts a newer catalog read.
     await act(async () => {
       resolveSchedule({
         lossToken: emptyScheduleToken,

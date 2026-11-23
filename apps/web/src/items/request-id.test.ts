@@ -1,3 +1,4 @@
+import { getHeldWrite } from '@/lib/held-writes';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { ConfirmedRefusalError } from '@/items/errors';
 import {
@@ -5,6 +6,7 @@ import {
   hasAction,
   heldAction,
   replaceActivationPayload,
+  pinActivationReviewReload,
   resetHeldWrites,
   settleAction,
   unknownAction,
@@ -54,11 +56,21 @@ describe('settleAction', () => {
     settleAction(subject, held.requestId, new Error('socket'));
     expect(unknownAction(subject)).toEqual(held);
 
-    replaceActivationPayload(subject, held.requestId, {
-      requestId: held.requestId,
-      manifestHash: 'b'.repeat(32),
-      explicitZeroItemIds: [],
-    });
+    pinActivationReviewReload(subject, held.requestId);
+    const pending = getHeldWrite(subject);
+    expect(pending?.awaitingReviewReload).toBe(true);
+    if (!pending) throw new Error('expected a pending review');
+
+    replaceActivationPayload(
+      subject,
+      held.requestId,
+      {
+        requestId: held.requestId,
+        manifestHash: 'b'.repeat(32),
+        explicitZeroItemIds: [],
+      },
+      pending,
+    );
     expect(unknownAction(subject)).toBeNull();
     expect(heldAction(subject)).toEqual({
       requestId: held.requestId,

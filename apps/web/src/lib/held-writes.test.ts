@@ -141,7 +141,7 @@ describe('held-writes store', () => {
     });
   });
 
-  it('keeps waiting_for_sync and posted_reload across reloads until cleared', () => {
+  it('keeps waiting_for_sync and posted_reload across reloads until cleared', async () => {
     setHeldWriteUser('user-a');
     putHeldWrite('count:daily', {
       requestId: 'req-wait',
@@ -165,10 +165,10 @@ describe('held-writes store', () => {
     expect(hasAnyHeldWrite()).toBe(true);
 
     // clearPostedReload clears only posted_reload, never waiting_for_sync.
-    clearPostedReload('count:daily');
+    await clearPostedReload('count:daily');
     expect(getHeldWrite('count:daily')?.phase).toBe('waiting_for_sync');
 
-    clearPostedReload('sort:new');
+    await clearPostedReload('sort:new');
     expect(getHeldWrite('sort:new')).toBeNull();
   });
 
@@ -500,7 +500,7 @@ describe('held-writes store', () => {
     }
   });
 
-  it('R3-1d: clearPostedReload requires BOTH matching requestId and readTarget', () => {
+  it('R3-1d: clearPostedReload requires BOTH matching requestId and readTarget', async () => {
     setHeldWriteUser('user-a');
     putHeldWrite('expense:new', {
       requestId: 'req-exp-1',
@@ -513,19 +513,19 @@ describe('held-writes store', () => {
     });
 
     // Clearing without target must NOT clear a targeted posted_reload pin.
-    clearPostedReload('expense:new');
+    await clearPostedReload('expense:new');
     expect(hasPostedReload('expense:new', '2030-03-01')).toBe(true);
 
     // Clearing with wrong target must NOT clear.
-    clearPostedReload('expense:new', '2030-04-01');
+    await clearPostedReload('expense:new', '2030-04-01');
     expect(hasPostedReload('expense:new', '2030-03-01')).toBe(true);
 
     // Clearing with matching target + WRONG requestId must NOT clear.
-    clearPostedReload('expense:new', '2030-03-01', 'req-exp-wrong');
+    await clearPostedReload('expense:new', '2030-03-01', 'req-exp-wrong');
     expect(hasPostedReload('expense:new', '2030-03-01')).toBe(true);
 
     // Clearing with matching target AND matching requestId clears it.
-    clearPostedReload('expense:new', '2030-03-01', 'req-exp-1');
+    await clearPostedReload('expense:new', '2030-03-01', 'req-exp-1');
     expect(hasPostedReload('expense:new', '2030-03-01')).toBe(false);
   });
 

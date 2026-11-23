@@ -214,23 +214,12 @@ export function ItemsPage() {
   }, []);
 
   const syncFormBaseline = useCallback(
-    (
-      fresh: CatalogItem,
-      opts?: { forceSyncBaseline?: boolean; bumpFormEpoch?: boolean },
-    ) => {
+    (fresh: CatalogItem, opts?: { forceSyncBaseline?: boolean }) => {
       const editing = formModeRef.current;
       if (editing?.type !== 'edit' || editing.id !== fresh.id) return;
       const nextExp = expectationFromItem(fresh);
-      if (opts?.forceSyncBaseline) {
-        expectedRef.current = nextExp;
-        if (opts.bumpFormEpoch) {
-          formDetailsDirtyRef.current = false;
-          setFormEpoch((value) => value + 1);
-        }
-        setFreshItemNoticeId(null);
-        return;
-      }
-      if (!formDetailsDirtyRef.current) {
+      if (opts?.forceSyncBaseline || !formDetailsDirtyRef.current) {
+        formDetailsDirtyRef.current = false;
         expectedRef.current = nextExp;
         setFormEpoch((value) => value + 1);
         setFreshItemNoticeId(null);
@@ -346,8 +335,6 @@ export function ItemsPage() {
       },
       opts?: {
         forceSyncBaseline?: boolean;
-        bumpFormEpoch?: boolean;
-        clearPins?: PostedReloadSnapshot;
       },
     ): boolean => {
       if (!isLatestForItem(itemId, token)) return false;
@@ -382,9 +369,6 @@ export function ItemsPage() {
       if (payload.item) {
         syncFormBaseline(payload.item, opts);
       }
-      if (opts?.clearPins && opts.clearPins.length > 0) {
-        clearCostingPinsForItem(opts.clearPins, itemId);
-      }
       return true;
     },
     [isLatestForItem, syncFormBaseline],
@@ -400,53 +384,35 @@ export function ItemsPage() {
       itemId: string,
       request: ItemReadRequest,
     ): Promise<ItemReadOutcome> => {
+      const token = beginItemRead(itemId);
+      const isLatest = () => isLatestForItem(itemId, token);
       if (request.kind === 'loss' || request.kind === 'conversion') {
-        const token = beginItemRead(itemId);
         const readSession = captureWriteSession();
         catalogLoadsRef.current += 1;
         setCatalogLoads(catalogLoadsRef.current);
         try {
-          if (request.kind === 'loss') {
-            const verified = await verifyLossItem(itemId);
-            if (!isLatestForItem(itemId, token)) {
-              return { status: 'superseded' };
-            }
-            dataSessionRef.current = readSession;
-            applyItemTransition(
-              itemId,
-              token,
-              { item: verified.item, schedule: verified.schedule },
-              { clearPins: request.snapshots },
-            );
-            return {
-              status: 'applied',
-              item: verified.item,
-              schedule: verified.schedule,
-            };
-          }
-          const verified = await verifyConversionItem(itemId);
-          if (!isLatestForItem(itemId, token)) {
-            return { status: 'superseded' };
-          }
-          dataSessionRef.current = readSession;
-          applyItemTransition(
+          const verified: {
+            item: CatalogItem;
+            schedule: CostingSchedule;
+            conversions?: ConversionList;
+          } =
+            request.kind === 'loss'
+              ? await verifyLossItem(itemId)
+              : await verifyConversionItem(itemId);
+          if (!isLatest()) return { status: 'superseded' };
+          // Check the read token again under each subject lock. Finish
+          // verification before publishing an identity that starts new reads.
+          await clearCostingPinsForItem(
+            request.snapshots ?? [],
             itemId,
-            token,
-            {
-              item: verified.item,
-              schedule: verified.schedule,
-              conversions: verified.conversions,
-            },
-            { clearPins: request.snapshots },
+            isLatest,
           );
-          return {
-            status: 'applied',
-            item: verified.item,
-            schedule: verified.schedule,
-            conversions: verified.conversions,
-          };
+          if (!isLatest()) return { status: 'superseded' };
+          dataSessionRef.current = readSession;
+          applyItemTransition(itemId, token, verified);
+          return { status: 'applied', ...verified };
         } catch (error) {
-          if (!isLatestForItem(itemId, token)) {
+          if (!isLatest()) {
             return { status: 'superseded' };
           }
           throw error;
@@ -456,57 +422,22 @@ export function ItemsPage() {
         }
       }
 
-      // Passive panel/form read (no pending pin): uses the same monotonic clock
-      // so it can never overwrite schedule/conversions from a newer item read,
-      // without locking page-level details edits while opening.
-      const token = ++readSeqRef.current;
-      if (request.kind === 'schedule') {
-        const nextSchedule = await listCostingSchedule(itemId);
-        if (token > (itemAppliedSeqRef.current.get(itemId) ?? 0)) {
-          setCatalogState((state) => {
-            const prev = state.byId[itemId];
-            if (prev && prev.version > token) return state;
-            return {
-              items: state.items,
-              byId: {
-                ...state.byId,
-                [itemId]: {
-                  version: token,
-                  schedule: nextSchedule,
-                  conversions: prev?.conversions,
-                },
-              },
-            };
-          });
+      // Passive loads share the ordering without blocking details edits.
+      try {
+        const [schedule, conversions] = await Promise.all([
+          listCostingSchedule(itemId),
+          request.kind === 'conversions_open'
+            ? listConversions(itemId)
+            : undefined,
+        ]);
+        if (!applyItemTransition(itemId, token, { schedule, conversions })) {
+          return { status: 'superseded' };
         }
-        return { status: 'applied', schedule: nextSchedule };
+        return { status: 'applied', schedule, conversions };
+      } catch (error) {
+        if (!isLatest()) return { status: 'superseded' };
+        throw error;
       }
-      const [nextConversions, nextSchedule] = await Promise.all([
-        listConversions(itemId),
-        listCostingSchedule(itemId),
-      ]);
-      if (token > (itemAppliedSeqRef.current.get(itemId) ?? 0)) {
-        setCatalogState((state) => {
-          const prev = state.byId[itemId];
-          if (prev && prev.version > token) return state;
-          return {
-            items: state.items,
-            byId: {
-              ...state.byId,
-              [itemId]: {
-                version: token,
-                schedule: nextSchedule,
-                conversions: nextConversions,
-              },
-            },
-          };
-        });
-      }
-      return {
-        status: 'applied',
-        schedule: nextSchedule,
-        conversions: nextConversions,
-      };
     },
     [applyItemTransition, beginItemRead, isLatestForItem],
   );
@@ -528,10 +459,7 @@ export function ItemsPage() {
       const fresh = next.find((row) => row.id === current.itemId);
       // Never mark verification done when the affected item is absent from the catalog response.
       if (!fresh) return;
-      syncFormBaseline(fresh, {
-        forceSyncBaseline: true,
-        bumpFormEpoch: true,
-      });
+      syncFormBaseline(fresh, { forceSyncBaseline: true });
       if (current.reason === 'stale') {
         setFormError(staleWriteMessage);
         setDetailsVerifyState(null);
@@ -594,7 +522,6 @@ export function ItemsPage() {
     if (!loaded) return false;
     applyCatalogRows(loaded.rows, loaded.token);
     setLoadError(null);
-    clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
     reconcileDetailsVerifyOnCatalog(loaded.rows, loaded.token);
     setLocalNeedsReload(false);
     const editing = formModeRef.current;
@@ -605,25 +532,17 @@ export function ItemsPage() {
         if (byId.status === 'superseded') return false;
         fresh = byId.item;
         if (fresh) {
-          applyItemTransition(
-            staleItemId,
-            byId.token,
-            { item: fresh },
-            { forceSyncBaseline: true, bumpFormEpoch: true },
-          );
+          applyItemTransition(staleItemId, byId.token, { item: fresh });
         }
       } else {
-        syncFormBaseline(fresh, {
-          forceSyncBaseline: true,
-          bumpFormEpoch: true,
-        });
+        if (isLatestForItem(staleItemId, loaded.token)) syncFormBaseline(fresh);
       }
       if (!fresh) {
         throw new Error(genericCatalogError);
       }
       setFormError(staleMessage);
-      return true;
     }
+    await clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
     return true;
   }
 
@@ -664,7 +583,7 @@ export function ItemsPage() {
         itemId,
         result.token,
         { item: result.item },
-        { forceSyncBaseline: true, bumpFormEpoch: true },
+        { forceSyncBaseline: true },
       );
       setLoadError(null);
       setFormError(staleWriteMessage);
@@ -701,7 +620,7 @@ export function ItemsPage() {
             pendingItemId,
             result.token,
             { item: result.item },
-            { forceSyncBaseline: true, bumpFormEpoch: true },
+            { forceSyncBaseline: true },
           );
           pendingSavedItemIdRef.current = null;
           setLoadError(null);
@@ -711,7 +630,7 @@ export function ItemsPage() {
           if (cancelled || !loaded) return;
           applyCatalogRows(loaded.rows, loaded.token);
           setLoadError(null);
-          clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
+          await clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
           reconcileDetailsVerifyOnCatalog(loaded.rows, loaded.token);
           setLocalNeedsReload(false);
         }
@@ -792,7 +711,7 @@ export function ItemsPage() {
         current.itemId,
         result.token,
         { item: result.item },
-        { forceSyncBaseline: true, bumpFormEpoch: true },
+        { forceSyncBaseline: true },
       );
       setLoadError(null);
       setDetailsVerifyState({
@@ -952,7 +871,7 @@ export function ItemsPage() {
             started.id,
             result.token,
             { item: result.item },
-            { forceSyncBaseline: true, bumpFormEpoch: true },
+            { forceSyncBaseline: true },
           );
           setLoadError(null);
           setDetailsVerifyState({
@@ -1020,7 +939,7 @@ export function ItemsPage() {
       if (loaded) {
         applyCatalogRows(loaded.rows, loaded.token);
         setLoadError(null);
-        clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
+        await clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
         reconcileDetailsVerifyOnCatalog(loaded.rows, loaded.token);
         setLocalNeedsReload(false);
       }

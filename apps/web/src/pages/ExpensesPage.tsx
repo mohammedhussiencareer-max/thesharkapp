@@ -37,6 +37,7 @@ import {
   claimFreshHeldWrite,
   claimReplayHeldWrite,
   clearHeldWrite,
+  clearVerifiedHeldWrite,
   clearPostedReloadSnapshot,
   getHeldWrite,
   hasDurableHeldWrite,
@@ -217,7 +218,9 @@ export function ExpensesPage() {
     [],
   );
 
-  function reconcileCommittedVoids(entries: readonly ExpenseLine[]): void {
+  async function reconcileCommittedVoids(
+    entries: readonly ExpenseLine[],
+  ): Promise<void> {
     const voidedIds = new Set(
       entries.filter((line) => line.voided).map((line) => line.id),
     );
@@ -228,7 +231,7 @@ export function ExpensesPage() {
     )) {
       if (record.phase !== 'unknown' || !record.payload) continue;
       if (voidedIds.has(record.payload.id)) {
-        clearHeldWrite(record.subject, record.requestId);
+        await clearVerifiedHeldWrite(record);
         voidRequestIdsRef.current.delete(record.payload.id);
         clearedIds.push(record.payload.id);
       }
@@ -421,9 +424,9 @@ export function ExpensesPage() {
         dataSessionRef.current = result.readSession;
         setData(result.data);
         setLoadError(null);
-        reconcileCommittedVoids(result.data.entries);
+        await reconcileCommittedVoids(result.data.entries);
         reconcileRequestlessVerifyOnMonth(result.data);
-        clearPostedReloadSnapshot(pendingReloads, result.data.monthStart);
+        await clearPostedReloadSnapshot(pendingReloads, result.data.monthStart);
         needsReloadRef.current = false;
         setLocalNeedsReload(false);
       } catch (error) {
@@ -491,9 +494,9 @@ export function ExpensesPage() {
         dataSessionRef.current = result.readSession;
         setData(fresh);
         setLoadError(null);
-        reconcileCommittedVoids(fresh.entries);
+        await reconcileCommittedVoids(fresh.entries);
       }
-      clearPostedReloadSnapshot(pendingReloads, fresh.monthStart);
+      await clearPostedReloadSnapshot(pendingReloads, fresh.monthStart);
       setVerify({ targetMonth, status: 'verified', readError: null });
       reconcileRequestlessVerifyOnMonth(fresh);
     } catch (readError) {
@@ -551,9 +554,12 @@ export function ExpensesPage() {
             dataSessionRef.current = result.readSession;
             setData(result.data);
             setLoadError(null);
-            reconcileCommittedVoids(result.data.entries);
+            await reconcileCommittedVoids(result.data.entries);
           }
-          clearPostedReloadSnapshot(pendingReloads, result.data.monthStart);
+          await clearPostedReloadSnapshot(
+            pendingReloads,
+            result.data.monthStart,
+          );
           needsReloadRef.current = false;
           setLocalNeedsReload(false);
         }
@@ -581,9 +587,9 @@ export function ExpensesPage() {
           dataSessionRef.current = result.readSession;
           setData(fresh);
           setLoadError(null);
-          reconcileCommittedVoids(fresh.entries);
+          await reconcileCommittedVoids(fresh.entries);
         }
-        clearPostedReloadSnapshot(pendingReloads, fresh.monthStart);
+        await clearPostedReloadSnapshot(pendingReloads, fresh.monthStart);
         setVerify({ targetMonth, status: 'verified', readError: null });
       } catch (readError) {
         setVerify({
@@ -645,8 +651,8 @@ export function ExpensesPage() {
         if (next) {
           setData(next);
           setLoadError(null);
-          reconcileCommittedVoids(next.entries);
-          clearPostedReloadSnapshot(pendingReloads, next.monthStart);
+          await reconcileCommittedVoids(next.entries);
+          await clearPostedReloadSnapshot(pendingReloads, next.monthStart);
           needsReloadRef.current = false;
           setLocalNeedsReload(false);
         }

@@ -130,7 +130,7 @@ export function RecipeDetails({
       releaseLock = () => {};
       const fresh = await onReload();
       if (fresh !== null) {
-        clearActionPostedReload(subject, subject, requestId);
+        await clearActionPostedReload(subject, subject, requestId);
       }
       adopt(
         fresh ?? {
