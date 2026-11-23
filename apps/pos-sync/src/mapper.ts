@@ -80,6 +80,12 @@ function documentFields(fields: unknown): Record<string, unknown> {
   return fields;
 }
 
+/** Normalizes optional POS text the same way for orders and catalog sizes. */
+export function normalizeOptionalText(value: string): string | null {
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : trimmed;
+}
+
 function optionalString(value: unknown, label: string): string | null {
   if (value === undefined || isNullValue(value)) {
     return null;
@@ -91,8 +97,7 @@ function optionalString(value: unknown, label: string): string | null {
   if (typeof decoded !== 'string') {
     throw new Error(`unexpected ${label}`);
   }
-  const trimmed = decoded.trim();
-  return trimmed.length === 0 ? null : trimmed;
+  return normalizeOptionalText(decoded);
 }
 
 function requiredString(value: unknown, label: string): string {

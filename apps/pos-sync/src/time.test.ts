@@ -21,5 +21,17 @@ describe('normalizeTimestamp', () => {
     expect(() => normalizeTimestamp('2026-13-40T00:00:00Z')).toThrow(
       /invalid timestamp/,
     );
+    expect(() => normalizeTimestamp('2026-02-30T10:00:00Z')).toThrow(
+      /invalid timestamp/,
+    );
+    expect(() => normalizeTimestamp('2025-02-29T10:00:00Z')).toThrow(
+      /invalid timestamp/,
+    );
+    expect(() => normalizeTimestamp('2026-04-31T10:00:00Z')).toThrow(
+      /invalid timestamp/,
+    );
+    expect(normalizeTimestamp('2024-02-29T10:00:00Z')).toBe(
+      '2024-02-29T10:00:00.000000Z',
+    );
   });
 });

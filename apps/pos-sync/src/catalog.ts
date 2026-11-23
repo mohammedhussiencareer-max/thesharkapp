@@ -1,11 +1,14 @@
 import {
-  isCustomerShapedPath,
-  isPriceShapedPath,
-} from './catalog-allowlist.ts';
+  assertNoPriceShapedKeys,
+  hasCustomerShapedSchemaKey,
+} from './catalog-refusals.ts';
 import { isRecord, isSafeDocumentId, splitDocumentName } from './decode.ts';
 import { canonicalJson, compareId, sha256Canonical } from './hash.ts';
+import { normalizeOptionalText } from './mapper.ts';
 import type { FirestoreRestDocument } from './pos-firestore.ts';
 import { normalizeTimestamp } from './time.ts';
+
+export { assertNoPriceShapedKeys } from './catalog-refusals.ts';
 
 export type PosSizeKey = readonly ['none'] | readonly ['name', string];
 
@@ -59,131 +62,8 @@ export type ParsedCatalogOptionGroup =
   | { outcome: 'rejected'; group_id: string };
 
 const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-const MAX_WALK_DEPTH = 32;
 
 class MalformedCatalogFieldError extends Error {}
-
-function walkFirestoreValueForCustomerKey(
-  value: unknown,
-  path: string,
-  depth: number,
-): boolean {
-  if (depth > MAX_WALK_DEPTH) {
-    throw new MalformedCatalogFieldError('excessive nesting');
-  }
-  if (Array.isArray(value)) {
-    const arrayPath = `${path}[]`;
-    for (const entry of value) {
-      if (walkFirestoreValueForCustomerKey(entry, arrayPath, depth + 1)) {
-        return true;
-      }
-    }
-    return false;
-  }
-  if (!isRecord(value)) {
-    return false;
-  }
-  const keys = Object.keys(value);
-  if (keys.length === 1 && keys[0] === 'mapValue' && isRecord(value.mapValue)) {
-    for (const mapKey of Object.keys(value.mapValue)) {
-      if (mapKey === 'fields' && isRecord(value.mapValue.fields)) {
-        if (
-          walkFirestoreFieldsForCustomerKey(
-            value.mapValue.fields,
-            path,
-            depth + 1,
-          )
-        ) {
-          return true;
-        }
-      } else {
-        const extraPath = path === '' ? mapKey : `${path}.${mapKey}`;
-        if (
-          isCustomerShapedPath(extraPath) ||
-          walkFirestoreValueForCustomerKey(
-            value.mapValue[mapKey],
-            extraPath,
-            depth + 1,
-          )
-        ) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-  if (
-    keys.length === 1 &&
-    keys[0] === 'arrayValue' &&
-    isRecord(value.arrayValue)
-  ) {
-    for (const arrKey of Object.keys(value.arrayValue)) {
-      if (arrKey === 'values' && Array.isArray(value.arrayValue.values)) {
-        const arrayPath = `${path}[]`;
-        for (const entry of value.arrayValue.values) {
-          if (walkFirestoreValueForCustomerKey(entry, arrayPath, depth + 1)) {
-            return true;
-          }
-        }
-      } else {
-        const extraPath = path === '' ? arrKey : `${path}.${arrKey}`;
-        if (
-          isCustomerShapedPath(extraPath) ||
-          walkFirestoreValueForCustomerKey(
-            value.arrayValue[arrKey],
-            extraPath,
-            depth + 1,
-          )
-        ) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-  for (const [key, child] of Object.entries(value)) {
-    const childPath = path === '' ? key : `${path}.${key}`;
-    if (
-      isCustomerShapedPath(childPath) ||
-      walkFirestoreValueForCustomerKey(child, childPath, depth + 1)
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function walkFirestoreFieldsForCustomerKey(
-  fields: Record<string, unknown>,
-  prefix: string,
-  depth: number,
-): boolean {
-  if (depth > MAX_WALK_DEPTH) {
-    throw new MalformedCatalogFieldError('excessive nesting');
-  }
-  for (const [key, value] of Object.entries(fields)) {
-    const path = prefix === '' ? key : `${prefix}.${key}`;
-    if (isCustomerShapedPath(path)) {
-      return true;
-    }
-    if (walkFirestoreValueForCustomerKey(value, path, depth + 1)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function hasCustomerShapedKey(document: FirestoreRestDocument): boolean {
-  for (const key of Object.keys(document)) {
-    if (isCustomerShapedPath(key)) {
-      return true;
-    }
-  }
-  if (isRecord(document.fields)) {
-    return walkFirestoreFieldsForCustomerKey(document.fields, '', 0);
-  }
-  return false;
-}
 
 function btrimSpaces(value: string): string {
   return value.replace(/^ +| +$/g, '');
@@ -308,7 +188,8 @@ function readSizes(raw: unknown): PosCatalogSize[] {
     if (rawName === undefined || isNullValue(rawName)) {
       sizeKey = posSizeKey(null);
     } else {
-      sizeKey = posSizeKey(readStringValue(rawName));
+      // Apply the exact same JS trim normalization as mapper.ts before pos_size_key.
+      sizeKey = posSizeKey(normalizeOptionalText(readStringValue(rawName)));
     }
     const sizeName = sizeKey[0] === 'name' ? sizeKey[1] : null;
     const keyText = canonicalJson(sizeKey);
@@ -321,12 +202,9 @@ function readSizes(raw: unknown): PosCatalogSize[] {
     .map(([, size]) => size);
 }
 
-function readSharedOptionGroupIds(raw: unknown): {
-  labels: Set<string>;
-  groupIds: string[];
-} {
+function readSharedOptionGroupIds(raw: unknown): string[] {
   if (raw === undefined || isNullValue(raw)) {
-    return { labels: new Set(), groupIds: [] };
+    return [];
   }
   const mapFields = readMapFields(raw);
   const labels = new Set<string>();
@@ -346,7 +224,7 @@ function readSharedOptionGroupIds(raw: unknown): {
     labels.add(label);
     ids.add(groupId);
   }
-  return { labels, groupIds: [...ids].sort(compareId) };
+  return [...ids].sort(compareId);
 }
 
 function readOptionValues(raw: unknown): string[] {
@@ -359,16 +237,18 @@ function readOptionValues(raw: unknown): string[] {
   return [...values].sort(compareId);
 }
 
-function readItemLocalOptionGroups(
-  raw: unknown,
-  sharedLabels: ReadonlySet<string>,
-): Record<string, string[]> {
+/**
+ * Preserves every inline option group on the item (including copies of shared
+ * groups) so item-scoped option subjects remain available even when the text
+ * matches a global option group value.
+ */
+function readItemOptionGroups(raw: unknown): Record<string, string[]> {
   if (raw === undefined || isNullValue(raw)) {
     return {};
   }
   const mapFields = readMapFields(raw);
   const seenLabels = new Set<string>();
-  const localGroups = new Map<string, string[]>();
+  const groups = new Map<string, string[]>();
   for (const [rawLabel, rawGroup] of Object.entries(mapFields)) {
     const label = rawLabel.trim();
     if (label.length === 0 || RESERVED_KEYS.has(label)) {
@@ -378,14 +258,11 @@ function readItemLocalOptionGroups(
       throw new MalformedCatalogFieldError('duplicate option group label');
     }
     seenLabels.add(label);
-    const values = readOptionValues(rawGroup);
-    if (!sharedLabels.has(label)) {
-      localGroups.set(label, values);
-    }
+    groups.set(label, readOptionValues(rawGroup));
   }
   const sorted: Record<string, string[]> = {};
-  for (const label of [...localGroups.keys()].sort(compareId)) {
-    const values = localGroups.get(label);
+  for (const label of [...groups.keys()].sort(compareId)) {
+    const values = groups.get(label);
     if (values !== undefined) {
       sorted[label] = values;
     }
@@ -418,38 +295,6 @@ export function catalogItemContentHash(item: StoredCatalogItem): string {
   return sha256Canonical(normalizedHashBody(item));
 }
 
-function walkPayloadForPriceKey(
-  value: unknown,
-  prefix: string,
-  depth: number,
-): void {
-  if (depth > MAX_WALK_DEPTH) {
-    throw new Error('Catalog payload refused: excessive nesting');
-  }
-  if (Array.isArray(value)) {
-    const arrayPrefix = `${prefix}[]`;
-    for (const entry of value) {
-      walkPayloadForPriceKey(entry, arrayPrefix, depth + 1);
-    }
-    return;
-  }
-  if (!isRecord(value)) {
-    return;
-  }
-  for (const [key, child] of Object.entries(value)) {
-    const path = prefix === '' ? key : `${prefix}.${key}`;
-    if (isPriceShapedPath(path)) {
-      throw new Error('Catalog payload refused: price-shaped key');
-    }
-    walkPayloadForPriceKey(child, path, depth + 1);
-  }
-}
-
-/** Refuses any built catalog payload that contains a price-shaped key at any depth. */
-export function assertNoPriceShapedKeys(payload: unknown): void {
-  walkPayloadForPriceKey(payload, '', 0);
-}
-
 export function parseCatalogItemDocument(
   document: FirestoreRestDocument,
 ): ParsedCatalogItem {
@@ -460,15 +305,11 @@ export function parseCatalogItemDocument(
   if (collection !== 'items') {
     throw new Error('invalid catalog item document name');
   }
-  try {
-    if (hasCustomerShapedKey(document)) {
-      return { outcome: 'rejected', pos_item_id: posItemId };
-    }
-  } catch (error) {
-    if (error instanceof MalformedCatalogFieldError) {
-      return { outcome: 'rejected', pos_item_id: posItemId };
-    }
-    throw error;
+  if (
+    document.rejected === true ||
+    hasCustomerShapedSchemaKey(document, 'items')
+  ) {
+    return { outcome: 'rejected', pos_item_id: posItemId };
   }
   if (!isRecord(document.fields)) {
     return { outcome: 'rejected', pos_item_id: posItemId };
@@ -488,19 +329,18 @@ export function parseCatalogItemDocument(
   try {
     const name = readRequiredTrimmedString(field(document.fields, 'name'));
     const sizes = readSizes(field(document.fields, 'sizes'));
-    const shared = readSharedOptionGroupIds(
+    const sharedOptionGroupIds = readSharedOptionGroupIds(
       field(document.fields, 'sharedOptionGroupIds'),
     );
-    const itemOptionGroups = readItemLocalOptionGroups(
+    const itemOptionGroups = readItemOptionGroups(
       field(document.fields, 'options'),
-      shared.labels,
     );
     const stored: StoredCatalogItem = {
       pos_item_id: posItemId,
       name,
       sizes,
       item_option_groups: itemOptionGroups,
-      shared_option_group_ids: shared.groupIds,
+      shared_option_group_ids: sharedOptionGroupIds,
     };
     return {
       outcome: 'accepted',
@@ -528,15 +368,11 @@ export function parseCatalogOptionGroupDocument(
   if (collection !== 'optionGroups') {
     throw new Error('invalid catalog option group document name');
   }
-  try {
-    if (hasCustomerShapedKey(document)) {
-      return { outcome: 'rejected', group_id: groupId };
-    }
-  } catch (error) {
-    if (error instanceof MalformedCatalogFieldError) {
-      return { outcome: 'rejected', group_id: groupId };
-    }
-    throw error;
+  if (
+    document.rejected === true ||
+    hasCustomerShapedSchemaKey(document, 'optionGroups')
+  ) {
+    return { outcome: 'rejected', group_id: groupId };
   }
   if (!isRecord(document.fields)) {
     return { outcome: 'rejected', group_id: groupId };

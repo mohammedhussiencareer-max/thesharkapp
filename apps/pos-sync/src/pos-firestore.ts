@@ -2,6 +2,7 @@ export type FirestoreRestDocument = {
   name: string;
   updateTime?: string;
   fields?: Record<string, unknown>;
+  rejected?: true;
 };
 
 export type ListQuery = {

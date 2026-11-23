@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { decodeFirestoreValue, splitDocumentName } from './decode.ts';
+import {
+  decodeFirestoreValue,
+  isSafeDocumentId,
+  splitDocumentName,
+} from './decode.ts';
 
 describe('decodeFirestoreValue', () => {
   it('decodes the REST value types', () => {
@@ -73,6 +77,12 @@ describe('splitDocumentName', () => {
     expect(() =>
       splitDocumentName(
         'projects/thesharkrestaurant/databases/(default)/documents/customers/a',
+      ),
+    ).toThrow(/invalid/);
+    expect(isSafeDocumentId('item\0id')).toBe(false);
+    expect(() =>
+      splitDocumentName(
+        'projects/thesharkrestaurant/databases/(default)/documents/items/item\0id',
       ),
     ).toThrow(/invalid/);
   });

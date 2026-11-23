@@ -1,8 +1,10 @@
+import { hasCustomerShapedSchemaKey } from './catalog-refusals.ts';
 import {
   isRecord,
   isSafeDocumentId,
   splitDocumentName,
   splitTransactionName,
+  type PosCollection,
 } from './decode.ts';
 import type {
   FirestoreRestDocument,
@@ -109,6 +111,12 @@ export function assertFirestoreReadAllowed(
     throw new Error('Firestore read refused');
   }
   if (parsed.port !== '' && parsed.port !== '443') {
+    throw new Error('Firestore read refused');
+  }
+  // Refuse dot-segment or backslash traversal even when URL normalization
+  // resolves to an allowed collection path (e.g. /items/../optionGroups).
+  const rawPathMatch = /^https:\/\/[^/?#\s]+(\/[^?#]*)(?:[?#]|$)/i.exec(url);
+  if (rawPathMatch === null || rawPathMatch[1] !== parsed.pathname) {
     throw new Error('Firestore read refused');
   }
   if (verb === 'POST') {
@@ -507,7 +515,7 @@ function isRfc3339(value: unknown): boolean {
   return Number.isFinite(Date.parse(`${date}T${time}.${millis}${offset}`));
 }
 
-function assertKnownDocumentName(name: string): void {
+function assertKnownDocumentName(name: string): PosCollection | 'transactions' {
   const rest = name.startsWith(
     'projects/thesharkrestaurant/databases/(default)/documents/',
   )
@@ -518,21 +526,30 @@ function assertKnownDocumentName(name: string): void {
   const depth = rest === '' ? 0 : rest.split('/').length;
   if (depth === 4) {
     splitTransactionName(name);
-    return;
+    return 'transactions';
   }
-  splitDocumentName(name);
+  return splitDocumentName(name).collection;
 }
 
 function requireDocument(value: unknown): FirestoreRestDocument {
   if (!isRecord(value) || typeof value.name !== 'string') {
     throw new Error('Firestore read failed: invalid response');
   }
+  let collection: PosCollection | 'transactions';
   try {
-    assertKnownDocumentName(value.name);
+    collection = assertKnownDocumentName(value.name);
   } catch (error) {
     throw new Error('Firestore read failed: invalid response', {
       cause: error,
     });
+  }
+  // Scan the raw catalog document (including any extra envelope properties)
+  // before projection so customer-shaped keys cannot be stripped silently.
+  if (
+    (collection === 'items' || collection === 'optionGroups') &&
+    hasCustomerShapedSchemaKey(value, collection)
+  ) {
+    return { name: value.name, rejected: true };
   }
   const document: FirestoreRestDocument = { name: value.name };
   if (value.updateTime !== undefined) {

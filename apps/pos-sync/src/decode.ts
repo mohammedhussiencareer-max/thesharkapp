@@ -96,6 +96,12 @@ export function isSafeDocumentId(id: string): boolean {
   if (id === '.' || id === '..' || id.includes('..')) {
     return false;
   }
+  for (let index = 0; index < id.length; index += 1) {
+    const code = id.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) {
+      return false;
+    }
+  }
   return !/[/%:?#\\\s]/.test(id);
 }
 

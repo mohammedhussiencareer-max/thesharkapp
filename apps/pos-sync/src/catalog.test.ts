@@ -1,9 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import {
-  CATALOG_REJECTED_FIELDS,
-  isCustomerShapedPath,
-  isPriceShapedPath,
-} from './catalog-allowlist.ts';
+import { CATALOG_REJECTED_FIELDS } from './catalog-allowlist.ts';
+import { isCustomerShapedKey, isPriceShapedKey } from './catalog-refusals.ts';
 import {
   assertNoPriceShapedKeys,
   catalogItemContentHash,
@@ -12,6 +9,8 @@ import {
   parseCatalogOptionGroupDocument,
   posSizeKey,
 } from './catalog.ts';
+import { parseListResponse } from './firestore-read.ts';
+import { mapOrderDocument } from './mapper.ts';
 import type { FirestoreRestDocument } from './pos-firestore.ts';
 
 const DOC_ROOT = 'projects/thesharkrestaurant/databases/(default)/documents';
@@ -62,23 +61,33 @@ function groupDoc(
   };
 }
 
-function collectKeyPaths(
+function collectSchemaKeys(
   value: unknown,
-  prefix = '',
+  segments: readonly string[] = [],
   found: string[] = [],
 ): string[] {
   if (Array.isArray(value)) {
-    const arrayPrefix = `${prefix}[]`;
+    const next = [...segments, '[]'];
     for (const entry of value) {
-      collectKeyPaths(entry, arrayPrefix, found);
+      collectSchemaKeys(entry, next, found);
     }
     return found;
   }
   if (value !== null && typeof value === 'object') {
+    const keysAreLabels =
+      segments.length === 3 &&
+      segments[0] === 'items' &&
+      segments[1] === '[]' &&
+      segments[2] === 'item_option_groups';
     for (const [key, child] of Object.entries(value)) {
-      const path = prefix === '' ? key : `${prefix}.${key}`;
-      found.push(path);
-      collectKeyPaths(child, path, found);
+      if (!keysAreLabels) {
+        found.push(key);
+      }
+      collectSchemaKeys(
+        child,
+        [...segments, keysAreLabels ? '<label>' : key],
+        found,
+      );
     }
   }
   return found;
@@ -269,6 +278,63 @@ describe('posSizeKey parity with app.pos_size_key', () => {
     // PostgreSQL btrim(text) strips ASCII space (' ') only, not tabs.
     expect(posSizeKey('\t')).toEqual(['name', '\t']);
   });
+
+  it('matches order mapper normalization + app.pos_size_key across whitespace inputs', () => {
+    const inputs = [
+      '',
+      '   ',
+      '\t',
+      '\tRegular\t',
+      '\r\n  صغير \t',
+      '  صغير  ',
+      'none',
+      '  none  ',
+      'small  size',
+    ];
+    for (const rawSize of inputs) {
+      const order = mapOrderDocument({
+        name: `${DOC_ROOT}/orders/order-syn-size-parity`,
+        updateTime: '2026-11-20T10:00:00Z',
+        fields: {
+          status: str('complete'),
+          shiftId: str('shift-syn-1'),
+          timestamp: { timestampValue: '2026-11-20T10:00:00Z' },
+          subtotalAmount: dbl(10),
+          discountAmount: dbl(0),
+          taxTotalAmount: dbl(0),
+          serviceTaxAmount: dbl(0),
+          totalAmount: dbl(10),
+          items: arr([
+            map({
+              orderItemId: str('line-1'),
+              itemId: str('item-syn-size-parity'),
+              name: str('Synthetic Dish'),
+              quantity: int(1),
+              price: dbl(10),
+              selectedSize: map({ name: str(rawSize) }),
+            }),
+          ]),
+        },
+      });
+      const catalog = parseCatalogItemDocument(
+        itemDoc('item-syn-size-parity', {
+          name: str('Synthetic Dish'),
+          sizes: arr([map({ name: str(rawSize) })]),
+        }),
+      );
+      expect(catalog.outcome).toBe('accepted');
+      if (catalog.outcome !== 'accepted') {
+        throw new Error('expected accepted');
+      }
+      const orderSizeName = order.lines[0]?.size_name ?? null;
+      expect(catalog.item.sizes[0]?.size_name, JSON.stringify(rawSize)).toBe(
+        orderSizeName,
+      );
+      expect(catalog.item.sizes[0]?.size_key, JSON.stringify(rawSize)).toEqual(
+        posSizeKey(orderSizeName),
+      );
+    }
+  });
 });
 
 describe('parseCatalog fixtures', () => {
@@ -307,7 +373,7 @@ describe('parseCatalog fixtures', () => {
     }
     for (const rejected of CATALOG_REJECTED_FIELDS) {
       const leaf = rejected.replace(/\[\]/g, '').split('.').pop() ?? rejected;
-      expect(collectKeyPaths(result.item)).not.toContain(leaf);
+      expect(collectSchemaKeys(result.item)).not.toContain(leaf);
     }
   });
 
@@ -323,7 +389,7 @@ describe('parseCatalog fixtures', () => {
     expect(result.item.shared_option_group_ids).toEqual([]);
   });
 
-  it('separates shared option groups from item-local groups and parses optionGroups', () => {
+  it('preserves inline shared option copies in item scope alongside global optionGroups and shared_option_group_ids', () => {
     const payload = parseCatalog(
       [FIXTURE_SHARED_AND_LOCAL],
       [FIXTURE_SHARED_GROUP],
@@ -331,6 +397,7 @@ describe('parseCatalog fixtures', () => {
     expect(payload.items).toHaveLength(1);
     expect(payload.items[0]?.item_option_groups).toEqual({
       'Synthetic Addon': ['Extra Lemon'],
+      'Synthetic Prep': ['Baked'],
     });
     expect(payload.items[0]?.shared_option_group_ids).toEqual([
       'group-syn-prep',
@@ -348,6 +415,33 @@ describe('parseCatalog fixtures', () => {
     expect(payload.option_group_presence).toEqual([
       { group_id: 'group-syn-prep', outcome: 'accepted' },
     ]);
+
+    // Adding an item-only inline value inside a shared group changes the item content hash.
+    const withExtraInline = parseCatalogItemDocument(
+      itemDoc('item-syn-shared-opt', {
+        name: str('Synthetic Dish Gamma'),
+        sizes: arr([map({ name: str('Portion'), price: dbl(140) })]),
+        options: map({
+          'Synthetic Prep': arr([
+            map({ value: str('Baked'), price: dbl(20) }),
+            map({ value: str('Smoked'), price: dbl(25) }),
+          ]),
+          'Synthetic Addon': arr([
+            map({ value: str('Extra Lemon'), price: dbl(5) }),
+          ]),
+        }),
+        sharedOptionGroupIds: map({
+          'Synthetic Prep': str('group-syn-prep'),
+        }),
+      }),
+    );
+    expect(withExtraInline.outcome).toBe('accepted');
+    if (withExtraInline.outcome !== 'accepted') {
+      throw new Error('expected accepted');
+    }
+    expect(withExtraInline.item.content_hash).not.toBe(
+      payload.items[0]?.content_hash,
+    );
   });
 
   it('maps empty or missing sizes to a single ["none"] size key', () => {
@@ -500,11 +594,11 @@ describe('refusals', () => {
     const payload = parseCatalog(ALL_SAFE_ITEM_FIXTURES, [
       FIXTURE_SHARED_GROUP,
     ]);
-    const allPaths = collectKeyPaths(payload);
-    expect(allPaths.length).toBeGreaterThan(0);
-    for (const path of allPaths) {
-      expect(isPriceShapedPath(path), path).toBe(false);
-      expect(isCustomerShapedPath(path), path).toBe(false);
+    const schemaKeys = collectSchemaKeys(payload);
+    expect(schemaKeys.length).toBeGreaterThan(0);
+    for (const key of schemaKeys) {
+      expect(isPriceShapedKey(key), key).toBe(false);
+      expect(isCustomerShapedKey(key), key).toBe(false);
     }
 
     expect(() => assertNoPriceShapedKeys({ items: [{ price: 10 }] })).toThrow(
@@ -520,15 +614,162 @@ describe('refusals', () => {
         option_groups: [{ pricingType: 'fixed' }],
       }),
     ).toThrow(/price-shaped/);
+    for (const forged of [
+      { items: [{ 'extraPrice.details': 1 }] },
+      { items: [{ deliveryFee: 10 }] },
+      { items: [{ serviceCharge: 5 }] },
+      { items: [{ discount: 2 }] },
+      { items: [{ tax: 14 }] },
+      { items: [{ tip: 3 }] },
+      {
+        items: [{ item_option_groups: { 'Price Specials': [{ fee: 1 }] } }],
+      },
+    ]) {
+      expect(
+        () => assertNoPriceShapedKeys(forged),
+        JSON.stringify(forged),
+      ).toThrow(/price-shaped/);
+    }
+  });
 
-    // A price-shaped item-local option-group label is also caught before sending.
-    const priceLabeledItem = itemDoc('item-syn-price-label', {
-      name: str('Synthetic Dish Price Label'),
+  it('accepts dynamic labels containing guest or price words while rejecting schema keys', () => {
+    const labeledItem = itemDoc('item-syn-data-labels', {
+      name: str('Synthetic Dish Labels'),
       options: map({
-        extraPrice: arr([map({ value: str('X') })]),
+        'Guest Favorites': arr([
+          map({ value: str('Mild'), price: dbl(10), fee: dbl(2) }),
+        ]),
+        'Price Specials': arr([
+          map({ value: str('Combo'), costPrice: dbl(5), discount: dbl(1) }),
+        ]),
+      }),
+      sharedOptionGroupIds: map({
+        'Guest Favorites': str('group-syn-guest'),
+        'Price Specials': str('group-syn-special'),
       }),
     });
-    expect(() => parseCatalog([priceLabeledItem], [])).toThrow(/price-shaped/);
+    const payload = parseCatalog([labeledItem], []);
+    expect(payload.items).toHaveLength(1);
+    expect(payload.items[0]?.item_option_groups).toEqual({
+      'Guest Favorites': ['Mild'],
+      'Price Specials': ['Combo'],
+    });
+    expect(payload.items[0]?.shared_option_group_ids).toEqual([
+      'group-syn-guest',
+      'group-syn-special',
+    ]);
+
+    for (const [id, fields] of [
+      [
+        'item-syn-recipient',
+        { name: str('X'), recipientName: str('syn-recipient') },
+      ],
+      ['item-syn-contact', { name: str('X'), contactInfo: str('syn-contact') }],
+      [
+        'item-syn-guest-schema',
+        {
+          name: str('X'),
+          options: map({
+            'Guest Favorites': arr([
+              map({ value: str('Mild'), guestNote: str('syn-guest') }),
+            ]),
+          }),
+        },
+      ],
+      [
+        'item-syn-dotted-customer',
+        { name: str('X'), 'recipient.details': str('syn-dotted') },
+      ],
+    ] as const) {
+      expect(parseCatalogItemDocument(itemDoc(id, fields))).toEqual({
+        outcome: 'rejected',
+        pos_item_id: id,
+      });
+    }
+  });
+
+  it('rejects catalog documents carrying customer-shaped keys in extra raw document properties', () => {
+    const rawPage = parseListResponse({
+      documents: [
+        {
+          name: `${DOC_ROOT}/items/item-syn-raw-extra`,
+          updateTime: '2026-11-20T10:00:00Z',
+          fields: { name: str('Synthetic Dish Extra Prop') },
+          customerMeta: { phone: '01000000000' },
+        },
+        {
+          name: `${DOC_ROOT}/items/item-syn-raw-nested-recipient`,
+          updateTime: '2026-11-20T10:00:00Z',
+          fields: { name: str('Synthetic Dish Nested Extra') },
+          annotations: { recipientName: 'syn-person' },
+        },
+      ],
+    });
+    const rawGroupPage = parseListResponse({
+      documents: [
+        {
+          name: `${DOC_ROOT}/optionGroups/group-syn-raw-extra`,
+          updateTime: '2026-11-20T09:00:00Z',
+          fields: { name: str('Synthetic Group Extra') },
+          contactMeta: { phone: '01111111111' },
+        },
+      ],
+    });
+    const payload = parseCatalog(rawPage.documents, rawGroupPage.documents);
+    expect(payload.items).toEqual([]);
+    expect(payload.presence).toEqual([
+      { pos_item_id: 'item-syn-raw-extra', outcome: 'rejected' },
+      { pos_item_id: 'item-syn-raw-nested-recipient', outcome: 'rejected' },
+    ]);
+    expect(payload.option_groups).toEqual([]);
+    expect(payload.option_group_presence).toEqual([
+      { group_id: 'group-syn-raw-extra', outcome: 'rejected' },
+    ]);
+    expect(JSON.stringify(rawPage)).not.toContain('01000000000');
+    expect(JSON.stringify(rawPage)).not.toContain('syn-person');
+    expect(JSON.stringify(rawGroupPage)).not.toContain('01111111111');
+  });
+
+  it('rejects impossible updateTime calendar dates and NUL bytes in ids', () => {
+    expect(
+      parseCatalogItemDocument(
+        itemDoc(
+          'item-syn-feb30',
+          { name: str('Synthetic Dish Feb 30') },
+          '2026-02-30T10:00:00Z',
+        ),
+      ),
+    ).toEqual({
+      outcome: 'rejected',
+      pos_item_id: 'item-syn-feb30',
+    });
+
+    expect(() =>
+      parseCatalog(
+        [
+          {
+            name: `${DOC_ROOT}/items/item-syn\0nul`,
+            updateTime: '2026-11-20T10:00:00Z',
+            fields: { name: str('NUL Doc Id') },
+          },
+        ],
+        [],
+      ),
+    ).toThrow();
+
+    expect(
+      parseCatalogItemDocument(
+        itemDoc('item-syn-nul-shared', {
+          name: str('NUL Shared Group Id'),
+          sharedOptionGroupIds: map({
+            'Synthetic Prep': str('group-syn\0nul'),
+          }),
+        }),
+      ),
+    ).toEqual({
+      outcome: 'rejected',
+      pos_item_id: 'item-syn-nul-shared',
+    });
   });
 });
 
