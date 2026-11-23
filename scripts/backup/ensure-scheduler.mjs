@@ -9,25 +9,18 @@ import {
 } from './config.mjs';
 import { runPsql } from './psql.mjs';
 
-// Reports whether pg_cron and pg_net are installed. Fails closed when pg_net
-// is installed and backup_reader has effective USAGE on schema net or SELECT
-// on any net table, or when that role has USAGE on schema cron or vault.
-// Does not read job rows or request rows.
-// A missing extension is created only for a loopback target when
-// BACKUP_ALLOW_LOOPBACK=1 and BACKUP_SCHEDULER_CREATE=1 are both set.
-// A remote host never receives a create statement.
+// Read-only report of whether pg_cron and pg_net are installed. Fails closed
+// when pg_net is installed and backup_reader has effective USAGE on schema net
+// or SELECT on any net table, or when that role has USAGE on schema cron or
+// vault. Does not read job rows or request rows. Every statement is a select.
+// A loopback address is not proof of a local database (a port forward can
+// present 127.0.0.1 while the server is hosted), so this command never
+// creates an extension.
 
 const QUERY_CODE = 'SCHEDULER_QUERY_FAILED';
 
 const EXTENSIONS_SQL =
   "select extname from pg_catalog.pg_extension where extname in ('pg_cron', 'pg_net') order by 1;";
-
-const CREATE_SQL = {
-  pg_cron: 'create extension if not exists "pg_cron";',
-  pg_net: 'create extension if not exists "pg_net";',
-};
-
-const SCHEDULER_EXTENSIONS = ['pg_cron', 'pg_net'];
 
 const PRIVILEGE_SQL = `
 select problem
@@ -96,29 +89,34 @@ function readNames(output) {
     .filter(Boolean);
 }
 
-function assertReaderLockedOut(output) {
-  const problems = readNames(output).sort();
-  if (problems.length > 0) {
-    throw new BackupError(
-      'SCHEDULER_NET_UNSAFE',
-      `backup_reader can reach scheduler data: ${problems.join('; ')}`,
-    );
-  }
-}
-
-function creationAllowed(env) {
+function isNetProblem(line) {
   return (
-    env.BACKUP_SCHEDULER_CREATE === '1' &&
-    env.BACKUP_ALLOW_LOOPBACK === '1' &&
-    classifyTarget(env).allLoopback
+    line.startsWith('pg_net is installed') ||
+    line.includes('schema net') ||
+    line.startsWith('backup_reader can select net.')
   );
 }
 
-function creationRefusalMessage(env) {
-  if (!classifyTarget(env).allLoopback) {
-    return 'a remote host cannot create pg_cron or pg_net';
+function assertReaderLockedOut(output) {
+  const problems = readNames(output).sort();
+  const net = problems.filter(isNetProblem);
+  const role = problems.filter((line) => !isNetProblem(line));
+  if (net.length > 0) {
+    const extra =
+      role.length > 0
+        ? `; backup_reader can enter cron or vault: ${role.join('; ')}`
+        : '';
+    throw new BackupError(
+      'SCHEDULER_NET_UNSAFE',
+      `pg_net exposes request data to backup_reader: ${net.join('; ')}${extra}`,
+    );
   }
-  return 'creating pg_cron or pg_net needs BACKUP_ALLOW_LOOPBACK=1 on a loopback target';
+  if (role.length > 0) {
+    throw new BackupError(
+      'SCHEDULER_ROLE_UNSAFE',
+      `backup_reader can enter cron or vault: ${role.join('; ')}`,
+    );
+  }
 }
 
 function clientDirectory(path) {
@@ -157,38 +155,17 @@ function connectionEnv(env) {
 }
 
 export function formatSchedulerReport(result) {
-  const created =
-    result.created.length > 0 ? `created ${result.created.join(', ')}; ` : '';
   const cron = result.pgCron ? 'present' : 'absent';
   const net = result.pgNet ? 'present' : 'absent';
-  return `scheduler check: ${created}pg_cron ${cron}, pg_net ${net}`;
+  return `scheduler check: pg_cron ${cron}, pg_net ${net}`;
 }
 
 export function ensureScheduler({ query = runPsql, env = process.env } = {}) {
   const connection = connectionEnv(env);
-  if (env.BACKUP_SCHEDULER_CREATE === '1' && !creationAllowed(env)) {
-    throw new BackupError(
-      'SCHEDULER_CREATE_REFUSED',
-      creationRefusalMessage(env),
-    );
-  }
   const ask = (sql) => query({ sql, code: QUERY_CODE, env: connection });
-  let extensions = readNames(ask(EXTENSIONS_SQL));
-  const created = [];
-  if (creationAllowed(env)) {
-    for (const name of SCHEDULER_EXTENSIONS) {
-      if (!extensions.includes(name)) {
-        ask(CREATE_SQL[name]);
-        created.push(name);
-      }
-    }
-    if (created.length > 0) {
-      extensions = readNames(ask(EXTENSIONS_SQL));
-    }
-  }
+  const extensions = readNames(ask(EXTENSIONS_SQL));
   assertReaderLockedOut(ask(PRIVILEGE_SQL));
   return {
-    created,
     pgCron: extensions.includes('pg_cron'),
     pgNet: extensions.includes('pg_net'),
   };

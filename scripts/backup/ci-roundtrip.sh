@@ -425,8 +425,8 @@ run_full() {
     "begin read write; delete from storage.buckets where false; rollback"
   expect_denied "storage.objects" 42501 "select 1 from storage.objects limit 1"
   # vault.secrets is proved on this fresh stack, before pg_net exists.
-  # cron.job is proved after the local-only create. net tables are not read:
-  # readable net access is what the later guarded dump must refuse.
+  # cron.job is proved after this script creates the extensions with psql.
+  # net tables are not read: readable net access is what the later guarded dump must refuse.
   expect_denied "pg_authid" 42501 "select rolpassword from pg_catalog.pg_authid limit 1"
   expect_denied "write under the read-only default" 25006 \
     "update app.stock_items set name = name where false"
@@ -583,12 +583,16 @@ run_full() {
   [ "$present" = t ] || fail SCHEDULER_VAULT "vault.secrets does not exist"
   expect_denied "vault.secrets" 42501 "select 1 from vault.secrets limit 1"
 
-  step "stack A: local pg_net creation fails the guard closed"
+  step "stack A: disposable stack installs pg_net and the read-only check fails closed"
+  psql -X -q -v ON_ERROR_STOP=1 -c 'create extension if not exists "pg_cron";' ||
+    fail SCHEDULER_INSTALL "the disposable stack could not create pg_cron"
+  psql -X -q -v ON_ERROR_STOP=1 -c 'create extension if not exists "pg_net";' ||
+    fail SCHEDULER_INSTALL "the disposable stack could not create pg_net"
   local scheduler_rc=0
-  env BACKUP_SCHEDULER_CREATE=1 node "$here/ensure-scheduler.mjs" \
+  node "$here/ensure-scheduler.mjs" \
     >"$work_dir/scheduler.out" 2>"$work_dir/scheduler.err" || scheduler_rc=$?
   if [ "$scheduler_rc" -eq 0 ]; then
-    fail SCHEDULER_UNSAFE "ensure-scheduler passed after creating pg_net"
+    fail SCHEDULER_UNSAFE "the read-only check passed after pg_net was installed"
   fi
   if ! grep -F '[SCHEDULER_NET_UNSAFE]' "$work_dir/scheduler.err"; then
     node "$backup_dir/sanitize.mjs" "$work_dir/scheduler.err" 2>&3 || true
@@ -596,7 +600,7 @@ run_full() {
   fi
   net_installed=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c \
     "select exists (select 1 from pg_catalog.pg_extension where extname = 'pg_net')")
-  [ "$net_installed" = t ] || fail SCHEDULER_INSTALL "the local flag did not create pg_net"
+  [ "$net_installed" = t ] || fail SCHEDULER_INSTALL "pg_net was not created on the disposable stack"
   present=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c "select to_regclass('cron.job') is not null")
   [ "$present" = t ] || fail SCHEDULER_CRON "cron.job does not exist after the local create"
   expect_denied "cron.job" 42501 "select 1 from cron.job limit 1"

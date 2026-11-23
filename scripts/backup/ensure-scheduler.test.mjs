@@ -76,11 +76,100 @@ function database({ extensions, problems = '' }) {
   return { query, calls };
 }
 
+const WRITE_SQL =
+  /\b(alter|comment|create|delete|drop|grant|insert|revoke|truncate|update)\b/i;
+
+test('p2: the checker never issues a write statement in any env', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const envs = [
+    loopback,
+    { ...loopback, BACKUP_ALLOW_LOOPBACK: '1' },
+    { ...loopback, BACKUP_ALLOW_LOOPBACK: '1', BACKUP_SCHEDULER_CREATE: '1' },
+    {
+      ...loopback,
+      PGHOST: '127.0.0.1',
+      PGPORT: '15432',
+      BACKUP_ALLOW_LOOPBACK: '1',
+      BACKUP_SCHEDULER_CREATE: '1',
+    },
+    remoteReady,
+  ];
+  const writes = [];
+  for (const env of envs) {
+    const { query, calls } = database({ extensions: [] });
+    try {
+      ensureScheduler({ query, env });
+    } catch {
+      // A refused connection is acceptable. A write is not.
+    }
+    for (const call of calls) {
+      if (WRITE_SQL.test(call.sql)) {
+        writes.push(`${env.PGHOST}:${env.PGPORT ?? ''}: ${call.sql}`);
+      }
+    }
+  }
+  assert.deepEqual(writes, []);
+  const source = readFileSync(
+    new URL('./ensure-scheduler.mjs', import.meta.url),
+    'utf8',
+  );
+  assert.doesNotMatch(source, /create\s+extension/i);
+  assert.doesNotMatch(source, /BACKUP_SCHEDULER_CREATE/);
+});
+
+test('p2: cron or vault usage while pg_net is absent is not a reason to remove pg_net', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const { query } = database({
+    extensions: [],
+    problems: 'backup_reader can use schema vault',
+  });
+  let thrown = null;
+  try {
+    ensureScheduler({ query, env: loopback });
+  } catch (error) {
+    thrown = error;
+  }
+  const runbook = readFileSync(
+    new URL('../../docs/RESTORE-RUNBOOK.md', import.meta.url),
+    'utf8',
+  );
+  const arabic = runbook.slice(
+    runbook.indexOf('## 10.'),
+    runbook.indexOf('## تمرين الاستعادة'),
+  );
+  const backup = readFileSync(
+    new URL('../../docs/BACKUP.md', import.meta.url),
+    'utf8',
+  );
+  const section = backup.slice(
+    backup.indexOf('### Scheduler after the app is usable'),
+    backup.indexOf('\n## CI proof'),
+  );
+  assert.deepEqual(
+    {
+      code: thrown ? thrown.code : null,
+      mentionsVault: Boolean(thrown && /schema vault/.test(thrown.message)),
+      runbookNamesRoleCode: arabic.includes('SCHEDULER_ROLE_UNSAFE'),
+      runbookRemovesPgNetForAnyUnsafe: arabic.includes(
+        'لو طلع `SCHEDULER_NET_UNSAFE`، وقف واشيل `pg_net`',
+      ),
+      backupNamesRoleCode: section.includes('SCHEDULER_ROLE_UNSAFE'),
+    },
+    {
+      code: 'SCHEDULER_ROLE_UNSAFE',
+      mentionsVault: true,
+      runbookNamesRoleCode: true,
+      runbookRemovesPgNetForAnyUnsafe: false,
+      backupNamesRoleCode: true,
+    },
+  );
+});
+
 test('new behaviour: pg_net absent passes and creates nothing', async () => {
   const { ensureScheduler, formatSchedulerReport } = await loadScheduler();
   const { query, calls } = database({ extensions: [] });
   const result = ensureScheduler({ query, env: loopback });
-  assert.deepEqual(result.created, []);
+  assert.equal(Object.hasOwn(result, 'created'), false);
   assert.equal(calls.some(isCreate), false);
   assert.equal(result.pgCron, false);
   assert.equal(result.pgNet, false);
@@ -148,175 +237,49 @@ test('new behaviour: cron or vault usage fails closed without creating extension
       create: calls.filter(isCreate).map((call) => call.sql),
     },
     {
-      code: 'SCHEDULER_NET_UNSAFE',
+      code: 'SCHEDULER_ROLE_UNSAFE',
       mentionsVault: true,
       create: [],
     },
   );
 });
 
-test('new behaviour: remote target never creates extensions', async () => {
-  const { ensureScheduler } = await loadScheduler();
-  const calls = [];
-  let thrown = null;
-  try {
-    ensureScheduler({
-      query: (call) => {
-        calls.push(call);
-        return '';
-      },
-      env: remoteReady,
-    });
-  } catch (error) {
-    thrown = error;
-  }
-  assert.equal(
-    thrown && thrown.code,
-    'SCHEDULER_CREATE_REFUSED',
-    `creates=${calls
-      .filter(isCreate)
-      .map((call) => call.sql)
-      .join('|')}`,
-  );
-  assert.equal(calls.filter(isCreate).length, 0);
-  assert.equal(String(thrown.message).includes('synthetic-password'), false);
-  assert.match(thrown.message, /remote host/);
-});
-
-test('new behaviour: local flag creates only on loopback', async () => {
-  const { ensureScheduler, formatSchedulerReport } = await loadScheduler();
-  const allowed = database({ extensions: ['pg_cron'] });
-  let allowedResult = null;
-  let allowedError = null;
-  try {
-    allowedResult = ensureScheduler({
-      query: allowed.query,
-      env: {
-        ...loopback,
-        BACKUP_ALLOW_LOOPBACK: '1',
-        BACKUP_SCHEDULER_CREATE: '1',
-      },
-    });
-  } catch (error) {
-    allowedError = error;
-  }
-
-  const noAllowCalls = [];
-  let noAllowError = null;
-  try {
-    ensureScheduler({
-      query: (call) => {
-        noAllowCalls.push(call);
-        return '';
-      },
-      env: { ...loopback, BACKUP_SCHEDULER_CREATE: '1' },
-    });
-  } catch (error) {
-    noAllowError = error;
-  }
-
-  const ambient = database({ extensions: [] });
-  let ambientResult = null;
-  let ambientError = null;
-  try {
-    ambientResult = ensureScheduler({
-      query: ambient.query,
-      env: { ...loopback, BACKUP_ALLOW_LOOPBACK: '1' },
-    });
-  } catch (error) {
-    ambientError = error;
-  }
-
-  assert.deepEqual(
-    {
-      allowedCreated: allowedResult ? allowedResult.created : null,
-      allowedCode: allowedError ? allowedError.code : null,
-      allowedReport: allowedResult
-        ? formatSchedulerReport(allowedResult)
-        : null,
-      noAllowCode: noAllowError ? noAllowError.code : null,
-      noAllowCreates: noAllowCalls.filter(isCreate).length,
-      ambientCreated: ambientResult ? ambientResult.created : null,
-      ambientCode: ambientError ? ambientError.code : null,
-      ambientCreates: ambient.calls.filter(isCreate).length,
-    },
-    {
-      allowedCreated: ['pg_net'],
-      allowedCode: null,
-      allowedReport:
-        'scheduler check: created pg_net; pg_cron present, pg_net present',
-      noAllowCode: 'SCHEDULER_CREATE_REFUSED',
-      noAllowCreates: 0,
-      ambientCreated: [],
-      ambientCode: null,
-      ambientCreates: 0,
-    },
-  );
-  assert.equal(allowed.calls[0].sql.includes('pg_extension'), true);
-  assert.equal(allowed.calls[1].sql, CREATE_PG_NET);
-  assert.equal(
-    allowed.calls.some((call) => call.sql === CREATE_PG_CRON),
-    false,
-  );
-  assert.equal(
-    allowed.calls.some((call) => /with schema/i.test(call.sql)),
-    false,
-  );
-  const privilegeAt = allowed.calls.findIndex((call) =>
-    /has_schema_privilege/i.test(call.sql),
-  );
-  assert.ok(privilegeAt > 1);
-});
-
-test('the local flag creates pg_cron before pg_net when both are missing', async () => {
+test('new behaviour: a remote target is only read', async () => {
   const { ensureScheduler } = await loadScheduler();
   const { query, calls } = database({ extensions: [] });
-  const result = ensureScheduler({
-    query,
-    env: {
-      ...loopback,
-      BACKUP_ALLOW_LOOPBACK: '1',
-      BACKUP_SCHEDULER_CREATE: '1',
-    },
-  });
-  assert.deepEqual(result.created, ['pg_cron', 'pg_net']);
-  assert.equal(result.pgCron, true);
-  assert.equal(result.pgNet, true);
-  assert.equal(calls[1].sql, CREATE_PG_CRON);
-  assert.equal(calls[2].sql, CREATE_PG_NET);
-  assert.equal(calls.filter(isCreate).length, 2);
+  const result = ensureScheduler({ query, env: remoteReady });
+  assert.equal(result.pgNet, false);
+  assert.equal(calls.filter(isCreate).length, 0);
+  assert.equal(calls.some(isPrivilegeChange), false);
+  assert.ok(calls.every((call) => /^\s*select\b/i.test(call.sql)));
 });
 
-test('a local create that leaves reader access fails after the create statements', async () => {
+test('confirmed net exposure keeps SCHEDULER_NET_UNSAFE and still names cron or vault', async () => {
   const { ensureScheduler } = await loadScheduler();
   const { query, calls } = database({
-    extensions: [],
-    problems: 'backup_reader can use schema net',
+    extensions: ['pg_net'],
+    problems: [
+      'backup_reader can use schema vault',
+      'backup_reader can select net.http_request_queue',
+    ].join('\n'),
   });
   assert.throws(
-    () =>
-      ensureScheduler({
-        query,
-        env: {
-          ...loopback,
-          BACKUP_ALLOW_LOOPBACK: '1',
-          BACKUP_SCHEDULER_CREATE: '1',
-        },
-      }),
-    { code: 'SCHEDULER_NET_UNSAFE', message: /schema net/ },
+    () => ensureScheduler({ query, env: loopback }),
+    (error) => {
+      assert.equal(error.code, 'SCHEDULER_NET_UNSAFE');
+      assert.match(error.message, /schema vault/);
+      assert.match(error.message, /net\.http_request_queue/);
+      return true;
+    },
   );
-  const createAt = calls.findIndex((call) => call.sql === CREATE_PG_NET);
-  const checkAt = calls.findIndex((call) =>
-    /has_schema_privilege/i.test(call.sql),
-  );
-  assert.ok(createAt !== -1 && checkAt > createAt);
+  assert.equal(calls.some(isCreate), false);
 });
 
 test('pg_net present without reader access passes and creates nothing', async () => {
   const { ensureScheduler, formatSchedulerReport } = await loadScheduler();
   const { query, calls } = database({ extensions: ['pg_net'] });
   const result = ensureScheduler({ query, env: loopback });
-  assert.deepEqual(result.created, []);
+  assert.equal(Object.hasOwn(result, 'created'), false);
   assert.equal(result.pgCron, false);
   assert.equal(result.pgNet, true);
   assert.equal(
@@ -450,25 +413,23 @@ test('unset PGSSLMODE on a remote host is refused', async () => {
   assert.equal(calls.length, 0);
 });
 
-test('a remote host with a loopback hostaddr still refuses creation', async () => {
+test('a loopback name with a remote hostaddr is still only read', async () => {
   const { ensureScheduler } = await loadScheduler();
   const calls = [];
-  assert.throws(
-    () =>
-      ensureScheduler({
-        query: (call) => {
-          calls.push(call);
-          return '';
-        },
-        env: {
-          ...remoteReady,
-          PGHOST: '127.0.0.1',
-          PGHOSTADDR: '203.0.113.10',
-        },
-      }),
-    { code: 'SCHEDULER_CREATE_REFUSED' },
-  );
+  const result = ensureScheduler({
+    query: (call) => {
+      calls.push(call);
+      return '';
+    },
+    env: {
+      ...remoteReady,
+      PGHOST: '127.0.0.1',
+      PGHOSTADDR: '203.0.113.10',
+    },
+  });
+  assert.equal(result.pgNet, false);
   assert.equal(calls.filter(isCreate).length, 0);
+  assert.ok(calls.every((call) => /^\s*select\b/i.test(call.sql)));
 });
 
 test('the privilege query gates net on pg_net and still checks cron and vault', async () => {
@@ -515,9 +476,10 @@ test('the scheduler script does not change privileges or read job rows', () => {
   assert.doesNotMatch(source, /SCHEDULER_NET_ACL/);
   assert.doesNotMatch(source, /SCHEDULER_NOT_READY/);
   assert.match(source, /SCHEDULER_NET_UNSAFE/);
-  assert.match(source, /SCHEDULER_CREATE_REFUSED/);
-  assert.match(source, /create extension if not exists "pg_cron";/);
-  assert.match(source, /create extension if not exists "pg_net";/);
+  assert.match(source, /SCHEDULER_ROLE_UNSAFE/);
+  assert.doesNotMatch(source, /SCHEDULER_CREATE_REFUSED/);
+  assert.doesNotMatch(source, /BACKUP_SCHEDULER_CREATE/);
+  assert.doesNotMatch(source, /create\s+extension/i);
   assert.doesNotMatch(source, /with schema/i);
 });
 
@@ -527,7 +489,7 @@ test('the CI round trip proves a guarded backup, then fails closed after pg_net'
     'utf8',
   );
   const dumpAt = sh.indexOf('"$archives/without-net"');
-  const createAt = sh.indexOf('BACKUP_SCHEDULER_CREATE=1');
+  const createAt = sh.indexOf('create extension if not exists "pg_net"');
   const checkerAt = sh.indexOf('[SCHEDULER_NET_UNSAFE]');
   const roleAt = sh.indexOf('"[ROLE_UNSAFE]"');
   const vaultAt = sh.indexOf('expect_denied "vault.secrets" 42501 ');
@@ -541,6 +503,8 @@ test('the CI round trip proves a guarded backup, then fails closed after pg_net'
   assert.match(sh, /extname = 'pg_net'/);
   assert.match(sh, /pg_net absent/);
   assert.match(sh, /pg_restore -l/);
+  assert.match(sh, /create extension if not exists "pg_cron"/);
+  assert.doesNotMatch(sh, /BACKUP_SCHEDULER_CREATE/);
   assert.doesNotMatch(sh, /expect_denied "net\.http_request_queue"/);
   assert.doesNotMatch(sh, /http_post/);
   assert.doesNotMatch(sh, /cron\.schedule/);
@@ -565,18 +529,21 @@ test('restore docs defer scheduler activation and do not install pg_net', () => 
     'one-minute trigger',
     'decision pending',
     'ensure-scheduler.mjs',
-    'BACKUP_SCHEDULER_CREATE',
-    'BACKUP_ALLOW_LOOPBACK',
-    'never on a remote host',
+    'read statements',
+    'named privilege',
     'SCHEDULER_NET_UNSAFE',
+    'SCHEDULER_ROLE_UNSAFE',
   ]) {
     assert.ok(section.includes(marker), marker);
   }
   assert.equal(section.includes('scheduler ready'), false);
   assert.equal(section.includes('CREATE EXTENSION'), false);
+  assert.equal(section.includes('BACKUP_SCHEDULER_CREATE'), false);
   assert.match(backup, /SCHEDULER_NET_UNSAFE/);
   assert.equal(backup.includes('SCHEDULER_NET_ACL'), false);
   assert.equal(backup.includes('SCHEDULER_NOT_READY'), false);
+  assert.equal(backup.includes('SCHEDULER_CREATE_REFUSED'), false);
+  assert.equal(backup.includes('BACKUP_SCHEDULER_CREATE'), false);
   const runbook = readFileSync(
     new URL('../../docs/RESTORE-RUNBOOK.md', import.meta.url),
     'utf8',
@@ -589,8 +556,10 @@ test('restore docs defer scheduler activation and do not install pg_net', () => 
     'متثبّتش `pg_net`',
     'P7-9',
     'SCHEDULER_NET_UNSAFE',
+    'SCHEDULER_ROLE_UNSAFE',
     'ensure-scheduler.mjs',
     'دقيقة',
+    'متشيلش `pg_net`',
   ]) {
     assert.ok(arabic.includes(marker), marker);
   }
