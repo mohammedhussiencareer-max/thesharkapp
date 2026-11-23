@@ -417,7 +417,7 @@ function assertNetLock(calls) {
   );
   assert.doesNotMatch(sql, /revoke\s+[\s\S]*from\s+current_user/i);
   assert.doesNotMatch(sql, /revoke\s+[\s\S]*from\s+postgres/i);
-  assert.doesNotMatch(sql, /net\.http_request_queue/i);
+  assert.doesNotMatch(sql, /from\s+net\.http_request_queue/i);
   assert.doesNotMatch(sql, /set_config\(\s*'role'/i);
   assert.match(sql, /http_post/);
   assert.match(
@@ -526,7 +526,7 @@ test('reader privileges are checked without impersonation and a held privilege r
   if (/\bset\s+role\s+backup_reader\b/i.test(sql)) {
     problems.push('assumes backup_reader with set role');
   }
-  if (/net\.http_request_queue/i.test(sql)) {
+  if (/from\s+net\.http_request_queue/i.test(sql)) {
     problems.push('reads net.http_request_queue');
   }
   if (
@@ -565,6 +565,53 @@ test('reader privileges are checked without impersonation and a held privilege r
     problems.push(
       'held privilege is not rolled back inside the transaction before commit',
     );
+  }
+  assert.deepEqual(problems, []);
+  const sh = readFileSync(
+    new URL('./ci-roundtrip.sh', import.meta.url),
+    'utf8',
+  );
+  assert.match(sh, /expect_denied "cron\.job" 42501 /);
+  assert.match(sh, /expect_denied "vault\.secrets" 42501 /);
+  assert.match(sh, /expect_denied "net\.http_request_queue" 42501 /);
+});
+
+test('a public select on cron.job does not roll back when backup_reader has no cron usage', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const { query, calls } = replyingQuery({
+    firstExtensions: ['pg_cron', 'pg_net'],
+  });
+  const result = ensureScheduler({ query, env: loopback });
+  assert.deepEqual(result.created, []);
+  const sql = calls.find((call) =>
+    /revoke usage on schema net from public/i.test(call.sql),
+  ).sql;
+  const selectAt = sql.search(/backup_reader can select/i);
+  const tableAt = sql.search(/has_table_privilege\(\s*'backup_reader'/i);
+  const tableClause = sql.slice(selectAt, tableAt);
+  const usageClause = sql.slice(
+    sql.search(/backup_reader can use schema/i),
+    selectAt,
+  );
+  const problems = [];
+  if (/'cron'/i.test(tableClause) || /'vault'/i.test(tableClause)) {
+    problems.push(
+      'table select on cron or vault rolls the lock back without schema usage',
+    );
+  }
+  if (!/nspname\s*=\s*'net'/i.test(tableClause)) {
+    problems.push('net table select is not checked');
+  }
+  if (!/'cron'/.test(usageClause) || !/'vault'/.test(usageClause)) {
+    problems.push('cron and vault schema usage is not checked');
+  }
+  if (/has_table_privilege/i.test(usageClause)) {
+    problems.push('cron and vault are judged by table privileges');
+  }
+  const elseAt = sql.search(/\\else\b/);
+  const commitAt = sql.search(/^\s*commit\s*;/im);
+  if (!(elseAt !== -1 && commitAt > elseAt)) {
+    problems.push('a clean check does not commit');
   }
   assert.deepEqual(problems, []);
   const sh = readFileSync(
@@ -615,6 +662,69 @@ test('the lock grants only the job owner usage and the exact http_post signature
   }
   if (/https?:\/\//i.test(sql) || /select\s+net\.http_post\s*\(/i.test(sql)) {
     problems.push('calls net.http_post');
+  }
+  assert.deepEqual(problems, []);
+});
+
+test('an invoker http_post keeps queue privileges and CI calls that signature after the lock', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const { query, calls } = replyingQuery({
+    firstExtensions: ['pg_cron', 'pg_net'],
+  });
+  ensureScheduler({ query, env: loopback });
+  const sql = calls.find((call) =>
+    /revoke usage on schema net from public/i.test(call.sql),
+  ).sql;
+  const problems = [];
+  if (!/prosecdef/i.test(sql)) {
+    problems.push('does not read prosecdef');
+  }
+  if (!/security definer/i.test(sql)) {
+    problems.push('does not document a security definer http_post');
+  }
+  if (
+    !/grant\s+insert\s*,\s*select\s+on\s+table\s+net\.http_request_queue/i.test(
+      sql,
+    )
+  ) {
+    problems.push('does not grant queue insert and select');
+  }
+  if (!/grant\s+usage\s+on\s+sequence/i.test(sql)) {
+    problems.push('does not grant sequence usage');
+  }
+  if (!/has_sequence_privilege\s*\(/i.test(sql)) {
+    problems.push('does not check sequence usage');
+  }
+  if (!/has_table_privilege\([\s\S]{0,180}'insert'/i.test(sql)) {
+    problems.push('does not check queue insert');
+  }
+  if (/select\s+net\.http_post\s*\(/i.test(sql)) {
+    problems.push('calls http_post inside the lock transaction');
+  }
+  const sh = readFileSync(
+    new URL('./ci-roundtrip.sh', import.meta.url),
+    'utf8',
+  );
+  const install = sh.indexOf('node "$here/ensure-scheduler.mjs"');
+  const probe = sh.indexOf('scheduler_probe_owner', install);
+  const call = probe === -1 ? -1 : sh.indexOf('http_post', probe);
+  const rollback = call === -1 ? -1 : sh.indexOf('rollback', call);
+  if (!(
+    install !== -1 &&
+    probe > install &&
+    call > probe &&
+    rollback > call &&
+    /nologin/i.test(sh.slice(probe, rollback)) &&
+    /nosuperuser/i.test(sh.slice(probe, rollback)) &&
+    /set\s+local\s+role\s+scheduler_probe_owner/i.test(
+      sh.slice(probe, rollback),
+    ) &&
+    /http:\/\/127\.0\.0\.1\//.test(sh.slice(probe, rollback)) &&
+    /^\s*begin\s*;/im.test(sh.slice(install, probe))
+  )) {
+    problems.push(
+      'CI does not call http_post as a non-superuser after the lock commits',
+    );
   }
   assert.deepEqual(problems, []);
 });

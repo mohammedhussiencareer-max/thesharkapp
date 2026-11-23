@@ -595,6 +595,94 @@ run_full() {
   expect_denied "cron.job" 42501 "select 1 from cron.job limit 1"
   expect_denied "vault.secrets" 42501 "select 1 from vault.secrets limit 1"
   expect_denied "net.http_request_queue" 42501 "select 1 from net.http_request_queue limit 1"
+  # The lock transaction has already committed. This one grants a non-superuser
+  # the same privileges the job owner received, calls the installed signature,
+  # and rolls the insert back.
+  psql -X -q -v ON_ERROR_STOP=1 -f - >/dev/null <<'SQL' || fail SCHEDULER_HTTP_POST "the job owner could not call net.http_post"
+begin;
+create role scheduler_probe_owner nologin nosuperuser nobypassrls nocreatedb nocreaterole noinherit;
+do $probe$
+declare
+  func regprocedure;
+  definer boolean;
+  arg_oids oid[];
+  seq_name text;
+  i int;
+  typ text;
+  literals text;
+  url_used boolean;
+begin
+  for func, definer in
+    select p.oid::regprocedure, p.prosecdef
+    from pg_catalog.pg_proc as p
+    join pg_catalog.pg_namespace as n on n.oid = p.pronamespace
+    where n.nspname = 'net'
+      and p.proname = 'http_post'
+      and p.prokind = 'f'
+  loop
+    execute format('grant usage on schema net to %I', 'scheduler_probe_owner');
+    execute format('grant execute on function %s to %I', func, 'scheduler_probe_owner');
+    if not definer then
+      execute format(
+        'grant insert, select on table net.http_request_queue to %I',
+        'scheduler_probe_owner'
+      );
+      for seq_name in
+        select pg_get_serial_sequence('net.http_request_queue', a.attname)
+        from pg_catalog.pg_attribute as a
+        where a.attrelid = 'net.http_request_queue'::regclass
+          and a.attnum > 0
+          and not a.attisdropped
+          and pg_get_serial_sequence('net.http_request_queue', a.attname) is not null
+      loop
+        execute format(
+          'grant usage on sequence %s to %I',
+          seq_name,
+          'scheduler_probe_owner'
+        );
+      end loop;
+    end if;
+  end loop;
+  execute 'set local role scheduler_probe_owner';
+  for func, arg_oids in
+    select p.oid::regprocedure, p.proargtypes::oid[]
+    from pg_catalog.pg_proc as p
+    join pg_catalog.pg_namespace as n on n.oid = p.pronamespace
+    where n.nspname = 'net'
+      and p.proname = 'http_post'
+      and p.prokind = 'f'
+  loop
+    literals := '';
+    url_used := false;
+    for i in 1 .. coalesce(array_length(arg_oids, 1), 0) loop
+      if literals <> '' then
+        literals := literals || ', ';
+      end if;
+      typ := arg_oids[i]::regtype::text;
+      if typ in ('text', 'character varying', 'varchar', 'name') then
+        if not url_used then
+          literals := literals || quote_literal('http://127.0.0.1/');
+          url_used := true;
+        else
+          literals := literals || quote_literal('');
+        end if;
+      elsif typ = 'jsonb' then
+        literals := literals || '''{}''::jsonb';
+      elsif typ = 'json' then
+        literals := literals || '''{}''::json';
+      elsif typ in ('integer', 'bigint', 'smallint', 'int4', 'int8', 'int2') then
+        literals := literals || '1000';
+      else
+        literals := literals || 'null::' || typ;
+      end if;
+    end loop;
+    execute format('select %s(%s)', func, literals);
+  end loop;
+  execute 'reset role';
+end
+$probe$;
+rollback;
+SQL
   step "stack A: dump as backup_reader after the scheduler extensions"
   scheduler_archive=$(PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
     "$here/dump.sh" "$archives/scheduler" 2>&3) ||

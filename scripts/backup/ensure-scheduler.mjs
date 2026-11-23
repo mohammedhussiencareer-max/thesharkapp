@@ -13,10 +13,13 @@ import { runPsql } from './psql.mjs';
 // extension rows and the cron and net schemas exist. It then removes PUBLIC
 // access to schema net. The connected owner, and postgres when that role
 // exists, keep usage on net and execute on each net.http_post identity.
-// Privilege functions check the reader inside that same transaction; a held
-// privilege rolls the transaction back. Run as the database owner before
-// secrets and before the job. Does not read or write job rows and does not
-// call net.http_post.
+// A security definer identity runs as its owner, so that is enough. An
+// invoker also keeps insert and select on the queue and usage on its
+// sequences. Privilege functions check the reader inside that same
+// transaction; cron and vault are schema usage only, and net also checks
+// table select. A held privilege rolls the transaction back. Run as the
+// database owner before secrets and before the job. Does not read or write
+// job rows and does not call net.http_post.
 
 const QUERY_CODE = 'SCHEDULER_QUERY_FAILED';
 
@@ -79,7 +82,9 @@ create temp table scheduler_acl_problem (problem text) on commit drop;
 do $net_acl$
 declare
   func regprocedure;
+  func_definer boolean;
   role_name text;
+  seq_name text;
 begin
   foreach role_name in array array[current_user::text, 'postgres']
   loop
@@ -90,8 +95,13 @@ begin
       continue;
     end if;
     execute format('grant usage on schema net to %I', role_name);
-    for func in
-      select p.oid::regprocedure
+    -- A security definer http_post (pg_proc.prosecdef) runs as the function
+    -- owner, who keeps the right to insert into the queue. Schema usage and
+    -- execute are enough for that caller. An invoker runs as the job owner,
+    -- so that role also needs insert and select on the queue table and usage
+    -- on the queue sequences.
+    for func, func_definer in
+      select p.oid::regprocedure, p.prosecdef
       from pg_catalog.pg_proc as p
       join pg_catalog.pg_namespace as n on n.oid = p.pronamespace
       where n.nspname = 'net'
@@ -100,12 +110,31 @@ begin
         and pg_get_function_identity_arguments(p.oid) is not null
     loop
       execute format('grant execute on function %s to %I', func, role_name);
+      if not func_definer then
+        execute format(
+          'grant insert, select on table net.http_request_queue to %I',
+          role_name
+        );
+        for seq_name in
+          select pg_get_serial_sequence('net.http_request_queue', a.attname)
+          from pg_catalog.pg_attribute as a
+          where a.attrelid = 'net.http_request_queue'::regclass
+            and a.attnum > 0
+            and not a.attisdropped
+            and pg_get_serial_sequence('net.http_request_queue', a.attname) is not null
+        loop
+          execute format('grant usage on sequence %s to %I', seq_name, role_name);
+        end loop;
+      end if;
     end loop;
   end loop;
   revoke usage on schema net from public;
   revoke all privileges on all tables in schema net from public;
   revoke all privileges on all sequences in schema net from public;
 
+  -- cron and vault follow the backup role guard: schema usage only. A public
+  -- select on one of their tables is unreachable without that usage, so it
+  -- must not roll this lock back. net still checks table select.
   insert into pg_temp.scheduler_acl_problem (problem)
   select 'backup_reader can use schema ' || n.nspname
   from pg_catalog.pg_namespace as n
@@ -121,7 +150,7 @@ begin
   select 'backup_reader can select ' || n.nspname || '.' || c.relname
   from pg_catalog.pg_class as c
   join pg_catalog.pg_namespace as n on n.oid = c.relnamespace
-  where n.nspname in ('net', 'cron', 'vault')
+  where n.nspname = 'net'
     and c.relkind in ('r', 'p', 'v', 'm')
     and has_table_privilege('backup_reader', c.oid, 'SELECT');
   if not has_schema_privilege(current_user, 'net', 'USAGE') then
@@ -170,6 +199,57 @@ begin
     ) then
       insert into pg_temp.scheduler_acl_problem (problem)
       values ('the database owner cannot execute net.http_post');
+    end if;
+  end if;
+  if exists (
+    select 1
+    from pg_catalog.pg_proc as p
+    join pg_catalog.pg_namespace as n on n.oid = p.pronamespace
+    where n.nspname = 'net'
+      and p.proname = 'http_post'
+      and p.prokind = 'f'
+      and not p.prosecdef
+  ) then
+    if not has_table_privilege(current_user, 'net.http_request_queue'::regclass, 'INSERT')
+       or not has_table_privilege(current_user, 'net.http_request_queue'::regclass, 'SELECT')
+       or exists (
+         select 1
+         from pg_catalog.pg_attribute as a
+         where a.attrelid = 'net.http_request_queue'::regclass
+           and a.attnum > 0
+           and not a.attisdropped
+           and pg_get_serial_sequence('net.http_request_queue', a.attname) is not null
+           and not has_sequence_privilege(
+             current_user,
+             pg_get_serial_sequence('net.http_request_queue', a.attname)::regclass,
+             'USAGE'
+           )
+       )
+    then
+      insert into pg_temp.scheduler_acl_problem (problem)
+      values ('the database owner cannot write the net.http_post queue');
+    elsif exists (
+      select 1 from pg_catalog.pg_roles where rolname = 'postgres'
+    ) then
+      if not has_table_privilege('postgres', 'net.http_request_queue'::regclass, 'INSERT')
+         or not has_table_privilege('postgres', 'net.http_request_queue'::regclass, 'SELECT')
+         or exists (
+           select 1
+           from pg_catalog.pg_attribute as a
+           where a.attrelid = 'net.http_request_queue'::regclass
+             and a.attnum > 0
+             and not a.attisdropped
+             and pg_get_serial_sequence('net.http_request_queue', a.attname) is not null
+             and not has_sequence_privilege(
+               'postgres',
+               pg_get_serial_sequence('net.http_request_queue', a.attname)::regclass,
+               'USAGE'
+             )
+         )
+      then
+        insert into pg_temp.scheduler_acl_problem (problem)
+        values ('the database owner cannot write the net.http_post queue');
+      end if;
     end if;
   end if;
 end
