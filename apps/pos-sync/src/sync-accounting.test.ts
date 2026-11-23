@@ -168,7 +168,7 @@ describe('runPosSync accounting drain', () => {
     expect(reported).toHaveLength(1);
     expect(reported[0]?.slice(1)).toEqual(['order-a', 1]);
     expect(logs.at(-1)).toMatch(
-      /^accounting drain stop=call_failed .* report=recorded error=Supabase RPC failed: HTTP 500$/,
+      /^accounting drain stop=call_failed .* report=recorded error=Supabase RPC failed: HTTP 500 57014$/,
     );
   });
 
@@ -252,7 +252,7 @@ describe('runPosSync accounting drain', () => {
           },
         },
       }),
-    ).rejects.toThrow('ingest broke');
+    ).rejects.toThrow(/^sync failed$/);
     expect(events).toEqual(['start', 'finish:failed']);
     expect(drained).toBe(false);
   });

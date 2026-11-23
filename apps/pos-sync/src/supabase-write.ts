@@ -300,7 +300,7 @@ function rpcUrl(base: string, name: string): string {
     url.origin !== baseUrl.origin ||
     url.pathname !== `/rest/v1/rpc/${name}`
   ) {
-    throw new Error(`Refusing non-local Supabase URL: ${base}`);
+    throw new Error('Refusing non-local Supabase URL');
   }
   return url.toString();
 }

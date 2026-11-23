@@ -173,9 +173,9 @@ describe('runPosSync', () => {
         },
         db,
       }),
-    ).rejects.toThrow(/^boom \[redacted\]$/);
+    ).rejects.toThrow(/^sync failed$/);
     expect(ingestCalls).toEqual([]);
-    expect(finished).toEqual({ status: 'failed', error: 'boom [redacted]' });
+    expect(finished).toEqual({ status: 'failed', error: 'sync failed' });
   });
 
   it.each([
