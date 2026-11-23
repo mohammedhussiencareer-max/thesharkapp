@@ -234,21 +234,6 @@ expect_reader_count() {
   info "allowed ok: $label"
 }
 
-# True when both scheduler extensions and their schemas exist.
-scheduler_installed() {
-  local ready
-  ready=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c \
-    "select (select count(*) from pg_catalog.pg_extension where extname in ('pg_cron', 'pg_net')) = 2 and (select count(*) from pg_catalog.pg_namespace where nspname in ('cron', 'net')) = 2")
-  [ "$ready" = t ]
-}
-
-# Stands in for secret entry and job creation. CI has no secret and this
-# revision has no committed job name, so the step cannot write either one.
-# It is refused until both extensions exist, and it never creates a job.
-scheduler_secret_and_job() {
-  scheduler_installed
-}
-
 extract_manifest() {
   mkdir -p "$2"
   tar -xzf "$1" -C "$2" --no-same-owner manifest.json
@@ -439,9 +424,9 @@ run_full() {
   expect_denied "storage.buckets delete" 42501 \
     "begin read write; delete from storage.buckets where false; rollback"
   expect_denied "storage.objects" 42501 "select 1 from storage.objects limit 1"
-  # cron, net and vault are proved after ensure-scheduler, once the relations
-  # exist. Installing them here would make schema net readable and the reader
-  # dumps below would fail the role check.
+  # vault.secrets is proved on this fresh stack, before pg_net exists.
+  # cron.job is proved after the local-only create. net tables are not read:
+  # readable net access is what the later guarded dump must refuse.
   expect_denied "pg_authid" 42501 "select rolpassword from pg_catalog.pg_authid limit 1"
   expect_denied "write under the read-only default" 25006 \
     "update app.stock_items set name = name where false"
@@ -569,134 +554,57 @@ run_full() {
     "$here/dump.sh" "$neg_dir/out"
   sql "grant select (id) on storage.buckets to backup_reader"
 
-  step "stack A: scheduler extensions on the fresh target"
-  if scheduler_secret_and_job; then
-    fail SCHEDULER_GATE "secret entry and job creation were allowed before ensure-scheduler"
+  step "stack A: guarded backup without pg_net"
+  local net_installed present guarded_archive scheduler_report
+  net_installed=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c \
+    "select exists (select 1 from pg_catalog.pg_extension where extname = 'pg_net')")
+  [ "$net_installed" = f ] || fail SCHEDULER_PRESENT "pg_net is installed before the guarded backup"
+  scheduler_report=$(node_cli node "$here/ensure-scheduler.mjs") ||
+    fail SCHEDULER_CHECK "ensure-scheduler failed while pg_net was absent"
+  case "$scheduler_report" in
+    *"scheduler check:"*"pg_net absent"*) ;;
+    *) fail SCHEDULER_CHECK "ensure-scheduler did not report pg_net absent" ;;
+  esac
+  case "$scheduler_report" in
+    *created*) fail SCHEDULER_CHECK "ensure-scheduler created an extension before the guarded backup" ;;
+  esac
+  guarded_archive=$(PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
+    "$here/dump.sh" "$archives/without-net" 2>&3) ||
+    fail SCHEDULER_DUMP "the guarded backup failed while pg_net was absent"
+  [ -n "$guarded_archive" ] || fail SCHEDULER_DUMP "the guarded backup produced no archive"
+  mkdir -p "$work_dir/without-net-list"
+  tar -xzf "$guarded_archive" -C "$work_dir/without-net-list" --no-same-owner db.dump
+  pg_restore -l "$work_dir/without-net-list/db.dump" >"$work_dir/without-net.list"
+  if grep -E 'SCHEMA - (cron|net|vault)( |$)| (cron|net|vault) ' "$work_dir/without-net.list"; then
+    fail SCHEDULER_DUMP "the guarded backup lists scheduler objects"
   fi
-  info "negative ok: secret entry and job creation are blocked before ensure-scheduler"
-  local scheduler_ready present scheduler_archive
-  scheduler_ready=$(node_cli node "$here/ensure-scheduler.mjs") ||
-    fail SCHEDULER_INSTALL "ensure-scheduler failed"
-  printf '%s\n' "$scheduler_ready" | grep -F 'scheduler ready' >/dev/null ||
-    fail SCHEDULER_INSTALL "ensure-scheduler did not report ready"
-  grep -F 'create extension if not exists "pg_cron";' "$here/ensure-scheduler.mjs" >/dev/null ||
-    fail SCHEDULER_INSTALL "pg_cron is not created with a bare CREATE EXTENSION"
-  grep -F 'create extension if not exists "pg_net";' "$here/ensure-scheduler.mjs" >/dev/null ||
-    fail SCHEDULER_INSTALL "pg_net is not created with a bare CREATE EXTENSION"
-  if grep -F -i 'with schema' "$here/ensure-scheduler.mjs" >/dev/null; then
-    fail SCHEDULER_INSTALL "CREATE EXTENSION must not choose a schema"
-  fi
-  present=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c "select to_regclass('cron.job') is not null")
-  [ "$present" = t ] || fail SCHEDULER_INSTALL "cron.job does not exist after ensure-scheduler"
-  present=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c "select to_regclass('net.http_request_queue') is not null")
-  [ "$present" = t ] || fail SCHEDULER_INSTALL "net.http_request_queue does not exist after ensure-scheduler"
+  info "guarded backup ok without pg_net"
   present=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c "select to_regclass('vault.secrets') is not null")
-  [ "$present" = t ] || fail SCHEDULER_INSTALL "vault.secrets does not exist after ensure-scheduler"
+  [ "$present" = t ] || fail SCHEDULER_VAULT "vault.secrets does not exist"
+  expect_denied "vault.secrets" 42501 "select 1 from vault.secrets limit 1"
+
+  step "stack A: local pg_net creation fails the guard closed"
+  local scheduler_rc=0
+  env BACKUP_SCHEDULER_CREATE=1 node "$here/ensure-scheduler.mjs" \
+    >"$work_dir/scheduler.out" 2>"$work_dir/scheduler.err" || scheduler_rc=$?
+  if [ "$scheduler_rc" -eq 0 ]; then
+    fail SCHEDULER_UNSAFE "ensure-scheduler passed after creating pg_net"
+  fi
+  if ! grep -F '[SCHEDULER_NET_UNSAFE]' "$work_dir/scheduler.err"; then
+    node "$backup_dir/sanitize.mjs" "$work_dir/scheduler.err" 2>&3 || true
+    fail SCHEDULER_UNSAFE "ensure-scheduler did not fail closed with SCHEDULER_NET_UNSAFE"
+  fi
+  net_installed=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c \
+    "select exists (select 1 from pg_catalog.pg_extension where extname = 'pg_net')")
+  [ "$net_installed" = t ] || fail SCHEDULER_INSTALL "the local flag did not create pg_net"
+  present=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -c "select to_regclass('cron.job') is not null")
+  [ "$present" = t ] || fail SCHEDULER_CRON "cron.job does not exist after the local create"
   expect_denied "cron.job" 42501 "select 1 from cron.job limit 1"
   expect_denied "vault.secrets" 42501 "select 1 from vault.secrets limit 1"
-  expect_denied "net.http_request_queue" 42501 "select 1 from net.http_request_queue limit 1"
-  # The lock transaction has already committed. This one grants a non-superuser
-  # the same privileges the job owner received, calls the installed signature,
-  # and rolls the insert back.
-  psql -X -q -v ON_ERROR_STOP=1 -f - >/dev/null <<'SQL' || fail SCHEDULER_HTTP_POST "the job owner could not call net.http_post"
-begin;
-create role scheduler_probe_owner nologin nosuperuser nobypassrls nocreatedb nocreaterole noinherit;
-do $probe$
-declare
-  func regprocedure;
-  definer boolean;
-  arg_oids oid[];
-  seq_name text;
-  i int;
-  typ text;
-  literals text;
-  url_used boolean;
-begin
-  for func, definer in
-    select p.oid::regprocedure, p.prosecdef
-    from pg_catalog.pg_proc as p
-    join pg_catalog.pg_namespace as n on n.oid = p.pronamespace
-    where n.nspname = 'net'
-      and p.proname = 'http_post'
-      and p.prokind = 'f'
-  loop
-    execute format('grant usage on schema net to %I', 'scheduler_probe_owner');
-    execute format('grant execute on function %s to %I', func, 'scheduler_probe_owner');
-    if not definer then
-      execute format(
-        'grant insert, select on table net.http_request_queue to %I',
-        'scheduler_probe_owner'
-      );
-      for seq_name in
-        select pg_get_serial_sequence('net.http_request_queue', a.attname)
-        from pg_catalog.pg_attribute as a
-        where a.attrelid = 'net.http_request_queue'::regclass
-          and a.attnum > 0
-          and not a.attisdropped
-          and pg_get_serial_sequence('net.http_request_queue', a.attname) is not null
-      loop
-        execute format(
-          'grant usage on sequence %s to %I',
-          seq_name,
-          'scheduler_probe_owner'
-        );
-      end loop;
-    end if;
-  end loop;
-  execute 'set local role scheduler_probe_owner';
-  for func, arg_oids in
-    select p.oid::regprocedure, p.proargtypes::oid[]
-    from pg_catalog.pg_proc as p
-    join pg_catalog.pg_namespace as n on n.oid = p.pronamespace
-    where n.nspname = 'net'
-      and p.proname = 'http_post'
-      and p.prokind = 'f'
-  loop
-    literals := '';
-    url_used := false;
-    for i in 1 .. coalesce(array_length(arg_oids, 1), 0) loop
-      if literals <> '' then
-        literals := literals || ', ';
-      end if;
-      typ := arg_oids[i]::regtype::text;
-      if typ in ('text', 'character varying', 'varchar', 'name') then
-        if not url_used then
-          literals := literals || quote_literal('http://127.0.0.1/');
-          url_used := true;
-        else
-          literals := literals || quote_literal('');
-        end if;
-      elsif typ = 'jsonb' then
-        literals := literals || '''{}''::jsonb';
-      elsif typ = 'json' then
-        literals := literals || '''{}''::json';
-      elsif typ in ('integer', 'bigint', 'smallint', 'int4', 'int8', 'int2') then
-        literals := literals || '1000';
-      else
-        literals := literals || 'null::' || typ;
-      end if;
-    end loop;
-    execute format('select %s(%s)', func, literals);
-  end loop;
-  execute 'reset role';
-end
-$probe$;
-rollback;
-SQL
-  step "stack A: dump as backup_reader after the scheduler extensions"
-  scheduler_archive=$(PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
-    "$here/dump.sh" "$archives/scheduler" 2>&3) ||
-    fail SCHEDULER_DUMP "the reader dump failed after ensure-scheduler"
-  [ -n "$scheduler_archive" ] || fail SCHEDULER_DUMP "the reader dump produced no archive"
-  mkdir -p "$work_dir/scheduler-list"
-  tar -xzf "$scheduler_archive" -C "$work_dir/scheduler-list" --no-same-owner db.dump
-  pg_restore -l "$work_dir/scheduler-list/db.dump" >"$work_dir/reader-scoped.list"
-  if grep -E 'SCHEMA - (cron|net|vault)( |$)| (cron|net|vault) ' "$work_dir/reader-scoped.list"; then
-    fail SCHEDULER_DUMP "the reader dump lists scheduler objects"
-  fi
-  info "reader dump excludes scheduler objects"
-  scheduler_secret_and_job || fail SCHEDULER_GATE "ensure-scheduler did not open the following step"
-  info "secret entry and job creation stay manual: CI has no secret and no committed job name"
+  expect_fail "reader dump after pg_net" "[ROLE_UNSAFE]" \
+    env PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
+    "$here/dump.sh" "$archives/after-net"
+  info "a backup with unsafe net access was refused"
 
   step "stack B: empty project"
   make_empty_project "$work_dir/stack-b"

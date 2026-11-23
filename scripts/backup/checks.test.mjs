@@ -124,7 +124,9 @@ test('application objects in a platform schema are named, whatever the schema', 
   );
 });
 
-test('pg_cron and pg_net are platform extensions and usage of auth, cron, net, and vault stays forbidden', () => {
+test('pg_cron and pg_net stay platform extensions, and usage of auth, cron, net, and vault stays forbidden', () => {
+  // Kept after ensure-scheduler stopped installing extensions: drift still
+  // allows both, and any reader usage of these schemas still fails the backup.
   const violations = evaluateDrift({
     ...clean,
     extensions: [...clean.extensions, 'pg_cron', 'pg_net'],

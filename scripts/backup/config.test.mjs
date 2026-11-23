@@ -9,10 +9,13 @@ import {
   checkRestoreTarget,
   clientMajor,
   diagnosticsAllowed,
+  FORBIDDEN_EXTENSIONS,
+  FORBIDDEN_USAGE_SCHEMAS,
   formatError,
   isLoopbackAddress,
   parseDbPort,
   parsePinnedMajor,
+  PLATFORM_EXTENSIONS,
   repoRoot,
   RESTORE_CONFIRM,
   serverMajor,
@@ -387,6 +390,18 @@ test('internal error text is printed only for the synthetic loopback round trip'
       'backup: error [INTERNAL]: an internal error occurred',
     );
   }
+});
+
+test('pg_cron and pg_net stay platform extensions and are not forbidden', () => {
+  // Kept after ensure-scheduler stopped installing extensions.
+  assert.equal(FORBIDDEN_EXTENSIONS.includes('pg_cron'), false);
+  assert.equal(FORBIDDEN_EXTENSIONS.includes('pg_net'), false);
+  assert.equal(PLATFORM_EXTENSIONS.includes('pg_cron'), true);
+  assert.equal(PLATFORM_EXTENSIONS.includes('pg_net'), true);
+  assert.deepEqual(
+    [...FORBIDDEN_USAGE_SCHEMAS],
+    ['auth', 'cron', 'net', 'vault'],
+  );
 });
 
 test('sanitizeStderr keeps only error lines and masks hosts and values', () => {
