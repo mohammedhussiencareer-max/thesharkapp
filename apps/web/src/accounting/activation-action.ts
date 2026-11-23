@@ -29,7 +29,9 @@ import {
 } from '@/items/request-id';
 import {
   abortClaimBeforeDispatch,
+  acquireHeldWriteLock,
   captureWriteSession,
+  HeldWriteStorageError,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
@@ -127,11 +129,21 @@ export function useActivationAction(
       onReview(next);
       return;
     }
-    replaceActivationPayload(ACTIVATION_SUBJECT, requestId, {
-      requestId,
-      manifestHash: next.openingManifestHash,
-      explicitZeroItemIds: [],
-    });
+    try {
+      replaceActivationPayload(ACTIVATION_SUBJECT, requestId, {
+        requestId,
+        manifestHash: next.openingManifestHash,
+        explicitZeroItemIds: [],
+      });
+    } catch (error) {
+      setReloadBlocked(true);
+      setNotice(
+        error instanceof HeldWriteStorageError
+          ? storageWriteFailedMessage
+          : messageFrom(error),
+      );
+      return;
+    }
     setChecks({ hash: next.openingManifestHash, ids: new Set() });
     setReloadBlocked(false);
     onReview(next);
@@ -149,10 +161,15 @@ export function useActivationAction(
       if (!requestId) return;
       flight.current = true;
       setSaving(true);
+      let releaseReloadLock = () => {};
       try {
+        const lock = await acquireHeldWriteLock(ACTIVATION_SUBJECT);
+        if (!lock.acquired) return;
+        releaseReloadLock = lock.release;
         const next = await reloadReview();
         if (next) acceptReloaded(requestId, next);
       } finally {
+        releaseReloadLock();
         flight.current = false;
         setSaving(false);
       }
@@ -262,7 +279,17 @@ export function useActivationAction(
         });
       } catch (failure) {
         if (!persisted && isOpeningManifestChange(failure)) {
-          pinActivationReviewReload(ACTIVATION_SUBJECT, action.requestId);
+          try {
+            pinActivationReviewReload(ACTIVATION_SUBJECT, action.requestId);
+          } catch (storageError) {
+            setReloadBlocked(true);
+            setNotice(
+              storageError instanceof HeldWriteStorageError
+                ? storageWriteFailedMessage
+                : messageFrom(storageError),
+            );
+            return;
+          }
           setReloadBlocked(true);
           const next = await reloadReview();
           if (next) acceptReloaded(action.requestId, next);

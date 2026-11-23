@@ -6,6 +6,33 @@ import {
 } from '@/items/api';
 import { genericCatalogError } from '@/items/errors';
 import type { CatalogItem, CostingSchedule } from '@/items/types';
+import type { PostedReloadSnapshot } from '@/lib/held-writes';
+
+export type ItemSyncedData = {
+  version: number;
+  schedule?: CostingSchedule;
+  conversions?: ConversionList;
+};
+
+export type ItemReadRequest =
+  | { kind: 'loss'; snapshots?: PostedReloadSnapshot }
+  | { kind: 'conversion'; snapshots?: PostedReloadSnapshot }
+  | { kind: 'schedule' }
+  | { kind: 'conversions_open' };
+
+export type ItemReadOutcome =
+  | {
+      status: 'applied';
+      item?: CatalogItem;
+      schedule?: CostingSchedule;
+      conversions?: ConversionList;
+    }
+  | { status: 'superseded' };
+
+export type RunItemRead = (
+  itemId: string,
+  request: ItemReadRequest,
+) => Promise<ItemReadOutcome>;
 
 export type VerifiedLossItem = {
   schedule: CostingSchedule;

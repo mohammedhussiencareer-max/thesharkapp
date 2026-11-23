@@ -15,6 +15,7 @@ import {
   getHeldWrite,
   hasDurableHeldWrite,
   listHeldWritesByPrefix,
+  listPostedReloadRecords,
   resetHeldWritesStore,
   setHeldWritePhase,
   snapshotPostedReloads,
@@ -199,9 +200,7 @@ export function pinActivationReviewReload(
   subject: string,
   requestId: string,
 ): void {
-  const current = getHeldWrite(subject);
-  if (!current || current.requestId !== requestId) return;
-  updateHeldWritePayload(subject, requestId, current.payload, {
+  updateHeldWritePayload(subject, requestId, undefined, {
     phase: 'inflight',
     awaitingReviewReload: true,
   });
@@ -216,8 +215,6 @@ export function replaceActivationPayload<T extends { requestId: string }>(
   requestId: string,
   next: T,
 ): void {
-  const current = getHeldWrite(subject);
-  if (!current || current.requestId !== requestId) return;
   if (next.requestId !== requestId) return;
   updateHeldWritePayload(subject, requestId, next, {
     phase: 'inflight',
@@ -302,50 +299,86 @@ export type PostedCostingPin = {
   requestId: string;
   itemId: string;
   kind: 'loss' | 'conversion';
+  readTarget?: string;
 };
 
 const lossPrefix = 'loss:';
 
-/** List all outstanding `posted_reload` pins for loss and conversion saves. */
+/** Derive the costing kind and item id directly from a loss or conversion subject. */
+export function costingItemIdFromSubject(
+  subject: string,
+): { kind: 'loss' | 'conversion'; itemId: string } | null {
+  if (subject.startsWith(lossPrefix)) {
+    const itemId = subject.slice(lossPrefix.length);
+    return itemId.length > 0 ? { kind: 'loss', itemId } : null;
+  }
+  if (subject.startsWith(conversionPrefix)) {
+    try {
+      const parsed: unknown = JSON.parse(
+        subject.slice(conversionPrefix.length),
+      );
+      if (
+        Array.isArray(parsed) &&
+        typeof parsed[0] === 'string' &&
+        parsed[0].length > 0
+      ) {
+        return { kind: 'conversion', itemId: parsed[0] };
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * List all outstanding `posted_reload` and acknowledged-inflight pins for loss
+ * and conversion saves. Always derives `itemId` from the action subject so
+ * legacy Round-8 pins with `readTarget: 'items:reload'` or `'loss:<id>'` still
+ * recover cleanly.
+ */
 export function listPostedCostingPins(): PostedCostingPin[] {
   const pins: PostedCostingPin[] = [];
-  for (const record of listHeldWritesByPrefix(lossPrefix)) {
-    if (record.phase !== 'posted_reload') continue;
-    const itemId = record.readTarget ?? record.subject.slice(lossPrefix.length);
-    if (itemId.length > 0) {
-      pins.push({
-        subject: record.subject,
-        requestId: record.requestId,
-        itemId,
-        kind: 'loss',
-      });
-    }
-  }
-  for (const record of listHeldWritesByPrefix(conversionPrefix)) {
-    if (record.phase !== 'posted_reload') continue;
-    let itemId = record.readTarget ?? '';
-    if (itemId.length === 0) {
-      try {
-        const parsed: unknown = JSON.parse(
-          record.subject.slice(conversionPrefix.length),
-        );
-        if (Array.isArray(parsed) && typeof parsed[0] === 'string') {
-          itemId = parsed[0];
-        }
-      } catch {
-        continue;
-      }
-    }
-    if (itemId.length > 0) {
-      pins.push({
-        subject: record.subject,
-        requestId: record.requestId,
-        itemId,
-        kind: 'conversion',
-      });
-    }
+  for (const record of [
+    ...listPostedReloadRecords(lossPrefix),
+    ...listPostedReloadRecords(conversionPrefix),
+  ]) {
+    const parsed = costingItemIdFromSubject(record.subject);
+    if (!parsed) continue;
+    pins.push({
+      subject: record.subject,
+      requestId: record.requestId,
+      itemId: parsed.itemId,
+      kind: parsed.kind,
+      ...(record.readTarget !== undefined
+        ? { readTarget: record.readTarget }
+        : {}),
+    });
   }
   return pins;
+}
+
+/**
+ * Clear captured loss/conversion pins for `itemId` after a combined read
+ * applies, including legacy Round-8 targets (`items:reload`, `loss:<id>`).
+ */
+export function clearCostingPinsForItem(
+  snapshot: PostedReloadSnapshot,
+  itemId: string,
+): void {
+  const legacyLossTarget = lossSubject(itemId);
+  for (const entry of snapshot) {
+    if (costingItemIdFromSubject(entry.subject)?.itemId !== itemId) continue;
+    const target = entry.readTarget;
+    if (
+      target === undefined ||
+      target === itemId ||
+      target === ITEMS_RELOAD_SUBJECT ||
+      target === legacyLossTarget
+    ) {
+      clearPostedReloadSnapshot([entry], target ?? itemId);
+    }
+  }
 }
 
 /**

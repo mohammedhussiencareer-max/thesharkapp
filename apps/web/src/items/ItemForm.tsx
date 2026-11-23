@@ -35,7 +35,7 @@ import {
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
-  clearActionPostedReloadSnapshot,
+  clearCostingPinsForItem,
   createSubject,
   firstUnknownItemCreate,
   hasAction,
@@ -49,7 +49,7 @@ import {
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
-import { verifyLossItem } from '@/items/verify';
+import { verifyLossItem, type RunItemRead } from '@/items/verify';
 import { UnknownSave } from '@/items/UnknownSave';
 import {
   frequencyOptions,
@@ -71,6 +71,7 @@ import {
 
 import {
   captureWriteSession,
+  HeldWriteStorageError,
   storageWriteFailedMessage,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
@@ -100,6 +101,20 @@ type PriceAction = {
   requestId: string;
 };
 
+function areDetailsDirty(
+  current: ItemFormValues,
+  baseline: ItemFormValues,
+): boolean {
+  return (
+    current.name !== baseline.name ||
+    current.kind !== baseline.kind ||
+    current.baseUnit !== baseline.baseUnit ||
+    current.countFrequency !== baseline.countFrequency ||
+    current.parentItemId !== baseline.parentItemId ||
+    current.active !== baseline.active
+  );
+}
+
 export function ItemForm({
   items,
   editingId,
@@ -111,9 +126,13 @@ export function ItemForm({
   onSubmit,
   onCancel,
   detailsKey = 0,
+  syncedSchedule,
+  freshDataAvailable = false,
+  onAdoptFreshData,
   onIdentityDirtyChange,
+  onDetailsDirtyChange,
   onItemStale,
-  onItemVerified,
+  onRunItemRead,
 }: {
   items: readonly CatalogItem[];
   editingId?: string;
@@ -125,33 +144,49 @@ export function ItemForm({
   onClearServerError: () => void;
   onSubmit: (action: ItemSave) => Promise<boolean>;
   onCancel: () => void;
-  /** Bumped after a stale details reload. Resets details only. */
+  /** Bumped after a stale details reload or clean sync. Resets details only. */
   detailsKey?: number;
+  /** Shared per-item schedule pushed by ItemsPage's unified read pipeline. */
+  syncedSchedule?: CostingSchedule | null;
+  /** True when a newer server row arrived while the form holds unsaved detail edits. */
+  freshDataAvailable?: boolean;
+  /** Explicitly adopt the latest server row into the form and its CAS baseline. */
+  onAdoptFreshData?: () => void;
   /** True while kind, base unit or parent differs from the saved item. */
   onIdentityDirtyChange?: (dirty: boolean) => void;
+  /** True while any editable detail field differs from the form's baseline. */
+  onDetailsDirtyChange?: (dirty: boolean) => void;
   /** The costing schedule is for a different identity than the shown item. */
   onItemStale?: (itemId: string) => void | Promise<void>;
-  /** Called with the fresh item row once a combined loss verification read succeeds. */
-  onItemVerified?: (item: CatalogItem) => void;
+  /** Unified per-item read pipeline provided by ItemsPage. */
+  onRunItemRead?: RunItemRead;
 }) {
   const online = useOnline();
   const titleId = useId();
+  const [baselineValues, setBaselineValues] = useState(
+    initial ?? emptyItemForm,
+  );
   const [values, setValues] = useState(initial ?? emptyItemForm);
   const [seenDetails, setSeenDetails] = useState(detailsKey);
   if (seenDetails !== detailsKey) {
     setSeenDetails(detailsKey);
-    // A stale details reload refreshes name, kind, and the other detail
-    // fields. Loss and price stay, including a value whose write outcome
-    // is still unknown.
+    const nextBaseline = initial ?? emptyItemForm();
+    setBaselineValues(nextBaseline);
+    // A stale details reload or explicit refresh updates name, kind, and the
+    // other detail fields. Loss and price stay, including a value whose write
+    // outcome is still unknown.
     setValues((current) => ({
-      ...(initial ?? emptyItemForm()),
+      ...nextBaseline,
       lossPercent: current.lossPercent,
     }));
   }
   const [errors, setErrors] = useState<ItemFormErrors>({});
   const [extraError, setExtraError] = useState<string | null>(null);
   const [shiftStart, setShiftStart] = useState<string | null>(null);
-  const [schedule, setSchedule] = useState<CostingSchedule | null>(null);
+  const [localSchedule, setLocalSchedule] = useState<CostingSchedule | null>(
+    null,
+  );
+  const schedule = syncedSchedule ?? localSchedule;
   const [mode, setMode] = useState<EffectiveMode>('now');
   const [customLocal, setCustomLocal] = useState('');
   const [lossReason, setLossReason] = useState('');
@@ -170,7 +205,10 @@ export function ItemForm({
   const timingTouched = useRef(false);
   const scheduleLoad = useRef(0);
   const onItemStaleRef = useRef(onItemStale);
-  const onItemVerifiedRef = useRef(onItemVerified);
+  const onRunItemReadRef = useRef(onRunItemRead);
+  const onDetailsDirtyChangeRef = useRef(onDetailsDirtyChange);
+  const detailsDirty =
+    editingId !== undefined && areDetailsDirty(values, baselineValues);
   const lossFlight = useRef(false);
   const priceFlight = useRef(false);
   const createFlight = useRef(false);
@@ -251,9 +289,18 @@ export function ItemForm({
   }, [identityDirty, onIdentityDirtyChange]);
 
   useEffect(() => {
+    onDetailsDirtyChangeRef.current = onDetailsDirtyChange;
+  }, [onDetailsDirtyChange]);
+
+  useEffect(() => {
+    onDetailsDirtyChange?.(detailsDirty);
+    return () => onDetailsDirtyChange?.(false);
+  }, [detailsDirty, onDetailsDirtyChange]);
+
+  useEffect(() => {
     onItemStaleRef.current = onItemStale;
-    onItemVerifiedRef.current = onItemVerified;
-  }, [onItemStale, onItemVerified]);
+    onRunItemReadRef.current = onRunItemRead;
+  }, [onItemStale, onRunItemRead]);
 
   // A new displayed identity re-reads the schedule. A schedule for another
   // identity than the one this read was issued for means the shown item is
@@ -264,18 +311,47 @@ export function ItemForm({
     let cancelled = false;
     const subject = lossSubject(editingId);
     const pendingReloads = snapshotActionPostedReloads({ subject });
+    const runItemRead = onRunItemReadRef.current;
     void (async () => {
       try {
+        if (runItemRead) {
+          const [shift, outcome] = await Promise.all([
+            currentShiftStart(),
+            runItemRead(
+              editingId,
+              pendingReloads.length > 0
+                ? { kind: 'loss', snapshots: pendingReloads }
+                : { kind: 'schedule' },
+            ),
+          ]);
+          if (
+            cancelled ||
+            request !== scheduleLoad.current ||
+            outcome.status === 'superseded' ||
+            !outcome.schedule
+          ) {
+            return;
+          }
+          setShiftStart(shift);
+          setLocalSchedule(outcome.schedule);
+          if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
+          const appliedIdentity = outcome.item
+            ? itemIdentity(outcome.item)
+            : editingIdentity;
+          if (outcome.schedule.identity !== appliedIdentity) {
+            void onItemStaleRef.current?.(editingId);
+          }
+          return;
+        }
         if (pendingReloads.length > 0) {
           const [shift, verified] = await Promise.all([
             currentShiftStart(),
             verifyLossItem(editingId),
           ]);
-          clearActionPostedReloadSnapshot(pendingReloads, editingId);
+          clearCostingPinsForItem(pendingReloads, editingId);
           if (cancelled || request !== scheduleLoad.current) return;
           setShiftStart(shift);
-          setSchedule(verified.schedule);
-          onItemVerifiedRef.current?.(verified.item);
+          setLocalSchedule(verified.schedule);
           if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
           if (verified.schedule.identity !== editingIdentity) {
             void onItemStaleRef.current?.(editingId);
@@ -288,7 +364,7 @@ export function ItemForm({
         ]);
         if (cancelled || request !== scheduleLoad.current) return;
         setShiftStart(shift);
-        setSchedule(nextSchedule);
+        setLocalSchedule(nextSchedule);
         if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
         if (nextSchedule.identity !== editingIdentity) {
           void onItemStaleRef.current?.(editingId);
@@ -313,19 +389,40 @@ export function ItemForm({
     const subject = lossSubject(editingId);
     const pendingReloads = snapshotActionPostedReloads({ subject });
     const includeItem = options?.includeItem ?? true;
+    const runItemRead = onRunItemReadRef.current;
     try {
+      if (runItemRead) {
+        const outcome = await runItemRead(
+          editingId,
+          includeItem || pendingReloads.length > 0
+            ? { kind: 'loss', snapshots: pendingReloads }
+            : { kind: 'schedule' },
+        );
+        if (outcome.status === 'superseded') return false;
+        if (request !== scheduleLoad.current || !outcome.schedule) return true;
+        setLocalSchedule(outcome.schedule);
+        const appliedIdentity = outcome.item
+          ? itemIdentity(outcome.item)
+          : expectedIdentity;
+        if (
+          appliedIdentity !== undefined &&
+          outcome.schedule.identity !== appliedIdentity
+        ) {
+          void onItemStaleRef.current?.(editingId);
+        }
+        return true;
+      }
       let nextSchedule: CostingSchedule;
       if (includeItem || pendingReloads.length > 0) {
         const verified = await verifyLossItem(editingId);
-        clearActionPostedReloadSnapshot(pendingReloads, editingId);
+        clearCostingPinsForItem(pendingReloads, editingId);
         if (request !== scheduleLoad.current) return false;
         nextSchedule = verified.schedule;
-        setSchedule(nextSchedule);
-        onItemVerifiedRef.current?.(verified.item);
+        setLocalSchedule(nextSchedule);
       } else {
         nextSchedule = await listCostingSchedule(editingId);
         if (request !== scheduleLoad.current) return false;
-        setSchedule(nextSchedule);
+        setLocalSchedule(nextSchedule);
       }
       if (
         expectedIdentity !== undefined &&
@@ -386,7 +483,15 @@ export function ItemForm({
   function change(patch: Partial<ItemFormValues>) {
     onClearServerError();
     setExtraError(null);
-    setValues((current) => ({ ...current, ...patch }));
+    setValues((current) => {
+      const next = { ...current, ...patch };
+      if (editingId !== undefined) {
+        onDetailsDirtyChangeRef.current?.(
+          areDetailsDirty(next, baselineValues),
+        );
+      }
+      return next;
+    });
     setErrors({});
   }
 
@@ -471,12 +576,19 @@ export function ItemForm({
         return;
       }
       saved = true;
-      markActionPostedReload(subject, requestId, editingId);
+      try {
+        markActionPostedReload(subject, requestId, editingId);
+      } catch (storageError) {
+        if (!(storageError instanceof HeldWriteStorageError)) {
+          throw storageError;
+        }
+        setExtraError(messageFrom(storageError));
+      }
       releaseLock();
       releaseLock = () => {};
       setDatedLoss(false);
       const reloaded = await reloadLossSchedule();
-      if (reloaded) {
+      if (reloaded && !onRunItemReadRef.current) {
         clearActionPostedReload(subject, editingId, requestId);
       }
     } catch (error) {
@@ -837,6 +949,24 @@ export function ItemForm({
         <h2 id={titleId} className="text-lg font-semibold">
           {title}
         </h2>
+        {freshDataAvailable ? (
+          <div
+            role="status"
+            className="flex flex-wrap items-center justify-between gap-2 rounded border border-neutral-300 p-2 text-sm"
+          >
+            <span>البيانات اتحدّثت على السيرفر — في نسخة أحدث متاحة</span>
+            {onAdoptFreshData ? (
+              <button
+                className={secondaryButton}
+                type="button"
+                disabled={submitting || locked}
+                onClick={onAdoptFreshData}
+              >
+                تحميل أحدث بيانات
+              </button>
+            ) : null}
+          </div>
+        ) : null}
         {serverError ? <p role="alert">{serverError}</p> : null}
         {extraError ? <p role="alert">{extraError}</p> : null}
         <div className="flex flex-col gap-1">

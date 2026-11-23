@@ -36,3 +36,18 @@ export function expectationFromItem(item: CatalogItem): ItemExpectation {
     active: item.active,
   };
 }
+
+export function sameExpectation(
+  a: ItemExpectation | null,
+  b: ItemExpectation | null,
+): boolean {
+  if (a === null || b === null) return a === b;
+  return (
+    a.name === b.name &&
+    a.kind === b.kind &&
+    a.baseUnit === b.baseUnit &&
+    a.countFrequency === b.countFrequency &&
+    a.parentItemId === b.parentItemId &&
+    a.active === b.active
+  );
+}

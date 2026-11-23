@@ -4,6 +4,7 @@ import { formatEgp, formatLossPercent, formatQty } from '@/items/format';
 import { groupCatalog } from '@/items/group';
 import { frequencyLabels, kindLabels, unitLabels } from '@/items/labels';
 import type { CatalogItem } from '@/items/types';
+import type { ItemSyncedData, RunItemRead } from '@/items/verify';
 
 const secondaryButton =
   'rounded border border-neutral-300 px-3 py-2 disabled:opacity-60';
@@ -15,11 +16,12 @@ function ItemCard({
   conversionsLocked,
   identityDirty,
   hideMoney = false,
+  syncedData,
   onEdit,
   onToggleConversions,
   onConversionsBusy,
   onItemStale,
-  onItemVerified,
+  onRunItemRead,
 }: {
   item: CatalogItem;
   conversionsOpen: boolean;
@@ -27,11 +29,12 @@ function ItemCard({
   conversionsLocked: boolean;
   identityDirty: boolean;
   hideMoney?: boolean;
+  syncedData?: ItemSyncedData;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusy: (busy: boolean) => void;
   onItemStale?: (itemId: string) => void | Promise<void>;
-  onItemVerified?: (item: CatalogItem) => void;
+  onRunItemRead?: RunItemRead;
 }) {
   return (
     <article
@@ -100,9 +103,10 @@ function ItemCard({
           item={item}
           locked={editsDisabled}
           identityDirty={identityDirty}
+          syncedData={syncedData}
           onBusyChange={onConversionsBusy}
           onItemStale={onItemStale}
-          onItemVerified={onItemVerified}
+          onRunItemRead={onRunItemRead}
         />
       ) : null}
     </article>
@@ -125,11 +129,12 @@ export function ItemList({
   editsDisabled,
   identityDirtyId = null,
   hideMoney = false,
+  syncedDataById,
   onEdit,
   onToggleConversions,
   onConversionsBusyChange,
   onItemStale,
-  onItemVerified,
+  onRunItemRead,
 }: {
   items: readonly CatalogItem[];
   showInactive: boolean;
@@ -138,11 +143,12 @@ export function ItemList({
   /** The item whose open editor holds an unsaved kind, base unit or parent. */
   identityDirtyId?: string | null;
   hideMoney?: boolean;
+  syncedDataById?: Readonly<Record<string, ItemSyncedData>>;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusyChange?: (busy: boolean) => void;
   onItemStale?: (itemId: string) => void | Promise<void>;
-  onItemVerified?: (item: CatalogItem) => void;
+  onRunItemRead?: RunItemRead;
 }) {
   const [conversionsBusy, setConversionsBusyState] = useState(false);
   // The page also locks controls that would unmount an open panel (the inactive filter).
@@ -160,11 +166,12 @@ export function ItemList({
       conversionsLocked={conversionsBusy || editsDisabled}
       identityDirty={identityDirtyId === item.id}
       hideMoney={hideMoney}
+      syncedData={syncedDataById?.[item.id]}
       onEdit={onEdit}
       onToggleConversions={onToggleConversions}
       onConversionsBusy={setConversionsBusy}
       onItemStale={onItemStale}
-      onItemVerified={onItemVerified}
+      onRunItemRead={onRunItemRead}
     />
   );
 
@@ -190,11 +197,12 @@ export function ItemList({
                   conversionsLocked={conversionsBusy || editsDisabled}
                   identityDirty={identityDirtyId === block.parent.id}
                   hideMoney={hideMoney}
+                  syncedData={syncedDataById?.[block.parent.id]}
                   onEdit={onEdit}
                   onToggleConversions={onToggleConversions}
                   onConversionsBusy={setConversionsBusy}
                   onItemStale={onItemStale}
-                  onItemVerified={onItemVerified}
+                  onRunItemRead={onRunItemRead}
                 />
               ) : (
                 <p>تحت {block.parent.name} (موقوف)</p>

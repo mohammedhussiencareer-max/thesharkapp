@@ -29,7 +29,7 @@ import {
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
-  clearActionPostedReloadSnapshot,
+  clearCostingPinsForItem,
   conversionSubject,
   hasAction,
   hasDurableAction,
@@ -42,7 +42,11 @@ import {
   unknownSaveMessage,
   updateActionPayload,
 } from '@/items/request-id';
-import { verifyConversionItem } from '@/items/verify';
+import {
+  verifyConversionItem,
+  type ItemSyncedData,
+  type RunItemRead,
+} from '@/items/verify';
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatStoredFactor } from '@/items/format';
@@ -314,25 +318,28 @@ export function ConversionsPanel({
   item,
   locked = false,
   identityDirty = false,
+  syncedData,
   onBusyChange,
   onItemStale,
-  onItemVerified,
+  onRunItemRead,
 }: {
   item: CatalogItem;
   /** Set by the page while an item save is in flight. */
   locked?: boolean;
   /** The open editor holds a kind, base unit or parent that is not saved. */
   identityDirty?: boolean;
+  /** Shared per-item schedule/conversions snapshot driven by ItemsPage's read pipeline. */
+  syncedData?: ItemSyncedData;
   onBusyChange?: (busy: boolean) => void;
   /** The snapshot base unit no longer matches the item the page rendered. */
   onItemStale?: (itemId: string) => void | Promise<void>;
-  /** Called with the fresh item row once a combined conversion verification read succeeds. */
-  onItemVerified?: (item: CatalogItem) => void;
+  /** Unified per-item read pipeline provided by ItemsPage. */
+  onRunItemRead?: RunItemRead;
 }) {
   const requestRef = useRef(0);
   const aliveRef = useRef(false);
   const onItemStaleRef = useRef(onItemStale);
-  const onItemVerifiedRef = useRef(onItemVerified);
+  const onRunItemReadRef = useRef(onRunItemRead);
   const itemBaseUnitRef = useRef(item.baseUnit);
   const identityKey = itemIdentity(item);
   const itemIdentityRef = useRef(identityKey);
@@ -340,13 +347,22 @@ export function ConversionsPanel({
   const replayFlight = useRef(new Set<string>());
   useEffect(() => {
     onItemStaleRef.current = onItemStale;
-    onItemVerifiedRef.current = onItemVerified;
+    onRunItemReadRef.current = onRunItemRead;
     itemBaseUnitRef.current = item.baseUnit;
     itemIdentityRef.current = identityKey;
-  }, [identityKey, item.baseUnit, onItemStale, onItemVerified]);
-  const [rows, setRows] = useState<UnitConversion[] | null>(null);
-  const [baseUnit, setBaseUnit] = useState<BaseUnit | null>(null);
-  const [schedule, setSchedule] = useState<CostingSchedule | null>(null);
+  }, [identityKey, item.baseUnit, onItemStale, onRunItemRead]);
+  const [localRows, setLocalRows] = useState<UnitConversion[] | null>(null);
+  const [localBaseUnit, setLocalBaseUnit] = useState<BaseUnit | null>(null);
+  const [localSchedule, setLocalSchedule] = useState<CostingSchedule | null>(
+    null,
+  );
+  const rows = syncedData?.conversions
+    ? syncedData.conversions.rows
+    : localRows;
+  const baseUnit = syncedData?.conversions
+    ? syncedData.conversions.baseUnit
+    : localBaseUnit;
+  const schedule = syncedData?.schedule ?? localSchedule;
   const [meta, setMeta] = useState<{
     itemId: string;
     shiftStart: string | null;
@@ -432,8 +448,8 @@ export function ConversionsPanel({
     ) => {
       if (!aliveRef.current || cancelled() || requestId !== requestRef.current)
         return;
-      setRows(next.rows);
-      setBaseUnit(next.baseUnit);
+      setLocalRows(next.rows);
+      setLocalBaseUnit(next.baseUnit);
       setLoadError(null);
       if (
         next.baseUnit !== itemBaseUnitRef.current ||
@@ -467,17 +483,43 @@ export function ConversionsPanel({
     const pendingReloads = snapshotActionPostedReloads({
       prefix: `conversion:[${JSON.stringify(item.id)},`,
     });
+    const runItemRead = onRunItemReadRef.current;
     try {
-      const verified = await verifyConversionItem(item.id);
-      clearActionPostedReloadSnapshot(pendingReloads, item.id);
-      if (!aliveRef.current || requestId !== requestRef.current) return false;
-      setSchedule(verified.schedule);
-      const stale =
-        verified.conversions.baseUnit !== itemBaseUnitRef.current ||
-        verified.schedule.identity !== itemIdentityRef.current;
-      if (!stale) {
-        onItemVerifiedRef.current?.(verified.item);
+      if (runItemRead) {
+        const outcome = await runItemRead(item.id, {
+          kind: 'conversion',
+          snapshots: pendingReloads,
+        });
+        if (outcome.status === 'superseded') return false;
+        if (
+          !aliveRef.current ||
+          requestId !== requestRef.current ||
+          !outcome.conversions ||
+          !outcome.schedule
+        ) {
+          return true;
+        }
+        setLocalSchedule(outcome.schedule);
+        setLocalRows(outcome.conversions.rows);
+        setLocalBaseUnit(outcome.conversions.baseUnit);
+        setLoadError(null);
+        const appliedBaseUnit =
+          outcome.item?.baseUnit ?? itemBaseUnitRef.current;
+        const appliedIdentity = outcome.item
+          ? itemIdentity(outcome.item)
+          : itemIdentityRef.current;
+        if (
+          outcome.conversions.baseUnit !== appliedBaseUnit ||
+          outcome.schedule.identity !== appliedIdentity
+        ) {
+          await onItemStaleRef.current?.(item.id);
+        }
+        return true;
       }
+      const verified = await verifyConversionItem(item.id);
+      clearCostingPinsForItem(pendingReloads, item.id);
+      if (!aliveRef.current || requestId !== requestRef.current) return false;
+      setLocalSchedule(verified.schedule);
       await applySnapshot(
         item.id,
         verified.conversions,
@@ -499,25 +541,56 @@ export function ConversionsPanel({
     const pendingReloads = snapshotActionPostedReloads({
       prefix: `conversion:[${JSON.stringify(item.id)},`,
     });
+    const runItemRead = onRunItemReadRef.current;
 
     void (async () => {
       try {
+        if (runItemRead) {
+          const outcome = await runItemRead(
+            item.id,
+            pendingReloads.length > 0
+              ? { kind: 'conversion', snapshots: pendingReloads }
+              : { kind: 'conversions_open' },
+          );
+          if (outcome.status === 'superseded') {
+            return;
+          }
+          if (
+            !aliveRef.current ||
+            cancelled ||
+            requestId !== requestRef.current ||
+            !outcome.conversions ||
+            !outcome.schedule
+          ) {
+            return;
+          }
+          setLocalSchedule(outcome.schedule);
+          setLocalRows(outcome.conversions.rows);
+          setLocalBaseUnit(outcome.conversions.baseUnit);
+          setLoadError(null);
+          const appliedBaseUnit =
+            outcome.item?.baseUnit ?? itemBaseUnitRef.current;
+          const appliedIdentity = outcome.item
+            ? itemIdentity(outcome.item)
+            : itemIdentityRef.current;
+          if (
+            outcome.conversions.baseUnit !== appliedBaseUnit ||
+            outcome.schedule.identity !== appliedIdentity
+          ) {
+            await onItemStaleRef.current?.(item.id);
+          }
+          return;
+        }
         if (pendingReloads.length > 0) {
           const verified = await verifyConversionItem(item.id);
-          clearActionPostedReloadSnapshot(pendingReloads, item.id);
+          clearCostingPinsForItem(pendingReloads, item.id);
           if (
             !aliveRef.current ||
             cancelled ||
             requestId !== requestRef.current
           )
             return;
-          setSchedule(verified.schedule);
-          const stale =
-            verified.conversions.baseUnit !== itemBaseUnitRef.current ||
-            verified.schedule.identity !== itemIdentityRef.current;
-          if (!stale) {
-            onItemVerifiedRef.current?.(verified.item);
-          }
+          setLocalSchedule(verified.schedule);
           await applySnapshot(
             item.id,
             verified.conversions,
@@ -533,7 +606,7 @@ export function ConversionsPanel({
         ]);
         if (!aliveRef.current || cancelled || requestId !== requestRef.current)
           return;
-        setSchedule(nextSchedule);
+        setLocalSchedule(nextSchedule);
         await applySnapshot(
           item.id,
           next,
@@ -751,7 +824,14 @@ export function ConversionsPanel({
           try {
             await perform(action, session);
             saved = true;
-            markActionPostedReload(subject, requestId, item.id);
+            try {
+              markActionPostedReload(subject, requestId, item.id);
+            } catch (storageError) {
+              if (!(storageError instanceof HeldWriteStorageError)) {
+                throw storageError;
+              }
+              setActionError(messageFrom(storageError));
+            }
             clearSubmittedAdd(action);
           } catch (error) {
             if (
@@ -768,7 +848,9 @@ export function ConversionsPanel({
           }
         },
         () => {
-          clearActionPostedReload(subject, item.id, requestId);
+          if (!onRunItemReadRef.current) {
+            clearActionPostedReload(subject, item.id, requestId);
+          }
         },
       );
       if (accepted === false) {
