@@ -367,18 +367,24 @@ export function ExpensesPage() {
    * older read for a month can never overwrite a newer read for that same month.
    */
   const readExpenseMonthTarget = useCallback(
-    async (targetMonth: string): Promise<MonthReadResult | null> => {
+    async (
+      targetMonth: string,
+      mode: 'month' | 'global' = 'month',
+    ): Promise<MonthReadResult | null> => {
       const monthSeq = nextMonthSeq(targetMonth);
       const globalSeq = ++globalReadSeqRef.current;
       const readSession = captureWriteSession();
+      const isStale = () =>
+        !isLatestMonthSeq(targetMonth, monthSeq) ||
+        (mode === 'global' && globalSeq !== globalReadSeqRef.current);
       readsRef.current += 1;
       setReadLoads(readsRef.current);
       try {
         const next = await loadExpenseMonth(targetMonth);
-        if (!isLatestMonthSeq(targetMonth, monthSeq)) return null;
+        if (isStale()) return null;
         return { data: next, monthSeq, globalSeq, readSession };
       } catch (error) {
-        if (!isLatestMonthSeq(targetMonth, monthSeq)) return null;
+        if (isStale()) return null;
         throw error;
       } finally {
         readsRef.current -= 1;
@@ -474,15 +480,12 @@ export function ExpensesPage() {
     setVerify({ targetMonth, status: 'verifying', readError: null });
     const pendingReloads = snapshotExpensePostedReloads();
     try {
-      const result = await readExpenseMonthTarget(targetMonth);
+      const result = await readExpenseMonthTarget(
+        targetMonth,
+        kind === 'category' ? 'global' : 'month',
+      );
       // Discard superseded reads so an older verification cannot overwrite newer month data or unlock writes from stale data.
       if (!result) return;
-      if (
-        kind === 'category' &&
-        result.globalSeq !== globalReadSeqRef.current
-      ) {
-        return;
-      }
       const fresh = result.data;
       if (fresh.monthStart === `${monthRef.current}-01`) {
         dataSessionRef.current = result.readSession;
@@ -568,14 +571,11 @@ export function ExpensesPage() {
       setVerify({ targetMonth, status: 'verifying', readError: null });
       const pendingReloads = snapshotExpensePostedReloads();
       try {
-        const result = await readExpenseMonthTarget(targetMonth);
+        const result = await readExpenseMonthTarget(
+          targetMonth,
+          kind === 'category' ? 'global' : 'month',
+        );
         if (!result) return false;
-        if (
-          kind === 'category' &&
-          result.globalSeq !== globalReadSeqRef.current
-        ) {
-          return false;
-        }
         const fresh = result.data;
         if (fresh.monthStart === `${monthRef.current}-01`) {
           dataSessionRef.current = result.readSession;

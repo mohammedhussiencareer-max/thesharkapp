@@ -29,10 +29,10 @@ import {
   claimFreshAction,
   claimReplayAction,
   clearActionPostedReload,
+  clearActionPostedReloadSnapshot,
   conversionSubject,
   hasAction,
   hasDurableAction,
-  ITEMS_RELOAD_SUBJECT,
   listUnknownConversionsForItem,
   markActionPostedReload,
   settleAction,
@@ -42,6 +42,7 @@ import {
   unknownSaveMessage,
   updateActionPayload,
 } from '@/items/request-id';
+import { verifyConversionItem } from '@/items/verify';
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatStoredFactor } from '@/items/format';
@@ -315,7 +316,7 @@ export function ConversionsPanel({
   identityDirty = false,
   onBusyChange,
   onItemStale,
-  onConversionSaved,
+  onItemVerified,
 }: {
   item: CatalogItem;
   /** Set by the page while an item save is in flight. */
@@ -325,12 +326,13 @@ export function ConversionsPanel({
   onBusyChange?: (busy: boolean) => void;
   /** The snapshot base unit no longer matches the item the page rendered. */
   onItemStale?: (itemId: string) => void | Promise<void>;
-  /** A write landed, so the item's configuration status may have changed. */
-  onConversionSaved?: (itemId: string) => void | Promise<void>;
+  /** Called with the fresh item row once a combined conversion verification read succeeds. */
+  onItemVerified?: (item: CatalogItem) => void;
 }) {
   const requestRef = useRef(0);
   const aliveRef = useRef(false);
   const onItemStaleRef = useRef(onItemStale);
+  const onItemVerifiedRef = useRef(onItemVerified);
   const itemBaseUnitRef = useRef(item.baseUnit);
   const identityKey = itemIdentity(item);
   const itemIdentityRef = useRef(identityKey);
@@ -338,9 +340,10 @@ export function ConversionsPanel({
   const replayFlight = useRef(new Set<string>());
   useEffect(() => {
     onItemStaleRef.current = onItemStale;
+    onItemVerifiedRef.current = onItemVerified;
     itemBaseUnitRef.current = item.baseUnit;
     itemIdentityRef.current = identityKey;
-  }, [identityKey, item.baseUnit, onItemStale]);
+  }, [identityKey, item.baseUnit, onItemStale, onItemVerified]);
   const [rows, setRows] = useState<UnitConversion[] | null>(null);
   const [baseUnit, setBaseUnit] = useState<BaseUnit | null>(null);
   const [schedule, setSchedule] = useState<CostingSchedule | null>(null);
@@ -465,22 +468,23 @@ export function ConversionsPanel({
       prefix: `conversion:[${JSON.stringify(item.id)},`,
     });
     try {
-      const [next, nextSchedule] = await Promise.all([
-        listConversions(item.id),
-        listCostingSchedule(item.id),
-      ]);
+      const verified = await verifyConversionItem(item.id);
+      clearActionPostedReloadSnapshot(pendingReloads, item.id);
       if (!aliveRef.current || requestId !== requestRef.current) return false;
-      setSchedule(nextSchedule);
+      setSchedule(verified.schedule);
+      const stale =
+        verified.conversions.baseUnit !== itemBaseUnitRef.current ||
+        verified.schedule.identity !== itemIdentityRef.current;
+      if (!stale) {
+        onItemVerifiedRef.current?.(verified.item);
+      }
       await applySnapshot(
         item.id,
-        next,
-        nextSchedule.identity,
+        verified.conversions,
+        verified.schedule.identity,
         requestId,
         () => false,
       );
-      for (const entry of pendingReloads) {
-        clearActionPostedReload(entry.subject, entry.subject, entry.requestId);
-      }
       return true;
     } catch (error) {
       await failLoad(item.id, error, requestId, () => false);
@@ -498,6 +502,31 @@ export function ConversionsPanel({
 
     void (async () => {
       try {
+        if (pendingReloads.length > 0) {
+          const verified = await verifyConversionItem(item.id);
+          clearActionPostedReloadSnapshot(pendingReloads, item.id);
+          if (
+            !aliveRef.current ||
+            cancelled ||
+            requestId !== requestRef.current
+          )
+            return;
+          setSchedule(verified.schedule);
+          const stale =
+            verified.conversions.baseUnit !== itemBaseUnitRef.current ||
+            verified.schedule.identity !== itemIdentityRef.current;
+          if (!stale) {
+            onItemVerifiedRef.current?.(verified.item);
+          }
+          await applySnapshot(
+            item.id,
+            verified.conversions,
+            verified.schedule.identity,
+            requestId,
+            () => cancelled,
+          );
+          return;
+        }
         const [next, nextSchedule] = await Promise.all([
           listConversions(item.id),
           listCostingSchedule(item.id),
@@ -512,13 +541,6 @@ export function ConversionsPanel({
           requestId,
           () => cancelled,
         );
-        for (const entry of pendingReloads) {
-          clearActionPostedReload(
-            entry.subject,
-            entry.subject,
-            entry.requestId,
-          );
-        }
       } catch (error) {
         await failLoad(item.id, error, requestId, () => cancelled);
       }
@@ -567,7 +589,6 @@ export function ConversionsPanel({
       await work();
       const reloaded = await load();
       if (reloaded) onReloaded?.();
-      await onConversionSaved?.(item.id);
       return true;
     } catch (error) {
       setActionError(messageFrom(error));
@@ -730,11 +751,7 @@ export function ConversionsPanel({
           try {
             await perform(action, session);
             saved = true;
-            markActionPostedReload(
-              subject,
-              requestId,
-              onConversionSaved ? [subject, ITEMS_RELOAD_SUBJECT] : subject,
-            );
+            markActionPostedReload(subject, requestId, item.id);
             clearSubmittedAdd(action);
           } catch (error) {
             if (
@@ -751,7 +768,7 @@ export function ConversionsPanel({
           }
         },
         () => {
-          clearActionPostedReload(subject, subject, requestId);
+          clearActionPostedReload(subject, item.id, requestId);
         },
       );
       if (accepted === false) {

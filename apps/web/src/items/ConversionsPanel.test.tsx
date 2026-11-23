@@ -12,6 +12,7 @@ import {
   costingImpact,
   currentShiftStart,
   deleteConversion,
+  getItemById,
   listConversions,
   listCostingSchedule,
   listUnitOptions,
@@ -33,6 +34,7 @@ import { resetHeldWrites, unknownSaveMessage } from '@/items/request-id';
 import type { BaseUnit, CatalogItem, UnitConversion } from '@/items/types';
 
 vi.mock('@/items/api', () => ({
+  getItemById: vi.fn(),
   listConversions: vi.fn(),
   addConversion: vi.fn(),
   updateConversion: vi.fn(),
@@ -91,6 +93,10 @@ function sentTiming(index: number): {
 describe('ConversionsPanel', () => {
   beforeEach(() => {
     resetHeldWrites();
+    vi.mocked(getItemById).mockReset();
+    vi.mocked(getItemById).mockImplementation((id: string) =>
+      Promise.resolve({ ...item, id }),
+    );
     vi.mocked(listConversions).mockReset();
     vi.mocked(addConversion).mockReset();
     vi.mocked(updateConversion).mockReset();

@@ -19,7 +19,7 @@ function ItemCard({
   onToggleConversions,
   onConversionsBusy,
   onItemStale,
-  onConversionSaved,
+  onItemVerified,
 }: {
   item: CatalogItem;
   conversionsOpen: boolean;
@@ -31,7 +31,7 @@ function ItemCard({
   onToggleConversions: (itemId: string) => void;
   onConversionsBusy: (busy: boolean) => void;
   onItemStale?: (itemId: string) => void | Promise<void>;
-  onConversionSaved?: (itemId: string) => void | Promise<void>;
+  onItemVerified?: (item: CatalogItem) => void;
 }) {
   return (
     <article
@@ -102,7 +102,7 @@ function ItemCard({
           identityDirty={identityDirty}
           onBusyChange={onConversionsBusy}
           onItemStale={onItemStale}
-          onConversionSaved={onConversionSaved}
+          onItemVerified={onItemVerified}
         />
       ) : null}
     </article>
@@ -129,7 +129,7 @@ export function ItemList({
   onToggleConversions,
   onConversionsBusyChange,
   onItemStale,
-  onConversionSaved,
+  onItemVerified,
 }: {
   items: readonly CatalogItem[];
   showInactive: boolean;
@@ -142,7 +142,7 @@ export function ItemList({
   onToggleConversions: (itemId: string) => void;
   onConversionsBusyChange?: (busy: boolean) => void;
   onItemStale?: (itemId: string) => void | Promise<void>;
-  onConversionSaved?: (itemId: string) => void | Promise<void>;
+  onItemVerified?: (item: CatalogItem) => void;
 }) {
   const [conversionsBusy, setConversionsBusyState] = useState(false);
   // The page also locks controls that would unmount an open panel (the inactive filter).
@@ -164,7 +164,7 @@ export function ItemList({
       onToggleConversions={onToggleConversions}
       onConversionsBusy={setConversionsBusy}
       onItemStale={onItemStale}
-      onConversionSaved={onConversionSaved}
+      onItemVerified={onItemVerified}
     />
   );
 
@@ -194,7 +194,7 @@ export function ItemList({
                   onToggleConversions={onToggleConversions}
                   onConversionsBusy={setConversionsBusy}
                   onItemStale={onItemStale}
-                  onConversionSaved={onConversionSaved}
+                  onItemVerified={onItemVerified}
                 />
               ) : (
                 <p>تحت {block.parent.name} (موقوف)</p>

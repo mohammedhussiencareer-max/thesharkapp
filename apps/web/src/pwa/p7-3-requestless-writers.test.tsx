@@ -241,11 +241,13 @@ describe('P7-3 scope correction: request-less writers outside held-write store',
   });
 
   it('Rule 2: definite server refusals (stale compare-and-set, 23505 uniqueness, SQLSTATE validation) show actionable errors with no ambiguous notice and nothing in localStorage', async () => {
-    // 1. ItemsPage: StaleWriteError reloads item & shows staleWriteMessage, no ambiguous banner, nothing in localStorage.
+    // 1. ItemsPage: StaleWriteError reloads item by ID & shows staleWriteMessage, no ambiguous banner, nothing in localStorage.
     vi.mocked(updateItem).mockRejectedValueOnce(new StaleWriteError());
-    vi.mocked(listItems)
-      .mockResolvedValueOnce([oilItem])
-      .mockResolvedValueOnce([{ ...oilItem, name: 'زيت محدث من جهاز تاني' }]);
+    vi.mocked(listItems).mockResolvedValueOnce([oilItem]);
+    vi.mocked(getItemById).mockResolvedValueOnce({
+      ...oilItem,
+      name: 'زيت محدث من جهاز تاني',
+    });
 
     const itemsView = render(
       <MemoryRouter>
@@ -329,12 +331,11 @@ describe('P7-3 scope correction: request-less writers outside held-write store',
   });
 
   it('Rules 3 & 4 (ItemsPage): ambiguous updateItem shows "مش متأكد إنه اتحفظ", reads affected item by ID, offers read-only "تحقق تاني" on read failure, unlocks after read succeeds, never writes localStorage, never auto-replays', async () => {
-    vi.mocked(listItems)
-      .mockResolvedValueOnce([oilItem])
-      .mockResolvedValueOnce([{ ...oilItem, name: 'زيت جديد' }]);
+    vi.mocked(listItems).mockResolvedValueOnce([oilItem]);
     vi.mocked(getItemById)
       .mockRejectedValueOnce(new Error('item read down'))
-      .mockResolvedValueOnce({ ...oilItem, name: 'زيت' });
+      .mockResolvedValueOnce({ ...oilItem, name: 'زيت' })
+      .mockResolvedValueOnce({ ...oilItem, name: 'زيت جديد' });
     vi.mocked(updateItem)
       .mockRejectedValueOnce(new Error('network lost'))
       .mockResolvedValueOnce(undefined);
@@ -552,10 +553,9 @@ describe('P7-3 scope correction: request-less writers outside held-write store',
   });
 
   it('Rule 3 (success + failed post-write reload): request-less writes never persist reload markers in localStorage', async () => {
-    // 1. ItemsPage updateItem succeeds, post-write listItems fails -> ZERO localStorage.
-    vi.mocked(listItems)
-      .mockResolvedValueOnce([oilItem])
-      .mockRejectedValueOnce(new Error('catalog down'));
+    // 1. ItemsPage updateItem succeeds, post-write getItemById fails -> ZERO localStorage.
+    vi.mocked(listItems).mockResolvedValueOnce([oilItem]);
+    vi.mocked(getItemById).mockRejectedValueOnce(new Error('catalog down'));
     const itemsView = render(
       <MemoryRouter>
         <ItemsPage />

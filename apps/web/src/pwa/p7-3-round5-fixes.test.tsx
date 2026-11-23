@@ -32,6 +32,7 @@ import {
   addConversion,
   addCustomUnit,
   createItem,
+  getItemById,
   listConversions,
   listCostingSchedule,
   listItems,
@@ -95,6 +96,7 @@ vi.mock('@/expenses/api', () => ({
 
 vi.mock('@/items/api', () => ({
   listItems: vi.fn(),
+  getItemById: vi.fn(),
   createItem: vi.fn(),
   updateItem: vi.fn(),
   setItemLoss: vi.fn(),
@@ -231,6 +233,21 @@ describe('P7-3 round-5 review fixes', () => {
     setHeldWriteUser('owner-r5');
     setNavigatorOnline(true);
     vi.resetAllMocks();
+    vi.mocked(getItemById).mockImplementation((id: string) =>
+      Promise.resolve({
+        id,
+        name: 'زيت',
+        kind: 'ingredient',
+        baseUnit: 'kg',
+        countFrequency: 'weekly',
+        lossPct: 0,
+        parentItemId: null,
+        active: true,
+        onHandQty: 0,
+        avgCost: 0,
+        onHandValue: 0,
+      }),
+    );
   });
 
   afterEach(() => {

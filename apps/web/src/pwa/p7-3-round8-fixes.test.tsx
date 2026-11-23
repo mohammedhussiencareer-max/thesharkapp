@@ -220,14 +220,13 @@ describe('P7-3 round-8 review fixes', () => {
 
   it('R8-1: ItemsPage keeps editor locked and offers only a read-only refresh when compare-and-set fails and follow-up read also fails', async () => {
     vi.mocked(updateItem).mockRejectedValueOnce(new StaleWriteError());
-    vi.mocked(listItems)
-      .mockResolvedValueOnce([oilItem])
+    vi.mocked(listItems).mockResolvedValueOnce([oilItem]);
+    mocks.getItemById
       .mockRejectedValueOnce(new Error('stale reload down'))
-      .mockResolvedValueOnce([{ ...oilItem, name: 'زيت محدث من جهاز تاني' }]);
-    mocks.getItemById.mockResolvedValueOnce({
-      ...oilItem,
-      name: 'زيت محدث من جهاز تاني',
-    });
+      .mockResolvedValueOnce({
+        ...oilItem,
+        name: 'زيت محدث من جهاز تاني',
+      });
 
     render(
       <MemoryRouter>
@@ -344,7 +343,7 @@ describe('P7-3 round-8 review fixes', () => {
     ).toBeChecked();
   });
 
-  it('R8-3a: Loss save keeps real request id held in posted_reload when schedule read succeeds but catalog refresh fails, blocking shell updates until catalog reload succeeds', async () => {
+  it('R8-3a: Loss save keeps real request id held in posted_reload when combined verification item-row read fails, blocking shell updates until read-only verification succeeds', async () => {
     const reload = vi.fn();
     const postMessage = vi.fn();
     setTestWaitingWorker({ postMessage } as unknown as ServiceWorker);
@@ -356,17 +355,15 @@ describe('P7-3 round-8 review fixes', () => {
         return Promise.resolve();
       },
     );
-    vi.mocked(listItems)
-      .mockResolvedValueOnce([oilItem])
-      .mockRejectedValueOnce(new Error('catalog refresh failed'))
-      .mockResolvedValueOnce([
-        {
-          ...oilItem,
-          lossPct: 0.1,
-          lossFractionText: '0.1',
-          identityLocked: true,
-        },
-      ]);
+    vi.mocked(listItems).mockResolvedValueOnce([oilItem]);
+    mocks.getItemById
+      .mockRejectedValueOnce(new Error('item row refresh failed'))
+      .mockResolvedValueOnce({
+        ...oilItem,
+        lossPct: 0.1,
+        lossFractionText: '0.1',
+        identityLocked: true,
+      });
 
     render(
       <MemoryRouter>
@@ -383,19 +380,19 @@ describe('P7-3 round-8 review fixes', () => {
     fireEvent.click(screen.getByRole('button', { name: 'حفظ الفاقد' }));
 
     expect(
-      await screen.findByText('catalog refresh failed'),
+      await screen.findByText('item row refresh failed'),
     ).toBeInTheDocument();
     expect(capturedRequestId).not.toBe('');
-    // Wait a tick for ItemForm's schedule reload to finish too.
     await waitFor(() => {
       expect(listCostingSchedule).toHaveBeenCalledTimes(2);
     });
 
-    // Real loss pin MUST STILL be held in posted_reload because catalog refresh failed!
+    // Real loss pin MUST STILL be held in posted_reload because the combined read failed!
     const held = getHeldWrite(lossSubject('oil'));
     expect(held?.phase).toBe('posted_reload');
     expect(held?.requestId).toBe(capturedRequestId);
-    expect(hasPostedReloadForTarget('items:reload')).toBe(true);
+    expect(held?.readTarget).toBe('oil');
+    expect(hasPostedReloadForTarget('oil')).toBe(true);
     expect(hasAnyHeldWrite()).toBe(true);
     expect(applyPwaUpdate(reload, { authResolved: true })).toBe(false);
     expect(postMessage).not.toHaveBeenCalled();
@@ -405,15 +402,15 @@ describe('P7-3 round-8 review fixes', () => {
     expect(getHeldWrite(lossSubject('oil'))?.phase).toBe('posted_reload');
     expect(hasAnyHeldWrite()).toBe(true);
 
-    // Retrying catalog load now succeeds -> real loss pin clears completely!
-    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    // Retrying combined verification succeeds -> real loss pin clears completely!
+    fireEvent.click(screen.getByRole('button', { name: 'تحقق تاني' }));
     await waitFor(() => {
       expect(getHeldWrite(lossSubject('oil'))).toBeNull();
     });
     expect(hasAnyHeldWrite()).toBe(false);
   });
 
-  it('R8-3b: Conversion save keeps real request id held in posted_reload when conversion schedule read succeeds but catalog refresh fails, blocking shell updates until catalog reload succeeds', async () => {
+  it('R8-3b: Conversion save keeps real request id held in posted_reload when combined verification item-row read fails, blocking shell updates until read-only verification succeeds', async () => {
     const reload = vi.fn();
     const postMessage = vi.fn();
     setTestWaitingWorker({ postMessage } as unknown as ServiceWorker);
@@ -440,10 +437,10 @@ describe('P7-3 round-8 review fixes', () => {
         return Promise.resolve();
       },
     );
-    vi.mocked(listItems)
-      .mockResolvedValueOnce([boxItem])
-      .mockRejectedValueOnce(new Error('catalog refresh failed after conv'))
-      .mockResolvedValueOnce([{ ...boxItem, identityLocked: true }]);
+    vi.mocked(listItems).mockResolvedValueOnce([boxItem]);
+    mocks.getItemById
+      .mockRejectedValueOnce(new Error('item row refresh failed after conv'))
+      .mockResolvedValueOnce({ ...boxItem, identityLocked: true });
 
     render(
       <MemoryRouter>
@@ -463,7 +460,7 @@ describe('P7-3 round-8 review fixes', () => {
     fireEvent.click(within(card).getByRole('button', { name: 'ضيف التحويل' }));
 
     expect(
-      await screen.findByText('catalog refresh failed after conv'),
+      await screen.findByText('item row refresh failed after conv'),
     ).toBeInTheDocument();
     expect(capturedRequestId).not.toBe('');
 
@@ -471,13 +468,14 @@ describe('P7-3 round-8 review fixes', () => {
     const held = getHeldWrite(subject);
     expect(held?.phase).toBe('posted_reload');
     expect(held?.requestId).toBe(capturedRequestId);
-    expect(hasPostedReloadForTarget('items:reload')).toBe(true);
+    expect(held?.readTarget).toBe('box');
+    expect(hasPostedReloadForTarget('box')).toBe(true);
     expect(hasAnyHeldWrite()).toBe(true);
     expect(applyPwaUpdate(reload, { authResolved: true })).toBe(false);
     expect(postMessage).not.toHaveBeenCalled();
 
-    // Retrying catalog load succeeds -> real conversion pin clears completely!
-    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    // Retrying combined verification succeeds -> real conversion pin clears completely!
+    fireEvent.click(screen.getByRole('button', { name: 'تحقق تاني' }));
     await waitFor(() => {
       expect(getHeldWrite(subject)).toBeNull();
     });

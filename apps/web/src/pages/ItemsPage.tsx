@@ -29,10 +29,11 @@ import { ItemList } from '@/items/ItemList';
 import {
   firstUnknownItemCreate,
   ITEMS_RELOAD_SUBJECT,
-  lossSubject,
+  listPostedCostingPins,
   markActionPostedReload,
   priceSubject,
 } from '@/items/request-id';
+import { verifyConversionItem, verifyLossItem } from '@/items/verify';
 import type { CatalogItem, ItemSave } from '@/items/types';
 import { emptyItemForm, itemToFormValues } from '@/items/validation';
 import {
@@ -90,6 +91,9 @@ function visibleCount(
 export function ItemsPage() {
   const [items, setItems] = useState<CatalogItem[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [costingVerifyError, setCostingVerifyError] = useState<string | null>(
+    null,
+  );
   const [loading, setLoading] = useState(true);
   const [loadId, setLoadId] = useState(0);
   const [showInactive, setShowInactive] = useState(false);
@@ -111,8 +115,11 @@ export function ItemsPage() {
   // reload after it) is in flight, nothing that edits data or remounts a panel
   // can start, so no editor or panel ever opens on stale data.
   const [catalogLoads, setCatalogLoads] = useState(0);
+  const postedCostingPins = heldEpoch < 0 ? [] : listPostedCostingPins();
   const postedReload =
-    heldEpoch >= 0 && hasPostedReloadForTarget(ITEMS_RELOAD_SUBJECT);
+    heldEpoch >= 0 &&
+    (hasPostedReloadForTarget(ITEMS_RELOAD_SUBJECT) ||
+      postedCostingPins.length > 0);
   const needsReload = localNeedsReload || postedReload;
   const detailsVerifyBlocked =
     detailsVerify !== null && detailsVerify.status !== 'verified';
@@ -136,8 +143,10 @@ export function ItemsPage() {
   const formModeRef = useRef<ItemEditor | null>(formMode);
   const expectedRef = useRef<ItemExpectation | null>(null);
   const detailsVerifyRef = useRef<DetailsVerifyState | null>(detailsVerify);
+  const pendingSavedItemIdRef = useRef<string | null>(null);
   const dataSessionRef = useRef<WriteSession | null>(null);
   const catalogSeqRef = useRef(0);
+  const itemReadSeqRef = useRef(new Map<string, number>());
   const catalogLoadsRef = useRef(0);
 
   const setDetailsVerifyState = useCallback(
@@ -150,7 +159,7 @@ export function ItemsPage() {
 
   // Every catalog read goes through here: it holds the page lock while in
   // flight, and only the newest read may apply its rows or its error.
-  async function readCatalog(): Promise<CatalogItem[] | null> {
+  const readCatalog = useCallback(async (): Promise<CatalogItem[] | null> => {
     const seq = ++catalogSeqRef.current;
     const readSession = captureWriteSession();
     catalogLoadsRef.current += 1;
@@ -167,25 +176,41 @@ export function ItemsPage() {
       catalogLoadsRef.current -= 1;
       setCatalogLoads(catalogLoadsRef.current);
     }
-  }
+  }, []);
 
-  // Targeted by-ID read for single-item verification and stale-write refresh,
-  // avoiding the 1,000-row cap of the full catalog list query.
-  async function readItemById(itemId: string): Promise<CatalogItem | null> {
-    const readSession = captureWriteSession();
-    catalogLoadsRef.current += 1;
-    setCatalogLoads(catalogLoadsRef.current);
-    try {
-      const fresh = await getItemById(itemId);
-      dataSessionRef.current = readSession;
-      return fresh;
-    } finally {
-      catalogLoadsRef.current -= 1;
+  type ItemByIdResult =
+    { status: 'ok'; item: CatalogItem | null } | { status: 'superseded' };
+
+  // Targeted by-ID read for single-item verification, acknowledged details
+  // refreshes, and stale-write reloads (avoiding the 1,000-row catalog cap).
+  const readItemById = useCallback(
+    async (itemId: string): Promise<ItemByIdResult> => {
+      const catalogSeq = catalogSeqRef.current;
+      const itemSeq = (itemReadSeqRef.current.get(itemId) ?? 0) + 1;
+      itemReadSeqRef.current.set(itemId, itemSeq);
+      const readSession = captureWriteSession();
+      const isSuperseded = () =>
+        catalogSeq !== catalogSeqRef.current ||
+        itemReadSeqRef.current.get(itemId) !== itemSeq;
+      catalogLoadsRef.current += 1;
       setCatalogLoads(catalogLoadsRef.current);
-    }
-  }
+      try {
+        const fresh = await getItemById(itemId);
+        if (isSuperseded()) return { status: 'superseded' };
+        dataSessionRef.current = readSession;
+        return { status: 'ok', item: fresh };
+      } catch (error) {
+        if (isSuperseded()) return { status: 'superseded' };
+        throw error;
+      } finally {
+        catalogLoadsRef.current -= 1;
+        setCatalogLoads(catalogLoadsRef.current);
+      }
+    },
+    [],
+  );
 
-  function mergeFetchedItem(fresh: CatalogItem) {
+  const mergeFetchedItem = useCallback((fresh: CatalogItem) => {
     setItems((current) => {
       if (!current) return [fresh];
       const exists = current.some((row) => row.id === fresh.id);
@@ -193,7 +218,18 @@ export function ItemsPage() {
         ? current.map((row) => (row.id === fresh.id ? fresh : row))
         : [...current, fresh];
     });
-  }
+  }, []);
+
+  const applyVerifiedItem = useCallback(
+    (fresh: CatalogItem) => {
+      mergeFetchedItem(fresh);
+      const editing = formModeRef.current;
+      if (editing?.type === 'edit' && editing.id === fresh.id) {
+        expectedRef.current = expectationFromItem(fresh);
+      }
+    },
+    [mergeFetchedItem],
+  );
 
   function setEditor(next: ItemEditor | null) {
     formModeRef.current = next;
@@ -227,10 +263,59 @@ export function ItemsPage() {
     [setDetailsVerifyState],
   );
 
-  async function reloadCatalog(staleItemId?: string) {
+  const resumePostedCostingPins = useCallback(async () => {
+    const pins = listPostedCostingPins();
+    if (pins.length === 0 || !isOnline()) return;
+    const byItem = new Map<
+      string,
+      { hasConversion: boolean; snapshots: PostedReloadSnapshot }
+    >();
+    for (const pin of pins) {
+      const existing = byItem.get(pin.itemId) ?? {
+        hasConversion: false,
+        snapshots: [],
+      };
+      if (pin.kind === 'conversion') existing.hasConversion = true;
+      existing.snapshots = [
+        ...existing.snapshots,
+        ...snapshotPostedReloads({ subject: pin.subject }),
+      ];
+      byItem.set(pin.itemId, existing);
+    }
+    setCostingVerifyError(null);
+    catalogLoadsRef.current += 1;
+    setCatalogLoads(catalogLoadsRef.current);
+    try {
+      let firstError: unknown = null;
+      await Promise.all(
+        [...byItem.entries()].map(async ([itemId, entry]) => {
+          try {
+            const verified = entry.hasConversion
+              ? await verifyConversionItem(itemId)
+              : await verifyLossItem(itemId);
+            applyVerifiedItem(verified.item);
+            clearPostedReloadSnapshot(entry.snapshots, itemId);
+          } catch (error) {
+            if (firstError === null) firstError = error;
+          }
+        }),
+      );
+      if (firstError !== null) {
+        setCostingVerifyError(messageFrom(firstError));
+      }
+    } finally {
+      catalogLoadsRef.current -= 1;
+      setCatalogLoads(catalogLoadsRef.current);
+    }
+  }, [applyVerifiedItem]);
+
+  async function reloadCatalog(
+    staleItemId?: string,
+    staleMessage: string = staleWriteMessage,
+  ): Promise<boolean> {
     const pendingReload = snapshotItemsReloads();
     const next = await readCatalog();
-    if (!next) return;
+    if (!next) return false;
     setItems(next);
     setLoadError(null);
     clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
@@ -239,8 +324,10 @@ export function ItemsPage() {
     const editing = formModeRef.current;
     if (staleItemId && editing?.type === 'edit' && editing.id === staleItemId) {
       let fresh = next.find((row) => row.id === staleItemId) ?? null;
-      if (!fresh && typeof getItemById === 'function') {
-        fresh = await readItemById(staleItemId);
+      if (!fresh) {
+        const byId = await readItemById(staleItemId);
+        if (byId.status === 'superseded') return false;
+        fresh = byId.item;
         if (fresh) mergeFetchedItem(fresh);
       }
       if (!fresh) {
@@ -248,33 +335,96 @@ export function ItemsPage() {
       }
       expectedRef.current = expectationFromItem(fresh);
       setFormEpoch((value) => value + 1);
-      setFormError(staleWriteMessage);
+      setFormError(staleMessage);
+      return true;
     }
+    return true;
   }
 
-  // A landed conversion can configure the item. Stay locked until the catalog
-  // says so; a failed read leaves the lock and the retry button in place.
-  async function refreshAfterConversion() {
-    setLocalNeedsReload(true);
+  async function refreshStaleDetailsItem(itemId: string): Promise<boolean> {
+    setDetailsVerifyState({
+      itemId,
+      reason: 'stale',
+      status: 'verifying',
+      readError: null,
+    });
     try {
-      await reloadCatalog();
-    } catch (error) {
-      setLoadError(messageFrom(error));
+      const result = await readItemById(itemId);
+      if (result.status === 'superseded') {
+        // Only stay locked if no newer read has already refreshed this item.
+        if (
+          detailsVerifyRef.current?.itemId === itemId &&
+          detailsVerifyRef.current.status !== 'verified'
+        ) {
+          setDetailsVerifyState({
+            itemId,
+            reason: 'stale',
+            status: 'read_failed',
+            readError: genericCatalogError,
+          });
+        }
+        return false;
+      }
+      if (!result.item) {
+        setDetailsVerifyState({
+          itemId,
+          reason: 'stale',
+          status: 'read_failed',
+          readError: genericCatalogError,
+        });
+        return false;
+      }
+      mergeFetchedItem(result.item);
+      setLoadError(null);
+      const editing = formModeRef.current;
+      if (editing?.type === 'edit' && editing.id === itemId) {
+        expectedRef.current = expectationFromItem(result.item);
+        setFormEpoch((value) => value + 1);
+      }
+      setFormError(staleWriteMessage);
+      setDetailsVerifyState(null);
+      return true;
+    } catch (reloadError) {
+      setDetailsVerifyState({
+        itemId,
+        reason: 'stale',
+        status: 'read_failed',
+        readError: messageFrom(reloadError),
+      });
+      return false;
     }
   }
 
   useEffect(() => {
     let cancelled = false;
     const pendingReload = snapshotItemsReloads();
+    const pendingItemId = pendingSavedItemIdRef.current;
     void (async () => {
       try {
-        const next = await readCatalog();
-        if (cancelled || !next) return;
-        setItems(next);
-        setLoadError(null);
-        clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
-        reconcileDetailsVerifyOnCatalog(next);
-        setLocalNeedsReload(false);
+        if (pendingItemId) {
+          const result = await readItemById(pendingItemId);
+          if (cancelled || result.status === 'superseded') return;
+          if (!result.item) {
+            setLoadError(genericCatalogError);
+            return;
+          }
+          mergeFetchedItem(result.item);
+          const editing = formModeRef.current;
+          if (editing?.type === 'edit' && editing.id === pendingItemId) {
+            expectedRef.current = expectationFromItem(result.item);
+          }
+          pendingSavedItemIdRef.current = null;
+          setLoadError(null);
+          setLocalNeedsReload(false);
+        } else {
+          const next = await readCatalog();
+          if (cancelled || !next) return;
+          setItems(next);
+          setLoadError(null);
+          clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
+          reconcileDetailsVerifyOnCatalog(next);
+          setLocalNeedsReload(false);
+        }
       } catch (error) {
         if (cancelled) return;
         setLoadError(messageFrom(error));
@@ -282,10 +432,21 @@ export function ItemsPage() {
         if (!cancelled) setLoading(false);
       }
     })();
+    void Promise.resolve().then(() => {
+      if (!cancelled) return resumePostedCostingPins();
+      return undefined;
+    });
     return () => {
       cancelled = true;
     };
-  }, [loadId, reconcileDetailsVerifyOnCatalog]);
+  }, [
+    loadId,
+    mergeFetchedItem,
+    readCatalog,
+    readItemById,
+    reconcileDetailsVerifyOnCatalog,
+    resumePostedCostingPins,
+  ]);
 
   function retry() {
     if (saving || conversionsBusy || catalogLoadsRef.current > 0) return;
@@ -305,40 +466,53 @@ export function ItemsPage() {
     ) {
       return;
     }
+    if (current.reason === 'stale') {
+      await refreshStaleDetailsItem(current.itemId);
+      return;
+    }
     setDetailsVerifyState({ ...current, status: 'verifying', readError: null });
     try {
-      const fresh = await readItemById(current.itemId);
-      if (!fresh) {
+      const result = await readItemById(current.itemId);
+      if (result.status === 'superseded') {
+        if (
+          detailsVerifyRef.current?.itemId === current.itemId &&
+          detailsVerifyRef.current.status !== 'verified'
+        ) {
+          setDetailsVerifyState({
+            itemId: current.itemId,
+            reason: 'ambiguous',
+            status: 'read_failed',
+            readError: genericCatalogError,
+          });
+        }
+        return;
+      }
+      if (!result.item) {
         setDetailsVerifyState({
           itemId: current.itemId,
-          reason: current.reason,
+          reason: 'ambiguous',
           status: 'read_failed',
           readError: genericCatalogError,
         });
         return;
       }
-      mergeFetchedItem(fresh);
+      mergeFetchedItem(result.item);
       setLoadError(null);
       const editing = formModeRef.current;
       if (editing?.type === 'edit' && editing.id === current.itemId) {
-        expectedRef.current = expectationFromItem(fresh);
+        expectedRef.current = expectationFromItem(result.item);
         setFormEpoch((value) => value + 1);
       }
-      if (current.reason === 'stale') {
-        setFormError(staleWriteMessage);
-        setDetailsVerifyState(null);
-      } else {
-        setDetailsVerifyState({
-          itemId: current.itemId,
-          reason: 'ambiguous',
-          status: 'verified',
-          readError: null,
-        });
-      }
+      setDetailsVerifyState({
+        itemId: current.itemId,
+        reason: 'ambiguous',
+        status: 'verified',
+        readError: null,
+      });
     } catch (readError) {
       setDetailsVerifyState({
         itemId: current.itemId,
-        reason: current.reason,
+        reason: 'ambiguous',
         status: 'read_failed',
         readError: messageFrom(readError),
       });
@@ -392,44 +566,33 @@ export function ItemsPage() {
         await updateItem(started.id, action.draft, expected);
         expectedRef.current = expectationFromDraft(action.draft);
         saved = true;
+        pendingSavedItemIdRef.current = started.id;
         setLocalNeedsReload(true);
-        const pendingReload = snapshotItemsReloads();
-        const next = await readCatalog();
-        if (next) {
-          setItems(next);
+        const result = await readItemById(started.id);
+        if (result.status === 'ok' && result.item) {
+          mergeFetchedItem(result.item);
+          if (sameEditor(formModeRef.current, started)) {
+            expectedRef.current = expectationFromItem(result.item);
+          }
+          pendingSavedItemIdRef.current = null;
           setLoadError(null);
-          clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
           setLocalNeedsReload(false);
+        } else if (result.status === 'ok' && !result.item) {
+          setLoadError(genericCatalogError);
         }
         return true;
       } catch (error) {
         if (saved) {
+          pendingSavedItemIdRef.current = started.id;
           setLocalNeedsReload(true);
           setLoadError(messageFrom(error));
           return true;
         }
         if (error instanceof StaleWriteError) {
           if (sameEditor(formModeRef.current, started)) {
-            setDetailsVerifyState({
-              itemId: started.id,
-              reason: 'stale',
-              status: 'verifying',
-              readError: null,
-            });
-            try {
-              await reloadCatalog(started.id);
-              setDetailsVerifyState(null);
-              if (error instanceof CostingChangedError) {
-                setFormError(costingChangedMessage);
-              }
-            } catch (reloadError) {
-              // Keep editor locked with read-only refresh until fresh data arrives.
-              setDetailsVerifyState({
-                itemId: started.id,
-                reason: 'stale',
-                status: 'read_failed',
-                readError: messageFrom(reloadError),
-              });
+            const applied = await refreshStaleDetailsItem(started.id);
+            if (applied && error instanceof CostingChangedError) {
+              setFormError(costingChangedMessage);
             }
           }
           throw error;
@@ -451,8 +614,22 @@ export function ItemsPage() {
           readError: null,
         });
         try {
-          const fresh = await readItemById(started.id);
-          if (!fresh) {
+          const result = await readItemById(started.id);
+          if (result.status === 'superseded') {
+            if (
+              detailsVerifyRef.current?.itemId === started.id &&
+              detailsVerifyRef.current.status !== 'verified'
+            ) {
+              setDetailsVerifyState({
+                itemId: started.id,
+                reason: 'ambiguous',
+                status: 'read_failed',
+                readError: genericCatalogError,
+              });
+            }
+            return false;
+          }
+          if (!result.item) {
             setDetailsVerifyState({
               itemId: started.id,
               reason: 'ambiguous',
@@ -461,10 +638,10 @@ export function ItemsPage() {
             });
             return false;
           }
-          mergeFetchedItem(fresh);
+          mergeFetchedItem(result.item);
           setLoadError(null);
           if (sameEditor(formModeRef.current, started)) {
-            expectedRef.current = expectationFromItem(fresh);
+            expectedRef.current = expectationFromItem(result.item);
             setFormEpoch((value) => value + 1);
           }
           setDetailsVerifyState({
@@ -498,13 +675,10 @@ export function ItemsPage() {
       } else if (started.type !== 'edit') {
         return false;
       } else if (action.kind === 'loss') {
+        // ItemForm owns the single-target loss pin and runs the combined
+        // schedule + item-by-ID verification read immediately after this settles.
         await setItemLoss(started.id, action.lossPct, action.write);
-        saved = true;
-        markActionPostedReload(
-          lossSubject(started.id),
-          action.write.requestId,
-          [lossSubject(started.id), ITEMS_RELOAD_SUBJECT],
-        );
+        return true;
       } else {
         await setOpeningPrice(
           started.id,
@@ -547,10 +721,12 @@ export function ItemsPage() {
         sameEditor(formModeRef.current, started)
       ) {
         try {
-          await reloadCatalog(started.id);
-          if (error instanceof CostingChangedError) {
-            setFormError(costingChangedMessage);
-          }
+          await reloadCatalog(
+            started.id,
+            error instanceof CostingChangedError
+              ? costingChangedMessage
+              : staleWriteMessage,
+          );
         } catch (reloadError) {
           setFormError(messageFrom(reloadError));
         }
@@ -589,6 +765,23 @@ export function ItemsPage() {
           <p role="status">{offlineWriteMessage}</p>
           <p role="status">{offlineMoneyMessage}</p>
         </>
+      ) : null}
+      {postedCostingPins.length > 0 ? (
+        <section
+          aria-label="حالة التحقق من التكلفة"
+          className="flex flex-col gap-2 rounded border border-neutral-300 p-3"
+        >
+          <p role="status">جاري التحقق من حفظ بيانات التكلفة</p>
+          {costingVerifyError ? <p role="alert">{costingVerifyError}</p> : null}
+          <button
+            className={secondaryButton}
+            type="button"
+            disabled={saving || conversionsBusy || catalogLoads > 0 || !online}
+            onClick={() => void resumePostedCostingPins()}
+          >
+            تحقق تاني
+          </button>
+        </section>
       ) : null}
       {detailsVerify &&
       (detailsVerify.reason === 'ambiguous' ||
@@ -684,10 +877,13 @@ export function ItemsPage() {
               detailsKey={formEpoch}
               onIdentityDirtyChange={setFormIdentityDirty}
               onItemStale={(itemId) =>
-                reloadCatalog(itemId).catch((error: unknown) => {
-                  setLoadError(messageFrom(error));
-                })
+                reloadCatalog(itemId)
+                  .then(() => undefined)
+                  .catch((error: unknown) => {
+                    setLoadError(messageFrom(error));
+                  })
               }
+              onItemVerified={applyVerifiedItem}
               onSubmit={(action) => handleSubmit(action)}
               onCancel={() => {
                 if (busy) return;
@@ -722,11 +918,13 @@ export function ItemsPage() {
                 )
               }
               onConversionsBusyChange={setConversionsBusy}
-              onConversionSaved={refreshAfterConversion}
+              onItemVerified={applyVerifiedItem}
               onItemStale={(itemId) =>
-                reloadCatalog(itemId).catch((error: unknown) => {
-                  setLoadError(messageFrom(error));
-                })
+                reloadCatalog(itemId)
+                  .then(() => undefined)
+                  .catch((error: unknown) => {
+                    setLoadError(messageFrom(error));
+                  })
               }
             />
           )}

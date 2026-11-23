@@ -14,7 +14,6 @@ import {
   clearPostedReloadSnapshot,
   getHeldWrite,
   hasDurableHeldWrite,
-  hasPostedReload,
   listHeldWritesByPrefix,
   resetHeldWritesStore,
   setHeldWritePhase,
@@ -298,33 +297,68 @@ export function abortActionBeforeDispatch(
   );
 }
 
+export type PostedCostingPin = {
+  subject: string;
+  requestId: string;
+  itemId: string;
+  kind: 'loss' | 'conversion';
+};
+
+const lossPrefix = 'loss:';
+
+/** List all outstanding `posted_reload` pins for loss and conversion saves. */
+export function listPostedCostingPins(): PostedCostingPin[] {
+  const pins: PostedCostingPin[] = [];
+  for (const record of listHeldWritesByPrefix(lossPrefix)) {
+    if (record.phase !== 'posted_reload') continue;
+    const itemId = record.readTarget ?? record.subject.slice(lossPrefix.length);
+    if (itemId.length > 0) {
+      pins.push({
+        subject: record.subject,
+        requestId: record.requestId,
+        itemId,
+        kind: 'loss',
+      });
+    }
+  }
+  for (const record of listHeldWritesByPrefix(conversionPrefix)) {
+    if (record.phase !== 'posted_reload') continue;
+    let itemId = record.readTarget ?? '';
+    if (itemId.length === 0) {
+      try {
+        const parsed: unknown = JSON.parse(
+          record.subject.slice(conversionPrefix.length),
+        );
+        if (Array.isArray(parsed) && typeof parsed[0] === 'string') {
+          itemId = parsed[0];
+        }
+      } catch {
+        continue;
+      }
+    }
+    if (itemId.length > 0) {
+      pins.push({
+        subject: record.subject,
+        requestId: record.requestId,
+        itemId,
+        kind: 'conversion',
+      });
+    }
+  }
+  return pins;
+}
+
 /**
- * Move a confirmed RPC write to `posted_reload` until its post-write read(s)
- * covering `readTarget` (or every target in `readTarget`) succeed. Throws
- * `HeldWriteStorageError` (keeping the old durable record intact) if storage
- * cannot persist the replacement.
+ * Move a confirmed RPC write to `posted_reload` until its post-write read
+ * covering `readTarget` succeeds. Throws `HeldWriteStorageError` (keeping the
+ * old durable record intact) if storage cannot persist the replacement.
  */
 export function markActionPostedReload(
   subject: string,
   requestId: string,
-  readTarget: string | readonly string[],
+  readTarget: string,
 ): void {
-  if (typeof readTarget === 'string') {
-    setHeldWritePhase(subject, requestId, 'posted_reload', { readTarget });
-    return;
-  }
-  setHeldWritePhase(subject, requestId, 'posted_reload', {
-    readTargets: [...readTarget],
-  });
-}
-
-/** True while `(subject, requestId)` holds a `posted_reload` pin. */
-export function hasActionPostedReload(
-  subject: string,
-  readTarget?: string,
-  requestId?: string,
-): boolean {
-  return hasPostedReload(subject, readTarget, requestId);
+  setHeldWritePhase(subject, requestId, 'posted_reload', { readTarget });
 }
 
 /** Clear a `posted_reload` pin only after a read covering `readTarget` (and matching `requestId` when supplied) succeeds. */

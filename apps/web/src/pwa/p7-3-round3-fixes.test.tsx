@@ -34,6 +34,7 @@ import type { ExpenseMonth } from '@/expenses/types';
 import {
   addConversion,
   addCustomUnit,
+  getItemById,
   listConversions,
   listCostingSchedule,
   listItems,
@@ -171,6 +172,7 @@ vi.mock('@/order-decisions/api', () => ({
 
 vi.mock('@/items/api', () => ({
   listItems: vi.fn(),
+  getItemById: vi.fn(),
   createItem: vi.fn(),
   updateItem: vi.fn(),
   setItemLoss: vi.fn(),
@@ -270,6 +272,21 @@ describe('P7-3 round-3 review fixes', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.mocked(listUnitsAt).mockResolvedValue({});
+    vi.mocked(getItemById).mockImplementation((id: string) =>
+      Promise.resolve({
+        id,
+        name: 'زيت',
+        kind: 'ingredient',
+        baseUnit: 'kg',
+        countFrequency: 'weekly',
+        lossPct: 0,
+        parentItemId: null,
+        active: true,
+        onHandQty: 0,
+        avgCost: 0,
+        onHandValue: 0,
+      }),
+    );
     localStorage.clear();
     resetHeldWrites();
     resetHeldWritesStore({ clearStorage: true, resetUser: true });

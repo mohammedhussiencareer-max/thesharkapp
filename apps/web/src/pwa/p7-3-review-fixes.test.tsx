@@ -35,6 +35,7 @@ import {
   createItem,
   currentShiftStart,
   deleteConversion,
+  getItemById,
   listConversions,
   listCostingSchedule,
   listItems,
@@ -126,6 +127,21 @@ vi.mock('@/expenses/api', () => ({
 
 vi.mock('@/items/api', () => ({
   listItems: vi.fn(),
+  getItemById: vi.fn((id: string) =>
+    Promise.resolve({
+      id,
+      name: 'زيت',
+      kind: 'ingredient',
+      baseUnit: 'kg',
+      countFrequency: 'weekly',
+      lossPct: 0,
+      parentItemId: null,
+      active: true,
+      onHandQty: 0,
+      avgCost: 0,
+      onHandValue: 0,
+    }),
+  ),
   createItem: vi.fn(),
   updateItem: vi.fn(),
   setItemLoss: vi.fn(),
@@ -846,9 +862,8 @@ describe('P7-3 review fixes', () => {
     // stay outside the held-write store and never write to localStorage.
     localStorage.clear();
     resetHeldWritesStore({ clearStorage: true });
-    vi.mocked(listItems)
-      .mockResolvedValueOnce([oilItem])
-      .mockRejectedValueOnce(new Error('catalog down'));
+    vi.mocked(listItems).mockResolvedValueOnce([oilItem]);
+    vi.mocked(getItemById).mockRejectedValueOnce(new Error('catalog down'));
     const itemsView = render(
       <MemoryRouter>
         <ItemsPage />

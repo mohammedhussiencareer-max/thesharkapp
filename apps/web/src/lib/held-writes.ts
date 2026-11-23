@@ -42,14 +42,9 @@ export type HeldWriteRecord<T = unknown> = {
   phase: HeldWritePhase;
   /**
    * Read target that must succeed before `posted_reload` clears (e.g. a month
-   * start `2030-04-01` or a mapping/recipe subject key).
+   * start `2030-04-01` or an item id).
    */
   readTarget?: string;
-  /**
-   * Multiple read targets that must ALL succeed before `posted_reload` clears
-   * (e.g. both a schedule read and a catalog refresh).
-   */
-  readTargets?: string[];
   /**
    * Activation review reload pin: server confirmed `opening manifest changed`
    * (stored nothing), so the request id is kept but cannot send until a review
@@ -253,39 +248,23 @@ function parseRecord(raw: string): HeldWriteRecord | null {
   if (typeof row.readTarget === 'string' && row.readTarget.length > 0) {
     record.readTarget = row.readTarget;
   }
-  if (Array.isArray(row.readTargets)) {
-    const cleaned = row.readTargets.filter(
-      (item): item is string => typeof item === 'string' && item.length > 0,
-    );
-    if (cleaned.length > 0) {
-      record.readTargets = [...new Set(cleaned)];
-    }
-  }
   if (row.awaitingReviewReload === true) {
     record.awaitingReviewReload = true;
   }
   return record;
 }
 
-function recordTargets(record: HeldWriteRecord): string[] {
-  if (Array.isArray(record.readTargets) && record.readTargets.length > 0) {
-    return record.readTargets;
-  }
-  return record.readTarget !== undefined ? [record.readTarget] : [];
-}
-
 function matchesPostedTarget(
   record: HeldWriteRecord,
   expectedTarget: string | undefined,
 ): boolean {
-  const targets = recordTargets(record);
-  if (targets.length === 0 || targets.includes('*')) {
+  if (record.readTarget === undefined || record.readTarget === '*') {
     return true;
   }
   if (expectedTarget === undefined) {
     return false;
   }
-  return targets.includes(expectedTarget);
+  return record.readTarget === expectedTarget;
 }
 
 export type HeldWriteStoreOptions = {
@@ -1280,17 +1259,24 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     subject: string,
     requestId: string,
     phase: HeldWritePhase,
-    phaseOptions?: { readTarget?: string; readTargets?: string[] },
+    phaseOptions?: { readTarget?: string },
   ): void {
     ensureHydrated();
     const userId = activeUserId();
     if (userId === null) return;
-    const raw = safeReadItem(entryStorageKey(subject, userId));
-    const stored = raw !== null ? parseRecord(raw) : null;
+    const read = strictReadItem(entryStorageKey(subject, userId));
+    const stored =
+      read.ok && read.value !== null ? parseRecord(read.value) : null;
     const inMemory = records.get(subject) ?? null;
-    const current = stored ?? inMemory;
+    // When storage is readable, trust durable storage: if another tab already
+    // cleared this record, drop any stale in-memory copy and skip so we never
+    // resurrect a cleared pin.
+    const current = read.ok ? stored : inMemory;
     if (!current || current.requestId !== requestId) {
-      if (stored && isUnresolvedPhase(stored.phase)) {
+      if (read.ok && stored === null && inMemory !== null) {
+        records.delete(subject);
+        emit();
+      } else if (stored && isUnresolvedPhase(stored.phase)) {
         records.set(subject, stored);
         emit();
       }
@@ -1307,29 +1293,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       payload: phase === 'posted_reload' ? null : preservedPayload,
       phase,
     };
-    if (phase === 'posted_reload') {
-      const normalizedTargets = [
-        ...new Set(
-          (phaseOptions?.readTargets ?? []).filter(
-            (target) => typeof target === 'string' && target.length > 0,
-          ),
-        ),
-      ];
-      if (normalizedTargets.length > 1) {
-        next.readTargets = normalizedTargets;
-        next.readTarget = normalizedTargets[0];
-      } else if (normalizedTargets.length === 1) {
-        next.readTarget = normalizedTargets[0];
-        delete next.readTargets;
-      } else if (phaseOptions?.readTarget) {
-        next.readTarget = phaseOptions.readTarget;
-        delete next.readTargets;
-      } else {
-        delete next.readTargets;
-      }
-    } else {
+    if (phase === 'posted_reload' && phaseOptions?.readTarget) {
+      next.readTarget = phaseOptions.readTarget;
+    } else if (phase !== 'posted_reload') {
       delete next.readTarget;
-      delete next.readTargets;
     }
     if (phase !== 'unknown') {
       delete next.awaitingReviewReload;
@@ -1360,11 +1327,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     ensureHydrated();
     const userId = activeUserId();
     if (userId === null) return;
-    const raw = safeReadItem(entryStorageKey(subject, userId));
-    const stored = raw !== null ? parseRecord(raw) : null;
-    const current = stored ?? records.get(subject) ?? null;
+    const read = strictReadItem(entryStorageKey(subject, userId));
+    const stored =
+      read.ok && read.value !== null ? parseRecord(read.value) : null;
+    const inMemory = records.get(subject) ?? null;
+    const current = read.ok ? stored : inMemory;
     if (!current || current.requestId !== requestId) {
-      if (stored && isUnresolvedPhase(stored.phase)) {
+      if (read.ok && stored === null && inMemory !== null) {
+        records.delete(subject);
+        emit();
+      } else if (stored && isUnresolvedPhase(stored.phase)) {
         records.set(subject, stored);
         emit();
       }
@@ -1510,27 +1482,6 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (!matchesPostedTarget(entry, expectedTarget)) {
         continue;
       }
-      const targets = recordTargets(entry);
-      if (
-        expectedTarget !== undefined &&
-        targets.length > 1 &&
-        targets.includes(expectedTarget)
-      ) {
-        const remaining = targets.filter((target) => target !== expectedTarget);
-        const updated: HeldWriteRecord = {
-          ...entry,
-          readTarget: remaining[0],
-        };
-        if (remaining.length > 1) {
-          updated.readTargets = remaining;
-        } else {
-          delete updated.readTargets;
-        }
-        writeRecordToStorage(updated, userId);
-        postedReloads.set(k, updated);
-        changed = true;
-        continue;
-      }
       postedReloads.delete(k);
       removePostedFromStorage(entry.subject, entry.requestId, userId);
       changed = true;
@@ -1542,10 +1493,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   function hasPostedReloadForTarget(target: string): boolean {
     ensureHydrated();
     for (const entry of postedReloads.values()) {
-      if (
-        entry.phase === 'posted_reload' &&
-        recordTargets(entry).includes(target)
-      ) {
+      if (entry.phase === 'posted_reload' && entry.readTarget === target) {
         return true;
       }
     }
@@ -1559,7 +1507,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (
         parsed &&
         parsed.phase === 'posted_reload' &&
-        recordTargets(parsed).includes(target)
+        parsed.readTarget === target
       ) {
         return true;
       }
@@ -1590,7 +1538,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       }
       if (
         filter.readTarget !== undefined &&
-        !recordTargets(entry).includes(filter.readTarget)
+        entry.readTarget !== filter.readTarget
       ) {
         return;
       }

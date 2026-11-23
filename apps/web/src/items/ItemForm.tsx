@@ -39,7 +39,6 @@ import {
   createSubject,
   firstUnknownItemCreate,
   hasAction,
-  hasActionPostedReload,
   hasDurableAction,
   hasItemConfigurationAction,
   lossSubject,
@@ -50,6 +49,7 @@ import {
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
+import { verifyLossItem } from '@/items/verify';
 import { UnknownSave } from '@/items/UnknownSave';
 import {
   frequencyOptions,
@@ -113,6 +113,7 @@ export function ItemForm({
   detailsKey = 0,
   onIdentityDirtyChange,
   onItemStale,
+  onItemVerified,
 }: {
   items: readonly CatalogItem[];
   editingId?: string;
@@ -130,6 +131,8 @@ export function ItemForm({
   onIdentityDirtyChange?: (dirty: boolean) => void;
   /** The costing schedule is for a different identity than the shown item. */
   onItemStale?: (itemId: string) => void | Promise<void>;
+  /** Called with the fresh item row once a combined loss verification read succeeds. */
+  onItemVerified?: (item: CatalogItem) => void;
 }) {
   const online = useOnline();
   const titleId = useId();
@@ -167,6 +170,7 @@ export function ItemForm({
   const timingTouched = useRef(false);
   const scheduleLoad = useRef(0);
   const onItemStaleRef = useRef(onItemStale);
+  const onItemVerifiedRef = useRef(onItemVerified);
   const lossFlight = useRef(false);
   const priceFlight = useRef(false);
   const createFlight = useRef(false);
@@ -248,7 +252,8 @@ export function ItemForm({
 
   useEffect(() => {
     onItemStaleRef.current = onItemStale;
-  }, [onItemStale]);
+    onItemVerifiedRef.current = onItemVerified;
+  }, [onItemStale, onItemVerified]);
 
   // A new displayed identity re-reads the schedule. A schedule for another
   // identity than the one this read was issued for means the shown item is
@@ -261,6 +266,22 @@ export function ItemForm({
     const pendingReloads = snapshotActionPostedReloads({ subject });
     void (async () => {
       try {
+        if (pendingReloads.length > 0) {
+          const [shift, verified] = await Promise.all([
+            currentShiftStart(),
+            verifyLossItem(editingId),
+          ]);
+          clearActionPostedReloadSnapshot(pendingReloads, editingId);
+          if (cancelled || request !== scheduleLoad.current) return;
+          setShiftStart(shift);
+          setSchedule(verified.schedule);
+          onItemVerifiedRef.current?.(verified.item);
+          if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
+          if (verified.schedule.identity !== editingIdentity) {
+            void onItemStaleRef.current?.(editingId);
+          }
+          return;
+        }
         const [shift, nextSchedule] = await Promise.all([
           currentShiftStart(),
           listCostingSchedule(editingId),
@@ -268,7 +289,6 @@ export function ItemForm({
         if (cancelled || request !== scheduleLoad.current) return;
         setShiftStart(shift);
         setSchedule(nextSchedule);
-        clearActionPostedReloadSnapshot(pendingReloads, subject);
         if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
         if (nextSchedule.identity !== editingIdentity) {
           void onItemStaleRef.current?.(editingId);
@@ -286,19 +306,30 @@ export function ItemForm({
 
   async function reloadLossSchedule(
     expectedIdentity?: string,
+    options?: { includeItem?: boolean },
   ): Promise<boolean> {
     if (!editingId) return false;
     const request = ++scheduleLoad.current;
     const subject = lossSubject(editingId);
     const pendingReloads = snapshotActionPostedReloads({ subject });
+    const includeItem = options?.includeItem ?? true;
     try {
-      const next = await listCostingSchedule(editingId);
-      if (request !== scheduleLoad.current) return false;
-      setSchedule(next);
-      clearActionPostedReloadSnapshot(pendingReloads, subject);
+      let nextSchedule: CostingSchedule;
+      if (includeItem || pendingReloads.length > 0) {
+        const verified = await verifyLossItem(editingId);
+        clearActionPostedReloadSnapshot(pendingReloads, editingId);
+        if (request !== scheduleLoad.current) return false;
+        nextSchedule = verified.schedule;
+        setSchedule(nextSchedule);
+        onItemVerifiedRef.current?.(verified.item);
+      } else {
+        nextSchedule = await listCostingSchedule(editingId);
+        if (request !== scheduleLoad.current) return false;
+        setSchedule(nextSchedule);
+      }
       if (
         expectedIdentity !== undefined &&
-        next.identity !== expectedIdentity
+        nextSchedule.identity !== expectedIdentity
       ) {
         void onItemStaleRef.current?.(editingId);
       }
@@ -440,15 +471,13 @@ export function ItemForm({
         return;
       }
       saved = true;
-      if (!hasActionPostedReload(subject, undefined, requestId)) {
-        markActionPostedReload(subject, requestId, subject);
-      }
+      markActionPostedReload(subject, requestId, editingId);
       releaseLock();
       releaseLock = () => {};
       setDatedLoss(false);
       const reloaded = await reloadLossSchedule();
       if (reloaded) {
-        clearActionPostedReload(subject, subject, requestId);
+        clearActionPostedReload(subject, editingId, requestId);
       }
     } catch (error) {
       if (!saved && requestId !== null) {
@@ -457,7 +486,7 @@ export function ItemForm({
       if (saved) {
         setExtraError(messageFrom(error));
       } else if (isConfirmedConfigurationChange(error)) {
-        await reloadLossSchedule();
+        await reloadLossSchedule(undefined, { includeItem: false });
       }
     } finally {
       releaseLock();
@@ -549,7 +578,7 @@ export function ItemForm({
       } else if (isConfirmedConfigurationChange(error)) {
         // The held price keeps the identity it was submitted with. A confirmed
         // conflict retires that hold; the next fresh action reads this reload.
-        await reloadLossSchedule();
+        await reloadLossSchedule(undefined, { includeItem: false });
       }
     } finally {
       releaseLock();
