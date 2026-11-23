@@ -150,19 +150,15 @@ export class BackupError extends Error {
   }
 }
 
-// A URI or keyword conninfo can name another host, or a hostaddr, without the
-// first token showing it. The synthetic gate does not try to parse either form.
+// Any "=" is keyword conninfo (service, host, hostaddr, and the rest). Any URI
+// scheme is a connection string. A plain database name has neither, so this
+// does not keep a list of keywords.
 function connectionDisablesDiagnostics(value) {
-  const text = String(value ?? '');
-  if (/postgres(?:ql)?:\/\//i.test(text)) {
+  const text = String(value ?? '').trim();
+  if (text.includes('=')) {
     return true;
   }
-  if (/hostaddr\s*=/i.test(text)) {
-    return true;
-  }
-  return /(?:^|[\s;])(?:host|port|dbname|user|password|sslmode|sslrootcert|sslcert|sslkey|options|application_name|requiressl|gssencmode|channel_binding|target_session_attrs)\s*=/i.test(
-    text,
-  );
+  return /^[a-z][a-z0-9+.-]*:/i.test(text);
 }
 
 // The synthetic gate is the address 127.0.0.1, not a hostname. "localhost"
@@ -179,9 +175,9 @@ function diagnosticHost(raw) {
 }
 
 // Server text may be printed only by the synthetic round trip. Every effective
-// host has to be 127.0.0.1: libpq prefers PGHOSTADDR over PGHOST. A service, a
-// URI, a conninfo string, or any hostaddr parameter turns this off. An unset
-// host is not accepted.
+// host has to be 127.0.0.1: libpq prefers PGHOSTADDR over PGHOST. A service
+// file, or any "=" or URI scheme in PGDATABASE or DATABASE_URL, turns this
+// off. An unset host is not accepted.
 export function diagnosticsAllowed(env = process.env) {
   if (
     env.BACKUP_SYNTHETIC_DIAGNOSTICS !== '1' ||

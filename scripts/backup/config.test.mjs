@@ -341,6 +341,26 @@ test('diagnostics stay off when a URI has a remote hostaddr parameter', () => {
   );
 });
 
+test('diagnostics stay off when PGDATABASE is service=fixture', () => {
+  const base = {
+    BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
+    BACKUP_ALLOW_LOOPBACK: '1',
+    PGHOST: '127.0.0.1',
+  };
+  assert.deepEqual(
+    {
+      service: diagnosticsAllowed({ ...base, PGDATABASE: 'service=fixture' }),
+      url: diagnosticsAllowed({ ...base, DATABASE_URL: 'service=fixture' }),
+      scheme: diagnosticsAllowed({
+        ...base,
+        DATABASE_URL: 'socket://127.0.0.1/postgres',
+      }),
+      name: diagnosticsAllowed({ ...base, PGDATABASE: 'postgres' }),
+    },
+    { service: false, url: false, scheme: false, name: true },
+  );
+});
+
 test('internal error text is printed only for the synthetic loopback round trip', () => {
   const synthetic = {
     BACKUP_SYNTHETIC_DIAGNOSTICS: '1',

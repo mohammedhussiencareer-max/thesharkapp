@@ -41,9 +41,14 @@ function scriptedQuery(replies) {
 function assertUntouched(calls) {
   for (const call of calls) {
     assert.equal(typeof call.sql, 'string');
-    assert.doesNotMatch(call.sql, /vault/i);
     assert.doesNotMatch(call.sql, /cron\.schedule/i);
     assert.doesNotMatch(call.sql, /cron\.job/i);
+    assert.doesNotMatch(call.sql, /vault\.secrets/i);
+    assert.doesNotMatch(call.sql, /from\s+vault\b/i);
+    assert.doesNotMatch(
+      call.sql,
+      /set_config\(\s*'role'\s*,\s*'backup_reader'/i,
+    );
   }
 }
 
@@ -55,7 +60,7 @@ test('a target without either extension creates both, then verifies', async () =
     '',
     lines(['pg_cron', 'pg_net']),
     lines(['cron', 'net']),
-    'f 42501 t t\n',
+    '',
   ]);
   const result = ensureScheduler({ query, env: loopback });
   assert.deepEqual(result.created, ['pg_cron', 'pg_net']);
@@ -80,7 +85,7 @@ test('a target that already has one extension creates only the missing one', asy
     '',
     lines(['pg_cron', 'pg_net']),
     lines(['cron', 'net']),
-    'f 42501 t t\n',
+    '',
   ]);
   const result = ensureScheduler({ query, env: loopback });
   assert.deepEqual(result.created, ['pg_net']);
@@ -100,7 +105,7 @@ test('a target with both extensions creates nothing and passes', async () => {
     lines(['pg_cron', 'pg_net']),
     lines(['pg_net', 'pg_cron']),
     lines(['net', 'cron']),
-    'f 42501 t t\n',
+    '',
   ]);
   const result = ensureScheduler({ query, env: loopback });
   assert.deepEqual(result.created, []);
@@ -246,7 +251,7 @@ test('the validated connection env is the env used for every query', async () =>
       lines(['pg_cron', 'pg_net']),
       lines(['pg_cron', 'pg_net']),
       lines(['cron', 'net']),
-      'f 42501 t t\n',
+      '',
     ]);
     ensureScheduler({ query, env });
     assert.ok(calls.length >= 3);
@@ -359,7 +364,7 @@ test('restore docs run the scheduler from current main, in order', () => {
   }
 });
 
-function replyingQuery({ firstExtensions, checks = 'f 42501 t t' }) {
+function replyingQuery({ firstExtensions, checks = '' }) {
   let extensionReads = 0;
   const calls = [];
   const query = (call) => {
@@ -391,12 +396,17 @@ function assertNetLock(calls) {
     sql.search(/grant usage on schema net/i) <
       sql.search(/revoke usage on schema net from public/i),
   );
-  assert.match(sql, /grant execute on all functions in schema net/i);
-  assert.match(sql, /grant all privileges on all tables in schema net/i);
-  assert.match(sql, /grant all privileges on all sequences in schema net/i);
+  assert.match(sql, /grant execute on function /i);
+  assert.match(sql, /pg_get_function_identity_arguments\s*\(/i);
+  assert.doesNotMatch(sql, /grant execute on all functions in schema net/i);
+  assert.doesNotMatch(sql, /grant all privileges on all tables in schema net/i);
+  assert.doesNotMatch(
+    sql,
+    /grant all privileges on all sequences in schema net/i,
+  );
   assert.match(sql, /'postgres'/);
-  assert.match(sql, /'supabase_functions_admin'/);
-  assert.match(sql, /'supabase_admin'/);
+  assert.doesNotMatch(sql, /supabase_functions_admin/i);
+  assert.doesNotMatch(sql, /supabase_admin/i);
   assert.match(
     sql,
     /revoke all privileges on all tables in schema net from public/i,
@@ -407,9 +417,37 @@ function assertNetLock(calls) {
   );
   assert.doesNotMatch(sql, /revoke\s+[\s\S]*from\s+current_user/i);
   assert.doesNotMatch(sql, /revoke\s+[\s\S]*from\s+postgres/i);
-  assert.match(sql, /net\.http_request_queue/);
+  assert.doesNotMatch(sql, /net\.http_request_queue/i);
+  assert.doesNotMatch(sql, /set_config\(\s*'role'/i);
   assert.match(sql, /http_post/);
-  assert.match(sql, /has_schema_privilege\('backup_reader', 'net', 'usage'\)/);
+  assert.match(
+    sql,
+    /has_schema_privilege\(\s*'backup_reader'\s*,\s*'net'\s*,\s*'usage'\s*\)/i,
+  );
+  assert.match(sql, /has_table_privilege\(\s*'backup_reader'/i);
+  assert.match(
+    sql,
+    /nspname\s+in\s*\(\s*'net'\s*,\s*'cron'\s*,\s*'vault'\s*\)/i,
+  );
+  assert.match(sql, /has_function_privilege\s*\(/i);
+  assert.match(sql, /the database owner has no usage on schema net/);
+  assert.match(sql, /the database owner cannot execute net\.http_post/);
+  assert.match(sql, /as acl_failed[\s\S]*\\gset/);
+  assert.match(sql, /\\if :acl_failed/);
+  const beginAt = sql.search(/^\s*begin\s*;/im);
+  const checkAt = sql.search(/has_table_privilege\(\s*'backup_reader'/i);
+  const ifAt = sql.search(/\\if\b/);
+  const rollbackAt = sql.search(/\brollback\b/i);
+  const elseAt = sql.search(/\\else\b/);
+  const commitAt = sql.search(/^\s*commit\s*;/im);
+  assert.ok(
+    beginAt !== -1 &&
+      beginAt < checkAt &&
+      checkAt < ifAt &&
+      ifAt < rollbackAt &&
+      rollbackAt < elseAt &&
+      elseAt < commitAt,
+  );
   assertUntouched(calls);
 }
 
@@ -463,13 +501,122 @@ test('a missing owner privilege on net fails after the lock', async () => {
   const { ensureScheduler } = await loadScheduler();
   const { query, calls } = replyingQuery({
     firstExtensions: ['pg_cron', 'pg_net'],
-    checks: 'f 42501 f t',
+    checks: 'the database owner has no usage on schema net',
   });
   assert.throws(() => ensureScheduler({ query, env: loopback }), {
     code: 'SCHEDULER_NET_ACL',
     message: /database owner has no usage on schema net/,
   });
   assertNetLock(calls);
+});
+
+test('reader privileges are checked without impersonation and a held privilege rolls back before commit', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const { query, calls } = replyingQuery({
+    firstExtensions: ['pg_cron', 'pg_net'],
+  });
+  ensureScheduler({ query, env: loopback });
+  const sql = calls.find((call) =>
+    /revoke usage on schema net from public/i.test(call.sql),
+  ).sql;
+  const problems = [];
+  if (/set_config\(\s*'role'/i.test(sql)) {
+    problems.push('assumes a role with set_config');
+  }
+  if (/\bset\s+role\s+backup_reader\b/i.test(sql)) {
+    problems.push('assumes backup_reader with set role');
+  }
+  if (/net\.http_request_queue/i.test(sql)) {
+    problems.push('reads net.http_request_queue');
+  }
+  if (
+    !/has_schema_privilege\(\s*'backup_reader'\s*,\s*'net'\s*,\s*'usage'\s*\)/i.test(
+      sql,
+    )
+  ) {
+    problems.push('missing has_schema_privilege for net');
+  }
+  if (!/has_table_privilege\(\s*'backup_reader'/i.test(sql)) {
+    problems.push('missing has_table_privilege for backup_reader');
+  }
+  if (
+    !/nspname\s+in\s*\(\s*'net'\s*,\s*'cron'\s*,\s*'vault'\s*\)/i.test(sql) ||
+    !/has_schema_privilege\(\s*'backup_reader'/i.test(sql)
+  ) {
+    problems.push('missing cron and vault privilege checks');
+  }
+  if (!/'select'/i.test(sql)) {
+    problems.push('missing select privilege');
+  }
+  const beginAt = sql.search(/^\s*begin\s*;/im);
+  const checkAt = sql.search(/has_table_privilege\(\s*'backup_reader'/i);
+  const ifAt = sql.search(/\\if\b/);
+  const rollbackAt = sql.search(/\brollback\b/i);
+  const elseAt = sql.search(/\\else\b/);
+  const commitAt = sql.search(/^\s*commit\s*;/im);
+  if (!(
+    beginAt !== -1 &&
+    checkAt !== -1 &&
+    ifAt > checkAt &&
+    rollbackAt > ifAt &&
+    elseAt > rollbackAt &&
+    commitAt > elseAt
+  )) {
+    problems.push(
+      'held privilege is not rolled back inside the transaction before commit',
+    );
+  }
+  assert.deepEqual(problems, []);
+  const sh = readFileSync(
+    new URL('./ci-roundtrip.sh', import.meta.url),
+    'utf8',
+  );
+  assert.match(sh, /expect_denied "cron\.job" 42501 /);
+  assert.match(sh, /expect_denied "vault\.secrets" 42501 /);
+  assert.match(sh, /expect_denied "net\.http_request_queue" 42501 /);
+});
+
+test('the lock grants only the job owner usage and the exact http_post signature', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const { query, calls } = replyingQuery({
+    firstExtensions: ['pg_cron', 'pg_net'],
+  });
+  ensureScheduler({ query, env: loopback });
+  const sql = calls.find((call) =>
+    /revoke usage on schema net from public/i.test(call.sql),
+  ).sql;
+  const problems = [];
+  if (/supabase_functions_admin/i.test(sql)) {
+    problems.push('names supabase_functions_admin');
+  }
+  if (/supabase_admin/i.test(sql)) {
+    problems.push('names supabase_admin');
+  }
+  if (/grant execute on all functions in schema net/i.test(sql)) {
+    problems.push('grants every net function');
+  }
+  if (/grant all privileges on all tables in schema net/i.test(sql)) {
+    problems.push('grants every net table');
+  }
+  if (/grant all privileges on all sequences in schema net/i.test(sql)) {
+    problems.push('grants every net sequence');
+  }
+  if (!/pg_get_function_identity_arguments\s*\(/i.test(sql)) {
+    problems.push('does not look up http_post argument types');
+  }
+  if (!/grant execute on function /i.test(sql)) {
+    problems.push('does not grant one function signature');
+  }
+  if (!/has_function_privilege\s*\(/i.test(sql)) {
+    problems.push('does not check execute');
+  }
+  if (!/'postgres'/.test(sql)) {
+    problems.push('does not name postgres');
+  }
+  if (/https?:\/\//i.test(sql) || /select\s+net\.http_post\s*\(/i.test(sql)) {
+    problems.push('calls net.http_post');
+  }
+  assert.deepEqual(problems, []);
 });
 
 test('the CI round trip proves a reader dump after the scheduler lock', () => {
@@ -505,14 +652,18 @@ test('restore docs say the scheduler removes public access to net', () => {
   assert.match(arabic, /لو الامتداد اتثبّت تاني/);
 });
 
-test('the scheduler script never mentions vault, cron.schedule, or cron.job', async () => {
+test('the scheduler script does not schedule a job or read cron or vault rows', async () => {
   const source = readFileSync(
     new URL('./ensure-scheduler.mjs', import.meta.url),
     'utf8',
   );
-  assert.doesNotMatch(source, /vault/i);
   assert.doesNotMatch(source, /cron\.schedule/);
   assert.doesNotMatch(source, /cron\.job/);
+  assert.doesNotMatch(source, /vault\.secrets/i);
+  assert.doesNotMatch(source, /from\s+vault\b/i);
+  assert.doesNotMatch(source, /set_config\(\s*'role'\s*,\s*'backup_reader'/i);
+  assert.match(source, /has_schema_privilege\(\s*'backup_reader'/i);
+  assert.match(source, /'vault'/);
   const { ensureScheduler } = await loadScheduler();
   assert.equal(typeof ensureScheduler, 'function');
 });
