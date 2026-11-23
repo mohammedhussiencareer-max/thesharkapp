@@ -146,6 +146,10 @@ function walkFirestoreValueForCustomerKey(
     }
   }
   for (const key of keys) {
+    // Keep scalar payloads opaque even when a value has extra wrapper keys.
+    if (FIRESTORE_SCALAR_VALUE_KEYS.has(key)) {
+      continue;
+    }
     if (
       isCustomerShapedKey(key) ||
       walkArbitraryForCustomerKey(value[key], depth + 1)

@@ -367,14 +367,14 @@ function readSharedOptionGroupIds(raw: unknown): string[] {
   // Firestore map keys are unique, so byte-identical duplicate labels cannot
   // occur in a Firestore document; this duplicate check is only a defensive
   // guard for non-Firestore input.
-  for (const [label, rawGroupId] of Object.entries(mapFields)) {
+  for (const label of Object.keys(mapFields)) {
     if (label.length === 0 || label.includes('\0')) {
       throw new MalformedCatalogFieldError('invalid shared option label');
     }
     if (labels.has(label)) {
       throw new MalformedCatalogFieldError('duplicate shared option label');
     }
-    const groupId = readStringValue(rawGroupId);
+    const groupId = readStringValue(field(mapFields, label));
     if (!isSafeCatalogDocumentId(groupId)) {
       throw new MalformedCatalogFieldError('unsafe shared option group id');
     }
@@ -408,7 +408,7 @@ function readItemOptionGroups(raw: unknown): Record<string, string[]> {
   const mapFields = readMapFields(raw);
   const seenLabels = new Set<string>();
   const groups = new Map<string, string[]>();
-  for (const [label, rawGroup] of Object.entries(mapFields)) {
+  for (const label of Object.keys(mapFields)) {
     if (label.length === 0 || label.includes('\0')) {
       throw new MalformedCatalogFieldError('invalid option group label');
     }
@@ -416,7 +416,10 @@ function readItemOptionGroups(raw: unknown): Record<string, string[]> {
       throw new MalformedCatalogFieldError('duplicate option group label');
     }
     seenLabels.add(label);
-    groups.set(label, readOptionValues(rawGroup, SELECTORS.optionValue));
+    groups.set(
+      label,
+      readOptionValues(field(mapFields, label), SELECTORS.optionValue),
+    );
   }
   for (const label of [...groups.keys()].sort(compareId)) {
     const values = groups.get(label);

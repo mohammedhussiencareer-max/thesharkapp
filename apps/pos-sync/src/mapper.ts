@@ -1,5 +1,6 @@
 import {
   decodeFirestoreValue,
+  hasFirestoreValueKind,
   isRecord,
   splitDocumentName,
   splitTransactionName,
@@ -36,14 +37,20 @@ function isOnlyKey(value: Record<string, unknown>, key: string): boolean {
 }
 
 function isNullValue(value: unknown): boolean {
-  return isRecord(value) && isOnlyKey(value, 'nullValue');
+  return (
+    hasFirestoreValueKind(value, 'nullValue') &&
+    (value.nullValue === null || value.nullValue === 'NULL_VALUE')
+  );
 }
 
 function isMapValue(
   value: unknown,
 ): value is { mapValue: { fields?: unknown } } {
   return (
-    isRecord(value) && isOnlyKey(value, 'mapValue') && isRecord(value.mapValue)
+    isRecord(value) &&
+    isOnlyKey(value, 'mapValue') &&
+    isRecord(value.mapValue) &&
+    Object.keys(value.mapValue).every((key) => key === 'fields')
   );
 }
 
@@ -53,7 +60,8 @@ function isArrayValue(
   return (
     isRecord(value) &&
     isOnlyKey(value, 'arrayValue') &&
-    isRecord(value.arrayValue)
+    isRecord(value.arrayValue) &&
+    Object.keys(value.arrayValue).every((key) => key === 'values')
   );
 }
 
@@ -86,18 +94,22 @@ export function normalizeOptionalText(value: string): string | null {
   return trimmed.length === 0 ? null : trimmed;
 }
 
-function optionalString(value: unknown, label: string): string | null {
+function optionalText(
+  value: unknown,
+  label: string,
+  kind: 'stringValue' | 'timestampValue',
+): string | null {
   if (value === undefined || isNullValue(value)) {
     return null;
   }
-  const decoded = decodeFirestoreValue(value);
-  if (decoded === null) {
-    return null;
-  }
-  if (typeof decoded !== 'string') {
+  if (!hasFirestoreValueKind(value, kind) || typeof value[kind] !== 'string') {
     throw new Error(`unexpected ${label}`);
   }
-  return normalizeOptionalText(decoded);
+  return normalizeOptionalText(value[kind]);
+}
+
+function optionalString(value: unknown, label: string): string | null {
+  return optionalText(value, label, 'stringValue');
 }
 
 function requiredString(value: unknown, label: string): string {
@@ -112,10 +124,10 @@ function optionalNumber(value: unknown, label: string): number | null {
   if (value === undefined || isNullValue(value)) {
     return null;
   }
-  const decoded = decodeFirestoreValue(value);
-  if (decoded === null) {
-    return null;
+  if (!hasFirestoreValueKind(value, 'integerValue', 'doubleValue')) {
+    throw new Error(`unexpected ${label}`);
   }
+  const decoded = decodeFirestoreValue(value);
   if (typeof decoded !== 'number') {
     throw new Error(`unexpected ${label}`);
   }
@@ -161,20 +173,25 @@ function requiredBool(value: unknown, label: string): boolean {
   if (value === undefined || isNullValue(value)) {
     throw new Error(`${label} is required`);
   }
-  const decoded = decodeFirestoreValue(value);
-  if (typeof decoded !== 'boolean') {
+  if (
+    !hasFirestoreValueKind(value, 'booleanValue') ||
+    typeof value.booleanValue !== 'boolean'
+  ) {
     throw new Error(`unexpected ${label}`);
   }
-  return decoded;
+  return value.booleanValue;
 }
 
 function requiredTime(value: unknown, label: string): string {
-  const text = requiredString(value, label);
-  return normalizeTimestamp(text);
+  const time = optionalTime(value, label);
+  if (time === null) {
+    throw new Error(`${label} is required`);
+  }
+  return time;
 }
 
 function optionalTime(value: unknown, label: string): string | null {
-  const text = optionalString(value, label);
+  const text = optionalText(value, label, 'timestampValue');
   if (text === null) {
     return null;
   }
@@ -261,6 +278,8 @@ function readOptions(value: unknown): PosLineOptionIngest[] {
 }
 
 function readLines(value: unknown): PosLineIngest[] {
+  // Firestore masks cannot select inside array elements. Read only the
+  // accounting leaves by key and return fresh rows without the raw items.
   if (value === undefined || isNullValue(value)) {
     return [];
   }

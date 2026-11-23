@@ -6,30 +6,83 @@ import { isRecord } from './decode.ts';
 
 // The accounting paths mirror the reads in mapper.ts. Firestore cannot mask
 // individual fields inside array elements, so orders select the items array.
-export const ORDER_FIELD_PATHS = Object.freeze([
-  'status',
-  'orderNumber',
-  'shiftId',
-  'orderType',
-  'paymentType',
-  'timestamp',
-  'subtotalAmount',
-  'discountAmount',
-  'taxTotalAmount',
-  'serviceTaxAmount',
-  'deliveryDetails.deliveryFee',
-  'totalAmount',
-  'financialRevision',
-  'lastFinancialOperationKey',
-  'items',
-]);
+const VALUE_PAYLOADS = {
+  stringValue: (value: unknown) => typeof value === 'string',
+  timestampValue: (value: unknown) => typeof value === 'string',
+  booleanValue: (value: unknown) => typeof value === 'boolean',
+  integerValue: (value: unknown) =>
+    typeof value === 'string' &&
+    /^-?\d+$/.test(value) &&
+    Number.isSafeInteger(Number(value)),
+  doubleValue: (value: unknown) =>
+    typeof value === 'number' && Number.isFinite(value),
+  nullValue: (value: unknown) => value === null || value === 'NULL_VALUE',
+  arrayValue: (value: unknown) =>
+    isRecord(value) &&
+    Object.keys(value).every((key) => key === 'values') &&
+    (value.values === undefined || Array.isArray(value.values)),
+  mapValue: (value: unknown) =>
+    isRecord(value) &&
+    Object.keys(value).every((key) => key === 'fields') &&
+    (value.fields === undefined || isRecord(value.fields)),
+};
 
-export const TRANSACTION_FIELD_PATHS = Object.freeze([
-  'orderId',
-  'type',
-  'amount',
-  'timestamp',
-]);
+type Kind = keyof typeof VALUE_PAYLOADS;
+const NUMBER = ['integerValue', 'doubleValue'] as const;
+const OPTIONAL_NUMBER = [...NUMBER, 'nullValue'] as const;
+const OPTIONAL_STRING = ['stringValue', 'nullValue'] as const;
+const OPTIONAL_ARRAY = ['arrayValue', 'nullValue'] as const;
+const OPTIONAL_MAP = ['mapValue', 'nullValue'] as const;
+
+const ORDER_FIELD_KINDS = {
+  status: ['stringValue'],
+  orderNumber: OPTIONAL_NUMBER,
+  shiftId: ['stringValue'],
+  orderType: OPTIONAL_STRING,
+  paymentType: OPTIONAL_STRING,
+  timestamp: ['timestampValue'],
+  subtotalAmount: NUMBER,
+  discountAmount: NUMBER,
+  taxTotalAmount: NUMBER,
+  serviceTaxAmount: NUMBER,
+  'deliveryDetails.deliveryFee': OPTIONAL_NUMBER,
+  totalAmount: NUMBER,
+  financialRevision: OPTIONAL_NUMBER,
+  lastFinancialOperationKey: OPTIONAL_STRING,
+  items: OPTIONAL_ARRAY,
+} satisfies Record<string, readonly Kind[]>;
+
+const SHIFT_FIELD_KINDS = {
+  id: OPTIONAL_STRING,
+  opening_time: ['timestampValue'],
+  closingTime: ['timestampValue', 'nullValue'],
+  isActive: ['booleanValue'],
+  cash_payments_net: OPTIONAL_NUMBER,
+  credit_payments: OPTIONAL_NUMBER,
+} satisfies Record<string, readonly Kind[]>;
+
+export const TRANSACTION_FIELD_KINDS = {
+  orderId: OPTIONAL_STRING,
+  type: NUMBER,
+  amount: NUMBER,
+  timestamp: ['timestampValue'],
+} satisfies Record<string, readonly Kind[]>;
+
+const FIELD_KINDS: Readonly<Record<string, readonly Kind[] | undefined>> = {
+  ...ORDER_FIELD_KINDS,
+  ...SHIFT_FIELD_KINDS,
+  ...TRANSACTION_FIELD_KINDS,
+  name: ['stringValue'],
+  sizes: OPTIONAL_ARRAY,
+  options: OPTIONAL_MAP,
+  sharedOptionGroupIds: OPTIONAL_MAP,
+  values: OPTIONAL_ARRAY,
+};
+
+export const ORDER_FIELD_PATHS = Object.freeze(Object.keys(ORDER_FIELD_KINDS));
+export const TRANSACTION_FIELD_PATHS = Object.freeze(
+  Object.keys(TRANSACTION_FIELD_KINDS),
+);
 
 // Parent paths preserve all dynamic labels and array entries. Firestore has
 // no wildcard for unknown map keys or field paths through array elements.
@@ -42,14 +95,7 @@ function catalogRootPaths(paths: readonly string[]): readonly string[] {
 
 export const FIRESTORE_FIELD_PATHS = Object.freeze({
   orders: ORDER_FIELD_PATHS,
-  custody_shifts: Object.freeze([
-    'id',
-    'opening_time',
-    'closingTime',
-    'isActive',
-    'cash_payments_net',
-    'credit_payments',
-  ]),
+  custody_shifts: Object.freeze(Object.keys(SHIFT_FIELD_KINDS)),
   transactions: TRANSACTION_FIELD_PATHS,
   items: catalogRootPaths(CATALOG_ITEM_FIELDS),
   optionGroups: catalogRootPaths(CATALOG_OPTION_GROUP_FIELDS),
@@ -70,17 +116,26 @@ export function assertProjectedDocument(
   projection: readonly string[],
 ): void {
   // The document parsers own envelope validation and catalog rejection rows.
-  if (isRecord(document) && isRecord(document.fields)) {
-    assertProjectedFields(document.fields, projection);
+  if (!isRecord(document) || document.fields === undefined) {
+    return;
   }
+  if (!isRecord(document.fields)) {
+    throw new Error('Firestore read failed: invalid response');
+  }
+  assertProjectedFields(document.fields, projection);
 }
 
 function assertProjectedFields(
   fields: Record<string, unknown>,
   projection: readonly string[],
+  parent = '',
 ): void {
   for (const key of Object.keys(fields)) {
+    const path = `${parent}${key}`;
     if (!key.includes('.') && projection.includes(key)) {
+      if (!matchesValueKind(fields[key], FIELD_KINDS[path])) {
+        throw new Error('Firestore read failed: invalid response');
+      }
       continue;
     }
     const prefix = `${key}.`;
@@ -102,41 +157,22 @@ function assertProjectedFields(
       if (!isRecord(nested)) {
         throw new Error('Firestore read failed: invalid response');
       }
-      assertProjectedFields(nested, children);
+      assertProjectedFields(nested, children, `${path}.`);
     }
   }
 }
 
-const TRANSACTION_RESPONSE_KEYS = new Set([
-  'documents',
-  'nextPageToken',
-  'name',
-  'fields',
-  'createTime',
-  'updateTime',
-  'stringValue',
-  'timestampValue',
-  'integerValue',
-  'doubleValue',
-  'nullValue',
-  ...TRANSACTION_FIELD_PATHS,
-]);
-
-export function transactionResponseKeysAllowed(text: string): boolean {
-  // Scan JSON string tokens, including escaped quotes, before parsing the
-  // response. A string followed by a colon is a key. Decode only escaped
-  // keys here. JSON.parse validates the full syntax after this check passes.
-  const strings = /("[^"\\]*(?:\\[\s\S][^"\\]*)*")\s*(:)?/g;
-  for (const [, token, colon] of text.matchAll(strings)) {
-    if (colon === undefined || token === undefined) {
-      continue;
-    }
-    const key: unknown = token.includes('\\')
-      ? JSON.parse(token)
-      : token.slice(1, -1);
-    if (typeof key !== 'string' || !TRANSACTION_RESPONSE_KEYS.has(key)) {
-      return false;
-    }
+function matchesValueKind(
+  value: unknown,
+  kinds: readonly Kind[] | undefined,
+): boolean {
+  if (
+    kinds === undefined ||
+    !isRecord(value) ||
+    Object.keys(value).length !== 1
+  ) {
+    return false;
   }
-  return true;
+  const kind = kinds.find((candidate) => Object.hasOwn(value, candidate));
+  return kind !== undefined && VALUE_PAYLOADS[kind](value[kind]);
 }

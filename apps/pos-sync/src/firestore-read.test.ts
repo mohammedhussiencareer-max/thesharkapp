@@ -22,6 +22,8 @@ const ORDER_SELECT = {
 const ORDER_MASK = ORDER_FIELD_PATHS.map(
   (path) => `mask.fieldPaths=${path}`,
 ).join('&');
+const SHIFT_MASK =
+  'mask.fieldPaths=id&mask.fieldPaths=opening_time&mask.fieldPaths=closingTime&mask.fieldPaths=isActive&mask.fieldPaths=cash_payments_net&mask.fieldPaths=credit_payments';
 const TX_MASK =
   'mask.fieldPaths=orderId&mask.fieldPaths=type&mask.fieldPaths=amount&mask.fieldPaths=timestamp';
 const ITEM_MASK =
@@ -66,7 +68,6 @@ describe('assertFirestoreReadAllowed', () => {
     ['GET', `${ROOT}/customers?pageSize=1`],
     ['GET', `${ROOT}/orders/order-test-1/items/item-test-1`],
     ['GET', `${ROOT}/orders?pageSize=1&mask.fieldPaths=customerName`],
-    ['GET', `${ROOT}/custody_shifts?pageSize=4&orderBy=customerName`],
     ['POST', `${firestoreRunQueryUrl()}?pageSize=1`],
     [
       'GET',
@@ -128,6 +129,16 @@ describe('assertFirestoreReadAllowed', () => {
     ['PATCH', `${ROOT}/optionGroups/group-test-1`],
     ['DELETE', `${ROOT}/optionGroups/group-test-1`],
   ] as const;
+
+  it('refuses a forbidden shift orderBy with an otherwise valid exact mask', () => {
+    const url = `${ROOT}/custody_shifts?pageSize=4&${SHIFT_MASK}`;
+    expect(() =>
+      assertFirestoreReadAllowed('GET', `${url}&orderBy=opening_time`),
+    ).not.toThrow();
+    expect(() =>
+      assertFirestoreReadAllowed('GET', `${url}&orderBy=customerName`),
+    ).toThrow(/^Firestore read refused$/);
+  });
 
   it('refuses writes and other URLs before any request', async () => {
     for (const [method, url] of refused) {

@@ -1,3 +1,4 @@
+import { splitDocumentName } from './decode.ts';
 import { ORDER_FIELD_PATHS } from './firestore-projection.ts';
 import { compareId } from './hash.ts';
 import {
@@ -100,7 +101,7 @@ export function timestampRangeQuery(
 export function timestampProbeQuery(start: string): unknown {
   return {
     structuredQuery: {
-      select: orderProjection(),
+      select: { fields: [{ fieldPath: '__name__' }] },
       from: [{ collectionId: 'orders' }],
       where: {
         fieldFilter: {
@@ -180,16 +181,9 @@ async function readRecent(firestore: PosFirestore): Promise<PosSnapshot> {
     'shift',
   );
   const shiftIds = shifts.map((shift) => shift.id);
-  let documents: FirestoreRestDocument[] = [];
-  if (shiftIds.length > 0) {
-    documents = await firestore.queryOrders(recentOrdersQuery(shiftIds));
-    if (documents.length >= RECENT_ORDER_LIMIT) {
-      throw new Error('recent orders page was truncated');
-    }
-  }
   return {
     shifts,
-    orders: mapOrders(documents),
+    orders: mapOrders(await readOrdersForShifts(firestore, shiftIds)),
     scope: { shift_ids: shiftIds },
     missingShiftIds: [],
   };
@@ -201,16 +195,11 @@ async function readWindow(
 ): Promise<PosSnapshot> {
   const from = window35From(now);
   const scanEnd = new Date(now.getTime() + 2 * DAY_MS).toISOString();
-  const documents = await collectTimestampRange(firestore, from, scanEnd);
-  const probe = await firestore.queryOrders(timestampProbeQuery(scanEnd));
-  if (probe.length > 0) {
-    throw new Error('orders exist after the scan window');
-  }
   // Map the window once. A shift that opened earlier still owns orders from
   // before `from`; those orders are in the drawer. Read them too, or the
   // sales summary shows a false drawer difference. Each document is mapped
   // once. Scope stays {from}, so orders before `from` are never marked missing.
-  const windowOrders = mapOrders(documents);
+  const windowOrders = await readWindowOrders(firestore, from, scanEnd);
   const shiftIds = [
     ...new Set(windowOrders.map((order) => order.shift_id)),
   ].sort(compareId);
@@ -229,15 +218,32 @@ async function readWindow(
   const earlyShiftIds = uniqueShifts
     .filter((shift) => openedBefore(shift.opened_at, fromMs))
     .map((shift) => shift.id);
-  const backfill = await readOrdersForShifts(firestore, earlyShiftIds);
-  const seenNames = new Set(documents.map((document) => document.name));
-  const fresh = backfill.filter((document) => !seenNames.has(document.name));
+  const seenIds = new Set(windowOrders.map((order) => order.id));
+  const backfill = mapOrders(
+    (await readOrdersForShifts(firestore, earlyShiftIds)).filter((document) => {
+      const { collection, id } = splitDocumentName(document.name);
+      return collection !== 'orders' || !seenIds.has(id);
+    }),
+  );
   return {
     shifts: uniqueShifts,
-    orders: uniqueById([...windowOrders, ...mapOrders(fresh)], 'order'),
+    orders: uniqueById([...windowOrders, ...backfill], 'order'),
     scope: { from },
     missingShiftIds,
   };
+}
+
+async function readWindowOrders(
+  firestore: PosFirestore,
+  from: string,
+  scanEnd: string,
+): Promise<PosOrderIngest[]> {
+  const documents = await collectTimestampRange(firestore, from, scanEnd);
+  const probe = await firestore.queryOrders(timestampProbeQuery(scanEnd));
+  if (probe.length > 0) {
+    throw new Error('orders exist after the scan window');
+  }
+  return mapOrders(documents);
 }
 
 function openedBefore(openedAt: string, fromMs: number): boolean {

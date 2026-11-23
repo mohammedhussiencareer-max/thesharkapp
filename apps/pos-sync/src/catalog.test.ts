@@ -652,6 +652,12 @@ describe('parseCatalog fixtures', () => {
           }
           return Reflect.get(obj, prop, receiver) as unknown;
         },
+        ownKeys(obj) {
+          if (!isLabelMap) {
+            throw new Error(`unexpected key iteration at ${prefix || 'root'}`);
+          }
+          return Reflect.ownKeys(obj);
+        },
       });
     }
 
@@ -1037,6 +1043,38 @@ describe('parseCatalog fixtures', () => {
     expect([...pipelineGroupScalarReads].sort()).toEqual(
       [...CATALOG_OPTION_GROUP_FIELDS].sort(),
     );
+  });
+
+  it('does not read price, cost, or recipe scalar payloads under dynamic labels', () => {
+    const marker = 'synthetic-unread-catalog-leaf';
+    const reads: string[] = [];
+    const protectedScalar = (field: string) => ({
+      // A malformed wrapper still must not expose its scalar payload to the key scan.
+      extraWrapperKey: null,
+      get stringValue() {
+        reads.push(field);
+        throw new Error(marker);
+      },
+    });
+    const item = itemDoc('item-syn-unread-leaves', {
+      name: str('Synthetic Catalog Item'),
+      options: map({
+        'Guest Specials': arr([
+          map({
+            value: str('Synthetic Add-on'),
+            price: protectedScalar('price'),
+            costPrice: protectedScalar('costPrice'),
+            recipe: arr([map({ ingredientId: protectedScalar('recipe') })]),
+          }),
+        ]),
+      }),
+    });
+    const result = parseCatalog([item], []);
+    expect(result.items[0]?.item_option_groups).toEqual({
+      'Guest Specials': ['Synthetic Add-on'],
+    });
+    expect(reads).toEqual([]);
+    expect(JSON.stringify(result)).not.toContain(marker);
   });
 
   it('accepts 15 and 20 nested Firestore maps during customer-key scan and rejects beyond the walk cap', () => {
