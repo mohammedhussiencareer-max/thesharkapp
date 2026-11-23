@@ -55,10 +55,11 @@ test('a target without either extension creates both, then verifies', async () =
     '',
     lines(['pg_cron', 'pg_net']),
     lines(['cron', 'net']),
+    'f 42501 t t\n',
   ]);
   const result = ensureScheduler({ query, env: loopback });
   assert.deepEqual(result.created, ['pg_cron', 'pg_net']);
-  assert.equal(calls.length, 5);
+  assert.equal(calls.length, 6);
   assert.match(calls[0].sql, /pg_catalog\.pg_extension/);
   assert.match(calls[0].sql, /'pg_cron'/);
   assert.match(calls[0].sql, /'pg_net'/);
@@ -79,6 +80,7 @@ test('a target that already has one extension creates only the missing one', asy
     '',
     lines(['pg_cron', 'pg_net']),
     lines(['cron', 'net']),
+    'f 42501 t t\n',
   ]);
   const result = ensureScheduler({ query, env: loopback });
   assert.deepEqual(result.created, ['pg_net']);
@@ -98,6 +100,7 @@ test('a target with both extensions creates nothing and passes', async () => {
     lines(['pg_cron', 'pg_net']),
     lines(['pg_net', 'pg_cron']),
     lines(['net', 'cron']),
+    'f 42501 t t\n',
   ]);
   const result = ensureScheduler({ query, env: loopback });
   assert.deepEqual(result.created, []);
@@ -243,6 +246,7 @@ test('the validated connection env is the env used for every query', async () =>
       lines(['pg_cron', 'pg_net']),
       lines(['pg_cron', 'pg_net']),
       lines(['cron', 'net']),
+      'f 42501 t t\n',
     ]);
     ensureScheduler({ query, env });
     assert.ok(calls.length >= 3);
@@ -297,8 +301,7 @@ test('the CI round trip installs the scheduler on the real stack', () => {
   assert.match(sh, /pg_restore -l/);
   assert.match(sh, /scheduler_secret_and_job/);
   assert.doesNotMatch(sh, /cron\.schedule/);
-  assert.match(sh, /\[ROLE_UNSAFE\]/);
-  assert.match(sh, /select count\(\*\) from net\.http_request_queue/);
+  assert.match(sh, /expect_denied "net\.http_request_queue" 42501 /);
   const blocked = sh.indexOf('if scheduler_secret_and_job; then');
   const install = sh.indexOf('node "$here/ensure-scheduler.mjs"');
   const opened = sh.indexOf(
@@ -354,6 +357,152 @@ test('restore docs run the scheduler from current main, in order', () => {
     assert.ok(next > at, marker);
     at = next;
   }
+});
+
+function replyingQuery({ firstExtensions, checks = 'f 42501 t t' }) {
+  let extensionReads = 0;
+  const calls = [];
+  const query = (call) => {
+    calls.push(call);
+    if (/revoke usage on schema net from public/i.test(call.sql)) {
+      return `${checks}\n`;
+    }
+    if (/pg_catalog\.pg_extension/.test(call.sql)) {
+      extensionReads += 1;
+      return lines(
+        extensionReads === 1 ? firstExtensions : ['pg_cron', 'pg_net'],
+      );
+    }
+    if (/pg_catalog\.pg_namespace/.test(call.sql)) {
+      return lines(['cron', 'net']);
+    }
+    return '';
+  };
+  return { query, calls };
+}
+
+function assertNetLock(calls) {
+  const acl = calls.filter((call) =>
+    /revoke usage on schema net from public/i.test(call.sql),
+  );
+  assert.equal(acl.length, 1);
+  const sql = acl[0].sql;
+  assert.ok(
+    sql.search(/grant usage on schema net/i) <
+      sql.search(/revoke usage on schema net from public/i),
+  );
+  assert.match(sql, /grant execute on all functions in schema net/i);
+  assert.match(sql, /grant all privileges on all tables in schema net/i);
+  assert.match(sql, /grant all privileges on all sequences in schema net/i);
+  assert.match(sql, /'postgres'/);
+  assert.match(sql, /'supabase_functions_admin'/);
+  assert.match(sql, /'supabase_admin'/);
+  assert.match(
+    sql,
+    /revoke all privileges on all tables in schema net from public/i,
+  );
+  assert.match(
+    sql,
+    /revoke all privileges on all sequences in schema net from public/i,
+  );
+  assert.doesNotMatch(sql, /revoke\s+[\s\S]*from\s+current_user/i);
+  assert.doesNotMatch(sql, /revoke\s+[\s\S]*from\s+postgres/i);
+  assert.match(sql, /net\.http_request_queue/);
+  assert.match(sql, /http_post/);
+  assert.match(sql, /has_schema_privilege\('backup_reader', 'net', 'usage'\)/);
+  assertUntouched(calls);
+}
+
+test('a fresh install locks net after creating both extensions', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const { query, calls } = replyingQuery({ firstExtensions: [] });
+  const result = ensureScheduler({ query, env: loopback });
+  assert.deepEqual(result.created, ['pg_cron', 'pg_net']);
+  const revokeAt = calls.findIndex((call) =>
+    /revoke usage on schema net from public/i.test(call.sql),
+  );
+  const createdNetAt = calls.findIndex((call) => call.sql === CREATE_PG_NET);
+  const schemaAt = calls.findIndex((call) => /pg_namespace/.test(call.sql));
+  assert.ok(
+    createdNetAt !== -1 && schemaAt > createdNetAt && revokeAt > schemaAt,
+  );
+  assertNetLock(calls);
+});
+
+test('an existing install with public grants locks net without creating extensions', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const { query, calls } = replyingQuery({
+    firstExtensions: ['pg_cron', 'pg_net'],
+  });
+  const result = ensureScheduler({ query, env: loopback });
+  assert.deepEqual(result.created, []);
+  assert.equal(
+    calls.some((call) => /create\s+extension/i.test(call.sql)),
+    false,
+  );
+  assertNetLock(calls);
+});
+
+test('a second run locks net again and creates nothing', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const first = replyingQuery({ firstExtensions: ['pg_cron', 'pg_net'] });
+  const second = replyingQuery({ firstExtensions: ['pg_cron', 'pg_net'] });
+  assert.deepEqual(
+    ensureScheduler({ query: first.query, env: loopback }).created,
+    [],
+  );
+  assert.deepEqual(
+    ensureScheduler({ query: second.query, env: loopback }).created,
+    [],
+  );
+  assertNetLock(first.calls);
+  assertNetLock(second.calls);
+});
+
+test('a missing owner privilege on net fails after the lock', async () => {
+  const { ensureScheduler } = await loadScheduler();
+  const { query, calls } = replyingQuery({
+    firstExtensions: ['pg_cron', 'pg_net'],
+    checks: 'f 42501 f t',
+  });
+  assert.throws(() => ensureScheduler({ query, env: loopback }), {
+    code: 'SCHEDULER_NET_ACL',
+    message: /database owner has no usage on schema net/,
+  });
+  assertNetLock(calls);
+});
+
+test('the CI round trip proves a reader dump after the scheduler lock', () => {
+  const sh = readFileSync(
+    new URL('./ci-roundtrip.sh', import.meta.url),
+    'utf8',
+  );
+  assert.doesNotMatch(sh, /ROLE_UNSAFE/);
+  assert.match(sh, /expect_denied "net\.http_request_queue" 42501 /);
+  const install = sh.indexOf('node "$here/ensure-scheduler.mjs"');
+  const dump = sh.indexOf('"$archives/scheduler"', install);
+  assert.ok(install !== -1 && dump > install);
+});
+
+test('restore docs say the scheduler removes public access to net', () => {
+  const backup = readFileSync(
+    new URL('../../docs/BACKUP.md', import.meta.url),
+    'utf8',
+  );
+  const section = backup.slice(
+    backup.indexOf('### Scheduler after the app is usable'),
+    backup.indexOf('\n## CI proof'),
+  );
+  assert.match(section, /revokes PUBLIC access to schema net/);
+  assert.match(section, /reinstalled/);
+  assert.match(section, /role check stays the tripwire/);
+  const runbook = readFileSync(
+    new URL('../../docs/RESTORE-RUNBOOK.md', import.meta.url),
+    'utf8',
+  );
+  const arabic = runbook.slice(runbook.indexOf('## 10.'));
+  assert.match(arabic, /PUBLIC/);
+  assert.match(arabic, /لو الامتداد اتثبّت تاني/);
 });
 
 test('the scheduler script never mentions vault, cron.schedule, or cron.job', async () => {

@@ -10,8 +10,10 @@ import {
 import { runPsql } from './psql.mjs';
 
 // Creates pg_cron and pg_net when they are missing, then checks that both
-// extension rows and the cron and net schemas exist. Run as the database
-// owner before secrets and before the job. Does not read or write job rows.
+// extension rows and the cron and net schemas exist. It then removes PUBLIC
+// access to schema net so the backup role cannot enter it, and checks the
+// owner can still use net. Run as the database owner before secrets and
+// before the job. Does not read or write job rows.
 
 const QUERY_CODE = 'SCHEDULER_QUERY_FAILED';
 
@@ -57,6 +59,110 @@ function assertReady({ extensions, schemas }) {
 }
 
 const VERIFIED_TLS = new Set(['verify-full', 'verify-ca']);
+
+// Grants explicit use to the owner and to the platform roles the extension
+// needs, then removes the PUBLIC grants. Re-running it is safe. The select
+// reports reader usage, the reader's SQLSTATE, owner usage, and owner execute.
+const NET_ACL_SQL = `
+do $net_acl$
+declare
+  role_name text;
+begin
+  execute format('grant usage on schema net to %I', current_user);
+  execute format('grant execute on all functions in schema net to %I', current_user);
+  execute format('grant all privileges on all tables in schema net to %I', current_user);
+  execute format('grant all privileges on all sequences in schema net to %I', current_user);
+  foreach role_name in array array['postgres', 'supabase_functions_admin', 'supabase_admin']
+  loop
+    if role_name is distinct from current_user
+       and exists (select 1 from pg_catalog.pg_roles where rolname = role_name) then
+      execute format('grant usage on schema net to %I', role_name);
+      execute format('grant execute on all functions in schema net to %I', role_name);
+      execute format('grant all privileges on all tables in schema net to %I', role_name);
+      execute format('grant all privileges on all sequences in schema net to %I', role_name);
+    end if;
+  end loop;
+  revoke usage on schema net from public;
+  revoke all privileges on all tables in schema net from public;
+  revoke all privileges on all sequences in schema net from public;
+end
+$net_acl$;
+
+create or replace function pg_temp.scheduler_net_reader_state()
+returns text
+language plpgsql
+as $fn$
+declare
+  state text;
+begin
+  begin
+    perform set_config('role', 'backup_reader', true);
+  exception
+    when others then
+      return 'set-role';
+  end;
+  begin
+    execute 'select 1 from net.http_request_queue limit 1';
+    perform set_config('role', 'none', true);
+    return 'allowed';
+  exception
+    when others then
+      state := sqlstate;
+      perform set_config('role', 'none', true);
+      return state;
+  end;
+end
+$fn$;
+
+select
+  case when facts.reader_usage then 't' else 'f' end
+  || ' ' || pg_temp.scheduler_net_reader_state()
+  || ' ' || case when facts.owner_usage then 't' else 'f' end
+  || ' ' || case when facts.owner_execute then 't' else 'f' end
+from (
+  select
+    has_schema_privilege('backup_reader', 'net', 'usage') as reader_usage,
+    has_schema_privilege(current_user, 'net', 'usage') as owner_usage,
+    exists (
+      select 1
+      from pg_catalog.pg_proc as p
+      join pg_catalog.pg_namespace as n on n.oid = p.pronamespace
+      where n.nspname = 'net'
+        and p.proname = 'http_post'
+        and has_function_privilege(current_user, p.oid, 'execute')
+    ) as owner_execute
+) as facts;
+`;
+
+function assertNetClosed(output) {
+  const line =
+    String(output ?? '')
+      .split(/\r?\n/)
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .at(-1) ?? '';
+  const [readerUsage, readerState, ownerUsage, ownerExecute] =
+    line.split(/\s+/);
+  const problems = [];
+  if (readerUsage !== 'f') {
+    problems.push('backup_reader can use schema net');
+  }
+  if (readerState !== '42501') {
+    problems.push('backup_reader was not refused on net.http_request_queue');
+  }
+  if (ownerUsage !== 't') {
+    problems.push('the database owner has no usage on schema net');
+  }
+  if (ownerExecute !== 't') {
+    problems.push('the database owner cannot execute net.http_post');
+  }
+  if (problems.length > 0) {
+    throw new BackupError(
+      'SCHEDULER_NET_ACL',
+      `net access is not safe: ${problems.join('; ')}`,
+    );
+  }
+}
 
 function clientDirectory(path) {
   try {
@@ -107,6 +213,7 @@ export function ensureScheduler({ query = runPsql, env = process.env } = {}) {
   const extensions = readNames(ask(EXTENSIONS_SQL));
   const schemas = readNames(ask(SCHEMAS_SQL));
   assertReady({ extensions, schemas });
+  assertNetClosed(ask(NET_ACL_SQL));
   return { created };
 }
 

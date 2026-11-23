@@ -150,16 +150,19 @@ export class BackupError extends Error {
   }
 }
 
-// Hosts named by a postgres URI in a connection variable. libpq uses that host
-// ahead of PGHOST when the value is a URI.
-function connectionUriHosts(value) {
-  const hosts = [];
-  const pattern =
-    /postgres(?:ql)?:\/\/(?:[^@/?#\s]*@)?(\[[^\]]+\]|[^:/?#\s]+)/gi;
-  for (const match of String(value ?? '').matchAll(pattern)) {
-    hosts.push(match[1]);
+// A URI or keyword conninfo can name another host, or a hostaddr, without the
+// first token showing it. The synthetic gate does not try to parse either form.
+function connectionDisablesDiagnostics(value) {
+  const text = String(value ?? '');
+  if (/postgres(?:ql)?:\/\//i.test(text)) {
+    return true;
   }
-  return hosts;
+  if (/hostaddr\s*=/i.test(text)) {
+    return true;
+  }
+  return /(?:^|[\s;])(?:host|port|dbname|user|password|sslmode|sslrootcert|sslcert|sslkey|options|application_name|requiressl|gssencmode|channel_binding|target_session_attrs)\s*=/i.test(
+    text,
+  );
 }
 
 // The synthetic gate is the address 127.0.0.1, not a hostname. "localhost"
@@ -176,8 +179,9 @@ function diagnosticHost(raw) {
 }
 
 // Server text may be printed only by the synthetic round trip. Every effective
-// host has to be 127.0.0.1: libpq prefers PGHOSTADDR over PGHOST, and a
-// service or a URI can name another host. An unset host is not accepted.
+// host has to be 127.0.0.1: libpq prefers PGHOSTADDR over PGHOST. A service, a
+// URI, a conninfo string, or any hostaddr parameter turns this off. An unset
+// host is not accepted.
 export function diagnosticsAllowed(env = process.env) {
   if (
     env.BACKUP_SYNTHETIC_DIAGNOSTICS !== '1' ||
@@ -196,10 +200,8 @@ export function diagnosticsAllowed(env = process.env) {
     return false;
   }
   for (const key of ['PGDATABASE', 'DATABASE_URL']) {
-    for (const host of connectionUriHosts(env[key])) {
-      if (!diagnosticHost(host)) {
-        return false;
-      }
+    if (connectionDisablesDiagnostics(env[key])) {
+      return false;
     }
   }
   if (env.PGSERVICE) {

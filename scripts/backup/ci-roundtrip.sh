@@ -574,7 +574,7 @@ run_full() {
     fail SCHEDULER_GATE "secret entry and job creation were allowed before ensure-scheduler"
   fi
   info "negative ok: secret entry and job creation are blocked before ensure-scheduler"
-  local scheduler_ready present net_rc=0 scoped
+  local scheduler_ready present scheduler_archive
   scheduler_ready=$(node_cli node "$here/ensure-scheduler.mjs") ||
     fail SCHEDULER_INSTALL "ensure-scheduler failed"
   printf '%s\n' "$scheduler_ready" | grep -F 'scheduler ready' >/dev/null ||
@@ -594,25 +594,15 @@ run_full() {
   [ "$present" = t ] || fail SCHEDULER_INSTALL "vault.secrets does not exist after ensure-scheduler"
   expect_denied "cron.job" 42501 "select 1 from cron.job limit 1"
   expect_denied "vault.secrets" 42501 "select 1 from vault.secrets limit 1"
-  # pg_net grants schema net and net.http_request_queue to PUBLIC, so this
-  # select is not 42501 on the current image. A denial, if one appears, must
-  # still be 42501. When the select is allowed, the role check refuses the dump.
-  reader_psql -c "select count(*) from net.http_request_queue" >/dev/null 2>"$work_dir/net.err" || net_rc=$?
-  if [ "$net_rc" -ne 0 ]; then
-    grep -Eq '(^|[^0-9A-Za-z])42501([^0-9A-Za-z]|$)' "$work_dir/net.err" ||
-      fail DENIAL_WRONG "net.http_request_queue: expected SQLSTATE 42501"
-    info "denied ok: net.http_request_queue"
-  else
-    info "net.http_request_queue is readable through the extension PUBLIC grants"
-    expect_fail "reader dump while net is readable" "[ROLE_UNSAFE]" \
-      env PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
-      "$here/dump.sh" "$neg_dir/scheduler-refused"
-  fi
-  scoped="$work_dir/reader-scoped.dump"
-  PGUSER=backup_reader PGPASSWORD="$reader_password" pg_dump \
-    --format=custom --schema=app --schema=ledger_scratch \
-    --file="$scoped" || fail SCHEDULER_DUMP "the schema-scoped reader dump failed"
-  pg_restore -l "$scoped" >"$work_dir/reader-scoped.list"
+  expect_denied "net.http_request_queue" 42501 "select 1 from net.http_request_queue limit 1"
+  step "stack A: dump as backup_reader after the scheduler extensions"
+  scheduler_archive=$(PGUSER=backup_reader PGPASSWORD="$reader_password" BACKUP_FORCE_ROLE_CHECK=1 \
+    "$here/dump.sh" "$archives/scheduler" 2>&3) ||
+    fail SCHEDULER_DUMP "the reader dump failed after ensure-scheduler"
+  [ -n "$scheduler_archive" ] || fail SCHEDULER_DUMP "the reader dump produced no archive"
+  mkdir -p "$work_dir/scheduler-list"
+  tar -xzf "$scheduler_archive" -C "$work_dir/scheduler-list" --no-same-owner db.dump
+  pg_restore -l "$work_dir/scheduler-list/db.dump" >"$work_dir/reader-scoped.list"
   if grep -E 'SCHEMA - (cron|net|vault)( |$)| (cron|net|vault) ' "$work_dir/reader-scoped.list"; then
     fail SCHEDULER_DUMP "the reader dump lists scheduler objects"
   fi

@@ -307,6 +307,40 @@ test('diagnostics stay off when any effective host is remote', () => {
   assert.equal(diagnosticsAllowed(base), true);
 });
 
+test('diagnostics stay off when a URI lists 127.0.0.1:5432 and then a remote host', () => {
+  const base = {
+    BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
+    BACKUP_ALLOW_LOOPBACK: '1',
+    PGHOST: '127.0.0.1',
+  };
+  assert.equal(
+    diagnosticsAllowed({
+      ...base,
+      PGDATABASE: 'postgresql://127.0.0.1:5432,db.example.com/postgres',
+    }),
+    false,
+  );
+  assert.equal(
+    diagnosticsAllowed({
+      ...base,
+      PGDATABASE: 'host=127.0.0.1:5432,db.example.com dbname=postgres',
+    }),
+    false,
+  );
+});
+
+test('diagnostics stay off when a URI has a remote hostaddr parameter', () => {
+  assert.equal(
+    diagnosticsAllowed({
+      BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
+      BACKUP_ALLOW_LOOPBACK: '1',
+      PGHOST: '127.0.0.1',
+      DATABASE_URL: 'postgresql://127.0.0.1/postgres?hostaddr=203.0.113.10',
+    }),
+    false,
+  );
+});
+
 test('internal error text is printed only for the synthetic loopback round trip', () => {
   const synthetic = {
     BACKUP_SYNTHETIC_DIAGNOSTICS: '1',
