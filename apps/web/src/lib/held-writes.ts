@@ -1760,8 +1760,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       ...(target ? { target } : {}),
     };
     const persisted = writeMarkerToStorage(marker, userId);
-    reloadMarkers.set(markerMapKey(subject, id), marker);
-    emit();
+    if (persisted) {
+      reloadMarkers.set(markerMapKey(subject, id), marker);
+      emit();
+    }
     return persisted;
   }
 

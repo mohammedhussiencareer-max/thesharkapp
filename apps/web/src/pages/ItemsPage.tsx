@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   createItem,
@@ -14,7 +14,6 @@ import {
 } from '@/items/expectation';
 import { sameEditor, type ItemEditor } from '@/items/editor';
 import {
-  ConfirmedRefusalError,
   CostingChangedError,
   costingChangedMessage,
   genericCatalogError,
@@ -34,25 +33,20 @@ import type { CatalogItem, ItemDraft, ItemSave } from '@/items/types';
 import { emptyItemForm, itemToFormValues } from '@/items/validation';
 import {
   abortClaimBeforeDispatch,
-  canDispatchHeldWrite,
   captureWriteSession,
-  claimFreshHeldWrite,
-  claimReplayHeldWrite,
-  clearHeldWrite,
   clearPostedReloadSnapshot,
   hasAnyReloadMarker,
-  hasDurableHeldWrite,
   hasPostedReloadForTarget,
-  listHeldWritesByPrefix,
-  setHeldWritePhase,
   setReloadMarker,
   snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
-  type HeldWriteRecord,
   type PostedReloadSnapshot,
 } from '@/lib/held-writes';
-import { isPayloadRefusal } from '@/lib/write-outcome';
+import {
+  createRequestlessReconciler,
+  type RequestlessPin,
+} from '@/lib/requestless-reconcile';
 import {
   isOnline,
   offlineMoneyMessage,
@@ -103,8 +97,12 @@ function itemMatchesDetailsIntent(
   );
 }
 
-function detailsPinKey(record: HeldWriteRecord): string {
-  return `${record.subject}:${record.requestId}`;
+function catalogMatchesDetailsIntent(
+  catalog: readonly CatalogItem[],
+  intent: StoredItemDetailsIntent,
+): boolean {
+  const fresh = catalog.find((row) => row.id === intent.itemId);
+  return fresh !== undefined && itemMatchesDetailsIntent(fresh, intent);
 }
 
 function snapshotItemsReloads(): PostedReloadSnapshot {
@@ -147,31 +145,37 @@ export function ItemsPage() {
   const [formIdentityDirty, setFormIdentityDirty] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [detailsNotice, setDetailsNotice] = useState<string | null>(null);
-  const [verifiedAbsentDetails, setVerifiedAbsentDetails] = useState<
-    ReadonlySet<string>
-  >(() => new Set());
+  const [detailsError, setDetailsError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   // A save landed and fresh rows are not applied yet: stay locked until a read applies them.
   const [localNeedsReload, setLocalNeedsReload] = useState(false);
   const [heldEpoch, setHeldEpoch] = useState(0);
+  const [reconcileEpoch, setReconcileEpoch] = useState(0);
+  const [detailsReconciler] = useState(() =>
+    createRequestlessReconciler<StoredItemDetailsIntent, CatalogItem[]>({
+      prefixes: [ITEM_DETAILS_PREFIX],
+      reloadSubject: ITEMS_RELOAD_SUBJECT,
+      isIntent: isStoredItemDetailsIntent,
+      targetOf: () => ITEMS_RELOAD_SUBJECT,
+      markerTargetOf: () => undefined,
+      matchesServerState: catalogMatchesDetailsIntent,
+      onChange: () => setReconcileEpoch((value) => value + 1),
+    }),
+  );
   // One page-wide lock: while an item save or a conversion operation (and the
   // reload after it) is in flight, nothing that edits data or remounts a panel
   // can start, so no editor or panel ever opens on stale data.
   const [catalogLoads, setCatalogLoads] = useState(0);
-  const unknownDetailsPins =
-    heldEpoch < 0
+  const recoverableDetailsPins =
+    heldEpoch < 0 || reconcileEpoch < 0
       ? []
-      : listHeldWritesByPrefix<StoredItemDetailsIntent>(
-          ITEM_DETAILS_PREFIX,
-        ).filter(
-          (record) =>
-            record.phase === 'unknown' &&
-            isStoredItemDetailsIntent(record.payload),
-        );
+      : detailsReconciler.listRecoverablePins();
   const postedReload =
     heldEpoch >= 0 &&
+    reconcileEpoch >= 0 &&
     (hasPostedReloadForTarget(ITEMS_RELOAD_SUBJECT) ||
-      hasAnyReloadMarker(ITEMS_RELOAD_SUBJECT));
+      hasAnyReloadMarker(ITEMS_RELOAD_SUBJECT) ||
+      detailsReconciler.hasAcknowledgedClaim());
   const needsReload = localNeedsReload || postedReload;
   const busy = saving || conversionsBusy || needsReload || catalogLoads > 0;
   const online = useReconnectReload(() => {
@@ -218,58 +222,49 @@ export function ItemsPage() {
     setFormMode(next);
   }
 
-  function reconcileUnknownDetails(catalog: readonly CatalogItem[]): {
-    reconciledSubjects: ReadonlySet<string>;
-  } {
-    const reconciled = new Set<string>();
-    const absentKeys: string[] = [];
-    const clearedKeys: string[] = [];
-    for (const record of listHeldWritesByPrefix<StoredItemDetailsIntent>(
-      ITEM_DETAILS_PREFIX,
-    )) {
-      if (
-        record.phase !== 'unknown' ||
-        !isStoredItemDetailsIntent(record.payload)
-      ) {
-        continue;
-      }
-      const key = detailsPinKey(record);
-      const fresh = catalog.find((row) => row.id === record.payload.itemId);
-      if (fresh && itemMatchesDetailsIntent(fresh, record.payload)) {
-        clearHeldWrite(record.subject, record.requestId);
-        reconciled.add(record.subject);
-        clearedKeys.push(key);
+  const applyDetailsRead = useCallback(
+    (
+      snapshot: ReturnType<typeof detailsReconciler.snapshotBeforeRead>,
+      catalog: CatalogItem[],
+    ) => {
+      const outcome = detailsReconciler.applyReadResult(
+        snapshot,
+        catalog,
+        ITEMS_RELOAD_SUBJECT,
+      );
+      if (outcome.reconciledSubjects.size > 0) {
+        setDetailsNotice('اتحفظت بيانات الصنف');
+        setDetailsError(null);
+        setFormError(null);
         const editing = formModeRef.current;
-        if (editing?.type === 'edit' && editing.id === fresh.id) {
-          expectedRef.current = expectationFromItem(fresh);
+        if (editing?.type === 'edit') {
+          const fresh = catalog.find((row) => row.id === editing.id);
+          if (fresh) {
+            expectedRef.current = expectationFromItem(fresh);
+          }
         }
-      } else {
-        absentKeys.push(key);
       }
-    }
-    if (reconciled.size > 0) {
-      setDetailsNotice('اتحفظت بيانات الصنف');
-      setFormError(null);
-    }
-    if (absentKeys.length > 0 || clearedKeys.length > 0) {
-      setVerifiedAbsentDetails((current) => {
-        const next = new Set(current);
-        for (const key of clearedKeys) next.delete(key);
-        for (const key of absentKeys) next.add(key);
-        return next;
-      });
-    }
-    return { reconciledSubjects: reconciled };
-  }
+      return outcome;
+    },
+    [detailsReconciler],
+  );
 
   async function reloadCatalog(staleItemId?: string) {
     const pendingReload = snapshotItemsReloads();
-    const next = await readCatalog();
+    const detailsSnap =
+      detailsReconciler.snapshotBeforeRead(ITEMS_RELOAD_SUBJECT);
+    let next: CatalogItem[] | null;
+    try {
+      next = await readCatalog();
+    } catch (error) {
+      detailsReconciler.applyReadFailure(detailsSnap);
+      throw error;
+    }
     if (!next) return;
     setItems(next);
     setLoadError(null);
     clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
-    reconcileUnknownDetails(next);
+    applyDetailsRead(detailsSnap, next);
     setLocalNeedsReload(false);
     const editing = formModeRef.current;
     if (staleItemId && editing?.type === 'edit' && editing.id === staleItemId) {
@@ -297,6 +292,8 @@ export function ItemsPage() {
   useEffect(() => {
     let cancelled = false;
     const pendingReload = snapshotItemsReloads();
+    const detailsSnap =
+      detailsReconciler.snapshotBeforeRead(ITEMS_RELOAD_SUBJECT);
     void (async () => {
       try {
         const next = await readCatalog();
@@ -304,9 +301,10 @@ export function ItemsPage() {
         setItems(next);
         setLoadError(null);
         clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
-        reconcileUnknownDetails(next);
+        applyDetailsRead(detailsSnap, next);
         setLocalNeedsReload(false);
       } catch (error) {
+        detailsReconciler.applyReadFailure(detailsSnap);
         if (cancelled) return;
         setLoadError(messageFrom(error));
       } finally {
@@ -316,7 +314,7 @@ export function ItemsPage() {
     return () => {
       cancelled = true;
     };
-  }, [loadId]);
+  }, [loadId, applyDetailsRead, detailsReconciler]);
 
   function retry() {
     if (saving || conversionsBusy || catalogLoadsRef.current > 0) return;
@@ -350,6 +348,7 @@ export function ItemsPage() {
     let detailsClaim: {
       subject: string;
       requestId: string;
+      attempt: number;
       intent: StoredItemDetailsIntent;
       release: () => void;
     } | null = null;
@@ -377,51 +376,39 @@ export function ItemsPage() {
           expected,
         };
         const session = captureWriteSession();
-        const claim = await claimFreshHeldWrite<StoredItemDetailsIntent>(
+        const claimed = await detailsReconciler.claimFresh(
           detailsSubject,
-          () => intent,
-          {
-            kind: 'item_details',
-            session,
-          },
+          'item_details',
+          intent,
+          session,
         );
-        if (!claim.ok) {
-          if (claim.reason === 'storage' || claim.reason === 'missing') {
+        if (!claimed.ok) {
+          if (claimed.reason === 'storage' || claimed.reason === 'missing') {
             setFormError(storageWriteFailedMessage);
-          } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          } else if (claimed.reason === 'session_invalid' && !isOnline()) {
             setFormError(offlineWriteMessage);
           }
           return false;
         }
-        let released = false;
-        const releaseOnce = () => {
-          if (!released) {
-            released = true;
-            claim.release();
-          }
-        };
-        if (
-          !canDispatchHeldWrite(detailsSubject, claim.record.requestId, session)
-        ) {
-          const missingPin = !hasDurableHeldWrite(
-            detailsSubject,
-            claim.record.requestId,
-          );
-          abortClaimBeforeDispatch(
-            detailsSubject,
-            claim.record.requestId,
-            null,
-            releaseOnce,
-          );
+        const dispatchCheck = detailsReconciler.verifyCanDispatchOrAbort(
+          detailsSubject,
+          claimed.requestId,
+          null,
+          session,
+          claimed.releaseOnce,
+        );
+        if (!dispatchCheck.ok) {
           if (!isOnline()) setFormError(offlineWriteMessage);
-          else if (missingPin) setFormError(storageWriteFailedMessage);
+          else if (dispatchCheck.missingPin)
+            setFormError(storageWriteFailedMessage);
           return false;
         }
         detailsClaim = {
           subject: detailsSubject,
-          requestId: claim.record.requestId,
+          requestId: claimed.requestId,
+          attempt: claimed.attempt,
           intent,
-          release: releaseOnce,
+          release: claimed.releaseOnce,
         };
       }
       if (action.kind === 'create') {
@@ -453,15 +440,12 @@ export function ItemsPage() {
         );
         expectedRef.current = expectationFromDraft(detailsClaim.intent.draft);
         saved = true;
-        if (
-          setReloadMarker(
-            ITEMS_RELOAD_SUBJECT,
-            undefined,
-            detailsClaim.requestId,
-          )
-        ) {
-          clearHeldWrite(detailsClaim.subject, detailsClaim.requestId);
-        }
+        detailsReconciler.markAcknowledged(
+          detailsClaim.subject,
+          detailsClaim.requestId,
+          detailsClaim.intent,
+          detailsClaim.attempt,
+        );
         detailsClaim.release();
         detailsClaim = null;
       } else if (action.kind === 'loss') {
@@ -494,47 +478,70 @@ export function ItemsPage() {
         setEditor(null);
       }
       const pendingReload = snapshotItemsReloads();
-      const next = await readCatalog();
+      const detailsSnap =
+        detailsReconciler.snapshotBeforeRead(ITEMS_RELOAD_SUBJECT);
+      let next: CatalogItem[] | null;
+      try {
+        next = await readCatalog();
+      } catch (readError) {
+        detailsReconciler.applyReadFailure(detailsSnap);
+        throw readError;
+      }
       if (next) {
         setItems(next);
         setLoadError(null);
         clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
-        reconcileUnknownDetails(next);
+        applyDetailsRead(detailsSnap, next);
         setLocalNeedsReload(false);
       }
     } catch (error) {
       if (!saved && detailsClaim) {
-        const definiteRefusal =
-          error instanceof StaleWriteError ||
-          error instanceof ConfirmedRefusalError ||
-          isPayloadRefusal(error);
-        if (definiteRefusal) {
-          clearHeldWrite(detailsClaim.subject, detailsClaim.requestId);
-        } else {
-          // Ambiguous outcome: keep the pin in `unknown` and verify via a
-          // targeted read before ever clearing or offering retry.
-          setHeldWritePhase(
-            detailsClaim.subject,
-            detailsClaim.requestId,
-            'unknown',
-          );
-          const pendingSubject = detailsClaim.subject;
-          detailsClaim.release();
-          detailsClaim = null;
-          try {
-            const fresh = await readCatalog();
-            if (fresh) {
-              setItems(fresh);
-              setLoadError(null);
-              const { reconciledSubjects } = reconcileUnknownDetails(fresh);
-              if (reconciledSubjects.has(pendingSubject)) {
-                return true;
+        const activeClaim = detailsClaim;
+        detailsClaim = null;
+        const outcome = await detailsReconciler.settleFailure({
+          subject: activeClaim.subject,
+          requestId: activeClaim.requestId,
+          target: ITEMS_RELOAD_SUBJECT,
+          error,
+          releaseOnce: activeClaim.release,
+          readState: () => readCatalog(),
+          onReadData: (fresh) => {
+            setItems(fresh);
+            setLoadError(null);
+            const editing = formModeRef.current;
+            if (
+              editing?.type === 'edit' &&
+              editing.id === activeClaim.intent.itemId
+            ) {
+              const row = fresh.find(
+                (entry) => entry.id === activeClaim.intent.itemId,
+              );
+              if (row) {
+                expectedRef.current = expectationFromItem(row);
               }
             }
-          } catch {
-            // Keep pin in `unknown` until a later targeted read succeeds.
-          }
+          },
+          loadedTargetOf: () => ITEMS_RELOAD_SUBJECT,
+        });
+        if (outcome.status === 'reconciled_saved') {
+          setDetailsNotice('اتحفظت بيانات الصنف');
+          setFormError(null);
+          return true;
         }
+        if (outcome.status === 'stale_conflict') {
+          if (
+            started.type === 'edit' &&
+            sameEditor(formModeRef.current, started)
+          ) {
+            setFormEpoch((value) => value + 1);
+            setFormError(staleWriteMessage);
+          }
+          throw error;
+        }
+        if (sameEditor(formModeRef.current, started)) {
+          setFormError(messageFrom(error));
+        }
+        throw error;
       }
       if (
         !saved &&
@@ -567,96 +574,112 @@ export function ItemsPage() {
   }
 
   async function retryUnknownDetails(
-    record: HeldWriteRecord<StoredItemDetailsIntent>,
+    pin: RequestlessPin<StoredItemDetailsIntent>,
   ): Promise<void> {
     if (busy || catalogLoadsRef.current > 0 || !isOnline()) return;
     const session = captureWriteSession();
     setSaving(true);
     setFormError(null);
     setDetailsNotice(null);
+    setDetailsError(null);
     let releaseOnce = () => {};
     let saved = false;
     try {
-      const claim = await claimReplayHeldWrite<StoredItemDetailsIntent>(
-        record.subject,
-        record.requestId,
-        { session },
-      );
-      if (!claim.ok) {
-        if (claim.reason === 'storage' || claim.reason === 'missing') {
+      const claimed = await detailsReconciler.claimReplay(pin, session);
+      if (!claimed.ok) {
+        if (claimed.reason === 'storage' || claimed.reason === 'missing') {
+          setDetailsError(storageWriteFailedMessage);
           setFormError(storageWriteFailedMessage);
-        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        } else if (claimed.reason === 'session_invalid' && !isOnline()) {
+          setDetailsError(offlineWriteMessage);
           setFormError(offlineWriteMessage);
         }
         return;
       }
-      let released = false;
-      releaseOnce = () => {
-        if (!released) {
-          released = true;
-          claim.release();
+      releaseOnce = claimed.releaseOnce;
+      const dispatchCheck = detailsReconciler.verifyCanDispatchOrAbort(
+        pin.subject,
+        claimed.requestId,
+        'unknown',
+        session,
+        releaseOnce,
+      );
+      if (!dispatchCheck.ok) {
+        if (!isOnline()) {
+          setDetailsError(offlineWriteMessage);
+          setFormError(offlineWriteMessage);
+        } else if (dispatchCheck.missingPin) {
+          setDetailsError(storageWriteFailedMessage);
+          setFormError(storageWriteFailedMessage);
         }
-      };
-      if (!canDispatchHeldWrite(record.subject, record.requestId, session)) {
-        const missingPin = !hasDurableHeldWrite(
-          record.subject,
-          record.requestId,
-        );
-        abortClaimBeforeDispatch(
-          record.subject,
-          record.requestId,
-          'unknown',
-          releaseOnce,
-        );
-        if (!isOnline()) setFormError(offlineWriteMessage);
-        else if (missingPin) setFormError(storageWriteFailedMessage);
         return;
       }
-      const intent = claim.record.payload;
-      await updateItem(intent.itemId, intent.draft, intent.expected);
+      await updateItem(
+        claimed.intent.itemId,
+        claimed.intent.draft,
+        claimed.intent.expected,
+      );
       saved = true;
-      if (setReloadMarker(ITEMS_RELOAD_SUBJECT, undefined, record.requestId)) {
-        clearHeldWrite(record.subject, record.requestId);
-      }
+      detailsReconciler.markAcknowledged(
+        pin.subject,
+        claimed.requestId,
+        claimed.intent,
+        claimed.attempt,
+      );
       releaseOnce();
       setLocalNeedsReload(true);
       const pendingReload = snapshotItemsReloads();
-      const next = await readCatalog();
+      const detailsSnap =
+        detailsReconciler.snapshotBeforeRead(ITEMS_RELOAD_SUBJECT);
+      let next: CatalogItem[] | null;
+      try {
+        next = await readCatalog();
+      } catch (readError) {
+        detailsReconciler.applyReadFailure(detailsSnap);
+        throw readError;
+      }
       if (next) {
         setItems(next);
         setLoadError(null);
         clearPostedReloadSnapshot(pendingReload, ITEMS_RELOAD_SUBJECT);
-        reconcileUnknownDetails(next);
+        applyDetailsRead(detailsSnap, next);
         setLocalNeedsReload(false);
       }
       setDetailsNotice('اتحفظت بيانات الصنف');
     } catch (error) {
       if (!saved) {
-        const definiteRefusal =
-          error instanceof StaleWriteError ||
-          error instanceof ConfirmedRefusalError ||
-          isPayloadRefusal(error);
-        if (definiteRefusal) {
-          clearHeldWrite(record.subject, record.requestId);
-          setFormError(
-            error instanceof StaleWriteError
-              ? staleWriteMessage
-              : messageFrom(error),
-          );
-        } else {
-          setHeldWritePhase(record.subject, record.requestId, 'unknown');
-          releaseOnce();
-          try {
-            const fresh = await readCatalog();
-            if (fresh) {
-              setItems(fresh);
-              setLoadError(null);
-              reconcileUnknownDetails(fresh);
+        const outcome = await detailsReconciler.settleFailure({
+          subject: pin.subject,
+          requestId: pin.requestId,
+          target: ITEMS_RELOAD_SUBJECT,
+          error,
+          releaseOnce,
+          readState: () => readCatalog(),
+          onReadData: (fresh) => {
+            setItems(fresh);
+            setLoadError(null);
+            const editing = formModeRef.current;
+            if (editing?.type === 'edit' && editing.id === pin.intent.itemId) {
+              const row = fresh.find((entry) => entry.id === pin.intent.itemId);
+              if (row) {
+                expectedRef.current = expectationFromItem(row);
+                setFormEpoch((value) => value + 1);
+              }
             }
-          } catch {
-            // Keep unknown until targeted read succeeds.
-          }
-          setFormError(messageFrom(error));
+          },
+          loadedTargetOf: () => ITEMS_RELOAD_SUBJECT,
+        });
+        if (outcome.status === 'reconciled_saved') {
+          setDetailsNotice('اتحفظت بيانات الصنف');
+          setDetailsError(null);
+          setFormError(null);
+        } else if (outcome.status === 'stale_conflict') {
+          setDetailsError(staleWriteMessage);
+          setFormError(staleWriteMessage);
+        } else {
+          const message = messageFrom(error);
+          setDetailsError(message);
+          setFormError(message);
         }
       } else {
         setLocalNeedsReload(true);
@@ -690,20 +713,22 @@ export function ItemsPage() {
         </>
       ) : null}
       {detailsNotice ? <p role="status">{detailsNotice}</p> : null}
-      {unknownDetailsPins.length > 0 ? (
+      {detailsError ? <p role="alert">{detailsError}</p> : null}
+      {recoverableDetailsPins.length > 0 ? (
         <section
           aria-label="تعديلات أصناف مش متأكد إنها اتسجلت"
           className="flex flex-col gap-2 rounded border border-neutral-300 p-3"
         >
-          {unknownDetailsPins.map((pin) => {
-            const absent = verifiedAbsentDetails.has(detailsPinKey(pin));
+          {recoverableDetailsPins.map((pin) => {
+            const replayReady = detailsReconciler.canReplay(pin);
             return (
               <div key={pin.subject} className="flex flex-col gap-2">
                 <p role="status">
-                  تعديل الصنف «{pin.payload.draft.name.trim()}» مش متأكد إنه
-                  اتسجل
+                  {pin.acknowledged
+                    ? `تعديل الصنف «${pin.intent.draft.name.trim()}» اتحفظ وجاري التحقق من التحديث`
+                    : `تعديل الصنف «${pin.intent.draft.name.trim()}» مش متأكد إنه اتسجل`}
                 </p>
-                {absent ? (
+                {replayReady ? (
                   <button
                     className={secondaryButton}
                     type="button"

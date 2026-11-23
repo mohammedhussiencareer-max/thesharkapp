@@ -197,22 +197,25 @@ describe('P7-3 round-6 review fixes', () => {
     setReloadMarker('expense:reload', '2026-01-01');
     expect(hasReloadMarker('expense:reload', '2026-01-01')).toBe(true);
 
-    // Owner opens ExpensesPage on February (2026-02) and confirms February; February's read succeeds.
-    vi.mocked(loadExpenseMonth).mockImplementation((monthStart) =>
-      Promise.resolve(
-        expenseMonth(monthStart, { complete: monthStart === '2026-02-01' }),
-      ),
-    );
-    // Switch to February by setting another month marker directly and confirming via ExpensesPage.
-    const currentMonthStart = `${cairoMonthInput()}-01`;
-    vi.mocked(loadExpenseMonth).mockResolvedValueOnce(
-      expenseMonth(currentMonthStart, { complete: false }),
-    );
-    vi.mocked(loadExpenseMonth).mockResolvedValueOnce(
-      expenseMonth('2026-02-01', { complete: false }),
-    );
-    vi.mocked(loadExpenseMonth).mockResolvedValueOnce(
-      expenseMonth('2026-02-01', { complete: true }),
+    let febComplete = false;
+    vi.mocked(loadExpenseMonth).mockImplementation((monthStart) => {
+      if (monthStart === '2026-01-01') {
+        return Promise.reject(new Error('january reload still failing'));
+      }
+      if (monthStart === '2026-02-01') {
+        return Promise.resolve(
+          expenseMonth('2026-02-01', { complete: febComplete }),
+        );
+      }
+      return Promise.resolve(expenseMonth(monthStart, { complete: false }));
+    });
+    vi.mocked(setMonthExpenseComplete).mockImplementation(
+      (monthStart, next) => {
+        if (monthStart === '2026-02-01') {
+          febComplete = next;
+        }
+        return Promise.resolve();
+      },
     );
 
     render(
@@ -228,13 +231,27 @@ describe('P7-3 round-6 review fixes', () => {
       expect(loadExpenseMonth).toHaveBeenCalledWith('2026-02-01');
     });
 
-    // Directly test two independent posted markers: Jan (2026-01-01) and Feb (2026-02-01).
-    setReloadMarker('expense:reload', '2026-02-01');
-    expect(hasReloadMarker('expense:reload', '2026-01-01')).toBe(true);
-    expect(hasReloadMarker('expense:reload', '2026-02-01')).toBe(true);
+    // Drive the REAL February confirmation via the checkbox and its following read.
+    const checkbox = screen.getByRole('checkbox', {
+      name: 'مصاريف الشهر كاملة',
+    });
+    await waitFor(() => {
+      expect(checkbox).toBeEnabled();
+    });
+    fireEvent.click(checkbox);
 
-    // Reading February clears ONLY February's marker; January's marker MUST remain!
+    await waitFor(() => {
+      expect(setMonthExpenseComplete).toHaveBeenCalledWith('2026-02-01', true);
+    });
+    await waitFor(() => {
+      expect(
+        screen.getByRole('checkbox', { name: 'مصاريف الشهر كاملة' }),
+      ).toBeChecked();
+    });
+
+    // February's marker cleared after February's read succeeded, while January's marker REMAINS!
     rehydrateHeldWrites();
+    expect(hasReloadMarker('expense:reload', '2026-02-01')).toBe(false);
     expect(hasReloadMarker('expense:reload', '2026-01-01')).toBe(true);
   });
 

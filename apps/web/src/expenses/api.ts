@@ -34,8 +34,20 @@ function appDb() {
   return supabase.schema('app');
 }
 
-function throwIfError(error: { message?: string } | null): void {
-  if (error) throw new Error(mapExpenseError(error));
+function throwIfError(
+  error: {
+    code?: string;
+    message?: string;
+    details?: string | null;
+    hint?: string | null;
+  } | null,
+): void {
+  if (!error) return;
+  const mapped = new Error(mapExpenseError(error), { cause: error });
+  if (typeof error.code === 'string' && error.code.trim() !== '') {
+    Object.assign(mapped, { code: error.code.trim() });
+  }
+  throw mapped;
 }
 
 async function readPages<T extends object>(

@@ -1,4 +1,5 @@
 import {
+  ConfirmedRefusalError,
   CostingChangedError,
   genericCatalogError,
   mapCatalogError,
@@ -288,6 +289,9 @@ export async function updateItem(
       ? matched.is('parent_item_id', null)
       : matched.eq('parent_item_id', expected.parentItemId);
   const { data, error } = await filtered.select('id');
+  if (error?.code === '23505') {
+    throw new ConfirmedRefusalError(mapCatalogError(error));
+  }
   throwIfError(error);
   if (!data || data.length === 0) throw new StaleWriteError();
 }
