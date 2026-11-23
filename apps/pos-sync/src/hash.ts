@@ -65,9 +65,12 @@ function hashBody(order: StoredOrder): unknown {
   };
 }
 
+/** SHA-256 of any value serialized with canonical sorted object keys. */
+export function sha256Canonical(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex');
+}
+
 /** SHA-256 of the stored accounting shape. Update time is compared separately. */
 export function contentHash(order: StoredOrder): string {
-  return createHash('sha256')
-    .update(canonicalJson(hashBody(order)))
-    .digest('hex');
+  return sha256Canonical(hashBody(order));
 }

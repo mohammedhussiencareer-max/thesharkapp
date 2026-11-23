@@ -235,6 +235,25 @@ describe('mapOrderDocument', () => {
       }),
     ).toThrow(/unexpected status/);
   });
+
+  it('keeps a 24:00:00 order timestamp in the legacy normalized form', () => {
+    const order = mapOrderDocument({
+      name: `${NAME_PREFIX}/orders/order-test-24`,
+      updateTime: '2026-10-15T24:00:00Z',
+      fields: {
+        status: str('complete'),
+        shiftId: str('shift-test-1'),
+        timestamp: ts('2026-10-15T24:00:00Z'),
+        subtotalAmount: dbl(10),
+        discountAmount: dbl(0),
+        taxTotalAmount: dbl(0),
+        serviceTaxAmount: dbl(0),
+        totalAmount: dbl(10),
+      },
+    });
+    expect(order.ordered_at).toBe('2026-10-15T24:00:00.000000Z');
+    expect(order.pos_update_time).toBe('2026-10-15T24:00:00.000000Z');
+  });
 });
 
 describe('mapShiftDocument', () => {
@@ -286,6 +305,21 @@ describe('mapShiftDocument', () => {
     expect(shift.drawer_credit).toBe('20.00');
     expect(JSON.stringify(shift)).not.toContain('difference');
     expect(JSON.stringify(shift)).not.toContain('-12.34');
+  });
+
+  it('keeps a 24:00:00 shift timestamp in the legacy normalized form', () => {
+    const shift = mapShiftDocument({
+      name: `${NAME_PREFIX}/custody_shifts/shift-test-24`,
+      updateTime: '2026-10-15T24:00:00Z',
+      fields: {
+        opening_time: ts('2026-10-15T24:00:00Z'),
+        closingTime: ts('2026-10-16T24:00:00Z'),
+        isActive: bool(false),
+      },
+    });
+    expect(shift.opened_at).toBe('2026-10-15T24:00:00.000000Z');
+    expect(shift.closed_at).toBe('2026-10-16T24:00:00.000000Z');
+    expect(shift.pos_update_time).toBe('2026-10-15T24:00:00.000000Z');
   });
 
   it('rejects a shift id that does not match the document', () => {

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { decodeFirestoreValue, splitDocumentName } from './decode.ts';
+import {
+  decodeFirestoreValue,
+  isSafeDocumentId,
+  splitDocumentName,
+} from './decode.ts';
 
 describe('decodeFirestoreValue', () => {
   it('decodes the REST value types', () => {
@@ -41,12 +45,22 @@ describe('decodeFirestoreValue', () => {
 });
 
 describe('splitDocumentName', () => {
-  it('reads an order id from the document name', () => {
+  it('reads an order, item, or optionGroup id from the document name', () => {
     expect(
       splitDocumentName(
         'projects/thesharkrestaurant/databases/(default)/documents/orders/order-test-1',
       ),
     ).toEqual({ collection: 'orders', id: 'order-test-1' });
+    expect(
+      splitDocumentName(
+        'projects/thesharkrestaurant/databases/(default)/documents/items/item-test-1',
+      ),
+    ).toEqual({ collection: 'items', id: 'item-test-1' });
+    expect(
+      splitDocumentName(
+        'projects/thesharkrestaurant/databases/(default)/documents/optionGroups/group-test-1',
+      ),
+    ).toEqual({ collection: 'optionGroups', id: 'group-test-1' });
   });
 
   it('rejects other projects and subcollections', () => {
@@ -65,5 +79,26 @@ describe('splitDocumentName', () => {
         'projects/thesharkrestaurant/databases/(default)/documents/customers/a',
       ),
     ).toThrow(/invalid/);
+    expect(isSafeDocumentId('order\u0001compat')).toBe(true);
+    expect(
+      splitDocumentName(
+        'projects/thesharkrestaurant/databases/(default)/documents/orders/order\u0001compat',
+      ),
+    ).toEqual({ collection: 'orders', id: 'order\u0001compat' });
+  });
+
+  it('rejects C0, DEL, and C1 Unicode control characters in catalog document ids', () => {
+    for (const control of ['\u0000', '\u0001', '\u007f', '\u0085']) {
+      expect(() =>
+        splitDocumentName(
+          `projects/thesharkrestaurant/databases/(default)/documents/items/item${control}id`,
+        ),
+      ).toThrow(/invalid/);
+      expect(() =>
+        splitDocumentName(
+          `projects/thesharkrestaurant/databases/(default)/documents/optionGroups/group${control}id`,
+        ),
+      ).toThrow(/invalid/);
+    }
   });
 });
