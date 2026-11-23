@@ -813,6 +813,12 @@ describe('parseCatalog fixtures', () => {
           'categoryId',
           pipelineItemScalarReads,
         ),
+        syntheticLocation: traceScalar(
+          'geoPointValue',
+          { latitude: 0, longitude: 0 },
+          'syntheticLocation',
+          pipelineItemScalarReads,
+        ),
         description: traceScalar(
           'stringValue',
           'desc-drop',

@@ -29,6 +29,7 @@ const FIRESTORE_SCALAR_VALUE_KEYS = new Set([
   'stringValue',
   'bytesValue',
   'referenceValue',
+  'geoPointValue',
 ]);
 
 export type CatalogCollection = 'items' | 'optionGroups';
