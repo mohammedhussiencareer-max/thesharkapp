@@ -388,9 +388,18 @@ export function CountsPage() {
   ): Promise<boolean> {
     if (result.status === 'waiting_for_sync') {
       if (daily && requestId === daily.requestId) {
-        setHeldWritePhase(COUNT_DAILY_SUBJECT, requestId, 'waiting_for_sync', {
-          expected: daily,
-        });
+        try {
+          setHeldWritePhase(
+            COUNT_DAILY_SUBJECT,
+            requestId,
+            'waiting_for_sync',
+            {
+              expected: daily,
+            },
+          );
+        } catch (error) {
+          setServerError(messageFrom(error));
+        }
       }
       if (storedSubject && stored && requestId === stored.requestId) {
         try {
@@ -402,7 +411,7 @@ export function CountsPage() {
               expected: stored,
             });
           } catch {
-            // Keep the card error visible; any durable inflight pin stays recoverable on reload.
+            // Keep the card error visible; in-tab wait acknowledgement stays bound to this claim.
           }
         }
       }

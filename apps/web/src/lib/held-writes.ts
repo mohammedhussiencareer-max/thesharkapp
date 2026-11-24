@@ -352,6 +352,11 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     string,
     { record: HeldWriteRecord; requestId: string; readTarget?: string }
   >();
+  // Tracks confirmed `waiting_for_sync` replies whose durable phase update
+  // failed (on lookup or storage write), bound to the exact claimed `inflight`
+  // record so cross-tab storage syncs preserve the wait phase without masking
+  // a different claim or posted outcome.
+  const acknowledgedWait = new Map<string, HeldWriteRecord>();
   const activeLockReleases = new Map<string, () => void>();
   let liveClaimCount = 0;
   const listeners = new Set<() => void>();
@@ -687,18 +692,86 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       }
       const promoted: HeldWriteRecord = { ...stored, phase: 'unknown' };
       if (!writeRecordToStorage(promoted, userId)) return false;
-      records.set(subject, promoted);
+      const ackWait = acknowledgedWait.get(subject);
+      if (ackWait && sameAcknowledgedClaim(promoted, ackWait)) {
+        records.set(subject, toAcknowledgedWaitRecord(promoted));
+      } else {
+        if (ackWait) acknowledgedWait.delete(subject);
+        records.set(subject, promoted);
+      }
       return true;
     } catch {
       return false;
     }
   }
 
+  function toAcknowledgedWaitRecord(record: HeldWriteRecord): HeldWriteRecord {
+    const next: HeldWriteRecord = {
+      ...record,
+      phase: 'waiting_for_sync',
+    };
+    delete next.readTarget;
+    delete next.awaitingReviewReload;
+    return next;
+  }
+
   function observePostedCopy(posted: HeldWriteRecord): void {
     if (records.get(posted.subject)?.requestId === posted.requestId) {
       records.delete(posted.subject);
     }
+    if (acknowledgedWait.get(posted.subject)?.requestId === posted.requestId) {
+      acknowledgedWait.delete(posted.subject);
+    }
+    const alias = countAliasSubject(posted.subject, posted.requestId);
+    if (alias && acknowledgedWait.get(alias)?.requestId === posted.requestId) {
+      acknowledgedWait.delete(alias);
+    }
     postedReloads.set(postedMapKey(posted.subject, posted.requestId), posted);
+  }
+
+  function reconcileAcknowledgedWait(userId: string, projectUrl: string): void {
+    for (const [subject, ackWait] of [...acknowledgedWait.entries()]) {
+      const mapKey = postedMapKey(subject, ackWait.requestId);
+      const alias = countAliasSubject(subject, ackWait.requestId);
+      if (
+        postedReloads.has(mapKey) ||
+        (alias !== null &&
+          postedReloads.has(postedMapKey(alias, ackWait.requestId))) ||
+        acknowledgedInflight.get(subject)?.requestId === ackWait.requestId
+      ) {
+        acknowledgedWait.delete(subject);
+        if (records.get(subject)?.requestId === ackWait.requestId) {
+          records.delete(subject);
+        }
+        continue;
+      }
+      const loaded = records.get(subject);
+      if (loaded) {
+        if (sameAcknowledgedClaim(loaded, ackWait)) {
+          records.set(subject, toAcknowledgedWaitRecord(loaded));
+        } else {
+          acknowledgedWait.delete(subject);
+        }
+        continue;
+      }
+      const direct = strictReadItem(
+        entryStorageKey(subject, userId, projectUrl),
+      );
+      if (!direct.ok) {
+        records.set(subject, toAcknowledgedWaitRecord(ackWait));
+        continue;
+      }
+      if (direct.value === null) {
+        acknowledgedWait.delete(subject);
+        continue;
+      }
+      const parsed = parseRecord(direct.value);
+      if (parsed && sameAcknowledgedClaim(parsed, ackWait)) {
+        records.set(subject, toAcknowledgedWaitRecord(parsed));
+      } else {
+        acknowledgedWait.delete(subject);
+      }
+    }
   }
 
   function loadScopeFromStorage(
@@ -777,6 +850,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         // Keep the active record locked when the companion lookup is unreadable.
       }
     }
+
+    reconcileAcknowledgedWait(userId, projectUrl);
 
     // Discard legacy reload markers written by earlier builds for this user scope.
     for (const key of safeListKeys(
@@ -918,6 +993,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       cancelPendingPromotions();
       if (records.size > 0) records.clear();
       if (postedReloads.size > 0) postedReloads.clear();
+      if (acknowledgedWait.size > 0) acknowledgedWait.clear();
       hydratedScopeKey = null;
       return;
     }
@@ -925,6 +1001,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const scopeKey = userStoragePrefix(userId, projectUrl);
     if (hydratedScopeKey === scopeKey) return;
     cancelPendingPromotions();
+    acknowledgedWait.clear();
     const runId = hydrationRunId;
     hydratedScopeKey = scopeKey;
     const locksAvailable = getLocks() !== null;
@@ -999,10 +1076,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       const had =
         records.size > 0 ||
         postedReloads.size > 0 ||
-        acknowledgedInflight.size > 0;
+        acknowledgedInflight.size > 0 ||
+        acknowledgedWait.size > 0;
       records.clear();
       postedReloads.clear();
       acknowledgedInflight.clear();
+      acknowledgedWait.clear();
       if (had) emit();
     }
   }
@@ -1043,10 +1122,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       const had =
         records.size > 0 ||
         postedReloads.size > 0 ||
-        acknowledgedInflight.size > 0;
+        acknowledgedInflight.size > 0 ||
+        acknowledgedWait.size > 0;
       records.clear();
       postedReloads.clear();
       acknowledgedInflight.clear();
+      acknowledgedWait.clear();
       if (had) emit();
       return;
     }
@@ -1137,11 +1218,13 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       getProjectUrl() === projectUrl &&
       (records.size > 0 ||
         postedReloads.size > 0 ||
-        acknowledgedInflight.size > 0)
+        acknowledgedInflight.size > 0 ||
+        acknowledgedWait.size > 0)
     ) {
       records.clear();
       postedReloads.clear();
       acknowledgedInflight.clear();
+      acknowledgedWait.clear();
       emit();
     }
   }
@@ -1152,6 +1235,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     records.clear();
     postedReloads.clear();
     acknowledgedInflight.clear();
+    acknowledgedWait.clear();
     ensureHydrated();
     emit();
   }
@@ -1203,7 +1287,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     if (
       records.size > 0 ||
       postedReloads.size > 0 ||
-      acknowledgedInflight.size > 0
+      acknowledgedInflight.size > 0 ||
+      acknowledgedWait.size > 0
     ) {
       return true;
     }
@@ -1346,6 +1431,18 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
             },
           };
         }
+        const ackWait = acknowledgedWait.get(subject);
+        if (ackWait) {
+          if (sameAcknowledgedClaim(stored, ackWait)) {
+            const waitRecord = toAcknowledgedWaitRecord(
+              preservePayloadIdentity(subject, stored),
+            );
+            records.set(subject, waitRecord);
+            emit();
+            return { ok: false, reason: 'conflict', existing: waitRecord };
+          }
+          acknowledgedWait.delete(subject);
+        }
         const preserved = preservePayloadIdentity(subject, stored);
         if (isUnresolvedPhase(stored.phase)) records.set(subject, preserved);
         emit();
@@ -1365,6 +1462,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (!writeRecordToStorage(next, userId)) {
         return { ok: false, reason: 'storage' };
       }
+      acknowledgedWait.delete(subject);
       records.set(subject, next);
       const release = wrapClaimRelease(lock.release);
       emit();
@@ -1406,6 +1504,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const userId = session.userId;
     const key = entryStorageKey(subject, userId);
     const expected = records.get(subject);
+    const initialAckWait = acknowledgedWait.get(subject);
     const lock = await acquireSubjectLock(subjectLockKey(subject, userId));
     if (!lock.acquired) {
       return { ok: false, reason: 'locked' };
@@ -1418,6 +1517,15 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       try {
         const conflict = opts?.checkConflict?.();
         if (conflict) {
+          if (
+            conflict.phase === 'posted_reload' &&
+            acknowledgedWait.get(subject)?.requestId === conflict.requestId
+          ) {
+            acknowledgedWait.delete(subject);
+            if (records.get(subject)?.requestId === conflict.requestId) {
+              records.delete(subject);
+            }
+          }
           emit();
           return { ok: false, reason: 'conflict', existing: conflict };
         }
@@ -1437,6 +1545,13 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         stored.requestId !== requestId ||
         !isUnresolvedPhase(stored.phase)
       ) {
+        const currentAckWait = acknowledgedWait.get(subject);
+        if (
+          currentAckWait &&
+          (!stored || !sameAcknowledgedClaim(stored, currentAckWait))
+        ) {
+          acknowledgedWait.delete(subject);
+        }
         if (stored && isUnresolvedPhase(stored.phase)) {
           records.set(subject, stored);
           emit();
@@ -1476,6 +1591,17 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         return { ok: false, reason: 'storage' };
       }
       const preserved = preservePayloadIdentity<T>(subject, stored);
+      const ackWait = acknowledgedWait.get(subject) ?? initialAckWait;
+      if (ackWait && !sameAcknowledgedClaim(stored, ackWait)) {
+        if (acknowledgedWait.get(subject) === ackWait) {
+          acknowledgedWait.delete(subject);
+        }
+        if (stored.phase !== 'waiting_for_sync') {
+          records.set(subject, preserved);
+          emit();
+          return { ok: false, reason: 'conflict', existing: preserved };
+        }
+      }
       if (
         stored.awaitingReviewReload ||
         (opts?.payload !== undefined &&
@@ -1499,6 +1625,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (!writeRecordToStorage(next, userId)) {
         return { ok: false, reason: 'storage' };
       }
+      acknowledgedWait.delete(subject);
       records.set(subject, next);
       const release = wrapClaimRelease(lock.release);
       emit();
@@ -1699,6 +1826,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     if (!wrote) {
       return { ok: false, reason: 'storage' };
     }
+    acknowledgedWait.delete(subject);
     if (input.phase === 'posted_reload') {
       if (stored && stored.requestId === input.requestId) {
         removeRecordFromStorage(subject, userId);
@@ -1808,12 +1936,24 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     if (options?.refresh) {
       const current = records.get(subject);
       if (stored && isUnresolvedPhase(stored.phase)) {
-        if (!current || !sameClaim(stored, current)) {
-          records.set(subject, stored);
+        const ackWait = acknowledgedWait.get(subject);
+        let effective = stored;
+        if (ackWait) {
+          if (sameAcknowledgedClaim(stored, ackWait)) {
+            effective = toAcknowledgedWaitRecord(stored);
+          } else {
+            acknowledgedWait.delete(subject);
+          }
+        }
+        if (!current || !sameClaim(effective, current)) {
+          records.set(subject, effective);
           emit();
         }
-      } else if (records.delete(subject)) {
-        emit();
+      } else {
+        acknowledgedWait.delete(subject);
+        if (records.delete(subject)) {
+          emit();
+        }
       }
     }
     return stored as HeldWriteRecord<T> | null;
@@ -1858,16 +1998,33 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const userId = activeUserId();
     if (userId === null) return;
     const expected = phaseOptions?.expected ?? records.get(subject);
-    const acknowledge = () => {
-      if (phase !== 'posted_reload' || expected?.requestId !== requestId)
+    const acknowledgePosted = (
+      claimedRecord: HeldWriteRecord | undefined = expected,
+    ) => {
+      if (phase !== 'posted_reload' || claimedRecord?.requestId !== requestId)
         return;
       acknowledgedInflight.set(subject, {
-        record: expected,
+        record: claimedRecord,
         requestId,
         ...(phaseOptions?.readTarget
           ? { readTarget: phaseOptions.readTarget }
           : {}),
       });
+      acknowledgedWait.delete(subject);
+      emit();
+    };
+    const acknowledgeWait = (
+      claimedRecord: HeldWriteRecord | undefined = expected,
+    ) => {
+      if (
+        phase !== 'waiting_for_sync' ||
+        claimedRecord?.requestId !== requestId ||
+        claimedRecord.phase !== 'inflight'
+      ) {
+        return;
+      }
+      acknowledgedWait.set(subject, claimedRecord);
+      records.set(subject, toAcknowledgedWaitRecord(claimedRecord));
       emit();
     };
 
@@ -1875,7 +2032,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     try {
       stored = readLockedHeldWrite(subject);
     } catch (error) {
-      if (error instanceof HeldWriteStorageError) acknowledge();
+      if (error instanceof HeldWriteStorageError) {
+        acknowledgePosted();
+        acknowledgeWait();
+      }
       throw error;
     }
     if (!stored) {
@@ -1885,6 +2045,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       ) {
         records.delete(subject);
         acknowledgedInflight.delete(subject);
+        acknowledgedWait.delete(subject);
         emit();
       }
       return;
@@ -1911,20 +2072,27 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       delete next.awaitingReviewReload;
     }
     if (!writeRecordToStorage(next, userId)) {
-      acknowledge();
-      if (
-        (phase === 'unknown' || phase === 'waiting_for_sync') &&
-        stored.phase === 'inflight'
-      ) {
-        // Keep the exact durable inflight claim recoverable while allowing
-        // an explicit retry of its payload in this tab.
-        records.set(subject, next);
-        emit();
-      } else {
+      if (phase === 'posted_reload') {
+        acknowledgePosted(preserved);
         throw new HeldWriteStorageError();
       }
-      return;
+      if (phase === 'waiting_for_sync' && stored.phase === 'inflight') {
+        acknowledgedWait.set(subject, preserved);
+        records.set(subject, next);
+        emit();
+        return;
+      }
+      if (phase === 'unknown' && stored.phase === 'inflight') {
+        // Keep the exact durable inflight claim recoverable while allowing
+        // an explicit retry of its payload in this tab.
+        acknowledgedWait.delete(subject);
+        records.set(subject, next);
+        emit();
+        return;
+      }
+      throw new HeldWriteStorageError();
     }
+    acknowledgedWait.delete(subject);
     if (phase === 'posted_reload') {
       observePostedCopy(next);
       acknowledgedInflight.delete(subject);
@@ -1974,6 +2142,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     if (!writeRecordToStorage(next, userId)) {
       throw new HeldWriteStorageError();
     }
+    acknowledgedWait.delete(subject);
     records.set(subject, next);
     emit();
     return true;
@@ -1997,7 +2166,19 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     if (stored && !sameClaim(stored, captured)) return;
     if (stored) removeDurableRecord(entryStorageKey(subject, userId));
     const current = records.get(subject);
-    if (current && sameClaim(current, captured)) records.delete(subject);
+    const waitAck = acknowledgedWait.get(subject);
+    if (
+      current &&
+      (sameClaim(current, captured) ||
+        (waitAck &&
+          sameAcknowledgedClaim(captured, waitAck) &&
+          current.requestId === captured.requestId))
+    ) {
+      records.delete(subject);
+    }
+    if (waitAck && sameAcknowledgedClaim(captured, waitAck)) {
+      acknowledgedWait.delete(subject);
+    }
     const ack = acknowledgedInflight.get(subject);
     if (ack && sameClaim(ack.record, captured))
       acknowledgedInflight.delete(subject);
@@ -2117,6 +2298,9 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
             ) {
               acknowledgedInflight.delete(aliasSubject);
             }
+            if (acknowledgedWait.get(aliasSubject)?.requestId === requestId) {
+              acknowledgedWait.delete(aliasSubject);
+            }
             changed = true;
           }
         };
@@ -2145,6 +2329,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
             active = null;
             if (records.get(subject)?.requestId === stored.requestId)
               records.delete(subject);
+            if (acknowledgedWait.get(subject)?.requestId === stored.requestId)
+              acknowledgedWait.delete(subject);
             changed = true;
           }
           if (key !== activeKey) removeDurableRecord(key);
@@ -2160,6 +2346,9 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
           // A different claim owns the active slot. Retire only this tab's
           // acknowledgement so it cannot settle that claim on a later read.
           acknowledgedInflight.delete(subject);
+          if (acknowledgedWait.get(subject)?.requestId === ack.requestId) {
+            acknowledgedWait.delete(subject);
+          }
           const current = records.get(subject);
           if (current && sameAcknowledgedClaim(current, ack.record)) {
             if (
@@ -2318,10 +2507,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const had =
       records.size > 0 ||
       postedReloads.size > 0 ||
-      acknowledgedInflight.size > 0;
+      acknowledgedInflight.size > 0 ||
+      acknowledgedWait.size > 0;
     records.clear();
     postedReloads.clear();
     acknowledgedInflight.clear();
+    acknowledgedWait.clear();
     hydratedScopeKey = null;
     writesLocked = false;
     if (resetOptions?.resetUser) {

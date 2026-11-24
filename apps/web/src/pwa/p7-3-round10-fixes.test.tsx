@@ -3023,11 +3023,13 @@ describe('P7-3 round-10 review fixes', () => {
       await waitFor(() => expect(recordStoredCount).toHaveBeenCalledTimes(1));
       expect(getHeldWrite(storedSubject)?.phase).toBe('waiting_for_sync');
 
-      // Full reload: waiting_for_sync must persist without turning into unknown.
+      // Full reload: waiting_for_sync must persist without turning into unknown,
+      // and restore a local-only card even when the server pending list is empty.
       firstView.unmount();
       resetHeldWritesStore({ clearStorage: false, resetUser: false });
       setHeldWriteUser('owner-r10');
       blockStoredRemove = false;
+      vi.mocked(listPendingCounts).mockResolvedValue([]);
 
       render(
         <MemoryRouter>
@@ -3037,11 +3039,14 @@ describe('P7-3 round-10 review fixes', () => {
       expect(
         await screen.findByText(waitingForSyncMessage),
       ).toBeInTheDocument();
+      const restoredCardBtn = await screen.findByRole('button', {
+        name: 'سجّل الجرد',
+      });
+      await waitFor(() => expect(restoredCardBtn).toBeEnabled());
       expect(getHeldWrite(storedSubject)?.phase).toBe('waiting_for_sync');
       expect(screen.queryByText(pendingResendMessage)).not.toBeInTheDocument();
 
-      vi.mocked(listPendingCounts).mockResolvedValue([]);
-      fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+      fireEvent.click(restoredCardBtn);
       await waitFor(() => expect(recordStoredCount).toHaveBeenCalledTimes(2));
       expect(vi.mocked(recordStoredCount).mock.calls[1]?.[0]).toEqual(
         storedPayload,
@@ -3145,6 +3150,349 @@ describe('P7-3 round-10 review fixes', () => {
       );
       expect(await screen.findByText('اتسجل الجرد')).toBeInTheDocument();
       await waitFor(() => expect(localStorage.getItem(storedKey)).toBeNull());
+    } finally {
+      removeSpy.mockRestore();
+      setSpy.mockRestore();
+    }
+  });
+
+  it('R18-1a: stored count card stays replayable after both post-RPC storage lookups fail on waiting_for_sync', async () => {
+    const requestId = 'd1900000-0000-4000-8000-000000000086';
+    const countedAt = '2026-10-22T10:00:00.000Z';
+    const storedSubject = `${COUNT_STORED_PREFIX}${requestId}`;
+    const prefix = userStoragePrefix('owner-r10');
+    const storedKey = `${prefix}${encodeURIComponent(storedSubject)}`;
+    const storedPayload = {
+      request_id: requestId,
+      frequency: 'daily',
+      counted_at: countedAt,
+      note: 'انتظار مع تعطل القراءة',
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
+    };
+    const pendingCard = {
+      requestId,
+      preparedAt: '2026-10-22T10:05:00.000Z',
+      countedAt,
+      itemCount: 1,
+      payload: storedPayload,
+    };
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([pendingCard]);
+
+    const origGet = localStorage.getItem.bind(localStorage);
+    let blockStoredRead = false;
+    const getSpy = vi
+      .spyOn(Storage.prototype, 'getItem')
+      .mockImplementation((key) => {
+        if (blockStoredRead && key === storedKey) {
+          throw new Error('storage read failed after wait');
+        }
+        return origGet(key);
+      });
+
+    vi.mocked(recordStoredCount)
+      .mockImplementationOnce(() => {
+        blockStoredRead = true;
+        return Promise.resolve({ status: 'waiting_for_sync' });
+      })
+      .mockResolvedValueOnce({ status: 'posted', countId: 'count-r18-1a' });
+
+    try {
+      render(
+        <MemoryRouter>
+          <CountsPage />
+        </MemoryRouter>,
+      );
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'سجّل الجرد' }),
+      );
+      await waitFor(() => expect(recordStoredCount).toHaveBeenCalledTimes(1));
+      expect(
+        await screen.findByText(waitingForSyncMessage),
+      ).toBeInTheDocument();
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+      expect(getHeldWrite(storedSubject)?.phase).toBe('waiting_for_sync');
+
+      // Even while storage reads still fail, an unrelated cross-tab storage event
+      // must keep the acknowledged wait in memory.
+      act(() => {
+        window.dispatchEvent(
+          new StorageEvent('storage', {
+            key: `${prefix}${encodeURIComponent('purchase:new')}`,
+          }),
+        );
+      });
+      expect(getHeldWrite(storedSubject)?.phase).toBe('waiting_for_sync');
+
+      // Storage recovers and another unrelated cross-tab storage event fires.
+      blockStoredRead = false;
+      expect(JSON.parse(origGet(storedKey) ?? '{}')).toMatchObject({
+        requestId,
+        phase: 'inflight',
+      });
+      act(() => {
+        window.dispatchEvent(
+          new StorageEvent('storage', {
+            key: `${prefix}${encodeURIComponent('purchase:new')}`,
+          }),
+        );
+      });
+      expect(getHeldWrite(storedSubject)?.phase).toBe('waiting_for_sync');
+
+      vi.mocked(listPendingCounts).mockResolvedValue([]);
+      await waitFor(() =>
+        expect(
+          screen.getByRole('button', { name: 'سجّل الجرد' }),
+        ).toBeEnabled(),
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+      await waitFor(() => expect(recordStoredCount).toHaveBeenCalledTimes(2));
+      expect(vi.mocked(recordStoredCount).mock.calls[1]?.[0]).toEqual(
+        storedPayload,
+      );
+      expect(await screen.findByText('اتسجل الجرد')).toBeInTheDocument();
+      await waitFor(() => expect(localStorage.getItem(storedKey)).toBeNull());
+    } finally {
+      getSpy.mockRestore();
+    }
+  });
+
+  it('R18-1b: unrelated cross-tab storage event does not replace in-memory waiting_for_sync fallback with durable inflight', async () => {
+    const requestId = 'd1900000-0000-4000-8000-000000000087';
+    const countedAt = '2026-10-22T10:00:00.000Z';
+    const storedSubject = `${COUNT_STORED_PREFIX}${requestId}`;
+    const prefix = userStoragePrefix('owner-r10');
+    const storedKey = `${prefix}${encodeURIComponent(storedSubject)}`;
+    const storedPayload = {
+      request_id: requestId,
+      frequency: 'daily',
+      counted_at: countedAt,
+      note: 'حدث تبويب آخر',
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
+    };
+    const pendingCard = {
+      requestId,
+      preparedAt: '2026-10-22T10:05:00.000Z',
+      countedAt,
+      itemCount: 1,
+      payload: storedPayload,
+    };
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([pendingCard]);
+
+    const origRemove = localStorage.removeItem.bind(localStorage);
+    const origSet = localStorage.setItem.bind(localStorage);
+    let blockStorageWrites = false;
+    const removeSpy = vi
+      .spyOn(Storage.prototype, 'removeItem')
+      .mockImplementation((key) => {
+        if (blockStorageWrites && key === storedKey) {
+          throw new Error('remove failed');
+        }
+        return origRemove(key);
+      });
+    const setSpy = vi
+      .spyOn(Storage.prototype, 'setItem')
+      .mockImplementation((key, value) => {
+        if (blockStorageWrites && key === storedKey) {
+          throw new Error('set failed');
+        }
+        return origSet(key, value);
+      });
+
+    vi.mocked(recordStoredCount)
+      .mockImplementationOnce(() => {
+        blockStorageWrites = true;
+        return Promise.resolve({ status: 'waiting_for_sync' });
+      })
+      .mockResolvedValueOnce({ status: 'posted', countId: 'count-r18-1b' });
+
+    try {
+      render(
+        <MemoryRouter>
+          <CountsPage />
+        </MemoryRouter>,
+      );
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'سجّل الجرد' }),
+      );
+      await waitFor(() => expect(recordStoredCount).toHaveBeenCalledTimes(1));
+      expect(
+        await screen.findByText(waitingForSyncMessage),
+      ).toBeInTheDocument();
+      expect(getHeldWrite(storedSubject)?.phase).toBe('waiting_for_sync');
+
+      // An unrelated cross-tab storage event fires while localStorage still holds inflight.
+      act(() => {
+        window.dispatchEvent(
+          new StorageEvent('storage', {
+            key: `${prefix}${encodeURIComponent('expense:new')}`,
+          }),
+        );
+      });
+      expect(getHeldWrite(storedSubject)?.phase).toBe('waiting_for_sync');
+
+      blockStorageWrites = false;
+      vi.mocked(listPendingCounts).mockResolvedValue([]);
+      await waitFor(() =>
+        expect(
+          screen.getByRole('button', { name: 'سجّل الجرد' }),
+        ).toBeEnabled(),
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+      await waitFor(() => expect(recordStoredCount).toHaveBeenCalledTimes(2));
+      expect(vi.mocked(recordStoredCount).mock.calls[1]?.[0]).toEqual(
+        storedPayload,
+      );
+      expect(await screen.findByText('اتسجل الجرد')).toBeInTheDocument();
+      await waitFor(() => expect(localStorage.getItem(storedKey)).toBeNull());
+    } finally {
+      removeSpy.mockRestore();
+      setSpy.mockRestore();
+    }
+  });
+
+  it('R18-1c: wait acknowledgement is bound to exact claim across storage sync and revalidated under the shared lock before replay', async () => {
+    const requestId = 'd1900000-0000-4000-8000-000000000088';
+    const countedAt = '2026-10-22T10:00:00.000Z';
+    const storedSubject = `${COUNT_STORED_PREFIX}${requestId}`;
+    const prefix = userStoragePrefix('owner-r10');
+    const storedKey = `${prefix}${encodeURIComponent(storedSubject)}`;
+    const storedPayload = {
+      request_id: requestId,
+      frequency: 'daily',
+      counted_at: countedAt,
+      note: 'تحقق من القفل المشترك',
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
+    };
+    const pendingCard = {
+      requestId,
+      preparedAt: '2026-10-22T10:05:00.000Z',
+      countedAt,
+      itemCount: 1,
+      payload: storedPayload,
+    };
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([pendingCard]);
+
+    const origRemove = localStorage.removeItem.bind(localStorage);
+    const origSet = localStorage.setItem.bind(localStorage);
+    let blockStorageWrites = false;
+    const removeSpy = vi
+      .spyOn(Storage.prototype, 'removeItem')
+      .mockImplementation((key) => {
+        if (blockStorageWrites && key === storedKey) {
+          throw new Error('remove failed');
+        }
+        return origRemove(key);
+      });
+    const setSpy = vi
+      .spyOn(Storage.prototype, 'setItem')
+      .mockImplementation((key, value) => {
+        if (blockStorageWrites && key === storedKey) {
+          throw new Error('set failed');
+        }
+        return origSet(key, value);
+      });
+
+    vi.mocked(recordStoredCount).mockImplementationOnce(() => {
+      blockStorageWrites = true;
+      return Promise.resolve({ status: 'waiting_for_sync' });
+    });
+
+    try {
+      render(
+        <MemoryRouter>
+          <CountsPage />
+        </MemoryRouter>,
+      );
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'سجّل الجرد' }),
+      );
+      await waitFor(() => expect(recordStoredCount).toHaveBeenCalledTimes(1));
+      expect(getHeldWrite(storedSubject)?.phase).toBe('waiting_for_sync');
+
+      // Storage recovers, but another tab has replaced the slot with a different inflight claim
+      // and no storage event has arrived in this tab yet.
+      blockStorageWrites = false;
+      const originalDurable = JSON.parse(
+        localStorage.getItem(storedKey) ?? '{}',
+      ) as {
+        claimId?: string;
+      };
+      const replacementClaimId = 'claim-from-other-tab';
+      expect(originalDurable.claimId).not.toBe(replacementClaimId);
+      localStorage.setItem(
+        storedKey,
+        JSON.stringify({
+          ...originalDurable,
+          claimId: replacementClaimId,
+          phase: 'inflight',
+        }),
+      );
+
+      await waitFor(() =>
+        expect(
+          screen.getByRole('button', { name: 'سجّل الجرد' }),
+        ).toBeEnabled(),
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+
+      // Revalidation under the shared lock must reject the stale wait ack without dispatching.
+      await waitFor(() =>
+        expect(getHeldWrite(storedSubject)).toMatchObject({
+          requestId,
+          claimId: replacementClaimId,
+          phase: 'inflight',
+        }),
+      );
+      expect(recordStoredCount).toHaveBeenCalledTimes(1);
+
+      // A subsequent cross-tab storage event also keeps the replacement inflight claim intact.
+      act(() => {
+        window.dispatchEvent(new StorageEvent('storage', { key: storedKey }));
+      });
+      expect(getHeldWrite(storedSubject)).toMatchObject({
+        requestId,
+        claimId: replacementClaimId,
+        phase: 'inflight',
+      });
     } finally {
       removeSpy.mockRestore();
       setSpy.mockRestore();
