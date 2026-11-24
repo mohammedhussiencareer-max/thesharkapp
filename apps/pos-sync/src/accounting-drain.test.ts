@@ -6,8 +6,11 @@ import {
   DRAIN_BUDGET_MS,
   RECORDER_BACKOFF_MS,
 } from './accounting-drain.ts';
+import { localServiceRoleKey } from './local-supabase.ts';
 import {
+  createSupabaseDb,
   SupabaseRpcError,
+  SyncDiagnostic,
   zeroAccountingCounts,
   type AccountingDb,
   type AccountingOrderRef,
@@ -137,12 +140,15 @@ describe('drainAccountingWork', () => {
     const { db, runs, reports } = fakeDb(
       [],
       'recorded',
-      new SupabaseRpcError('Supabase RPC failed: network', 'network'),
+      new SupabaseRpcError('network'),
     );
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('call_failed');
     expect(outcome.report).toBe('not_needed');
-    expect(outcome.error).toBe('Supabase RPC failed: network');
+    expect(SyncDiagnostic.is(outcome.error)).toBe(true);
+    expect(SyncDiagnostic.render(outcome.error!)).toBe(
+      'Supabase RPC failed: network',
+    );
     expect(runs).toEqual([]);
     expect(reports).toEqual([]);
   });
@@ -208,7 +214,7 @@ describe('drainAccountingWork', () => {
     const { db, runs, reports } = fakeDb(
       [
         run('processed', { remaining: 1 }, orderC),
-        new SupabaseRpcError('Supabase RPC failed: network', 'network'),
+        new SupabaseRpcError('network'),
       ],
       'recorded',
       { status: 'empty', head: null },
@@ -270,7 +276,7 @@ describe('drainAccountingWork', () => {
     expect(reports).toEqual([]);
   });
 
-  it('stops on critical and names the order', async () => {
+  it('reports critical status without logging the order id', async () => {
     const { db } = fakeDb([
       run('critical', { failed: 1 }, null, {
         orderId: 'order-crit',
@@ -279,9 +285,36 @@ describe('drainAccountingWork', () => {
     ]);
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('critical');
-    expect(outcome.criticalOrderId).toBe('order-crit');
-    expect(formatDrain(outcome)).toContain('critical_order=order-crit');
+    expect(formatDrain(outcome)).toContain('stop=critical');
+    expect.soft(formatDrain(outcome)).not.toContain('order-crit');
+    expect(JSON.stringify(outcome)).not.toContain('order-crit');
   });
+
+  it.each(['peek', 'worker', 'recorder'] as const)(
+    'drops an arbitrary %s error from the drain report',
+    async (stage) => {
+      const marker = 'SyntheticMarker7f3a';
+      const error = new Error(`unexpected ${marker}`);
+      const rpc = new SupabaseRpcError('network');
+      const { db } =
+        stage === 'peek'
+          ? fakeDb([], 'recorded', error)
+          : stage === 'worker'
+            ? fakeDb([error])
+            : fakeDb([rpc], error);
+      const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+      expect(outcome.stop).toBe('call_failed');
+      expect(SyncDiagnostic.is(outcome.error)).toBe(true);
+      expect
+        .soft(SyncDiagnostic.render(outcome.error!))
+        .toBe(
+          stage === 'recorder'
+            ? 'Supabase RPC failed: network; sync failed'
+            : 'sync failed',
+        );
+      expect(formatDrain(outcome)).not.toContain(marker);
+    },
+  );
 
   it('stops when the order failed inside the call, without reporting', async () => {
     const { db, reports } = fakeDb([
@@ -313,10 +346,7 @@ describe('drainAccountingWork', () => {
   });
 
   it('reports an escaped failure with the same attempt id, naming only the bound order', async () => {
-    const timeout = new SupabaseRpcError(
-      'Supabase RPC failed: network',
-      'network',
-    );
+    const timeout = new SupabaseRpcError('network');
     const { db, runs, reports } = fakeDb(
       [
         run(
@@ -334,7 +364,10 @@ describe('drainAccountingWork', () => {
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('call_failed');
     expect(outcome.report).toBe('recorded');
-    expect(outcome.error).toBe('Supabase RPC failed: network');
+    expect(SyncDiagnostic.is(outcome.error)).toBe(true);
+    expect(SyncDiagnostic.render(outcome.error!)).toBe(
+      'Supabase RPC failed: network',
+    );
     expect(reports).toEqual([
       {
         attemptId: runs[1]?.attemptId,
@@ -346,14 +379,7 @@ describe('drainAccountingWork', () => {
 
   it('reports a server error on the first call against the order the peek named', async () => {
     const { db, runs, reports, timeouts } = fakeDb(
-      [
-        new SupabaseRpcError(
-          'Supabase RPC failed: HTTP 500',
-          'http',
-          500,
-          '57014',
-        ),
-      ],
+      [new SupabaseRpcError('http', 500, '57014')],
       'committed',
     );
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
@@ -370,14 +396,7 @@ describe('drainAccountingWork', () => {
 
   it('retries a statement timeout on the timeout recorder only', async () => {
     const { db, reports, timeouts } = fakeDb(
-      [
-        new SupabaseRpcError(
-          'Supabase RPC failed: HTTP 500',
-          'http',
-          500,
-          '57014',
-        ),
-      ],
+      [new SupabaseRpcError('http', 500, '57014')],
       ['busy', 'recorded'],
     );
     const outcome = await drainAccountingWork(db, {
@@ -393,7 +412,7 @@ describe('drainAccountingWork', () => {
 
   it('makes no report when an unbound (maintenance) call fails, as it processed no order', async () => {
     const { db, reports } = fakeDb(
-      [new SupabaseRpcError('Supabase RPC failed: network', 'network')],
+      [new SupabaseRpcError('network')],
       'recorded',
       { status: 'empty', head: null },
     );
@@ -405,12 +424,7 @@ describe('drainAccountingWork', () => {
 
   it('does not report a refused call', async () => {
     const { db, reports } = fakeDb([
-      new SupabaseRpcError(
-        'Supabase RPC failed: HTTP 400',
-        'http',
-        400,
-        '22023',
-      ),
+      new SupabaseRpcError('http', 400, '22023'),
     ]);
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('call_failed');
@@ -420,22 +434,20 @@ describe('drainAccountingWork', () => {
 
   it('keeps going to a clean stop when the report itself fails', async () => {
     const { db } = fakeDb(
-      [new SupabaseRpcError('Supabase RPC failed: network', 'network')],
-      new SupabaseRpcError('Supabase RPC failed: network', 'network'),
+      [new SupabaseRpcError('network')],
+      new SupabaseRpcError('network'),
     );
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(outcome.stop).toBe('call_failed');
     expect(outcome.report).toBe('unreported');
-    expect(outcome.error).toBe(
+    expect(SyncDiagnostic.is(outcome.error)).toBe(true);
+    expect(SyncDiagnostic.render(outcome.error!)).toBe(
       'Supabase RPC failed: network; Supabase RPC failed: network',
     );
   });
 
   describe('a failure report the ledger lock turns away', () => {
-    const lost = new SupabaseRpcError(
-      'Supabase RPC failed: network',
-      'network',
-    );
+    const lost = new SupabaseRpcError('network');
 
     function pauses(clockStart = 0) {
       let now = clockStart;
@@ -596,10 +608,7 @@ describe('drainAccountingWork', () => {
     it('ends unreported when a repeat itself fails, keeping the attempt id', async () => {
       const { db, runs, reports } = fakeDb(
         [lost],
-        [
-          'busy',
-          new SupabaseRpcError('Supabase RPC failed: network', 'network'),
-        ],
+        ['busy', new SupabaseRpcError('network')],
       );
       const pace = pauses();
       const outcome = await drainAccountingWork(db, {
@@ -616,9 +625,131 @@ describe('drainAccountingWork', () => {
 
   it('redacts secrets from a reported error', async () => {
     const { db } = fakeDb([
-      new SupabaseRpcError('boom Bearer ya29.SECRET-TOKEN', 'network'),
+      Object.assign(new SupabaseRpcError('network'), {
+        message: 'boom Bearer ya29.SECRET-TOKEN',
+      }),
     ]);
     const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
     expect(formatDrain(outcome)).not.toContain('SECRET-TOKEN');
+  });
+
+  it('never emits unchecked text passed directly to formatDrain', () => {
+    const marker = 'SyntheticMarker7f3a';
+    const base = {
+      stop: 'call_failed' as const,
+      calls: 1,
+      counts: zeroAccountingCounts(),
+      report: 'not_needed' as const,
+    };
+    const forged = Object.create(SyncDiagnostic.prototype) as SyncDiagnostic;
+    const branded = SyncDiagnostic.fromError(
+      Object.assign(new SupabaseRpcError('http', 400, '23505'), {
+        message: marker,
+      }),
+    );
+    const fromString = formatDrain({ ...base, error: marker as never });
+    const fromError = formatDrain({
+      ...base,
+      error: new Error(`unexpected ${marker}`) as never,
+    });
+    const fromForged = formatDrain({ ...base, error: forged });
+    const fromBranded = formatDrain({ ...base, error: branded });
+    expect(fromString).toMatch(/ error=sync failed$/);
+    expect(fromString).not.toContain(marker);
+    expect(fromError).toMatch(/ error=sync failed$/);
+    expect(fromError).not.toContain(marker);
+    expect(fromForged).toMatch(/ error=sync failed$/);
+    expect(fromForged).not.toContain(marker);
+    expect(fromBranded).toMatch(/ error=Supabase RPC failed: HTTP 400 23505$/);
+    expect(fromBranded).not.toContain(marker);
+  });
+
+  it('routes a timeout and formats the drain even when public RPC getters throw', async () => {
+    const marker = 'SyntheticMarker7f3a';
+    const timeout = new SupabaseRpcError('http', 500, '57014');
+    for (const prop of ['kind', 'status', 'sqlstate', 'message']) {
+      Object.defineProperty(timeout, prop, {
+        get() {
+          throw new Error(`getter ${prop} ${marker}`);
+        },
+        configurable: true,
+      });
+    }
+    const { db, reports, timeouts } = fakeDb([timeout], 'recorded');
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('call_failed');
+    expect(outcome.report).toBe('recorded');
+    expect(reports).toEqual([]);
+    expect(timeouts).toHaveLength(1);
+    const formatted = formatDrain(outcome);
+    expect(formatted).toMatch(
+      / report=recorded error=Supabase RPC failed: HTTP 500 57014$/,
+    );
+    expect(formatted).not.toContain(marker);
+  });
+
+  it('records a bound call failure for an HTTP reply above 599 without rendering the status', async () => {
+    const marker = 'SyntheticMarker7f3a';
+    const recordedBodies: Array<Record<string, unknown>> = [];
+    const timeoutBodies: Array<Record<string, unknown>> = [];
+    const db = createSupabaseDb(
+      'http://127.0.0.1:55421',
+      localServiceRoleKey,
+      async (url, init) => {
+        const path = new URL(url).pathname;
+        if (path.endsWith('/accounting_next_work')) {
+          return new Response(
+            JSON.stringify({
+              status: 'ok',
+              head: { order_id: 'order-a', work_generation: 1 },
+            }),
+            { status: 200 },
+          );
+        }
+        if (path.endsWith('/run_accounting_work')) {
+          return {
+            ok: false,
+            status: 600,
+            async text() {
+              return `proxy failure ${marker}`;
+            },
+          } as unknown as Response;
+        }
+        if (path.endsWith('/record_accounting_call_failure')) {
+          if (typeof init.body !== 'string') {
+            throw new Error('request body is not a string');
+          }
+          recordedBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+          return new Response(JSON.stringify({ status: 'recorded' }), {
+            status: 200,
+          });
+        }
+        if (path.endsWith('/record_accounting_recompute_timeout')) {
+          if (typeof init.body !== 'string') {
+            throw new Error('request body is not a string');
+          }
+          timeoutBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+          return new Response(JSON.stringify({ status: 'recorded' }), {
+            status: 200,
+          });
+        }
+        throw new Error(`unexpected RPC path: ${path}`);
+      },
+    );
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('call_failed');
+    expect(outcome.report).toBe('recorded');
+    expect(timeoutBodies).toEqual([]);
+    expect(recordedBodies).toEqual([
+      {
+        p_attempt_id: '00000000-0000-4000-8000-000000000001',
+        p_order_id: 'order-a',
+        p_work_generation: 1,
+      },
+    ]);
+    const formatted = formatDrain(outcome);
+    expect(formatted).toMatch(/ report=recorded error=sync failed$/);
+    expect(formatted).not.toContain('600');
+    expect(formatted).not.toContain(marker);
   });
 });

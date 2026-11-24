@@ -1,3 +1,4 @@
+import { PosSyncError } from './safe-error.ts';
 import { isRecord } from './decode.ts';
 
 /**
@@ -232,7 +233,7 @@ function walkPayloadForPriceKey(
   depth: number,
 ): void {
   if (depth > MAX_CATALOG_WALK_DEPTH) {
-    throw new Error('Catalog payload refused: excessive nesting');
+    throw new PosSyncError('catalogExcessiveNesting');
   }
   if (Array.isArray(value)) {
     const nextSegments: readonly PathStep[] = [...segments, ARRAY_STEP];
@@ -247,7 +248,7 @@ function walkPayloadForPriceKey(
   const keysAreLabels = isItemOptionGroupLabelMapPath(segments);
   for (const [key, child] of Object.entries(value)) {
     if (!keysAreLabels && isPriceShapedKey(key)) {
-      throw new Error('Catalog payload refused: price-shaped key');
+      throw new PosSyncError('catalogPriceKey');
     }
     walkPayloadForPriceKey(
       child,

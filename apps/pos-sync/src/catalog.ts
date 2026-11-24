@@ -1,3 +1,4 @@
+import { PosSyncError } from './safe-error.ts';
 import {
   CATALOG_ITEM_FIELDS,
   CATALOG_OPTION_GROUP_FIELDS,
@@ -106,9 +107,7 @@ export function resolveCatalogFieldSelectors(
     const scalar = SCALAR_PATH.exec(path);
     if (scalar?.[1] !== undefined) {
       if (itemName !== undefined) {
-        throw new Error(
-          `Catalog allowlist mismatch: unexpected item path ${path}`,
-        );
+        throw new PosSyncError('unexpectedCatalogItemPath');
       }
       itemName = scalar[1];
       continue;
@@ -116,9 +115,7 @@ export function resolveCatalogFieldSelectors(
     const arrayField = ARRAY_FIELD_PATH.exec(path);
     if (arrayField?.[1] !== undefined && arrayField[2] !== undefined) {
       if (sizesArray !== undefined) {
-        throw new Error(
-          `Catalog allowlist mismatch: unexpected item path ${path}`,
-        );
+        throw new PosSyncError('unexpectedCatalogItemPath');
       }
       sizesArray = arrayField[1];
       sizeName = arrayField[2];
@@ -127,9 +124,7 @@ export function resolveCatalogFieldSelectors(
     const labeledArray = LABELED_ARRAY_FIELD_PATH.exec(path);
     if (labeledArray?.[1] !== undefined && labeledArray[2] !== undefined) {
       if (optionsMap !== undefined) {
-        throw new Error(
-          `Catalog allowlist mismatch: unexpected item path ${path}`,
-        );
+        throw new PosSyncError('unexpectedCatalogItemPath');
       }
       optionsMap = labeledArray[1];
       optionValue = labeledArray[2];
@@ -138,16 +133,12 @@ export function resolveCatalogFieldSelectors(
     const labeledScalar = LABELED_SCALAR_PATH.exec(path);
     if (labeledScalar?.[1] !== undefined) {
       if (sharedOptionGroupIdsMap !== undefined) {
-        throw new Error(
-          `Catalog allowlist mismatch: unexpected item path ${path}`,
-        );
+        throw new PosSyncError('unexpectedCatalogItemPath');
       }
       sharedOptionGroupIdsMap = labeledScalar[1];
       continue;
     }
-    throw new Error(
-      `Catalog allowlist mismatch: unsupported item path ${path}`,
-    );
+    throw new PosSyncError('unsupportedCatalogItemPath');
   }
 
   let groupName: string | undefined;
@@ -158,9 +149,7 @@ export function resolveCatalogFieldSelectors(
     const scalar = SCALAR_PATH.exec(path);
     if (scalar?.[1] !== undefined) {
       if (groupName !== undefined) {
-        throw new Error(
-          `Catalog allowlist mismatch: unexpected optionGroup path ${path}`,
-        );
+        throw new PosSyncError('unexpectedCatalogGroupPath');
       }
       groupName = scalar[1];
       continue;
@@ -168,17 +157,13 @@ export function resolveCatalogFieldSelectors(
     const arrayField = ARRAY_FIELD_PATH.exec(path);
     if (arrayField?.[1] !== undefined && arrayField[2] !== undefined) {
       if (groupValuesArray !== undefined) {
-        throw new Error(
-          `Catalog allowlist mismatch: unexpected optionGroup path ${path}`,
-        );
+        throw new PosSyncError('unexpectedCatalogGroupPath');
       }
       groupValuesArray = arrayField[1];
       groupOptionValue = arrayField[2];
       continue;
     }
-    throw new Error(
-      `Catalog allowlist mismatch: unsupported optionGroup path ${path}`,
-    );
+    throw new PosSyncError('unsupportedCatalogGroupPath');
   }
 
   if (
@@ -192,7 +177,7 @@ export function resolveCatalogFieldSelectors(
     groupValuesArray === undefined ||
     groupOptionValue === undefined
   ) {
-    throw new Error('Catalog allowlist mismatch: missing required selector');
+    throw new PosSyncError('catalogSelectorMissing');
   }
 
   return {
@@ -213,7 +198,7 @@ const SELECTORS = resolveCatalogFieldSelectors(
   CATALOG_OPTION_GROUP_FIELDS,
 );
 
-class MalformedCatalogFieldError extends Error {}
+class MalformedCatalogFieldError extends PosSyncError {}
 
 function btrimSpaces(value: string): string {
   return value.replace(/^ +| +$/g, '');
@@ -260,22 +245,22 @@ function readStringValue(value: unknown): string {
     !isOnlyKey(value, 'stringValue') ||
     typeof value.stringValue !== 'string'
   ) {
-    throw new MalformedCatalogFieldError('expected Firestore stringValue');
+    throw new MalformedCatalogFieldError('catalogExpectedString');
   }
   // PostgreSQL jsonb rejects U+0000 in stored strings; reject only this doc.
   if (value.stringValue.includes('\0')) {
-    throw new MalformedCatalogFieldError('string contains NUL');
+    throw new MalformedCatalogFieldError('catalogStringContainsNul');
   }
   return value.stringValue;
 }
 
 function readRequiredTrimmedString(value: unknown): string {
   if (value === undefined || isNullValue(value)) {
-    throw new MalformedCatalogFieldError('missing required string');
+    throw new MalformedCatalogFieldError('catalogStringMissing');
   }
   const trimmed = readStringValue(value).trim();
   if (trimmed.length === 0) {
-    throw new MalformedCatalogFieldError('blank required string');
+    throw new MalformedCatalogFieldError('catalogStringBlank');
   }
   return trimmed;
 }
@@ -286,11 +271,11 @@ function readMapFields(value: unknown): Record<string, unknown> {
     !isOnlyKey(value, 'mapValue') ||
     !isRecord(value.mapValue)
   ) {
-    throw new MalformedCatalogFieldError('expected Firestore mapValue');
+    throw new MalformedCatalogFieldError('catalogExpectedMap');
   }
   for (const key of Object.keys(value.mapValue)) {
     if (key !== 'fields') {
-      throw new MalformedCatalogFieldError('unexpected mapValue key');
+      throw new MalformedCatalogFieldError('catalogUnexpectedMapKey');
     }
   }
   const fields = value.mapValue.fields;
@@ -298,7 +283,7 @@ function readMapFields(value: unknown): Record<string, unknown> {
     return {};
   }
   if (!isRecord(fields)) {
-    throw new MalformedCatalogFieldError('invalid mapValue.fields');
+    throw new MalformedCatalogFieldError('catalogInvalidMapFields');
   }
   return fields;
 }
@@ -309,11 +294,11 @@ function readArrayValues(value: unknown): unknown[] {
     !isOnlyKey(value, 'arrayValue') ||
     !isRecord(value.arrayValue)
   ) {
-    throw new MalformedCatalogFieldError('expected Firestore arrayValue');
+    throw new MalformedCatalogFieldError('catalogExpectedArray');
   }
   for (const key of Object.keys(value.arrayValue)) {
     if (key !== 'values') {
-      throw new MalformedCatalogFieldError('unexpected arrayValue key');
+      throw new MalformedCatalogFieldError('catalogUnexpectedArrayKey');
     }
   }
   const values = value.arrayValue.values;
@@ -321,7 +306,7 @@ function readArrayValues(value: unknown): unknown[] {
     return [];
   }
   if (!Array.isArray(values)) {
-    throw new MalformedCatalogFieldError('invalid arrayValue.values');
+    throw new MalformedCatalogFieldError('catalogInvalidArrayValues');
   }
   return values;
 }
@@ -369,14 +354,14 @@ function readSharedOptionGroupIds(raw: unknown): string[] {
   // guard for non-Firestore input.
   for (const [label, rawGroupId] of Object.entries(mapFields)) {
     if (label.length === 0 || label.includes('\0')) {
-      throw new MalformedCatalogFieldError('invalid shared option label');
+      throw new MalformedCatalogFieldError('catalogInvalidSharedOptionLabel');
     }
     if (labels.has(label)) {
-      throw new MalformedCatalogFieldError('duplicate shared option label');
+      throw new MalformedCatalogFieldError('catalogDuplicateSharedOptionLabel');
     }
     const groupId = readStringValue(rawGroupId);
     if (!isSafeCatalogDocumentId(groupId)) {
-      throw new MalformedCatalogFieldError('unsafe shared option group id');
+      throw new MalformedCatalogFieldError('catalogUnsafeSharedOptionGroupId');
     }
     labels.add(label);
     ids.add(groupId);
@@ -410,10 +395,10 @@ function readItemOptionGroups(raw: unknown): Record<string, string[]> {
   const groups = new Map<string, string[]>();
   for (const [label, rawGroup] of Object.entries(mapFields)) {
     if (label.length === 0 || label.includes('\0')) {
-      throw new MalformedCatalogFieldError('invalid option group label');
+      throw new MalformedCatalogFieldError('catalogInvalidOptionGroupLabel');
     }
     if (seenLabels.has(label)) {
-      throw new MalformedCatalogFieldError('duplicate option group label');
+      throw new MalformedCatalogFieldError('catalogDuplicateOptionGroupLabel');
     }
     seenLabels.add(label);
     groups.set(label, readOptionValues(rawGroup, SELECTORS.optionValue));
@@ -495,11 +480,11 @@ export function parseCatalogItemDocument(
   document: FirestoreRestDocument,
 ): ParsedCatalogItem {
   if (typeof document.name !== 'string') {
-    throw new Error('invalid catalog item document name');
+    throw new PosSyncError('invalidCatalogItemName');
   }
   const { collection, id: posItemId } = splitDocumentName(document.name);
   if (collection !== 'items') {
-    throw new Error('invalid catalog item document name');
+    throw new PosSyncError('invalidCatalogItemName');
   }
   if (
     document.rejected === true ||
@@ -548,11 +533,11 @@ export function parseCatalogOptionGroupDocument(
   document: FirestoreRestDocument,
 ): ParsedCatalogOptionGroup {
   if (typeof document.name !== 'string') {
-    throw new Error('invalid catalog option group document name');
+    throw new PosSyncError('invalidCatalogOptionGroupName');
   }
   const { collection, id: groupId } = splitDocumentName(document.name);
   if (collection !== 'optionGroups') {
-    throw new Error('invalid catalog option group document name');
+    throw new PosSyncError('invalidCatalogOptionGroupName');
   }
   if (
     document.rejected === true ||
@@ -607,7 +592,7 @@ export function parseCatalog(
         ? parsed.item.pos_item_id
         : parsed.pos_item_id;
     if (seenItems.has(id)) {
-      throw new Error('duplicate catalog item id');
+      throw new PosSyncError('duplicateCatalogItem');
     }
     seenItems.add(id);
     presence.push({ pos_item_id: id, outcome: parsed.outcome });
@@ -626,7 +611,7 @@ export function parseCatalog(
         ? parsed.option_group.group_id
         : parsed.group_id;
     if (seenGroups.has(id)) {
-      throw new Error('duplicate catalog option group id');
+      throw new PosSyncError('duplicateCatalogOptionGroup');
     }
     seenGroups.add(id);
     optionGroupPresence.push({ group_id: id, outcome: parsed.outcome });

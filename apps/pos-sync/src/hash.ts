@@ -1,3 +1,4 @@
+import { PosSyncError } from './safe-error.ts';
 import { createHash } from 'node:crypto';
 import { isRecord } from './decode.ts';
 import type { StoredOrder } from './types.ts';
@@ -14,12 +15,12 @@ export function compareId(left: string, right: string): number {
 
 export function canonicalJson(value: unknown): string {
   if (value === undefined) {
-    throw new Error('invalid hash value');
+    throw new PosSyncError('invalidHashValue');
   }
   if (value === null || typeof value !== 'object') {
     const text = JSON.stringify(value);
     if (text === undefined) {
-      throw new Error('invalid hash value');
+      throw new PosSyncError('invalidHashValue');
     }
     return text;
   }
@@ -27,14 +28,14 @@ export function canonicalJson(value: unknown): string {
     return `[${value.map((entry) => canonicalJson(entry)).join(',')}]`;
   }
   if (!isRecord(value)) {
-    throw new Error('invalid hash value');
+    throw new PosSyncError('invalidHashValue');
   }
   const keys = Object.keys(value).sort();
   return `{${keys
     .map((key) => {
       const child = value[key];
       if (child === undefined) {
-        throw new Error('invalid hash value');
+        throw new PosSyncError('invalidHashValue');
       }
       return `${JSON.stringify(key)}:${canonicalJson(child)}`;
     })

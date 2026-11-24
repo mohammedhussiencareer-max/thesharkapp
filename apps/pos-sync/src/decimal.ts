@@ -1,3 +1,4 @@
+import { PosSyncError } from './safe-error.ts';
 export type Decimal = {
   sign: 1 | -1;
   digits: string;
@@ -9,17 +10,17 @@ export function parseDecimal(input: string): Decimal {
     input.trim(),
   );
   if (!match) {
-    throw new Error('invalid decimal');
+    throw new PosSyncError('invalidDecimal');
   }
   const whole = match[2];
   if (whole === undefined) {
-    throw new Error('invalid decimal');
+    throw new PosSyncError('invalidDecimal');
   }
   const frac = match[3] ?? '';
   const expText = match[4];
   const exp = expText === undefined ? 0 : Number.parseInt(expText, 10);
   if (!Number.isInteger(exp)) {
-    throw new Error('invalid decimal');
+    throw new PosSyncError('invalidDecimal');
   }
   let digits = `${whole}${frac}`.replace(/^0+/, '') || '0';
   let scale = frac.length - exp;
@@ -35,7 +36,7 @@ export function parseDecimal(input: string): Decimal {
 
 export function decimalFromNumber(value: number): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new Error('number must be finite');
+    throw new PosSyncError('numberNotFinite');
   }
   return JSON.stringify(value);
 }
@@ -51,7 +52,7 @@ function multiplyDigits(left: string, right: string): string {
       const pos = i + j + 1;
       const current = result[pos];
       if (current === undefined) {
-        throw new Error('invalid decimal');
+        throw new PosSyncError('invalidDecimal');
       }
       result[pos] = current + leftDigit * (right.charCodeAt(j) - 48);
     }
@@ -60,7 +61,7 @@ function multiplyDigits(left: string, right: string): string {
     const current = result[k];
     const previous = result[k - 1];
     if (current === undefined || previous === undefined) {
-      throw new Error('invalid decimal');
+      throw new PosSyncError('invalidDecimal');
     }
     result[k] = current % 10;
     result[k - 1] = previous + Math.floor(current / 10);
@@ -116,7 +117,7 @@ function splitDecimal(value: Decimal): {
 /** Half away from zero, matching PostgreSQL numeric round. */
 export function roundDecimal(value: Decimal, places: number): Decimal {
   if (!Number.isInteger(places) || places < 0) {
-    throw new Error('invalid decimal places');
+    throw new PosSyncError('invalidDecimalPlaces');
   }
   if (value.digits === '0') {
     return { sign: 1, digits: '0', scale: 0 };

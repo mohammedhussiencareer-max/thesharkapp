@@ -4,6 +4,7 @@ import {
   createSupabaseDb,
   isUnknownOutcome,
   SupabaseRpcError,
+  SyncDiagnostic,
 } from './supabase-write.ts';
 import type { IngestCounts } from './types.ts';
 
@@ -157,6 +158,64 @@ describe('createSupabaseDb', () => {
     await expect(ingest.ingest(4, [], [], null)).rejects.toThrow(
       /^Supabase RPC failed: HTTP 409$/,
     );
+  });
+
+  it('never sends unchecked text passed directly to finishRun', async () => {
+    const marker = 'SyntheticMarker7f3a';
+    const bodies: unknown[] = [];
+    const db = createSupabaseDb(
+      'http://127.0.0.1:55421',
+      localServiceRoleKey,
+      async (_url, init) => {
+        if (typeof init.body !== 'string') {
+          throw new Error('request body is not a string');
+        }
+        bodies.push(JSON.parse(init.body) as unknown);
+        return new Response(null, { status: 204 });
+      },
+    );
+    const forged = Object.create(SyncDiagnostic.prototype) as SyncDiagnostic;
+    const branded = SyncDiagnostic.fromError(
+      Object.assign(new SupabaseRpcError('http', 400, '23505'), {
+        message: marker,
+      }),
+    );
+    await db.finishRun(4, 'failed', { read: 0 }, marker as never);
+    await db.finishRun(
+      4,
+      'failed',
+      { read: 0 },
+      new Error(`unexpected ${marker}`) as never,
+    );
+    await db.finishRun(4, 'failed', { read: 0 }, forged);
+    await db.finishRun(4, 'failed', { read: 0 }, branded);
+    expect(bodies).toEqual([
+      {
+        p_run_id: 4,
+        p_status: 'failed',
+        p_counts: { read: 0 },
+        p_error: 'sync failed',
+      },
+      {
+        p_run_id: 4,
+        p_status: 'failed',
+        p_counts: { read: 0 },
+        p_error: 'sync failed',
+      },
+      {
+        p_run_id: 4,
+        p_status: 'failed',
+        p_counts: { read: 0 },
+        p_error: 'sync failed',
+      },
+      {
+        p_run_id: 4,
+        p_status: 'failed',
+        p_counts: { read: 0 },
+        p_error: 'Supabase RPC failed: HTTP 400 23505',
+      },
+    ]);
+    expect(JSON.stringify(bodies)).not.toContain(marker);
   });
 });
 

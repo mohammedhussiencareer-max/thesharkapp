@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { safeErrorMessage } from './safe-error.ts';
+import { SyncDiagnostic } from './safe-error.ts';
 import {
   isUnknownOutcome,
   SupabaseRpcError,
@@ -36,9 +36,8 @@ export type DrainOutcome = {
   stop: DrainStop;
   calls: number;
   counts: AccountingCounts;
-  criticalOrderId: string | null;
   report: FailureReport | 'not_needed' | 'unreported' | null;
-  error: string | null;
+  error: SyncDiagnostic | null;
 };
 
 export type DrainOptions = {
@@ -84,17 +83,15 @@ export async function drainAccountingWork(
   let calls = 0;
   let stale = 0;
   let binding: AccountingOrderRef | null;
-  let criticalOrderId: string | null = null;
 
   const done = (
     stop: DrainStop,
     report: DrainOutcome['report'] = null,
-    error: string | null = null,
+    error: SyncDiagnostic | null = null,
   ): DrainOutcome => ({
     stop,
     calls,
     counts,
-    criticalOrderId,
     report,
     error,
   });
@@ -106,7 +103,7 @@ export async function drainAccountingWork(
     }
     binding = next.head;
   } catch (error) {
-    return done('call_failed', 'not_needed', safeErrorMessage(error));
+    return done('call_failed', 'not_needed', SyncDiagnostic.fromError(error));
   }
 
   for (;;) {
@@ -140,10 +137,6 @@ export async function drainAccountingWork(
     counts.failed += run.counts.failed;
     counts.remaining = run.counts.remaining;
     binding = run.head;
-    if (run.status === 'critical') {
-      criticalOrderId = run.critical?.orderId ?? null;
-      return done('critical');
-    }
     if (run.status !== 'processed') {
       return done(run.status);
     }
@@ -162,18 +155,17 @@ async function failedCall(
   done: (
     stop: DrainStop,
     report?: DrainOutcome['report'],
-    error?: string | null,
+    error?: SyncDiagnostic | null,
   ) => DrainOutcome,
 ): Promise<DrainOutcome> {
-  const message = safeErrorMessage(error);
+  const diagnostic = SyncDiagnostic.fromError(error);
   // An unbound call is maintenance and processed no order: nothing to charge.
   if (binding === null || !isUnknownOutcome(error)) {
-    return done('call_failed', 'not_needed', message);
+    return done('call_failed', 'not_needed', diagnostic);
   }
-  const kind =
-    error instanceof SupabaseRpcError && error.sqlstate === '57014'
-      ? 'recompute_timeout'
-      : 'escaped';
+  const kind = SupabaseRpcError.hasSqlstate(error, '57014')
+    ? 'recompute_timeout'
+    : 'escaped';
   const record = () =>
     kind === 'recompute_timeout'
       ? db.recordAccountingRecomputeTimeout(
@@ -202,12 +194,12 @@ async function failedCall(
       waited += pause;
       report = await record();
     }
-    return done('call_failed', report, message);
+    return done('call_failed', report, diagnostic);
   } catch (reportError) {
     return done(
       'call_failed',
       'unreported',
-      `${message}; ${safeErrorMessage(reportError)}`,
+      SyncDiagnostic.combine(error, reportError),
     );
   }
 }
@@ -227,14 +219,11 @@ export function formatDrain(outcome: DrainOutcome): string {
     `failed=${c.failed}`,
     `remaining=${c.remaining}`,
   ];
-  if (outcome.criticalOrderId !== null) {
-    parts.push(`critical_order=${outcome.criticalOrderId}`);
-  }
   if (outcome.report !== null) {
     parts.push(`report=${outcome.report}`);
   }
   if (outcome.error !== null) {
-    parts.push(`error=${outcome.error}`);
+    parts.push(`error=${SyncDiagnostic.render(outcome.error)}`);
   }
   return parts.join(' ');
 }
