@@ -6,12 +6,13 @@ import {
 } from '@/accounting/activation-action';
 import { loadOpeningReview } from '@/accounting/api';
 import { ActivationReview } from '@/accounting/ActivationReview';
-import type { OpeningReview } from '@/accounting/types';
+import type { ActivationWrite, OpeningReview } from '@/accounting/types';
 import { messageFrom } from '@/items/errors';
 import {
   clearActionPostedReloadSnapshot,
   snapshotActionPostedReloads,
 } from '@/items/request-id';
+import { clearVerifiedHeldWrite, getHeldWrite } from '@/lib/held-writes';
 import { offlineMoneyMessage, useReconnectReload } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 
@@ -34,6 +35,7 @@ export function ActivationPage() {
     const pendingReloads = snapshotActionPostedReloads({
       subject: ACTIVATION_SUBJECT,
     });
+    const capturedHeld = getHeldWrite<ActivationWrite>(ACTIVATION_SUBJECT);
     void (async () => {
       try {
         const next = await loadOpeningReview();
@@ -41,6 +43,9 @@ export function ActivationPage() {
         setReview(next);
         setLoadError(null);
         if (next.activated) {
+          if (capturedHeld && capturedHeld.phase !== 'posted_reload') {
+            await clearVerifiedHeldWrite(capturedHeld);
+          }
           await clearActionPostedReloadSnapshot(
             pendingReloads,
             ACTIVATION_SUBJECT,

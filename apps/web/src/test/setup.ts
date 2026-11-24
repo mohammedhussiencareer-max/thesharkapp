@@ -30,6 +30,7 @@ const auditedWriterSuites = new Set([
   'pages/SalesPage.processing.test.tsx',
   'pages/SortingPage.test.tsx',
   'pages/WastePage.test.tsx',
+  'pwa/pwa-held-writes.test.tsx',
   'recipes/api.test.ts',
 ]);
 let audit: ReturnType<typeof makeAuditedLocks> | undefined;

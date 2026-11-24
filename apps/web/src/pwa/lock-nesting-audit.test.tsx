@@ -424,7 +424,7 @@ describe('mechanical lock-nesting audit', () => {
 
   it('instrumentation fails when a context requests a second subject lock while holding one', async () => {
     allowNestedForControl = true;
-    const { locks, nested } = makeAuditedLocks();
+    const { locks, client, nested } = makeAuditedLocks();
     await locks.request('subject-a', { mode: 'exclusive' }, async () => {
       await locks.request('subject-b', { mode: 'exclusive' }, () => {});
     });
@@ -435,6 +435,36 @@ describe('mechanical lock-nesting audit', () => {
         requested: 'subject-b',
       },
     ]);
+
+    // A simulated tab using one stable audit client catches two overlapping claims on the same store.
+    const tabLocks = client('single-tab');
+    const tab = createHeldWriteStore({ getLocks: () => tabLocks });
+    tab.setHeldWriteUser(owner);
+    const first = await tab.claimFreshHeldWrite(lossSubject('nest-a'), () => ({
+      loss: '1',
+    }));
+    const second = await tab.claimFreshHeldWrite(
+      priceSubject('nest-b'),
+      () => ({ price: '2' }),
+    );
+    try {
+      expect(first.ok).toBe(true);
+      expect(second.ok).toBe(true);
+      expect(nested).toHaveLength(2);
+      const tabNested = nested[1];
+      expect(tabNested?.context).toBe('single-tab');
+      expect(tabNested?.holding).toHaveLength(1);
+      expect(tabNested?.holding[0]).toContain(
+        encodeURIComponent('loss:nest-a'),
+      );
+      expect(tabNested?.requested).toContain(
+        encodeURIComponent('price:nest-b'),
+      );
+    } finally {
+      if (first.ok) first.release();
+      if (second.ok) second.release();
+      tab.dispose();
+    }
   });
 
   it('WastePage / useWasteAction: success, definitive rejection, unknown, replay, and sibling cleanup never nest locks', async () => {
@@ -1053,18 +1083,22 @@ describe('mechanical lock-nesting audit', () => {
 
     // clearHeldWritesForUser across multiple subjects (one free, one busy transitioning active->posted)
     const { client, nested } = makeAuditedLocks();
-    const tabA = createHeldWriteStore({ getLocks: () => client('tab-a') });
-    const tabB = createHeldWriteStore({ getLocks: () => client('tab-b') });
+    const tabALocks = client('tab-a');
+    const tabBLocks = client('tab-b');
+    const tabA = createHeldWriteStore({ getLocks: () => tabALocks });
+    const tabB = createHeldWriteStore({ getLocks: () => tabBLocks });
     tabA.setHeldWriteUser(owner);
     tabB.setHeldWriteUser(owner);
     const c1 = await tabA.claimFreshHeldWrite(lossSubject('a1'), () => ({
       loss: '1',
     }));
+    if (!c1.ok) throw new Error('expected first claim');
+    c1.release();
+    await Promise.resolve();
     const c2 = await tabA.claimFreshHeldWrite(priceSubject('b1'), () => ({
       price: '2',
     }));
-    if (!c1.ok || !c2.ok) throw new Error('expected claims');
-    c1.release();
+    if (!c2.ok) throw new Error('expected second claim');
     try {
       tabB.setWritesLocked(true);
       tabB.clearHeldWritesForUser(owner);
@@ -1089,10 +1123,7 @@ describe('mechanical lock-nesting audit', () => {
       const c3 = await tabA.claimFreshHeldWrite(lossSubject('h1'), () => ({
         loss: '3',
       }));
-      const c4 = await tabA.claimFreshHeldWrite(priceSubject('h2'), () => ({
-        price: '4',
-      }));
-      if (!c3.ok || !c4.ok) throw new Error('expected hydration claims');
+      if (!c3.ok) throw new Error('expected first hydration claim');
       const spy = vi
         .spyOn(Storage.prototype, 'setItem')
         .mockImplementationOnce(() => {
@@ -1110,7 +1141,13 @@ describe('mechanical lock-nesting audit', () => {
       ).toThrow(HeldWriteStorageError);
       spy.mockRestore();
       c3.release();
+      await Promise.resolve();
+      const c4 = await tabA.claimFreshHeldWrite(priceSubject('h2'), () => ({
+        price: '4',
+      }));
+      if (!c4.ok) throw new Error('expected second hydration claim');
       c4.release();
+      await Promise.resolve();
       await act(async () => {
         await tabA.rehydrateHeldWritesAsync();
       });

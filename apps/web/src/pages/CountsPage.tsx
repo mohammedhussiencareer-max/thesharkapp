@@ -40,6 +40,7 @@ import {
   COUNT_STORED_PREFIX,
   getHeldWrite,
   hasDurableHeldWrite,
+  hasPostedReload,
   listHeldWritesByPrefix,
   readLockedHeldWrite,
   readLockedPostedWrite,
@@ -299,18 +300,36 @@ export function CountsPage() {
     fromForm: boolean,
     storedSubject: string | null,
     daily: HeldWriteRecord<CountDraft> | null,
+    stored: HeldWriteRecord<Json> | null,
   ): void {
     const matchesDaily = requestId !== null && daily?.requestId === requestId;
-    if (fromForm || matchesDaily) {
-      if (daily && requestId !== null && daily.requestId === requestId) {
+    const matchesStored =
+      storedSubject !== null &&
+      requestId !== null &&
+      stored?.requestId === requestId;
+    let firstError: Error | null = null;
+    if (matchesDaily) {
+      try {
         setHeldWritePhase(COUNT_DAILY_SUBJECT, requestId, 'posted_reload', {
           expected: daily,
         });
+      } catch (error) {
+        firstError =
+          error instanceof Error ? error : new Error(messageFrom(error));
       }
-      setFormEpoch((value) => value + 1);
     }
-    if (storedSubject && requestId !== null) {
-      setHeldWritePhase(storedSubject, requestId, 'posted_reload');
+    if (matchesStored) {
+      try {
+        setHeldWritePhase(storedSubject, requestId, 'posted_reload', {
+          expected: stored,
+        });
+      } catch (error) {
+        firstError ??=
+          error instanceof Error ? error : new Error(messageFrom(error));
+      }
+    }
+    if (fromForm || matchesDaily) {
+      setFormEpoch((value) => value + 1);
     }
     setWaitNotice((current) =>
       current !== null && current === requestId ? null : current,
@@ -320,6 +339,9 @@ export function CountsPage() {
     // for a successful read.
     setLocalNeedsReload(true);
     setSuccess('اتسجل الجرد');
+    if (firstError !== null) {
+      throw firstError;
+    }
   }
 
   function holdUnknown(
@@ -360,6 +382,7 @@ export function CountsPage() {
     requestId: string | null,
     storedSubject: string | null,
     daily: HeldWriteRecord<CountDraft> | null,
+    stored: HeldWriteRecord<Json> | null,
     release: () => void,
   ): Promise<boolean> {
     if (result.status === 'waiting_for_sync') {
@@ -368,8 +391,8 @@ export function CountsPage() {
           expected: daily,
         });
       }
-      if (storedSubject && requestId) {
-        clearHeldWrite(storedSubject, requestId);
+      if (storedSubject && stored && requestId === stored.requestId) {
+        clearHeldWrite(storedSubject, requestId, stored);
       }
       setWaitNotice(requestId ?? draft?.requestId ?? null);
       setSuccess(null);
@@ -377,7 +400,7 @@ export function CountsPage() {
       await refreshAfterWait();
       return false;
     }
-    applyPosted(requestId, draft !== null, storedSubject, daily);
+    applyPosted(requestId, draft !== null, storedSubject, daily, stored);
     // The readback may cover pins owned by other count writers.
     release();
     await reloadPostedCounts(captureWriteSession());
@@ -414,9 +437,33 @@ export function CountsPage() {
     // transmission restores `unknown`. Refuse to send if storage fails.
     const storedDraft = toStoredCountDraft(draft);
     const storedSubject = `${COUNT_STORED_PREFIX}${draft.requestId}`;
-    const checkConflict = () =>
-      readLockedPostedWrite(COUNT_DAILY_SUBJECT, draft.requestId) ??
-      readLockedPostedWrite(storedSubject, draft.requestId);
+    const matchingStored: { record: HeldWriteRecord<Json> | null } = {
+      record: null,
+    };
+    const checkConflict = () => {
+      const dailyPosted = readLockedPostedWrite(
+        COUNT_DAILY_SUBJECT,
+        draft.requestId,
+      );
+      const cardPosted = readLockedPostedWrite(storedSubject, draft.requestId);
+      const currentStored = readLockedHeldWrite<Json>(storedSubject);
+      if (
+        currentStored?.requestId === draft.requestId &&
+        currentStored.phase !== 'posted_reload'
+      ) {
+        matchingStored.record = currentStored;
+      }
+      if (cardPosted) {
+        const staleDaily = readLockedHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
+        if (
+          staleDaily?.requestId === draft.requestId &&
+          staleDaily.phase !== 'posted_reload'
+        ) {
+          clearHeldWrite(COUNT_DAILY_SUBJECT, draft.requestId, staleDaily);
+        }
+      }
+      return dailyPosted ?? cardPosted;
+    };
     const claim =
       priorPhase !== null
         ? await claimReplayHeldWrite<CountDraft>(
@@ -476,13 +523,21 @@ export function CountsPage() {
         result,
         draft,
         draft.requestId,
-        null,
+        matchingStored.record ? storedSubject : null,
         claim.record,
+        matchingStored.record,
         claim.release,
       );
     } catch (error) {
       if (!saved) {
         holdUnknown(draft, error, priorPhase);
+        if (
+          isPayloadRefusal(error) &&
+          matchingStored.record &&
+          matchingStored.record.requestId === draft.requestId
+        ) {
+          clearHeldWrite(storedSubject, draft.requestId, matchingStored.record);
+        }
       } else {
         setLocalNeedsReload(true);
         setLoadError(messageFrom(error));
@@ -500,6 +555,7 @@ export function CountsPage() {
     const storedSubject =
       requestId !== null ? `${COUNT_STORED_PREFIX}${requestId}` : null;
     let releaseLock = () => {};
+    let storedRecord: HeldWriteRecord<Json> | null = null;
     const matchingDaily: { record: HeldWriteRecord<CountDraft> | null } = {
       record: null,
     };
@@ -566,6 +622,7 @@ export function CountsPage() {
         return;
       }
       releaseLock = claim.release;
+      storedRecord = claim.record;
     }
     const canDispatch =
       storedSubject && requestId !== null
@@ -605,6 +662,7 @@ export function CountsPage() {
         requestId,
         storedSubject,
         daily,
+        storedRecord,
         releaseLock,
       );
     } catch (error) {
@@ -664,7 +722,13 @@ export function CountsPage() {
     if (
       serverPendingIds.has(requestId) ||
       requestId === waiting?.requestId ||
-      requestId === pending?.requestId
+      requestId === pending?.requestId ||
+      hasPostedReload(COUNT_DAILY_SUBJECT, undefined, requestId) ||
+      hasPostedReload(
+        `${COUNT_STORED_PREFIX}${requestId}`,
+        undefined,
+        requestId,
+      )
     ) {
       continue;
     }

@@ -37,9 +37,11 @@ import { pendingResendMessage as expensePendingMessage } from '@/expenses/errors
 import type { ExpenseMonth } from '@/expenses/types';
 import { unknownSaveMessage } from '@/items/request-id';
 import {
-  beginHeldWrite,
+  claimFreshHeldWrite,
   clearHeldWrite,
   rehydrateHeldWrites,
+  rehydrateHeldWritesAsync,
+  resetHeldWritesStore,
 } from '@/lib/held-writes';
 import { setTestWaitingWorker } from '@/lib/pwa';
 import { setBaseMapping } from '@/mapping/api';
@@ -355,7 +357,8 @@ describe('held writes and offline behavior across writers', () => {
     expect(localStorage.length).toBeGreaterThan(0);
 
     view.unmount();
-    rehydrateHeldWrites();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
 
     // Fresh mount must restore unknown without auto-sending.
     render(
@@ -415,7 +418,8 @@ describe('held writes and offline behavior across writers', () => {
     expect(serverLedger.size).toBe(1);
 
     view.unmount();
-    rehydrateHeldWrites();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
 
     render(
       <MemoryRouter>
@@ -492,7 +496,8 @@ describe('held writes and offline behavior across writers', () => {
     expect(localStorage.length).toBeGreaterThan(0);
 
     view.unmount();
-    rehydrateHeldWrites();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
 
     // Reopen while read still fails: posted_reload stays held and save stays locked.
     render(
@@ -538,7 +543,8 @@ describe('held writes and offline behavior across writers', () => {
     const first = vi.mocked(recordPurchase).mock.calls[0]?.[0];
 
     view.unmount();
-    rehydrateHeldWrites();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
 
     render(
       <MemoryRouter>
@@ -557,6 +563,8 @@ describe('held writes and offline behavior across writers', () => {
   });
 
   it('reload restores opening stock payload', async () => {
+    expect(navigator.locks).toBeDefined();
+    const lockSpy = vi.spyOn(navigator.locks, 'request');
     vi.mocked(listStockChoices).mockResolvedValue([openingOil]);
     vi.mocked(recordOpeningStock).mockRejectedValueOnce(new Error('socket'));
     const view = render(
@@ -577,9 +585,16 @@ describe('held writes and offline behavior across writers', () => {
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('socket');
     const first = vi.mocked(recordOpeningStock).mock.calls[0]?.[0];
+    expect(lockSpy).toHaveBeenCalledWith(
+      expect.stringContaining(encodeURIComponent('opening:new')),
+      expect.objectContaining({ mode: 'exclusive' }),
+      expect.any(Function),
+    );
+    const firstLockCalls = lockSpy.mock.calls.length;
 
     view.unmount();
-    rehydrateHeldWrites();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
 
     // Even if server already moved oil out of candidates, pinned retry stays available.
     vi.mocked(listStockChoices).mockResolvedValue([oil]);
@@ -594,6 +609,7 @@ describe('held writes and offline behavior across writers', () => {
       expect(recordOpeningStock).toHaveBeenCalledTimes(2);
     });
     expect(vi.mocked(recordOpeningStock).mock.calls[1]?.[0]).toEqual(first);
+    expect(lockSpy.mock.calls.length).toBeGreaterThan(firstLockCalls);
   });
 
   it('reload restores sort payload', async () => {
@@ -618,7 +634,8 @@ describe('held writes and offline behavior across writers', () => {
     const first = vi.mocked(recordSort).mock.calls[0]?.[0];
 
     view.unmount();
-    rehydrateHeldWrites();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
 
     render(
       <MemoryRouter>
@@ -652,7 +669,8 @@ describe('held writes and offline behavior across writers', () => {
     const first = vi.mocked(addExpenseEntry).mock.calls[0]?.[0];
 
     view.unmount();
-    rehydrateHeldWrites();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
 
     render(
       <MemoryRouter>
@@ -687,7 +705,8 @@ describe('held writes and offline behavior across writers', () => {
     const first = vi.mocked(setBaseMapping).mock.calls[0]?.[0];
 
     view.unmount();
-    rehydrateHeldWrites();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
 
     render(
       <SubjectPanel
@@ -857,9 +876,10 @@ describe('held writes and offline behavior across writers', () => {
       vi.stubEnv('PROD', true);
       initPwa(reload);
       setTestWaitingWorker({ postMessage } as unknown as ServiceWorker);
-      const held = beginHeldWrite('count:daily', (requestId) => ({
+      const held = await claimFreshHeldWrite('count:daily', (requestId) => ({
         requestId,
       }));
+      if (!held.ok) throw new Error('expected held write claim');
 
       const { AuthContext } = await import('@/lib/auth-context');
       render(
@@ -882,26 +902,28 @@ describe('held writes and offline behavior across writers', () => {
       expect(reload).not.toHaveBeenCalled();
 
       // Clear pin -> owner approves update.
-      act(() => {
-        clearHeldWrite('count:daily', held.requestId);
+      await act(async () => {
+        clearHeldWrite('count:daily', held.record.requestId);
+        held.release();
+        await Promise.resolve();
       });
       expect(button).toBeEnabled();
       fireEvent.click(button);
       expect(postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
 
       // A pin appears AFTER approval and BEFORE controllerchange fires -> NO reload!
-      act(() => {
-        beginHeldWrite('purchase:new', (requestId) => ({ requestId }));
-      });
+      const held2 = await claimFreshHeldWrite('purchase:new', (requestId) => ({
+        requestId,
+      }));
+      if (!held2.ok) throw new Error('expected second held write claim');
       for (const listener of controllerListeners) listener();
       expect(reload).not.toHaveBeenCalled();
 
       // Also verify controllerchange DOES reload when no pin is held and approved again.
-      const held2 = beginHeldWrite('purchase:new', (requestId) => ({
-        requestId,
-      }));
-      act(() => {
-        clearHeldWrite('purchase:new', held2.requestId);
+      await act(async () => {
+        clearHeldWrite('purchase:new', held2.record.requestId);
+        held2.release();
+        await Promise.resolve();
       });
       fireEvent.click(button);
       for (const listener of controllerListeners) listener();

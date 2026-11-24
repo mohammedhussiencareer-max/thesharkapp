@@ -307,6 +307,16 @@ function sameAcknowledgedClaim(
 export const COUNT_DAILY_SUBJECT = 'count:daily';
 export const COUNT_STORED_PREFIX = 'count:stored:';
 
+function countAliasSubject(subject: string, requestId: string): string | null {
+  if (subject === COUNT_DAILY_SUBJECT) {
+    return `${COUNT_STORED_PREFIX}${requestId}`;
+  }
+  if (subject === `${COUNT_STORED_PREFIX}${requestId}`) {
+    return COUNT_DAILY_SUBJECT;
+  }
+  return null;
+}
+
 export type HeldWriteStoreOptions = {
   getStorage?: () => Storage | null;
   getProjectUrl?: () => string;
@@ -329,8 +339,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   let userScope: UserScopeState = { mode: 'uninitialized' };
   let writesLocked = false;
   let sessionGeneration = 0;
+  let hydrationRunId = 0;
   let hydratedScopeKey: string | null = null;
   let hydrationPromise: Promise<void> = Promise.resolve();
+  const deferredPromotions: Array<() => void> = [];
   const records = new Map<string, HeldWriteRecord>();
   const postedReloads = new Map<string, HeldWriteRecord>();
   // Tracks commits whose RPC succeeded but whose `posted_reload` storage write
@@ -536,6 +548,21 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
                     activeLockReleases.delete(lockName);
                   }
                   releaseLock();
+                  if (
+                    activeLockReleases.size === 0 &&
+                    deferredPromotions.length > 0
+                  ) {
+                    const queued = deferredPromotions.splice(0);
+                    void Promise.resolve()
+                      .then(() => Promise.resolve())
+                      .then(() => {
+                        if (activeLockReleases.size > 0) {
+                          deferredPromotions.push(...queued);
+                          return;
+                        }
+                        for (const run of queued) run();
+                      });
+                  }
                 };
                 activeLockReleases.set(lockName, releaseFn);
                 finish(true);
@@ -618,6 +645,55 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       : null;
   }
 
+  function readAliasPostedCopy(
+    active: Pick<HeldWriteRecord, 'subject' | 'requestId'>,
+    userId: string,
+    projectUrl = getProjectUrl(),
+  ): HeldWriteRecord | null {
+    const alias = countAliasSubject(active.subject, active.requestId);
+    if (!alias) return null;
+    return readPostedCopy(
+      { subject: alias, requestId: active.requestId },
+      userId,
+      projectUrl,
+    );
+  }
+
+  function cancelPendingPromotions(): void {
+    hydrationRunId += 1;
+    deferredPromotions.length = 0;
+  }
+
+  function promoteExpectedUnderLock(
+    userId: string,
+    projectUrl: string,
+    expected: HeldWriteRecord,
+  ): boolean {
+    const { subject } = expected;
+    try {
+      const stored = readDurableRecord(
+        entryStorageKey(subject, userId, projectUrl),
+      );
+      if (!stored || !sameClaim(stored, expected)) return false;
+      const posted =
+        readPostedCopy(stored, userId, projectUrl) ??
+        readAliasPostedCopy(stored, userId, projectUrl);
+      if (posted) {
+        observePostedCopy(posted);
+        if (records.get(subject)?.requestId === stored.requestId) {
+          records.delete(subject);
+        }
+        return true;
+      }
+      const promoted: HeldWriteRecord = { ...stored, phase: 'unknown' };
+      if (!writeRecordToStorage(promoted, userId)) return false;
+      records.set(subject, promoted);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function observePostedCopy(posted: HeldWriteRecord): void {
     if (records.get(posted.subject)?.requestId === posted.requestId) {
       records.delete(posted.subject);
@@ -662,11 +738,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       records.set(parsed.subject, parsed);
     }
 
-    // A posted copy can outlive a failed removal of the active slot.
+    // A posted copy can outlive a failed removal of the active slot or its count alias.
     // Resolve the pair after scanning both slots, regardless of key order.
     for (const [subject, active] of records) {
       const mapKey = postedMapKey(subject, active.requestId);
-      if (postedReloads.has(mapKey)) {
+      const alias = countAliasSubject(subject, active.requestId);
+      if (
+        postedReloads.has(mapKey) ||
+        (alias !== null &&
+          postedReloads.has(postedMapKey(alias, active.requestId)))
+      ) {
         records.delete(subject);
         continue;
       }
@@ -679,9 +760,14 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         const key = entryStorageKey(subject, userId, projectUrl);
         const stored = readDurableRecord(key);
         if (!stored || !sameClaim(stored, active)) continue;
-        const posted = readPostedCopy(stored, userId, projectUrl);
+        const posted =
+          readPostedCopy(stored, userId, projectUrl) ??
+          readAliasPostedCopy(stored, userId, projectUrl);
         if (posted) {
           observePostedCopy(posted);
+          if (records.get(subject)?.requestId === stored.requestId) {
+            records.delete(subject);
+          }
           continue;
         }
         const promoted: HeldWriteRecord = { ...stored, phase: 'unknown' };
@@ -706,6 +792,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     userId: string,
     projectUrl: string,
     expectedRecords: readonly HeldWriteRecord[],
+    runId: number,
   ): Promise<void> {
     if (expectedRecords.length === 0) return;
     const locks = getLocks();
@@ -726,47 +813,109 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
 
     let changed = false;
+    const busyByLock = new Map<string, HeldWriteRecord[]>();
+    const deferBusy = (lockName: string, expected: HeldWriteRecord) => {
+      const group = busyByLock.get(lockName);
+      if (group) group.push(expected);
+      else busyByLock.set(lockName, [expected]);
+    };
+
     for (const expected of expectedRecords) {
       const { subject } = expected;
-      if (activeUserId() !== userId || hydratedScopeKey !== scopeKey) return;
+      if (
+        hydrationRunId !== runId ||
+        activeUserId() !== userId ||
+        hydratedScopeKey !== scopeKey
+      ) {
+        return;
+      }
       const lockName = subjectLockKey(subject, userId, projectUrl);
-      if (heldNames.has(lockName) || activeLockReleases.has(lockName)) {
+      if (heldNames.has(lockName) || activeLockReleases.size > 0) {
+        deferBusy(lockName, expected);
         continue;
       }
       try {
+        let lockBusy = false;
         await locks.request(
           lockName,
           { mode: 'exclusive', ifAvailable: true },
           (lock) => {
-            if (!lock) return;
-            if (activeUserId() !== userId || hydratedScopeKey !== scopeKey) {
+            if (!lock) {
+              lockBusy = true;
               return;
             }
-            const stored = readDurableRecord(
-              entryStorageKey(subject, userId, projectUrl),
-            );
-            if (!stored || !sameClaim(stored, expected)) return;
-            const posted = readPostedCopy(stored, userId, projectUrl);
-            if (posted) {
-              observePostedCopy(posted);
-            } else {
-              const promoted: HeldWriteRecord = { ...stored, phase: 'unknown' };
-              if (!writeRecordToStorage(promoted, userId)) return;
-              records.set(subject, promoted);
+            if (
+              hydrationRunId !== runId ||
+              activeUserId() !== userId ||
+              hydratedScopeKey !== scopeKey
+            ) {
+              return;
             }
-            changed = true;
+            if (promoteExpectedUnderLock(userId, projectUrl, expected)) {
+              changed = true;
+            }
           },
         );
+        if (lockBusy) {
+          deferBusy(lockName, expected);
+        }
       } catch {
         // Ignore lock errors on best-effort promotion.
       }
     }
     if (changed) emit();
+
+    // Recheck any exact pins skipped on a busy lock once that lock frees,
+    // without blocking hydrationPromise or nesting on local locks.
+    for (const [lockName, group] of busyByLock) {
+      const queueRecheck = () => {
+        if (
+          hydrationRunId !== runId ||
+          activeUserId() !== userId ||
+          hydratedScopeKey !== scopeKey
+        ) {
+          return;
+        }
+        if (activeLockReleases.size > 0) {
+          deferredPromotions.push(queueRecheck);
+          return;
+        }
+        const currentLocks = getLocks();
+        if (!currentLocks) return;
+        void Promise.resolve(
+          currentLocks.request(lockName, { mode: 'exclusive' }, (lock) => {
+            if (
+              !lock ||
+              hydrationRunId !== runId ||
+              activeUserId() !== userId ||
+              hydratedScopeKey !== scopeKey
+            ) {
+              return;
+            }
+            let promotedAny = false;
+            for (const item of group) {
+              if (promoteExpectedUnderLock(userId, projectUrl, item)) {
+                promotedAny = true;
+              }
+            }
+            if (promotedAny) emit();
+          }),
+        ).catch(() => {
+          // Ignore lock errors on best-effort deferred promotion.
+        });
+      };
+      if (activeLockReleases.size > 0) {
+        deferredPromotions.push(queueRecheck);
+      } else {
+        queueRecheck();
+      }
+    }
   }
 
   function ensureHydrated(): void {
     const userId = activeUserId();
     if (userId === null) {
+      cancelPendingPromotions();
       if (records.size > 0) records.clear();
       if (postedReloads.size > 0) postedReloads.clear();
       hydratedScopeKey = null;
@@ -775,6 +924,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const projectUrl = getProjectUrl();
     const scopeKey = userStoragePrefix(userId, projectUrl);
     if (hydratedScopeKey === scopeKey) return;
+    cancelPendingPromotions();
+    const runId = hydrationRunId;
     hydratedScopeKey = scopeKey;
     const locksAvailable = getLocks() !== null;
     const inflightRecords = loadScopeFromStorage(userId, !locksAvailable);
@@ -783,6 +934,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         userId,
         projectUrl,
         inflightRecords,
+        runId,
       );
     } else {
       hydrationPromise = Promise.resolve();
@@ -814,6 +966,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
 
   function dispose(): void {
     sessionGeneration += 1;
+    cancelPendingPromotions();
     releaseAllLocks();
     if (
       typeof window !== 'undefined' &&
@@ -839,6 +992,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     writesLocked = locked;
     if (locked) {
       sessionGeneration += 1;
+      cancelPendingPromotions();
       // Keep any already-dispatched Web Lock held until its RPC settles;
       // locking writes blocks NEW dispatches only.
       hydratedScopeKey = null;
@@ -880,6 +1034,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (userScope.mode !== 'signed_out') {
         sessionGeneration += 1;
       }
+      cancelPendingPromotions();
       userScope = { mode: 'signed_out' };
       // Do NOT release already-dispatched Web Locks on sign-out; each live
       // writer releases its lock when its HTTP call settles. Sign-out blocks
@@ -992,6 +1147,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   }
 
   function rehydrateHeldWrites(): void {
+    cancelPendingPromotions();
     hydratedScopeKey = null;
     records.clear();
     postedReloads.clear();
@@ -1851,7 +2007,18 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const userId = activeUserId();
     if (userId === null) return;
     await mutateUnderSubjectLock(record.subject, userId, () => {
-      clearHeldWrite(record.subject, record.requestId, record);
+      const stored = readLockedHeldWrite(record.subject);
+      if (!stored) {
+        clearHeldWrite(record.subject, record.requestId, record);
+        return;
+      }
+      const matchesPromoted =
+        record.phase === 'inflight' &&
+        stored.phase === 'unknown' &&
+        sameClaim({ ...stored, phase: 'inflight' }, record);
+      if (sameClaim(stored, record) || matchesPromoted) {
+        clearHeldWrite(record.subject, record.requestId, stored);
+      }
     });
   }
 
@@ -1929,6 +2096,27 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       let changed = false;
       try {
         let active = readDurableRecord(activeKey);
+        const clearAliasActive = (requestId: string): void => {
+          const aliasSubject = countAliasSubject(subject, requestId);
+          if (!aliasSubject) return;
+          const aliasKey = entryStorageKey(aliasSubject, userId);
+          const aliasActive = readDurableRecord(aliasKey);
+          if (
+            aliasActive?.subject === aliasSubject &&
+            aliasActive.requestId === requestId
+          ) {
+            removeDurableRecord(aliasKey);
+            if (records.get(aliasSubject)?.requestId === requestId) {
+              records.delete(aliasSubject);
+            }
+            if (
+              acknowledgedInflight.get(aliasSubject)?.requestId === requestId
+            ) {
+              acknowledgedInflight.delete(aliasSubject);
+            }
+            changed = true;
+          }
+        };
         for (const key of [...candidates, activeKey]) {
           const stored = key === activeKey ? active : readDurableRecord(key);
           if (
@@ -1942,8 +2130,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
               key !== postedStorageKey(subject, stored.requestId, userId))
           )
             continue;
-          // Clear the active duplicate first so a failed removal leaves the
-          // authoritative posted record available for another verification.
+          // Clear the active duplicate and any exact count alias first so a
+          // failed removal leaves the authoritative posted record available.
           if (
             active?.subject === subject &&
             active.requestId === stored.requestId
@@ -1954,6 +2142,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
               records.delete(subject);
             changed = true;
           }
+          clearAliasActive(stored.requestId);
           if (key !== activeKey) removeDurableRecord(key);
           postedReloads.delete(postedMapKey(subject, stored.requestId));
           changed = true;
@@ -1963,6 +2152,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
           if (active && sameAcknowledgedClaim(active, ack.record)) {
             removeDurableRecord(activeKey);
           }
+          clearAliasActive(ack.requestId);
           // A different claim owns the active slot. Retire only this tab's
           // acknowledgement so it cannot settle that claim on a later read.
           acknowledgedInflight.delete(subject);
@@ -2109,6 +2299,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     clearStorage?: boolean;
     resetUser?: boolean;
   }): void {
+    cancelPendingPromotions();
     releaseAllLocks();
     const shouldClearStorage = resetOptions?.clearStorage !== false;
     if (shouldClearStorage) {

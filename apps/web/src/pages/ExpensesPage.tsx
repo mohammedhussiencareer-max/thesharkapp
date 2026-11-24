@@ -67,6 +67,11 @@ type RequestlessVerifyState = {
   readError: string | null;
 };
 
+type LocalReloadLock = {
+  id: number;
+  targetMonth: string;
+};
+
 /** Stored in localStorage for void retries: request id, reason, and target month (no cached money). */
 type StoredVoidPayload = {
   id: string;
@@ -188,7 +193,36 @@ export function ExpensesPage() {
   const globalReadSeqRef = useRef(0);
   const readsRef = useRef(0);
   const savingRef = useRef(false);
-  const needsReloadRef = useRef(false);
+  const reloadLockSeqRef = useRef(0);
+  const reloadLockRef = useRef<LocalReloadLock | null>(null);
+
+  const raiseLocalReloadLock = useCallback(
+    (targetMonth: string): LocalReloadLock => {
+      const lock: LocalReloadLock = {
+        id: ++reloadLockSeqRef.current,
+        targetMonth,
+      };
+      reloadLockRef.current = lock;
+      setLocalNeedsReload(true);
+      return lock;
+    },
+    [],
+  );
+
+  const releaseLocalReloadLock = useCallback(
+    (captured: LocalReloadLock | null, loadedMonthStart: string): void => {
+      if (
+        captured !== null &&
+        reloadLockRef.current === captured &&
+        (captured.targetMonth === '*' ||
+          captured.targetMonth === loadedMonthStart)
+      ) {
+        reloadLockRef.current = null;
+        setLocalNeedsReload(false);
+      }
+    },
+    [],
+  );
 
   const setCompleteVerifyState = useCallback(
     (next: RequestlessVerifyState | null) => {
@@ -419,6 +453,7 @@ export function ExpensesPage() {
     const displayedMonthStart = `${month}-01`;
     const completeAttempt = completeVerifyRef.current;
     const categoryAttempt = categoryVerifyRef.current;
+    const capturedReloadLock = reloadLockRef.current;
     const pendingReloads = snapshotExpensePostedReloads();
     void (async () => {
       try {
@@ -440,8 +475,7 @@ export function ExpensesPage() {
         );
         await reconcileCommittedVoids(result.data.entries);
         await clearPostedReloadSnapshot(pendingReloads, result.data.monthStart);
-        needsReloadRef.current = false;
-        setLocalNeedsReload(false);
+        releaseLocalReloadLock(capturedReloadLock, result.data.monthStart);
       } catch (error) {
         if (cancelled) return;
         setLoadError(messageFrom(error));
@@ -455,6 +489,7 @@ export function ExpensesPage() {
     loadId,
     readExpenseMonthTarget,
     reconcileRequestlessVerifyOnMonth,
+    releaseLocalReloadLock,
   ]);
 
   function retry() {
@@ -466,7 +501,7 @@ export function ExpensesPage() {
   function changeMonth(next: string) {
     if (
       savingRef.current ||
-      needsReloadRef.current ||
+      reloadLockRef.current !== null ||
       postedReloadForCurrentMonth
     )
       return;
@@ -562,7 +597,7 @@ export function ExpensesPage() {
           categoryVerifyRef.current.status !== 'verified';
     if (
       savingRef.current ||
-      needsReloadRef.current ||
+      reloadLockRef.current !== null ||
       postedReloadForTarget(targetMonth) ||
       readsRef.current > 0 ||
       blocked ||
@@ -582,8 +617,9 @@ export function ExpensesPage() {
     else setCategoryVerifyState(null);
     try {
       await action();
-      needsReloadRef.current = true;
-      setLocalNeedsReload(true);
+      const reloadLock = raiseLocalReloadLock(
+        kind === 'category' ? '*' : targetMonth,
+      );
       try {
         const pendingReloads = snapshotExpensePostedReloads();
         const result = await readExpenseMonthTarget(targetMonth);
@@ -598,8 +634,7 @@ export function ExpensesPage() {
             pendingReloads,
             result.data.monthStart,
           );
-          needsReloadRef.current = false;
-          setLocalNeedsReload(false);
+          releaseLocalReloadLock(reloadLock, result.data.monthStart);
         }
       } catch (readError) {
         setLoadError(messageFrom(readError));
@@ -634,7 +669,7 @@ export function ExpensesPage() {
     const effectiveTarget = guard.readTarget ?? displayedMonthStart;
     if (
       savingRef.current ||
-      needsReloadRef.current ||
+      reloadLockRef.current !== null ||
       postedReloadForTarget(effectiveTarget) ||
       readsRef.current > 0 ||
       !isOnline()
@@ -656,8 +691,7 @@ export function ExpensesPage() {
     try {
       await action();
       saved = true;
-      needsReloadRef.current = true;
-      setLocalNeedsReload(true);
+      const reloadLock = raiseLocalReloadLock(displayedMonthStart);
       try {
         try {
           await onSaved();
@@ -671,8 +705,7 @@ export function ExpensesPage() {
           setLoadError(null);
           await reconcileCommittedVoids(next.entries);
           await clearPostedReloadSnapshot(pendingReloads, next.monthStart);
-          needsReloadRef.current = false;
-          setLocalNeedsReload(false);
+          releaseLocalReloadLock(reloadLock, next.monthStart);
         }
       } catch (error) {
         // The write is already stored. Stay locked until a later read applies,
@@ -695,7 +728,7 @@ export function ExpensesPage() {
     const targetMonth = expenseTargetMonth(draft, monthRef.current);
     if (
       savingRef.current ||
-      needsReloadRef.current ||
+      reloadLockRef.current !== null ||
       postedReloadForTarget(targetMonth) ||
       readsRef.current > 0 ||
       !isOnline()
@@ -787,7 +820,7 @@ export function ExpensesPage() {
   async function voidEntry(id: string, typedReason: string) {
     if (
       savingRef.current ||
-      needsReloadRef.current ||
+      reloadLockRef.current !== null ||
       postedReloadForCurrentMonth ||
       readsRef.current > 0 ||
       !isOnline()

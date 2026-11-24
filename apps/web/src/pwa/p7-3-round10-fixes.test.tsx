@@ -15,6 +15,7 @@ import {
   listCounts,
   listDailyItems,
   listPendingCounts,
+  recordCount,
   recordStoredCount,
 } from '@/counts/api';
 import {
@@ -50,6 +51,8 @@ import {
 } from '@/items/request-id';
 import type { CatalogItem, DatedWrite } from '@/items/types';
 import {
+  COUNT_DAILY_SUBJECT,
+  COUNT_STORED_PREFIX,
   createHeldWriteStore,
   clearPostedReload,
   claimFreshHeldWrite,
@@ -1265,12 +1268,15 @@ describe('P7-3 round-10 review fixes', () => {
 
   it('R14-1: queued sign-out follows a captured claim into the posted slot and respects session and newer-claim guards', async () => {
     const { client, nested } = makeAuditedLocks();
-    const writer = createHeldWriteStore({ getLocks: () => client('writer-1') });
+    const writerLocks = client('writer-1');
+    const writerNewerLocks = client('writer-2');
+    const signerLocks = client('signing-out tab');
+    const writer = createHeldWriteStore({ getLocks: () => writerLocks });
     const writerNewer = createHeldWriteStore({
-      getLocks: () => client('writer-2'),
+      getLocks: () => writerNewerLocks,
     });
     const signer = createHeldWriteStore({
-      getLocks: () => client('signing-out tab'),
+      getLocks: () => signerLocks,
     });
     const subject = lossSubject('oil');
     const subjectNewer = lossSubject('box');
@@ -1319,8 +1325,9 @@ describe('P7-3 round-10 review fixes', () => {
 
       // Session guard: if the same user signs back in before a queued cleanup runs, keep their pin.
       signer.setHeldWriteUser(owner);
+      const writer2Locks = client('writer-3');
       const writer2 = createHeldWriteStore({
-        getLocks: () => client('writer-3'),
+        getLocks: () => writer2Locks,
       });
       writer2.setHeldWriteUser(owner);
       const claimResign = await writer2.claimFreshHeldWrite(
@@ -2169,5 +2176,461 @@ describe('P7-3 round-10 review fixes', () => {
     });
     expect(hasAnyHeldWrite()).toBe(false);
     expect(localStorage.length).toBe(0);
+  });
+
+  it('R15-1a: a confirmed daily count retry settles a matching unknown stored-card alias so no detached retry card remains', async () => {
+    const requestId = 'd1900000-0000-4000-8000-000000000071';
+    const countedAt = '2026-10-22T10:00:00.000Z';
+    const storedSubject = `${COUNT_STORED_PREFIX}${requestId}`;
+    const storedPayload = {
+      request_id: requestId,
+      frequency: 'daily',
+      counted_at: countedAt,
+      note: null,
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
+    };
+    const dailyDraft = {
+      requestId,
+      countedAt,
+      note: null,
+      lines: [{ itemId: 'tilapia', countedQty: '7', expectedBaseUnit: 'kg' }],
+    };
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([]);
+    vi.mocked(recordCount).mockResolvedValueOnce({
+      status: 'posted',
+      countId: 'count-r15-1a',
+    });
+
+    putHeldWrite(COUNT_DAILY_SUBJECT, {
+      requestId,
+      payload: dailyDraft,
+      phase: 'unknown',
+      kind: 'count',
+    });
+    putHeldWrite(storedSubject, {
+      requestId,
+      payload: storedPayload,
+      phase: 'unknown',
+      kind: 'count_stored',
+    });
+
+    render(
+      <MemoryRouter>
+        <CountsPage />
+      </MemoryRouter>,
+    );
+    const saveBtn = await screen.findByRole('button', { name: 'حفظ' });
+    fireEvent.click(saveBtn);
+
+    await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(getHeldWrite(COUNT_DAILY_SUBJECT)).toBeNull());
+    expect(getHeldWrite(storedSubject)).toBeNull();
+    expect(
+      screen.queryByRole('button', { name: 'سجّل الجرد' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('R15-1b: a confirmed daily count retains posted proof if stored-alias cleanup fails and clears both on recovery', async () => {
+    const requestId = 'd1900000-0000-4000-8000-000000000072';
+    const countedAt = '2026-10-22T10:00:00.000Z';
+    const storedSubject = `${COUNT_STORED_PREFIX}${requestId}`;
+    const prefix = userStoragePrefix('owner-r10');
+    const storedKey = `${prefix}${encodeURIComponent(storedSubject)}`;
+    const dailyPostedKey = `${prefix}posted:${encodeURIComponent(COUNT_DAILY_SUBJECT)}:${encodeURIComponent(requestId)}`;
+    const storedPostedKey = `${prefix}posted:${encodeURIComponent(storedSubject)}:${encodeURIComponent(requestId)}`;
+    const storedPayload = {
+      request_id: requestId,
+      frequency: 'daily',
+      counted_at: countedAt,
+      note: null,
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
+    };
+    const dailyDraft = {
+      requestId,
+      countedAt,
+      note: null,
+      lines: [{ itemId: 'tilapia', countedQty: '7', expectedBaseUnit: 'kg' }],
+    };
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([]);
+    vi.mocked(recordCount).mockResolvedValueOnce({
+      status: 'posted',
+      countId: 'count-r15-1b',
+    });
+
+    putHeldWrite(COUNT_DAILY_SUBJECT, {
+      requestId,
+      payload: dailyDraft,
+      phase: 'unknown',
+      kind: 'count',
+    });
+    putHeldWrite(storedSubject, {
+      requestId,
+      payload: storedPayload,
+      phase: 'unknown',
+      kind: 'count_stored',
+    });
+
+    const origRemove = localStorage.removeItem.bind(localStorage);
+    let blockStoredRemove = true;
+    const removeSpy = vi
+      .spyOn(Storage.prototype, 'removeItem')
+      .mockImplementation((key) => {
+        if (blockStoredRemove && key === storedKey) {
+          throw new Error('alias remove failed');
+        }
+        return origRemove(key);
+      });
+
+    try {
+      const firstView = render(
+        <MemoryRouter>
+          <CountsPage />
+        </MemoryRouter>,
+      );
+      fireEvent.click(await screen.findByRole('button', { name: 'حفظ' }));
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(1));
+      await screen.findByRole('alert');
+
+      // While stored-alias removal fails, posted proof MUST stay in storage.
+      expect(
+        localStorage.getItem(dailyPostedKey) !== null ||
+          localStorage.getItem(storedPostedKey) !== null,
+      ).toBe(true);
+      expect(
+        screen.queryByRole('button', { name: 'سجّل الجرد' }),
+      ).not.toBeInTheDocument();
+
+      // Simulate full reload while alias removal STILL fails: readback must retain posted proof and not expose a detached retry card.
+      firstView.unmount();
+      resetHeldWritesStore({ clearStorage: false, resetUser: false });
+      setHeldWriteUser('owner-r10');
+
+      render(
+        <MemoryRouter>
+          <CountsPage />
+        </MemoryRouter>,
+      );
+      await screen.findByRole('alert');
+      expect(
+        localStorage.getItem(dailyPostedKey) !== null ||
+          localStorage.getItem(storedPostedKey) !== null,
+      ).toBe(true);
+      expect(
+        screen.queryByRole('button', { name: 'سجّل الجرد' }),
+      ).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+
+      // Once storage removal recovers, retry readback clears BOTH the stored alias and posted proof.
+      blockStoredRemove = false;
+      fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled(),
+      );
+      expect(localStorage.getItem(storedKey)).toBeNull();
+      expect(localStorage.getItem(dailyPostedKey)).toBeNull();
+      expect(localStorage.getItem(storedPostedKey)).toBeNull();
+      expect(
+        screen.queryByRole('button', { name: 'سجّل الجرد' }),
+      ).not.toBeInTheDocument();
+      expect(recordCount).toHaveBeenCalledTimes(1);
+      expect(recordStoredCount).not.toHaveBeenCalled();
+    } finally {
+      removeSpy.mockRestore();
+    }
+  });
+
+  it('R15-2: old expense void cleanup completing cannot unlock a newer category rename whose readback failed', async () => {
+    const { locks } = makeFakeLocks();
+    vi.stubGlobal('navigator', { onLine: true, locks });
+    const other = createHeldWriteStore({ getLocks: () => locks });
+    other.setHeldWriteUser('owner-r10');
+    const subject = 'expense:void:synthetic-void-r15';
+    let release = () => {};
+    vi.mocked(loadExpenseMonth).mockImplementation((target) =>
+      Promise.resolve(r13ExpenseMonth(target)),
+    );
+    try {
+      render(
+        <MemoryRouter>
+          <ExpensesPage />
+        </MemoryRouter>,
+      );
+      await screen.findByRole('button', { name: 'حفظ اسم إيجار' });
+      const claim = await other.acquireHeldWriteLock(subject);
+      if (!claim.acquired) throw new Error('expected busy void subject');
+      release = claim.release;
+      act(() => {
+        putHeldWrite(subject, {
+          requestId: 'old-void-r15',
+          phase: 'unknown',
+          payload: { id: 'synthetic-void-r15' },
+        });
+      });
+
+      vi.mocked(loadExpenseMonth).mockResolvedValueOnce(
+        r13ExpenseMonth('2030-05-01', [
+          {
+            id: 'synthetic-void-r15',
+            categoryId: 'rent',
+            categoryName: 'إيجار',
+            categoryKind: 'fixed_monthly',
+            amount: '100.00',
+            periodMonth: '2030-05-01',
+            expenseDate: null,
+            paidOn: null,
+            isEstimate: false,
+            note: 'إلغاء معلق r15',
+            hours: null,
+            hourlyRate: null,
+            driverLabel: null,
+            createdAt: '2030-05-01T08:00:00Z',
+            voided: true,
+            voidReason: 'تكرار',
+            superseded: false,
+          },
+        ]),
+      );
+      fireEvent.change(screen.getByLabelText('الشهر'), {
+        target: { value: '2030-05' },
+      });
+      await screen.findByText('إلغاء معلق r15');
+
+      // While old month read is waiting on void cleanup, category rename succeeds but its readback fails.
+      vi.mocked(renameExpenseCategory).mockResolvedValueOnce(undefined);
+      vi.mocked(loadExpenseMonth).mockRejectedValueOnce(
+        new Error('rename readback failed'),
+      );
+      fireEvent.change(screen.getByLabelText('اسم إيجار'), {
+        target: { value: 'إيجار محدث' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ اسم إيجار' }));
+      await screen.findByText('rename readback failed');
+      expect(screen.getByLabelText('الشهر')).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'ضيف تصنيف' })).toBeDisabled();
+
+      // Releasing the old void cleanup MUST NOT clear the newer write's reload lock!
+      await act(async () => {
+        release();
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(getHeldWrite(subject)).toBeNull());
+      expect(screen.getByLabelText('الشهر')).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'ضيف تصنيف' })).toBeDisabled();
+      expect(
+        screen.getByRole('button', { name: 'حفظ اسم إيجار' }),
+      ).toBeDisabled();
+
+      // A fresh qualifying retry read unlocks the page.
+      fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'ضيف تصنيف' })).toBeEnabled(),
+      );
+      expect(screen.getByLabelText('الشهر')).toBeEnabled();
+    } finally {
+      release();
+      other.dispose();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('R15-3: a tab opened while a daily count holds the shared lock promotes an abandoned stored-card pin once the lock frees', async () => {
+    const { client, nested } = makeAuditedLocks();
+    const tab1Locks = client('tab-daily');
+    const tab2Locks = client('tab-reader');
+    const tab1 = createHeldWriteStore({ getLocks: () => tab1Locks });
+    const tab2 = createHeldWriteStore({ getLocks: () => tab2Locks });
+    const owner = 'owner-r10';
+    const storedSubject = `${COUNT_STORED_PREFIX}req-abandoned-r15`;
+    const prefix = userStoragePrefix(owner);
+    const storedKey = `${prefix}${encodeURIComponent(storedSubject)}`;
+    let releaseDaily = () => {};
+    try {
+      // Seed an abandoned inflight stored-card pin (simulating a crashed tab).
+      localStorage.setItem(
+        storedKey,
+        JSON.stringify({
+          v: 1,
+          subject: storedSubject,
+          kind: 'count_stored',
+          requestId: 'req-abandoned-r15',
+          claimId: 'abandoned-claim-r15',
+          payload: { request_id: 'req-abandoned-r15' },
+          phase: 'inflight',
+        }),
+      );
+
+      tab1.setHeldWriteUser(owner);
+      const dailyClaim = await tab1.claimFreshHeldWrite(
+        COUNT_DAILY_SUBJECT,
+        (requestId) => ({ requestId }),
+        { kind: 'count' },
+      );
+      if (!dailyClaim.ok) throw new Error('expected daily claim');
+      releaseDaily = dailyClaim.release;
+
+      // Tab 2 opens while Tab 1 holds the shared count lock.
+      tab2.setHeldWriteUser(owner);
+      await tab2.rehydrateHeldWritesAsync();
+      expect(tab2.getHeldWrite(COUNT_DAILY_SUBJECT)?.phase).toBe('inflight');
+      expect(tab2.getHeldWrite(storedSubject)?.phase).toBe('inflight');
+
+      let notifications = 0;
+      const unsub = tab2.subscribeHeldWritesStore(() => {
+        notifications += 1;
+      });
+      try {
+        // Tab 1 finishes its daily count, fires a cross-tab storage event, and releases the shared lock.
+        tab1.setHeldWritePhase(
+          COUNT_DAILY_SUBJECT,
+          dailyClaim.record.requestId,
+          'posted_reload',
+        );
+        window.dispatchEvent(
+          new StorageEvent('storage', {
+            key: `${prefix}${encodeURIComponent(COUNT_DAILY_SUBJECT)}`,
+          }),
+        );
+        dailyClaim.release();
+
+        // Without another page reload, Tab 2 must promote the abandoned stored-card pin once the shared lock frees.
+        await waitFor(() =>
+          expect(tab2.getHeldWrite(storedSubject)?.phase).toBe('unknown'),
+        );
+        expect(
+          JSON.parse(localStorage.getItem(storedKey) ?? '{}'),
+        ).toMatchObject({
+          requestId: 'req-abandoned-r15',
+          phase: 'unknown',
+        });
+        expect(notifications).toBeGreaterThan(0);
+        expect(nested).toEqual([]);
+      } finally {
+        unsub();
+      }
+    } finally {
+      releaseDaily();
+      tab1.dispose();
+      tab2.dispose();
+    }
+  });
+
+  it('R15-4: reloading activation after a failed posted marker resolves the unknown pin when fresh review is activated and keeps fallback read-only', async () => {
+    const review = makeReview('a'.repeat(32));
+    const activated = { ...review, activated: true, canActivate: false };
+    vi.mocked(loadOpeningReview)
+      .mockResolvedValueOnce(review)
+      .mockResolvedValue(activated);
+    vi.mocked(activateInventory).mockImplementationOnce(() => {
+      vi.spyOn(Storage.prototype, 'setItem').mockImplementationOnce(() => {
+        throw new Error('posted storage unavailable');
+      });
+      return Promise.resolve({
+        activated: true,
+        stockStartedAt: null,
+        openingManifestHash: review.openingManifestHash,
+      });
+    });
+
+    const firstView = render(
+      <MemoryRouter>
+        <ActivationPage />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'تفعيل الخصم' }));
+    await screen.findByRole('button', { name: 'إعادة تحميل المراجعة' });
+    expect(activateInventory).toHaveBeenCalledTimes(1);
+
+    // Simulate a full page reload (loses in-memory acknowledgement; active inflight pin restores as unknown).
+    firstView.unmount();
+    resetHeldWritesStore({ clearStorage: false, resetUser: false });
+    setHeldWriteUser('owner-r10');
+
+    const secondView = render(
+      <MemoryRouter>
+        <ActivationPage />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(getHeldWrite(ACTIVATION_SUBJECT)).toBeNull());
+    expect(
+      screen.queryByRole('button', { name: 'إعادة المحاولة' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'تفعيل الخصم' }),
+    ).not.toBeInTheDocument();
+    expect(activateInventory).toHaveBeenCalledTimes(1);
+    secondView.unmount();
+
+    // If clearing the restored unknown pin fails (e.g. removeItem throws), the UI must stay read-only and never offer a write retry.
+    putHeldWrite(ACTIVATION_SUBJECT, {
+      requestId: 'req-act-r15-fallback',
+      payload: {
+        requestId: 'req-act-r15-fallback',
+        manifestHash: 'a'.repeat(32),
+        explicitZeroItemIds: [],
+      },
+      phase: 'unknown',
+      kind: 'action',
+    });
+    const actKey = `${userStoragePrefix('owner-r10')}${encodeURIComponent(ACTIVATION_SUBJECT)}`;
+    const origRemove = localStorage.removeItem.bind(localStorage);
+    let blockRemove = true;
+    const removeSpy = vi
+      .spyOn(Storage.prototype, 'removeItem')
+      .mockImplementation((key) => {
+        if (blockRemove && key === actKey) {
+          throw new Error('remove failed');
+        }
+        return origRemove(key);
+      });
+    try {
+      render(
+        <MemoryRouter>
+          <ActivationPage />
+        </MemoryRouter>,
+      );
+      const reloadButtons = await screen.findAllByRole('button', {
+        name: 'إعادة تحميل المراجعة',
+      });
+      expect(reloadButtons.length).toBeGreaterThan(0);
+      expect(
+        screen.queryByRole('button', { name: 'إعادة المحاولة' }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: 'تفعيل الخصم' }),
+      ).not.toBeInTheDocument();
+
+      blockRemove = false;
+      fireEvent.click(reloadButtons[reloadButtons.length - 1]!);
+      await waitFor(() => expect(getHeldWrite(ACTIVATION_SUBJECT)).toBeNull());
+      expect(activateInventory).toHaveBeenCalledTimes(1);
+    } finally {
+      removeSpy.mockRestore();
+    }
   });
 });

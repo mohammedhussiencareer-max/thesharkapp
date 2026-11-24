@@ -82,11 +82,16 @@ export function useActivationAction(
 
   const unknown =
     heldEpoch < 0 ? null : unknownAction<ActivationWrite>(ACTIVATION_SUBJECT);
+  const held =
+    heldEpoch < 0 ? null : heldAction<ActivationWrite>(ACTIVATION_SUBJECT);
   const posted =
     heldEpoch >= 0 && hasPostedReload(ACTIVATION_SUBJECT, ACTIVATION_SUBJECT);
+  const activatedWithHeld =
+    review?.activated === true && (unknown !== null || held !== null);
   const reloadPending =
     posted ||
     reloadBlocked ||
+    activatedWithHeld ||
     (heldEpoch >= 0 && activationReviewReloadPending(ACTIVATION_SUBJECT));
 
   function toggleZero(itemId: string) {
@@ -186,7 +191,7 @@ export function useActivationAction(
     const unknownHeld = unknownAction<ActivationWrite>(ACTIVATION_SUBJECT);
     const isPosted =
       posted || hasPostedReload(ACTIVATION_SUBJECT, ACTIVATION_SUBJECT);
-    if (reloadPending || isPosted) {
+    if (reloadPending || isPosted || review.activated) {
       const reviewWasPending =
         activationReviewReloadPending(ACTIVATION_SUBJECT);
       const requestId =
