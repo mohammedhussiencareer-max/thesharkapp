@@ -4,7 +4,12 @@ import { TRANSACTION_FIELD_PATHS } from './firestore-projection.ts';
 import {
   assertFirestoreReadAllowed,
   createPosFirestore,
+  firestoreFetch,
+  firestoreGetUrl,
+  firestoreListUrl,
   firestoreRunQueryUrl,
+  parseListResponse,
+  parseRunQueryResponse,
 } from './firestore-read.ts';
 import {
   mapOrderDocument,
@@ -16,6 +21,7 @@ import {
   timestampProbeQuery,
   timestampRangeQuery,
 } from './read-pos.ts';
+import { PosSyncError, safeErrorMessage } from './safe-error.ts';
 import { readTransactionResponse } from './transaction-response.ts';
 
 const QUERY_URL = firestoreRunQueryUrl();
@@ -185,6 +191,122 @@ it('accepts an envelope-only probe result and refuses document fields in a probe
 });
 
 it.each([
+  ['orders', 'list'],
+  ['orders', 'query'],
+  ['custody_shifts', 'list'],
+  ['custody_shifts', 'get'],
+] as const)(
+  'rejects an unexpected %s document envelope key statically through %s and raw firestoreFetch',
+  async (collection, operation) => {
+    const marker = 'synthetic-envelope-extra-marker';
+    const doc = {
+      name: `${DOCUMENT_ROOT}/${collection}/doc-test-env`,
+      extra: { stringValue: marker },
+    };
+    const badCreateTimeDoc = {
+      name: `${DOCUMENT_ROOT}/${collection}/doc-test-env`,
+      createTime: 12345,
+    };
+    const makePayload = (document: unknown) =>
+      operation === 'query'
+        ? [{ document, readTime: READ_TIME }]
+        : operation === 'get'
+          ? document
+          : { documents: [document] };
+
+    for (const candidate of [doc, badCreateTimeDoc]) {
+      const transport = async () => respond(makePayload(candidate));
+      const client = createPosFirestore('test-token', transport);
+      const clientReq =
+        operation === 'query'
+          ? client.queryOrders(recentOrdersQuery(['shift-test-1']))
+          : operation === 'get'
+            ? client.getShift('doc-test-env')
+            : client.list(collection, { pageSize: 1 });
+      const clientError: unknown = await clientReq.then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+      expect(clientError).toEqual(new PosSyncError('firestoreInvalidResponse'));
+      expect(safeErrorMessage(clientError)).toBe(INVALID_RESPONSE);
+      expect(String(clientError)).not.toContain(marker);
+
+      const rawReq =
+        operation === 'query'
+          ? firestoreFetch(
+              'POST',
+              QUERY_URL,
+              'test-token',
+              recentOrdersQuery(['shift-test-1']),
+              transport,
+            )
+          : operation === 'get'
+            ? firestoreFetch(
+                'GET',
+                firestoreGetUrl('custody_shifts', 'doc-test-env'),
+                'test-token',
+                undefined,
+                transport,
+              )
+            : firestoreFetch(
+                'GET',
+                firestoreListUrl(collection, { pageSize: 1 }),
+                'test-token',
+                undefined,
+                transport,
+              );
+      const rawError: unknown = await rawReq.then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+      expect(rawError).toEqual(new PosSyncError('firestoreInvalidResponse'));
+      expect(safeErrorMessage(rawError)).toBe(INVALID_RESPONSE);
+      expect(String(rawError)).not.toContain(marker);
+    }
+
+    const directParse = () =>
+      operation === 'query'
+        ? parseRunQueryResponse(
+            [{ document: doc, readTime: READ_TIME }],
+            collection,
+          )
+        : parseListResponse({ documents: [doc] }, collection);
+    let directError: unknown;
+    try {
+      directParse();
+    } catch (error) {
+      directError = error;
+    }
+    expect(directError).toEqual(new PosSyncError('firestoreInvalidResponse'));
+    expect(safeErrorMessage(directError)).toBe(INVALID_RESPONSE);
+    expect(String(directError)).not.toContain(marker);
+  },
+);
+
+it('rejects an unexpected transaction document envelope key in parseListResponse', () => {
+  const marker = 'synthetic-tx-envelope-marker';
+  let caught: unknown;
+  try {
+    parseListResponse(
+      {
+        documents: [
+          {
+            name: `${DOCUMENT_ROOT}/${TX_PATH}/tx-test-env`,
+            extra: { stringValue: marker },
+          },
+        ],
+      },
+      'transactions',
+    );
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toEqual(new PosSyncError('firestoreInvalidResponse'));
+  expect(safeErrorMessage(caught)).toBe(INVALID_RESPONSE);
+  expect(String(caught)).not.toContain(marker);
+});
+
+it.each([
   `${TX_PATH}?pageSize=1&pageToken=next`,
   'orders?pageSize=1',
   'orders/order-test-1',
@@ -270,7 +392,8 @@ it('refuses a transaction description before JSON decoding and keeps it out of e
         () => undefined,
         (reason: unknown) => reason,
       );
-    expect(error).toEqual(new Error(INVALID_RESPONSE));
+    expect(error).toEqual(new PosSyncError('firestoreInvalidResponse'));
+    expect(safeErrorMessage(error)).toBe(INVALID_RESPONSE);
     expect(error).not.toHaveProperty('cause');
     expect(parse.mock.calls.some(([text]) => text.includes(marker))).toBe(
       false,
@@ -323,7 +446,8 @@ it.each([
       const error: unknown = await client
         .listShiftTransactions('shift-test-1', { pageSize: 1 })
         .catch((reason: unknown) => reason);
-      expect(error).toEqual(new Error(INVALID_RESPONSE));
+      expect(error).toEqual(new PosSyncError('firestoreInvalidResponse'));
+      expect(safeErrorMessage(error)).toBe(INVALID_RESPONSE);
       expect(error).not.toHaveProperty('cause');
       expect(String(error)).not.toContain(marker);
       expect({ reads, cancellations: cancel.mock.calls.length }).toEqual({
@@ -372,7 +496,8 @@ it('cancels a transaction stream before consuming a later chunk holding the forb
     const error: unknown = await client
       .listShiftTransactions('shift-test-1', { pageSize: 1 })
       .catch((reason: unknown) => reason);
-    expect(error).toEqual(new Error(INVALID_RESPONSE));
+    expect(error).toEqual(new PosSyncError('firestoreInvalidResponse'));
+    expect(safeErrorMessage(error)).toBe(INVALID_RESPONSE);
     expect(error).not.toHaveProperty('cause');
     expect(String(error)).not.toContain(marker);
     expect({ reads, cancellations: cancel.mock.calls.length }).toEqual({
@@ -419,7 +544,8 @@ it('cancels a transaction stream on missing comma after string value before read
     const error: unknown = await client
       .listShiftTransactions('shift-test-1', { pageSize: 1 })
       .catch((reason: unknown) => reason);
-    expect(error).toEqual(new Error(INVALID_RESPONSE));
+    expect(error).toEqual(new PosSyncError('firestoreInvalidResponse'));
+    expect(safeErrorMessage(error)).toBe(INVALID_RESPONSE);
     expect({ reads, cancellations: cancel.mock.calls.length }).toEqual({
       reads: 1,
       cancellations: 1,
@@ -566,7 +692,8 @@ it.each([
       () => undefined,
       (reason: unknown) => reason,
     );
-    expect(error).toEqual(new Error(INVALID_RESPONSE));
+    expect(error).toEqual(new PosSyncError('firestoreInvalidResponse'));
+    expect(safeErrorMessage(error)).toBe(INVALID_RESPONSE);
   },
 );
 
@@ -638,7 +765,8 @@ it('refuses a sibling of the projected delivery fee', async () => {
       () => undefined,
       (reason: unknown) => reason,
     );
-  expect(error).toEqual(new Error(INVALID_RESPONSE));
+  expect(error).toEqual(new PosSyncError('firestoreInvalidResponse'));
+  expect(safeErrorMessage(error)).toBe(INVALID_RESPONSE);
 });
 
 it('rejects a map under projected status without decoding the nested customer field', async () => {
@@ -676,7 +804,8 @@ it('rejects a map under projected status without decoding the nested customer fi
       .queryOrders(recentOrdersQuery(['shift-test-1']))
       .then((documents) => documents.map(mapOrder))
       .catch((reason: unknown) => reason);
-    expect(error).toEqual(new Error(INVALID_RESPONSE));
+    expect(error).toEqual(new PosSyncError('firestoreInvalidResponse'));
+    expect(safeErrorMessage(error)).toBe(INVALID_RESPONSE);
     expect(mapOrder).not.toHaveBeenCalled();
     expect(readNested).not.toHaveBeenCalled();
     expect(String(error)).not.toContain(marker);

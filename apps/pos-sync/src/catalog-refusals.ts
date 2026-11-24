@@ -1,3 +1,4 @@
+import { PosSyncError } from './safe-error.ts';
 import { isRecord } from './decode.ts';
 
 /**
@@ -30,6 +31,12 @@ const FIRESTORE_SCALAR_VALUE_KEYS = new Set([
   'bytesValue',
   'referenceValue',
   'geoPointValue',
+]);
+
+const FIRESTORE_VALUE_KEYS = new Set([
+  ...FIRESTORE_SCALAR_VALUE_KEYS,
+  'mapValue',
+  'arrayValue',
 ]);
 
 export type CatalogCollection = 'items' | 'optionGroups';
@@ -90,63 +97,58 @@ function walkFirestoreValueForCustomerKey(
     if (onlyKey === 'mapValue') {
       const mapValue = value.mapValue;
       if (!isRecord(mapValue)) {
-        return walkArbitraryForCustomerKey(mapValue, depth + 1);
+        return true;
       }
-      for (const mapKey of Object.keys(mapValue)) {
-        if (mapKey === 'fields') {
-          const mapFields = mapValue.fields;
-          if (isRecord(mapFields)) {
-            if (
-              walkFirestoreFieldsForCustomerKey(
-                mapFields,
-                false,
-                dynamicLabelMap,
-                depth + 1,
-              )
-            ) {
-              return true;
-            }
-          } else if (walkArbitraryForCustomerKey(mapFields, depth + 1)) {
-            return true;
-          }
-        } else if (
-          isCustomerShapedKey(mapKey) ||
-          walkArbitraryForCustomerKey(mapValue[mapKey], depth + 1)
-        ) {
-          return true;
-        }
+      const mapKeys = Object.keys(mapValue);
+      if (mapKeys.some((mapKey) => mapKey !== 'fields')) {
+        return true;
       }
-      return false;
+      if (mapKeys.length === 0) {
+        return false;
+      }
+      const mapFields = mapValue.fields;
+      if (mapFields === undefined) {
+        return false;
+      }
+      if (!isRecord(mapFields)) {
+        return true;
+      }
+      return walkFirestoreFieldsForCustomerKey(
+        mapFields,
+        false,
+        dynamicLabelMap,
+        depth + 1,
+      );
     }
     if (onlyKey === 'arrayValue') {
       const arrayValue = value.arrayValue;
       if (!isRecord(arrayValue)) {
-        return walkArbitraryForCustomerKey(arrayValue, depth + 1);
+        return true;
       }
-      for (const arrKey of Object.keys(arrayValue)) {
-        if (arrKey === 'values') {
-          const arrValues = arrayValue.values;
-          if (Array.isArray(arrValues)) {
-            for (const entry of arrValues) {
-              if (walkFirestoreValueForCustomerKey(entry, false, depth + 1)) {
-                return true;
-              }
-            }
-          } else if (walkArbitraryForCustomerKey(arrValues, depth + 1)) {
-            return true;
-          }
-        } else if (
-          isCustomerShapedKey(arrKey) ||
-          walkArbitraryForCustomerKey(arrayValue[arrKey], depth + 1)
-        ) {
+      const arrKeys = Object.keys(arrayValue);
+      if (arrKeys.some((arrKey) => arrKey !== 'values')) {
+        return true;
+      }
+      if (arrKeys.length === 0) {
+        return false;
+      }
+      const arrValues = arrayValue.values;
+      if (arrValues === undefined) {
+        return false;
+      }
+      if (!Array.isArray(arrValues)) {
+        return true;
+      }
+      for (const entry of arrValues) {
+        if (walkFirestoreValueForCustomerKey(entry, false, depth + 1)) {
           return true;
         }
       }
       return false;
     }
   }
-  // Reject mixed scalar wrappers by their keys without opening scalar payloads.
-  if (keys.some((key) => FIRESTORE_SCALAR_VALUE_KEYS.has(key))) {
+  // Reject mixed scalar, map, or array wrappers by their keys without opening payloads.
+  if (keys.some((key) => FIRESTORE_VALUE_KEYS.has(key))) {
     return true;
   }
   for (const key of keys) {
@@ -236,7 +238,7 @@ function walkPayloadForPriceKey(
   depth: number,
 ): void {
   if (depth > MAX_CATALOG_WALK_DEPTH) {
-    throw new Error('Catalog payload refused: excessive nesting');
+    throw new PosSyncError('catalogExcessiveNesting');
   }
   if (Array.isArray(value)) {
     const nextSegments: readonly PathStep[] = [...segments, ARRAY_STEP];
@@ -251,7 +253,7 @@ function walkPayloadForPriceKey(
   const keysAreLabels = isItemOptionGroupLabelMapPath(segments);
   for (const [key, child] of Object.entries(value)) {
     if (!keysAreLabels && isPriceShapedKey(key)) {
-      throw new Error('Catalog payload refused: price-shaped key');
+      throw new PosSyncError('catalogPriceKey');
     }
     walkPayloadForPriceKey(
       child,

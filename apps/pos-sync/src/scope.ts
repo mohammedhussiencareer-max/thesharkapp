@@ -1,3 +1,4 @@
+import { PosSyncError } from './safe-error.ts';
 import type { PosOrderIngest, PosShiftIngest, SyncScope } from './types.ts';
 
 export const ORDER_BATCH_SIZE = 200;
@@ -31,7 +32,7 @@ export function planIngestCalls(input: {
 }> {
   const batchSize = input.batchSize ?? ORDER_BATCH_SIZE;
   if (!Number.isInteger(batchSize) || batchSize < 1) {
-    throw new Error('batch size must be positive');
+    throw new PosSyncError('batchSizeNotPositive');
   }
   const chunks: PosOrderIngest[][] = [];
   for (let index = 0; index < input.orders.length; index += batchSize) {

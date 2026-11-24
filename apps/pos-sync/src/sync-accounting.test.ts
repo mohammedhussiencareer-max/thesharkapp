@@ -147,12 +147,7 @@ describe('runPosSync accounting drain', () => {
       accountingDb: {
         getNextWork: someone,
         async runAccountingWork() {
-          throw new SupabaseRpcError(
-            'Supabase RPC failed: HTTP 500',
-            'http',
-            500,
-            '57014',
-          );
+          throw new SupabaseRpcError('http', 500, '57014');
         },
         async recordAccountingCallFailure() {
           throw new Error('escaped recorder');
@@ -168,7 +163,7 @@ describe('runPosSync accounting drain', () => {
     expect(reported).toHaveLength(1);
     expect(reported[0]?.slice(1)).toEqual(['order-a', 1]);
     expect(logs.at(-1)).toMatch(
-      /^accounting drain stop=call_failed .* report=recorded error=Supabase RPC failed: HTTP 500$/,
+      /^accounting drain stop=call_failed .* report=recorded error=Supabase RPC failed: HTTP 500 57014$/,
     );
   });
 
@@ -187,10 +182,10 @@ describe('runPosSync accounting drain', () => {
       accountingDb: {
         getNextWork: someone,
         async runAccountingWork() {
-          throw new SupabaseRpcError('Supabase RPC failed: network', 'network');
+          throw new SupabaseRpcError('network');
         },
         async recordAccountingCallFailure() {
-          throw new SupabaseRpcError('Supabase RPC failed: network', 'network');
+          throw new SupabaseRpcError('network');
         },
         async recordAccountingRecomputeTimeout() {
           throw new Error('must not be called');
@@ -204,6 +199,33 @@ describe('runPosSync accounting drain', () => {
     });
     expect(events).toEqual(['start', 'ingest', 'finish:ok']);
     expect(result.counts.read).toBe(0);
+  });
+
+  it('drops an arbitrary accounting dependency error from the logger', async () => {
+    const events: string[] = [];
+    const logs: string[] = [];
+    const marker = 'SyntheticMarker7f3a';
+    await run({
+      db: posDb(events),
+      logs,
+      accountingDb: {
+        getNextWork: nobody,
+        async runAccountingWork() {
+          throw new Error(`unexpected ${marker}`);
+        },
+        async recordAccountingCallFailure() {
+          throw new Error('must not be called');
+        },
+        async recordAccountingRecomputeTimeout() {
+          throw new Error('must not be called');
+        },
+      },
+    });
+    expect(events).toEqual(['start', 'ingest', 'finish:ok']);
+    expect(logs.at(-1)).toMatch(
+      /^accounting drain stop=call_failed .* report=not_needed error=sync failed$/,
+    );
+    expect(logs.join('\n')).not.toContain(marker);
   });
 
   it('does not drain when the sync itself fails', async () => {
@@ -252,7 +274,7 @@ describe('runPosSync accounting drain', () => {
           },
         },
       }),
-    ).rejects.toThrow('ingest broke');
+    ).rejects.toThrow(/^sync failed$/);
     expect(events).toEqual(['start', 'finish:failed']);
     expect(drained).toBe(false);
   });

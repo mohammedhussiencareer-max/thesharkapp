@@ -1,5 +1,11 @@
 import { assertLocalSupabaseUrl } from './local-guard.ts';
 import { isRecord, isSafeDocumentId } from './decode.ts';
+import {
+  POS_SYNC_ALREADY_RUNNING,
+  PosSyncError,
+  SupabaseRpcError,
+  SyncDiagnostic,
+} from './safe-error.ts';
 import type {
   IngestCounts,
   PosOrderIngest,
@@ -26,41 +32,17 @@ function localFetch(input: string, init: RequestInit): Promise<Response> {
   return fetch(input, init);
 }
 
-export type RpcFailureKind = 'network' | 'http' | 'response';
-
-export class SupabaseRpcError extends Error {
-  readonly kind: RpcFailureKind;
-  readonly status: number | null;
-  readonly sqlstate: string | null;
-
-  constructor(
-    message: string,
-    kind: RpcFailureKind,
-    status: number | null = null,
-    sqlstate: string | null = null,
-  ) {
-    super(message);
-    this.name = 'SupabaseRpcError';
-    this.kind = kind;
-    this.status = status;
-    this.sqlstate = sqlstate;
-  }
-}
+export {
+  SupabaseRpcError,
+  SyncDiagnostic,
+  type RpcFailureKind,
+} from './safe-error.ts';
 
 // True when the call may have reached the database and its outcome is not
 // known: no reply, a server error, a statement timeout, or a reply that cannot
 // be read. A refusal (4xx other than a timeout) means the call did not run.
 export function isUnknownOutcome(error: unknown): boolean {
-  if (!(error instanceof SupabaseRpcError)) {
-    return false;
-  }
-  if (error.sqlstate === '57014') {
-    return true;
-  }
-  if (error.kind === 'network' || error.kind === 'response') {
-    return true;
-  }
-  return error.status !== null && error.status >= 500;
+  return SupabaseRpcError.isUnknownOutcome(error);
 }
 
 export type AccountingStatus =
@@ -108,7 +90,7 @@ export type PosDb = {
     runId: number,
     status: 'ok' | 'failed',
     counts: Record<string, number>,
-    error: string | null,
+    error: SyncDiagnostic | null,
   ): Promise<void>;
 };
 
@@ -146,7 +128,7 @@ export function createSupabaseDb(
 ): PosDb & AccountingDb {
   assertLocalSupabaseUrl(supabaseUrl);
   if (serviceRoleKey.trim().length === 0) {
-    throw new Error('Supabase service role key is required');
+    throw new PosSyncError('supabaseKeyRequired');
   }
 
   async function rpc(
@@ -177,7 +159,7 @@ export function createSupabaseDb(
           : { signal: AbortSignal.timeout(timeoutMs) }),
       });
     } catch {
-      throw new SupabaseRpcError('Supabase RPC failed: network', 'network');
+      throw new SupabaseRpcError('network');
     }
     if (!response.ok) {
       let text: string;
@@ -187,14 +169,9 @@ export function createSupabaseDb(
         text = '';
       }
       if (name === 'start_pos_sync_run' && isAnotherPosSyncRunning(text)) {
-        throw new Error('another POS sync is running');
+        throw new PosSyncError('syncAlreadyRunning');
       }
-      throw new SupabaseRpcError(
-        `Supabase RPC failed: HTTP ${response.status}`,
-        'http',
-        response.status,
-        errorSqlstate(text),
-      );
+      throw new SupabaseRpcError('http', response.status, errorSqlstate(text));
     }
     const text = await readBody(response);
     if (text.trim().length === 0) {
@@ -226,7 +203,7 @@ export function createSupabaseDb(
         p_run_id: runId,
         p_status: status,
         p_counts: counts,
-        p_error: error,
+        p_error: error === null ? null : SyncDiagnostic.render(error),
       });
     },
     async getNextWork() {
@@ -278,10 +255,7 @@ export function createSupabaseDb(
 }
 
 function unexpectedResponse(): SupabaseRpcError {
-  return new SupabaseRpcError(
-    'Supabase RPC failed: unexpected response',
-    'response',
-  );
+  return new SupabaseRpcError('response');
 }
 
 async function readBody(response: Response): Promise<string> {
@@ -300,7 +274,7 @@ function rpcUrl(base: string, name: string): string {
     url.origin !== baseUrl.origin ||
     url.pathname !== `/rest/v1/rpc/${name}`
   ) {
-    throw new Error(`Refusing non-local Supabase URL: ${base}`);
+    throw new PosSyncError('nonLocalSupabase');
   }
   return url.toString();
 }
@@ -315,7 +289,7 @@ function isAnotherPosSyncRunning(body: string): boolean {
   return (
     isRecord(parsed) &&
     parsed.code === '55P03' &&
-    parsed.message === 'another POS sync is running'
+    parsed.message === POS_SYNC_ALREADY_RUNNING
   );
 }
 

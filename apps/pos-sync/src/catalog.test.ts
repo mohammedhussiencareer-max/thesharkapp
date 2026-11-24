@@ -1225,6 +1225,157 @@ describe('parseCatalog fixtures', () => {
     ).not.toContain(marker);
   });
 
+  it('rejects malformed map and array wrappers by their keys with an ID-only rejection and zero scalar reads', () => {
+    const marker = 'synthetic-malformed-container-marker';
+    const reads: string[] = [];
+    const trappedScalar = (label: string) => ({
+      get stringValue() {
+        reads.push(label);
+        throw new Error(marker);
+      },
+    });
+
+    const malformedCases: Array<[string, Record<string, unknown>]> = [
+      [
+        'mixed-map',
+        {
+          extraWrapperKey: null,
+          mapValue: {
+            fields: { internalCode: trappedScalar('mixed-map') },
+          },
+        },
+      ],
+      [
+        'mixed-array',
+        {
+          extraWrapperKey: null,
+          arrayValue: {
+            values: [
+              {
+                mapValue: {
+                  fields: { internalCode: trappedScalar('mixed-array') },
+                },
+              },
+            ],
+          },
+        },
+      ],
+      [
+        'dual-container',
+        {
+          mapValue: { fields: { a: trappedScalar('dual-map') } },
+          arrayValue: { values: [trappedScalar('dual-array')] },
+        },
+      ],
+      [
+        'map-extra-key',
+        {
+          mapValue: {
+            extraMapKey: trappedScalar('map-extra-key'),
+            fields: { internalCode: trappedScalar('map-extra-fields') },
+          },
+        },
+      ],
+      [
+        'array-extra-key',
+        {
+          arrayValue: {
+            extraArrKey: trappedScalar('array-extra-key'),
+            values: [trappedScalar('array-extra-values')],
+          },
+        },
+      ],
+      [
+        'bad-map-fields',
+        {
+          mapValue: {
+            fields: [trappedScalar('bad-map-fields')],
+          },
+        },
+      ],
+      [
+        'bad-array-values',
+        {
+          arrayValue: {
+            values: { unexpected: trappedScalar('bad-array-values') },
+          },
+        },
+      ],
+    ];
+
+    const itemDocs = malformedCases.map(([slug, malformed]) =>
+      itemDoc(`item-syn-${slug}`, {
+        name: str(`Synthetic ${slug} Item`),
+        options: map({
+          extras: arr([
+            map({
+              value: str('Synthetic Option'),
+              costPrice: malformed,
+            }),
+          ]),
+        }),
+      }),
+    );
+    const groupDocs = malformedCases.map(([slug, malformed]) =>
+      groupDoc(`group-syn-${slug}`, {
+        name: str(`Synthetic ${slug} Group`),
+        values: arr([
+          map({
+            value: str('Synthetic Value'),
+            costPrice: malformed,
+          }),
+        ]),
+      }),
+    );
+
+    const itemPage = parseListResponse({ documents: itemDocs }, 'items');
+    expect(itemPage.documents).toEqual(
+      itemDocs.map((doc) => ({ name: doc.name, rejected: true })),
+    );
+    const groupPage = parseListResponse(
+      { documents: groupDocs },
+      'optionGroups',
+    );
+    expect(groupPage.documents).toEqual(
+      groupDocs.map((doc) => ({ name: doc.name, rejected: true })),
+    );
+
+    const directPayload = parseCatalog(itemDocs, groupDocs);
+    expect(directPayload.items).toEqual([]);
+    expect(directPayload.option_groups).toEqual([]);
+    expect(directPayload.presence).toEqual(
+      malformedCases
+        .map(([slug]) => ({
+          pos_item_id: `item-syn-${slug}`,
+          outcome: 'rejected' as const,
+        }))
+        .sort((left, right) =>
+          left.pos_item_id.localeCompare(right.pos_item_id),
+        ),
+    );
+    expect(directPayload.option_group_presence).toEqual(
+      malformedCases
+        .map(([slug]) => ({
+          group_id: `group-syn-${slug}`,
+          outcome: 'rejected' as const,
+        }))
+        .sort((left, right) => left.group_id.localeCompare(right.group_id)),
+    );
+    expect(reads).toEqual([]);
+    expect(
+      JSON.stringify({ itemPage, groupPage, directPayload }),
+    ).not.toContain(marker);
+  });
+
+  it('reports catalog allowlist drift without echoing the input selector', () => {
+    expect(() =>
+      resolveCatalogFieldSelectors(
+        [...CATALOG_ITEM_FIELDS, 'SyntheticMarker7f3a'],
+        CATALOG_OPTION_GROUP_FIELDS,
+      ),
+    ).toThrow(/^Catalog allowlist mismatch: unexpected item path$/);
+  });
+
   it('accepts 15 and 20 nested Firestore maps during customer-key scan and rejects beyond the walk cap', () => {
     function nestedMap(levels: number): unknown {
       let current: unknown = str('leaf');

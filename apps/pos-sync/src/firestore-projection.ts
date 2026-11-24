@@ -3,6 +3,7 @@ import {
   CATALOG_OPTION_GROUP_FIELDS,
 } from './catalog-allowlist.ts';
 import { isRecord } from './decode.ts';
+import { PosSyncError } from './safe-error.ts';
 import { normalizeTimestamp } from './time.ts';
 
 function isValidTimestamp(value: unknown, allowBlank = false): boolean {
@@ -141,7 +142,7 @@ export function assertProjectedDocument(
     return;
   }
   if (!isRecord(document.fields)) {
-    throw new Error('Firestore read failed: invalid response');
+    throw new PosSyncError('firestoreInvalidResponse');
   }
   assertProjectedFields(document.fields, projection);
 }
@@ -155,7 +156,7 @@ function assertProjectedFields(
     const path = `${parent}${key}`;
     if (!key.includes('.') && projection.includes(key)) {
       if (!matchesValueKind(fields[key], FIELD_KINDS[path], path)) {
-        throw new Error('Firestore read failed: invalid response');
+        throw new PosSyncError('firestoreInvalidResponse');
       }
       continue;
     }
@@ -171,12 +172,12 @@ function assertProjectedFields(
       !isRecord(value.mapValue) ||
       Object.keys(value.mapValue).some((property) => property !== 'fields')
     ) {
-      throw new Error('Firestore read failed: invalid response');
+      throw new PosSyncError('firestoreInvalidResponse');
     }
     const nested = value.mapValue.fields;
     if (nested !== undefined) {
       if (!isRecord(nested)) {
-        throw new Error('Firestore read failed: invalid response');
+        throw new PosSyncError('firestoreInvalidResponse');
       }
       assertProjectedFields(nested, children, `${path}.`);
     }

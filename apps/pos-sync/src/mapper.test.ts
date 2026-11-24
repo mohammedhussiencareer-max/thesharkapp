@@ -6,6 +6,7 @@ import {
   mapShiftTransaction,
   storedProjection,
 } from './mapper.ts';
+import { safeErrorMessage } from './safe-error.ts';
 
 const NAME_PREFIX = 'projects/thesharkrestaurant/databases/(default)/documents';
 
@@ -66,6 +67,52 @@ function keysDeep(value: unknown, found: string[] = []): string[] {
 }
 
 describe('mapOrderDocument', () => {
+  it.each([
+    ['missing shift id', { shiftId: undefined }, 'shift id is required'],
+    [
+      'invalid service tax',
+      { serviceTaxAmount: str('SyntheticMarker7f3a') },
+      'unexpected service tax',
+    ],
+    [
+      'missing line id',
+      {
+        items: {
+          arrayValue: {
+            values: [{ mapValue: { fields: { quantity: int(1) } } }],
+          },
+        },
+      },
+      'line id is required',
+    ],
+  ] as const)(
+    'preserves the package diagnostic for %s',
+    (_case, fields, message) => {
+      let thrown: unknown;
+      try {
+        mapOrderDocument({
+          name: `${NAME_PREFIX}/orders/order-test-1`,
+          updateTime: '2026-10-15T14:00:00Z',
+          fields: {
+            status: str('complete'),
+            shiftId: str('shift-test-1'),
+            timestamp: ts('2026-10-15T12:00:00Z'),
+            subtotalAmount: int(1),
+            discountAmount: int(0),
+            taxTotalAmount: int(0),
+            serviceTaxAmount: int(0),
+            totalAmount: int(1),
+            ...fields,
+          },
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toHaveProperty('message', message);
+      expect(safeErrorMessage(thrown)).toBe(message);
+    },
+  );
+
   it('keeps accounting fields and drops synthetic PII', () => {
     const order = mapOrderDocument({
       name: `${NAME_PREFIX}/orders/order-test-1`,

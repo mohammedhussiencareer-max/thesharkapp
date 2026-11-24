@@ -74,7 +74,7 @@ describe('assertFirestoreReadAllowed', () => {
       `https://user:pass@firestore.googleapis.com/v1/projects/thesharkrestaurant/databases/(default)/documents/orders?pageSize=1&${ORDER_MASK}`,
     ],
     ['GET', `${ROOT}/orders/../customers?pageSize=1`],
-    ['GET', `${ROOT}/custody_shifts/shift-test-1/orders?pageSize=1`],
+    ['GET', `${ROOT}/custody_shifts/shift-test-1/orders?pageSize=1&${TX_MASK}`],
     [
       'GET',
       `${ROOT}/custody_shifts/shift-test-1/transactions/tx-test-1/notes?pageSize=1`,
