@@ -661,6 +661,100 @@ it('copies each transaction chunk into an owned buffer before scanning so a reus
   }
 });
 
+it('rejects duplicate documents and nextPageToken keys in a transaction response before JSON decoding', async () => {
+  const txName = `${DOCUMENT_ROOT}/${TX_PATH}/tx-test-dup`;
+  const validDoc = `{"name":"${txName}","fields":{"amount":{"integerValue":"5"}}}`;
+  const cases = [
+    [
+      'escaped duplicate documents',
+      `{"documents":[${validDoc}],"docu\\u006dents":[]}`,
+    ],
+    [
+      'literal duplicate documents',
+      `{"documents":[${validDoc}],"documents":[]}`,
+    ],
+    [
+      'literal duplicate nextPageToken',
+      `{"documents":[${validDoc}],"nextPageToken":"page-2","nextPageToken":""}`,
+    ],
+    [
+      'escaped duplicate nextPageToken',
+      `{"documents":[${validDoc}],"nextPageToken":"page-2","next\\u0050ageToken":""}`,
+    ],
+    [
+      'duplicate document field key',
+      `{"documents":[{"name":"${txName}","fields":{"amount":{"integerValue":"5"},"am\\u006funt":{"integerValue":"0"}}}]}`,
+    ],
+  ] as const;
+
+  for (const [label, body] of cases) {
+    const parse = vi.spyOn(JSON, 'parse');
+    try {
+      const directError: unknown = await readTransactionResponse(
+        new Response(body),
+      ).then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+      expect(directError, `${label} (direct)`).toEqual(
+        new PosSyncError('firestoreInvalidResponse'),
+      );
+      expect(safeErrorMessage(directError), `${label} (direct)`).toBe(
+        INVALID_RESPONSE,
+      );
+      expect(directError, `${label} (direct)`).not.toHaveProperty('cause');
+
+      const client = createPosFirestore(
+        'test-token',
+        async () => new Response(body),
+      );
+      const clientError: unknown = await client
+        .listShiftTransactions('shift-test-1', { pageSize: 1 })
+        .then(
+          () => undefined,
+          (reason: unknown) => reason,
+        );
+      expect(clientError, `${label} (client)`).toEqual(
+        new PosSyncError('firestoreInvalidResponse'),
+      );
+      expect(safeErrorMessage(clientError), `${label} (client)`).toBe(
+        INVALID_RESPONSE,
+      );
+      expect(clientError, `${label} (client)`).not.toHaveProperty('cause');
+      expect(
+        parse.mock.calls.some(([text]) => text.includes(txName)),
+        `${label} must reject before parsing full body`,
+      ).toBe(false);
+    } finally {
+      parse.mockRestore();
+    }
+  }
+});
+
+it('converts raw stream errors to firestoreInvalidResponse in readTransactionResponse', async () => {
+  const marker = 'synthetic-stream-source-error';
+  const raw = new Error(marker);
+  const brokenStream = new ReadableStream<Uint8Array>(
+    {
+      pull() {
+        throw raw;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const response = new Response(brokenStream);
+  const error: unknown = await readTransactionResponse(response).then(
+    () => undefined,
+    (reason: unknown) => reason,
+  );
+  expect(PosSyncError.is(error)).toBe(true);
+  expect(error).toEqual(new PosSyncError('firestoreInvalidResponse'));
+  expect(safeErrorMessage(error)).toBe(INVALID_RESPONSE);
+  expect(error).not.toHaveProperty('cause');
+  expect(String(error)).not.toContain(marker);
+  expect(response.body?.locked).toBe(false);
+});
+
 it.each([
   ['orders', 'list'],
   ['orders', 'query'],

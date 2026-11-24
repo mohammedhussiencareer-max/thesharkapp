@@ -20,7 +20,7 @@ import {
   projectAllowedOptionGroupFields,
   resolveCatalogFieldSelectors,
 } from './catalog.ts';
-import { parseListResponse } from './firestore-read.ts';
+import { createPosFirestore, parseListResponse } from './firestore-read.ts';
 import { mapOrderDocument } from './mapper.ts';
 import type { FirestoreRestDocument } from './pos-firestore.ts';
 
@@ -1365,6 +1365,129 @@ describe('parseCatalog fixtures', () => {
     expect(
       JSON.stringify({ itemPage, groupPage, directPayload }),
     ).not.toContain(marker);
+  });
+
+  it('rejects unrecognized wrappers in Firestore value positions before descending with ID-only rejection and zero scalar reads', async () => {
+    const marker = 'synthetic-unknown-wrapper-marker';
+    const reads: string[] = [];
+    const trappedScalar = (label: string) => ({
+      get stringValue() {
+        reads.push(label);
+        throw new Error(marker);
+      },
+    });
+
+    const unknownCases: Array<[string, unknown]> = [
+      [
+        'single-unknown-wrapper',
+        {
+          unknownWrapper: {
+            mapValue: {
+              fields: { internalCode: trappedScalar('single-unknown-wrapper') },
+            },
+          },
+        },
+      ],
+      [
+        'multi-unknown-wrapper',
+        {
+          unknownA: trappedScalar('multi-unknown-a'),
+          unknownB: trappedScalar('multi-unknown-b'),
+        },
+      ],
+      ['empty-wrapper', {}],
+      ['raw-array-value', [trappedScalar('raw-array-value')]],
+      ['raw-primitive-value', 'raw-unwrapped-string'],
+    ];
+
+    const itemDocs = unknownCases.map(([slug, malformed]) =>
+      itemDoc(`item-syn-${slug}`, {
+        name: str(`Synthetic ${slug} Item`),
+        options: map({
+          extras: arr([
+            map({
+              value: str('Synthetic Option'),
+              costPrice: malformed,
+            }),
+          ]),
+        }),
+      }),
+    );
+    const groupDocs = unknownCases.map(([slug, malformed]) =>
+      groupDoc(`group-syn-${slug}`, {
+        name: str(`Synthetic ${slug} Group`),
+        values: arr([
+          map({
+            value: str('Synthetic Value'),
+            costPrice: malformed,
+          }),
+        ]),
+      }),
+    );
+
+    const itemPage = parseListResponse({ documents: itemDocs }, 'items');
+    expect(itemPage.documents).toEqual(
+      itemDocs.map((doc) => ({ name: doc.name, rejected: true })),
+    );
+    const groupPage = parseListResponse(
+      { documents: groupDocs },
+      'optionGroups',
+    );
+    expect(groupPage.documents).toEqual(
+      groupDocs.map((doc) => ({ name: doc.name, rejected: true })),
+    );
+
+    const directPayload = parseCatalog(itemDocs, groupDocs);
+    expect(directPayload.items).toEqual([]);
+    expect(directPayload.option_groups).toEqual([]);
+    expect(directPayload.presence).toEqual(
+      unknownCases
+        .map(([slug]) => ({
+          pos_item_id: `item-syn-${slug}`,
+          outcome: 'rejected' as const,
+        }))
+        .sort((left, right) =>
+          left.pos_item_id.localeCompare(right.pos_item_id),
+        ),
+    );
+    expect(directPayload.option_group_presence).toEqual(
+      unknownCases
+        .map(([slug]) => ({
+          group_id: `group-syn-${slug}`,
+          outcome: 'rejected' as const,
+        }))
+        .sort((left, right) => left.group_id.localeCompare(right.group_id)),
+    );
+    expect(reads).toEqual([]);
+    expect(
+      JSON.stringify({ itemPage, groupPage, directPayload }),
+    ).not.toContain(marker);
+
+    // Also verify through createPosFirestore.list for a plain JSON unknown wrapper.
+    const jsonUnknownItem = itemDoc('item-syn-json-unknown-wrapper', {
+      name: str('Synthetic JSON Unknown Wrapper'),
+      options: map({
+        extras: arr([
+          map({
+            value: str('Synthetic Option'),
+            costPrice: {
+              unknownWrapper: {
+                mapValue: {
+                  fields: { internalCode: str(marker) },
+                },
+              },
+            },
+          }),
+        ]),
+      }),
+    });
+    const transportPage = await createPosFirestore('test-token', async () =>
+      Response.json({ documents: [jsonUnknownItem] }),
+    ).list('items', { pageSize: 1 });
+    expect(transportPage.documents).toEqual([
+      { name: jsonUnknownItem.name, rejected: true },
+    ]);
+    expect(JSON.stringify(transportPage)).not.toContain(marker);
   });
 
   it('reports catalog allowlist drift without echoing the input selector', () => {

@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { parseCatalog } from './catalog.ts';
-import { ORDER_FIELD_PATHS } from './firestore-projection.ts';
+import {
+  FIRESTORE_FIELD_PATHS,
+  ORDER_FIELD_PATHS,
+} from './firestore-projection.ts';
 import {
   assertFirestoreReadAllowed,
   createPosFirestore,
@@ -18,6 +21,14 @@ import { recentOrdersQuery } from './read-pos.ts';
 const ROOT = firestoreRunQueryUrl().replace(':runQuery', '');
 const ORDER_SELECT = {
   fields: ORDER_FIELD_PATHS.map((fieldPath) => ({ fieldPath })),
+};
+const ITEM_SELECT = {
+  fields: FIRESTORE_FIELD_PATHS.items.map((fieldPath) => ({ fieldPath })),
+};
+const GROUP_SELECT = {
+  fields: FIRESTORE_FIELD_PATHS.optionGroups.map((fieldPath) => ({
+    fieldPath,
+  })),
 };
 const ORDER_MASK = ORDER_FIELD_PATHS.map(
   (path) => `mask.fieldPaths=${path}`,
@@ -96,7 +107,7 @@ describe('assertFirestoreReadAllowed', () => {
     ['GET', `${ROOT}/items?pageSize=1&orderBy=opening_time&${ITEM_MASK}`],
     ['GET', `${ROOT}/items?pageSize=1&orderBy=name&${ITEM_MASK}`],
     ['GET', `${ROOT}/items?pageSize=1&mask.fieldPaths=price`],
-    ['GET', `${ROOT}/items/item-test-1`],
+    ['GET', `${ROOT}/items/item-test-1?${ITEM_MASK}`],
     ['GET', `${ROOT}/items/item-test-1/sub?pageSize=1`],
     ['GET', `${ROOT}/items/../customers?pageSize=1`],
     ['GET', `${ROOT}/items/../optionGroups?pageSize=1&${GROUP_MASK}`],
@@ -122,7 +133,7 @@ describe('assertFirestoreReadAllowed', () => {
       'GET',
       `${ROOT}/optionGroups?pageSize=1&orderBy=opening_time&${GROUP_MASK}`,
     ],
-    ['GET', `${ROOT}/optionGroups/group-test-1`],
+    ['GET', `${ROOT}/optionGroups/group-test-1?${GROUP_MASK}`],
     ['GET', `${ROOT}/optionGroups/group-test-1/values?pageSize=1`],
     ['GET', `${ROOT}/optionGroups/../customers?pageSize=1`],
     ['POST', `${ROOT}/optionGroups?pageSize=1`],
@@ -209,6 +220,7 @@ describe('assertFirestoreReadAllowed', () => {
     expect(() =>
       assertFirestoreReadAllowed('POST', firestoreRunQueryUrl(), {
         structuredQuery: {
+          select: ITEM_SELECT,
           from: [{ collectionId: 'items' }],
           limit: 1,
         },
@@ -217,6 +229,7 @@ describe('assertFirestoreReadAllowed', () => {
     expect(() =>
       assertFirestoreReadAllowed('POST', firestoreRunQueryUrl(), {
         structuredQuery: {
+          select: GROUP_SELECT,
           from: [{ collectionId: 'optionGroups' }],
           limit: 1,
         },

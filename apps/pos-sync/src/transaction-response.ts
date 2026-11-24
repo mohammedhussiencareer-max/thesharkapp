@@ -30,7 +30,12 @@ type FrameState =
   | 'primitive'
   | 'comma-or-end';
 
-type Frame = { layout: Container; state: FrameState; child?: Layout };
+type Frame = {
+  layout: Container;
+  state: FrameState;
+  child?: Layout;
+  seen?: Set<string>;
+};
 
 // A key is ASCII and can use up to six bytes per character (\uXXXX).
 const MAX_KEY_BYTES = 'timestampValue'.length * 6 + 2;
@@ -79,7 +84,11 @@ class TransactionKeyScanner {
       if (frame === undefined) {
         if (isWhitespace(byte)) continue;
         if (!this.done && byte === 0x7b) {
-          this.frames.push({ layout: TRANSACTION_PAGE, state: 'key-or-end' });
+          this.frames.push({
+            layout: TRANSACTION_PAGE,
+            state: 'key-or-end',
+            seen: new Set(),
+          });
           continue;
         }
         throw new PosSyncError('firestoreInvalidResponse');
@@ -140,10 +149,11 @@ class TransactionKeyScanner {
           throw new PosSyncError('firestoreInvalidResponse');
         }
         frame.state = 'comma-or-end';
-        this.frames.push({
-          layout: child,
-          state: Array.isArray(child) ? 'value-or-end' : 'key-or-end',
-        });
+        this.frames.push(
+          Array.isArray(child)
+            ? { layout: child, state: 'value-or-end' }
+            : { layout: child, state: 'key-or-end', seen: new Set() },
+        );
         return;
       }
       if (isPrimitiveStart(byte)) {
@@ -205,9 +215,15 @@ class TransactionKeyScanner {
         } catch {
           throw new PosSyncError('firestoreInvalidResponse');
         }
-        if (typeof key !== 'string' || !Object.hasOwn(frame.layout, key)) {
+        if (
+          typeof key !== 'string' ||
+          !Object.hasOwn(frame.layout, key) ||
+          frame.seen === undefined ||
+          frame.seen.has(key)
+        ) {
           throw new PosSyncError('firestoreInvalidResponse');
         }
+        frame.seen.add(key);
         frame.child = frame.layout[key];
         frame.state = 'colon';
         this.keyToken = undefined;
@@ -245,13 +261,13 @@ export async function readTransactionResponse(
       chunks.push(owned);
     }
     scanner.finish();
-  } catch (error) {
+  } catch {
     try {
       await reader.cancel();
     } catch {
       // A broken source still fails closed.
     }
-    throw error;
+    throw new PosSyncError('firestoreInvalidResponse');
   } finally {
     reader.releaseLock();
   }

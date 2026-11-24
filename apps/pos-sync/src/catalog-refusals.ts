@@ -33,12 +33,6 @@ const FIRESTORE_SCALAR_VALUE_KEYS = new Set([
   'geoPointValue',
 ]);
 
-const FIRESTORE_VALUE_KEYS = new Set([
-  ...FIRESTORE_SCALAR_VALUE_KEYS,
-  'mapValue',
-  'arrayValue',
-]);
-
 export type CatalogCollection = 'items' | 'optionGroups';
 
 /** True when an original schema key is price-shaped. */
@@ -80,86 +74,71 @@ function walkFirestoreValueForCustomerKey(
   if (depth > MAX_CATALOG_WALK_DEPTH) {
     return true;
   }
-  if (Array.isArray(value)) {
-    return value.some((entry) =>
-      walkFirestoreValueForCustomerKey(entry, false, depth + 1),
-    );
-  }
   if (!isRecord(value)) {
-    return false;
-  }
-  const keys = Object.keys(value);
-  if (keys.length === 1) {
-    const onlyKey = keys[0];
-    if (onlyKey !== undefined && FIRESTORE_SCALAR_VALUE_KEYS.has(onlyKey)) {
-      return false;
-    }
-    if (onlyKey === 'mapValue') {
-      const mapValue = value.mapValue;
-      if (!isRecord(mapValue)) {
-        return true;
-      }
-      const mapKeys = Object.keys(mapValue);
-      if (mapKeys.some((mapKey) => mapKey !== 'fields')) {
-        return true;
-      }
-      if (mapKeys.length === 0) {
-        return false;
-      }
-      const mapFields = mapValue.fields;
-      if (mapFields === undefined) {
-        return false;
-      }
-      if (!isRecord(mapFields)) {
-        return true;
-      }
-      return walkFirestoreFieldsForCustomerKey(
-        mapFields,
-        false,
-        dynamicLabelMap,
-        depth + 1,
-      );
-    }
-    if (onlyKey === 'arrayValue') {
-      const arrayValue = value.arrayValue;
-      if (!isRecord(arrayValue)) {
-        return true;
-      }
-      const arrKeys = Object.keys(arrayValue);
-      if (arrKeys.some((arrKey) => arrKey !== 'values')) {
-        return true;
-      }
-      if (arrKeys.length === 0) {
-        return false;
-      }
-      const arrValues = arrayValue.values;
-      if (arrValues === undefined) {
-        return false;
-      }
-      if (!Array.isArray(arrValues)) {
-        return true;
-      }
-      for (const entry of arrValues) {
-        if (walkFirestoreValueForCustomerKey(entry, false, depth + 1)) {
-          return true;
-        }
-      }
-      return false;
-    }
-  }
-  // Reject mixed scalar, map, or array wrappers by their keys without opening payloads.
-  if (keys.some((key) => FIRESTORE_VALUE_KEYS.has(key))) {
     return true;
   }
-  for (const key of keys) {
-    if (
-      isCustomerShapedKey(key) ||
-      walkArbitraryForCustomerKey(value[key], depth + 1)
-    ) {
+  const keys = Object.keys(value);
+  if (keys.length !== 1) {
+    return true;
+  }
+  const onlyKey = keys[0];
+  if (onlyKey !== undefined && FIRESTORE_SCALAR_VALUE_KEYS.has(onlyKey)) {
+    return false;
+  }
+  if (onlyKey === 'mapValue') {
+    const mapValue = value.mapValue;
+    if (!isRecord(mapValue)) {
       return true;
     }
+    const mapKeys = Object.keys(mapValue);
+    if (mapKeys.some((mapKey) => mapKey !== 'fields')) {
+      return true;
+    }
+    if (mapKeys.length === 0) {
+      return false;
+    }
+    const mapFields = mapValue.fields;
+    if (mapFields === undefined) {
+      return false;
+    }
+    if (!isRecord(mapFields)) {
+      return true;
+    }
+    return walkFirestoreFieldsForCustomerKey(
+      mapFields,
+      false,
+      dynamicLabelMap,
+      depth + 1,
+    );
   }
-  return false;
+  if (onlyKey === 'arrayValue') {
+    const arrayValue = value.arrayValue;
+    if (!isRecord(arrayValue)) {
+      return true;
+    }
+    const arrKeys = Object.keys(arrayValue);
+    if (arrKeys.some((arrKey) => arrKey !== 'values')) {
+      return true;
+    }
+    if (arrKeys.length === 0) {
+      return false;
+    }
+    const arrValues = arrayValue.values;
+    if (arrValues === undefined) {
+      return false;
+    }
+    if (!Array.isArray(arrValues)) {
+      return true;
+    }
+    for (const entry of arrValues) {
+      if (walkFirestoreValueForCustomerKey(entry, false, depth + 1)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  // Reject unrecognized wrappers in Firestore value positions without descending.
+  return true;
 }
 
 function walkFirestoreFieldsForCustomerKey(
