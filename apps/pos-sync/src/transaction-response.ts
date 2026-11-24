@@ -236,8 +236,14 @@ export async function readTransactionResponse(
       if (!(bytes instanceof Uint8Array)) {
         throw new Error(INVALID_RESPONSE);
       }
-      scanner.scan(bytes);
-      chunks.push(bytes);
+      let owned: Uint8Array;
+      try {
+        owned = new Uint8Array(bytes);
+      } catch {
+        throw new Error(INVALID_RESPONSE);
+      }
+      scanner.scan(owned);
+      chunks.push(owned);
     }
     scanner.finish();
   } catch (error) {

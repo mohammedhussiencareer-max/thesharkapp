@@ -1049,8 +1049,6 @@ describe('parseCatalog fixtures', () => {
     const marker = 'synthetic-unread-catalog-leaf';
     const reads: string[] = [];
     const protectedScalar = (field: string) => ({
-      // A malformed wrapper still must not expose its scalar payload to the key scan.
-      extraWrapperKey: null,
       get stringValue() {
         reads.push(field);
         throw new Error(marker);
@@ -1075,6 +1073,97 @@ describe('parseCatalog fixtures', () => {
     });
     expect(reads).toEqual([]);
     expect(JSON.stringify(result)).not.toContain(marker);
+  });
+
+  it('rejects mixed scalar wrappers by their keys with an ID-only rejection without opening scalar payloads', () => {
+    const marker = 'synthetic-mixed-scalar-marker';
+    const reads: string[] = [];
+    const mixedWithTrap = (field: string) => ({
+      extraWrapperKey: null,
+      get stringValue() {
+        reads.push(field);
+        throw new Error(marker);
+      },
+    });
+    const dualScalarTrap = {
+      integerValue: '1',
+      get stringValue() {
+        reads.push('dual');
+        throw new Error(marker);
+      },
+    };
+    const itemWithConcealedCustomer = itemDoc('item-syn-mixed-customer', {
+      name: str('Synthetic Concealed Customer'),
+      options: map({
+        'Guest Specials': arr([
+          map({
+            value: str('Synthetic Add-on'),
+            price: {
+              extraWrapperKey: null,
+              stringValue: { customerName: 'syn-concealed-customer' },
+            },
+          }),
+        ]),
+      }),
+    });
+    const itemWithTrappedMixed = itemDoc('item-syn-mixed-trap', {
+      name: str('Synthetic Trapped Mixed'),
+      options: map({
+        'Guest Specials': arr([
+          map({
+            value: str('Synthetic Add-on'),
+            price: mixedWithTrap('price'),
+            costPrice: dualScalarTrap,
+          }),
+        ]),
+      }),
+    });
+    const groupWithConcealedCustomer = groupDoc('group-syn-mixed-customer', {
+      name: str('Synthetic Mixed Group'),
+      values: arr([
+        map({
+          value: str('Baked'),
+          price: {
+            extraWrapperKey: null,
+            stringValue: { customerPhone: '01000000000' },
+          },
+        }),
+      ]),
+    });
+
+    const itemPage = parseListResponse(
+      { documents: [itemWithConcealedCustomer, itemWithTrappedMixed] },
+      'items',
+    );
+    expect(itemPage.documents).toEqual([
+      { name: itemWithConcealedCustomer.name, rejected: true },
+      { name: itemWithTrappedMixed.name, rejected: true },
+    ]);
+    const groupPage = parseListResponse(
+      { documents: [groupWithConcealedCustomer] },
+      'optionGroups',
+    );
+    expect(groupPage.documents).toEqual([
+      { name: groupWithConcealedCustomer.name, rejected: true },
+    ]);
+
+    const directPayload = parseCatalog(
+      [itemWithConcealedCustomer, itemWithTrappedMixed],
+      [groupWithConcealedCustomer],
+    );
+    expect(directPayload.items).toEqual([]);
+    expect(directPayload.option_groups).toEqual([]);
+    expect(directPayload.presence).toEqual([
+      { pos_item_id: 'item-syn-mixed-customer', outcome: 'rejected' },
+      { pos_item_id: 'item-syn-mixed-trap', outcome: 'rejected' },
+    ]);
+    expect(directPayload.option_group_presence).toEqual([
+      { group_id: 'group-syn-mixed-customer', outcome: 'rejected' },
+    ]);
+    expect(reads).toEqual([]);
+    expect(JSON.stringify({ itemPage, groupPage, directPayload })).not.toMatch(
+      /syn-concealed-customer|01000000000|synthetic-mixed-scalar-marker/,
+    );
   });
 
   it('accepts 15 and 20 nested Firestore maps during customer-key scan and rejects beyond the walk cap', () => {

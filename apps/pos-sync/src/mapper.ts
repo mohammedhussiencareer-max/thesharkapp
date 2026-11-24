@@ -97,12 +97,16 @@ export function normalizeOptionalText(value: string): string | null {
 function optionalText(
   value: unknown,
   label: string,
-  kind: 'stringValue' | 'timestampValue',
+  ...kinds: ReadonlyArray<'stringValue' | 'timestampValue'>
 ): string | null {
   if (value === undefined || isNullValue(value)) {
     return null;
   }
-  if (!hasFirestoreValueKind(value, kind) || typeof value[kind] !== 'string') {
+  if (!hasFirestoreValueKind(value, ...kinds)) {
+    throw new Error(`unexpected ${label}`);
+  }
+  const kind = kinds.find((candidate) => Object.hasOwn(value, candidate));
+  if (kind === undefined || typeof value[kind] !== 'string') {
     throw new Error(`unexpected ${label}`);
   }
   return normalizeOptionalText(value[kind]);
@@ -191,7 +195,7 @@ function requiredTime(value: unknown, label: string): string {
 }
 
 function optionalTime(value: unknown, label: string): string | null {
-  const text = optionalText(value, label, 'timestampValue');
+  const text = optionalText(value, label, 'timestampValue', 'stringValue');
   if (text === null) {
     return null;
   }

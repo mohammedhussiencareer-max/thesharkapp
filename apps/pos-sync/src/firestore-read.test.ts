@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { parseCatalog } from './catalog.ts';
 import { ORDER_FIELD_PATHS } from './firestore-projection.ts';
 import {
@@ -130,14 +130,20 @@ describe('assertFirestoreReadAllowed', () => {
     ['DELETE', `${ROOT}/optionGroups/group-test-1`],
   ] as const;
 
-  it('refuses a forbidden shift orderBy with an otherwise valid exact mask', () => {
+  it('refuses a forbidden shift orderBy with an otherwise valid exact mask before any request', async () => {
     const url = `${ROOT}/custody_shifts?pageSize=4&${SHIFT_MASK}`;
+    const forbiddenUrl = `${url}&orderBy=customerName`;
     expect(() =>
       assertFirestoreReadAllowed('GET', `${url}&orderBy=opening_time`),
     ).not.toThrow();
-    expect(() =>
-      assertFirestoreReadAllowed('GET', `${url}&orderBy=customerName`),
-    ).toThrow(/^Firestore read refused$/);
+    expect(() => assertFirestoreReadAllowed('GET', forbiddenUrl)).toThrow(
+      /^Firestore read refused$/,
+    );
+    const transport = vi.fn(async () => jsonResponse({}));
+    await expect(
+      firestoreFetch('GET', forbiddenUrl, 'test-token', undefined, transport),
+    ).rejects.toThrow(/^Firestore read refused$/);
+    expect(transport).not.toHaveBeenCalled();
   });
 
   it('refuses writes and other URLs before any request', async () => {

@@ -375,6 +375,63 @@ describe('mapOrderDocument', () => {
     expect(order.ordered_at).toBe('2026-10-15T24:00:00.000000Z');
     expect(order.pos_update_time).toBe('2026-10-15T24:00:00.000000Z');
   });
+
+  it('accepts valid RFC 3339 timestamps stored as stringValue and rejects invalid text', () => {
+    const order = mapOrderDocument({
+      name: `${NAME_PREFIX}/orders/order-test-str-ts`,
+      updateTime: '2026-10-15T12:00:00Z',
+      fields: {
+        status: str('complete'),
+        shiftId: str('shift-test-1'),
+        timestamp: str('2026-10-15T12:00:00Z'),
+        subtotalAmount: dbl(10),
+        discountAmount: dbl(0),
+        taxTotalAmount: dbl(0),
+        serviceTaxAmount: dbl(0),
+        totalAmount: dbl(10),
+      },
+    });
+    expect(order.ordered_at).toBe('2026-10-15T12:00:00.000000Z');
+
+    const shift = mapShiftDocument({
+      name: `${NAME_PREFIX}/custody_shifts/shift-test-str-ts`,
+      updateTime: '2026-10-15T18:00:00Z',
+      fields: {
+        opening_time: str('2026-10-15T09:00:00Z'),
+        closingTime: str('2026-10-15T18:00:00Z'),
+        isActive: bool(false),
+      },
+    });
+    expect(shift.opened_at).toBe('2026-10-15T09:00:00.000000Z');
+    expect(shift.closed_at).toBe('2026-10-15T18:00:00.000000Z');
+
+    const tx = mapShiftTransaction(
+      'shift-test-1',
+      txDocument('shift-test-1', 'tx-str-ts', {
+        type: int(0),
+        amount: int(15),
+        timestamp: str('2026-10-15T15:04:05Z'),
+      }),
+    );
+    expect(tx.occurred_at).toBe('2026-10-15T15:04:05.000000Z');
+
+    expect(() =>
+      mapOrderDocument({
+        name: `${NAME_PREFIX}/orders/order-test-bad-str-ts`,
+        updateTime: '2026-10-15T12:00:00Z',
+        fields: {
+          status: str('complete'),
+          shiftId: str('shift-test-1'),
+          timestamp: str('not-a-timestamp'),
+          subtotalAmount: dbl(10),
+          discountAmount: dbl(0),
+          taxTotalAmount: dbl(0),
+          serviceTaxAmount: dbl(0),
+          totalAmount: dbl(10),
+        },
+      }),
+    ).toThrow(/invalid timestamp/);
+  });
 });
 
 describe('mapShiftDocument', () => {

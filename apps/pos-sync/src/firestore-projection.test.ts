@@ -6,12 +6,17 @@ import {
   createPosFirestore,
   firestoreRunQueryUrl,
 } from './firestore-read.ts';
-import { mapOrderDocument } from './mapper.ts';
+import {
+  mapOrderDocument,
+  mapShiftDocument,
+  mapShiftTransaction,
+} from './mapper.ts';
 import {
   recentOrdersQuery,
   timestampProbeQuery,
   timestampRangeQuery,
 } from './read-pos.ts';
+import { readTransactionResponse } from './transaction-response.ts';
 
 const QUERY_URL = firestoreRunQueryUrl();
 const ROOT = QUERY_URL.replace(':runQuery', '');
@@ -462,6 +467,74 @@ it('accepts a transaction response with keys and UTF-8 values split across chunk
   });
 });
 
+it('copies each transaction chunk into an owned buffer before scanning so a reused buffer cannot smuggle description into decoding', async () => {
+  const marker = 'synthetic-reused-buffer-description';
+  const safeValue = 'safe-placeholder-value-000000000000';
+  expect(safeValue.length).toBe(marker.length);
+  const encoder = new TextEncoder();
+  const initialText = `{"documents":[{"name":"${DOCUMENT_ROOT}/${TX_PATH}/tx-test-1","fields":{"orderId":    {"stringValue":"${safeValue}"}}}`;
+  const mutatedText = `{"documents":[{"name":"${DOCUMENT_ROOT}/${TX_PATH}/tx-test-1","fields":{"description":{"stringValue":"${marker}"}}}`;
+  const initialBytes = encoder.encode(initialText);
+  const mutatedBytes = encoder.encode(mutatedText);
+  expect(mutatedBytes.length).toBe(initialBytes.length);
+
+  const makeReusedBufferStream = () => {
+    const shared = new Uint8Array(initialBytes.length);
+    let step = 0;
+    return new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          if (step === 0) {
+            step = 1;
+            shared.set(initialBytes);
+            controller.enqueue(shared);
+          } else if (step === 1) {
+            step = 2;
+            shared.set(mutatedBytes);
+            controller.enqueue(encoder.encode(']}'));
+          } else {
+            controller.close();
+          }
+        },
+      },
+      { highWaterMark: 0 },
+    );
+  };
+
+  const expected = {
+    documents: [
+      {
+        name: `${DOCUMENT_ROOT}/${TX_PATH}/tx-test-1`,
+        fields: { orderId: { stringValue: safeValue } },
+      },
+    ],
+  };
+
+  const decoder = vi.spyOn(TextDecoder.prototype, 'decode');
+  try {
+    const direct = await readTransactionResponse(
+      new Response(makeReusedBufferStream()),
+    );
+    expect(direct).toEqual(expected);
+
+    const client = createPosFirestore(
+      'test-token',
+      async () => new Response(makeReusedBufferStream()),
+    );
+    await expect(
+      client.listShiftTransactions('shift-test-1', { pageSize: 1 }),
+    ).resolves.toEqual(expected);
+
+    const decodedTexts = decoder.mock.results
+      .map((result) => (typeof result.value === 'string' ? result.value : ''))
+      .join('');
+    expect(decodedTexts).not.toContain('description');
+    expect(decodedTexts).not.toContain(marker);
+  } finally {
+    decoder.mockRestore();
+  }
+});
+
 it.each([
   ['orders', 'list'],
   ['orders', 'query'],
@@ -613,7 +686,9 @@ it('rejects a map under projected status without decoding the nested customer fi
 });
 
 it.each([
-  ['orders', { timestamp: { stringValue: READ_TIME } }],
+  ['orders', { timestamp: { integerValue: '1' } }],
+  ['orders', { timestamp: { stringValue: 'not-a-timestamp' } }],
+  ['orders', { timestamp: { timestampValue: 'not-a-timestamp' } }],
   ['orders', { totalAmount: { booleanValue: true } }],
   ['orders', { orderNumber: { integerValue: 'one' } }],
   [
@@ -626,8 +701,10 @@ it.each([
   ],
   ['orders', { items: { arrayValue: { values: [], customerName: 'bad' } } }],
   ['custody_shifts', { isActive: { stringValue: 'true' } }],
+  ['custody_shifts', { opening_time: { stringValue: 'not-a-timestamp' } }],
+  ['custody_shifts', { closingTime: { stringValue: 'not-a-timestamp' } }],
 ] as const)(
-  'rejects the wrong value kind at a projected %s scalar (%j)',
+  'rejects the wrong value kind or invalid timestamp text at a projected %s scalar (%j)',
   async (collection, fields) => {
     const client = createPosFirestore('test-token', async () =>
       respond({
@@ -639,5 +716,91 @@ it.each([
     await expect(client.list(collection, { pageSize: 1 })).rejects.toThrow(
       INVALID_RESPONSE,
     );
+  },
+);
+
+it('accepts valid RFC 3339 timestamps stored as stringValue for orders, shifts, and transactions', async () => {
+  const orderDoc = {
+    name: `${DOCUMENT_ROOT}/orders/order-test-str-ts`,
+    updateTime: READ_TIME,
+    fields: {
+      status: { stringValue: 'complete' },
+      shiftId: { stringValue: 'shift-test-1' },
+      timestamp: { stringValue: '2026-11-20T12:00:00Z' },
+      subtotalAmount: { integerValue: '10' },
+      discountAmount: { integerValue: '0' },
+      taxTotalAmount: { integerValue: '0' },
+      serviceTaxAmount: { integerValue: '0' },
+      totalAmount: { integerValue: '10' },
+    },
+  };
+  const shiftDoc = {
+    name: `${DOCUMENT_ROOT}/custody_shifts/shift-test-1`,
+    updateTime: READ_TIME,
+    fields: {
+      id: { stringValue: 'shift-test-1' },
+      opening_time: { stringValue: '2026-11-20T09:00:00Z' },
+      closingTime: { stringValue: '2026-11-20T18:00:00Z' },
+      isActive: { booleanValue: false },
+    },
+  };
+  const txDoc = {
+    name: `${DOCUMENT_ROOT}/${TX_PATH}/tx-test-str-ts`,
+    fields: {
+      orderId: { stringValue: 'order-test-str-ts' },
+      type: { integerValue: '0' },
+      amount: { integerValue: '10' },
+      timestamp: { stringValue: '2026-11-20T15:04:05Z' },
+    },
+  };
+
+  const orderPage = await createPosFirestore('test-token', async () =>
+    respond({ documents: [orderDoc] }),
+  ).list('orders', { pageSize: 1 });
+  expect(mapOrderDocument(orderPage.documents[0]!).ordered_at).toBe(
+    '2026-11-20T12:00:00.000000Z',
+  );
+
+  const shift = await createPosFirestore('test-token', async () =>
+    respond(shiftDoc),
+  ).getShift('shift-test-1');
+  expect(mapShiftDocument(shift!)).toMatchObject({
+    opened_at: '2026-11-20T09:00:00.000000Z',
+    closed_at: '2026-11-20T18:00:00.000000Z',
+  });
+
+  const txPage = await createPosFirestore('test-token', async () =>
+    respond({ documents: [txDoc] }),
+  ).listShiftTransactions('shift-test-1', { pageSize: 1 });
+  expect(
+    mapShiftTransaction('shift-test-1', txPage.documents[0]!).occurred_at,
+  ).toBe('2026-11-20T15:04:05.000000Z');
+});
+
+it.each([
+  { stringValue: 'not-a-timestamp' },
+  { timestampValue: 'not-a-timestamp' },
+  { stringValue: '' },
+  { integerValue: '1' },
+] as const)(
+  'rejects invalid transaction timestamp encoding or text (%j)',
+  async (timestamp) => {
+    const client = createPosFirestore('test-token', async () =>
+      respond({
+        documents: [
+          {
+            name: `${DOCUMENT_ROOT}/${TX_PATH}/tx-test-bad-ts`,
+            fields: {
+              type: { integerValue: '0' },
+              amount: { integerValue: '10' },
+              timestamp,
+            },
+          },
+        ],
+      }),
+    );
+    await expect(
+      client.listShiftTransactions('shift-test-1', { pageSize: 1 }),
+    ).rejects.toThrow(INVALID_RESPONSE);
   },
 );

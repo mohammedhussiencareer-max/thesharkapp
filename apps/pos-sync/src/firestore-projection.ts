@@ -3,12 +3,25 @@ import {
   CATALOG_OPTION_GROUP_FIELDS,
 } from './catalog-allowlist.ts';
 import { isRecord } from './decode.ts';
+import { normalizeTimestamp } from './time.ts';
+
+function isValidTimestamp(value: unknown): boolean {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  try {
+    normalizeTimestamp(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // The accounting paths mirror the reads in mapper.ts. Firestore cannot mask
 // individual fields inside array elements, so orders select the items array.
 const VALUE_PAYLOADS = {
   stringValue: (value: unknown) => typeof value === 'string',
-  timestampValue: (value: unknown) => typeof value === 'string',
+  timestampValue: isValidTimestamp,
   booleanValue: (value: unknown) => typeof value === 'boolean',
   integerValue: (value: unknown) =>
     typeof value === 'string' &&
@@ -31,8 +44,11 @@ type Kind = keyof typeof VALUE_PAYLOADS;
 const NUMBER = ['integerValue', 'doubleValue'] as const;
 const OPTIONAL_NUMBER = [...NUMBER, 'nullValue'] as const;
 const OPTIONAL_STRING = ['stringValue', 'nullValue'] as const;
+const TIMESTAMP = ['timestampValue', 'stringValue'] as const;
+const OPTIONAL_TIMESTAMP = [...TIMESTAMP, 'nullValue'] as const;
 const OPTIONAL_ARRAY = ['arrayValue', 'nullValue'] as const;
 const OPTIONAL_MAP = ['mapValue', 'nullValue'] as const;
+const TIMESTAMP_FIELDS = new Set(['timestamp', 'opening_time', 'closingTime']);
 
 const ORDER_FIELD_KINDS = {
   status: ['stringValue'],
@@ -40,7 +56,7 @@ const ORDER_FIELD_KINDS = {
   shiftId: ['stringValue'],
   orderType: OPTIONAL_STRING,
   paymentType: OPTIONAL_STRING,
-  timestamp: ['timestampValue'],
+  timestamp: TIMESTAMP,
   subtotalAmount: NUMBER,
   discountAmount: NUMBER,
   taxTotalAmount: NUMBER,
@@ -54,8 +70,8 @@ const ORDER_FIELD_KINDS = {
 
 const SHIFT_FIELD_KINDS = {
   id: OPTIONAL_STRING,
-  opening_time: ['timestampValue'],
-  closingTime: ['timestampValue', 'nullValue'],
+  opening_time: TIMESTAMP,
+  closingTime: OPTIONAL_TIMESTAMP,
   isActive: ['booleanValue'],
   cash_payments_net: OPTIONAL_NUMBER,
   credit_payments: OPTIONAL_NUMBER,
@@ -65,7 +81,7 @@ export const TRANSACTION_FIELD_KINDS = {
   orderId: OPTIONAL_STRING,
   type: NUMBER,
   amount: NUMBER,
-  timestamp: ['timestampValue'],
+  timestamp: TIMESTAMP,
 } satisfies Record<string, readonly Kind[]>;
 
 const FIELD_KINDS: Readonly<Record<string, readonly Kind[] | undefined>> = {
@@ -133,7 +149,7 @@ function assertProjectedFields(
   for (const key of Object.keys(fields)) {
     const path = `${parent}${key}`;
     if (!key.includes('.') && projection.includes(key)) {
-      if (!matchesValueKind(fields[key], FIELD_KINDS[path])) {
+      if (!matchesValueKind(fields[key], FIELD_KINDS[path], path)) {
         throw new Error('Firestore read failed: invalid response');
       }
       continue;
@@ -165,6 +181,7 @@ function assertProjectedFields(
 function matchesValueKind(
   value: unknown,
   kinds: readonly Kind[] | undefined,
+  path: string,
 ): boolean {
   if (
     kinds === undefined ||
@@ -174,5 +191,12 @@ function matchesValueKind(
     return false;
   }
   const kind = kinds.find((candidate) => Object.hasOwn(value, candidate));
-  return kind !== undefined && VALUE_PAYLOADS[kind](value[kind]);
+  if (kind === undefined || !VALUE_PAYLOADS[kind](value[kind])) {
+    return false;
+  }
+  return !(
+    kind === 'stringValue' &&
+    TIMESTAMP_FIELDS.has(path) &&
+    !isValidTimestamp(value[kind])
+  );
 }
