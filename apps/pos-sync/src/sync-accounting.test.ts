@@ -225,6 +225,7 @@ describe('runPosSync accounting drain', () => {
     expect(logs.at(-1)).toMatch(
       /^accounting drain stop=call_failed .* report=not_needed error=sync failed$/,
     );
+    expect(logs.join('\n')).not.toContain(marker);
   });
 
   it('does not drain when the sync itself fails', async () => {
