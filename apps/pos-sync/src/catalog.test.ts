@@ -1085,13 +1085,6 @@ describe('parseCatalog fixtures', () => {
         throw new Error(marker);
       },
     });
-    const dualScalarTrap = {
-      integerValue: '1',
-      get stringValue() {
-        reads.push('dual');
-        throw new Error(marker);
-      },
-    };
     const itemWithConcealedCustomer = itemDoc('item-syn-mixed-customer', {
       name: str('Synthetic Concealed Customer'),
       options: map({
@@ -1113,7 +1106,6 @@ describe('parseCatalog fixtures', () => {
           map({
             value: str('Synthetic Add-on'),
             price: mixedWithTrap('price'),
-            costPrice: dualScalarTrap,
           }),
         ]),
       }),
@@ -1164,6 +1156,73 @@ describe('parseCatalog fixtures', () => {
     expect(JSON.stringify({ itemPage, groupPage, directPayload })).not.toMatch(
       /syn-concealed-customer|01000000000|synthetic-mixed-scalar-marker/,
     );
+  });
+
+  it('rejects a dual-scalar wrapper in its own fixture with an ID-only rejection and zero getter calls', () => {
+    const marker = 'synthetic-dual-scalar-marker';
+    const reads: string[] = [];
+    const dualScalarTrap = (label: string) => ({
+      get integerValue() {
+        reads.push(`${label}:integerValue`);
+        throw new Error(marker);
+      },
+      get stringValue() {
+        reads.push(`${label}:stringValue`);
+        throw new Error(marker);
+      },
+    });
+    const itemWithDualScalar = itemDoc('item-syn-dual-scalar-trap', {
+      name: str('Synthetic Dual Scalar Item'),
+      options: map({
+        'Guest Specials': arr([
+          map({
+            value: str('Synthetic Add-on'),
+            costPrice: dualScalarTrap('item'),
+          }),
+        ]),
+      }),
+    });
+    const groupWithDualScalar = groupDoc('group-syn-dual-scalar-trap', {
+      name: str('Synthetic Dual Scalar Group'),
+      values: arr([
+        map({
+          value: str('Baked'),
+          price: dualScalarTrap('group'),
+        }),
+      ]),
+    });
+
+    const itemPage = parseListResponse(
+      { documents: [itemWithDualScalar] },
+      'items',
+    );
+    expect(itemPage.documents).toEqual([
+      { name: itemWithDualScalar.name, rejected: true },
+    ]);
+    const groupPage = parseListResponse(
+      { documents: [groupWithDualScalar] },
+      'optionGroups',
+    );
+    expect(groupPage.documents).toEqual([
+      { name: groupWithDualScalar.name, rejected: true },
+    ]);
+
+    const directPayload = parseCatalog(
+      [itemWithDualScalar],
+      [groupWithDualScalar],
+    );
+    expect(directPayload.items).toEqual([]);
+    expect(directPayload.option_groups).toEqual([]);
+    expect(directPayload.presence).toEqual([
+      { pos_item_id: 'item-syn-dual-scalar-trap', outcome: 'rejected' },
+    ]);
+    expect(directPayload.option_group_presence).toEqual([
+      { group_id: 'group-syn-dual-scalar-trap', outcome: 'rejected' },
+    ]);
+    expect(reads).toEqual([]);
+    expect(
+      JSON.stringify({ itemPage, groupPage, directPayload }),
+    ).not.toContain(marker);
   });
 
   it('accepts 15 and 20 nested Firestore maps during customer-key scan and rejects beyond the walk cap', () => {

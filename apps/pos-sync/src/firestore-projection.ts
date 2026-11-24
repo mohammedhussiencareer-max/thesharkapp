@@ -5,12 +5,16 @@ import {
 import { isRecord } from './decode.ts';
 import { normalizeTimestamp } from './time.ts';
 
-function isValidTimestamp(value: unknown): boolean {
+function isValidTimestamp(value: unknown, allowBlank = false): boolean {
   if (typeof value !== 'string') {
     return false;
   }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return allowBlank;
+  }
   try {
-    normalizeTimestamp(value);
+    normalizeTimestamp(trimmed);
     return true;
   } catch {
     return false;
@@ -21,7 +25,7 @@ function isValidTimestamp(value: unknown): boolean {
 // individual fields inside array elements, so orders select the items array.
 const VALUE_PAYLOADS = {
   stringValue: (value: unknown) => typeof value === 'string',
-  timestampValue: isValidTimestamp,
+  timestampValue: (value: unknown) => isValidTimestamp(value),
   booleanValue: (value: unknown) => typeof value === 'boolean',
   integerValue: (value: unknown) =>
     typeof value === 'string' &&
@@ -49,6 +53,7 @@ const OPTIONAL_TIMESTAMP = [...TIMESTAMP, 'nullValue'] as const;
 const OPTIONAL_ARRAY = ['arrayValue', 'nullValue'] as const;
 const OPTIONAL_MAP = ['mapValue', 'nullValue'] as const;
 const TIMESTAMP_FIELDS = new Set(['timestamp', 'opening_time', 'closingTime']);
+const OPTIONAL_TIMESTAMP_FIELDS = new Set(['closingTime']);
 
 const ORDER_FIELD_KINDS = {
   status: ['stringValue'],
@@ -191,12 +196,14 @@ function matchesValueKind(
     return false;
   }
   const kind = kinds.find((candidate) => Object.hasOwn(value, candidate));
-  if (kind === undefined || !VALUE_PAYLOADS[kind](value[kind])) {
+  if (kind === undefined) {
     return false;
   }
-  return !(
-    kind === 'stringValue' &&
+  if (
     TIMESTAMP_FIELDS.has(path) &&
-    !isValidTimestamp(value[kind])
-  );
+    (kind === 'timestampValue' || kind === 'stringValue')
+  ) {
+    return isValidTimestamp(value[kind], OPTIONAL_TIMESTAMP_FIELDS.has(path));
+  }
+  return VALUE_PAYLOADS[kind](value[kind]);
 }

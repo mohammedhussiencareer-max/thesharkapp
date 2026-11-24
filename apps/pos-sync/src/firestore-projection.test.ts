@@ -804,3 +804,187 @@ it.each([
     ).rejects.toThrow(INVALID_RESPONSE);
   },
 );
+
+it.each(['stringValue', 'timestampValue'] as const)(
+  'accepts whitespace-padded legacy timestamps as %s through the transport for orders, shifts, and transactions',
+  async (kind) => {
+    const orderDoc = {
+      name: `${DOCUMENT_ROOT}/orders/order-test-padded-ts`,
+      updateTime: READ_TIME,
+      fields: {
+        status: { stringValue: 'complete' },
+        shiftId: { stringValue: 'shift-test-1' },
+        timestamp: { [kind]: '  2026-11-20T12:00:00Z  ' },
+        subtotalAmount: { integerValue: '10' },
+        discountAmount: { integerValue: '0' },
+        taxTotalAmount: { integerValue: '0' },
+        serviceTaxAmount: { integerValue: '0' },
+        totalAmount: { integerValue: '10' },
+      },
+    };
+    const shiftDoc = {
+      name: `${DOCUMENT_ROOT}/custody_shifts/shift-test-1`,
+      updateTime: READ_TIME,
+      fields: {
+        id: { stringValue: 'shift-test-1' },
+        opening_time: { [kind]: '\t2026-11-20T09:00:00Z\n' },
+        closingTime: { [kind]: ' 2026-11-20T18:00:00Z ' },
+        isActive: { booleanValue: false },
+      },
+    };
+    const txDoc = {
+      name: `${DOCUMENT_ROOT}/${TX_PATH}/tx-test-padded-ts`,
+      fields: {
+        orderId: { stringValue: 'order-test-padded-ts' },
+        type: { integerValue: '0' },
+        amount: { integerValue: '10' },
+        timestamp: { [kind]: ' 2026-11-20T15:04:05Z ' },
+      },
+    };
+
+    const orderPage = await createPosFirestore('test-token', async () =>
+      respond({ documents: [orderDoc] }),
+    ).list('orders', { pageSize: 1 });
+    expect(mapOrderDocument(orderPage.documents[0]!).ordered_at).toBe(
+      '2026-11-20T12:00:00.000000Z',
+    );
+
+    const queriedOrders = await createPosFirestore('test-token', async () =>
+      respond([{ document: orderDoc, readTime: READ_TIME }]),
+    ).queryOrders(recentOrdersQuery(['shift-test-1']));
+    expect(mapOrderDocument(queriedOrders[0]!).ordered_at).toBe(
+      '2026-11-20T12:00:00.000000Z',
+    );
+
+    const shiftPage = await createPosFirestore('test-token', async () =>
+      respond({ documents: [shiftDoc] }),
+    ).list('custody_shifts', { pageSize: 1 });
+    expect(mapShiftDocument(shiftPage.documents[0]!)).toMatchObject({
+      opened_at: '2026-11-20T09:00:00.000000Z',
+      closed_at: '2026-11-20T18:00:00.000000Z',
+    });
+
+    const shift = await createPosFirestore('test-token', async () =>
+      respond(shiftDoc),
+    ).getShift('shift-test-1');
+    expect(mapShiftDocument(shift!)).toMatchObject({
+      opened_at: '2026-11-20T09:00:00.000000Z',
+      closed_at: '2026-11-20T18:00:00.000000Z',
+    });
+
+    const txPage = await createPosFirestore('test-token', async () =>
+      respond({ documents: [txDoc] }),
+    ).listShiftTransactions('shift-test-1', { pageSize: 1 });
+    expect(
+      mapShiftTransaction('shift-test-1', txPage.documents[0]!).occurred_at,
+    ).toBe('2026-11-20T15:04:05.000000Z');
+  },
+);
+
+it('accepts blank optional closingTime text through the transport and rejects blank required timestamps', async () => {
+  for (const closingTime of [
+    { stringValue: '' },
+    { stringValue: '   ' },
+    { timestampValue: '' },
+    { timestampValue: ' \t ' },
+  ] as const) {
+    const shiftDoc = {
+      name: `${DOCUMENT_ROOT}/custody_shifts/shift-test-1`,
+      updateTime: READ_TIME,
+      fields: {
+        id: { stringValue: 'shift-test-1' },
+        opening_time: { timestampValue: '2026-11-20T09:00:00Z' },
+        closingTime,
+        isActive: { booleanValue: true },
+      },
+    };
+    const shift = await createPosFirestore('test-token', async () =>
+      respond(shiftDoc),
+    ).getShift('shift-test-1');
+    expect(mapShiftDocument(shift!).closed_at).toBeNull();
+
+    const shiftPage = await createPosFirestore('test-token', async () =>
+      respond({ documents: [shiftDoc] }),
+    ).list('custody_shifts', { pageSize: 1 });
+    expect(mapShiftDocument(shiftPage.documents[0]!).closed_at).toBeNull();
+  }
+
+  for (const badClosing of [
+    { stringValue: '  not-a-timestamp  ' },
+    { timestampValue: '  not-a-timestamp  ' },
+  ] as const) {
+    await expect(
+      createPosFirestore('test-token', async () =>
+        respond({
+          name: `${DOCUMENT_ROOT}/custody_shifts/shift-test-1`,
+          updateTime: READ_TIME,
+          fields: {
+            opening_time: { timestampValue: '2026-11-20T09:00:00Z' },
+            closingTime: badClosing,
+            isActive: { booleanValue: false },
+          },
+        }),
+      ).getShift('shift-test-1'),
+    ).rejects.toThrow(INVALID_RESPONSE);
+  }
+
+  for (const blank of [
+    { stringValue: '' },
+    { stringValue: '   ' },
+    { timestampValue: '' },
+    { timestampValue: '   ' },
+  ] as const) {
+    await expect(
+      createPosFirestore('test-token', async () =>
+        respond({
+          documents: [
+            {
+              name: `${DOCUMENT_ROOT}/orders/order-test-blank-ts`,
+              fields: { timestamp: blank },
+            },
+          ],
+        }),
+      ).list('orders', { pageSize: 1 }),
+    ).rejects.toThrow(INVALID_RESPONSE);
+
+    await expect(
+      createPosFirestore('test-token', async () =>
+        respond([
+          {
+            document: {
+              name: `${DOCUMENT_ROOT}/orders/order-test-blank-ts`,
+              fields: { timestamp: blank },
+            },
+            readTime: READ_TIME,
+          },
+        ]),
+      ).queryOrders(recentOrdersQuery(['shift-test-1'])),
+    ).rejects.toThrow(INVALID_RESPONSE);
+
+    await expect(
+      createPosFirestore('test-token', async () =>
+        respond({
+          name: `${DOCUMENT_ROOT}/custody_shifts/shift-test-1`,
+          fields: { opening_time: blank },
+        }),
+      ).getShift('shift-test-1'),
+    ).rejects.toThrow(INVALID_RESPONSE);
+
+    await expect(
+      createPosFirestore('test-token', async () =>
+        respond({
+          documents: [
+            {
+              name: `${DOCUMENT_ROOT}/${TX_PATH}/tx-test-blank-ts`,
+              fields: {
+                type: { integerValue: '0' },
+                amount: { integerValue: '10' },
+                timestamp: blank,
+              },
+            },
+          ],
+        }),
+      ).listShiftTransactions('shift-test-1', { pageSize: 1 }),
+    ).rejects.toThrow(INVALID_RESPONSE);
+  }
+});
