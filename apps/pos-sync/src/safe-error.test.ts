@@ -114,6 +114,35 @@ describe('safeErrorMessage', () => {
     ).toBe('Supabase RPC failed: HTTP 502');
   });
 
+  it('keeps numeric HTTP statuses above 599 for unknown-outcome classification while validating on render', () => {
+    const above599 = new SupabaseRpcError('http', 600);
+    expect(above599.status).toBe(600);
+    expect(isUnknownOutcome(above599)).toBe(true);
+    expect(above599.message).toBe('sync failed');
+    expect(safeErrorMessage(above599)).toBe('sync failed');
+    expect(SyncDiagnostic.render(SyncDiagnostic.fromError(above599))).toBe(
+      'sync failed',
+    );
+
+    const above599WithSqlstate = new SupabaseRpcError('http', 600, '23505');
+    expect(above599WithSqlstate.status).toBe(600);
+    expect(isUnknownOutcome(above599WithSqlstate)).toBe(true);
+    expect(above599WithSqlstate.message).toBe('sync failed');
+    expect(safeErrorMessage(above599WithSqlstate)).toBe(
+      'Supabase RPC failed: 23505',
+    );
+
+    const below500 = new SupabaseRpcError('http', 499);
+    expect(below500.status).toBe(499);
+    expect(isUnknownOutcome(below500)).toBe(false);
+    expect(safeErrorMessage(below500)).toBe('Supabase RPC failed: HTTP 499');
+
+    const nonFinite = new SupabaseRpcError('http', Number.POSITIVE_INFINITY);
+    expect(nonFinite.status).toBeNull();
+    expect(isUnknownOutcome(nonFinite)).toBe(false);
+    expect(safeErrorMessage(nonFinite)).toBe('sync failed');
+  });
+
   it('never throws when rendering or classifying errors with hostile getters or proxies', () => {
     const forged = Object.create(SupabaseRpcError.prototype) as object;
     for (const prop of ['kind', 'status', 'sqlstate', 'message']) {

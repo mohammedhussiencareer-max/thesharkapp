@@ -259,12 +259,13 @@ export class SupabaseRpcError extends Error {
     status: number | null = null,
     sqlstate: string | null = null,
   ) {
-    const safeStatus = validHttpStatus(status);
+    const numericStatus =
+      typeof status === 'number' && Number.isFinite(status) ? status : null;
     const safeSqlstate = validSqlstate(sqlstate);
-    super(renderRpc(kind, safeStatus, null));
+    super(renderRpc(kind, numericStatus, null));
     this.name = 'SupabaseRpcError';
     this.#kind = kind;
-    this.#status = safeStatus;
+    this.#status = numericStatus;
     this.#sqlstate = safeSqlstate;
   }
 

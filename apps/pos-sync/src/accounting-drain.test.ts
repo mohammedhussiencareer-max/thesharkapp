@@ -6,7 +6,9 @@ import {
   DRAIN_BUDGET_MS,
   RECORDER_BACKOFF_MS,
 } from './accounting-drain.ts';
+import { localServiceRoleKey } from './local-supabase.ts';
 import {
+  createSupabaseDb,
   SupabaseRpcError,
   SyncDiagnostic,
   zeroAccountingCounts,
@@ -683,6 +685,71 @@ describe('drainAccountingWork', () => {
     expect(formatted).toMatch(
       / report=recorded error=Supabase RPC failed: HTTP 500 57014$/,
     );
+    expect(formatted).not.toContain(marker);
+  });
+
+  it('records a bound call failure for an HTTP reply above 599 without rendering the status', async () => {
+    const marker = 'SyntheticMarker7f3a';
+    const recordedBodies: Array<Record<string, unknown>> = [];
+    const timeoutBodies: Array<Record<string, unknown>> = [];
+    const db = createSupabaseDb(
+      'http://127.0.0.1:55421',
+      localServiceRoleKey,
+      async (url, init) => {
+        const path = new URL(url).pathname;
+        if (path.endsWith('/accounting_next_work')) {
+          return new Response(
+            JSON.stringify({
+              status: 'ok',
+              head: { order_id: 'order-a', work_generation: 1 },
+            }),
+            { status: 200 },
+          );
+        }
+        if (path.endsWith('/run_accounting_work')) {
+          return {
+            ok: false,
+            status: 600,
+            async text() {
+              return `proxy failure ${marker}`;
+            },
+          } as unknown as Response;
+        }
+        if (path.endsWith('/record_accounting_call_failure')) {
+          if (typeof init.body !== 'string') {
+            throw new Error('request body is not a string');
+          }
+          recordedBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+          return new Response(JSON.stringify({ status: 'recorded' }), {
+            status: 200,
+          });
+        }
+        if (path.endsWith('/record_accounting_recompute_timeout')) {
+          if (typeof init.body !== 'string') {
+            throw new Error('request body is not a string');
+          }
+          timeoutBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+          return new Response(JSON.stringify({ status: 'recorded' }), {
+            status: 200,
+          });
+        }
+        throw new Error(`unexpected RPC path: ${path}`);
+      },
+    );
+    const outcome = await drainAccountingWork(db, { newAttemptId: ids() });
+    expect(outcome.stop).toBe('call_failed');
+    expect(outcome.report).toBe('recorded');
+    expect(timeoutBodies).toEqual([]);
+    expect(recordedBodies).toEqual([
+      {
+        p_attempt_id: '00000000-0000-4000-8000-000000000001',
+        p_order_id: 'order-a',
+        p_work_generation: 1,
+      },
+    ]);
+    const formatted = formatDrain(outcome);
+    expect(formatted).toMatch(/ report=recorded error=sync failed$/);
+    expect(formatted).not.toContain('600');
     expect(formatted).not.toContain(marker);
   });
 });
