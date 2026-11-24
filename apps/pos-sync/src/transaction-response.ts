@@ -240,7 +240,14 @@ export async function readTransactionResponse(
   if (response.body === null) {
     throw new PosSyncError('firestoreInvalidResponse');
   }
-  const reader = response.body.getReader();
+  // A body another caller already locked fails closed; that caller's lock is
+  // never released here.
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
+  try {
+    reader = response.body.getReader();
+  } catch {
+    throw new PosSyncError('firestoreInvalidResponse');
+  }
   const scanner = new TransactionKeyScanner();
   const chunks: Uint8Array[] = [];
   try {

@@ -755,6 +755,19 @@ it('converts raw stream errors to firestoreInvalidResponse in readTransactionRes
   expect(response.body?.locked).toBe(false);
 });
 
+it('maps an already-locked body to firestoreInvalidResponse and keeps the caller lock', async () => {
+  const response = new Response('{"documents":[]}');
+  const callerReader = response.body?.getReader();
+  const error: unknown = await readTransactionResponse(response).then(
+    () => undefined,
+    (reason: unknown) => reason,
+  );
+  expect(PosSyncError.is(error)).toBe(true);
+  expect(safeErrorMessage(error)).toBe(INVALID_RESPONSE);
+  expect(response.body?.locked).toBe(true);
+  callerReader?.releaseLock();
+});
+
 it.each([
   ['orders', 'list'],
   ['orders', 'query'],
