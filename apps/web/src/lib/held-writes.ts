@@ -1912,7 +1912,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
     if (!writeRecordToStorage(next, userId)) {
       acknowledge();
-      if (phase === 'unknown' && stored.phase === 'inflight') {
+      if (
+        (phase === 'unknown' || phase === 'waiting_for_sync') &&
+        stored.phase === 'inflight'
+      ) {
         // Keep the exact durable inflight claim recoverable while allowing
         // an explicit retry of its payload in this tab.
         records.set(subject, next);

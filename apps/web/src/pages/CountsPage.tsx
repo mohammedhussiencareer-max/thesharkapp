@@ -112,6 +112,7 @@ function hydrateCountDraft(
 function storedPinToPendingEntry(
   requestId: string,
   payload: Json,
+  unknown = true,
 ): PendingCountEntry {
   const obj =
     payload && typeof payload === 'object' && !Array.isArray(payload)
@@ -125,7 +126,7 @@ function storedPinToPendingEntry(
     countedAt,
     itemCount,
     payload,
-    unknown: true,
+    unknown,
   };
 }
 
@@ -396,6 +397,13 @@ export function CountsPage() {
           clearHeldWrite(storedSubject, requestId, stored);
         } catch (error) {
           setCardError(messageFrom(error));
+          try {
+            setHeldWritePhase(storedSubject, requestId, 'waiting_for_sync', {
+              expected: stored,
+            });
+          } catch {
+            // Keep the card error visible; any durable inflight pin stays recoverable on reload.
+          }
         }
       }
       setWaitNotice(requestId ?? draft?.requestId ?? null);
@@ -563,13 +571,15 @@ export function CountsPage() {
     const matchingDaily: { record: HeldWriteRecord<CountDraft> | null } = {
       record: null,
     };
-    let isLocalReplay = false;
+    let priorPhase: 'unknown' | 'waiting_for_sync' | null = null;
     if (storedSubject && requestId !== null) {
       const prior = getHeldWrite<Json>(storedSubject);
-      isLocalReplay =
+      priorPhase =
         prior !== null &&
         prior.requestId === requestId &&
-        prior.phase === 'unknown';
+        (prior.phase === 'unknown' || prior.phase === 'waiting_for_sync')
+          ? prior.phase
+          : null;
       // Daily writes and stored cards share the daily lock, even though their
       // pins occupy separate storage keys.
       const checkConflict = () => {
@@ -596,17 +606,18 @@ export function CountsPage() {
         }
         return dailyPosted ?? cardPosted;
       };
-      const claim = isLocalReplay
-        ? await claimReplayHeldWrite<Json>(storedSubject, requestId, {
-            session,
-            checkConflict,
-          })
-        : await claimFreshHeldWrite<Json>(storedSubject, () => payload, {
-            requestId,
-            kind: 'count_stored',
-            session,
-            checkConflict,
-          });
+      const claim =
+        priorPhase !== null
+          ? await claimReplayHeldWrite<Json>(storedSubject, requestId, {
+              session,
+              checkConflict,
+            })
+          : await claimFreshHeldWrite<Json>(storedSubject, () => payload, {
+              requestId,
+              kind: 'count_stored',
+              session,
+              checkConflict,
+            });
       if (!claim.ok) {
         if (
           claim.reason === 'conflict' &&
@@ -641,7 +652,7 @@ export function CountsPage() {
         abortClaimBeforeDispatch(
           storedSubject,
           requestId,
-          isLocalReplay ? 'unknown' : null,
+          priorPhase,
           releaseLock,
         );
       } else {
@@ -658,7 +669,8 @@ export function CountsPage() {
     setSuccess(null);
     let saved = false;
     try {
-      const result = await recordStoredCount(payload);
+      const dispatchPayload = storedRecord ? storedRecord.payload : payload;
+      const result = await recordStoredCount(dispatchPayload);
       if (result.status === 'posted') saved = true;
       await finishWrite(
         result,
@@ -672,12 +684,21 @@ export function CountsPage() {
     } catch (error) {
       if (!saved) {
         setCardError(reportedCountError(error));
-        if (requestId && !isUnknownOutcome(error)) {
+        if (
+          requestId &&
+          (isPayloadRefusal(error) ||
+            isUnknownOutcome(error) ||
+            priorPhase !== 'waiting_for_sync')
+        ) {
           setWaitNotice((current) => (current === requestId ? null : current));
         }
         if (storedSubject && requestId) {
-          if (isUnknownOutcome(error)) {
+          if (isPayloadRefusal(error)) {
+            clearHeldWrite(storedSubject, requestId);
+          } else if (isUnknownOutcome(error)) {
             setHeldWritePhase(storedSubject, requestId, 'unknown');
+          } else if (priorPhase !== null) {
+            setHeldWritePhase(storedSubject, requestId, priorPhase);
           } else {
             clearHeldWrite(storedSubject, requestId);
           }
@@ -704,22 +725,30 @@ export function CountsPage() {
   }
 
   const localUnknownStored = new Map<string, Json>();
+  const localWaitingStored = new Map<string, Json>();
   for (const record of storedCountPins) {
-    if (record.phase === 'unknown' && record.payload !== null) {
+    if (record.payload === null) continue;
+    if (record.phase === 'unknown') {
       localUnknownStored.set(record.requestId, record.payload);
+    } else if (record.phase === 'waiting_for_sync') {
+      localWaitingStored.set(record.requestId, record.payload);
     }
   }
+  const hasWaitingStored = localWaitingStored.size > 0;
 
   const serverPendingIds = new Set<string>();
   const visiblePendingCounts: PendingCountEntry[] = [];
   for (const row of snapshot?.pendingCounts ?? []) {
     if (row.requestId === waiting?.requestId) continue;
     serverPendingIds.add(row.requestId);
-    const localPayload = localUnknownStored.get(row.requestId);
+    const localUnknownPayload = localUnknownStored.get(row.requestId);
+    const localWaitingPayload = localWaitingStored.get(row.requestId);
     visiblePendingCounts.push(
-      localPayload !== undefined
-        ? { ...row, payload: localPayload, unknown: true }
-        : row,
+      localUnknownPayload !== undefined
+        ? { ...row, payload: localUnknownPayload, unknown: true }
+        : localWaitingPayload !== undefined
+          ? { ...row, payload: localWaitingPayload }
+          : row,
     );
   }
   for (const [requestId, payload] of localUnknownStored.entries()) {
@@ -736,7 +765,28 @@ export function CountsPage() {
     ) {
       continue;
     }
-    visiblePendingCounts.push(storedPinToPendingEntry(requestId, payload));
+    visiblePendingCounts.push(
+      storedPinToPendingEntry(requestId, payload, true),
+    );
+  }
+  for (const [requestId, payload] of localWaitingStored.entries()) {
+    if (
+      serverPendingIds.has(requestId) ||
+      localUnknownStored.has(requestId) ||
+      requestId === waiting?.requestId ||
+      requestId === pending?.requestId ||
+      hasPostedReload(COUNT_DAILY_SUBJECT, undefined, requestId) ||
+      hasPostedReload(
+        `${COUNT_STORED_PREFIX}${requestId}`,
+        undefined,
+        requestId,
+      )
+    ) {
+      continue;
+    }
+    visiblePendingCounts.push(
+      storedPinToPendingEntry(requestId, payload, false),
+    );
   }
 
   return (
@@ -753,7 +803,7 @@ export function CountsPage() {
           <p role="status">{offlineMoneyMessage}</p>
         </>
       ) : null}
-      {waiting || waitNotice !== null ? (
+      {waiting || hasWaitingStored || waitNotice !== null ? (
         <p role="status">{waitingForSyncMessage}</p>
       ) : null}
       {success ? <p role="status">{success}</p> : null}

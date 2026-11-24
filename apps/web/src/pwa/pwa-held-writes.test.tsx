@@ -599,11 +599,13 @@ describe('held writes and offline behavior across writers', () => {
     // Even if server already moved oil out of candidates, pinned retry stays available.
     vi.mocked(listStockChoices).mockResolvedValue([oil]);
     const openingLockPart = encodeURIComponent('opening:new');
-    let heldDuringReplay: string[] | null = null;
-    vi.mocked(recordOpeningStock).mockImplementationOnce(async () => {
-      const { held = [] } = await navigator.locks.query();
-      heldDuringReplay = held.map((lock) => lock.name ?? '');
-    });
+    let resolveReplay: (() => void) | undefined;
+    vi.mocked(recordOpeningStock).mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveReplay = resolve;
+        }),
+    );
     render(
       <MemoryRouter>
         <OpeningPage />
@@ -614,14 +616,32 @@ describe('held writes and offline behavior across writers', () => {
     await waitFor(() => {
       expect(recordOpeningStock).toHaveBeenCalledTimes(2);
     });
-    await waitFor(() => {
-      expect(heldDuringReplay).not.toBeNull();
+    // Yield microtasks while the replay RPC stays pending so an early
+    // claim.release() before dispatch would already have cleared the lock.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
     });
-    expect(vi.mocked(recordOpeningStock).mock.calls[1]?.[0]).toEqual(first);
-    expect(heldDuringReplay).toContainEqual(
+    const { held = [] } = await navigator.locks.query();
+    expect(held.map((lock) => lock.name ?? '')).toContainEqual(
       expect.stringContaining(openingLockPart),
     );
+    expect(vi.mocked(recordOpeningStock).mock.calls[1]?.[0]).toEqual(first);
     expect(lockSpy.mock.calls.length).toBeGreaterThan(firstLockCalls);
+
+    await act(async () => {
+      resolveReplay?.();
+      await Promise.resolve();
+    });
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'اتسجل الرصيد الافتتاحي',
+    );
+    await waitFor(async () => {
+      const after = await navigator.locks.query();
+      expect(
+        (after.held ?? []).map((lock) => lock.name ?? ''),
+      ).not.toContainEqual(expect.stringContaining(openingLockPart));
+    });
   });
 
   it('reload restores sort payload', async () => {
