@@ -598,6 +598,12 @@ describe('held writes and offline behavior across writers', () => {
 
     // Even if server already moved oil out of candidates, pinned retry stays available.
     vi.mocked(listStockChoices).mockResolvedValue([oil]);
+    const openingLockPart = encodeURIComponent('opening:new');
+    let heldDuringReplay: string[] | null = null;
+    vi.mocked(recordOpeningStock).mockImplementationOnce(async () => {
+      const { held = [] } = await navigator.locks.query();
+      heldDuringReplay = held.map((lock) => lock.name ?? '');
+    });
     render(
       <MemoryRouter>
         <OpeningPage />
@@ -608,7 +614,13 @@ describe('held writes and offline behavior across writers', () => {
     await waitFor(() => {
       expect(recordOpeningStock).toHaveBeenCalledTimes(2);
     });
+    await waitFor(() => {
+      expect(heldDuringReplay).not.toBeNull();
+    });
     expect(vi.mocked(recordOpeningStock).mock.calls[1]?.[0]).toEqual(first);
+    expect(heldDuringReplay).toContainEqual(
+      expect.stringContaining(openingLockPart),
+    );
     expect(lockSpy.mock.calls.length).toBeGreaterThan(firstLockCalls);
   });
 

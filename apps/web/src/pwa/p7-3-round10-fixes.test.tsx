@@ -18,6 +18,7 @@ import {
   recordCount,
   recordStoredCount,
 } from '@/counts/api';
+import { pendingResendMessage, waitingForSyncMessage } from '@/counts/errors';
 import {
   addConversion,
   addCustomUnit,
@@ -2629,6 +2630,222 @@ describe('P7-3 round-10 review fixes', () => {
       fireEvent.click(reloadButtons[reloadButtons.length - 1]!);
       await waitFor(() => expect(getHeldWrite(ACTIVATION_SUBJECT)).toBeNull());
       expect(activateInventory).toHaveBeenCalledTimes(1);
+    } finally {
+      removeSpy.mockRestore();
+    }
+  });
+
+  it('R16-1: legacy active-slot posted_reload keeps posted proof when count alias removal fails and clears both on recovery', async () => {
+    const requestId = 'd1900000-0000-4000-8000-000000000081';
+    const countedAt = '2026-10-22T10:00:00.000Z';
+    const storedSubject = `${COUNT_STORED_PREFIX}${requestId}`;
+    const prefix = userStoragePrefix('owner-r10');
+    const dailyKey = `${prefix}${encodeURIComponent(COUNT_DAILY_SUBJECT)}`;
+    const storedKey = `${prefix}${encodeURIComponent(storedSubject)}`;
+    const storedPayload = {
+      request_id: requestId,
+      frequency: 'daily',
+      counted_at: countedAt,
+      note: null,
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
+    };
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([]);
+
+    // Seed the legacy layout: posted_reload lives only in the active daily slot,
+    // while the matching stored-card alias remains unknown in its active slot.
+    localStorage.setItem(
+      dailyKey,
+      JSON.stringify({
+        v: 1,
+        subject: COUNT_DAILY_SUBJECT,
+        kind: 'count',
+        requestId,
+        payload: null,
+        phase: 'posted_reload',
+      }),
+    );
+    localStorage.setItem(
+      storedKey,
+      JSON.stringify({
+        v: 1,
+        subject: storedSubject,
+        kind: 'count_stored',
+        requestId,
+        payload: storedPayload,
+        phase: 'unknown',
+      }),
+    );
+    resetHeldWritesStore({ clearStorage: false, resetUser: false });
+    setHeldWriteUser('owner-r10');
+
+    const origRemove = localStorage.removeItem.bind(localStorage);
+    let blockStoredRemove = true;
+    const removeSpy = vi
+      .spyOn(Storage.prototype, 'removeItem')
+      .mockImplementation((key) => {
+        if (blockStoredRemove && key === storedKey) {
+          throw new Error('legacy alias remove failed');
+        }
+        return origRemove(key);
+      });
+
+    try {
+      const firstView = render(
+        <MemoryRouter>
+          <CountsPage />
+        </MemoryRouter>,
+      );
+      await screen.findByRole('alert');
+
+      // Alias removal failed: the legacy active-slot posted proof must stay intact.
+      expect(localStorage.getItem(dailyKey)).not.toBeNull();
+      expect(localStorage.getItem(storedKey)).not.toBeNull();
+      expect(
+        screen.queryByRole('button', { name: 'سجّل الجرد' }),
+      ).not.toBeInTheDocument();
+
+      // Simulate a full reload while alias removal still fails: the alias must
+      // remain suppressed and editing must stay locked.
+      firstView.unmount();
+      resetHeldWritesStore({ clearStorage: false, resetUser: false });
+      setHeldWriteUser('owner-r10');
+
+      render(
+        <MemoryRouter>
+          <CountsPage />
+        </MemoryRouter>,
+      );
+      await screen.findByRole('alert');
+      expect(localStorage.getItem(dailyKey)).not.toBeNull();
+      expect(
+        screen.queryByRole('button', { name: 'سجّل الجرد' }),
+      ).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+
+      // Once storage removal recovers, retry readback clears both records.
+      blockStoredRemove = false;
+      fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled(),
+      );
+      expect(localStorage.getItem(storedKey)).toBeNull();
+      expect(localStorage.getItem(dailyKey)).toBeNull();
+      expect(
+        screen.queryByRole('button', { name: 'سجّل الجرد' }),
+      ).not.toBeInTheDocument();
+      expect(recordCount).not.toHaveBeenCalled();
+      expect(recordStoredCount).not.toHaveBeenCalled();
+    } finally {
+      removeSpy.mockRestore();
+    }
+  });
+
+  it('R16-2: waiting_for_sync preserves wait phase and notice when deleting the stored-card alias fails', async () => {
+    const requestId = 'd1900000-0000-4000-8000-000000000082';
+    const countedAt = '2026-10-22T10:00:00.000Z';
+    const storedSubject = `${COUNT_STORED_PREFIX}${requestId}`;
+    const prefix = userStoragePrefix('owner-r10');
+    const dailyKey = `${prefix}${encodeURIComponent(COUNT_DAILY_SUBJECT)}`;
+    const storedKey = `${prefix}${encodeURIComponent(storedSubject)}`;
+    const storedPayload = {
+      request_id: requestId,
+      frequency: 'daily',
+      counted_at: countedAt,
+      note: null,
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
+    };
+    const dailyDraft = {
+      requestId,
+      countedAt,
+      note: null,
+      lines: [{ itemId: 'tilapia', countedQty: '7', expectedBaseUnit: 'kg' }],
+    };
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([]);
+    vi.mocked(recordCount)
+      .mockResolvedValueOnce({ status: 'waiting_for_sync' })
+      .mockResolvedValueOnce({ status: 'waiting_for_sync' });
+
+    putHeldWrite(COUNT_DAILY_SUBJECT, {
+      requestId,
+      payload: dailyDraft,
+      phase: 'unknown',
+      kind: 'count',
+    });
+    putHeldWrite(storedSubject, {
+      requestId,
+      payload: storedPayload,
+      phase: 'unknown',
+      kind: 'count_stored',
+    });
+
+    const origRemove = localStorage.removeItem.bind(localStorage);
+    let blockStoredRemove = true;
+    const removeSpy = vi
+      .spyOn(Storage.prototype, 'removeItem')
+      .mockImplementation((key) => {
+        if (blockStoredRemove && key === storedKey) {
+          throw new Error('wait alias remove failed');
+        }
+        return origRemove(key);
+      });
+
+    try {
+      render(
+        <MemoryRouter>
+          <CountsPage />
+        </MemoryRouter>,
+      );
+      fireEvent.click(await screen.findByRole('button', { name: 'حفظ' }));
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(1));
+
+      expect(
+        await screen.findByText(waitingForSyncMessage),
+      ).toBeInTheDocument();
+      expect(getHeldWrite(COUNT_DAILY_SUBJECT)?.phase).toBe('waiting_for_sync');
+      expect(JSON.parse(localStorage.getItem(dailyKey) ?? '{}')).toMatchObject({
+        requestId,
+        phase: 'waiting_for_sync',
+      });
+      expect(screen.queryByText(pendingResendMessage)).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('heading', { name: 'جرد مستني المزامنة' }),
+      ).not.toBeInTheDocument();
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+
+      // Once storage removal recovers, resending the waiting count cleans up the alias too.
+      blockStoredRemove = false;
+      fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(localStorage.getItem(storedKey)).toBeNull());
+      expect(getHeldWrite(COUNT_DAILY_SUBJECT)?.phase).toBe('waiting_for_sync');
+      expect(screen.getByText(waitingForSyncMessage)).toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     } finally {
       removeSpy.mockRestore();
     }

@@ -392,7 +392,11 @@ export function CountsPage() {
         });
       }
       if (storedSubject && stored && requestId === stored.requestId) {
-        clearHeldWrite(storedSubject, requestId, stored);
+        try {
+          clearHeldWrite(storedSubject, requestId, stored);
+        } catch (error) {
+          setCardError(messageFrom(error));
+        }
       }
       setWaitNotice(requestId ?? draft?.requestId ?? null);
       setSuccess(null);

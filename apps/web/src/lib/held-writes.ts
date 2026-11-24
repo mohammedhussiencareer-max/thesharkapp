@@ -2130,8 +2130,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
               key !== postedStorageKey(subject, stored.requestId, userId))
           )
             continue;
-          // Clear the active duplicate and any exact count alias first so a
-          // failed removal leaves the authoritative posted record available.
+          // Clear any exact count alias before deleting the durable posted
+          // copy (including legacy active-slot records) so a failed removal
+          // leaves posted proof intact.
+          clearAliasActive(stored.requestId);
           if (
             active?.subject === subject &&
             active.requestId === stored.requestId
@@ -2142,17 +2144,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
               records.delete(subject);
             changed = true;
           }
-          clearAliasActive(stored.requestId);
           if (key !== activeKey) removeDurableRecord(key);
           postedReloads.delete(postedMapKey(subject, stored.requestId));
           changed = true;
         }
 
         if (ack && matchesAck && acknowledgedInflight.get(subject) === ack) {
+          clearAliasActive(ack.requestId);
           if (active && sameAcknowledgedClaim(active, ack.record)) {
             removeDurableRecord(activeKey);
           }
-          clearAliasActive(ack.requestId);
           // A different claim owns the active slot. Retire only this tab's
           // acknowledgement so it cannot settle that claim on a later read.
           acknowledgedInflight.delete(subject);
