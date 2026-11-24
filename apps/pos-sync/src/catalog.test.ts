@@ -20,7 +20,7 @@ import {
   projectAllowedOptionGroupFields,
   resolveCatalogFieldSelectors,
 } from './catalog.ts';
-import { parseListResponse } from './firestore-read.ts';
+import { createPosFirestore, parseListResponse } from './firestore-read.ts';
 import { mapOrderDocument } from './mapper.ts';
 import type { FirestoreRestDocument } from './pos-firestore.ts';
 
@@ -652,6 +652,12 @@ describe('parseCatalog fixtures', () => {
           }
           return Reflect.get(obj, prop, receiver) as unknown;
         },
+        ownKeys(obj) {
+          if (!isLabelMap) {
+            throw new Error(`unexpected key iteration at ${prefix || 'root'}`);
+          }
+          return Reflect.ownKeys(obj);
+        },
       });
     }
 
@@ -1037,6 +1043,451 @@ describe('parseCatalog fixtures', () => {
     expect([...pipelineGroupScalarReads].sort()).toEqual(
       [...CATALOG_OPTION_GROUP_FIELDS].sort(),
     );
+  });
+
+  it('does not read price, cost, or recipe scalar payloads under dynamic labels', () => {
+    const marker = 'synthetic-unread-catalog-leaf';
+    const reads: string[] = [];
+    const protectedScalar = (field: string) => ({
+      get stringValue() {
+        reads.push(field);
+        throw new Error(marker);
+      },
+    });
+    const item = itemDoc('item-syn-unread-leaves', {
+      name: str('Synthetic Catalog Item'),
+      options: map({
+        'Guest Specials': arr([
+          map({
+            value: str('Synthetic Add-on'),
+            price: protectedScalar('price'),
+            costPrice: protectedScalar('costPrice'),
+            recipe: arr([map({ ingredientId: protectedScalar('recipe') })]),
+          }),
+        ]),
+      }),
+    });
+    const result = parseCatalog([item], []);
+    expect(result.items[0]?.item_option_groups).toEqual({
+      'Guest Specials': ['Synthetic Add-on'],
+    });
+    expect(reads).toEqual([]);
+    expect(JSON.stringify(result)).not.toContain(marker);
+  });
+
+  it('rejects mixed scalar wrappers by their keys with an ID-only rejection without opening scalar payloads', () => {
+    const marker = 'synthetic-mixed-scalar-marker';
+    const reads: string[] = [];
+    const mixedWithTrap = (field: string) => ({
+      extraWrapperKey: null,
+      get stringValue() {
+        reads.push(field);
+        throw new Error(marker);
+      },
+    });
+    const itemWithConcealedCustomer = itemDoc('item-syn-mixed-customer', {
+      name: str('Synthetic Concealed Customer'),
+      options: map({
+        'Guest Specials': arr([
+          map({
+            value: str('Synthetic Add-on'),
+            price: {
+              extraWrapperKey: null,
+              stringValue: { customerName: 'syn-concealed-customer' },
+            },
+          }),
+        ]),
+      }),
+    });
+    const itemWithTrappedMixed = itemDoc('item-syn-mixed-trap', {
+      name: str('Synthetic Trapped Mixed'),
+      options: map({
+        'Guest Specials': arr([
+          map({
+            value: str('Synthetic Add-on'),
+            price: mixedWithTrap('price'),
+          }),
+        ]),
+      }),
+    });
+    const groupWithConcealedCustomer = groupDoc('group-syn-mixed-customer', {
+      name: str('Synthetic Mixed Group'),
+      values: arr([
+        map({
+          value: str('Baked'),
+          price: {
+            extraWrapperKey: null,
+            stringValue: { customerPhone: '01000000000' },
+          },
+        }),
+      ]),
+    });
+
+    const itemPage = parseListResponse(
+      { documents: [itemWithConcealedCustomer, itemWithTrappedMixed] },
+      'items',
+    );
+    expect(itemPage.documents).toEqual([
+      { name: itemWithConcealedCustomer.name, rejected: true },
+      { name: itemWithTrappedMixed.name, rejected: true },
+    ]);
+    const groupPage = parseListResponse(
+      { documents: [groupWithConcealedCustomer] },
+      'optionGroups',
+    );
+    expect(groupPage.documents).toEqual([
+      { name: groupWithConcealedCustomer.name, rejected: true },
+    ]);
+
+    const directPayload = parseCatalog(
+      [itemWithConcealedCustomer, itemWithTrappedMixed],
+      [groupWithConcealedCustomer],
+    );
+    expect(directPayload.items).toEqual([]);
+    expect(directPayload.option_groups).toEqual([]);
+    expect(directPayload.presence).toEqual([
+      { pos_item_id: 'item-syn-mixed-customer', outcome: 'rejected' },
+      { pos_item_id: 'item-syn-mixed-trap', outcome: 'rejected' },
+    ]);
+    expect(directPayload.option_group_presence).toEqual([
+      { group_id: 'group-syn-mixed-customer', outcome: 'rejected' },
+    ]);
+    expect(reads).toEqual([]);
+    expect(JSON.stringify({ itemPage, groupPage, directPayload })).not.toMatch(
+      /syn-concealed-customer|01000000000|synthetic-mixed-scalar-marker/,
+    );
+  });
+
+  it('rejects a dual-scalar wrapper in its own fixture with an ID-only rejection and zero getter calls', () => {
+    const marker = 'synthetic-dual-scalar-marker';
+    const reads: string[] = [];
+    const dualScalarTrap = (label: string) => ({
+      get integerValue() {
+        reads.push(`${label}:integerValue`);
+        throw new Error(marker);
+      },
+      get stringValue() {
+        reads.push(`${label}:stringValue`);
+        throw new Error(marker);
+      },
+    });
+    const itemWithDualScalar = itemDoc('item-syn-dual-scalar-trap', {
+      name: str('Synthetic Dual Scalar Item'),
+      options: map({
+        'Guest Specials': arr([
+          map({
+            value: str('Synthetic Add-on'),
+            costPrice: dualScalarTrap('item'),
+          }),
+        ]),
+      }),
+    });
+    const groupWithDualScalar = groupDoc('group-syn-dual-scalar-trap', {
+      name: str('Synthetic Dual Scalar Group'),
+      values: arr([
+        map({
+          value: str('Baked'),
+          price: dualScalarTrap('group'),
+        }),
+      ]),
+    });
+
+    const itemPage = parseListResponse(
+      { documents: [itemWithDualScalar] },
+      'items',
+    );
+    expect(itemPage.documents).toEqual([
+      { name: itemWithDualScalar.name, rejected: true },
+    ]);
+    const groupPage = parseListResponse(
+      { documents: [groupWithDualScalar] },
+      'optionGroups',
+    );
+    expect(groupPage.documents).toEqual([
+      { name: groupWithDualScalar.name, rejected: true },
+    ]);
+
+    const directPayload = parseCatalog(
+      [itemWithDualScalar],
+      [groupWithDualScalar],
+    );
+    expect(directPayload.items).toEqual([]);
+    expect(directPayload.option_groups).toEqual([]);
+    expect(directPayload.presence).toEqual([
+      { pos_item_id: 'item-syn-dual-scalar-trap', outcome: 'rejected' },
+    ]);
+    expect(directPayload.option_group_presence).toEqual([
+      { group_id: 'group-syn-dual-scalar-trap', outcome: 'rejected' },
+    ]);
+    expect(reads).toEqual([]);
+    expect(
+      JSON.stringify({ itemPage, groupPage, directPayload }),
+    ).not.toContain(marker);
+  });
+
+  it('rejects malformed map and array wrappers by their keys with an ID-only rejection and zero scalar reads', () => {
+    const marker = 'synthetic-malformed-container-marker';
+    const reads: string[] = [];
+    const trappedScalar = (label: string) => ({
+      get stringValue() {
+        reads.push(label);
+        throw new Error(marker);
+      },
+    });
+
+    const malformedCases: Array<[string, Record<string, unknown>]> = [
+      [
+        'mixed-map',
+        {
+          extraWrapperKey: null,
+          mapValue: {
+            fields: { internalCode: trappedScalar('mixed-map') },
+          },
+        },
+      ],
+      [
+        'mixed-array',
+        {
+          extraWrapperKey: null,
+          arrayValue: {
+            values: [
+              {
+                mapValue: {
+                  fields: { internalCode: trappedScalar('mixed-array') },
+                },
+              },
+            ],
+          },
+        },
+      ],
+      [
+        'dual-container',
+        {
+          mapValue: { fields: { a: trappedScalar('dual-map') } },
+          arrayValue: { values: [trappedScalar('dual-array')] },
+        },
+      ],
+      [
+        'map-extra-key',
+        {
+          mapValue: {
+            extraMapKey: trappedScalar('map-extra-key'),
+            fields: { internalCode: trappedScalar('map-extra-fields') },
+          },
+        },
+      ],
+      [
+        'array-extra-key',
+        {
+          arrayValue: {
+            extraArrKey: trappedScalar('array-extra-key'),
+            values: [trappedScalar('array-extra-values')],
+          },
+        },
+      ],
+      [
+        'bad-map-fields',
+        {
+          mapValue: {
+            fields: [trappedScalar('bad-map-fields')],
+          },
+        },
+      ],
+      [
+        'bad-array-values',
+        {
+          arrayValue: {
+            values: { unexpected: trappedScalar('bad-array-values') },
+          },
+        },
+      ],
+    ];
+
+    const itemDocs = malformedCases.map(([slug, malformed]) =>
+      itemDoc(`item-syn-${slug}`, {
+        name: str(`Synthetic ${slug} Item`),
+        options: map({
+          extras: arr([
+            map({
+              value: str('Synthetic Option'),
+              costPrice: malformed,
+            }),
+          ]),
+        }),
+      }),
+    );
+    const groupDocs = malformedCases.map(([slug, malformed]) =>
+      groupDoc(`group-syn-${slug}`, {
+        name: str(`Synthetic ${slug} Group`),
+        values: arr([
+          map({
+            value: str('Synthetic Value'),
+            costPrice: malformed,
+          }),
+        ]),
+      }),
+    );
+
+    const itemPage = parseListResponse({ documents: itemDocs }, 'items');
+    expect(itemPage.documents).toEqual(
+      itemDocs.map((doc) => ({ name: doc.name, rejected: true })),
+    );
+    const groupPage = parseListResponse(
+      { documents: groupDocs },
+      'optionGroups',
+    );
+    expect(groupPage.documents).toEqual(
+      groupDocs.map((doc) => ({ name: doc.name, rejected: true })),
+    );
+
+    const directPayload = parseCatalog(itemDocs, groupDocs);
+    expect(directPayload.items).toEqual([]);
+    expect(directPayload.option_groups).toEqual([]);
+    expect(directPayload.presence).toEqual(
+      malformedCases
+        .map(([slug]) => ({
+          pos_item_id: `item-syn-${slug}`,
+          outcome: 'rejected' as const,
+        }))
+        .sort((left, right) =>
+          left.pos_item_id.localeCompare(right.pos_item_id),
+        ),
+    );
+    expect(directPayload.option_group_presence).toEqual(
+      malformedCases
+        .map(([slug]) => ({
+          group_id: `group-syn-${slug}`,
+          outcome: 'rejected' as const,
+        }))
+        .sort((left, right) => left.group_id.localeCompare(right.group_id)),
+    );
+    expect(reads).toEqual([]);
+    expect(
+      JSON.stringify({ itemPage, groupPage, directPayload }),
+    ).not.toContain(marker);
+  });
+
+  it('rejects unrecognized wrappers in Firestore value positions before descending with ID-only rejection and zero scalar reads', async () => {
+    const marker = 'synthetic-unknown-wrapper-marker';
+    const reads: string[] = [];
+    const trappedScalar = (label: string) => ({
+      get stringValue() {
+        reads.push(label);
+        throw new Error(marker);
+      },
+    });
+
+    const unknownCases: Array<[string, unknown]> = [
+      [
+        'single-unknown-wrapper',
+        {
+          unknownWrapper: {
+            mapValue: {
+              fields: { internalCode: trappedScalar('single-unknown-wrapper') },
+            },
+          },
+        },
+      ],
+      [
+        'multi-unknown-wrapper',
+        {
+          unknownA: trappedScalar('multi-unknown-a'),
+          unknownB: trappedScalar('multi-unknown-b'),
+        },
+      ],
+      ['empty-wrapper', {}],
+      ['raw-array-value', [trappedScalar('raw-array-value')]],
+      ['raw-primitive-value', 'raw-unwrapped-string'],
+    ];
+
+    const itemDocs = unknownCases.map(([slug, malformed]) =>
+      itemDoc(`item-syn-${slug}`, {
+        name: str(`Synthetic ${slug} Item`),
+        options: map({
+          extras: arr([
+            map({
+              value: str('Synthetic Option'),
+              costPrice: malformed,
+            }),
+          ]),
+        }),
+      }),
+    );
+    const groupDocs = unknownCases.map(([slug, malformed]) =>
+      groupDoc(`group-syn-${slug}`, {
+        name: str(`Synthetic ${slug} Group`),
+        values: arr([
+          map({
+            value: str('Synthetic Value'),
+            costPrice: malformed,
+          }),
+        ]),
+      }),
+    );
+
+    const itemPage = parseListResponse({ documents: itemDocs }, 'items');
+    expect(itemPage.documents).toEqual(
+      itemDocs.map((doc) => ({ name: doc.name, rejected: true })),
+    );
+    const groupPage = parseListResponse(
+      { documents: groupDocs },
+      'optionGroups',
+    );
+    expect(groupPage.documents).toEqual(
+      groupDocs.map((doc) => ({ name: doc.name, rejected: true })),
+    );
+
+    const directPayload = parseCatalog(itemDocs, groupDocs);
+    expect(directPayload.items).toEqual([]);
+    expect(directPayload.option_groups).toEqual([]);
+    expect(directPayload.presence).toEqual(
+      unknownCases
+        .map(([slug]) => ({
+          pos_item_id: `item-syn-${slug}`,
+          outcome: 'rejected' as const,
+        }))
+        .sort((left, right) =>
+          left.pos_item_id.localeCompare(right.pos_item_id),
+        ),
+    );
+    expect(directPayload.option_group_presence).toEqual(
+      unknownCases
+        .map(([slug]) => ({
+          group_id: `group-syn-${slug}`,
+          outcome: 'rejected' as const,
+        }))
+        .sort((left, right) => left.group_id.localeCompare(right.group_id)),
+    );
+    expect(reads).toEqual([]);
+    expect(
+      JSON.stringify({ itemPage, groupPage, directPayload }),
+    ).not.toContain(marker);
+
+    // Also verify through createPosFirestore.list for a plain JSON unknown wrapper.
+    const jsonUnknownItem = itemDoc('item-syn-json-unknown-wrapper', {
+      name: str('Synthetic JSON Unknown Wrapper'),
+      options: map({
+        extras: arr([
+          map({
+            value: str('Synthetic Option'),
+            costPrice: {
+              unknownWrapper: {
+                mapValue: {
+                  fields: { internalCode: str(marker) },
+                },
+              },
+            },
+          }),
+        ]),
+      }),
+    });
+    const transportPage = await createPosFirestore('test-token', async () =>
+      Response.json({ documents: [jsonUnknownItem] }),
+    ).list('items', { pageSize: 1 });
+    expect(transportPage.documents).toEqual([
+      { name: jsonUnknownItem.name, rejected: true },
+    ]);
+    expect(JSON.stringify(transportPage)).not.toContain(marker);
   });
 
   it('reports catalog allowlist drift without echoing the input selector', () => {

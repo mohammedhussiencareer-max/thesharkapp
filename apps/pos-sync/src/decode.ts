@@ -3,6 +3,17 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+export function hasFirestoreValueKind(
+  value: unknown,
+  ...kinds: string[]
+): value is Record<string, unknown> {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const [kind, extra] = Object.keys(value);
+  return kind !== undefined && extra === undefined && kinds.includes(kind);
+}
+
 export function decodeFirestoreValue(value: unknown): unknown {
   if (!isRecord(value)) {
     throw new PosSyncError('invalidFirestoreValue');

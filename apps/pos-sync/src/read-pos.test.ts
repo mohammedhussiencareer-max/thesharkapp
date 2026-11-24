@@ -310,6 +310,15 @@ describe('readPos', () => {
       'shift-early',
       '2026-09-10T09:00:00Z',
     );
+    let mappedWindow = false;
+    const windowDocument = {
+      ...inside,
+      get name() {
+        if (mappedWindow)
+          throw new Error('raw window order read after mapping');
+        return inside.name;
+      },
+    };
     const queries: unknown[] = [];
     const firestore: PosFirestore = {
       async listShiftTransactions() {
@@ -319,6 +328,7 @@ describe('readPos', () => {
         throw new Error('list should not be called');
       },
       async getShift(id) {
+        mappedWindow = true;
         return shiftDoc(
           id,
           id === 'shift-early'
@@ -334,7 +344,7 @@ describe('readPos', () => {
         }
         if (timestampCount(body) < 2) return [];
         return [
-          inside,
+          windowDocument,
           orderDoc('order-later', 'shift-later', '2026-10-15T13:00:00Z'),
         ];
       },

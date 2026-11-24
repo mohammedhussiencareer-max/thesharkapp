@@ -20,7 +20,9 @@
  *   `sharedOptionGroupIds[label]` holds the `optionGroups` document id. A label
  *   without a shared id is an item-local group.
  * - Map keys under `options` and `sharedOptionGroupIds` are data (labels), not
- *   schema keys.
+ *   schema keys. Firestore masks support neither dynamic-label wildcards nor
+ *   paths inside arrays. The read mask stops at those containers and the
+ *   catalog decoder selects only these leaves by key.
  * - Document id and `updateTime` come from the document envelope, not from
  *   `fields`.
  */

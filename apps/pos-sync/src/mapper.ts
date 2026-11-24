@@ -1,6 +1,7 @@
 import { PosSyncError, type FieldLabel } from './safe-error.ts';
 import {
   decodeFirestoreValue,
+  hasFirestoreValueKind,
   isRecord,
   splitDocumentName,
   splitTransactionName,
@@ -37,14 +38,20 @@ function isOnlyKey(value: Record<string, unknown>, key: string): boolean {
 }
 
 function isNullValue(value: unknown): boolean {
-  return isRecord(value) && isOnlyKey(value, 'nullValue');
+  return (
+    hasFirestoreValueKind(value, 'nullValue') &&
+    (value.nullValue === null || value.nullValue === 'NULL_VALUE')
+  );
 }
 
 function isMapValue(
   value: unknown,
 ): value is { mapValue: { fields?: unknown } } {
   return (
-    isRecord(value) && isOnlyKey(value, 'mapValue') && isRecord(value.mapValue)
+    isRecord(value) &&
+    isOnlyKey(value, 'mapValue') &&
+    isRecord(value.mapValue) &&
+    Object.keys(value.mapValue).every((key) => key === 'fields')
   );
 }
 
@@ -54,7 +61,8 @@ function isArrayValue(
   return (
     isRecord(value) &&
     isOnlyKey(value, 'arrayValue') &&
-    isRecord(value.arrayValue)
+    isRecord(value.arrayValue) &&
+    Object.keys(value.arrayValue).every((key) => key === 'values')
   );
 }
 
@@ -87,18 +95,26 @@ export function normalizeOptionalText(value: string): string | null {
   return trimmed.length === 0 ? null : trimmed;
 }
 
-function optionalString(value: unknown, label: FieldLabel): string | null {
+function optionalText(
+  value: unknown,
+  label: FieldLabel,
+  ...kinds: ReadonlyArray<'stringValue' | 'timestampValue'>
+): string | null {
   if (value === undefined || isNullValue(value)) {
     return null;
   }
-  const decoded = decodeFirestoreValue(value);
-  if (decoded === null) {
-    return null;
-  }
-  if (typeof decoded !== 'string') {
+  if (!hasFirestoreValueKind(value, ...kinds)) {
     throw new PosSyncError('unexpectedField', label);
   }
-  return normalizeOptionalText(decoded);
+  const kind = kinds.find((candidate) => Object.hasOwn(value, candidate));
+  if (kind === undefined || typeof value[kind] !== 'string') {
+    throw new PosSyncError('unexpectedField', label);
+  }
+  return normalizeOptionalText(value[kind]);
+}
+
+function optionalString(value: unknown, label: FieldLabel): string | null {
+  return optionalText(value, label, 'stringValue');
 }
 
 function requiredString(value: unknown, label: FieldLabel): string {
@@ -113,10 +129,10 @@ function optionalNumber(value: unknown, label: FieldLabel): number | null {
   if (value === undefined || isNullValue(value)) {
     return null;
   }
-  const decoded = decodeFirestoreValue(value);
-  if (decoded === null) {
-    return null;
+  if (!hasFirestoreValueKind(value, 'integerValue', 'doubleValue')) {
+    throw new PosSyncError('unexpectedField', label);
   }
+  const decoded = decodeFirestoreValue(value);
   if (typeof decoded !== 'number') {
     throw new PosSyncError('unexpectedField', label);
   }
@@ -162,20 +178,25 @@ function requiredBool(value: unknown, label: FieldLabel): boolean {
   if (value === undefined || isNullValue(value)) {
     throw new PosSyncError('requiredField', label);
   }
-  const decoded = decodeFirestoreValue(value);
-  if (typeof decoded !== 'boolean') {
+  if (
+    !hasFirestoreValueKind(value, 'booleanValue') ||
+    typeof value.booleanValue !== 'boolean'
+  ) {
     throw new PosSyncError('unexpectedField', label);
   }
-  return decoded;
+  return value.booleanValue;
 }
 
 function requiredTime(value: unknown, label: FieldLabel): string {
-  const text = requiredString(value, label);
-  return normalizeTimestamp(text);
+  const time = optionalTime(value, label);
+  if (time === null) {
+    throw new PosSyncError('requiredField', label);
+  }
+  return time;
 }
 
 function optionalTime(value: unknown, label: FieldLabel): string | null {
-  const text = optionalString(value, label);
+  const text = optionalText(value, label, 'timestampValue', 'stringValue');
   if (text === null) {
     return null;
   }
@@ -262,6 +283,8 @@ function readOptions(value: unknown): PosLineOptionIngest[] {
 }
 
 function readLines(value: unknown): PosLineIngest[] {
+  // Firestore masks cannot select inside array elements. Read only the
+  // accounting leaves by key and return fresh rows without the raw items.
   if (value === undefined || isNullValue(value)) {
     return [];
   }

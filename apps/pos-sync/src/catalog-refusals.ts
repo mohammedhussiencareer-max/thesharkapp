@@ -74,87 +74,71 @@ function walkFirestoreValueForCustomerKey(
   if (depth > MAX_CATALOG_WALK_DEPTH) {
     return true;
   }
-  if (Array.isArray(value)) {
-    return value.some((entry) =>
-      walkFirestoreValueForCustomerKey(entry, false, depth + 1),
-    );
-  }
   if (!isRecord(value)) {
-    return false;
+    return true;
   }
   const keys = Object.keys(value);
-  if (keys.length === 1) {
-    const onlyKey = keys[0];
-    if (onlyKey !== undefined && FIRESTORE_SCALAR_VALUE_KEYS.has(onlyKey)) {
-      return false;
-    }
-    if (onlyKey === 'mapValue') {
-      const mapValue = value.mapValue;
-      if (!isRecord(mapValue)) {
-        return walkArbitraryForCustomerKey(mapValue, depth + 1);
-      }
-      for (const mapKey of Object.keys(mapValue)) {
-        if (mapKey === 'fields') {
-          const mapFields = mapValue.fields;
-          if (isRecord(mapFields)) {
-            if (
-              walkFirestoreFieldsForCustomerKey(
-                mapFields,
-                false,
-                dynamicLabelMap,
-                depth + 1,
-              )
-            ) {
-              return true;
-            }
-          } else if (walkArbitraryForCustomerKey(mapFields, depth + 1)) {
-            return true;
-          }
-        } else if (
-          isCustomerShapedKey(mapKey) ||
-          walkArbitraryForCustomerKey(mapValue[mapKey], depth + 1)
-        ) {
-          return true;
-        }
-      }
-      return false;
-    }
-    if (onlyKey === 'arrayValue') {
-      const arrayValue = value.arrayValue;
-      if (!isRecord(arrayValue)) {
-        return walkArbitraryForCustomerKey(arrayValue, depth + 1);
-      }
-      for (const arrKey of Object.keys(arrayValue)) {
-        if (arrKey === 'values') {
-          const arrValues = arrayValue.values;
-          if (Array.isArray(arrValues)) {
-            for (const entry of arrValues) {
-              if (walkFirestoreValueForCustomerKey(entry, false, depth + 1)) {
-                return true;
-              }
-            }
-          } else if (walkArbitraryForCustomerKey(arrValues, depth + 1)) {
-            return true;
-          }
-        } else if (
-          isCustomerShapedKey(arrKey) ||
-          walkArbitraryForCustomerKey(arrayValue[arrKey], depth + 1)
-        ) {
-          return true;
-        }
-      }
-      return false;
-    }
+  if (keys.length !== 1) {
+    return true;
   }
-  for (const key of keys) {
-    if (
-      isCustomerShapedKey(key) ||
-      walkArbitraryForCustomerKey(value[key], depth + 1)
-    ) {
+  const onlyKey = keys[0];
+  if (onlyKey !== undefined && FIRESTORE_SCALAR_VALUE_KEYS.has(onlyKey)) {
+    return false;
+  }
+  if (onlyKey === 'mapValue') {
+    const mapValue = value.mapValue;
+    if (!isRecord(mapValue)) {
       return true;
     }
+    const mapKeys = Object.keys(mapValue);
+    if (mapKeys.some((mapKey) => mapKey !== 'fields')) {
+      return true;
+    }
+    if (mapKeys.length === 0) {
+      return false;
+    }
+    const mapFields = mapValue.fields;
+    if (mapFields === undefined) {
+      return false;
+    }
+    if (!isRecord(mapFields)) {
+      return true;
+    }
+    return walkFirestoreFieldsForCustomerKey(
+      mapFields,
+      false,
+      dynamicLabelMap,
+      depth + 1,
+    );
   }
-  return false;
+  if (onlyKey === 'arrayValue') {
+    const arrayValue = value.arrayValue;
+    if (!isRecord(arrayValue)) {
+      return true;
+    }
+    const arrKeys = Object.keys(arrayValue);
+    if (arrKeys.some((arrKey) => arrKey !== 'values')) {
+      return true;
+    }
+    if (arrKeys.length === 0) {
+      return false;
+    }
+    const arrValues = arrayValue.values;
+    if (arrValues === undefined) {
+      return false;
+    }
+    if (!Array.isArray(arrValues)) {
+      return true;
+    }
+    for (const entry of arrValues) {
+      if (walkFirestoreValueForCustomerKey(entry, false, depth + 1)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  // Reject unrecognized wrappers in Firestore value positions without descending.
+  return true;
 }
 
 function walkFirestoreFieldsForCustomerKey(
