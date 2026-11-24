@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { createPosFirestore } from './firestore-read.ts';
 import type { PosFirestore } from './pos-firestore.ts';
 import { createPosReader, type PosSnapshot } from './read-pos.ts';
-import { PosSyncError } from './safe-error.ts';
+import {
+  PosSyncError,
+  SupabaseRpcError,
+  SyncDiagnostic,
+} from './safe-error.ts';
 import { runPosSync } from './sync.ts';
 import type { PosDb } from './supabase-write.ts';
 import type {
@@ -164,7 +168,10 @@ describe('runPosSync', () => {
         return zeroCounts();
       },
       async finishRun(_runId, status, _counts, error) {
-        finished = { status, error };
+        finished = {
+          status,
+          error: error === null ? null : SyncDiagnostic.render(error),
+        };
       },
     };
     const failed = runPosSync({
@@ -209,7 +216,10 @@ describe('runPosSync', () => {
           return zeroCounts();
         },
         async finishRun(_runId, status, _counts, error) {
-          finished = { status, error };
+          finished = {
+            status,
+            error: error === null ? null : SyncDiagnostic.render(error),
+          };
         },
       };
       const firestore = createPosFirestore('test-token', async (_url, init) => {
@@ -268,7 +278,10 @@ describe('runPosSync', () => {
         return zeroCounts();
       },
       async finishRun(_runId, status, _counts, error) {
-        finished = { status, error };
+        finished = {
+          status,
+          error: error === null ? null : SyncDiagnostic.render(error),
+        };
       },
     };
     const firestore = createPosFirestore('test-token', async () => {
@@ -305,7 +318,10 @@ describe('runPosSync', () => {
         return zeroCounts();
       },
       async finishRun(_runId, status, _counts, error) {
-        finished = { status, error };
+        finished = {
+          status,
+          error: error === null ? null : SyncDiagnostic.render(error),
+        };
       },
     };
     const firestore = createPosFirestore('test-token', async () => {
@@ -463,7 +479,10 @@ describe('runPosSync', () => {
         return zeroCounts();
       },
       async finishRun(_runId, status, _counts, error) {
-        finished = { status, error };
+        finished = {
+          status,
+          error: error === null ? null : SyncDiagnostic.render(error),
+        };
       },
     };
     const firestore = createPosFirestore('test-token', async (url, init) => {
@@ -522,7 +541,10 @@ describe('runPosSync', () => {
         return zeroCounts();
       },
       async finishRun(_runId, status, _counts, error) {
-        finished = { status, error };
+        finished = {
+          status,
+          error: error === null ? null : SyncDiagnostic.render(error),
+        };
       },
     };
     const doc = 'projects/thesharkrestaurant/databases/(default)/documents';
@@ -582,5 +604,44 @@ describe('runPosSync', () => {
       status: 'failed',
       error: 'Firestore read failed: invalid response',
     });
+  });
+
+  it('still records a failed run when a thrown error has a throwing RPC accessor', async () => {
+    const marker = 'SyntheticMarker7f3a';
+    const forged = Object.create(SupabaseRpcError.prototype) as Error;
+    Object.defineProperty(forged, 'kind', {
+      get() {
+        throw new Error(`hostile getter ${marker}`);
+      },
+      configurable: true,
+    });
+    let finished: { status: string; error: SyncDiagnostic | null } | undefined;
+    const db: PosDb = {
+      async startRun() {
+        return 12;
+      },
+      async ingest() {
+        return zeroCounts();
+      },
+      async finishRun(_runId, status, _counts, error) {
+        finished = { status, error };
+      },
+    };
+    await expect(
+      runPosSync({
+        mode: 'recent',
+        supabaseUrl: 'http://127.0.0.1:55421',
+        serviceRoleKey: 'local-test-key',
+        reader: {
+          async read() {
+            throw forged;
+          },
+        },
+        db,
+      }),
+    ).rejects.toThrow(/^sync failed$/);
+    expect(finished?.status).toBe('failed');
+    expect(SyncDiagnostic.is(finished?.error)).toBe(true);
+    expect(SyncDiagnostic.render(finished!.error!)).toBe('sync failed');
   });
 });

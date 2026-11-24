@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { PosSyncCombinedError, safeErrorMessage } from './safe-error.ts';
+import { SyncDiagnostic } from './safe-error.ts';
 import {
   isUnknownOutcome,
   SupabaseRpcError,
@@ -37,7 +37,7 @@ export type DrainOutcome = {
   calls: number;
   counts: AccountingCounts;
   report: FailureReport | 'not_needed' | 'unreported' | null;
-  error: string | null;
+  error: SyncDiagnostic | null;
 };
 
 export type DrainOptions = {
@@ -87,7 +87,7 @@ export async function drainAccountingWork(
   const done = (
     stop: DrainStop,
     report: DrainOutcome['report'] = null,
-    error: string | null = null,
+    error: SyncDiagnostic | null = null,
   ): DrainOutcome => ({
     stop,
     calls,
@@ -103,7 +103,7 @@ export async function drainAccountingWork(
     }
     binding = next.head;
   } catch (error) {
-    return done('call_failed', 'not_needed', safeErrorMessage(error));
+    return done('call_failed', 'not_needed', SyncDiagnostic.fromError(error));
   }
 
   for (;;) {
@@ -155,18 +155,17 @@ async function failedCall(
   done: (
     stop: DrainStop,
     report?: DrainOutcome['report'],
-    error?: string | null,
+    error?: SyncDiagnostic | null,
   ) => DrainOutcome,
 ): Promise<DrainOutcome> {
-  const message = safeErrorMessage(error);
+  const diagnostic = SyncDiagnostic.fromError(error);
   // An unbound call is maintenance and processed no order: nothing to charge.
   if (binding === null || !isUnknownOutcome(error)) {
-    return done('call_failed', 'not_needed', message);
+    return done('call_failed', 'not_needed', diagnostic);
   }
-  const kind =
-    error instanceof SupabaseRpcError && error.sqlstate === '57014'
-      ? 'recompute_timeout'
-      : 'escaped';
+  const kind = SupabaseRpcError.hasSqlstate(error, '57014')
+    ? 'recompute_timeout'
+    : 'escaped';
   const record = () =>
     kind === 'recompute_timeout'
       ? db.recordAccountingRecomputeTimeout(
@@ -195,12 +194,12 @@ async function failedCall(
       waited += pause;
       report = await record();
     }
-    return done('call_failed', report, message);
+    return done('call_failed', report, diagnostic);
   } catch (reportError) {
     return done(
       'call_failed',
       'unreported',
-      safeErrorMessage(new PosSyncCombinedError(error, reportError)),
+      SyncDiagnostic.combine(error, reportError),
     );
   }
 }
@@ -224,7 +223,7 @@ export function formatDrain(outcome: DrainOutcome): string {
     parts.push(`report=${outcome.report}`);
   }
   if (outcome.error !== null) {
-    parts.push(`error=${outcome.error}`);
+    parts.push(`error=${SyncDiagnostic.render(outcome.error)}`);
   }
   return parts.join(' ');
 }

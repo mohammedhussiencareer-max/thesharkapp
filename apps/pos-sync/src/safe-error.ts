@@ -46,13 +46,28 @@ const FIELD_LABELS = [
 export type FieldLabel = (typeof FIELD_LABELS)[number];
 const fieldLabels: ReadonlySet<string> = new Set(FIELD_LABELS);
 
-function httpStatusDetail(status: unknown): string {
+function isObject(value: unknown): value is object {
+  return typeof value === 'object' && value !== null;
+}
+
+function validHttpStatus(status: unknown): number | null {
   return typeof status === 'number' &&
     Number.isInteger(status) &&
     status >= 100 &&
     status <= 599
-    ? ` HTTP ${status}`
-    : '';
+    ? status
+    : null;
+}
+
+function validSqlstate(sqlstate: unknown): string | null {
+  return typeof sqlstate === 'string' && /^[0-9A-Z]{5}$/.test(sqlstate)
+    ? sqlstate
+    : null;
+}
+
+function httpStatusDetail(status: unknown): string {
+  const valid = validHttpStatus(status);
+  return valid === null ? '' : ` HTTP ${valid}`;
 }
 
 // All thrown POS diagnostics originate here. Sinks render the classification
@@ -170,9 +185,10 @@ function renderDiagnostic([code, detail]: Diagnostic): string {
       ? DIAGNOSTICS.firestoreInvalidResponse
       : DIAGNOSTICS.firestoreHttp(status);
   }
-  const message = Object.hasOwn(DIAGNOSTICS, code)
-    ? DIAGNOSTICS[code]
-    : undefined;
+  const message =
+    typeof code === 'string' && Object.hasOwn(DIAGNOSTICS, code)
+      ? DIAGNOSTICS[code]
+      : undefined;
   return typeof message === 'string' ? message : DIAGNOSTICS.syncFailed;
 }
 
@@ -183,23 +199,26 @@ export class PosSyncError extends Error {
     const detail = diagnostic[1];
     super(
       renderDiagnostic(diagnostic),
-      typeof detail === 'object' ? detail : undefined,
+      detail !== null && typeof detail === 'object' ? detail : undefined,
     );
     this.name = 'PosSyncError';
     this.#diagnostic = diagnostic;
   }
 
+  static is(error: unknown): error is PosSyncError {
+    return isObject(error) && #diagnostic in error;
+  }
+
   static hasHttpStatus(error: unknown, status: number): boolean {
     return (
-      error instanceof PosSyncError &&
-      #diagnostic in error &&
+      PosSyncError.is(error) &&
       error.#diagnostic[0] === 'firestoreHttp' &&
       error.#diagnostic[1] === status
     );
   }
 
   static describe(error: PosSyncError): string {
-    return #diagnostic in error
+    return PosSyncError.is(error)
       ? renderDiagnostic(error.#diagnostic)
       : DIAGNOSTICS.syncFailed;
   }
@@ -218,10 +237,8 @@ function renderRpc(
     case 'response':
       return DIAGNOSTICS.rpcResponse;
     case 'http': {
-      const state =
-        typeof sqlstate === 'string' && /^[0-9A-Z]{5}$/.test(sqlstate)
-          ? ` ${sqlstate}`
-          : '';
+      const valid = validSqlstate(sqlstate);
+      const state = valid === null ? '' : ` ${valid}`;
       const detail = `${httpStatusDetail(status)}${state}`;
       return detail === ''
         ? DIAGNOSTICS.syncFailed
@@ -233,20 +250,61 @@ function renderRpc(
 }
 
 export class SupabaseRpcError extends Error {
-  readonly kind: RpcFailureKind;
-  readonly status: number | null;
-  readonly sqlstate: string | null;
+  readonly #kind: RpcFailureKind;
+  readonly #status: number | null;
+  readonly #sqlstate: string | null;
 
   constructor(
     kind: RpcFailureKind,
     status: number | null = null,
     sqlstate: string | null = null,
   ) {
-    super(renderRpc(kind, status, null));
+    const safeStatus = validHttpStatus(status);
+    const safeSqlstate = validSqlstate(sqlstate);
+    super(renderRpc(kind, safeStatus, null));
     this.name = 'SupabaseRpcError';
-    this.kind = kind;
-    this.status = status;
-    this.sqlstate = sqlstate;
+    this.#kind = kind;
+    this.#status = safeStatus;
+    this.#sqlstate = safeSqlstate;
+  }
+
+  get kind(): RpcFailureKind {
+    return this.#kind;
+  }
+
+  get status(): number | null {
+    return this.#status;
+  }
+
+  get sqlstate(): string | null {
+    return this.#sqlstate;
+  }
+
+  static is(error: unknown): error is SupabaseRpcError {
+    return isObject(error) && #kind in error;
+  }
+
+  static describe(error: SupabaseRpcError): string {
+    return SupabaseRpcError.is(error)
+      ? renderRpc(error.#kind, error.#status, error.#sqlstate)
+      : DIAGNOSTICS.syncFailed;
+  }
+
+  static isUnknownOutcome(error: unknown): boolean {
+    if (!SupabaseRpcError.is(error)) {
+      return false;
+    }
+    if (error.#sqlstate === '57014') {
+      return true;
+    }
+    if (error.#kind === 'network' || error.#kind === 'response') {
+      return true;
+    }
+    return error.#status !== null && error.#status >= 500;
+  }
+
+  static hasSqlstate(error: unknown, sqlstate: string): boolean {
+    return SupabaseRpcError.is(error) && error.#sqlstate === sqlstate;
   }
 }
 
@@ -254,9 +312,9 @@ type ClassifiedError = PosSyncError | SupabaseRpcError | PosSyncCombinedError;
 
 export function classifySyncError(error: unknown): ClassifiedError {
   if (
-    error instanceof PosSyncError ||
-    error instanceof SupabaseRpcError ||
-    error instanceof PosSyncCombinedError
+    PosSyncError.is(error) ||
+    SupabaseRpcError.is(error) ||
+    PosSyncCombinedError.is(error)
   ) {
     return error;
   }
@@ -278,8 +336,12 @@ export class PosSyncCombinedError extends Error {
     this.#secondary = second;
   }
 
+  static is(error: unknown): error is PosSyncCombinedError {
+    return isObject(error) && #primary in error;
+  }
+
   static describe(error: PosSyncCombinedError): string {
-    return #primary in error
+    return PosSyncCombinedError.is(error)
       ? DIAGNOSTICS.combined(
           safeErrorMessage(error.#primary),
           safeErrorMessage(error.#secondary),
@@ -288,15 +350,52 @@ export class PosSyncCombinedError extends Error {
   }
 }
 
+export class SyncDiagnostic {
+  readonly #source: ClassifiedError;
+
+  private constructor(source: ClassifiedError) {
+    this.#source = source;
+  }
+
+  static fromError(error: unknown): SyncDiagnostic {
+    if (SyncDiagnostic.is(error)) {
+      return error;
+    }
+    return new SyncDiagnostic(classifySyncError(error));
+  }
+
+  static combine(primary: unknown, secondary: unknown): SyncDiagnostic {
+    return new SyncDiagnostic(
+      new PosSyncCombinedError(
+        SyncDiagnostic.is(primary) ? primary.#source : primary,
+        SyncDiagnostic.is(secondary) ? secondary.#source : secondary,
+      ),
+    );
+  }
+
+  static is(value: unknown): value is SyncDiagnostic {
+    return isObject(value) && #source in value;
+  }
+
+  static render(diagnostic: SyncDiagnostic): string {
+    return SyncDiagnostic.is(diagnostic)
+      ? safeErrorMessage(diagnostic.#source)
+      : DIAGNOSTICS.syncFailed;
+  }
+}
+
 export function safeErrorMessage(error: unknown): string {
-  if (error instanceof PosSyncError) {
+  if (PosSyncError.is(error)) {
     return PosSyncError.describe(error);
   }
-  if (error instanceof SupabaseRpcError) {
-    return renderRpc(error.kind, error.status, error.sqlstate);
+  if (SupabaseRpcError.is(error)) {
+    return SupabaseRpcError.describe(error);
   }
-  if (error instanceof PosSyncCombinedError) {
+  if (PosSyncCombinedError.is(error)) {
     return PosSyncCombinedError.describe(error);
+  }
+  if (SyncDiagnostic.is(error)) {
+    return SyncDiagnostic.render(error);
   }
   return DIAGNOSTICS.syncFailed;
 }

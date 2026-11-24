@@ -4,6 +4,7 @@ import {
   POS_SYNC_ALREADY_RUNNING,
   PosSyncError,
   SupabaseRpcError,
+  SyncDiagnostic,
 } from './safe-error.ts';
 import type {
   IngestCounts,
@@ -31,22 +32,17 @@ function localFetch(input: string, init: RequestInit): Promise<Response> {
   return fetch(input, init);
 }
 
-export { SupabaseRpcError, type RpcFailureKind } from './safe-error.ts';
+export {
+  SupabaseRpcError,
+  SyncDiagnostic,
+  type RpcFailureKind,
+} from './safe-error.ts';
 
 // True when the call may have reached the database and its outcome is not
 // known: no reply, a server error, a statement timeout, or a reply that cannot
 // be read. A refusal (4xx other than a timeout) means the call did not run.
 export function isUnknownOutcome(error: unknown): boolean {
-  if (!(error instanceof SupabaseRpcError)) {
-    return false;
-  }
-  if (error.sqlstate === '57014') {
-    return true;
-  }
-  if (error.kind === 'network' || error.kind === 'response') {
-    return true;
-  }
-  return error.status !== null && error.status >= 500;
+  return SupabaseRpcError.isUnknownOutcome(error);
 }
 
 export type AccountingStatus =
@@ -94,7 +90,7 @@ export type PosDb = {
     runId: number,
     status: 'ok' | 'failed',
     counts: Record<string, number>,
-    error: string | null,
+    error: SyncDiagnostic | null,
   ): Promise<void>;
 };
 
@@ -207,7 +203,7 @@ export function createSupabaseDb(
         p_run_id: runId,
         p_status: status,
         p_counts: counts,
-        p_error: error,
+        p_error: error === null ? null : SyncDiagnostic.render(error),
       });
     },
     async getNextWork() {

@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { assertLocalSupabaseUrl } from './local-guard.ts';
 import {
+  classifySyncError,
   PosSyncError,
   safeErrorMessage,
   SupabaseRpcError,
+  SyncDiagnostic,
   type FieldLabel,
 } from './safe-error.ts';
+import { isUnknownOutcome } from './supabase-write.ts';
 
 const MARKER = 'SyntheticMarker7f3a';
 
@@ -109,6 +112,63 @@ describe('safeErrorMessage', () => {
     expect(
       safeErrorMessage(new SupabaseRpcError('http', 502, `${MARKER}x`)),
     ).toBe('Supabase RPC failed: HTTP 502');
+  });
+
+  it('never throws when rendering or classifying errors with hostile getters or proxies', () => {
+    const forged = Object.create(SupabaseRpcError.prototype) as object;
+    for (const prop of ['kind', 'status', 'sqlstate', 'message']) {
+      Object.defineProperty(forged, prop, {
+        get() {
+          throw new Error(`boom ${prop} ${MARKER}`);
+        },
+        configurable: true,
+      });
+    }
+    expect(safeErrorMessage(forged)).toBe('sync failed');
+    expect(safeErrorMessage(classifySyncError(forged))).toBe('sync failed');
+    expect(isUnknownOutcome(forged)).toBe(false);
+
+    const genuine = new SupabaseRpcError('http', 400, '23505');
+    for (const prop of ['kind', 'status', 'sqlstate', 'message']) {
+      Object.defineProperty(genuine, prop, {
+        get() {
+          throw new Error(`boom ${prop} ${MARKER}`);
+        },
+        configurable: true,
+      });
+    }
+    expect(safeErrorMessage(genuine)).toBe(
+      'Supabase RPC failed: HTTP 400 23505',
+    );
+    expect(SyncDiagnostic.render(SyncDiagnostic.fromError(genuine))).toBe(
+      'Supabase RPC failed: HTTP 400 23505',
+    );
+    expect(isUnknownOutcome(genuine)).toBe(false);
+
+    const forgedDiagnostic = Object.create(
+      SyncDiagnostic.prototype,
+    ) as SyncDiagnostic;
+    expect(SyncDiagnostic.is(forgedDiagnostic)).toBe(false);
+    expect(SyncDiagnostic.render(forgedDiagnostic)).toBe('sync failed');
+    expect(safeErrorMessage(forgedDiagnostic)).toBe('sync failed');
+
+    const hostileProxy = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          throw new Error(`proxy proto ${MARKER}`);
+        },
+        get() {
+          throw new Error(`proxy get ${MARKER}`);
+        },
+      },
+    );
+    expect(safeErrorMessage(hostileProxy)).toBe('sync failed');
+    expect(safeErrorMessage(classifySyncError(hostileProxy))).toBe(
+      'sync failed',
+    );
+    expect(isUnknownOutcome(hostileProxy)).toBe(false);
+    expect(PosSyncError.hasHttpStatus(hostileProxy, 404)).toBe(false);
   });
 });
 

@@ -10,6 +10,7 @@ import {
   classifySyncError,
   PosSyncCombinedError,
   safeErrorMessage,
+  SyncDiagnostic,
 } from './safe-error.ts';
 import { planIngestCalls } from './scope.ts';
 import {
@@ -136,7 +137,7 @@ export async function runPosSync(input: {
         runId,
         'failed',
         { ...counts },
-        safeErrorMessage(failure),
+        SyncDiagnostic.fromError(failure),
       );
     } catch (finishError) {
       throw new PosSyncCombinedError(failure, finishError);

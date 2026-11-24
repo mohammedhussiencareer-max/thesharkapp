@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { main } from './cli.ts';
-import { PosSyncError } from './safe-error.ts';
+import { PosSyncError, SyncDiagnostic } from './safe-error.ts';
 import { runPosSync, type SyncResult } from './sync.ts';
 import { SupabaseRpcError } from './supabase-write.ts';
 
@@ -106,7 +106,10 @@ describe('main', () => {
                 );
               },
               async finishRun(_runId, status, _counts, error) {
-                finished.push([status, error]);
+                finished.push([
+                  status,
+                  error === null ? null : SyncDiagnostic.render(error),
+                ]);
                 if (failFinish)
                   throw Object.assign(
                     new SupabaseRpcError('http', 503, '08006'),
@@ -128,6 +131,118 @@ describe('main', () => {
       ]);
     },
   );
+
+  it.each([
+    ['when the failed run is saved', false, ''],
+    [
+      'when saving the failed run also fails',
+      true,
+      '; Supabase RPC failed: HTTP 503 08006',
+    ],
+  ] as const)(
+    'parses HTTP RPC SQLSTATE through the real adapter into p_error and stderr %s',
+    async (_case, failFinish, suffix) => {
+      const errors: string[] = [];
+      const finishBodies: Array<Record<string, unknown>> = [];
+      const marker = 'SyntheticMarker7f3a';
+      const code = await main({
+        argv: ['--mode', 'recent'],
+        env: { POS_SUPABASE_SERVICE_ROLE_KEY: 'local-test-key' },
+        loadToken: async () => 'test-token',
+        runSync: ({ mode, supabaseUrl, serviceRoleKey }) =>
+          runPosSync({
+            mode,
+            supabaseUrl,
+            serviceRoleKey,
+            reader: {
+              async read() {
+                return {
+                  shifts: [],
+                  orders: [],
+                  scope: { shift_ids: [] },
+                  missingShiftIds: [],
+                };
+              },
+            },
+            fetchImpl: async (url, init) => {
+              const path = new URL(url).pathname;
+              if (path.endsWith('/start_pos_sync_run')) {
+                return new Response('9', { status: 200 });
+              }
+              if (path.endsWith('/ingest_pos_batch')) {
+                return new Response(
+                  JSON.stringify({
+                    code: '23505',
+                    message: `duplicate key ${marker}`,
+                    details: marker,
+                    hint: marker,
+                  }),
+                  { status: 400 },
+                );
+              }
+              if (path.endsWith('/finish_pos_sync_run')) {
+                if (typeof init.body !== 'string') {
+                  throw new Error('request body is not a string');
+                }
+                finishBodies.push(
+                  JSON.parse(init.body) as Record<string, unknown>,
+                );
+                if (failFinish) {
+                  return new Response(
+                    JSON.stringify({
+                      code: '08006',
+                      message: `connection failure ${marker}`,
+                      details: marker,
+                    }),
+                    { status: 503 },
+                  );
+                }
+                return new Response(null, { status: 204 });
+              }
+              throw new Error(`unexpected RPC path: ${path}`);
+            },
+          }),
+        log: () => undefined,
+        error: (line) => errors.push(line),
+      });
+      expect(code).toBe(1);
+      expect(finishBodies).toHaveLength(1);
+      expect(finishBodies[0]?.p_status).toBe('failed');
+      expect(finishBodies[0]?.p_error).toBe(
+        'Supabase RPC failed: HTTP 400 23505',
+      );
+      expect(JSON.stringify(finishBodies)).not.toContain(marker);
+      expect(errors.join('\n')).not.toContain(marker);
+      expect(errors).toEqual([
+        `pos sync failed: Supabase RPC failed: HTTP 400 23505${suffix}`,
+      ]);
+    },
+  );
+
+  it('returns exit code 1 when a dependency throws a forged RPC error with a throwing getter', async () => {
+    const marker = 'SyntheticMarker7f3a';
+    const forged = Object.create(SupabaseRpcError.prototype) as Error;
+    Object.defineProperty(forged, 'kind', {
+      get() {
+        throw new Error(`hostile getter ${marker}`);
+      },
+      configurable: true,
+    });
+    const errors: string[] = [];
+    const code = await main({
+      argv: ['--mode', 'recent'],
+      env: {},
+      loadToken: async () => 'test-token',
+      runSync: async () => {
+        throw forged;
+      },
+      log: () => undefined,
+      error: (line) => errors.push(line),
+    });
+    expect(code).toBe(1);
+    expect(errors).toEqual(['pos sync failed: sync failed']);
+    expect(errors.join('\n')).not.toContain(marker);
+  });
 
   it('drops arbitrary dependency errors from stderr', async () => {
     const marker = 'SyntheticMarker7f3a';
