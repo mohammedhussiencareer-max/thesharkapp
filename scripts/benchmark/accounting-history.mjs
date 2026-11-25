@@ -183,6 +183,18 @@ function claims(local = true) {
   return `select set_config('request.jwt.claims', jsonb_build_object('sub', '${owner}', 'role', 'authenticated')::text, ${local});`;
 }
 
+function persistBuildAnchorSql(anchor) {
+  return `
+create table if not exists public.bench_build_state (
+  id integer primary key check (id = 1),
+  anchor text not null,
+  created_at timestamptz not null default pg_catalog.clock_timestamp()
+);
+insert into public.bench_build_state (id, anchor)
+values (1, '${anchor}')
+on conflict (id) do nothing;`;
+}
+
 function setupSql(anchor) {
   const agedSales = histories
     .map(
@@ -250,6 +262,7 @@ where not exists (
 );
 ${claims()}
 ${agedSales}
+${persistBuildAnchorSql(anchor)}
 commit;
 `;
 }
@@ -388,6 +401,7 @@ values (
   'kg',
   'weekly'
 );
+${persistBuildAnchorSql(anchor)}
 commit;
 select '${history.name} catalog committed ${orders}';
 `;
@@ -486,11 +500,10 @@ begin
   for i in 1..${count} loop
     perform pg_temp.post_next_bench_order('${history.prefix}');
     n := n + 1;
-    commit;
     if n % ${history.perDay} = 0 then
       perform pg_temp.post_day_count(n / ${history.perDay});
-      commit;
     end if;
+    commit;
   end loop;
 end
 $chunk$;
@@ -829,6 +842,7 @@ begin
   end loop;
 end
 $$;
+${persistBuildAnchorSql(anchor)}
 commit;
 `;
 }
@@ -902,6 +916,7 @@ declare
   v_cut_id bigint;
   v_suffix_id bigint;
   v_last_sort timestamptz;
+  v_payload jsonb;
 begin
   select count(*)
   into v_sorts
@@ -1047,7 +1062,7 @@ begin
     and v_seconds <= 6
     and v_sorts = ${history.days};
 
-  raise notice 'MEASURE %', pg_catalog.jsonb_build_object(
+  v_payload := pg_catalog.jsonb_build_object(
     'kind', 'sort-traversal',
     'name', '${history.name}',
     'days', ${history.days},
@@ -1064,6 +1079,32 @@ begin
     'crossed_2s', v_seconds > 2,
     'pass', v_pass
   );
+
+  create table if not exists public.bench_sort_results (
+    name text primary key,
+    purchase_request uuid not null,
+    anchor text not null,
+    payload jsonb not null,
+    recorded_at timestamptz not null default pg_catalog.clock_timestamp()
+  );
+
+  insert into public.bench_sort_results (
+    name, purchase_request, anchor, payload, recorded_at
+  )
+  values (
+    '${history.name}',
+    '${history.purchaseRequest}',
+    '${anchor}',
+    v_payload,
+    pg_catalog.clock_timestamp()
+  )
+  on conflict (name) do update
+  set purchase_request = excluded.purchase_request,
+    anchor = excluded.anchor,
+    payload = excluded.payload,
+    recorded_at = excluded.recorded_at;
+
+  raise notice 'MEASURE %', v_payload;
 end
 $$;
 commit;
@@ -2051,12 +2092,152 @@ async function sortSuffixReady(history) {
   }
 }
 
+async function persistedBuildAnchor() {
+  try {
+    const result = await psqlCaptured(
+      `select anchor from public.bench_build_state where id = 1;`,
+    );
+    const match = result.out.match(
+      /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}/,
+    );
+    return match ? match[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+async function committedSortResults() {
+  try {
+    const result = await psqlCaptured(`
+      select coalesce(
+        jsonb_agg(
+          r.payload || jsonb_build_object(
+            'anchor', r.anchor,
+            'purchase_request', r.purchase_request::text
+          )
+          order by r.name
+        ),
+        '[]'::jsonb
+      )::text
+      from public.bench_sort_results r
+      join app.purchases p on p.request_id = r.purchase_request;
+    `);
+    const text = result.out.trim();
+    const match = text.match(/\[[\s\S]*\]/);
+    return match ? JSON.parse(match[0]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function isWarmedSortRow(row) {
+  return row?.warmed !== false;
+}
+
+function sortConditionsMatch(rows) {
+  const sorts = rows.filter(
+    (row) => row.kind === 'sort-traversal' && Number.isFinite(row.buffers),
+  );
+  if (sorts.length <= 1) return true;
+  const warmed = isWarmedSortRow(sorts[0]);
+  return sorts.every((row) => isWarmedSortRow(row) === warmed);
+}
+
+function sortGrowthFailed(rows) {
+  const first = rows.find((row) => row.name === '35-day sorts');
+  const last = rows.find((row) => row.name === '2-year sorts');
+  if (!Number.isFinite(first?.buffers) || !Number.isFinite(last?.buffers)) {
+    return false;
+  }
+  if (
+    isWarmedSortRow(first) !== isWarmedSortRow(last) ||
+    !sortConditionsMatch(rows)
+  ) {
+    return false;
+  }
+  return last.buffers * 10 > first.buffers * 11;
+}
+
+function hasCompletePassingSortResults(
+  rows,
+  { expectedAnchor = undefined } = {},
+) {
+  if (!Array.isArray(rows)) return false;
+  if (
+    expectedAnchor !== undefined &&
+    (typeof expectedAnchor !== 'string' || expectedAnchor.length === 0)
+  ) {
+    return false;
+  }
+  const byName = new Map();
+  for (const row of rows) {
+    if (row && typeof row.name === 'string') {
+      byName.set(row.name, row);
+    }
+  }
+  const matched = [];
+  for (const history of sortHistories) {
+    const row = byName.get(history.name);
+    if (!row) return false;
+    if (row.kind !== 'sort-traversal') return false;
+    if (row.pass !== true || row.resumed !== true) return false;
+    if (
+      !Number.isFinite(row.buffers) ||
+      row.buffers <= 0 ||
+      row.buffers >= SHARED_HIT_READ_LIMIT
+    ) {
+      return false;
+    }
+    if (!Number.isFinite(row.seconds) || row.seconds > 2) return false;
+    if (
+      row.purchase_request != null &&
+      row.purchase_request !== history.purchaseRequest
+    ) {
+      return false;
+    }
+    matched.push(row);
+  }
+  const anchors = matched
+    .map((row) => row.anchor)
+    .filter((value) => value !== undefined);
+  if (expectedAnchor !== undefined) {
+    if (matched.some((row) => row.anchor !== expectedAnchor)) return false;
+  } else if (anchors.length > 0) {
+    if (
+      anchors.length !== matched.length ||
+      anchors.some((value) => value !== anchors[0])
+    ) {
+      return false;
+    }
+  }
+  if (!sortConditionsMatch(matched)) return false;
+  if (!matched.every(isWarmedSortRow)) return false;
+  if (sortGrowthFailed(matched)) return false;
+  return true;
+}
+
+function resolveBuildAnchor({
+  persistedAnchor = null,
+  currentAnchor,
+  hasExistingFixtures = false,
+}) {
+  if (persistedAnchor) return persistedAnchor;
+  if (hasExistingFixtures) {
+    throw new Error(
+      'cannot resume a benchmark build without a persisted build anchor. Run pnpm db:reset and retry.',
+    );
+  }
+  return currentAnchor;
+}
+
 function resolveResumePlan({
   startName = null,
   sortOnly = false,
   resume = false,
   sortCommittedCount = 0,
   orderCatalogStarted = false,
+  sortResults = [],
+  buildAnchor = undefined,
 }) {
   if (sortOnly) {
     if (sortCommittedCount > 0) throw new Error(RESUME_REFUSAL);
@@ -2075,21 +2256,20 @@ function resolveResumePlan({
       sortCommittedCount === sortHistories.length &&
       orderCatalogStarted
     ) {
-      return { runSorts: false, orderHistories: histories };
+      if (
+        hasCompletePassingSortResults(sortResults, {
+          expectedAnchor: buildAnchor,
+        })
+      ) {
+        return { runSorts: false, orderHistories: histories };
+      }
+      throw new Error(
+        `${RESUME_REFUSAL} Sort-traversal gate did not pass for this build.`,
+      );
     }
     throw new Error(RESUME_REFUSAL);
   }
   return { runSorts: true, orderHistories: histories };
-}
-
-function sortGrowthFailed(rows) {
-  const first = rows.find((row) => row.name === '35-day sorts');
-  const last = rows.find((row) => row.name === '2-year sorts');
-  return (
-    Number.isFinite(first?.buffers) &&
-    Number.isFinite(last?.buffers) &&
-    last.buffers * 10 > first.buffers * 11
-  );
 }
 
 function sortBuffersNote(rows) {
@@ -2098,13 +2278,21 @@ function sortBuffersNote(rows) {
   );
   if (sorts.length === 0) return '';
   const numbers = sorts
-    .map((row) => `${row.name} ${row.buffers} warmed buffers / ${row.seconds}s`)
+    .map(
+      (row) =>
+        `${row.name} ${row.buffers} ${isWarmedSortRow(row) ? 'warmed' : 'cold'} buffers / ${row.seconds}s`,
+    )
     .join('; ');
-  if (sorts.length !== sortHistories.length)
-    return `Sort-traversal warmed RPC: ${numbers}.`;
-  return sortGrowthFailed(rows)
-    ? `Sort-traversal warmed RPC buffers grew by more than 10%: ${numbers}.`
-    : `Sort-traversal warmed RPC buffers stayed flat within 10%: ${numbers}.`;
+  if (!sortConditionsMatch(sorts)) {
+    return `Sort-traversal RPC (mixed cold/warmed; growth not compared): ${numbers}.`;
+  }
+  const label = isWarmedSortRow(sorts[0]) ? 'warmed' : 'cold';
+  if (sorts.length !== sortHistories.length) {
+    return `Sort-traversal ${label} RPC: ${numbers}.`;
+  }
+  return sortGrowthFailed(sorts)
+    ? `Sort-traversal ${label} RPC buffers grew by more than 10%: ${numbers}.`
+    : `Sort-traversal ${label} RPC buffers stayed flat within 10%: ${numbers}.`;
 }
 
 async function run() {
@@ -2119,6 +2307,8 @@ async function run() {
   const sortOnly = process.argv.includes('--sort-only');
 
   // Scope committed-measurement refusal to the workload being run or resumed.
+  const persistedAnchor = await persistedBuildAnchor();
+  const dbSortRows = await committedSortResults();
   let sortCommittedCount = 0;
   let orderCatalogStarted = false;
   if (sortOnly || startName === null) {
@@ -2145,6 +2335,8 @@ async function run() {
     resume,
     sortCommittedCount,
     orderCatalogStarted,
+    sortResults: dbSortRows,
+    buildAnchor: persistedAnchor,
   });
   if (plan.orderHistories.length > 0) {
     await psqlCaptured(plan.orderHistories.map(resumeGuardSql).join('\n'));
@@ -2159,7 +2351,25 @@ async function run() {
   if (!anchorMatch) {
     throw new Error(`no cairo anchor in ${anchorResult.out}`);
   }
-  const anchor = anchorMatch[0];
+  const currentAnchor = anchorMatch[0];
+  let hasExistingFixtures = false;
+  if (!persistedAnchor) {
+    const targetItems = [
+      ...(plan.runSorts ? sortHistories.map((history) => history.mixed) : []),
+      ...plan.orderHistories.map((history) => history.item),
+    ];
+    if (targetItems.length > 0) {
+      const existing = await psqlCaptured(
+        `select count(*) from app.stock_items where id in (${targetItems.map((id) => `'${id}'`).join(', ')});`,
+      );
+      hasExistingFixtures = firstInteger(existing.out) > 0;
+    }
+  }
+  const anchor = resolveBuildAnchor({
+    persistedAnchor,
+    currentAnchor,
+    hasExistingFixtures,
+  });
   process.stderr.write(`cairo day ${anchor}\n`);
   await psqlCaptured(setupSql(anchor));
   let sortFailed = false;
@@ -2266,7 +2476,18 @@ async function run() {
       return;
     }
   }
-  const sortRows = plan.runSorts ? rows : existingResultRows();
+  const sortRows = plan.runSorts
+    ? rows
+    : dbSortRows.length > 0
+      ? dbSortRows
+      : existingResultRows();
+  if (
+    !plan.runSorts &&
+    startName === null &&
+    !hasCompletePassingSortResults(sortRows, { expectedAnchor: anchor })
+  ) {
+    sortFailed = true;
+  }
   const sortNote = sortBuffersNote(sortRows);
   const closing = [
     sortFailed
@@ -2277,7 +2498,10 @@ async function run() {
   ]
     .filter(Boolean)
     .join(' ');
-  writeResults(rows, closing);
+  writeResults(
+    plan.runSorts || dbSortRows.length === 0 ? rows : [...dbSortRows, ...rows],
+    closing,
+  );
   if (sortFailed) process.exitCode = 1;
 }
 
@@ -2293,6 +2517,9 @@ if (
 
 export {
   setupSql,
+  historySql,
+  postSql,
+  persistBuildAnchorSql,
   histories,
   lateSql,
   resumeGuardSql,
@@ -2304,7 +2531,10 @@ export {
   sortMeasureSql,
   formatSortResult,
   existingResultRows,
+  sortConditionsMatch,
   sortBuffersNote,
   sortGrowthFailed,
+  hasCompletePassingSortResults,
+  resolveBuildAnchor,
   resolveResumePlan,
 };
