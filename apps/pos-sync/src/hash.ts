@@ -1,3 +1,4 @@
+import { PosSyncError } from './safe-error.ts';
 import { createHash } from 'node:crypto';
 import { isRecord } from './decode.ts';
 import type { StoredOrder } from './types.ts';
@@ -14,12 +15,12 @@ export function compareId(left: string, right: string): number {
 
 export function canonicalJson(value: unknown): string {
   if (value === undefined) {
-    throw new Error('invalid hash value');
+    throw new PosSyncError('invalidHashValue');
   }
   if (value === null || typeof value !== 'object') {
     const text = JSON.stringify(value);
     if (text === undefined) {
-      throw new Error('invalid hash value');
+      throw new PosSyncError('invalidHashValue');
     }
     return text;
   }
@@ -27,14 +28,14 @@ export function canonicalJson(value: unknown): string {
     return `[${value.map((entry) => canonicalJson(entry)).join(',')}]`;
   }
   if (!isRecord(value)) {
-    throw new Error('invalid hash value');
+    throw new PosSyncError('invalidHashValue');
   }
   const keys = Object.keys(value).sort();
   return `{${keys
     .map((key) => {
       const child = value[key];
       if (child === undefined) {
-        throw new Error('invalid hash value');
+        throw new PosSyncError('invalidHashValue');
       }
       return `${JSON.stringify(key)}:${canonicalJson(child)}`;
     })
@@ -65,9 +66,12 @@ function hashBody(order: StoredOrder): unknown {
   };
 }
 
+/** SHA-256 of any value serialized with canonical sorted object keys. */
+export function sha256Canonical(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex');
+}
+
 /** SHA-256 of the stored accounting shape. Update time is compared separately. */
 export function contentHash(order: StoredOrder): string {
-  return createHash('sha256')
-    .update(canonicalJson(hashBody(order)))
-    .digest('hex');
+  return sha256Canonical(hashBody(order));
 }

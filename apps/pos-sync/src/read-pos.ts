@@ -1,3 +1,6 @@
+import { splitDocumentName } from './decode.ts';
+import { ORDER_FIELD_PATHS } from './firestore-projection.ts';
+import { PosSyncError } from './safe-error.ts';
 import { compareId } from './hash.ts';
 import {
   mapOrderDocument,
@@ -36,9 +39,14 @@ export type PosSnapshot = {
   missingShiftIds: string[];
 };
 
+function orderProjection() {
+  return { fields: ORDER_FIELD_PATHS.map((fieldPath) => ({ fieldPath })) };
+}
+
 export function recentOrdersQuery(shiftIds: string[]): unknown {
   return {
     structuredQuery: {
+      select: orderProjection(),
       from: [{ collectionId: 'orders' }],
       where: {
         fieldFilter: {
@@ -63,6 +71,7 @@ export function timestampRangeQuery(
 ): unknown {
   return {
     structuredQuery: {
+      select: orderProjection(),
       from: [{ collectionId: 'orders' }],
       where: {
         compositeFilter: {
@@ -93,6 +102,7 @@ export function timestampRangeQuery(
 export function timestampProbeQuery(start: string): unknown {
   return {
     structuredQuery: {
+      select: { fields: [{ fieldPath: '__name__' }] },
       from: [{ collectionId: 'orders' }],
       where: {
         fieldFilter: {
@@ -141,7 +151,7 @@ async function readRecent(firestore: PosFirestore): Promise<PosSnapshot> {
   for (let page = 0; page < RECENT_SHIFT_MAX_PAGES; page += 1) {
     if (pageToken !== undefined) {
       if (seenTokens.has(pageToken)) {
-        throw new Error('repeated Firestore page token');
+        throw new PosSyncError('firestoreRepeatedPageToken');
       }
       seenTokens.add(pageToken);
     }
@@ -165,23 +175,16 @@ async function readRecent(firestore: PosFirestore): Promise<PosSnapshot> {
     pageToken = result.nextPageToken;
   }
   if (!complete) {
-    throw new Error('Firestore page limit exceeded');
+    throw new PosSyncError('firestorePageLimit');
   }
   const shifts = uniqueById(
     collected.map((document) => mapShiftDocument(document)),
-    'shift',
+    'duplicateShift',
   );
   const shiftIds = shifts.map((shift) => shift.id);
-  let documents: FirestoreRestDocument[] = [];
-  if (shiftIds.length > 0) {
-    documents = await firestore.queryOrders(recentOrdersQuery(shiftIds));
-    if (documents.length >= RECENT_ORDER_LIMIT) {
-      throw new Error('recent orders page was truncated');
-    }
-  }
   return {
     shifts,
-    orders: mapOrders(documents),
+    orders: mapOrders(await readOrdersForShifts(firestore, shiftIds)),
     scope: { shift_ids: shiftIds },
     missingShiftIds: [],
   };
@@ -193,16 +196,11 @@ async function readWindow(
 ): Promise<PosSnapshot> {
   const from = window35From(now);
   const scanEnd = new Date(now.getTime() + 2 * DAY_MS).toISOString();
-  const documents = await collectTimestampRange(firestore, from, scanEnd);
-  const probe = await firestore.queryOrders(timestampProbeQuery(scanEnd));
-  if (probe.length > 0) {
-    throw new Error('orders exist after the scan window');
-  }
   // Map the window once. A shift that opened earlier still owns orders from
   // before `from`; those orders are in the drawer. Read them too, or the
   // sales summary shows a false drawer difference. Each document is mapped
   // once. Scope stays {from}, so orders before `from` are never marked missing.
-  const windowOrders = mapOrders(documents);
+  const windowOrders = await readWindowOrders(firestore, from, scanEnd);
   const shiftIds = [
     ...new Set(windowOrders.map((order) => order.shift_id)),
   ].sort(compareId);
@@ -216,26 +214,43 @@ async function readWindow(
     }
     shifts.push(mapShiftDocument(document));
   }
-  const uniqueShifts = uniqueById(shifts, 'shift');
+  const uniqueShifts = uniqueById(shifts, 'duplicateShift');
   const fromMs = Date.parse(from);
   const earlyShiftIds = uniqueShifts
     .filter((shift) => openedBefore(shift.opened_at, fromMs))
     .map((shift) => shift.id);
-  const backfill = await readOrdersForShifts(firestore, earlyShiftIds);
-  const seenNames = new Set(documents.map((document) => document.name));
-  const fresh = backfill.filter((document) => !seenNames.has(document.name));
+  const seenIds = new Set(windowOrders.map((order) => order.id));
+  const backfill = mapOrders(
+    (await readOrdersForShifts(firestore, earlyShiftIds)).filter((document) => {
+      const { collection, id } = splitDocumentName(document.name);
+      return collection !== 'orders' || !seenIds.has(id);
+    }),
+  );
   return {
     shifts: uniqueShifts,
-    orders: uniqueById([...windowOrders, ...mapOrders(fresh)], 'order'),
+    orders: uniqueById([...windowOrders, ...backfill], 'duplicateOrder'),
     scope: { from },
     missingShiftIds,
   };
 }
 
+async function readWindowOrders(
+  firestore: PosFirestore,
+  from: string,
+  scanEnd: string,
+): Promise<PosOrderIngest[]> {
+  const documents = await collectTimestampRange(firestore, from, scanEnd);
+  const probe = await firestore.queryOrders(timestampProbeQuery(scanEnd));
+  if (probe.length > 0) {
+    throw new PosSyncError('ordersAfterScanWindow');
+  }
+  return mapOrders(documents);
+}
+
 function openedBefore(openedAt: string, fromMs: number): boolean {
   const openedMs = Date.parse(openedAt);
   if (!Number.isFinite(openedMs) || !Number.isFinite(fromMs)) {
-    throw new Error('invalid timestamp');
+    throw new PosSyncError('invalidTimestamp');
   }
   return openedMs < fromMs;
 }
@@ -250,7 +265,7 @@ async function readOrdersForShifts(
     const chunk = sorted.slice(index, index + FIRESTORE_IN_LIMIT);
     const page = await firestore.queryOrders(recentOrdersQuery(chunk));
     if (page.length >= RECENT_ORDER_LIMIT) {
-      throw new Error('recent orders page was truncated');
+      throw new PosSyncError('recentOrdersTruncated');
     }
     documents.push(...page);
   }
@@ -263,7 +278,7 @@ async function readFull(firestore: PosFirestore): Promise<PosSnapshot> {
   return {
     shifts: uniqueById(
       shiftDocuments.map((document) => mapShiftDocument(document)),
-      'shift',
+      'duplicateShift',
     ),
     orders: mapOrders(orderDocuments),
     scope: { all: true },
@@ -296,7 +311,7 @@ async function listShiftTransactions(
   for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
     if (pageToken !== undefined) {
       if (seenTokens.has(pageToken)) {
-        throw new Error('repeated Firestore page token');
+        throw new PosSyncError('firestoreRepeatedPageToken');
       }
       seenTokens.add(pageToken);
     }
@@ -311,7 +326,7 @@ async function listShiftTransactions(
     }
     pageToken = result.nextPageToken;
   }
-  throw new Error('Firestore page limit exceeded');
+  throw new PosSyncError('firestorePageLimit');
 }
 
 async function listAll(
@@ -324,7 +339,7 @@ async function listAll(
   for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
     if (pageToken !== undefined) {
       if (seenTokens.has(pageToken)) {
-        throw new Error('repeated Firestore page token');
+        throw new PosSyncError('firestoreRepeatedPageToken');
       }
       seenTokens.add(pageToken);
     }
@@ -338,7 +353,7 @@ async function listAll(
     }
     pageToken = result.nextPageToken;
   }
-  throw new Error('Firestore page limit exceeded');
+  throw new PosSyncError('firestorePageLimit');
 }
 
 export async function collectTimestampRange(
@@ -362,7 +377,7 @@ export async function collectTimestampRange(
     return documents;
   }
   if (endMs - startMs <= 1) {
-    throw new Error('timestamp range is still full');
+    throw new PosSyncError('timestampRangeFull');
   }
   const mid = new Date(
     startMs + Math.floor((endMs - startMs) / 2),
@@ -376,21 +391,24 @@ function mapOrders(documents: FirestoreRestDocument[]): PosOrderIngest[] {
   const seenNames = new Set<string>();
   for (const document of documents) {
     if (seenNames.has(document.name)) {
-      throw new Error('duplicate order id');
+      throw new PosSyncError('duplicateOrder');
     }
     seenNames.add(document.name);
   }
   return uniqueById(
     documents.map((document) => mapOrderDocument(document)),
-    'order',
+    'duplicateOrder',
   );
 }
 
-function uniqueById<T extends { id: string }>(rows: T[], label: string): T[] {
+function uniqueById<T extends { id: string }>(
+  rows: T[],
+  code: 'duplicateOrder' | 'duplicateShift',
+): T[] {
   const seen = new Set<string>();
   for (const row of rows) {
     if (seen.has(row.id)) {
-      throw new Error(`duplicate ${label} id`);
+      throw new PosSyncError(code);
     }
     seen.add(row.id);
   }

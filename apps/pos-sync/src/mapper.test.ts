@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { canonicalJson, contentHash } from './hash.ts';
 import {
   mapOrderDocument,
@@ -6,6 +6,7 @@ import {
   mapShiftTransaction,
   storedProjection,
 } from './mapper.ts';
+import { safeErrorMessage } from './safe-error.ts';
 
 const NAME_PREFIX = 'projects/thesharkrestaurant/databases/(default)/documents';
 
@@ -66,6 +67,52 @@ function keysDeep(value: unknown, found: string[] = []): string[] {
 }
 
 describe('mapOrderDocument', () => {
+  it.each([
+    ['missing shift id', { shiftId: undefined }, 'shift id is required'],
+    [
+      'invalid service tax',
+      { serviceTaxAmount: str('SyntheticMarker7f3a') },
+      'unexpected service tax',
+    ],
+    [
+      'missing line id',
+      {
+        items: {
+          arrayValue: {
+            values: [{ mapValue: { fields: { quantity: int(1) } } }],
+          },
+        },
+      },
+      'line id is required',
+    ],
+  ] as const)(
+    'preserves the package diagnostic for %s',
+    (_case, fields, message) => {
+      let thrown: unknown;
+      try {
+        mapOrderDocument({
+          name: `${NAME_PREFIX}/orders/order-test-1`,
+          updateTime: '2026-10-15T14:00:00Z',
+          fields: {
+            status: str('complete'),
+            shiftId: str('shift-test-1'),
+            timestamp: ts('2026-10-15T12:00:00Z'),
+            subtotalAmount: int(1),
+            discountAmount: int(0),
+            taxTotalAmount: int(0),
+            serviceTaxAmount: int(0),
+            totalAmount: int(1),
+            ...fields,
+          },
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toHaveProperty('message', message);
+      expect(safeErrorMessage(thrown)).toBe(message);
+    },
+  );
+
   it('keeps accounting fields and drops synthetic PII', () => {
     const order = mapOrderDocument({
       name: `${NAME_PREFIX}/orders/order-test-1`,
@@ -217,6 +264,127 @@ describe('mapOrderDocument', () => {
     expect(order.content_hash).toMatch(/^[0-9a-f]{64}$/);
   });
 
+  it.each([
+    'valid accounting leaves',
+    'a map in an accounting leaf',
+    'a timestamp in a text leaf',
+    'a malformed null leaf',
+    'an extra wrapper key on selectedSize mapValue',
+  ])('never reads excluded order line and option keys with %s', (variant) => {
+    const marker = 'synthetic-excluded-order-line-marker';
+    const touch = vi.fn(() => {
+      throw new Error(marker);
+    });
+    const protectedFields = (fields: Record<string, unknown>) =>
+      new Proxy(
+        {
+          ...fields,
+          note: str(marker),
+          costPrice: str(marker),
+          customerName: str(marker),
+        },
+        {
+          get(target: Record<string, unknown>, key, receiver) {
+            if (key === 'note' || key === 'costPrice' || key === 'customerName')
+              touch();
+            return Reflect.get(target, key, receiver) as unknown;
+          },
+          ownKeys() {
+            return touch();
+          },
+        },
+      );
+    const invalidOptionFields = {
+      get customerName() {
+        return touch();
+      },
+    };
+    const optionValue =
+      variant === 'a map in an accounting leaf'
+        ? { mapValue: { fields: invalidOptionFields } }
+        : variant === 'a timestamp in a text leaf'
+          ? ts(marker)
+          : variant === 'a malformed null leaf'
+            ? { nullValue: invalidOptionFields }
+            : str('option-test');
+    const logs = (['log', 'info', 'warn', 'error', 'debug'] as const).map(
+      (level) => vi.spyOn(console, level).mockImplementation(() => {}),
+    );
+    try {
+      const mapOrder = () =>
+        mapOrderDocument({
+          name: `${NAME_PREFIX}/orders/order-test-1`,
+          updateTime: '2026-10-15T12:00:00Z',
+          fields: {
+            status: str('complete'),
+            shiftId: str('shift-test-1'),
+            timestamp: ts('2026-10-15T12:00:00Z'),
+            subtotalAmount: int(1),
+            discountAmount: int(0),
+            taxTotalAmount: int(0),
+            serviceTaxAmount: int(0),
+            totalAmount: int(1),
+            items: {
+              arrayValue: {
+                values: [
+                  {
+                    mapValue: {
+                      fields: protectedFields({
+                        orderItemId: str('line-test'),
+                        itemId: str('item-test'),
+                        quantity: int(1),
+                        price: int(1),
+                        selectedSize: {
+                          mapValue: {
+                            fields: protectedFields({ name: str('Large') }),
+                            ...(variant ===
+                            'an extra wrapper key on selectedSize mapValue'
+                              ? { customerName: marker }
+                              : {}),
+                          },
+                        },
+                        selectedOptions: {
+                          arrayValue: {
+                            values: [
+                              {
+                                mapValue: {
+                                  fields: protectedFields({
+                                    value: optionValue,
+                                  }),
+                                },
+                              },
+                            ],
+                          },
+                        },
+                      }),
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        });
+      if (variant === 'valid accounting leaves') {
+        const order = mapOrder();
+        expect(order.lines[0]?.size_name).toBe('Large');
+        expect(order.lines[0]?.options[0]?.value).toBe('option-test');
+        expect(JSON.stringify([order, storedProjection(order)])).not.toMatch(
+          /note|costPrice|customerName|synthetic-excluded-order-line-marker/,
+        );
+      } else if (variant === 'an extra wrapper key on selectedSize mapValue') {
+        expect(mapOrder).toThrow(/^unexpected selectedSize$/);
+      } else {
+        expect(mapOrder).toThrow(/^unexpected option value$/);
+      }
+      expect(touch).not.toHaveBeenCalled();
+      expect(JSON.stringify(logs.map((log) => log.mock.calls))).not.toContain(
+        marker,
+      );
+    } finally {
+      for (const log of logs) log.mockRestore();
+    }
+  });
+
   it('does not echo a rejected status', () => {
     expect(() =>
       mapOrderDocument({
@@ -234,6 +402,82 @@ describe('mapOrderDocument', () => {
         },
       }),
     ).toThrow(/unexpected status/);
+  });
+
+  it('keeps a 24:00:00 order timestamp in the legacy normalized form', () => {
+    const order = mapOrderDocument({
+      name: `${NAME_PREFIX}/orders/order-test-24`,
+      updateTime: '2026-10-15T24:00:00Z',
+      fields: {
+        status: str('complete'),
+        shiftId: str('shift-test-1'),
+        timestamp: ts('2026-10-15T24:00:00Z'),
+        subtotalAmount: dbl(10),
+        discountAmount: dbl(0),
+        taxTotalAmount: dbl(0),
+        serviceTaxAmount: dbl(0),
+        totalAmount: dbl(10),
+      },
+    });
+    expect(order.ordered_at).toBe('2026-10-15T24:00:00.000000Z');
+    expect(order.pos_update_time).toBe('2026-10-15T24:00:00.000000Z');
+  });
+
+  it('accepts valid RFC 3339 timestamps stored as stringValue and rejects invalid text', () => {
+    const order = mapOrderDocument({
+      name: `${NAME_PREFIX}/orders/order-test-str-ts`,
+      updateTime: '2026-10-15T12:00:00Z',
+      fields: {
+        status: str('complete'),
+        shiftId: str('shift-test-1'),
+        timestamp: str('2026-10-15T12:00:00Z'),
+        subtotalAmount: dbl(10),
+        discountAmount: dbl(0),
+        taxTotalAmount: dbl(0),
+        serviceTaxAmount: dbl(0),
+        totalAmount: dbl(10),
+      },
+    });
+    expect(order.ordered_at).toBe('2026-10-15T12:00:00.000000Z');
+
+    const shift = mapShiftDocument({
+      name: `${NAME_PREFIX}/custody_shifts/shift-test-str-ts`,
+      updateTime: '2026-10-15T18:00:00Z',
+      fields: {
+        opening_time: str('2026-10-15T09:00:00Z'),
+        closingTime: str('2026-10-15T18:00:00Z'),
+        isActive: bool(false),
+      },
+    });
+    expect(shift.opened_at).toBe('2026-10-15T09:00:00.000000Z');
+    expect(shift.closed_at).toBe('2026-10-15T18:00:00.000000Z');
+
+    const tx = mapShiftTransaction(
+      'shift-test-1',
+      txDocument('shift-test-1', 'tx-str-ts', {
+        type: int(0),
+        amount: int(15),
+        timestamp: str('2026-10-15T15:04:05Z'),
+      }),
+    );
+    expect(tx.occurred_at).toBe('2026-10-15T15:04:05.000000Z');
+
+    expect(() =>
+      mapOrderDocument({
+        name: `${NAME_PREFIX}/orders/order-test-bad-str-ts`,
+        updateTime: '2026-10-15T12:00:00Z',
+        fields: {
+          status: str('complete'),
+          shiftId: str('shift-test-1'),
+          timestamp: str('not-a-timestamp'),
+          subtotalAmount: dbl(10),
+          discountAmount: dbl(0),
+          taxTotalAmount: dbl(0),
+          serviceTaxAmount: dbl(0),
+          totalAmount: dbl(10),
+        },
+      }),
+    ).toThrow(/invalid timestamp/);
   });
 });
 
@@ -286,6 +530,21 @@ describe('mapShiftDocument', () => {
     expect(shift.drawer_credit).toBe('20.00');
     expect(JSON.stringify(shift)).not.toContain('difference');
     expect(JSON.stringify(shift)).not.toContain('-12.34');
+  });
+
+  it('keeps a 24:00:00 shift timestamp in the legacy normalized form', () => {
+    const shift = mapShiftDocument({
+      name: `${NAME_PREFIX}/custody_shifts/shift-test-24`,
+      updateTime: '2026-10-15T24:00:00Z',
+      fields: {
+        opening_time: ts('2026-10-15T24:00:00Z'),
+        closingTime: ts('2026-10-16T24:00:00Z'),
+        isActive: bool(false),
+      },
+    });
+    expect(shift.opened_at).toBe('2026-10-15T24:00:00.000000Z');
+    expect(shift.closed_at).toBe('2026-10-16T24:00:00.000000Z');
+    expect(shift.pos_update_time).toBe('2026-10-15T24:00:00.000000Z');
   });
 
   it('rejects a shift id that does not match the document', () => {

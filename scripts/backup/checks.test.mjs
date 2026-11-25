@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import {
   assertNoDrift,
@@ -7,7 +8,12 @@ import {
   evaluateRole,
   planRestorePrep,
 } from './checks.mjs';
-import { FORBIDDEN_USAGE_SCHEMAS, OWNER_FK_COLUMNS } from './config.mjs';
+import {
+  FORBIDDEN_EXTENSIONS,
+  FORBIDDEN_USAGE_SCHEMAS,
+  OWNER_FK_COLUMNS,
+  PLATFORM_EXTENSIONS,
+} from './config.mjs';
 
 const clean = {
   schemas: [
@@ -118,17 +124,40 @@ test('application objects in a platform schema are named, whatever the schema', 
   );
 });
 
-test('pg_cron and pg_net fail the guard with their own message', () => {
-  for (const extension of ['pg_cron', 'pg_net']) {
-    const violations = evaluateDrift({
-      ...clean,
-      extensions: [...clean.extensions, extension],
+test('pg_cron and pg_net stay platform extensions, and usage of auth, cron, net, and vault stays forbidden', () => {
+  // Kept after ensure-scheduler stopped installing extensions: drift still
+  // allows both, and any reader usage of these schemas still fails the backup.
+  const violations = evaluateDrift({
+    ...clean,
+    extensions: [...clean.extensions, 'pg_cron', 'pg_net'],
+  });
+  assert.deepEqual(violations, []);
+  assert.equal(FORBIDDEN_EXTENSIONS.includes('pg_cron'), false);
+  assert.equal(FORBIDDEN_EXTENSIONS.includes('pg_net'), false);
+  assert.equal(PLATFORM_EXTENSIONS.includes('pg_cron'), true);
+  assert.equal(PLATFORM_EXTENSIONS.includes('pg_net'), true);
+  assert.deepEqual(
+    [...FORBIDDEN_USAGE_SCHEMAS],
+    ['auth', 'cron', 'net', 'vault'],
+  );
+  for (const schema of ['auth', 'cron', 'net', 'vault']) {
+    const found = evaluateRole({
+      canLogin: true,
+      bypassRls: true,
+      super: false,
+      createRole: false,
+      createDb: false,
+      replication: false,
+      memberships: [],
+      writable: [],
+      sequenceWrite: [],
+      executable: [],
+      storageAccess: [],
+      schemaCreate: [],
+      forbiddenUsage: [schema],
     });
-    assert.equal(violations.length, 1, extension);
-    assert.match(
-      violations[0],
-      new RegExp(`extension ${extension} is installed`),
-    );
+    assert.equal(found.length, 1, schema);
+    assert.ok(found[0].includes(schema), found[0]);
   }
 });
 
@@ -351,6 +380,29 @@ test('restore prep is a no-op when everything exists', () => {
   assert.equal(plan.sql, '');
 });
 
+test('restore prep skips pg_cron and pg_net', () => {
+  const plan = planRestorePrep({
+    metadata: {
+      ...metadata,
+      extensions: [
+        ...metadata.extensions,
+        { name: 'pg_cron', version: '1.6', schema: 'cron' },
+        { name: 'pg_net', version: '0.19', schema: 'net' },
+      ],
+    },
+    existingRoles: platformRoles,
+  });
+  assert.deepEqual(plan.extensions, ['btree_gist']);
+  assert.equal(
+    plan.sql,
+    [
+      'create extension if not exists "btree_gist" with schema "extensions";',
+      'create role "backup_reader" nologin;',
+    ].join('\n'),
+  );
+  assert.doesNotMatch(plan.sql, /pg_cron|pg_net/);
+});
+
 test('restore prep refuses a missing platform role or unknown extension', () => {
   assert.equal(
     codeOf(() => planRestorePrep({ metadata, existingRoles: ['anon'] })),
@@ -368,6 +420,22 @@ test('restore prep refuses a missing platform role or unknown extension', () => 
     ),
     'RESTORE_UNKNOWN_EXTENSION',
   );
+});
+
+test('provision-backup-reader grants backup_reader nothing in auth, vault, cron, or net', () => {
+  const sql = readFileSync(
+    new URL('./provision-backup-reader.sql', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    sql,
+    /backup_reader gets no access to the auth, vault, cron or net/,
+  );
+  const code = sql.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
+  for (const schema of ['auth', 'cron', 'net', 'vault']) {
+    assert.doesNotMatch(code, new RegExp(`\\b${schema}\\b`, 'i'), schema);
+  }
+  assert.doesNotMatch(code, /cron\.job|cron\.schedule/i);
 });
 
 test('restore prep rejects names that are not plain identifiers', () => {

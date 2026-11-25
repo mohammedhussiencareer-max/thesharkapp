@@ -13,6 +13,7 @@ import {
   defaultConfigPath,
   isMain,
   parseDbPort,
+  parseProjectId,
   readPinnedMajor,
   runCli,
 } from './config.mjs';
@@ -113,7 +114,7 @@ export function majorArgs(args) {
 }
 
 const USAGE =
-  'usage: guard.mjs pinned-major | db-port | dump-target | restore-target | ' +
+  'usage: guard.mjs pinned-major | db-port | project-id | dump-target | restore-target | ' +
   'assert-major <server_version_num> [tool=version text]... | server-version | ' +
   'role-check | target-empty | restore-prep <manifest.json>';
 
@@ -125,6 +126,8 @@ if (isMain(import.meta.url)) {
         return String(readPinnedMajor());
       case 'db-port':
         return String(parseDbPort(readFileSync(defaultConfigPath(), 'utf8')));
+      case 'project-id':
+        return parseProjectId(readFileSync(defaultConfigPath(), 'utf8'));
       case 'dump-target':
         return checkDumpTarget(process.env).enforceRole ? '1' : '0';
       case 'restore-target':
