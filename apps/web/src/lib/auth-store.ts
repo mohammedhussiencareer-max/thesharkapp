@@ -9,8 +9,69 @@ import {
   setWritesLocked,
 } from '@/lib/held-writes';
 import { setPwaAuthResolved, setPwaLogoutPending } from '@/lib/pwa';
-import { supabase } from '@/lib/supabase';
+import { readSupabaseEnv, supabase } from '@/lib/supabase';
 import type { AuthStatus } from '@/lib/auth-context';
+
+const LOGOUT_PENDING_KEY_PREFIX = 'theshark:auth:logout-pending:v1:';
+const FALLBACK_PROJECT = 'default';
+
+function logoutPendingStorageKey(): string {
+  let url: string | undefined;
+  try {
+    url =
+      typeof readSupabaseEnv === 'function'
+        ? readSupabaseEnv()?.url.trim()
+        : undefined;
+  } catch {
+    url = undefined;
+  }
+  const project = url && url.length > 0 ? url : FALLBACK_PROJECT;
+  return `${LOGOUT_PENDING_KEY_PREFIX}${encodeURIComponent(project)}`;
+}
+
+function logoutStorage(): Storage | null {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      return window.localStorage;
+    }
+    if (typeof localStorage !== 'undefined') {
+      return localStorage;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function hasPersistedLogoutIntent(): boolean {
+  const storage = logoutStorage();
+  if (!storage) return false;
+  try {
+    return storage.getItem(logoutPendingStorageKey()) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function persistLogoutIntent(): void {
+  const storage = logoutStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(logoutPendingStorageKey(), '1');
+  } catch {
+    // Keep the in-memory logoutUnresolved guard active even if storage fails.
+  }
+}
+
+function clearPersistedLogoutIntent(): void {
+  const storage = logoutStorage();
+  if (!storage) return;
+  try {
+    storage.removeItem(logoutPendingStorageKey());
+  } catch {
+    // Ignore storage cleanup errors.
+  }
+}
 
 type Snapshot = {
   status: AuthStatus;
@@ -58,6 +119,7 @@ function emit(
   snapshot = full;
   setPwaAuthResolved(
     !logoutUnresolved &&
+      !hasPersistedLogoutIntent() &&
       pendingSignOuts === 0 &&
       full.status !== 'loading' &&
       full.status !== 'checking',
@@ -183,6 +245,23 @@ export function startAuth() {
   started = true;
   setHeldWriteUser(null);
 
+  if (hasPersistedLogoutIntent()) {
+    // Honor an unfinished or failed logout from a previous document before
+    // registering the auth listener so INITIAL_SESSION cannot restore access.
+    logoutUnresolved = true;
+    currentSession = null;
+    setWritesLocked(true);
+    setHeldWriteUser(null);
+    setPwaLogoutPending(true);
+    setPwaAuthResolved(false);
+    emit({
+      status: 'signed-out',
+      email: null,
+      logoutPending: false,
+      logoutFailed: true,
+    });
+  }
+
   const {
     data: { subscription },
   } = client.auth.onAuthStateChange((event, session) => {
@@ -202,20 +281,40 @@ export function startAuth() {
       lastUserId = null;
       setHeldWriteUser(null);
       checkId += 1;
+      const persistedLogout = hasPersistedLogoutIntent();
+      if (event === 'SIGNED_OUT' && pendingSignOuts === 0 && !persistedLogout) {
+        logoutUnresolved = false;
+        setPwaLogoutPending(false);
+      } else if (persistedLogout) {
+        logoutUnresolved = true;
+        setPwaLogoutPending(true);
+      }
       emit({
         status: 'signed-out',
         email: null,
         logoutPending: pendingSignOuts > 0,
-        logoutFailed: snapshot.logoutFailed,
+        logoutFailed:
+          pendingSignOuts === 0 && logoutUnresolved
+            ? true
+            : snapshot.logoutFailed,
       });
       return;
     }
-    if (pendingSignOuts > 0 || logoutUnresolved) {
-      // Local logout has not completed yet: ignore any refocus/reconfirmation
+    if (pendingSignOuts > 0 || logoutUnresolved || hasPersistedLogoutIntent()) {
+      // Local logout has not completed yet: ignore any initial or refocus
       // session event so writes and PWA reload stay locked until logout finishes.
+      logoutUnresolved = true;
       currentSession = null;
       setWritesLocked(true);
       setHeldWriteUser(null);
+      setPwaLogoutPending(true);
+      setPwaAuthResolved(false);
+      emit({
+        status: 'signed-out',
+        email: null,
+        logoutPending: pendingSignOuts > 0,
+        logoutFailed: pendingSignOuts === 0 ? true : snapshot.logoutFailed,
+      });
       return;
     }
     currentSession = session;
@@ -257,6 +356,7 @@ export function getAuthSnapshot(): Snapshot {
 export function isAuthResolved(): boolean {
   return (
     !logoutUnresolved &&
+    !hasPersistedLogoutIntent() &&
     pendingSignOuts === 0 &&
     snapshot.status !== 'loading' &&
     snapshot.status !== 'checking'
@@ -272,7 +372,7 @@ export async function signIn(
   if (pendingSignOutPromise) {
     await pendingSignOutPromise.catch(() => {});
   }
-  if (logoutUnresolved) {
+  if (logoutUnresolved || hasPersistedLogoutIntent()) {
     return 'invalid';
   }
   const { error } = await client.auth.signInWithPassword({ email, password });
@@ -297,6 +397,7 @@ export async function signOut() {
   const epoch = storeEpoch;
   pendingSignOuts += 1;
   logoutUnresolved = true;
+  persistLogoutIntent();
   setWritesLocked(true);
   setPwaLogoutPending(true);
   setPwaAuthResolved(false);
@@ -333,6 +434,7 @@ export async function signOut() {
             pendingSignOutPromise = null;
           }
           if (succeeded && runId === signOutRunId) {
+            clearPersistedLogoutIntent();
             logoutUnresolved = false;
             setPwaLogoutPending(false);
             emit({
@@ -342,9 +444,12 @@ export async function signOut() {
               logoutFailed: false,
             });
             setPwaAuthResolved(
-              snapshot.status !== 'loading' && snapshot.status !== 'checking',
+              !hasPersistedLogoutIntent() &&
+                snapshot.status !== 'loading' &&
+                snapshot.status !== 'checking',
             );
           } else {
+            persistLogoutIntent();
             logoutUnresolved = true;
             currentSession = null;
             setWritesLocked(true);
@@ -372,7 +477,7 @@ export function retryOwnerCheck() {
   checkOwner(session);
 }
 
-export function resetAuthStore() {
+export function resetAuthStore(options?: { clearStorage?: boolean }) {
   storeEpoch += 1;
   checkId += 1;
   currentSession = null;
@@ -381,6 +486,9 @@ export function resetAuthStore() {
   logoutUnresolved = false;
   signOutRunId = 0;
   pendingSignOutPromise = null;
+  if (options?.clearStorage ?? true) {
+    clearPersistedLogoutIntent();
+  }
   unsubscribeAuth?.();
   unsubscribeAuth = null;
   started = false;

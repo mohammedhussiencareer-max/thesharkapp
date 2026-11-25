@@ -1609,6 +1609,132 @@ describe('held-writes store', () => {
     }
   });
 
+  it('P2: persists logout intent before SDK signOut, blocks INITIAL_SESSION across reload, and clears only after local credentials are removed', async () => {
+    const sessionA: NonNullable<Session> = {
+      user: { id: 'owner-a', email: 'a@theshark.test' },
+      access_token: 'tok-a-reload',
+      refresh_token: 'rt-a-reload',
+    };
+    const supabaseMod = await import('@/lib/supabase');
+    let releasePendingSignOut: (value: {
+      error: Error | null;
+    }) => void = () => {};
+    const signOutSpy = vi
+      .spyOn(supabaseMod.supabase!.auth, 'signOut')
+      .mockImplementationOnce(
+        () =>
+          new Promise<{ error: Error | null }>((resolve) => {
+            releasePendingSignOut = resolve;
+          }) as ReturnType<
+            NonNullable<typeof supabaseMod.supabase>['auth']['signOut']
+          >,
+      )
+      .mockResolvedValueOnce({
+        error: new Error('offline refresh failed') as never,
+      })
+      .mockImplementationOnce(() => {
+        authMock.session = null;
+        for (const listener of [...authMock.listeners]) {
+          listener('SIGNED_OUT', null);
+        }
+        return Promise.resolve({ error: null });
+      });
+
+    try {
+      authMock.session = sessionA;
+      startAuth();
+      await vi.waitFor(() => {
+        expect(getAuthSnapshot().status).toBe('owner');
+      });
+
+      // Start signOut and reload BEFORE the SDK call finishes.
+      const pendingLogout = signOut();
+      expect(signOutSpy).toHaveBeenCalledTimes(1);
+
+      // Fresh document reload while SDK still retains sessionA.
+      vi.resetModules();
+      const [freshAuth, freshHeld, freshPwa] = await Promise.all([
+        import('@/lib/auth-store'),
+        import('@/lib/held-writes'),
+        import('@/lib/pwa'),
+      ]);
+      freshAuth.startAuth();
+      await new Promise((resolve) => setTimeout(resolve, 15));
+
+      expect(freshAuth.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        email: null,
+        logoutPending: false,
+        logoutFailed: true,
+      });
+      expect(freshAuth.isAuthResolved()).toBe(false);
+      expect(freshPwa.isPwaLogoutPending()).toBe(true);
+      expect(freshHeld.isWritesLocked()).toBe(true);
+      expect(
+        await freshHeld.claimFreshHeldWrite('count:daily', (requestId) => ({
+          requestId,
+        })),
+      ).toEqual({ ok: false, reason: 'signed_out' });
+
+      // Release the old tab's hung SDK call with an error so no dangling promise remains.
+      releasePendingSignOut({ error: new Error('tab reloaded') });
+      await pendingLogout;
+
+      // Retrying signOut while offline (returns error) must keep persisted intent intact.
+      await freshAuth.signOut();
+      expect(freshAuth.getAuthSnapshot().logoutFailed).toBe(true);
+      expect(freshAuth.isAuthResolved()).toBe(false);
+
+      // Even if a fresh reload receives INITIAL_SESSION(null) while offline with
+      // retained credentials, persisted logout intent must stay active until signOut succeeds.
+      authMock.session = null;
+      vi.resetModules();
+      const [offlineReloadAuth, offlineReloadPwa] = await Promise.all([
+        import('@/lib/auth-store'),
+        import('@/lib/pwa'),
+      ]);
+      offlineReloadAuth.startAuth();
+      expect(offlineReloadAuth.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutFailed: true,
+      });
+      expect(offlineReloadAuth.isAuthResolved()).toBe(false);
+      expect(offlineReloadPwa.isPwaLogoutPending()).toBe(true);
+
+      // A later SIGNED_IN from the retained refresh token must still be rejected.
+      authMock.session = sessionA;
+      for (const listener of [...authMock.listeners]) {
+        listener('SIGNED_IN', sessionA);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      expect(offlineReloadAuth.getAuthSnapshot().status).toBe('signed-out');
+      expect(offlineReloadAuth.isAuthResolved()).toBe(false);
+
+      // Succeeding retry removes local credentials and clears persisted logout intent.
+      await offlineReloadAuth.signOut();
+      expect(offlineReloadAuth.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPending: false,
+        logoutFailed: false,
+      });
+      expect(offlineReloadAuth.isAuthResolved()).toBe(true);
+      expect(offlineReloadPwa.isPwaLogoutPending()).toBe(false);
+
+      // After local credentials were removed, a fresh reload accepts a new sign-in.
+      authMock.session = sessionA;
+      vi.resetModules();
+      const postCleanAuth = await import('@/lib/auth-store');
+      postCleanAuth.startAuth();
+      await vi.waitFor(() => {
+        expect(postCleanAuth.getAuthSnapshot().status).toBe('owner');
+      });
+      expect(postCleanAuth.isAuthResolved()).toBe(true);
+    } finally {
+      signOutSpy.mockRestore();
+      resetPwaState();
+    }
+  });
+
   it('P2: surviving tab queues exact-claim recheck on storage sync so inflight promotes to unknown when writer releases lock without another storage event', async () => {
     const { client } = makeAuditedLocks();
     const tab1 = createHeldWriteStore({ getLocks: () => client('writer-tab') });

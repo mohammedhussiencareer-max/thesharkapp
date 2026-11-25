@@ -4,6 +4,7 @@ import {
   createLoopbackOnlyProxy,
   developmentSupabaseUrl,
   installLoopbackGuard,
+  type LoopbackOnlyProxy,
 } from './local-guard';
 
 /**
@@ -17,6 +18,7 @@ import {
 export const test = base.extend<{
   supabaseUrl: string;
   loopbackGuardMode: 'route' | 'proxy';
+  loopbackGuardProxy: LoopbackOnlyProxy | null;
 }>({
   supabaseUrl: [
     // Reads the Vite development env; it does not use a Playwright fixture.
@@ -29,17 +31,20 @@ export const test = base.extend<{
     { auto: true },
   ],
   loopbackGuardMode: ['route', { option: true }],
-  proxy: async ({ proxy, loopbackGuardMode }, expose) => {
+  loopbackGuardProxy: async ({ loopbackGuardMode }, expose) => {
     if (loopbackGuardMode !== 'proxy') {
-      await expose(proxy);
+      await expose(null);
       return;
     }
     const guardProxy = await createLoopbackOnlyProxy();
     try {
-      await expose(guardProxy.proxyConfig);
+      await expose(guardProxy);
     } finally {
       await guardProxy.close();
     }
+  },
+  proxy: async ({ proxy, loopbackGuardProxy }, expose) => {
+    await expose(loopbackGuardProxy ? loopbackGuardProxy.proxyConfig : proxy);
   },
   context: async ({ context, loopbackGuardMode }, expose) => {
     if (loopbackGuardMode === 'route') {

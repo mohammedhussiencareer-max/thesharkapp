@@ -327,6 +327,99 @@ describe('owner access', () => {
     expect(isAuthResolved()).toBe(true);
     expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeEnabled();
   });
+
+  it('blocks a retained SDK session after a failed logout even across a document reload until retry succeeds', async () => {
+    const session = {
+      user: { id: 'owner', email: 'owner@theshark.test' },
+      access_token: 'tok-owner-reload',
+      refresh_token: 'rt-owner-reload',
+    };
+    authState.session = session;
+    authState.isOwner = true;
+    authState.signOutError = { message: 'session refresh failed' };
+
+    const firstView = renderApp('/');
+    expect(await screen.findByText('owner@theshark.test')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'تسجيل الخروج' }));
+    expect(
+      await screen.findByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
+    ).toBeInTheDocument();
+    expect(authState.signOut).toHaveBeenCalledTimes(1);
+    firstView.unmount();
+
+    // Simulate a fresh document reload while the SDK still retains the session.
+    vi.resetModules();
+    const [freshAuthStore, freshProviderMod, freshAppMod] = await Promise.all([
+      import('@/lib/auth-store'),
+      import('@/auth/AuthProvider'),
+      import('@/App'),
+    ]);
+
+    const reloadedView = render(
+      <MemoryRouter initialEntries={['/']}>
+        <freshProviderMod.AuthProvider>
+          <freshAppMod.AppRoutes />
+        </freshProviderMod.AuthProvider>
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
+    ).toBeInTheDocument();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    });
+    expect(freshAuthStore.getAuthSnapshot()).toMatchObject({
+      status: 'signed-out',
+      email: null,
+      logoutPending: false,
+      logoutFailed: true,
+    });
+    expect(freshAuthStore.isAuthResolved()).toBe(false);
+    expect(screen.queryByText('owner@theshark.test')).toBeNull();
+    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
+    expect(
+      await freshAuthStore.signIn('owner@theshark.test', 'ValidPassword123'),
+    ).toBe('invalid');
+
+    // Retrying logout after connectivity returns removes local credentials and clears the guard.
+    authState.signOutError = null;
+    fireEvent.click(
+      screen.getByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
+    );
+    await vi.waitFor(() => {
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+    expect(authState.signOut).toHaveBeenCalledTimes(2);
+    expect(freshAuthStore.isAuthResolved()).toBe(true);
+    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeEnabled();
+    reloadedView.unmount();
+
+    // A subsequent reload after local credentials were removed starts cleanly signed out.
+    vi.resetModules();
+    const [cleanAuthStore, cleanProviderMod, cleanAppMod] = await Promise.all([
+      import('@/lib/auth-store'),
+      import('@/auth/AuthProvider'),
+      import('@/App'),
+    ]);
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <cleanProviderMod.AuthProvider>
+          <cleanAppMod.AppRoutes />
+        </cleanProviderMod.AuthProvider>
+      </MemoryRouter>,
+    );
+    expect(
+      await screen.findByRole('heading', { name: 'تسجيل الدخول' }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(cleanAuthStore.getAuthSnapshot()).toMatchObject({
+      status: 'signed-out',
+      logoutFailed: false,
+    });
+    expect(cleanAuthStore.isAuthResolved()).toBe(true);
+  });
 });
 
 describe('login', () => {

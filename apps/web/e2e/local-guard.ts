@@ -4,7 +4,10 @@ import { join } from 'node:path';
 import { loadEnv } from 'vite';
 
 const localHosts = new Set(['127.0.0.1', 'localhost', '::1']);
-export const LOOPBACK_PROXY_BYPASS = '127.0.0.1,localhost,[::1]';
+// Disable Chromium's implicit bypass rules (which include link-local IPs like
+// 169.254.0.0/16 and [fe80::]/10) first with `<-loopback>`, then explicitly
+// allow only the intended loopback hosts.
+export const LOOPBACK_PROXY_BYPASS = '<-loopback>,127.0.0.1,localhost,[::1]';
 
 const webRoot = join(import.meta.dirname, '..');
 

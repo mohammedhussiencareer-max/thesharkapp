@@ -15,6 +15,7 @@ test('serves Arabic RTL manifest, registers shell-only service worker, and keeps
   page,
   context,
   supabaseUrl,
+  loopbackGuardProxy,
 }) => {
   assertLocalSupabaseUrl(supabaseUrl);
 
@@ -75,6 +76,7 @@ test('serves Arabic RTL manifest, registers shell-only service worker, and keeps
       first: { ok: boolean; status: number; hit: number };
       second: { ok: boolean; status: number; hit: number };
       remoteBlocked: boolean;
+      linkLocalBlocked: boolean;
     }>(`(async () => {
       const url = ${JSON.stringify(cacheControlCheckUrl)};
       const first = await fetch(url).then(async (res) => ({
@@ -90,11 +92,17 @@ test('serves Arabic RTL manifest, registers shell-only service worker, and keeps
       const remoteBlocked = await fetch('https://example.invalid/blocked-probe')
         .then(() => false)
         .catch(() => true);
+      const linkLocalBlocked = await fetch(
+        'https://169.254.0.1/blocked-link-local-probe',
+      )
+        .then(() => false)
+        .catch(() => true);
       return {
         controlled: navigator.serviceWorker?.controller !== null,
         first,
         second,
         remoteBlocked,
+        linkLocalBlocked,
       };
     })()`);
     expect(preSwCacheControl.controlled).toBe(false);
@@ -102,6 +110,14 @@ test('serves Arabic RTL manifest, registers shell-only service worker, and keeps
     expect(preSwCacheControl.second).toEqual({ ok: true, status: 200, hit: 1 });
     expect(cacheCheckHits).toBe(1);
     expect(preSwCacheControl.remoteBlocked).toBe(true);
+    expect(preSwCacheControl.linkLocalBlocked).toBe(true);
+    expect(loopbackGuardProxy).not.toBeNull();
+    expect(loopbackGuardProxy?.blockedRequests).toContain(
+      'CONNECT example.invalid:443',
+    );
+    expect(loopbackGuardProxy?.blockedRequests).toContain(
+      'CONNECT 169.254.0.1:443',
+    );
 
     const manifestResponse = await page.request.get('/manifest.webmanifest');
     expect(manifestResponse.status()).toBe(200);
