@@ -6,7 +6,7 @@ const shell =
   'mx-auto flex min-h-dvh max-w-lg flex-col gap-4 ps-4 pe-4 pt-8 text-start';
 
 export function RequireOwner({ children }: { children: ReactNode }) {
-  const { status, signOut, retry } = useAuth();
+  const { status, signOut, retry, logoutPending = false } = useAuth();
 
   if (status === 'loading' || status === 'checking') {
     return (
@@ -31,7 +31,11 @@ export function RequireOwner({ children }: { children: ReactNode }) {
     return (
       <main className={shell}>
         <h1 className="text-2xl font-semibold">الحساب ده مش مسموح له يدخل</h1>
-        <button type="button" onClick={() => void signOut()}>
+        <button
+          type="button"
+          disabled={logoutPending}
+          onClick={() => void signOut()}
+        >
           تسجيل الخروج
         </button>
       </main>

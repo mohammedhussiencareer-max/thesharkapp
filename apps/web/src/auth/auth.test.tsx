@@ -25,6 +25,7 @@ const authState = vi.hoisted(() => ({
   isOwner: false,
   rpcError: null as { message: string } | null,
   signInError: null as { message: string } | null,
+  signInThrow: null as Error | null,
   signInGate: null as Promise<{
     data: { user: null; session: null };
     error: { message: string } | null;
@@ -70,6 +71,9 @@ vi.mock('@/lib/supabase', () => ({
         };
       },
       signInWithPassword: () => {
+        if (authState.signInThrow) {
+          return Promise.reject(authState.signInThrow);
+        }
         if (authState.signInGate) return authState.signInGate;
         if (authState.signInError) {
           return Promise.resolve({
@@ -129,6 +133,7 @@ function resetMock() {
   authState.isOwner = false;
   authState.rpcError = null;
   authState.signInError = null;
+  authState.signInThrow = null;
   authState.signInGate = null;
   authState.holdRpc = false;
   authState.rpcHolds.splice(0, authState.rpcHolds.length);
@@ -412,6 +417,7 @@ describe('owner access', () => {
     expect(freshAuthStore.isAuthResolved()).toBe(true);
     expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeEnabled();
     reloadedView.unmount();
+    freshAuthStore.resetAuthStore({ clearStorage: false });
 
     // A subsequent reload after local credentials were removed starts cleanly signed out.
     vi.resetModules();
@@ -420,7 +426,7 @@ describe('owner access', () => {
       import('@/auth/AuthProvider'),
       import('@/App'),
     ]);
-    render(
+    const cleanView = render(
       <MemoryRouter initialEntries={['/']}>
         <cleanProviderMod.AuthProvider>
           <cleanAppMod.AppRoutes />
@@ -436,6 +442,8 @@ describe('owner access', () => {
       logoutFailed: false,
     });
     expect(cleanAuthStore.isAuthResolved()).toBe(true);
+    cleanView.unmount();
+    cleanAuthStore.resetAuthStore();
   });
 
   it('reconciles a failed logout in another tab when SIGNED_OUT arrives before marker removal', async () => {
@@ -733,5 +741,260 @@ describe('login', () => {
     expect(
       await screen.findByText('البريد أو كلمة السر غلط'),
     ).toBeInTheDocument();
+  });
+
+  it('P2-3: recovers from a QuotaExceededError thrown during signInWithPassword without permanently locking the submit button', async () => {
+    authState.signInThrow = new DOMException(
+      'QuotaExceededError',
+      'QuotaExceededError',
+    );
+    try {
+      renderApp('/login');
+      await screen.findByRole('heading', { name: 'تسجيل الدخول' });
+
+      fillForm();
+      fireEvent.submit(
+        screen.getByRole('button', { name: 'تسجيل الدخول' }).closest('form')!,
+      );
+
+      expect(
+        await screen.findByText('البريد أو كلمة السر غلط'),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole('button', { name: 'تسجيل الدخول' }),
+      ).toBeEnabled();
+    } finally {
+      authState.signInThrow = null;
+    }
+  });
+});
+
+describe('production GoTrueClient UI integration (hasDirectRevocationTransport === true)', () => {
+  it('P1-1 + P2-1 + P3-1: exercises LoginPage + AuthProvider against real GoTrueClient for reload-while-pending recovery, disabled sign-out button, and sibling pending banner', async () => {
+    const { createClient } = await import('@supabase/supabase-js');
+    const url = 'https://prod-ui-test.example.test';
+    const anonKey = 'anon-key-prod-ui';
+    const sdkKey = 'sb-prod-ui-test-auth-token';
+    const coordKey = `theshark:auth:logout-pending:v1:${encodeURIComponent(url)}`;
+
+    const makeJwt = (sid: string) => {
+      const enc = (o: Record<string, unknown>) =>
+        btoa(JSON.stringify(o))
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/g, '');
+      return `${enc({ alg: 'HS256', typ: 'JWT' })}.${enc({
+        sub: 'owner-ui',
+        session_id: sid,
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      })}.sig`;
+    };
+
+    const session1 = {
+      access_token: makeJwt('sid-ui-1'),
+      refresh_token: 'rt-ui-1',
+      token_type: 'bearer',
+      expires_in: 3600,
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      user: {
+        id: 'owner-ui',
+        email: 'owner-ui@theshark.test',
+        aud: 'authenticated',
+        app_metadata: {},
+        user_metadata: {},
+        created_at: '2026-01-01T00:00:00Z',
+      },
+    };
+    const session2 = {
+      ...session1,
+      access_token: makeJwt('sid-ui-2'),
+      refresh_token: 'rt-ui-2',
+    };
+
+    let logoutCallCount = 0;
+    const logoutControl: { release: ((r: Response) => void) | null } = {
+      release: null,
+    };
+    const prodFetch: typeof fetch = (input) => {
+      const href =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/logout')) {
+        logoutCallCount += 1;
+        return new Promise<Response>((resolve) => {
+          logoutControl.release = resolve;
+        });
+      }
+      if (href.includes('/auth/v1/token?grant_type=password')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(session2), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    const client = createClient(url, anonKey, {
+      auth: {
+        storage: window.localStorage,
+        storageKey: sdkKey,
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: false,
+      },
+      global: { fetch: prodFetch },
+    });
+
+    vi.resetModules();
+    vi.doMock('@/lib/supabase', () => ({
+      supabase: client,
+      readSupabaseEnv: () => ({ url, anonKey }),
+    }));
+
+    try {
+      window.localStorage.setItem(sdkKey, JSON.stringify(session1));
+
+      const [storeMod1, providerMod1, appMod1] = await Promise.all([
+        import('@/lib/auth-store'),
+        import('@/auth/AuthProvider'),
+        import('@/App'),
+      ]);
+
+      const view1 = render(
+        <MemoryRouter initialEntries={['/']}>
+          <providerMod1.AuthProvider>
+            <appMod1.AppRoutes />
+          </providerMod1.AuthProvider>
+        </MemoryRouter>,
+      );
+
+      expect(
+        await screen.findByText('owner-ui@theshark.test'),
+      ).toBeInTheDocument();
+
+      // Click sign-out -> writes pending, removes sdkKey, holds /logout in flight.
+      const signOutBtn = screen.getByRole('button', { name: 'تسجيل الخروج' });
+      fireEvent.click(signOutBtn);
+      await vi.waitFor(() => {
+        expect(logoutControl.release).not.toBeNull();
+      });
+      // P2-1: calling signOut again while in flight coalesces and does not fire a second /logout.
+      void storeMod1.signOut();
+      expect(logoutCallCount).toBe(1);
+      expect(storeMod1.getAuthSnapshot().logoutPending).toBe(true);
+      expect(window.localStorage.getItem(sdkKey)).toBeNull();
+      expect(
+        JSON.parse(window.localStorage.getItem(coordKey) ?? 'null'),
+      ).toMatchObject({ state: 'pending' });
+      view1.unmount();
+      storeMod1.resetAuthStore({ clearStorage: false });
+
+      // Simulate reload while coordKey is still state:'pending' (P1-1)!
+      vi.resetModules();
+      const clientReloaded = createClient(url, anonKey, {
+        auth: {
+          storage: window.localStorage,
+          storageKey: sdkKey,
+          persistSession: true,
+          autoRefreshToken: true,
+          detectSessionInUrl: false,
+        },
+        global: { fetch: prodFetch },
+      });
+      vi.doMock('@/lib/supabase', () => ({
+        supabase: clientReloaded,
+        readSupabaseEnv: () => ({ url, anonKey }),
+      }));
+
+      const [storeMod2, providerMod2, appMod2] = await Promise.all([
+        import('@/lib/auth-store'),
+        import('@/auth/AuthProvider'),
+        import('@/App'),
+      ]);
+
+      const view2 = render(
+        <MemoryRouter initialEntries={['/']}>
+          <providerMod2.AuthProvider>
+            <appMod2.AppRoutes />
+          </providerMod2.AuthProvider>
+        </MemoryRouter>,
+      );
+
+      // Should show amber revocation notice, NO red local failure banner, login form ENABLED!
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'تم تسجيل الخروج من هذا الجهاز، لكن تعذر تأكيد إنهاء الجلسة على الأجهزة الأخرى',
+      );
+      expect(
+        screen.queryByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
+      ).toBeNull();
+      const loginButton = screen.getByRole('button', { name: 'تسجيل الدخول' });
+      expect(loginButton).toBeEnabled();
+
+      // Owner signs in following the recovery prompt -> MUST succeed and land on owner home!
+      fireEvent.change(screen.getByLabelText('البريد'), {
+        target: { value: 'owner-ui@theshark.test' },
+      });
+      fireEvent.change(screen.getByLabelText('كلمة السر'), {
+        target: { value: 'ValidPassword123' },
+      });
+      fireEvent.submit(loginButton.closest('form')!);
+
+      expect(
+        await screen.findByText('owner-ui@theshark.test'),
+      ).toBeInTheDocument();
+
+      // P3-1: when another tab writes pending, sibling tab does NOT show red failure banner!
+      const pendingCoord = JSON.stringify({
+        attemptId: 99,
+        ownerTabId: 'other-tab',
+        state: 'pending',
+        sessionKey: 'sid:sid-ui-2',
+      });
+      window.localStorage.setItem(coordKey, pendingCoord);
+      act(() => {
+        window.dispatchEvent(
+          new StorageEvent('storage', {
+            key: coordKey,
+            oldValue: null,
+            newValue: pendingCoord,
+          }),
+        );
+      });
+      await vi.waitFor(() => {
+        expect(storeMod2.getAuthSnapshot().status).toBe('signed-out');
+      });
+      expect(storeMod2.getAuthSnapshot().logoutPending).toBe(true);
+      expect(storeMod2.getAuthSnapshot().logoutFailed).toBe(false);
+      expect(
+        screen.queryByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
+      ).toBeNull();
+      expect(
+        screen.getByRole('button', { name: 'تسجيل الدخول' }),
+      ).toBeDisabled();
+
+      view2.unmount();
+      await clientReloaded.auth.stopAutoRefresh();
+      storeMod2.resetAuthStore();
+    } finally {
+      logoutControl.release?.(new Response(null, { status: 204 }));
+      await client.auth.stopAutoRefresh();
+      window.localStorage.removeItem(sdkKey);
+      window.localStorage.removeItem(coordKey);
+      vi.doUnmock('@/lib/supabase');
+      vi.resetModules();
+    }
   });
 });

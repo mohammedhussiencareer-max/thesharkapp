@@ -29,13 +29,16 @@ export function LoginPage() {
     void (async () => {
       setSubmitting(true);
       setInvalid(false);
-      const result = await signIn(email, password);
-      setSubmitting(false);
-      if (result === 'invalid') {
-        setInvalid(true);
-        return;
+      try {
+        const result = await signIn(email, password);
+        if (result === 'invalid') {
+          setInvalid(true);
+          return;
+        }
+        void navigate('/');
+      } finally {
+        setSubmitting(false);
       }
-      void navigate('/');
     })();
   }
 

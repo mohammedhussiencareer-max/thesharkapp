@@ -27,8 +27,14 @@ import { NotFoundPage } from '@/pages/NotFoundPage';
 import { UpdateBanner } from '@/pwa/UpdateBanner';
 
 function HomeRoute() {
-  const { email, signOut } = useAuth();
-  return <HomePage email={email ?? ''} onSignOut={() => void signOut()} />;
+  const { email, signOut, logoutPending = false } = useAuth();
+  return (
+    <HomePage
+      email={email ?? ''}
+      logoutPending={logoutPending}
+      onSignOut={() => void signOut()}
+    />
+  );
 }
 
 export function AppRoutes() {

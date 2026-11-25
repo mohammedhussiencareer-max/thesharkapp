@@ -1594,7 +1594,11 @@ describe('held-writes store', () => {
       expect(getAuthSnapshot().status).toBe('signed-out');
 
       // Once logout cleanly finished, a subsequent fresh sign-in works again.
-      emitAuth('SIGNED_IN', { ...sessionA });
+      emitAuth('SIGNED_IN', {
+        ...sessionA,
+        access_token: 'tok-a-fresh-signin',
+        refresh_token: 'rt-a-fresh-signin',
+      });
       await vi.waitFor(() => {
         expect(getAuthSnapshot().status).toBe('owner');
       });
@@ -1721,7 +1725,11 @@ describe('held-writes store', () => {
       expect(offlineReloadPwa.isPwaLogoutPending()).toBe(false);
 
       // After local credentials were removed, a fresh reload accepts a new sign-in.
-      authMock.session = sessionA;
+      authMock.session = {
+        ...sessionA,
+        access_token: 'tok-a-reload-fresh',
+        refresh_token: 'rt-a-reload-fresh',
+      };
       vi.resetModules();
       const postCleanAuth = await import('@/lib/auth-store');
       postCleanAuth.startAuth();
