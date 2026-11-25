@@ -19,7 +19,7 @@
 // The sort-traversal case holds the suffix and open deficits fixed while a
 // frozen mixed/size sort history grows (35-day, 1-year, 2-year, at least one
 // sort per day, all behind certified cuts). The measured call is a backdated
-// record_purchase on one item inside that suffix. Its gate is the whole RPC
+// record_purchase on the mixed item inside that suffix and an unrelated new item. Its gate is the whole RPC
 // shared hit+read pages below SHARED_HIT_READ_LIMIT and 2 seconds. Those
 // buffers must stay flat as the frozen sort history grows.
 
@@ -34,6 +34,8 @@ const owner = 'b9e00000-0000-4000-8000-0000000000a1';
 // (the 2-year large share was 2136 including dirtied and written) and below
 // a sequence scan of a multi-year deficit table.
 const SHARED_HIT_READ_LIMIT = 5000;
+const RESUME_REFUSAL =
+  '--resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun.';
 
 // Cairo midnight of the run, captured once. History ends yesterday. The
 // measured order and the aged-deficit purchase are today.
@@ -683,10 +685,10 @@ select '${history.name} late order queued';
 `;
 }
 
-function measurementFixturesCommittedSql(history) {
+function measurementFixturesCommitted(history) {
   const late = `${history.prefix}-late`;
   return `
-select exists (
+exists (
   select 1
   from app.stock_items item
   where item.id in (
@@ -707,42 +709,28 @@ or exists (
       where input.order_id = o.id
         and application.receipt_kind = 'posting'
     )
-) as started;
+)
 `;
 }
 
+function measurementFixturesCommittedSql(history) {
+  return `select ${measurementFixturesCommitted(history)} as started;`;
+}
+
 function resumeGuardSql(history) {
-  const late = `${history.prefix}-late`;
   return `
 do $$
 begin
-  if exists (
-    select 1
-    from app.stock_items item
-    where item.id in (
-      md5('bench-sel-${history.prefix}')::uuid,
-      md5('bench-large-${history.prefix}')::uuid,
-      md5('bench-fill-${history.prefix}')::uuid
-    )
-  )
-  or exists (
-    select 1
-    from app.pos_orders o
-    where (o.id = '${late}' or o.id like '${late}-%')
-      and exists (
-        select 1
-        from app.pos_cost_inputs input
-        join app.order_cost_applications application
-          on application.cost_input_id = input.id
-        where input.order_id = o.id
-          and application.receipt_kind = 'posting'
-      )
-  ) then
-    raise exception '--resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun.';
+  if ${measurementFixturesCommitted(history)} then
+    raise exception '${RESUME_REFUSAL}';
   end if;
 end
 $$;
 `;
+}
+
+function sortNewItem(history) {
+  return `md5('sort-new|${history.prefix}')::uuid`;
 }
 
 function sortAt(anchor, days, dayIndex) {
@@ -765,7 +753,8 @@ select set_config(
 insert into app.stock_items (id, name, kind, base_unit, count_frequency, parent_item_id)
 values
   ('${history.mixed}', 'bench ${history.name} mixed', 'fish_mixed', 'kg', 'daily', null),
-  ('${history.size}', 'bench ${history.name} size', 'fish_size', 'kg', 'daily', '${history.mixed}');
+  ('${history.size}', 'bench ${history.name} size', 'fish_size', 'kg', 'daily', '${history.mixed}'),
+  (${sortNewItem(history)}, 'bench ${history.name} unrelated new', 'seafood', 'kg', 'daily', null);
 select app.set_item_loss(
   md5('loss|${history.prefix}')::uuid,
   '${history.mixed}',
@@ -889,6 +878,8 @@ declare
   v_deficits bigint;
   v_pass boolean;
   v_cut timestamptz;
+  v_cut_id bigint;
+  v_suffix_id bigint;
   v_last_sort timestamptz;
 begin
   select count(*)
@@ -914,18 +905,55 @@ begin
   into v_deficits
   from app.replay_checkpoint_deficits;
 
-  select checkpoint.cut_occurred_at
-  into v_cut
-  from app.replay_checkpoints checkpoint
-  where checkpoint.item_id = '${history.mixed}'
-    and not exists (
-      select 1
-      from app.replay_checkpoint_invalidations invalidation
-      where invalidation.checkpoint_id = checkpoint.id
-    )
-    and checkpoint.cut_occurred_at < timestamptz '${anchor}' + interval '13 hours'
-  order by checkpoint.cut_occurred_at desc, checkpoint.id desc
-  limit 1;
+  select line.movement_id
+  into v_suffix_id
+  from app.purchases purchase
+  join app.purchase_lines line on line.purchase_id = purchase.id
+  join app.stock_movements movement on movement.id = line.movement_id
+  where purchase.request_id = '${history.suffixPurchaseRequest}'
+    and movement.item_id = '${history.mixed}'
+    and movement.movement_type = 'purchase'
+    and movement.occurred_at = timestamptz '${anchor}' + interval '14 hours';
+
+  if v_suffix_id is null or v_suffix <> 1 then
+    raise exception 'required committed sort suffix fixture is missing or incomplete. Run pnpm db:reset and retry.';
+  end if;
+
+  -- Warm this fresh backend's relcache, syscache, and PL/pgSQL plans inside a
+  -- rolled-back subtransaction before timing the RPC. Cold psql backends pay
+  -- ~3,600-4,000 one-time pg_catalog compilation hits that can push the count
+  -- over SHARED_HIT_READ_LIMIT. replay_plan_shared_buffers counts shared hit
+  -- and read equally, so warming the session does not weaken the buffer gate.
+  begin
+    perform app.record_purchase(pg_catalog.jsonb_build_object(
+      'purchased_at', to_char(
+        (timestamptz '${anchor}' + interval '13 hours') at time zone 'UTC',
+        'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+      ),
+      'request_id', pg_catalog.gen_random_uuid()::text,
+      'lines', pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+        'item_id', '${history.mixed}',
+        'quantity', '1',
+        'unit', 'kg',
+        'amount_paid', '10.00',
+        'expected_base_unit', 'kg',
+        'expected_factor', '1'
+      ), pg_catalog.jsonb_build_object(
+        'item_id', ${sortNewItem(history)},
+        'quantity', '1',
+        'unit', 'kg',
+        'amount_paid', '10.00',
+        'expected_base_unit', 'kg',
+        'expected_factor', '1'
+      ))
+    ));
+    raise exception 'sort_measure_warmup' using errcode = 'P0001';
+  exception
+    when sqlstate 'P0001' then
+      if sqlerrm <> 'sort_measure_warmup' then
+        raise;
+      end if;
+  end;
 
   perform set_config('statement_timeout', '6s', true);
   v_t0 := pg_catalog.clock_timestamp();
@@ -945,6 +973,13 @@ begin
           'amount_paid', '10.00',
           'expected_base_unit', 'kg',
           'expected_factor', '1'
+        ), pg_catalog.jsonb_build_object(
+          'item_id', ${sortNewItem(history)},
+          'quantity', '1',
+          'unit', 'kg',
+          'amount_paid', '10.00',
+          'expected_base_unit', 'kg',
+          'expected_factor', '1'
         ))
       ))
     $ex$
@@ -956,12 +991,35 @@ begin
 
   v_buffers := app.replay_plan_shared_buffers(v_plan);
   v_seconds := round(extract(epoch from (v_t1 - v_t0))::numeric, 3);
-  v_resumed := v_cut is not null
-    and v_last_sort is not null
+  -- The confirming replay leaves its selected cut and loaded suffix in
+  -- scratch. Inspect them after the timed call without enabling probes.
+  select resume.checkpoint_id, resume.cut_occurred_at
+  into v_cut_id, v_cut
+  from ledger_scratch.replay_resume resume
+  where resume.item_id = '${history.mixed}';
+
+  v_resumed := v_cut_id is not null
     and v_cut >= v_last_sort
-    and v_sorts = ${history.days};
+    and v_cut < timestamptz '${anchor}' + interval '13 hours'
+    and exists (
+      select 1 from ledger_scratch.replay_resume resume
+      where resume.item_id = '${history.size}'
+        and resume.checkpoint_id is not null
+        and resume.cut_occurred_at >= v_last_sort
+        and resume.cut_occurred_at < timestamptz '${anchor}' + interval '13 hours'
+    )
+    and exists (
+      select 1 from ledger_scratch.recompute_row row
+      where row.movement_id = v_suffix_id and not row.is_pending
+    )
+    and exists (
+      select 1 from ledger_scratch.replay_resume resume
+      where resume.item_id = ${sortNewItem(history)} and resume.checkpoint_id is null
+    );
 
   v_pass := v_resumed
+    and v_suffix_id is not null
+    and v_suffix = 1
     and coalesce(v_buffers, 0) > 0
     and coalesce(v_buffers, 0) < ${SHARED_HIT_READ_LIMIT}
     and v_seconds <= 2
@@ -976,6 +1034,8 @@ begin
     'suffix_movements', v_suffix,
     'open_deficits', v_deficits,
     'resumed', v_resumed,
+    'checkpoint_id', v_cut_id,
+    'cut_occurred_at', v_cut,
     'buffer_limit', ${SHARED_HIT_READ_LIMIT},
     'buffers', coalesce(v_buffers, 0),
     'seconds', v_seconds,
@@ -1602,6 +1662,12 @@ function formatSortResult(row) {
     `- suffix movements: ${row.suffix_movements}`,
     `- open deficits: ${row.open_deficits}`,
     `- resumed from checkpoint: ${row.resumed}`,
+    ...(row.checkpoint_id == null
+      ? []
+      : [
+          `- checkpoint ID: ${row.checkpoint_id}`,
+          `- checkpoint cut: ${row.cut_occurred_at}`,
+        ]),
     `- shared hit+read limit: ${row.buffer_limit ?? SHARED_HIT_READ_LIMIT}`,
     `- rpc buffers: ${row.buffers}`,
     `- rpc seconds: ${row.seconds}`,
@@ -1711,6 +1777,8 @@ function existingResultRows() {
           suffix_movements: Number(value('suffix movements')),
           open_deficits: Number(value('open deficits')),
           resumed: value('resumed from checkpoint') === 'true',
+          checkpoint_id: maybeNumber('checkpoint ID'),
+          cut_occurred_at: value('checkpoint cut'),
           buffer_limit: maybeNumber('shared hit+read limit'),
           buffers: Number(value('rpc buffers')),
           seconds,
@@ -1825,7 +1893,7 @@ function writeResults(rows, note) {
   const body = [
     '# Accounting history benchmark',
     '',
-    'Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. Every measured call must resume from a checkpoint. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), shared hit plus read pages below 5000, and a frozen prefix that is not walked. The measured order suffix arms must be index scans on their own. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk. --resume is supported only before measurement starts; a committed measurement needs `pnpm db:reset` and a rerun. The sort-traversal case holds suffix and open deficits fixed while a frozen mixed/size sort history grows (35-day, 1-year, 2-year, at least one sort per day). Its gate is the whole RPC shared hit plus read pages below 5000 and 2 seconds, and those buffers must stay flat as the frozen history grows.',
+    'Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. Every measured call must resume from a checkpoint. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), shared hit plus read pages below 5000, and a frozen prefix that is not walked. The measured order suffix arms must be index scans on their own. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk. --resume is supported only before measurement starts; a committed measurement needs `pnpm db:reset` and a rerun. The sort-traversal case holds suffix and open deficits fixed while a frozen mixed/size sort history grows (35-day, 1-year, 2-year, at least one sort per day). Its gate is the whole RPC shared hit plus read pages below 5000 and 2 seconds, and the 2-year case may use at most 10% more buffers than the 35-day case.',
     '',
     ...merged.map((row) =>
       row.error
@@ -1938,40 +2006,29 @@ async function sortCatalogReady(history) {
   }
 }
 
-async function sortMeasured(history) {
-  try {
-    const result = await psqlCaptured(
-      `select count(*)::text from app.purchases where request_id = '${history.purchaseRequest}';`,
-    );
-    return firstInteger(result.out) > 0;
-  } catch {
-    return false;
-  }
+function sortGrowthFailed(rows) {
+  const first = rows.find((row) => row.name === '35-day sorts');
+  const last = rows.find((row) => row.name === '2-year sorts');
+  return (
+    Number.isFinite(first?.buffers) &&
+    Number.isFinite(last?.buffers) &&
+    last.buffers * 10 > first.buffers * 11
+  );
 }
 
 function sortBuffersNote(rows) {
-  const names = ['35-day sorts', '1-year sorts', '2-year sorts'];
-  const sorts = names
-    .map((name) => rows.find((row) => row.name === name))
-    .filter(Boolean);
+  const sorts = rows.filter(
+    (row) => row.kind === 'sort-traversal' && Number.isFinite(row.buffers),
+  );
   if (sorts.length === 0) return '';
   const numbers = sorts
     .map((row) => `${row.name} ${row.buffers} buffers / ${row.seconds}s`)
     .join('; ');
-  if (sorts.length < 2) {
+  if (sorts.length !== sortHistories.length)
     return `Sort-traversal RPC: ${numbers}.`;
-  }
-  const first = sorts[0].buffers;
-  const grew = sorts.some(
-    (row) =>
-      Number.isFinite(row.buffers) &&
-      Number.isFinite(first) &&
-      row.buffers > first + 50 &&
-      row.buffers > first * 1.25,
-  );
-  return grew
-    ? `Sort-traversal RPC buffers grew with frozen history: ${numbers}. Production was not changed.`
-    : `Sort-traversal RPC buffers stayed flat: ${numbers}.`;
+  return sortGrowthFailed(rows)
+    ? `Sort-traversal RPC buffers grew by more than 10%: ${numbers}.`
+    : `Sort-traversal RPC buffers stayed flat within 10%: ${numbers}.`;
 }
 
 async function run() {
@@ -1984,6 +2041,19 @@ async function run() {
   const skipBuild = process.argv.includes('--skip-build') ? startName : null;
   const resume = process.argv.includes('--resume');
   const sortOnly = process.argv.includes('--sort-only');
+  // Check all applicable committed measurements before setup, fixture builds,
+  // and either the order or sort measurement path.
+  if (resume && !sortOnly) {
+    await psqlCaptured(histories.map(resumeGuardSql).join('\n'));
+  }
+  const sortRequests = sortHistories
+    .map((history) => `'${history.purchaseRequest}'`)
+    .join(', ');
+  const sortCommitted = await psqlCaptured(
+    `select count(*) from app.purchases where request_id in (${sortRequests});`,
+  );
+  if (firstInteger(sortCommitted.out) > 0) throw new Error(RESUME_REFUSAL);
+
   let started = startName === null;
   const anchorResult = await psqlCaptured(
     `select to_char((date_trunc('day', pg_catalog.clock_timestamp() at time zone 'Africa/Cairo') at time zone 'Africa/Cairo'), 'YYYY-MM-DD HH24:MI:SSOF');`,
@@ -2003,10 +2073,6 @@ async function run() {
     try {
       const haveCatalog = await sortCatalogReady(history);
       if (!haveCatalog) await psqlCaptured(sortBuildSql(history, anchor));
-      if (await sortMeasured(history)) {
-        process.stderr.write(`skip ${history.name}: already measured\n`);
-        continue;
-      }
       const measured = await psqlCaptured(sortMeasureSql(history, anchor));
       const row = parseMeasure(measured.err);
       if (!row) {
@@ -2031,17 +2097,13 @@ async function run() {
       process.stderr.write(`${history.name} failed: ${error.message}\n`);
     }
   }
+  if (sortGrowthFailed(rows)) {
+    sortFailed = true;
+    process.stderr.write(`${sortBuffersNote(rows)}\n`);
+  }
   if (sortOnly) {
     const sortNote = sortBuffersNote(rows);
-    writeResults(
-      rows,
-      [
-        '--resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun.',
-        sortNote,
-      ]
-        .filter(Boolean)
-        .join(' '),
-    );
+    writeResults(rows, [RESUME_REFUSAL, sortNote].filter(Boolean).join(' '));
     if (sortFailed) process.exitCode = 1;
     return;
   }
@@ -2072,7 +2134,6 @@ async function run() {
             }),
           );
         }
-        if (resume) await psqlCaptured(resumeGuardSql(history));
         await psqlCaptured(lateSql(history, anchor));
       }
       const measured = await psqlCaptured(measureSql(history, anchor));
@@ -2110,8 +2171,10 @@ async function run() {
   }
   const sortNote = sortBuffersNote(rows);
   const closing = [
-    'The 35-day, 1-year, and 2-year histories passed the gate.',
-    '--resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun.',
+    sortFailed
+      ? 'Sort-traversal gate failed.'
+      : 'The 35-day, 1-year, and 2-year histories passed the gate.',
+    RESUME_REFUSAL,
     sortNote,
   ]
     .filter(Boolean)
@@ -2136,4 +2199,9 @@ export {
   lateSql,
   resumeGuardSql,
   measurementFixturesCommittedSql,
+  sortHistories,
+  sortBuildSql,
+  sortMeasureSql,
+  sortBuffersNote,
+  sortGrowthFailed,
 };

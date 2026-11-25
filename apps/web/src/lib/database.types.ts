@@ -2434,11 +2434,6 @@ isOneToOne: true
 "closed_allocation":
 { Args: { "p_affected_qty": number,"p_change": string,"p_doc_at": string,"p_document_id": number,"p_item_id": string,"p_qty_delta": number,"p_value_delta": number }; Returns: Json
                            },
-"closed_as_of_state":
-{ Args: { "p_item_id": string }; Returns: {
-              "avg_cost": number,"has_uncovered_deficit": boolean,"on_hand_qty": number,"on_hand_value": number
-            }[]
-                           },
 "closed_bucket_weights":
 { Args: { "p_change": string,"p_doc_at": string,"p_item_id": string }; Returns: (number)[]
                            },
@@ -2453,6 +2448,11 @@ isOneToOne: true
                            },
 "closed_required_value":
 { Args: { "p_recognized_amount": number,"p_recognized_qty": number,"p_required_qty": number,"p_unit": number }; Returns: number
+                           },
+"closed_sort_state":
+{ Args: { "p_at": string,"p_item_id": string }; Returns: {
+              "has_uncovered_deficit": boolean,"on_hand_qty": number,"on_hand_value": number
+            }[]
                            },
 "closed_unit_cost":
 { Args: { "p_item_id": string }; Returns: number
@@ -2478,7 +2478,15 @@ isOneToOne: true
 "cover_profit_bucket":
 { Args: { "p_movement_id": number }; Returns: string
                            } |
-{ Args: { "p_as_of": string,"p_movement_id": number }; Returns: string
+{ Args: { "p_as_of": string,"p_event_position"?: number,"p_movement_id": number }; Returns: string
+                           },
+"cover_transfer_value":
+{ Args: { "p_at": string,"p_bucket": string,"p_item_id": string,"p_order_id": string,"p_transfer_id": number }; Returns: number
+                           },
+"cover_transfers":
+{ Args: { "p_movement_id": number }; Returns: {
+              "from_bucket": string,"occurred_at": string,"order_id": string,"piece_position": number,"to_bucket": string,"transfer_id": number
+            }[]
                            },
 "coverage_dependency_items":
 { Args: { "p_provenance": Json }; Returns: string[]

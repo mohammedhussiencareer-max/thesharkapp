@@ -1,6 +1,6 @@
 # Accounting history benchmark
 
-Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. Every measured call must resume from a checkpoint. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), shared hit plus read pages below 5000, and a frozen prefix that is not walked. The measured order suffix arms must be index scans on their own. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk. --resume is supported only before measurement starts; a committed measurement needs `pnpm db:reset` and a rerun. The sort-traversal case holds suffix and open deficits fixed while a frozen mixed/size sort history grows (35-day, 1-year, 2-year, at least one sort per day). Its gate is the whole RPC shared hit plus read pages below 5000 and 2 seconds, and those buffers must stay flat as the frozen history grows.
+Synthetic catalog. Each history ends yesterday: past orders are frozen activation inputs and post on their own day. The measured order is a new order today, timed by a top-level statement after the session statement timeout is set to 6 seconds. Its probe is read before any later restore. A selective restore and a large-share restore are timed on their own, and each keeps the plan and buffers of the restore insert that ran inside that call. Every measured call must resume from a checkpoint. A sequence scan of about half the deficit table is accepted. The restore gate is latency (2 seconds soft, 6 seconds hard), shared hit plus read pages below 5000, and a frozen prefix that is not walked. The measured order suffix arms must be index scans on their own. The aged cover is record_purchase, the production purchase RPC. Daily fish counts and weekly counts are anchors. Checkpoints are published by the confirming walk. --resume is supported only before measurement starts; a committed measurement needs `pnpm db:reset` and a rerun. The sort-traversal case holds suffix and open deficits fixed while a frozen mixed/size sort history grows (35-day, 1-year, 2-year, at least one sort per day). Its gate is the whole RPC shared hit plus read pages below 5000 and 2 seconds, and the 2-year case may use at most 10% more buffers than the 35-day case.
 
 ## 35-day
 
@@ -11,20 +11,20 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 35
 - weekly anchors: 5
 - events plus anchors: 3538
-- queue depth 1 ms: 0.476
-- queue depth 50000 ms: 0.526
+- queue depth 1 ms: 0.697
+- queue depth 50000 ms: 0.5
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 14.919
+- confirming replay ms: 17.304
 - prefix rows: 0
 - resumed from checkpoint: true
 - shared hit+read limit: 5000
 - fresh buffers: 3
-- selective restore seconds: 0.01
+- selective restore seconds: 0.009
 - selective restore crossed 2s: false
 - selective prefix rows: 0
 - selective deficit rows: 1
@@ -43,9 +43,9 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.064
+- wall clock seconds: 0.066
 - crossed 2s: false
-- aged cover seconds: 0.018
+- aged cover seconds: 0.021
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1
@@ -63,26 +63,26 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 365
 - weekly anchors: 52
 - events plus anchors: 36868
-- queue depth 1 ms: 5.792
-- queue depth 50000 ms: 5.794
+- queue depth 1 ms: 5.659
+- queue depth 50000 ms: 6.354
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 29.761
+- confirming replay ms: 27.809
 - prefix rows: 0
 - resumed from checkpoint: true
 - shared hit+read limit: 5000
 - fresh buffers: 4
-- selective restore seconds: 0.01
+- selective restore seconds: 0.011
 - selective restore crossed 2s: false
 - selective prefix rows: 0
 - selective deficit rows: 1
 - selective buffers: 10
 - selective resumed: true
-- large-share restore seconds: 0.022
+- large-share restore seconds: 0.024
 - large-share restore crossed 2s: false
 - large-share prefix rows: 0
 - large-share deficit rows: 404
@@ -95,9 +95,9 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.108
+- wall clock seconds: 0.091
 - crossed 2s: false
-- aged cover seconds: 0.029
+- aged cover seconds: 0.033
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1
@@ -115,15 +115,15 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 730
 - weekly anchors: 104
 - events plus anchors: 73733
-- queue depth 1 ms: 12.781
-- queue depth 50000 ms: 11.488
+- queue depth 1 ms: 11.753
+- queue depth 50000 ms: 11.213
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 135.016
+- confirming replay ms: 107.426
 - prefix rows: 0
 - resumed from checkpoint: true
 - shared hit+read limit: 5000
@@ -134,7 +134,7 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - selective deficit rows: 1
 - selective buffers: 10
 - selective resumed: true
-- large-share restore seconds: 0.027
+- large-share restore seconds: 0.026
 - large-share restore crossed 2s: false
 - large-share prefix rows: 0
 - large-share deficit rows: 810
@@ -147,9 +147,9 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.326
+- wall clock seconds: 0.275
 - crossed 2s: false
-- aged cover seconds: 0.088
+- aged cover seconds: 0.084
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1
@@ -165,9 +165,11 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - suffix movements: 1
 - open deficits: 3
 - resumed from checkpoint: true
+- checkpoint ID: 4
+- checkpoint cut: 2026-11-23T10:00:00+00:00
 - shared hit+read limit: 5000
-- rpc buffers: 4583
-- rpc seconds: 0.027
+- rpc buffers: 1319
+- rpc seconds: 0.015
 - crossed 2s: false
 - gate: PASS
 
@@ -178,9 +180,11 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - suffix movements: 1
 - open deficits: 3
 - resumed from checkpoint: true
+- checkpoint ID: 10
+- checkpoint cut: 2026-11-23T10:00:00+00:00
 - shared hit+read limit: 5000
-- rpc buffers: 4413
-- rpc seconds: 0.027
+- rpc buffers: 1167
+- rpc seconds: 0.014
 - crossed 2s: false
 - gate: PASS
 
@@ -191,10 +195,12 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - suffix movements: 1
 - open deficits: 3
 - resumed from checkpoint: true
+- checkpoint ID: 16
+- checkpoint cut: 2026-11-23T10:00:00+00:00
 - shared hit+read limit: 5000
-- rpc buffers: 4473
-- rpc seconds: 0.031
+- rpc buffers: 1203
+- rpc seconds: 0.013
 - crossed 2s: false
 - gate: PASS
 
-The 35-day, 1-year, and 2-year histories passed the gate. --resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun. Sort-traversal RPC buffers stayed flat: 35-day sorts 4583 buffers / 0.027s; 1-year sorts 4413 buffers / 0.027s; 2-year sorts 4473 buffers / 0.031s.
+The 35-day, 1-year, and 2-year histories passed the gate. --resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun. Sort-traversal RPC buffers stayed flat within 10%: 35-day sorts 1319 buffers / 0.015s; 1-year sorts 1167 buffers / 0.014s; 2-year sorts 1203 buffers / 0.013s.

@@ -159,6 +159,10 @@ add constraint stock_count_lines_movement_chk check (
 
 comment on table app.stock_count_lines is 'Append-only lines of a stock count, in payload order. delta_qty is actual minus expected. movement_id is null when the delta is zero, and when a pre-window observation posts its variance as a closed_period row instead of a count_adjustment.';
 
+create index stock_count_lines_movement_id_idx on app.stock_count_lines (movement_id)
+where
+  movement_id is not null;
+
 alter table app.stock_count_anchors
 add column economic boolean not null default true;
 
@@ -370,6 +374,8 @@ create table app.closed_period_sources (
 comment on table app.closed_period_sources is 'Where a closed_period row came from. Waste rows are not inserted into waste_line_movements. waste_chain_id is the predecessor root so two corrections of one document stay together.';
 
 create index closed_period_sources_cause_idx on app.closed_period_sources (closed_cause_id);
+
+create index closed_period_sources_source_idx on app.closed_period_sources (source_kind, source_id, movement_id);
 
 create table app.recognized_contribution (
   source_kind text not null,
@@ -1359,18 +1365,32 @@ set
       '{}'::uuid[]
     )
   from
-    app.stock_items seed
-    join app.stock_items family on family.id <> seed.id
-    and (
-      family.id = seed.parent_item_id
-      or family.parent_item_id = seed.id
-      or (
-        seed.parent_item_id is not null
-        and family.parent_item_id = seed.parent_item_id
-      )
-    )
-  where
-    seed.id = p_item_id;
+    (
+      select
+        seed.parent_item_id as id
+      from
+        app.stock_items seed
+      where
+        seed.id = p_item_id
+        and seed.parent_item_id is not null
+      union
+      select
+        child.id
+      from
+        app.stock_items child
+      where
+        child.parent_item_id = p_item_id
+      union
+      select
+        sibling.id
+      from
+        app.stock_items seed
+        join app.stock_items sibling on sibling.parent_item_id = seed.parent_item_id
+      where
+        seed.id = p_item_id
+        and seed.parent_item_id is not null
+        and sibling.id <> seed.id
+    ) family;
 $$;
 
 comment on function app.sort_family_ids (uuid) is 'Mixed parent and size siblings of one fish item. Posted sorts stay inside this family.';
@@ -1387,6 +1407,8 @@ from
 create function app.replay_sort_after_key (p_item_id uuid) returns table (after_at timestamptz, after_id bigint) language plpgsql volatile security definer
 set
   search_path = '' as $$
+declare
+  v_family uuid[] := app.sort_family_ids (p_item_id);
 begin
   if not exists (
     select
@@ -1394,7 +1416,7 @@ begin
     from
       ledger_scratch.replay_resume other
     where
-      other.item_id <> p_item_id
+      other.item_id = any (v_family)
   ) then
     after_at := 'infinity'::timestamptz;
     after_id := 0;
@@ -1408,7 +1430,7 @@ begin
     from
       ledger_scratch.replay_resume other
     where
-      other.item_id <> p_item_id
+      other.item_id = any (v_family)
       and other.checkpoint_id is null
   ) then
     after_at := null;
@@ -1426,7 +1448,7 @@ begin
   from
     ledger_scratch.replay_resume other
   where
-    other.item_id <> p_item_id
+    other.item_id = any (v_family)
     and other.checkpoint_id is not null
   order by
     other.cut_occurred_at,
@@ -1469,7 +1491,7 @@ begin
   from
     ledger_scratch.replay_resume other
   where
-    other.item_id <> p_item_id;
+    other.item_id = any (app.sort_family_ids (p_item_id));
 
   if coalesce(pg_catalog.cardinality(v_partners), 0) = 0 then
     return false;
@@ -1521,6 +1543,7 @@ create function app.replay_untracked_sort_siblings (p_item_id uuid, p_cut_at tim
 set
   search_path = '' as $$
 declare
+  v_family uuid[] := app.sort_family_ids (p_item_id);
   v_missing uuid[];
   v_after_at timestamptz;
   v_found uuid[];
@@ -1533,7 +1556,7 @@ begin
     )
   into v_missing
   from
-    pg_catalog.unnest(app.sort_family_ids (p_item_id)) as family (item_id)
+    pg_catalog.unnest(v_family) as family (item_id)
   where
     not exists (
       select
@@ -1581,7 +1604,7 @@ begin
       from
         ledger_scratch.replay_resume other
       where
-        other.item_id <> p_item_id
+        other.item_id = any (v_family)
         and (
           other.checkpoint_id is null
           or edge.occurred_at > other.cut_occurred_at
@@ -1609,6 +1632,7 @@ declare
   v_cut_at timestamptz;
   v_cut_id bigint;
   v_targets uuid[];
+  v_member_targets uuid[];
   v_found uuid[] := '{}'::uuid[];
   v_add uuid[];
 begin
@@ -1640,6 +1664,21 @@ begin
     where
       t.item_id is not null
   loop
+    select
+      coalesce(
+        pg_catalog.array_agg(distinct t.item_id),
+        '{}'::uuid[]
+      )
+    into v_member_targets
+    from
+      pg_catalog.unnest(v_targets) as t (item_id)
+    where
+      t.item_id = any (app.sort_family_ids (v_member));
+
+    if coalesce(pg_catalog.cardinality(v_member_targets), 0) = 0 then
+      continue;
+    end if;
+
     v_cut_at := null;
     v_cut_id := null;
 
@@ -1680,7 +1719,7 @@ begin
         v_cut_id,
         null::timestamptz,
         null::bigint,
-        v_targets
+        v_member_targets
       ) edge
     where
       edge.sibling_id <> all (p_members);
@@ -1974,6 +2013,7 @@ declare
   v_item uuid;
   v_pending_min timestamptz;
   v_order_at timestamptz;
+  v_before_sort_at timestamptz;
   v_frozen boolean;
   v_checkpoint record;
   v_suffix_min timestamptz;
@@ -1996,6 +2036,11 @@ begin
   and coalesce(pg_catalog.current_setting('app.replay_order_at', true), '') <> '' then
     v_order_at := pg_catalog.current_setting('app.replay_order_at', true)::timestamptz;
   end if;
+
+  v_before_sort_at := nullif(
+    coalesce(pg_catalog.current_setting('app.replay_before_sort_at', true), ''),
+    ''
+  )::timestamptz;
 
   if p_pending is null
   or pg_catalog.jsonb_typeof(p_pending) <> 'array'
@@ -2106,6 +2151,7 @@ begin
         app.replay_checkpoints checkpoint
       where
         checkpoint.item_id = v_item
+        and (v_before_sort_at is null or checkpoint.cut_occurred_at < v_before_sort_at)
         and not exists (
           select
             1
@@ -2311,7 +2357,8 @@ begin
         1
       from
         ledger_scratch.replay_resume a
-        join ledger_scratch.replay_resume b on b.item_id <> a.item_id
+        join ledger_scratch.replay_resume b
+          on b.item_id = any (app.sort_family_ids (a.item_id))
       where
         a.checkpoint_id is not null
         and (
@@ -2368,6 +2415,7 @@ begin
           app.replay_checkpoints checkpoint
         where
           checkpoint.item_id = v_item
+          and (v_before_sort_at is null or checkpoint.cut_occurred_at < v_before_sort_at)
           and not exists (
             select
               1
@@ -2849,124 +2897,171 @@ from
   authenticated,
   service_role;
 
-create function app.cover_profit_bucket (p_movement_id bigint, p_as_of timestamptz) returns text language plpgsql stable security definer
+-- The FROM leg owns the event. The original TO leg references that event
+-- with the next piece position. Later compensation keeps the event position
+-- and uses later piece positions, regardless of the direction of its delta.
+create function app.cover_transfers (p_movement_id bigint) returns table (
+  transfer_id bigint,
+  occurred_at timestamptz,
+  piece_position integer,
+  from_bucket text,
+  to_bucket text,
+  order_id text
+) language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    first_leg.id,
+    first_leg.occurred_at,
+    first_leg.piece_position,
+    first_leg.closed_bucket,
+    second_leg.closed_bucket,
+    source.source_id
+  from
+    app.stock_movements deficit
+    join app.closed_period_sources source on source.source_kind = 'order'
+    join app.stock_movements first_leg on first_leg.id = source.movement_id
+    join app.closed_period_sources companion
+      on companion.closed_cause_id = source.closed_cause_id
+      and companion.source_kind = source.source_kind
+      and companion.source_id = source.source_id
+    join app.stock_movements second_leg on second_leg.id = companion.movement_id
+  where
+    deficit.id = p_movement_id
+    and (
+      exists (
+        select 1
+        from app.order_cost_movement_links link
+        where link.movement_id = deficit.id and link.order_id = source.source_id
+      )
+      or exists (
+        select 1
+        from app.closed_period_sources origin
+        where origin.movement_id = deficit.id
+          and origin.source_kind = source.source_kind
+          and origin.source_id = source.source_id
+      )
+    )
+    and first_leg.item_id = deficit.item_id
+    and first_leg.quantity = 0
+    and first_leg.event_position is null
+    and first_leg.cover_inflow_movement_id is null
+    and second_leg.item_id = first_leg.item_id
+    and second_leg.occurred_at = first_leg.occurred_at
+    and second_leg.event_position = first_leg.id
+    and second_leg.piece_position = first_leg.piece_position + 1
+    and second_leg.quantity = 0
+    and second_leg.closed_bucket <> first_leg.closed_bucket;
+$$;
+
+revoke all on function app.cover_transfers (bigint)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+create function app.cover_profit_bucket (
+  p_movement_id bigint,
+  p_as_of timestamptz,
+  p_event_position bigint default 9223372036854775807
+) returns text language plpgsql stable security definer
 set
   search_path = '' as $$
 declare
-  v_item uuid;
-  v_natural text;
   v_class text;
   v_xfer record;
 begin
-  select
-    sm.item_id,
-    case sm.movement_type
-      when 'waste'::app.movement_type then 'waste'
-      when 'sort_loss'::app.movement_type then 'waste'
-      when 'closed_period'::app.movement_type then case
-        when sm.closed_bucket in ('cogs', 'waste', 'count') then sm.closed_bucket
-        else 'cogs'
-      end
-      else 'cogs'
-    end
-  into
-    v_item,
-    v_natural
-  from
-    app.stock_movements sm
-  where
-    sm.id = p_movement_id;
-
-  -- Start at the original class and walk zero-qty transfer pairs in order
-  -- up to p_as_of. Positive total_cost is FROM, negative is TO. A later
-  -- reclass after p_as_of is left for its own day. Filtering the live
-  -- class can only fall back to the original when two reclasses straddle
-  -- the inflow.
-  v_class := v_natural;
+  select coalesce(sm.closed_bucket, app.profit_bucket (sm.movement_type), 'cogs')
+  into v_class
+  from app.stock_movements sm
+  where sm.id = p_movement_id;
 
   for v_xfer in
-    select
-      pair.occurred_at,
-      pair.from_bucket,
-      pair.to_bucket
-    from
-      (
-        select
-          later.occurred_at,
-          max(later.closed_bucket) filter (
-            where
-              later.total_cost > 0
-          ) as from_bucket,
-          max(later.closed_bucket) filter (
-            where
-              later.total_cost < 0
-          ) as to_bucket
-        from
-          app.stock_movements later
-          join app.closed_period_sources later_src on later_src.movement_id = later.id
-        where
-          later.item_id = v_item
-          and later.movement_type = 'closed_period'::app.movement_type
-          and later.quantity = 0
-          and later.cover_inflow_movement_id is null
-          and later.total_cost <> 0
-          and (
-            p_as_of is null
-            or later.occurred_at <= p_as_of
-          )
-          and (
-            exists (
-              select
-                1
-              from
-                app.order_cost_movement_links link
-              where
-                link.movement_id = p_movement_id
-                and later_src.source_kind = 'order'
-                and later_src.source_id = link.order_id
-            )
-            or exists (
-              select
-                1
-              from
-                app.closed_period_sources src
-              where
-                src.movement_id = p_movement_id
-                and later_src.source_kind = src.source_kind
-                and later_src.source_id = src.source_id
-            )
-            or exists (
-              select
-                1
-              from
-                app.waste_line_movements line
-              where
-                line.movement_id = p_movement_id
-                and later_src.source_kind = 'waste'
-                and later_src.source_id = app.waste_document_root (line.document_id)::text
-            )
-          )
-        group by
-          later.occurred_at
-      ) pair
-    where
-      pair.from_bucket is not null
-      and pair.to_bucket is not null
-    order by
-      pair.occurred_at
+    select transfer.*
+    from app.cover_transfers (p_movement_id) transfer
+    where p_as_of is null
+      or (transfer.occurred_at, transfer.transfer_id) <= (p_as_of, p_event_position)
+    order by transfer.occurred_at, transfer.transfer_id
   loop
     if v_class = v_xfer.from_bucket then
       v_class := v_xfer.to_bucket;
     end if;
   end loop;
 
-  return coalesce(v_class, v_natural, 'cogs');
+  return coalesce(v_class, 'cogs');
 end;
 $$;
 
-comment on function app.cover_profit_bucket (bigint, timestamptz) is 'Profit bucket of a cover at p_as_of. Null as-of is today''s live bucket after walking every transfer. A closed waste, sort loss, or count starts as that bucket. Each zero-qty transfer pair with occurred_at <= p_as_of moves FROM (positive total_cost) to TO (negative).';
+comment on function app.cover_profit_bucket (bigint, timestamptz, bigint) is 'Profit bucket of a cover at the inflow event key, or the current bucket when the instant is null. Follow the original transfer legs in replay order.';
 
-revoke all on function app.cover_profit_bucket (bigint, timestamptz)
+revoke all on function app.cover_profit_bucket (bigint, timestamptz, bigint)
+from
+  public,
+  anon,
+  authenticated,
+  service_role;
+
+-- All pieces of this order contribute to its balance in the outgoing bucket.
+-- Prior transfers and cover carriers retain their own bucket and replay key.
+create function app.cover_transfer_value (
+  p_order_id text,
+  p_item_id uuid,
+  p_bucket text,
+  p_at timestamptz,
+  p_transfer_id bigint
+) returns numeric language sql stable security definer
+set
+  search_path = '' as $$
+  with piece_ids as (
+    select link.movement_id
+    from app.order_cost_movement_links link
+    where link.order_id = p_order_id and link.item_id = p_item_id
+    union
+    select source.movement_id
+    from app.closed_period_sources source
+    where source.source_kind = 'order' and source.source_id = p_order_id
+  ),
+  pieces as materialized (
+    select
+      sm.id,
+      sm.occurred_at,
+      sm.event_position,
+      sm.total_cost,
+      coalesce(sm.closed_bucket, app.profit_bucket (sm.movement_type)) as bucket
+    from piece_ids
+    join app.stock_movements sm on sm.id = piece_ids.movement_id
+    where sm.item_id = p_item_id
+      and (sm.occurred_at, coalesce(sm.event_position, sm.id)) < (p_at, p_transfer_id)
+      and sm.movement_type <> 'cost_adjustment'::app.movement_type
+  ),
+  value_rows as (
+    select piece.total_cost, piece.bucket
+    from pieces piece
+    union all
+    select adjustment.total_cost, piece.bucket
+    from pieces piece
+    join app.stock_movements adjustment
+      on adjustment.adjusts_movement_id = piece.id
+      and adjustment.movement_type = 'cost_adjustment'::app.movement_type
+    where (adjustment.occurred_at, coalesce(adjustment.event_position, adjustment.id))
+      < (p_at, p_transfer_id)
+    union all
+    select carrier.total_cost, carrier.closed_bucket
+    from pieces piece
+    join app.stock_movements carrier
+      on carrier.cover_deficit_movement_id = piece.id
+      and carrier.cover_inflow_movement_id is not null
+      and carrier.movement_type = 'closed_period'::app.movement_type
+    where (carrier.occurred_at, coalesce(carrier.event_position, carrier.id))
+      < (p_at, p_transfer_id)
+  )
+  select -coalesce(sum(total_cost), 0)
+  from value_rows
+  where bucket = p_bucket;
+$$;
+
+revoke all on function app.cover_transfer_value (text, uuid, text, timestamptz, bigint)
 from
   public,
   anon,
@@ -3011,12 +3106,10 @@ declare
   v_sum numeric(14, 2);
   v_found boolean;
   v_xfer record;
-  v_before numeric(14, 2);
   v_required numeric(14, 2);
   v_posted_from numeric(14, 2);
   v_extra numeric(14, 2);
   v_xfer_shift text;
-  v_xfer_event bigint;
   v_xfer_piece integer;
   v_walked_ids bigint[];
 begin
@@ -3251,7 +3344,7 @@ begin
     select
       sm.item_id,
       sm.occurred_at,
-      sm.event_position,
+      coalesce(sm.event_position, sm.id) as event_position,
       sm.piece_position,
       sm.movement_type
     into v_inflow
@@ -3260,7 +3353,7 @@ begin
     where
       sm.id = v_pair.inflow_movement_id;
 
-    v_bucket := app.cover_profit_bucket (v_pair.deficit_movement_id, v_inflow.occurred_at);
+    v_bucket := app.cover_profit_bucket (v_pair.deficit_movement_id, v_inflow.occurred_at, v_inflow.event_position);
 
     v_shift := app.closed_containing_shift (v_inflow.occurred_at);
 
@@ -3288,139 +3381,39 @@ begin
     -- moves with it in this same transaction.
     perform app.note_recognized_cover (v_pair.deficit_movement_id, - v_delta);
 
-    -- A later transfer of this source still holds the value that was in
-    -- force when it posted. The required amount is this deficit's balance
-    -- up to that transfer's first leg. Only that transfer's own legs are
-    -- reconciled, so another closed row on the item does not move it.
+    -- Reconcile the ordered source balance against this exact transfer.
     for v_xfer in
-      select
-        pair.occurred_at,
-        pair.transfer_id,
-        pair.from_bucket,
-        pair.to_bucket,
-        pair.source_kind,
-        pair.source_id
-      from
-        (
-          select
-            later.occurred_at,
-            min(later.id) as transfer_id,
-            max(later.closed_bucket) filter (
-              where
-                later.total_cost > 0
-            ) as from_bucket,
-            max(later.closed_bucket) filter (
-              where
-                later.total_cost < 0
-            ) as to_bucket,
-            min(later_src.source_kind) as source_kind,
-            min(later_src.source_id) as source_id
-          from
-            app.stock_movements later
-            join app.closed_period_sources later_src on later_src.movement_id = later.id
-          where
-            later.item_id = v_inflow.item_id
-            and later.movement_type = 'closed_period'::app.movement_type
-            and later.quantity = 0
-            and later.cover_inflow_movement_id is null
-            and later.total_cost <> 0
-            and later.occurred_at > v_inflow.occurred_at
-            and (
-              exists (
-                select
-                  1
-                from
-                  app.order_cost_movement_links link
-                where
-                  link.movement_id = v_pair.deficit_movement_id
-                  and later_src.source_kind = 'order'
-                  and later_src.source_id = link.order_id
-              )
-              or exists (
-                select
-                  1
-                from
-                  app.closed_period_sources src
-                where
-                  src.movement_id = v_pair.deficit_movement_id
-                  and later_src.source_kind = src.source_kind
-                  and later_src.source_id = src.source_id
-              )
-            )
-          group by
-            later.occurred_at
-        ) pair
-      where
-        pair.from_bucket is not null
-        and pair.to_bucket is not null
-      order by
-        pair.occurred_at
+      select transfer.*
+      from app.cover_transfers (v_pair.deficit_movement_id) transfer
+      where (transfer.occurred_at, transfer.transfer_id)
+        > (v_inflow.occurred_at, v_inflow.event_position)
+      order by transfer.occurred_at, transfer.transfer_id
     loop
-      select
-        coalesce(src.total_cost, 0)
-        + coalesce(
-          (
-            select
-              sum(ca.total_cost)
-            from
-              app.stock_movements ca
-            where
-              ca.adjusts_movement_id = v_pair.deficit_movement_id
-              and ca.movement_type = 'cost_adjustment'::app.movement_type
-              and (
-                ca.occurred_at < v_xfer.occurred_at
-                or (
-                  ca.occurred_at = v_xfer.occurred_at
-                  and ca.id < v_xfer.transfer_id
-                )
-              )
-          ),
-          0
-        )
-        + coalesce(
-          (
-            select
-              sum(car.total_cost)
-            from
-              app.stock_movements car
-            where
-              car.cover_deficit_movement_id = v_pair.deficit_movement_id
-              and car.cover_inflow_movement_id is not null
-              and car.movement_type = 'closed_period'::app.movement_type
-              and (
-                car.occurred_at < v_xfer.occurred_at
-                or (
-                  car.occurred_at = v_xfer.occurred_at
-                  and car.id < v_xfer.transfer_id
-                )
-              )
-          ),
-          0
-        )
-      into v_before
-      from
-        app.stock_movements src
-      where
-        src.id = v_pair.deficit_movement_id;
-
-      v_required := -coalesce(v_before, 0);
+      v_required := app.cover_transfer_value (
+        v_xfer.order_id,
+        v_inflow.item_id,
+        v_xfer.from_bucket,
+        v_xfer.occurred_at,
+        v_xfer.transfer_id
+      );
 
       select
-        coalesce(sum(sm.total_cost), 0)
-      into v_posted_from
+        coalesce(sum(sm.total_cost), 0),
+        coalesce(max(sm.piece_position), v_xfer.piece_position + 1)
+      into v_posted_from, v_xfer_piece
       from
         app.stock_movements sm
-        join app.closed_period_sources xfer_src on xfer_src.movement_id = sm.id
+        join app.closed_period_sources src on src.movement_id = sm.id
       where
-        sm.item_id = v_inflow.item_id
+        src.source_kind = 'order'
+        and src.source_id = v_xfer.order_id
+        and sm.item_id = v_inflow.item_id
         and sm.movement_type = 'closed_period'::app.movement_type
         and sm.closed_bucket = v_xfer.from_bucket
         and sm.occurred_at = v_xfer.occurred_at
-        and sm.id >= v_xfer.transfer_id
+        and (sm.id = v_xfer.transfer_id or sm.event_position = v_xfer.transfer_id)
         and sm.quantity = 0
-        and sm.cover_inflow_movement_id is null
-        and xfer_src.source_kind = v_xfer.source_kind
-        and xfer_src.source_id = v_xfer.source_id;
+        and sm.cover_inflow_movement_id is null;
 
       v_extra := v_required - v_posted_from;
 
@@ -3429,19 +3422,6 @@ begin
       end if;
 
       v_xfer_shift := app.closed_containing_shift (v_xfer.occurred_at);
-
-      select
-        coalesce(max(sm.event_position), 0),
-        coalesce(max(sm.piece_position), 0)
-      into
-        v_xfer_event,
-        v_xfer_piece
-      from
-        app.stock_movements sm
-      where
-        sm.item_id = v_inflow.item_id
-        and sm.occurred_at = v_xfer.occurred_at
-        and sm.movement_type = 'closed_period'::app.movement_type;
 
       perform app.insert_closed_movement (
         v_cause,
@@ -3456,15 +3436,15 @@ begin
           else 'sale'
         end,
         v_xfer_shift,
-        v_xfer.source_kind,
-        v_xfer.source_id,
+        'order',
+        v_xfer.order_id,
         null,
         null,
         null,
         null,
         null,
-        v_xfer_event,
-        v_xfer_piece + 1
+        v_xfer.transfer_id,
+        v_xfer_piece + 2
       );
 
       perform app.insert_closed_movement (
@@ -3480,15 +3460,15 @@ begin
           else 'sale'
         end,
         v_xfer_shift,
-        v_xfer.source_kind,
-        v_xfer.source_id,
+        'order',
+        v_xfer.order_id,
         null,
         null,
         null,
         null,
         null,
-        v_xfer_event,
-        v_xfer_piece + 2
+        v_xfer.transfer_id,
+        v_xfer_piece + 3
       );
     end loop;
 
@@ -3567,16 +3547,27 @@ begin
       balance.item_id = v_item;
 
     select
-      max(sm.id),
-      max(sm.occurred_at)
+      (
+        select
+          max(sm.id)
+        from
+          app.stock_movements sm
+        where
+          sm.item_id = v_item
+          and sm.movement_type <> 'cost_adjustment'::app.movement_type
+      ),
+      (
+        select
+          max(sm.occurred_at)
+        from
+          app.stock_movements sm
+        where
+          sm.item_id = v_item
+          and sm.movement_type <> 'cost_adjustment'::app.movement_type
+      )
     into
       v_max,
-      v_cut
-    from
-      app.stock_movements sm
-    where
-      sm.item_id = v_item
-      and sm.movement_type <> 'cost_adjustment'::app.movement_type;
+      v_cut;
 
     select
       greatest(
@@ -5217,27 +5208,34 @@ begin
       state.*
     into v_as_of
     from
-      app.closed_as_of_state (v_mixed) as state;
+      app.closed_sort_state (v_mixed, v_change) as state;
 
-    if v_as_of.on_hand_qty > 0 then
+    if v_as_of.has_uncovered_deficit
+    or v_as_of.on_hand_qty <= 0
+    or v_taken_qty > v_as_of.on_hand_qty then
+      raise exception 'not enough stock to sort: on_hand_qty %, requested %',
+        v_as_of.on_hand_qty,
+        v_taken_qty::numeric(20, 6)
+        using errcode = '22023';
+    end if;
+
+    if v_taken_qty = v_as_of.on_hand_qty then
+      v_taken_value := v_as_of.on_hand_value;
+    else
       v_taken_value := pg_catalog.round(
         v_as_of.on_hand_value * v_taken_qty / v_as_of.on_hand_qty,
         2
       );
-    else
-      v_unit := app.closed_unit_cost (v_mixed);
-
-      if v_unit is null then
-        raise exception 'missing_cost_basis'
-          using errcode = 'P0001',
-          detail = 'missing_cost_basis';
-      end if;
-
-      v_taken_value := pg_catalog.round(v_taken_qty * v_unit, 2);
     end if;
 
     if v_loss_qty > 0 then
       v_loss_value := pg_catalog.round(v_taken_value * v_loss_qty / v_taken_qty, 2);
+
+      if v_loss_value < 0 then
+        v_loss_value := 0;
+      elsif v_loss_value > v_taken_value then
+        v_loss_value := v_taken_value;
+      end if;
     end if;
 
     v_out_value := v_taken_value - v_loss_value;
@@ -6719,10 +6717,17 @@ declare
   v_fx_at timestamptz;
   v_fx_bucket text;
   v_walked_ids bigint[];
+  v_uncut_ids uuid[];
+  v_before_sort_at timestamptz;
 begin
   if p_pending is null then
     p_pending := '[]'::jsonb;
   end if;
+
+  v_before_sort_at := nullif(
+    coalesce(pg_catalog.current_setting('app.replay_before_sort_at', true), ''),
+    ''
+  )::timestamptz;
 
   if coalesce(pg_catalog.current_setting('app.replay_probe', true), '') = '1' then
     perform pg_catalog.set_config('app.replay_probe_t0', pg_catalog.clock_timestamp()::text, true);
@@ -6756,17 +6761,19 @@ begin
   where
     t.item_id is not null;
 
-  -- The join below cannot see that a checkpoint already covers the item, so
-  -- it would hash the whole ledger and throw the rows away. Skip it then.
-  if exists (
-    select
-      1
-    from
-      ledger_scratch.replay_resume resume
-    where
-      resume.checkpoint_id is null
-      and resume.item_id = any (p_item_ids)
-  ) then
+  -- Query only the items without a checkpoint. Passing all of p_item_ids
+  -- would scan frozen history for checkpointed items alongside a new item
+  -- and then discard those rows on the join.
+  select
+    coalesce(pg_catalog.array_agg(resume.item_id), '{}'::uuid[])
+  into v_uncut_ids
+  from
+    ledger_scratch.replay_resume resume
+  where
+    resume.checkpoint_id is null
+    and resume.item_id = any (p_item_ids);
+
+  if coalesce(pg_catalog.cardinality(v_uncut_ids), 0) > 0 then
     insert into
       ledger_scratch.recompute_row (
         movement_id,
@@ -6828,10 +6835,9 @@ begin
         sm.*
       from
         app.stock_movements sm
-        join ledger_scratch.replay_resume resume on resume.item_id = sm.item_id
       where
-        resume.checkpoint_id is null
-        and sm.item_id = any (p_item_ids)
+        sm.item_id = any (v_uncut_ids)
+        and (v_before_sort_at is null or sm.occurred_at <= v_before_sort_at)
         and sm.movement_type <> 'cost_adjustment'
         and sm.reverses_movement_id is null
         and sm.movement_type not in ('sale_reversal', 'waste_reversal')
@@ -6916,6 +6922,7 @@ begin
         from app.stock_movements sm
         where sm.item_id = %1$L
           and sm.occurred_at > %2$L::timestamptz
+          %4$s
           and sm.movement_type <> 'cost_adjustment'
           and sm.reverses_movement_id is null
           and sm.movement_type not in ('sale_reversal', 'waste_reversal')
@@ -6936,6 +6943,7 @@ begin
         from app.stock_movements sm
         where sm.item_id = %1$L
           and sm.id > %3$L::bigint
+          %4$s
           and sm.movement_type <> 'cost_adjustment'
           and sm.reverses_movement_id is null
           and sm.movement_type not in ('sale_reversal', 'waste_reversal')
@@ -6955,7 +6963,11 @@ begin
       $load$,
       r.item_id,
       r.cut_occurred_at,
-      r.max_movement_id
+      r.max_movement_id,
+      case
+        when v_before_sort_at is null then ''
+        else format('and sm.occurred_at <= %L::timestamptz', v_before_sort_at)
+      end
     );
   end loop;
 
@@ -7038,6 +7050,7 @@ begin
     where
       anchor.item_id = any (p_item_ids)
       and anchor.economic
+      and (v_before_sort_at is null or anchor.counted_at < v_before_sort_at)
       and (
         resume.checkpoint_id is null
         or anchor.counted_at > resume.cut_occurred_at
@@ -7076,6 +7089,7 @@ begin
   where
     anchor.item_id = any (p_item_ids)
     and anchor.economic
+    and (v_before_sort_at is null or anchor.counted_at < v_before_sort_at)
     and (
       resume.checkpoint_id is null
       or anchor.counted_at > resume.cut_occurred_at
@@ -7846,36 +7860,9 @@ begin
     ib.item_id = b.item_id
     and ib.item_id = any (p_item_ids);
 
-  if exists (
-    select
-      1
-    from
-      app.stock_movements rev
-      join app.stock_movements target on target.id = rev.reverses_movement_id
-    where
-      rev.item_id = any (p_item_ids)
-      and rev.reverses_movement_id is not null
-      and (
-        target.quantity + rev.quantity <> 0
-        or target.total_cost + rev.total_cost + coalesce(
-          (
-            select
-              sum(ca.total_cost)
-            from
-              app.stock_movements ca
-            where
-              ca.movement_type = 'cost_adjustment'
-              and ca.adjusts_movement_id in (target.id, rev.id)
-          ),
-          0
-        ) <> 0
-      )
-  ) then
-    perform app.raise_recompute_failure ('critical');
-  end if;
-
-  -- A resumed item's checkpoint already holds the prefix totals. The check
-  -- adds only the suffix, so a long frozen history is not aggregated again.
+  -- A resumed item's checkpoint already holds the prefix totals and verified
+  -- prefix reversals. Check only suffix reversals and suffix totals so a long
+  -- frozen history (or unanalyzed unrelated rows) is never scanned.
   for r in
     select
       ib.item_id,
@@ -7903,6 +7890,82 @@ begin
       -- read. This check has indexes for both arms, so it uses them.
       v_seqscan := pg_catalog.current_setting('enable_seqscan');
       perform pg_catalog.set_config('enable_seqscan', 'off', true);
+
+      if exists (
+        select
+          1
+        from
+          (
+            select
+              rev.id,
+              rev.reverses_movement_id,
+              rev.quantity,
+              rev.total_cost
+            from
+              app.stock_movements rev
+            where
+              rev.item_id = r.item_id
+              and rev.occurred_at > v_resume.cut_occurred_at
+              and rev.reverses_movement_id is not null
+            union all
+            select
+              rev.id,
+              rev.reverses_movement_id,
+              rev.quantity,
+              rev.total_cost
+            from
+              app.stock_movements rev
+            where
+              rev.item_id = r.item_id
+              and rev.id > v_resume.max_movement_id
+              and rev.reverses_movement_id is not null
+            union all
+            select
+              rev.id,
+              rev.reverses_movement_id,
+              rev.quantity,
+              rev.total_cost
+            from
+              app.stock_movements ca
+              join app.stock_movements rev on rev.id = ca.adjusts_movement_id
+            where
+              ca.item_id = r.item_id
+              and ca.id > v_resume.max_movement_id
+              and ca.movement_type = 'cost_adjustment'::app.movement_type
+              and rev.reverses_movement_id is not null
+            union all
+            select
+              rev.id,
+              rev.reverses_movement_id,
+              rev.quantity,
+              rev.total_cost
+            from
+              app.stock_movements ca
+              join app.stock_movements rev on rev.reverses_movement_id = ca.adjusts_movement_id
+            where
+              ca.item_id = r.item_id
+              and ca.id > v_resume.max_movement_id
+              and ca.movement_type = 'cost_adjustment'::app.movement_type
+          ) rev
+          join app.stock_movements target on target.id = rev.reverses_movement_id
+        where
+          target.quantity + rev.quantity <> 0
+          or target.total_cost + rev.total_cost + coalesce(
+            (
+              select
+                sum(ca.total_cost)
+              from
+                app.stock_movements ca
+              where
+                ca.movement_type = 'cost_adjustment'
+                and ca.adjusts_movement_id in (target.id, rev.id)
+            ),
+            0
+          ) <> 0
+      ) then
+        perform pg_catalog.set_config('enable_seqscan', v_seqscan, true);
+        perform app.raise_recompute_failure ('critical');
+      end if;
 
       select
         min(sm.id)
@@ -7957,6 +8020,7 @@ begin
 
       if r.on_hand_qty is distinct from v_resume.on_hand_qty + v_suffix_qty
       or r.on_hand_value is distinct from v_resume.on_hand_value + v_suffix_value then
+        perform pg_catalog.set_config('enable_seqscan', v_seqscan, true);
         perform app.raise_recompute_failure ('critical');
       end if;
 
@@ -8017,23 +8081,60 @@ begin
       end if;
 
       perform pg_catalog.set_config('enable_seqscan', v_seqscan, true);
-    elsif r.on_hand_qty is distinct from (
-      select
-        coalesce(sum(sm.quantity), 0)
-      from
-        app.stock_movements sm
-      where
-        sm.item_id = r.item_id
-    )
-    or r.on_hand_value is distinct from (
-      select
-        coalesce(sum(sm.total_cost), 0)
-      from
-        app.stock_movements sm
-      where
-        sm.item_id = r.item_id
-    ) then
-      perform app.raise_recompute_failure ('critical');
+    else
+      v_seqscan := pg_catalog.current_setting('enable_seqscan');
+      perform pg_catalog.set_config('enable_seqscan', 'off', true);
+
+      if exists (
+        select
+          1
+        from
+          app.stock_movements rev
+          join app.stock_movements target on target.id = rev.reverses_movement_id
+        where
+          rev.item_id = r.item_id
+          and rev.reverses_movement_id is not null
+          and (
+            target.quantity + rev.quantity <> 0
+            or target.total_cost + rev.total_cost + coalesce(
+              (
+                select
+                  sum(ca.total_cost)
+                from
+                  app.stock_movements ca
+                where
+                  ca.movement_type = 'cost_adjustment'
+                  and ca.adjusts_movement_id in (target.id, rev.id)
+              ),
+              0
+            ) <> 0
+          )
+      ) then
+        perform pg_catalog.set_config('enable_seqscan', v_seqscan, true);
+        perform app.raise_recompute_failure ('critical');
+      end if;
+
+      if r.on_hand_qty is distinct from (
+        select
+          coalesce(sum(sm.quantity), 0)
+        from
+          app.stock_movements sm
+        where
+          sm.item_id = r.item_id
+      )
+      or r.on_hand_value is distinct from (
+        select
+          coalesce(sum(sm.total_cost), 0)
+        from
+          app.stock_movements sm
+        where
+          sm.item_id = r.item_id
+      ) then
+        perform pg_catalog.set_config('enable_seqscan', v_seqscan, true);
+        perform app.raise_recompute_failure ('critical');
+      end if;
+
+      perform pg_catalog.set_config('enable_seqscan', v_seqscan, true);
     end if;
   end loop;
 
@@ -8584,68 +8685,63 @@ begin
 end;
 $$;
 
-create function app.closed_as_of_state (p_item_id uuid) returns table (
+create function app.closed_sort_state (p_item_id uuid, p_at timestamptz) returns table (
   on_hand_qty numeric,
   on_hand_value numeric,
-  avg_cost numeric,
   has_uncovered_deficit boolean
 ) language plpgsql volatile security definer
 set
   search_path = '' as $$
 declare
-  v_at timestamptz;
-  v_qty numeric;
-  v_value numeric;
+  v_live app.item_balances;
+  v_items uuid[];
+  v_prev_before text;
 begin
-  v_at := app.note_change_instant ();
+  v_items := app.recompute_item_set (array[p_item_id]);
+  perform app.prepare_balance_locks (v_items);
 
-  select
-    coalesce(
-      sum(sm.quantity) filter (
-        where
-          sm.movement_type <> 'cost_adjustment'::app.movement_type
-      ),
-      0
-    ),
-    coalesce(sum(sm.total_cost), 0)
-  into
-    v_qty,
-    v_value
-  from
-    app.stock_movements sm
-  where
-    sm.item_id = p_item_id
-    and sm.occurred_at <= v_at;
+  select balance.*
+  into v_live
+  from app.item_balances balance
+  where balance.item_id = p_item_id;
 
-  on_hand_qty := v_qty;
-  on_hand_value := v_value;
-
-  if v_qty > 0 then
-    avg_cost := pg_catalog.round(v_value / v_qty, 6);
-  else
-    avg_cost := 0;
+  -- A newly posted sort follows the existing class-0 events at its instant
+  -- and precedes the class-1 economic anchors, even for a zero-delta count.
+  if (v_live.last_occurred_at is null or v_live.last_occurred_at <= p_at)
+  and not exists (
+    select 1
+    from app.stock_count_anchors anchor
+    where anchor.item_id = p_item_id
+      and anchor.economic
+      and anchor.counted_at >= p_at
+  ) then
+    return query select v_live.on_hand_qty, v_live.on_hand_value, v_live.has_uncovered_deficit;
+    return;
   end if;
 
-  has_uncovered_deficit := v_qty < 0
-  or exists (
-    select
-      1
-    from
-      app.provisional_deficits pd
-      join app.stock_movements deficit on deficit.id = pd.movement_id
-    where
-      pd.item_id = p_item_id
-      and pd.qty_uncovered > 0
-      and deficit.occurred_at <= v_at
-  );
+  v_prev_before := coalesce(pg_catalog.current_setting('app.replay_before_sort_at', true), '');
+  perform pg_catalog.set_config('app.replay_before_sort_at', p_at::text, true);
 
-  return next;
+  begin
+    perform app.replay_execute (v_items, '[]'::jsonb, null, false);
+  exception
+    when others then
+      perform pg_catalog.set_config('app.replay_before_sort_at', v_prev_before, true);
+      raise;
+  end;
+
+  perform pg_catalog.set_config('app.replay_before_sort_at', v_prev_before, true);
+
+  return query
+  select balance.on_hand_qty, balance.on_hand_value, balance.has_uncovered_deficit
+  from ledger_scratch.recompute_bal balance
+  where balance.item_id = p_item_id;
 end;
 $$;
 
-comment on function app.closed_as_of_state (uuid) is 'Quantity, value, average, and uncovered-deficit state of one item at t_change, excluding later-dated movements.';
+comment on function app.closed_sort_state (uuid, timestamptz) is 'Locked mixed stock just before an appended sort at t_change. Use the live state when it is at that key, or stop a certified replay before same-instant anchors and later events.';
 
-revoke all on function app.closed_as_of_state (uuid)
+revoke all on function app.closed_sort_state (uuid, timestamptz)
 from
   public,
   anon,
@@ -9462,7 +9558,7 @@ begin
         v_shift := app.closed_containing_shift (v_change);
         v_piece := v_piece + 1;
 
-        perform app.insert_closed_movement (
+        v_move := app.insert_closed_movement (
           v_cause,
           v_item,
           v_change,
@@ -9503,7 +9599,7 @@ begin
           null,
           null,
           null,
-          null,
+          v_move,
           v_piece
         );
 
@@ -15225,7 +15321,6 @@ declare
   v_check_types text[] := '{}'::text[];
   v_pending jsonb := '[]'::jsonb;
   v_key integer := 0;
-  v_as_of record;
 begin
   perform app.assert_ledger_write_allowed ();
 
@@ -15472,27 +15567,6 @@ begin
       );
     end loop;
   else
-    -- Closed legs post at t_change against the as-of mixed state. An
-    -- in-window backdated sort still walks history at occurred_at.
-    if p_occurred_at < app.restatement_window_start (app.note_change_instant ()) then
-      perform app.prepare_balance_locks (array[p_mixed_item]);
-
-      select
-        state.*
-      into v_as_of
-      from
-        app.closed_as_of_state (p_mixed_item) as state;
-
-      if v_as_of.has_uncovered_deficit
-      or v_as_of.on_hand_qty <= 0
-      or v_qty_taken > v_as_of.on_hand_qty then
-        raise exception 'not enough stock to sort: on_hand_qty %, requested %',
-          v_as_of.on_hand_qty,
-          v_qty_taken
-          using errcode = '22023';
-      end if;
-    end if;
-
     v_key := v_key + 1;
     v_pending := v_pending || pg_catalog.jsonb_build_array(
       pg_catalog.jsonb_build_object(

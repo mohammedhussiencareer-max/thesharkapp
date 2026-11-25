@@ -1,9 +1,27 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { setupSql, lateSql, resumeGuardSql } from './accounting-history.mjs';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
+import {
+  setupSql,
+  histories,
+  lateSql,
+  resumeGuardSql,
+  sortHistories,
+  sortBuildSql,
+  sortMeasureSql,
+  sortBuffersNote,
+  sortGrowthFailed,
+} from './accounting-history.mjs';
 
-function psql(sql) {
+const benchmark = fileURLToPath(
+  new URL('./accounting-history.mjs', import.meta.url),
+);
+const runBenchmark = promisify(execFile);
+const resetMessage = /--resume is supported only before measurement starts/;
+
+function psql(sql, { notices = false } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       'docker',
@@ -34,7 +52,7 @@ function psql(sql) {
       err += chunk;
     });
     child.on('close', (code) => {
-      if (code === 0) resolve(out.trim());
+      if (code === 0) resolve((notices ? err : out).trim());
       else reject(new Error((err || out).trim()));
     });
     child.stdin.end(sql);
@@ -184,4 +202,150 @@ values (
 );
 `);
   await assert.rejects(() => psql(resumeGuardSql(history)), /pnpm db:reset/);
+});
+
+test('sort growth gate rejects 2-year buffers more than 10% over 35-day buffers', () => {
+  const rows = [
+    {
+      kind: 'sort-traversal',
+      name: '35-day sorts',
+      buffers: 400,
+      seconds: 0.1,
+    },
+    {
+      kind: 'sort-traversal',
+      name: '1-year sorts',
+      buffers: 410,
+      seconds: 0.1,
+    },
+    {
+      kind: 'sort-traversal',
+      name: '2-year sorts',
+      buffers: 440,
+      seconds: 0.1,
+    },
+  ];
+  assert.equal(sortGrowthFailed(rows), false);
+  assert.match(sortBuffersNote(rows), /stayed flat/);
+  rows[2].buffers = 441;
+  assert.equal(sortGrowthFailed(rows), true);
+  assert.match(sortBuffersNote(rows), /grew/);
+});
+
+test('sort acceptance checks the committed suffix and reports the cut used by the RPC', async () => {
+  const anchor = await psql(
+    `select to_char((date_trunc('day', pg_catalog.clock_timestamp() at time zone 'Africa/Cairo') at time zone 'Africa/Cairo'), 'YYYY-MM-DD HH24:MI:SSOF');`,
+  );
+  const history = {
+    name: 'acceptance test sorts',
+    prefix: 's-acceptance',
+    days: 2,
+    mixed: 'b9e00000-0000-4000-8000-000000009001',
+    size: 'b9e00000-0000-4000-8000-000000009002',
+    openingRequest: 'b9e00000-0000-4000-8000-000000009003',
+    activationRequest: 'b9e00000-0000-4000-8000-000000009004',
+    suffixPurchaseRequest: 'b9e00000-0000-4000-8000-000000009005',
+    purchaseRequest: 'b9e00000-0000-4000-8000-000000009006',
+  };
+  const catalog = await psql(
+    `select exists (select from app.stock_items where id = '${history.mixed}')`,
+  );
+  if (catalog === 'f') await psql(sortBuildSql(history, anchor));
+
+  async function measure(fixture, clockOffset = null) {
+    let sql = sortMeasureSql(fixture, anchor).replace('commit;', 'rollback;');
+    if (clockOffset !== null) {
+      sql = sql.replace(
+        'do $$',
+        () =>
+          `select set_config('app.test_clock', (timestamptz '${anchor}' + interval '${clockOffset}')::text, true);\ndo $$`,
+      );
+    }
+    const notices = await psql(sql, {
+      notices: true,
+    });
+    const match = notices.match(/MEASURE (\{[^\r\n]+\})/);
+    assert.ok(match, notices);
+    return JSON.parse(match[1]);
+  }
+
+  await assert.rejects(
+    () =>
+      measure({
+        ...history,
+        suffixPurchaseRequest: 'b9e00000-0000-4000-8000-000000009007',
+      }),
+    /required committed sort suffix fixture is missing or incomplete/,
+  );
+  for (const clockOffset of [null, '3 hours', '22 hours']) {
+    const valid = await measure(history, clockOffset);
+    assert.deepEqual(
+      {
+        validPass: valid.pass,
+        resumed: valid.resumed,
+        actualCut: typeof valid.checkpoint_id,
+        hasCutTime:
+          typeof valid.cut_occurred_at === 'string' &&
+          valid.cut_occurred_at.length > 0,
+      },
+      { validPass: true, resumed: true, actualCut: 'number', hasCutTime: true },
+      `clockOffset=${clockOffset}: ${JSON.stringify(valid)}`,
+    );
+  }
+});
+
+test('benchmark CLI refuses committed measurements before sort skip or --skip-build', async () => {
+  // First test --skip-build --resume with ONLY an order measurement marker committed,
+  // proving it triggers the order guard without sort markers masking it.
+  const order = histories[0];
+  await psql(`
+    insert into app.stock_items (id, name, kind, base_unit, count_frequency)
+    values (md5('bench-sel-${order.prefix}')::uuid, 'order guard marker', 'seafood', 'kg', 'daily')
+    on conflict (id) do nothing;
+  `);
+  const orderResult = await Promise.allSettled([
+    runBenchmark(process.execPath, [
+      benchmark,
+      order.name,
+      '--skip-build',
+      '--resume',
+    ]),
+  ]);
+  assert.deepEqual(
+    orderResult.map((result) =>
+      result.status === 'fulfilled'
+        ? 'exit 0'
+        : resetMessage.test(result.reason.stderr)
+          ? 'reset required'
+          : result.reason.stderr,
+    ),
+    ['reset required'],
+  );
+
+  // Now commit sort measurement markers and prove --sort-only refuses both with
+  // and without --resume instead of silently skipping committed measurements.
+  for (const history of sortHistories) {
+    await psql(`
+      insert into app.stock_items (id, name, kind, base_unit, count_frequency)
+      values ('${history.mixed}', '${history.name} guard marker', 'fish_mixed', 'kg', 'daily')
+      on conflict (id) do nothing;
+      insert into app.purchases (request_id, purchased_at, total_paid, batch_id)
+      values ('${history.purchaseRequest}', now(), 0, gen_random_uuid())
+      on conflict (request_id) do nothing;
+    `);
+  }
+  const sortResults = await Promise.allSettled([
+    runBenchmark(process.execPath, [benchmark, '--sort-only', '--resume']),
+    runBenchmark(process.execPath, [benchmark, '--sort-only']),
+  ]);
+  assert.deepEqual(
+    sortResults.map((result) =>
+      result.status === 'fulfilled'
+        ? 'exit 0'
+        : resetMessage.test(result.reason.stderr)
+          ? 'reset required'
+          : result.reason.stderr,
+    ),
+    ['reset required', 'reset required'],
+  );
 });

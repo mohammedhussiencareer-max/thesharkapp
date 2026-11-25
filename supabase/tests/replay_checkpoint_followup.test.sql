@@ -12705,6 +12705,14 @@ select
   );
 
 select
+  app.replay_execute (
+    array['f6e00000-0000-4000-8000-00000000005b']::uuid[],
+    '[]'::jsonb,
+    gen_random_uuid(),
+    true
+  );
+
+select
   app.post_movements (
     jsonb_build_array(
       jsonb_build_object(
@@ -12727,6 +12735,11 @@ select
     )
   );
 
+delete from app.replay_read_probe;
+
+select
+  set_config('app.replay_probe', '1', true);
+
 select
   app.post_sort (
     'f6e00000-0000-4000-8000-00000000005b',
@@ -12745,6 +12758,26 @@ select
         5
       )
     )
+  );
+
+select
+  set_config('app.replay_probe', '', true);
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.replay_read_probe probe
+        cross join lateral jsonb_array_elements(probe.resume_detail) as resumed (item)
+      where
+        resumed.item ->> 'item_id' = 'f6e00000-0000-4000-8000-00000000005b'
+        and resumed.item ->> 'checkpoint_id' is not null
+        and (resumed.item ->> 'rows_loaded')::integer = 0
+    ),
+    1::bigint,
+    'closed sort guard and pricing share one certified walk bounded before the later receipt'
   );
 
 select
@@ -13186,6 +13219,311 @@ select
     'ordinary-deficit cover transfer keeps per-day bucket totals'
   );
 
+-- Independent ordinary order sources for value and class regressions.
+create function pg_temp.post_round7k_order (p_item uuid, v_order text, p_stock integer) returns void language plpgsql as $$
+begin
+  insert into app.stock_items (id, name, kind, base_unit, count_frequency)
+  values (p_item, v_order, 'seafood', 'kg', 'daily');
+
+  perform app.set_item_opening_price (
+    gen_random_uuid (), p_item, 10, null, null, 'kg|seafood||'
+  );
+
+  if p_stock > 0 then
+    perform app.post_movements (jsonb_build_array(jsonb_build_object(
+      'item_id', p_item,
+      'movement_type', 'opening',
+      'occurred_at', (select at - interval '60 days' from f6_anchor),
+      'quantity', p_stock,
+      'unit_cost', 10
+    )));
+  end if;
+
+perform
+  app.post_engine_outflows (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        p_item,
+        'movement_type',
+        'sale',
+        'occurred_at',
+        (
+          select
+            anchor.at - interval '40 days' + interval '1 hour'
+          from
+            f6_anchor anchor
+        ),
+        'quantity',
+        5,
+        'source_id',
+        v_order,
+        'shift_id',
+        'p24h-sale'
+      )
+    )
+  );
+
+insert into
+  app.pos_orders (
+    id,
+    shift_id,
+    status,
+    order_type,
+    ordered_at,
+    subtotal,
+    discount,
+    tax,
+    service_tax,
+    delivery_fee,
+    total,
+    pos_update_time,
+    content_hash,
+    missing_from_pos
+  )
+select
+  v_order,
+  'p24h-sale',
+  'complete',
+  'hall',
+  anchor.at - interval '40 days' + interval '1 hour',
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  anchor.at - interval '40 days' + interval '1 hour',
+  rpad(md5(v_order), 64, 'a'),
+  false
+from
+  f6_anchor anchor;
+
+perform
+  app.append_pos_cost_input (v_order, null, 'sync');
+
+insert into
+  app.order_cost_applications (
+    order_id,
+    cost_input_id,
+    snapshot_id,
+    receipt_kind,
+    disposition,
+    occurred_at,
+    shift_id,
+    signature,
+    requirements,
+    work_generation
+  )
+select
+  v_order,
+  input.id,
+  input.snapshot_id,
+  'posting',
+  'sale',
+  (
+    select
+      anchor.at - interval '40 days' + interval '1 hour'
+    from
+      f6_anchor anchor
+  ),
+  'p24h-sale',
+  md5('v_order-app'),
+  '[]'::jsonb,
+  1
+from
+  app.pos_cost_inputs input
+where
+  input.order_id = v_order;
+
+insert into
+  app.order_cost_state (
+    order_id,
+    latest_input_id,
+    latest_application_id,
+    owner_application_id,
+    disposition,
+    signature
+  )
+select
+  v_order,
+  input.id,
+  application.id,
+  application.id,
+  'sale',
+  md5('v_order-app')
+from
+  app.pos_cost_inputs input
+  join app.order_cost_applications application on application.order_id = input.order_id
+where
+  input.order_id = v_order;
+
+insert into
+  app.order_cost_movement_links (movement_id, application_id, order_id, item_id)
+select
+  movement.id,
+  application.id,
+  v_order,
+  movement.item_id
+from
+  app.stock_movements movement
+  join app.order_cost_applications application on application.order_id = v_order
+where
+  movement.item_id = p_item
+  and movement.movement_type = 'sale';
+
+perform
+  app.seed_order_recognized (v_order);
+
+perform
+  set_config('app.t_change_chosen', '1', true);
+
+perform
+  set_config(
+    'app.t_change',
+    (
+      select
+        (anchor.at - interval '10 days')::text
+      from
+        f6_anchor anchor
+    ),
+    true
+  );
+
+perform
+  app.post_closed_order_difference (
+    v_order,
+    jsonb_build_array(
+      jsonb_build_object(
+        'stock_item_id',
+        p_item,
+        'quantity',
+        5
+      )
+    ),
+    'waste',
+    'waste'
+  );
+
+  perform set_config('app.t_change_chosen', '', true);
+  perform set_config('app.t_change', '', true);
+  perform set_config('app.restatement_window_start', '', true);
+end;
+$$;
+
+create function pg_temp.round7k_cover (
+  p_item uuid,
+  p_days integer,
+  p_qty integer,
+  p_cost numeric
+) returns uuid language sql as $$
+  select app.post_movements(jsonb_build_array(jsonb_build_object(
+    'item_id', p_item,
+    'movement_type', 'purchase',
+    'occurred_at', (select at - make_interval(days => p_days) from f6_anchor),
+    'quantity', p_qty,
+    'unit_cost', p_cost
+  )));
+$$;
+
+select
+  pg_temp.post_round7k_order (
+    'f6e00000-0000-4000-8000-000000000064',
+    'round7k-pieces',
+    2
+  );
+
+select
+  pg_temp.round7k_cover ('f6e00000-0000-4000-8000-000000000064', 11, 3, 20);
+
+select
+  is (
+    (
+      select
+        sum(sm.total_cost)
+      from
+        app.stock_movements sm
+        join app.closed_period_sources src on src.movement_id = sm.id
+      where
+        src.source_kind = 'order'
+        and src.source_id = 'round7k-pieces'
+        and sm.closed_bucket = 'cogs'
+        and sm.quantity = 0
+    ),
+    80.00::numeric,
+    'a late cover reconciles the transfer of both the stocked and deficit pieces'
+  );
+
+select
+  is (
+    (
+      select
+        sum(sm.total_cost)
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-000000000064'
+        and coalesce(
+          sm.closed_bucket,
+          app.profit_bucket (sm.movement_type)
+        ) = 'cogs'
+    ),
+    0.00::numeric,
+    'a late cover on a mixed stocked and deficit order leaves zero residual in COGS'
+  );
+
+select
+  pg_temp.post_round7k_order (
+    'f6e00000-0000-4000-8000-000000000065',
+    'round7k-cheaper',
+    0
+  );
+
+select
+  pg_temp.round7k_cover ('f6e00000-0000-4000-8000-000000000065', 11, 2, 5);
+
+select
+  pg_temp.round7k_cover ('f6e00000-0000-4000-8000-000000000065', 9, 3, 20);
+
+select
+  is (
+    (
+      select
+        sm.closed_bucket
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-000000000065'
+        and sm.occurred_at = (
+          select
+            at - interval '9 days'
+          from
+            f6_anchor
+        )
+        and sm.cover_deficit_movement_id is not null
+    ),
+    'waste',
+    'a cheaper partial cover keeps the class transition for the later cover'
+  );
+
+select
+  is (
+    (
+      select
+        sum(sm.total_cost)
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-000000000065'
+        and coalesce(
+          sm.closed_bucket,
+          app.profit_bucket (sm.movement_type)
+        ) = 'cogs'
+    ),
+    0.00::numeric,
+    'a cheaper partial cover plus later cover leaves zero residual in COGS'
+  );
+
 -- Unrelated closed -50 on the same item as a covered closed sale. The
 -- source sale is first so the covering purchase attaches to it; the
 -- unrelated row must not inflate that source's transfer.
@@ -13433,6 +13771,17 @@ values
     'f6e00000-0000-4000-8000-00000000005f'
   );
 
+insert into
+  app.stock_items (id, name, kind, base_unit, count_frequency)
+values
+  (
+    'f6e00000-0000-4000-8000-000000000061',
+    'p5 unrelated new item',
+    'seafood',
+    'kg',
+    'daily'
+  );
+
 select
   app.set_item_opening_price (
     'f6e00000-0000-4000-8000-000000000590',
@@ -13678,6 +14027,13 @@ begin
         'amount_paid', '15.00',
         'expected_base_unit', 'kg',
         'expected_factor', '1'
+      ), pg_catalog.jsonb_build_object(
+        'item_id', 'f6e00000-0000-4000-8000-000000000061',
+        'quantity', '1',
+        'unit', 'kg',
+        'amount_paid', '10.00',
+        'expected_base_unit', 'kg',
+        'expected_factor', '1'
       ))
     ))
     $ex$,
@@ -13704,7 +14060,17 @@ select
   is (
     (
       select
-        probe.prefix_rows
+        (
+          select
+            sum((item ->> 'prefix_rows')::bigint)::bigint
+          from
+            jsonb_array_elements(probe.resume_detail) as resumed (item)
+          where
+            item ->> 'item_id' in (
+              'f6e00000-0000-4000-8000-00000000005f',
+              'f6e00000-0000-4000-8000-000000000060'
+            )
+        )
       from
         app.replay_read_probe probe
       order by
@@ -13714,6 +14080,41 @@ select
     ),
     0::bigint,
     'backdated record_purchase behind certified sort cuts reads zero prefix rows'
+  );
+
+select
+  is (
+    (
+      select
+        probe.prefix_rows
+      from
+        app.replay_read_probe probe
+      order by
+        probe.id desc
+      limit
+        1
+    ),
+    1::bigint,
+    'only the unrelated new item own purchase is uncheckpointed in prefix_rows'
+  );
+
+select
+  is (
+    (
+      select
+        after_at
+      from
+        app.replay_sort_after_key ('f6e00000-0000-4000-8000-00000000005f')
+    ),
+    (
+      select
+        cut_occurred_at
+      from
+        ledger_scratch.replay_resume
+      where
+        item_id = 'f6e00000-0000-4000-8000-000000000060'
+    ),
+    'an unrelated new purchase item leaves the mature sort family lower bound at its partner cut'
   );
 
 create temp table p5_resumed_balances as
@@ -13822,6 +14223,712 @@ select
       from p5_resumed_ledger
       order by item_id$$,
     'backdated record_purchase behind certified sort cuts matches a forced full walk ledger'
+  );
+
+update app.pos_shifts
+set
+  closed_at = (
+    select
+      at
+    from
+      f6_anchor
+  ),
+  is_active = false
+where
+  id = 'f6-now';
+
+-- The same-instant anchor is class 1. A new closed sort posts in class 0.
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    parent_item_id
+  )
+values
+  (
+    'f6e00000-0000-4000-8000-000000000062',
+    'same instant mixed',
+    'fish_mixed',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    'f6e00000-0000-4000-8000-000000000063',
+    'same instant size',
+    'fish_size',
+    'kg',
+    'daily',
+    'f6e00000-0000-4000-8000-000000000062'
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000062',
+        'movement_type',
+        'opening',
+        'occurred_at',
+        (
+          select
+            at - interval '60 days'
+          from
+            f6_anchor
+        ),
+        'quantity',
+        5,
+        'unit_cost',
+        10
+      )
+    )
+  );
+
+select
+  is (
+    pg_temp.cover_prepared_count (
+      jsonb_build_object(
+        'request_id',
+        'f6e00000-0000-4000-8000-000000000597',
+        'frequency',
+        'daily',
+        'counted_at',
+        (
+          select
+            at
+          from
+            f6_anchor
+        ),
+        'lines',
+        jsonb_build_array(
+          jsonb_build_object(
+            'item_id',
+            'f6e00000-0000-4000-8000-000000000062',
+            'counted_qty',
+            '10',
+            'expected_base_unit',
+            'kg'
+          )
+        )
+      )
+    ) ->> 'status',
+    'posted',
+    'the same-instant economic count to ten is posted'
+  );
+
+select
+  throws_ok (
+    $$select app.post_sort(
+    'f6e00000-0000-4000-8000-000000000062',
+    (select at - interval '50 days' from f6_anchor),
+    8,
+    '[{"item_id":"f6e00000-0000-4000-8000-000000000063","quantity":8}]'::jsonb,
+    null
+  )$$,
+    '22023',
+    'not enough stock to sort: on_hand_qty 5.000000, requested 8.000000',
+    'a closed sort cannot use stock from a same-instant later count anchor'
+  );
+
+-- When live state is already valid at t_change (no later events or same-instant anchor),
+-- closed_sort_state uses the locked live state directly with zero pre-sort replay walks.
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    parent_item_id
+  )
+values
+  (
+    'f6e00000-0000-4000-8000-000000000066',
+    'live fast path mixed',
+    'fish_mixed',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    'f6e00000-0000-4000-8000-000000000067',
+    'live fast path size',
+    'fish_size',
+    'kg',
+    'daily',
+    'f6e00000-0000-4000-8000-000000000066'
+  );
+
+select
+  app.post_movements (
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000066',
+        'movement_type',
+        'opening',
+        'occurred_at',
+        (
+          select
+            at - interval '60 days'
+          from
+            f6_anchor
+        ),
+        'quantity',
+        10,
+        'unit_cost',
+        15
+      )
+    )
+  );
+
+delete from app.replay_read_probe;
+
+select
+  set_config('app.replay_probe', '1', true);
+
+select
+  app.post_sort (
+    'f6e00000-0000-4000-8000-000000000066',
+    (
+      select
+        at - interval '50 days'
+      from
+        f6_anchor
+    ),
+    4,
+    '[{"item_id":"f6e00000-0000-4000-8000-000000000067","quantity":4}]'::jsonb,
+    null
+  );
+
+select
+  set_config('app.replay_probe', '', true);
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        app.replay_read_probe
+    ),
+    1::bigint,
+    'a closed sort with valid live state skips pre-sort replay and runs only the confirming walk'
+  );
+
+select
+  is (
+    (
+      select
+        on_hand_qty::text || '/' || on_hand_value::text
+      from
+        app.item_balances
+      where
+        item_id = 'f6e00000-0000-4000-8000-000000000067'
+    ),
+    '4.000000/60.00',
+    'a closed sort on the live-state fast path prices accurately'
+  );
+
+-- Unrelated sort families and unrelated stock_count_lines must not grow
+-- backdated record_purchase buffers or trigger sequential scans.
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config(
+    'app.test_clock',
+    (
+      select
+        at::text
+      from
+        f6_anchor
+    ),
+    true
+  );
+
+insert into
+  app.stock_items (
+    id,
+    name,
+    kind,
+    base_unit,
+    count_frequency,
+    parent_item_id
+  )
+values
+  (
+    'f6e00000-0000-4000-8000-000000000068',
+    'flat bound target mixed',
+    'fish_mixed',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    'f6e00000-0000-4000-8000-000000000069',
+    'flat bound target size',
+    'fish_size',
+    'kg',
+    'daily',
+    'f6e00000-0000-4000-8000-000000000068'
+  ),
+  (
+    'f6e00000-0000-4000-8000-00000000006a',
+    'flat bound target new',
+    'seafood',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    'f6e00000-0000-4000-8000-00000000006b',
+    'flat bound unrelated mixed 1',
+    'fish_mixed',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    'f6e00000-0000-4000-8000-00000000006c',
+    'flat bound unrelated size 1',
+    'fish_size',
+    'kg',
+    'daily',
+    'f6e00000-0000-4000-8000-00000000006b'
+  ),
+  (
+    'f6e00000-0000-4000-8000-00000000006d',
+    'flat bound unrelated mixed 2',
+    'fish_mixed',
+    'kg',
+    'daily',
+    null
+  ),
+  (
+    'f6e00000-0000-4000-8000-00000000006e',
+    'flat bound unrelated size 2',
+    'fish_size',
+    'kg',
+    'daily',
+    'f6e00000-0000-4000-8000-00000000006d'
+  ),
+  (
+    'f6e00000-0000-4000-8000-00000000006f',
+    'flat bound unrelated counted',
+    'seafood',
+    'kg',
+    'daily',
+    null
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-000000000598',
+    'f6e00000-0000-4000-8000-000000000068',
+    10,
+    null,
+    null,
+    'kg|fish_mixed||'
+  );
+
+select
+  app.set_item_opening_price (
+    'f6e00000-0000-4000-8000-000000000599',
+    'f6e00000-0000-4000-8000-000000000069',
+    10,
+    null,
+    null,
+    'kg|fish_size|f6e00000-0000-4000-8000-000000000068|'
+  );
+
+select
+  app.record_opening_stock (
+    (
+      select
+        at - interval '10 days'
+      from
+        f6_anchor
+    ),
+    jsonb_build_array(
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-000000000068',
+        'quantity',
+        '100',
+        'unit',
+        'kg',
+        'unit_cost',
+        '10',
+        'expected_base_unit',
+        'kg',
+        'expected_factor',
+        '1'
+      ),
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000006b',
+        'quantity',
+        '100',
+        'unit',
+        'kg',
+        'unit_cost',
+        '10',
+        'expected_base_unit',
+        'kg',
+        'expected_factor',
+        '1'
+      ),
+      jsonb_build_object(
+        'item_id',
+        'f6e00000-0000-4000-8000-00000000006d',
+        'quantity',
+        '100',
+        'unit',
+        'kg',
+        'unit_cost',
+        '10',
+        'expected_base_unit',
+        'kg',
+        'expected_factor',
+        '1'
+      )
+    ),
+    'f6e00000-0000-4000-8000-00000000059a'
+  );
+
+do $$
+declare
+  d integer;
+  v_anchor timestamptz := (select at from f6_anchor);
+begin
+  for d in 1..5 loop
+    perform app.post_sort(
+      'f6e00000-0000-4000-8000-000000000068',
+      v_anchor - (10 - d) * interval '1 day',
+      1,
+      '[{"item_id":"f6e00000-0000-4000-8000-000000000069","quantity":1}]'::jsonb,
+      null
+    );
+  end loop;
+end
+$$;
+
+select
+  app.replay_execute (
+    array[
+      'f6e00000-0000-4000-8000-000000000068',
+      'f6e00000-0000-4000-8000-000000000069'
+    ]::uuid[],
+    '[]'::jsonb,
+    'f6e00000-0000-4000-8000-00000000059b',
+    true
+  );
+
+select
+  app.record_purchase (
+    pg_catalog.jsonb_build_object (
+      'purchased_at',
+      to_char(
+        (
+          (
+            select
+              at
+            from
+              f6_anchor
+          ) + interval '14 hours'
+        ) at time zone 'UTC',
+        'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+      ),
+      'request_id',
+      'f6e00000-0000-4000-8000-00000000059c',
+      'lines',
+      pg_catalog.jsonb_build_array (
+        pg_catalog.jsonb_build_object (
+          'item_id',
+          'f6e00000-0000-4000-8000-000000000068',
+          'quantity',
+          '1',
+          'unit',
+          'kg',
+          'amount_paid',
+          '10.00',
+          'expected_base_unit',
+          'kg',
+          'expected_factor',
+          '1'
+        )
+      )
+    )
+  );
+
+create function pg_temp.measure_flat_sort_purchase () returns bigint language plpgsql as $$
+declare
+  v_at text;
+  v_line text;
+  v_plan text := '';
+  v_buffers bigint;
+begin
+  select
+    to_char (
+      (anchor.at + interval '13 hours') at time zone 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+    )
+  into v_at
+  from
+    f6_anchor anchor;
+
+  begin
+    for v_line in execute pg_catalog.format(
+      $ex$
+      explain (analyze, buffers)
+      select app.record_purchase(pg_catalog.jsonb_build_object(
+        'purchased_at', %L,
+        'request_id', 'f6e00000-0000-4000-8000-00000000059d',
+        'lines', pg_catalog.jsonb_build_array(
+          pg_catalog.jsonb_build_object(
+            'item_id', 'f6e00000-0000-4000-8000-000000000068',
+            'quantity', '1',
+            'unit', 'kg',
+            'amount_paid', '12.00',
+            'expected_base_unit', 'kg',
+            'expected_factor', '1'
+          ),
+          pg_catalog.jsonb_build_object(
+            'item_id', 'f6e00000-0000-4000-8000-00000000006a',
+            'quantity', '1',
+            'unit', 'kg',
+            'amount_paid', '10.00',
+            'expected_base_unit', 'kg',
+            'expected_factor', '1'
+          )
+        )
+      ))
+      $ex$,
+      v_at
+    )
+    loop
+      v_plan := v_plan || v_line || e'\n';
+    end loop;
+
+    v_buffers := app.replay_plan_shared_buffers (v_plan);
+    raise exception 'flat_sort_probe:%', v_buffers using errcode = 'P0001';
+  exception
+    when sqlstate 'P0001' then
+      if sqlerrm like 'flat_sort_probe:%' then
+        return split_part(sqlerrm, ':', 2)::bigint;
+      end if;
+      raise;
+  end;
+end;
+$$;
+
+-- Warm plans once before capturing baseline.
+select
+  pg_temp.measure_flat_sort_purchase ();
+
+create temp table f7_flat_baseline as
+select
+  pg_temp.measure_flat_sort_purchase () as buffers;
+
+-- Populate unrelated sort families and 5,000 unrelated stock_count_lines rows.
+do $$
+declare
+  d integer;
+  v_anchor timestamptz := (select at from f6_anchor);
+begin
+  for d in 1..25 loop
+    perform app.post_sort(
+      'f6e00000-0000-4000-8000-00000000006b',
+      v_anchor - interval '9 days' + d * interval '1 hour',
+      1,
+      '[{"item_id":"f6e00000-0000-4000-8000-00000000006c","quantity":1}]'::jsonb,
+      null
+    );
+    perform app.post_sort(
+      'f6e00000-0000-4000-8000-00000000006d',
+      v_anchor - interval '9 days' + d * interval '1 hour',
+      1,
+      '[{"item_id":"f6e00000-0000-4000-8000-00000000006e","quantity":1}]'::jsonb,
+      null
+    );
+  end loop;
+end
+$$;
+
+with
+  counts as (
+    insert into
+      app.stock_counts (id, request_id, frequency, counted_at)
+    select
+      pg_catalog.gen_random_uuid (),
+      pg_catalog.gen_random_uuid (),
+      'daily',
+      (
+        select
+          at
+        from
+          f6_anchor
+      ) - interval '20 days' + g.n * interval '1 minute'
+    from
+      pg_catalog.generate_series (1, 5000) as g (n)
+    returning
+      id
+  )
+insert into
+  app.stock_count_lines (
+    count_id,
+    line_no,
+    item_id,
+    expected_base_unit,
+    counted_qty,
+    expected_qty,
+    delta_qty,
+    delta_value
+  )
+select
+  counts.id,
+  1,
+  'f6e00000-0000-4000-8000-00000000006f',
+  'kg',
+  0,
+  0,
+  0,
+  0
+from
+  counts;
+
+select
+  is (
+    app.sort_family_ids ('f6e00000-0000-4000-8000-000000000068'),
+    array['f6e00000-0000-4000-8000-000000000069']::uuid[],
+    'sort_family_ids stays within the target sort family with unrelated families present'
+  );
+
+create temp table f7_flat_after as
+select
+  pg_temp.measure_flat_sort_purchase () as buffers;
+
+select
+  ok (
+    (
+      select
+        after_row.buffers < 5000
+        and after_row.buffers <= before_row.buffers + 100
+      from
+        f7_flat_baseline before_row,
+        f7_flat_after after_row
+    ),
+    'record_purchase shared buffers stay flat with unrelated sort families and 5000 unrelated stock_count_lines present'
+  );
+
+create function pg_temp.explain_target_suffix_load () returns text language plpgsql as $$
+declare
+  v_cut timestamptz;
+  v_max bigint;
+  v_line text;
+  v_plan text := '';
+begin
+  select
+    checkpoint.cut_occurred_at,
+    checkpoint.max_movement_id
+  into
+    v_cut,
+    v_max
+  from
+    app.replay_checkpoints checkpoint
+  where
+    checkpoint.item_id = 'f6e00000-0000-4000-8000-000000000068'
+    and not exists (
+      select
+        1
+      from
+        app.replay_checkpoint_invalidations inv
+      where
+        inv.checkpoint_id = checkpoint.id
+    )
+  order by
+    checkpoint.cut_occurred_at desc,
+    checkpoint.id desc
+  limit
+    1;
+
+  for v_line in execute pg_catalog.format(
+    $ex$
+    explain (analyze, buffers)
+    select sm.id
+    from (
+      select sm.*
+      from app.stock_movements sm
+      where sm.item_id = 'f6e00000-0000-4000-8000-000000000068'
+        and sm.occurred_at > %1$L::timestamptz
+        and sm.movement_type <> 'cost_adjustment'
+        and sm.reverses_movement_id is null
+        and sm.movement_type not in ('sale_reversal', 'waste_reversal')
+        and not exists (
+          select 1 from app.stock_movements rev where rev.reverses_movement_id = sm.id
+        )
+        and not exists (
+          select 1 from app.stock_count_lines linked where linked.movement_id = sm.id
+        )
+        and not exists (
+          select 1 from app.stock_count_postings posting where posting.movement_id = sm.id
+        )
+      union
+      select sm.*
+      from app.stock_movements sm
+      where sm.item_id = 'f6e00000-0000-4000-8000-000000000068'
+        and sm.id > %2$L::bigint
+        and sm.movement_type <> 'cost_adjustment'
+        and sm.reverses_movement_id is null
+        and sm.movement_type not in ('sale_reversal', 'waste_reversal')
+        and not exists (
+          select 1 from app.stock_movements rev where rev.reverses_movement_id = sm.id
+        )
+        and not exists (
+          select 1 from app.stock_count_lines linked where linked.movement_id = sm.id
+        )
+        and not exists (
+          select 1 from app.stock_count_postings posting where posting.movement_id = sm.id
+        )
+    ) sm
+    $ex$,
+    v_cut,
+    v_max
+  )
+  loop
+    v_plan := v_plan || v_line || e'\n';
+  end loop;
+
+  return v_plan;
+end;
+$$;
+
+select
+  ok (
+    (
+      select
+        p.plan like '%stock_count_lines_movement_id_idx%'
+        and p.plan not like '%Seq Scan on stock_count_lines%'
+        and p.plan like '%stock_movements_item_id_idx%'
+        and p.plan not like '%Seq Scan on stock_movements%'
+      from
+        (
+          select
+            pg_temp.explain_target_suffix_load () as plan
+        ) p
+    ),
+    'resumed suffix load uses stock_count_lines_movement_id_idx and stock_movements_item_id_idx with unrelated counts present'
   );
 
 select
