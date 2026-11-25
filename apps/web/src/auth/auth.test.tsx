@@ -7,6 +7,7 @@ import {
   getAuthSnapshot,
   isAuthResolved,
   resetAuthStore,
+  signIn,
 } from '@/lib/auth-store';
 
 type Session = {
@@ -419,6 +420,114 @@ describe('owner access', () => {
       logoutFailed: false,
     });
     expect(cleanAuthStore.isAuthResolved()).toBe(true);
+  });
+
+  it('reconciles a failed logout in another tab when SIGNED_OUT arrives before marker removal', async () => {
+    const markerKey = `theshark:auth:logout-pending:v1:${encodeURIComponent('http://127.0.0.1:55421')}`;
+    const session = {
+      user: { id: 'owner', email: 'owner@theshark.test' },
+      access_token: 'tok-owner-crosstab-a',
+      refresh_token: 'rt-owner-crosstab-a',
+    };
+
+    authState.session = session;
+    authState.isOwner = true;
+    authState.signOutError = { message: 'offline refresh failed' };
+
+    renderApp('/');
+    expect(await screen.findByText('owner@theshark.test')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'تسجيل الخروج' }));
+    expect(
+      await screen.findByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
+    ).toBeInTheDocument();
+    expect(localStorage.getItem(markerKey)).toBe('1');
+    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
+
+    // Another tab's SDK signOut emits SIGNED_OUT while the marker is still present.
+    authState.session = null;
+    act(() => {
+      for (const listener of [...authState.listeners]) {
+        listener('SIGNED_OUT', null);
+      }
+    });
+    expect(getAuthSnapshot().logoutFailed).toBe(true);
+    expect(isAuthResolved()).toBe(false);
+    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
+
+    // Then the other tab finishes signOut and clears the persisted logout marker.
+    localStorage.removeItem(markerKey);
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent('storage', {
+          key: markerKey,
+          oldValue: '1',
+          newValue: null,
+        }),
+      );
+    });
+
+    await vi.waitFor(() => {
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+    expect(
+      screen.queryByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
+    ).toBeNull();
+    expect(getAuthSnapshot()).toMatchObject({
+      status: 'signed-out',
+      logoutPending: false,
+      logoutFailed: false,
+    });
+    expect(isAuthResolved()).toBe(true);
+    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeEnabled();
+    expect(await signIn('owner@theshark.test', 'ValidPassword123')).toBe('ok');
+  });
+
+  it('reconciles a failed logout in another tab when SIGNED_OUT arrives after marker removal', async () => {
+    const markerKey = `theshark:auth:logout-pending:v1:${encodeURIComponent('http://127.0.0.1:55421')}`;
+    const session = {
+      user: { id: 'owner', email: 'owner@theshark.test' },
+      access_token: 'tok-owner-crosstab-b',
+      refresh_token: 'rt-owner-crosstab-b',
+    };
+
+    authState.session = session;
+    authState.isOwner = true;
+    authState.signOutError = { message: 'offline refresh failed' };
+
+    renderApp('/');
+    expect(await screen.findByText('owner@theshark.test')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'تسجيل الخروج' }));
+    expect(
+      await screen.findByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
+    ).toBeInTheDocument();
+    expect(localStorage.getItem(markerKey)).toBe('1');
+    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
+
+    // Marker is removed first without delivering a storage event, then SIGNED_OUT arrives.
+    localStorage.removeItem(markerKey);
+    authState.session = null;
+    act(() => {
+      for (const listener of [...authState.listeners]) {
+        listener('SIGNED_OUT', null);
+      }
+    });
+
+    await vi.waitFor(() => {
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+    expect(
+      screen.queryByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
+    ).toBeNull();
+    expect(getAuthSnapshot()).toMatchObject({
+      status: 'signed-out',
+      logoutPending: false,
+      logoutFailed: false,
+    });
+    expect(isAuthResolved()).toBe(true);
+    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeEnabled();
+    expect(await signIn('owner@theshark.test', 'ValidPassword123')).toBe('ok');
   });
 });
 

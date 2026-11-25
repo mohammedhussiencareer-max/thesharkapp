@@ -1735,6 +1735,121 @@ describe('held-writes store', () => {
     }
   });
 
+  it('P2: removes persisted SDK credentials when localStorage rejects the logout marker on quota error so reload cannot restore owner access', async () => {
+    const sdkStorageKey = 'sb-127-auth-token';
+    const sessionA: NonNullable<Session> = {
+      user: { id: 'owner-a', email: 'a@theshark.test' },
+      access_token: 'tok-a-quota',
+      refresh_token: 'rt-a-quota',
+    };
+    const supabaseMod = await import('@/lib/supabase');
+    const authClient = supabaseMod.supabase!.auth;
+    const origOnAuthStateChange = authClient.onAuthStateChange.bind(authClient);
+    const onAuthSpy = vi
+      .spyOn(authClient, 'onAuthStateChange')
+      .mockImplementation((callback) => {
+        const stored = localStorage.getItem(sdkStorageKey);
+        const restored = stored
+          ? (JSON.parse(stored) as NonNullable<Session>)
+          : null;
+        authMock.session = restored;
+        return origOnAuthStateChange(callback);
+      });
+    const signOutSpy = vi.spyOn(authClient, 'signOut').mockResolvedValue({
+      error: new Error('offline refresh failed') as never,
+    });
+    const setItemDesc = Object.getOwnPropertyDescriptor(
+      Storage.prototype,
+      'setItem',
+    );
+    const origSetItem = setItemDesc?.value as (
+      this: Storage,
+      key: string,
+      value: string,
+    ) => void;
+    let rejectAllNewWrites = false;
+    let rejectUntilSdkKeyRemoved = false;
+    const setItemSpy = vi
+      .spyOn(Storage.prototype, 'setItem')
+      .mockImplementation(function (this: Storage, key: string, value: string) {
+        if (rejectAllNewWrites && this.getItem(key) === null) {
+          throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+        }
+        if (
+          rejectUntilSdkKeyRemoved &&
+          this.getItem(key) === null &&
+          this.getItem(sdkStorageKey) !== null
+        ) {
+          throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+        }
+        origSetItem.call(this, key, value);
+      });
+
+    try {
+      // Case 1: storage stays full even after SDK credentials are removed.
+      localStorage.setItem(sdkStorageKey, JSON.stringify(sessionA));
+      localStorage.setItem(
+        `${sdkStorageKey}-user`,
+        JSON.stringify(sessionA.user),
+      );
+      localStorage.setItem(`${sdkStorageKey}-code-verifier`, 'pkce-verifier-1');
+      startAuth();
+      await vi.waitFor(() => {
+        expect(getAuthSnapshot().status).toBe('owner');
+      });
+
+      rejectAllNewWrites = true;
+      await signOut();
+
+      expect(localStorage.getItem(sdkStorageKey)).toBeNull();
+      expect(localStorage.getItem(`${sdkStorageKey}-user`)).toBeNull();
+      expect(localStorage.getItem(`${sdkStorageKey}-code-verifier`)).toBeNull();
+      expect(getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        email: null,
+        logoutPending: false,
+        logoutFailed: true,
+      });
+      expect(isAuthResolved()).toBe(false);
+      expect(isPwaLogoutPending()).toBe(true);
+
+      // Fresh document reload must NOT restore owner access.
+      vi.resetModules();
+      const reloadedAuth = await import('@/lib/auth-store');
+      reloadedAuth.startAuth();
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      expect(reloadedAuth.getAuthSnapshot().status).toBe('signed-out');
+      expect(reloadedAuth.getAuthSnapshot().email).toBeNull();
+
+      // Case 2: removing the SDK session frees enough quota for the logout marker retry to succeed.
+      rejectAllNewWrites = false;
+      localStorage.clear();
+      reloadedAuth.resetAuthStore();
+      localStorage.setItem(sdkStorageKey, JSON.stringify(sessionA));
+      reloadedAuth.startAuth();
+      await vi.waitFor(() => {
+        expect(reloadedAuth.getAuthSnapshot().status).toBe('owner');
+      });
+
+      rejectUntilSdkKeyRemoved = true;
+      await reloadedAuth.signOut();
+
+      expect(localStorage.getItem(sdkStorageKey)).toBeNull();
+      expect(
+        localStorage.getItem(
+          `theshark:auth:logout-pending:v1:${encodeURIComponent('http://127.0.0.1:55421')}`,
+        ),
+      ).toBe('1');
+      expect(reloadedAuth.getAuthSnapshot().logoutFailed).toBe(true);
+      expect(reloadedAuth.isAuthResolved()).toBe(false);
+    } finally {
+      setItemSpy.mockRestore();
+      signOutSpy.mockRestore();
+      onAuthSpy.mockRestore();
+      resetPwaState();
+    }
+  });
+
   it('P2: surviving tab queues exact-claim recheck on storage sync so inflight promotes to unknown when writer releases lock without another storage event', async () => {
     const { client } = makeAuditedLocks();
     const tab1 = createHeldWriteStore({ getLocks: () => client('writer-tab') });
