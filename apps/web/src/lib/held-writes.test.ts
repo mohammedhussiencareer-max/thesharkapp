@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   beginHeldWrite,
+  claimFreshHeldWrite,
   clearHeldWritesForUser,
   clearPostedReload,
   createHeldWriteStore,
   getHeldWrite,
   hasAnyHeldWrite,
   hasPostedReload,
+  isCurrentWriteSession,
   listHeldWritesByPrefix,
   putHeldWrite,
   rehydrateHeldWrites,
@@ -23,7 +25,11 @@ import {
   startAuth,
 } from '@/lib/auth-store';
 
-type Session = { user: { id: string; email: string } } | null;
+type Session = {
+  user: { id: string; email: string };
+  access_token?: string;
+  refresh_token?: string;
+} | null;
 
 const authMock = vi.hoisted(() => ({
   session: null as Session,
@@ -1064,5 +1070,240 @@ describe('held-writes store', () => {
     } finally {
       store.dispose();
     }
+  });
+
+  it('R20-1a: same-session SIGNED_IN reconfirmation preserves write settlement while sign-out and session switches reject late settlement', async () => {
+    const makeSyntheticJwt = (payload: Record<string, unknown>): string => {
+      const encode = (value: Record<string, unknown>) =>
+        btoa(
+          String.fromCharCode(
+            ...new TextEncoder().encode(JSON.stringify(value)),
+          ),
+        )
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/g, '');
+      return `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode(payload)}.sig`;
+    };
+    const emitAuth = (event: string, session: Session) => {
+      authMock.session = session;
+      for (const listener of [...authMock.listeners]) {
+        listener(event, session);
+      }
+    };
+
+    const jwtSid1A = makeSyntheticJwt({
+      sub: 'owner-a',
+      session_id: 'sid-1',
+      exp: 2_000_000_000,
+    });
+    const jwtSid1Refreshed = makeSyntheticJwt({
+      sub: 'owner-a',
+      session_id: 'sid-1',
+      exp: 2_000_003_600,
+    });
+    const jwtSid2 = makeSyntheticJwt({
+      sub: 'owner-a',
+      session_id: 'sid-2',
+      exp: 2_000_007_200,
+    });
+
+    authMock.session = {
+      user: { id: 'owner-a', email: 'a@theshark.test' },
+      access_token: jwtSid1A,
+      refresh_token: 'rt-1',
+    };
+    startAuth();
+
+    // 1. Focus reconfirmation (SIGNED_IN with identical session) must preserve settlement.
+    const claim1 = await claimFreshHeldWrite(
+      'count:daily',
+      (requestId) => ({ requestId, qty: '10' }),
+      { kind: 'count' },
+    );
+    expect(claim1.ok).toBe(true);
+    if (!claim1.ok) return;
+
+    emitAuth('SIGNED_IN', {
+      user: { id: 'owner-a', email: 'a@theshark.test' },
+      access_token: jwtSid1A,
+      refresh_token: 'rt-1',
+    });
+
+    expect(isCurrentWriteSession(claim1.session)).toBe(true);
+    setHeldWritePhase('count:daily', claim1.record.requestId, 'posted_reload', {
+      expected: claim1.record,
+      session: claim1.session,
+    });
+    claim1.release();
+    expect(getHeldWrite('count:daily')?.phase).toBe('posted_reload');
+    expect(
+      hasPostedReload('count:daily', undefined, claim1.record.requestId),
+    ).toBe(true);
+    await clearPostedReload('count:daily', undefined, claim1.record.requestId);
+    expect(getHeldWrite('count:daily')).toBeNull();
+
+    // 2. Focus SIGNED_IN after another tab refreshed tokens of the SAME JWT session_id also preserves settlement.
+    const claim2 = await claimFreshHeldWrite(
+      'count:daily',
+      (requestId) => ({ requestId, qty: '11' }),
+      { kind: 'count' },
+    );
+    expect(claim2.ok).toBe(true);
+    if (!claim2.ok) return;
+
+    emitAuth('SIGNED_IN', {
+      user: { id: 'owner-a', email: 'a@theshark.test' },
+      access_token: jwtSid1Refreshed,
+      refresh_token: 'rt-2',
+    });
+
+    expect(isCurrentWriteSession(claim2.session)).toBe(true);
+    setHeldWritePhase('count:daily', claim2.record.requestId, 'posted_reload', {
+      expected: claim2.record,
+      session: claim2.session,
+    });
+    claim2.release();
+    expect(
+      hasPostedReload('count:daily', undefined, claim2.record.requestId),
+    ).toBe(true);
+    await clearPostedReload('count:daily', undefined, claim2.record.requestId);
+
+    // 3. Direct same-user session switch (different JWT session_id without SIGNED_OUT) must invalidate old write.
+    const claim3 = await claimFreshHeldWrite(
+      'count:daily',
+      (requestId) => ({ requestId, qty: '12' }),
+      { kind: 'count' },
+    );
+    expect(claim3.ok).toBe(true);
+    if (!claim3.ok) return;
+
+    emitAuth('SIGNED_IN', {
+      user: { id: 'owner-a', email: 'a@theshark.test' },
+      access_token: jwtSid2,
+      refresh_token: 'rt-3',
+    });
+
+    expect(isCurrentWriteSession(claim3.session)).toBe(false);
+    setHeldWritePhase('count:daily', claim3.record.requestId, 'posted_reload', {
+      expected: claim3.record,
+    });
+    claim3.release();
+    expect(
+      hasPostedReload('count:daily', undefined, claim3.record.requestId),
+    ).toBe(false);
+
+    // 4. Sign-out followed by re-sign-in as the same user (even with identical token) must reject late settlement.
+    clearHeldWritesForUser('owner-a');
+    rehydrateHeldWrites();
+    const claim4 = await claimFreshHeldWrite(
+      'count:daily',
+      (requestId) => ({ requestId, qty: '13' }),
+      { kind: 'count' },
+    );
+    expect(claim4.ok).toBe(true);
+    if (!claim4.ok) return;
+
+    emitAuth('SIGNED_OUT', null);
+    emitAuth('SIGNED_IN', {
+      user: { id: 'owner-a', email: 'a@theshark.test' },
+      access_token: jwtSid2,
+      refresh_token: 'rt-3',
+    });
+
+    expect(isCurrentWriteSession(claim4.session)).toBe(false);
+    setHeldWritePhase('count:daily', claim4.record.requestId, 'posted_reload', {
+      expected: claim4.record,
+    });
+    claim4.release();
+    expect(
+      hasPostedReload('count:daily', undefined, claim4.record.requestId),
+    ).toBe(false);
+
+    // 5. Direct cross-user SIGNED_IN must reject late settlement.
+    const claim5 = await claimFreshHeldWrite(
+      'count:daily',
+      (requestId) => ({ requestId, qty: '14' }),
+      { kind: 'count' },
+    );
+    expect(claim5.ok).toBe(true);
+    if (!claim5.ok) return;
+
+    emitAuth('SIGNED_IN', {
+      user: { id: 'owner-b', email: 'b@theshark.test' },
+      access_token: makeSyntheticJwt({
+        sub: 'owner-b',
+        session_id: 'sid-b1',
+        exp: 2_000_010_800,
+      }),
+      refresh_token: 'rt-b1',
+    });
+
+    expect(isCurrentWriteSession(claim5.session)).toBe(false);
+    setHeldWritePhase('count:daily', claim5.record.requestId, 'posted_reload', {
+      expected: claim5.record,
+    });
+    claim5.release();
+    expect(
+      hasPostedReload('count:daily', undefined, claim5.record.requestId),
+    ).toBe(false);
+
+    // 6. Opaque tokens (no JWT session_id): TOKEN_REFRESHED then focus SIGNED_IN preserves settlement,
+    //    whereas SIGNED_IN with changed opaque tokens invalidates the old session.
+    emitAuth('SIGNED_IN', {
+      user: { id: 'owner-opaque', email: 'opaque@theshark.test' },
+      access_token: 'opaque-1',
+      refresh_token: 'opaque-rt-1',
+    });
+    const claim6 = await claimFreshHeldWrite(
+      'count:daily',
+      (requestId) => ({ requestId, qty: '15' }),
+      { kind: 'count' },
+    );
+    expect(claim6.ok).toBe(true);
+    if (!claim6.ok) return;
+
+    emitAuth('TOKEN_REFRESHED', {
+      user: { id: 'owner-opaque', email: 'opaque@theshark.test' },
+      access_token: 'opaque-2',
+      refresh_token: 'opaque-rt-2',
+    });
+    emitAuth('SIGNED_IN', {
+      user: { id: 'owner-opaque', email: 'opaque@theshark.test' },
+      access_token: 'opaque-2',
+      refresh_token: 'opaque-rt-2',
+    });
+    expect(isCurrentWriteSession(claim6.session)).toBe(true);
+    setHeldWritePhase('count:daily', claim6.record.requestId, 'posted_reload', {
+      expected: claim6.record,
+      session: claim6.session,
+    });
+    claim6.release();
+    expect(
+      hasPostedReload('count:daily', undefined, claim6.record.requestId),
+    ).toBe(true);
+    await clearPostedReload('count:daily', undefined, claim6.record.requestId);
+
+    const claim7 = await claimFreshHeldWrite(
+      'count:daily',
+      (requestId) => ({ requestId, qty: '16' }),
+      { kind: 'count' },
+    );
+    expect(claim7.ok).toBe(true);
+    if (!claim7.ok) return;
+
+    emitAuth('SIGNED_IN', {
+      user: { id: 'owner-opaque', email: 'opaque@theshark.test' },
+      access_token: 'opaque-3',
+      refresh_token: 'opaque-rt-3',
+    });
+    expect(isCurrentWriteSession(claim7.session)).toBe(false);
+    setHeldWritePhase('count:daily', claim7.record.requestId, 'posted_reload', {
+      expected: claim7.record,
+    });
+    claim7.release();
+    expect(
+      hasPostedReload('count:daily', undefined, claim7.record.requestId),
+    ).toBe(false);
   });
 });

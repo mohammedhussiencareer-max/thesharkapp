@@ -2,6 +2,8 @@ import type { Session } from '@supabase/supabase-js';
 import {
   bumpSessionGeneration,
   clearHeldWritesForUser,
+  isWritesLocked,
+  rehydrateHeldWrites,
   resetHeldWritesStore,
   setHeldWriteUser,
   setWritesLocked,
@@ -32,6 +34,81 @@ function emit(next: Snapshot) {
 
 function emailOf(session: Session): string | null {
   return session.user.email ?? null;
+}
+
+function decodeBase64UrlUtf8(segment: string): string | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(segment)) return null;
+  const base64 = segment.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
+  if (typeof atob !== 'function') return null;
+  try {
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function extractJwtSessionId(accessToken: unknown): string | null {
+  if (typeof accessToken !== 'string') return null;
+  const parts = accessToken.split('.');
+  if (parts.length !== 3 || !parts[1]) return null;
+  const decoded = decodeBase64UrlUtf8(parts[1]);
+  if (decoded === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(decoded);
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      'session_id' in parsed &&
+      typeof (parsed as { session_id?: unknown }).session_id === 'string'
+    ) {
+      const id = (parsed as { session_id: string }).session_id.trim();
+      return id !== '' ? id : null;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() !== '' ? value : null;
+}
+
+function isSameAuthenticatedSession(
+  previous: Session | null,
+  next: Session,
+  event: string,
+): boolean {
+  if (!previous) return false;
+  if (previous.user.id !== next.user.id) return false;
+
+  const prevSessionId = extractJwtSessionId(previous.access_token);
+  const nextSessionId = extractJwtSessionId(next.access_token);
+  if (prevSessionId !== null || nextSessionId !== null) {
+    return prevSessionId === nextSessionId;
+  }
+
+  if (event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
+    return true;
+  }
+
+  const prevAccess = nonEmptyString(previous.access_token);
+  const nextAccess = nonEmptyString(next.access_token);
+  const prevRefresh = nonEmptyString(previous.refresh_token);
+  const nextRefresh = nonEmptyString(next.refresh_token);
+  if (
+    prevAccess !== null ||
+    nextAccess !== null ||
+    prevRefresh !== null ||
+    nextRefresh !== null
+  ) {
+    return prevAccess === nextAccess && prevRefresh === nextRefresh;
+  }
+
+  return true;
 }
 
 function checkOwner(session: Session) {
@@ -69,7 +146,8 @@ export function startAuth() {
   const {
     data: { subscription },
   } = client.auth.onAuthStateChange((event, session) => {
-    const previousUserId = currentSession?.user.id ?? lastUserId;
+    const previousSession = currentSession;
+    const previousUserId = previousSession?.user.id ?? lastUserId;
     currentSession = session;
     if (!session) {
       setWritesLocked(true);
@@ -83,12 +161,23 @@ export function startAuth() {
       emit({ status: 'signed-out', email: null });
       return;
     }
+    const wasWritesLocked = isWritesLocked();
+    const sameSession =
+      !wasWritesLocked &&
+      isSameAuthenticatedSession(previousSession, session, event);
     lastUserId = session.user.id;
-    if (event === 'SIGNED_IN') {
+    if (!sameSession) {
       bumpSessionGeneration();
     }
     setWritesLocked(false);
     setHeldWriteUser(session.user.id);
+    if (
+      !sameSession &&
+      !wasWritesLocked &&
+      previousSession?.user.id === session.user.id
+    ) {
+      rehydrateHeldWrites();
+    }
     checkOwner(session);
   });
 

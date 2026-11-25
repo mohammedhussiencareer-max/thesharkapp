@@ -61,6 +61,7 @@ import {
   getHeldWrite,
   hasAnyHeldWrite,
   hasLiveHeldWriteClaims,
+  hasPostedReload,
   HeldWriteStorageError,
   putHeldWrite,
   resetHeldWritesStore,
@@ -69,6 +70,7 @@ import {
   setWritesLocked,
   userStoragePrefix,
 } from '@/lib/held-writes';
+import { resetAuthStore, startAuth } from '@/lib/auth-store';
 import {
   applyPwaUpdate,
   resetPwaState,
@@ -80,6 +82,56 @@ import { CountsPage } from '@/pages/CountsPage';
 import { ExpensesPage } from '@/pages/ExpensesPage';
 import { ItemsPage } from '@/pages/ItemsPage';
 import { makeAuditedLocks } from '@/test/held-write-locks';
+
+type AuthMockSession = {
+  user: { id: string; email: string };
+  access_token?: string;
+  refresh_token?: string;
+} | null;
+
+const authMock = vi.hoisted(() => ({
+  session: null as AuthMockSession,
+  listeners: [] as Array<(event: string, session: AuthMockSession) => void>,
+}));
+
+vi.mock('@/lib/supabase', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/supabase')>();
+  return {
+    ...actual,
+    supabase: {
+      auth: {
+        onAuthStateChange: (
+          callback: (event: string, session: AuthMockSession) => void,
+        ) => {
+          authMock.listeners.push(callback);
+          callback('INITIAL_SESSION', authMock.session);
+          return {
+            data: {
+              subscription: {
+                unsubscribe: () => {
+                  const index = authMock.listeners.indexOf(callback);
+                  if (index >= 0) authMock.listeners.splice(index, 1);
+                },
+              },
+            },
+          };
+        },
+        signInWithPassword: () =>
+          Promise.resolve({ data: { user: null, session: null }, error: null }),
+        signOut: () => {
+          authMock.session = null;
+          for (const listener of [...authMock.listeners]) {
+            listener('SIGNED_OUT', null);
+          }
+          return Promise.resolve({ error: null });
+        },
+      },
+      schema: () => ({
+        rpc: () => Promise.resolve({ data: true, error: null }),
+      }),
+    },
+  };
+});
 
 vi.mock('@/items/api', () => ({
   ITEMS_RELOAD_SUBJECT: 'items:reload',
@@ -3614,6 +3666,200 @@ describe('P7-3 round-10 review fixes', () => {
       expect(screen.queryByText(waitingForSyncMessage)).not.toBeInTheDocument();
     } finally {
       getSpy.mockRestore();
+    }
+  });
+
+  it('R20-1b: refocusing a tab (SIGNED_IN reconfirmation) settles an in-flight daily count without stranding inflight, while sign-out or session switch still rejects late replies', async () => {
+    const makeSyntheticJwt = (payload: Record<string, unknown>): string => {
+      const encode = (value: Record<string, unknown>) =>
+        btoa(
+          String.fromCharCode(
+            ...new TextEncoder().encode(JSON.stringify(value)),
+          ),
+        )
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/g, '');
+      return `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode(payload)}.sig`;
+    };
+    const emitAuth = (event: string, session: AuthMockSession) => {
+      authMock.session = session;
+      for (const listener of [...authMock.listeners]) {
+        listener(event, session);
+      }
+    };
+
+    const userId = 'owner-r20';
+    const jwtSid1 = makeSyntheticJwt({
+      sub: userId,
+      session_id: 'sid-r20-1',
+      exp: 2_000_000_000,
+    });
+    const jwtSid2 = makeSyntheticJwt({
+      sub: userId,
+      session_id: 'sid-r20-2',
+      exp: 2_000_007_200,
+    });
+    const jwtSid3 = makeSyntheticJwt({
+      sub: userId,
+      session_id: 'sid-r20-3',
+      exp: 2_000_014_400,
+    });
+    const prefix = userStoragePrefix(userId);
+    const dailyKey = `${prefix}${encodeURIComponent(COUNT_DAILY_SUBJECT)}`;
+    const { locks, nested } = makeAuditedLocks();
+    const origLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: locks,
+    });
+
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([]);
+
+    let resolveFirst!: (value: { status: 'posted'; countId: string }) => void;
+    let resolveSecond!: (value: { status: 'posted'; countId: string }) => void;
+    let resolveThird!: (value: { status: 'posted'; countId: string }) => void;
+    vi.mocked(recordCount)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveSecond = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveThird = resolve;
+          }),
+      );
+
+    try {
+      authMock.listeners.splice(0, authMock.listeners.length);
+      authMock.session = {
+        user: { id: userId, email: 'owner@theshark.test' },
+        access_token: jwtSid1,
+        refresh_token: 'rt-r20-1',
+      };
+      startAuth();
+      setPwaAuthResolved(true);
+
+      render(
+        <MemoryRouter>
+          <CountsPage />
+        </MemoryRouter>,
+      );
+
+      const qtyInput = await screen.findByLabelText('الكمية المعدودة بلطي');
+      fireEvent.change(qtyInput, { target: { value: '8' } });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(1));
+      expect(getHeldWrite(COUNT_DAILY_SUBJECT)?.phase).toBe('inflight');
+      expect(hasLiveHeldWriteClaims()).toBe(true);
+
+      // Simulate tab refocus: Supabase reconfirms the existing session with SIGNED_IN.
+      act(() => {
+        emitAuth('SIGNED_IN', {
+          user: { id: userId, email: 'owner@theshark.test' },
+          access_token: jwtSid1,
+          refresh_token: 'rt-r20-1',
+        });
+      });
+
+      // The in-flight count succeeds after refocus and must settle cleanly.
+      await act(async () => {
+        resolveFirst({ status: 'posted', countId: 'cnt-r20-1' });
+        await Promise.resolve();
+      });
+
+      expect(await screen.findByText('اتسجل الجرد')).toBeInTheDocument();
+      await waitFor(() => expect(hasLiveHeldWriteClaims()).toBe(false));
+      expect(getHeldWrite(COUNT_DAILY_SUBJECT)).toBeNull();
+      expect(localStorage.getItem(dailyKey)).toBeNull();
+      expect(hasAnyHeldWrite()).toBe(false);
+      expect(screen.getByLabelText('الكمية المعدودة بلطي')).toBeEnabled();
+      expect(nested).toEqual([]);
+
+      // Now submit a second daily count, then sign out and sign in with a new session
+      // while the RPC is still in flight: late reply must be discarded and lock released.
+      fireEvent.change(screen.getByLabelText('الكمية المعدودة بلطي'), {
+        target: { value: '6' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(2));
+      expect(hasLiveHeldWriteClaims()).toBe(true);
+
+      act(() => {
+        emitAuth('SIGNED_OUT', null);
+        emitAuth('SIGNED_IN', {
+          user: { id: userId, email: 'owner@theshark.test' },
+          access_token: jwtSid2,
+          refresh_token: 'rt-r20-2',
+        });
+      });
+
+      await act(async () => {
+        resolveSecond({ status: 'posted', countId: 'cnt-r20-2' });
+        await Promise.resolve();
+      });
+
+      await waitFor(() => expect(hasLiveHeldWriteClaims()).toBe(false));
+      expect(hasPostedReload(COUNT_DAILY_SUBJECT)).toBe(false);
+      expect(localStorage.getItem(dailyKey)).toBeNull();
+      expect(hasAnyHeldWrite()).toBe(false);
+      expect(nested).toEqual([]);
+
+      // Direct same-user session switch (new session_id without SIGNED_OUT) also rejects
+      // the late reply and releases the claim lock cleanly without nesting.
+      fireEvent.change(screen.getByLabelText('الكمية المعدودة بلطي'), {
+        target: { value: '5' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(3));
+      expect(hasLiveHeldWriteClaims()).toBe(true);
+
+      act(() => {
+        emitAuth('SIGNED_IN', {
+          user: { id: userId, email: 'owner@theshark.test' },
+          access_token: jwtSid3,
+          refresh_token: 'rt-r20-3',
+        });
+      });
+
+      await act(async () => {
+        resolveThird({ status: 'posted', countId: 'cnt-r20-3' });
+        await Promise.resolve();
+      });
+
+      await waitFor(() => expect(hasLiveHeldWriteClaims()).toBe(false));
+      expect(hasPostedReload(COUNT_DAILY_SUBJECT)).toBe(false);
+      expect(nested).toEqual([]);
+    } finally {
+      authMock.session = null;
+      authMock.listeners.splice(0, authMock.listeners.length);
+      resetAuthStore();
+      if (origLocks) {
+        Object.defineProperty(navigator, 'locks', origLocks);
+      } else {
+        Reflect.deleteProperty(navigator, 'locks');
+      }
     }
   });
 });
