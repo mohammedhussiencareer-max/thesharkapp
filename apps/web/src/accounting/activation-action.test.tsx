@@ -5,6 +5,10 @@ import { activateInventory, loadOpeningReview } from '@/accounting/api';
 import { OpeningManifestChangedError, writeError } from '@/accounting/errors';
 import type { OpeningReview } from '@/accounting/types';
 import { resetHeldWrites, unknownAction } from '@/items/request-id';
+import {
+  rehydrateHeldWritesAsync,
+  resetHeldWritesStore,
+} from '@/lib/held-writes';
 import { ActivationPage } from '@/pages/ActivationPage';
 import { reloadFailedMessage } from '@/waste/useWasteAction';
 
@@ -304,6 +308,59 @@ describe('activation action', () => {
     await waitFor(() => expect(activateInventory).toHaveBeenCalledTimes(3));
     expect(activateInventory).toHaveBeenLastCalledWith({
       requestId: sent?.requestId,
+      manifestHash: hashB,
+      explicitZeroItemIds: [item],
+    });
+  });
+
+  it('P2 item 5: opening a second tab after manifest refresh keeps activation as a draft requiring reconfirmation instead of promoting to unknown retry', async () => {
+    vi.mocked(loadOpeningReview)
+      .mockResolvedValueOnce(opening(hashA))
+      .mockResolvedValue(opening(hashB));
+    vi.mocked(activateInventory).mockRejectedValueOnce(
+      new OpeningManifestChangedError(),
+    );
+    const firstView = render(
+      <MemoryRouter>
+        <ActivationPage />
+      </MemoryRouter>,
+    );
+    await checkAndActivate();
+    expect(
+      await screen.findByText('قائمة الافتتاح اتغيرت — راجعها وفعّل تاني'),
+    ).toBeInTheDocument();
+    const firstRequestId =
+      vi.mocked(activateInventory).mock.calls[0]?.[0]?.requestId;
+    firstView.unmount();
+
+    // Simulate a second tab rehydrating from shared storage while the draft waits for reconfirmation.
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
+
+    renderPage();
+    expect(
+      await screen.findByRole('button', { name: 'تفعيل الخصم' }),
+    ).toBeDisabled();
+    expect(unknownAction('activation')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'إعادة المحاولة' })).toBeNull();
+    const checkbox = screen.getByRole('checkbox', { name: 'صفر صريح' });
+    expect(checkbox).toBeEnabled();
+    expect(checkbox).not.toBeChecked();
+
+    fireEvent.click(checkbox);
+    vi.mocked(activateInventory).mockResolvedValueOnce({
+      activated: true,
+      stockStartedAt: '2026-03-01T08:00:00.000Z',
+      openingManifestHash: hashB,
+    });
+    const activateBtn = await screen.findByRole('button', {
+      name: 'تفعيل الخصم',
+    });
+    await waitFor(() => expect(activateBtn).toBeEnabled());
+    fireEvent.click(activateBtn);
+    await waitFor(() => expect(activateInventory).toHaveBeenCalledTimes(2));
+    expect(activateInventory).toHaveBeenLastCalledWith({
+      requestId: firstRequestId,
       manifestHash: hashB,
       explicitZeroItemIds: [item],
     });

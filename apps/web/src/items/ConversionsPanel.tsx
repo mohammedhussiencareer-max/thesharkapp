@@ -658,8 +658,19 @@ export function ConversionsPanel({
             action.label,
             action.unitRequestId,
           );
-          action.createdCode = unitCode;
-          updateActionPayload(subject, requestId, action);
+          try {
+            updateActionPayload(subject, requestId, {
+              ...action,
+              createdCode: unitCode,
+            });
+          } catch (checkpointError) {
+            // The initial pin already persists `unitRequestId`, so replay of
+            // `addCustomUnit` is idempotent if this optional checkpoint cannot
+            // be written (e.g. storage quota full).
+            if (!(checkpointError instanceof HeldWriteStorageError)) {
+              throw checkpointError;
+            }
+          }
           setCreatedUnit({
             code: unitCode,
             inputCode: action.inputCode,
@@ -766,7 +777,8 @@ export function ConversionsPanel({
         } catch (error) {
           if (
             !saved &&
-            !(error instanceof HeldWriteStorageError) &&
+            (!(error instanceof HeldWriteStorageError) ||
+              hasDurableAction(subject, requestId)) &&
             hasAction(subject)
           ) {
             settleAction(subject, requestId, error);

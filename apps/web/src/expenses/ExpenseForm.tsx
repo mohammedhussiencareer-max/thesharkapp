@@ -51,6 +51,7 @@ export function ExpenseForm({
   disabled,
   serverError,
   pending = null,
+  requestIdNonce = 0,
   onMonthChange,
   onSubmit,
 }: {
@@ -60,6 +61,8 @@ export function ExpenseForm({
   serverError: string | null;
   /** Set only after an unknown outcome. Null when the save was not sent or was refused. */
   pending?: ExpenseDraft | null;
+  /** Incremented after a definitive refusal of a previously-unknown write to mint a fresh request id without losing form edits. */
+  requestIdNonce?: number;
   onMonthChange: (month: string) => void;
   onSubmit: (draft: ExpenseDraft) => void;
 }) {
@@ -67,10 +70,19 @@ export function ExpenseForm({
   const effectiveDisabled = disabled || !online;
   const amountErrorId = useId();
   const headingId = useId();
-  // Reused after a definite refusal, because that attempt was not stored.
+  // Reused after a definite refusal of a fresh attempt, because that attempt
+  // was not stored. After a definitive refusal of a previously-unknown write,
+  // `requestIdNonce` increments to mint a fresh id without wiping edits.
   // An unknown outcome resends `pending` with this same id. A confirmed
   // save remounts the form and mints a new id.
-  const [requestId] = useState(() => crypto.randomUUID());
+  const [requestState, setRequestState] = useState(() => ({
+    nonce: requestIdNonce,
+    id: crypto.randomUUID(),
+  }));
+  if (requestState.nonce !== requestIdNonce) {
+    setRequestState({ nonce: requestIdNonce, id: crypto.randomUUID() });
+  }
+  const requestId = requestState.id;
   const [values, setValues] = useState<ExpenseFormValues>(emptyExpenseForm);
   const [errors, setErrors] = useState<ExpenseFormErrors>({});
   // Taken in the submit handler, while the category list is still the one the

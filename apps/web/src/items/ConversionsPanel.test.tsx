@@ -1462,4 +1462,64 @@ describe('ConversionsPanel', () => {
       expect.objectContaining({ effectiveFrom: null, reason: null }),
     );
   });
+
+  it('P2 item 4: storage quota error on intermediate unit checkpoint does not strand conversion and keeps retry available', async () => {
+    vi.mocked(listConversions).mockResolvedValue(snapshot([]));
+    const restoreRef: { fn: (() => void) | null } = { fn: null };
+    let unitCallCount = 0;
+    vi.mocked(addCustomUnit).mockImplementation(() => {
+      unitCallCount += 1;
+      if (unitCallCount === 1) {
+        const spy = vi
+          .spyOn(Storage.prototype, 'setItem')
+          .mockImplementation(() => {
+            throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+          });
+        restoreRef.fn = () => {
+          spy.mockRestore();
+        };
+      }
+      return Promise.resolve('دلو-1');
+    });
+    vi.mocked(addConversion)
+      .mockRejectedValueOnce(new Error('تعذر الاتصال'))
+      .mockResolvedValueOnce(undefined);
+
+    try {
+      render(<ConversionsPanel item={item} />);
+      expect(
+        await screen.findByRole('option', { name: 'كيس' }),
+      ).toBeInTheDocument();
+
+      addFreshUnit();
+
+      // Even though storage quota failed on the intermediate checkpoint after
+      // addCustomUnit succeeded, addConversion must still run and the failed
+      // conversion must transition to unknown so this tab offers retry.
+      await waitFor(() => {
+        expect(addConversion).toHaveBeenCalledTimes(1);
+      });
+      expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+      const retryBtn = screen.getByRole('button', { name: 'إعادة المحاولة' });
+      expect(retryBtn).toBeEnabled();
+
+      // Recover storage and retry: must replay addCustomUnit with the same
+      // durable unitRequestId and then complete addConversion.
+      restoreRef.fn?.();
+      restoreRef.fn = null;
+      fireEvent.click(retryBtn);
+      await waitFor(() => {
+        expect(addConversion).toHaveBeenCalledTimes(2);
+      });
+      expect(vi.mocked(addCustomUnit).mock.calls[0]?.[2]).toBeTruthy();
+      if (vi.mocked(addCustomUnit).mock.calls.length > 1) {
+        expect(vi.mocked(addCustomUnit).mock.calls[1]?.[2]).toBe(
+          vi.mocked(addCustomUnit).mock.calls[0]?.[2],
+        );
+      }
+      expect(sentTiming(1).requestId).toBe(sentTiming(0).requestId);
+    } finally {
+      restoreRef.fn?.();
+    }
+  });
 });

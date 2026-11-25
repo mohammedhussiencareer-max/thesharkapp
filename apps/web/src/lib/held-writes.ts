@@ -10,12 +10,19 @@ import { readSupabaseEnv } from '@/lib/supabase';
  * - `unknown`: reply was lost or outcome did not prove absence. The owner
  *   must explicitly retry the exact same request id and payload.
  * - `waiting_for_sync`: server stored a count request awaiting a covering sync.
+ * - `awaiting_reconfirm`: activation draft refreshed after manifest change;
+ *   keeps the request id and awaits owner reconfirmation. Recovery never
+ *   promotes it to `unknown`.
  * - `posted_reload`: write succeeded, waiting for the post-write read to
  *   succeed before unlocking. Never re-sends; clears only once a read covering
  *   its request id and read target succeeds.
  */
 export type HeldWritePhase =
-  'inflight' | 'unknown' | 'waiting_for_sync' | 'posted_reload';
+  | 'inflight'
+  | 'unknown'
+  | 'waiting_for_sync'
+  | 'awaiting_reconfirm'
+  | 'posted_reload';
 
 /**
  * Extension point for future writers (e.g. `'sync'` in P7-6 and
@@ -40,6 +47,8 @@ export type HeldWriteRecord<T = unknown> = {
   requestId: string;
   /** Changes on every dispatch claim, including a replay of the same request. */
   claimId?: string;
+  /** Identifies the in-memory writer that confirmed a posted claim. */
+  postedBy?: string;
   payload: T;
   phase: HeldWritePhase;
   /**
@@ -165,12 +174,16 @@ const VALID_PHASES: ReadonlySet<string> = new Set<HeldWritePhase>([
   'inflight',
   'unknown',
   'waiting_for_sync',
+  'awaiting_reconfirm',
   'posted_reload',
 ]);
 
 function isUnresolvedPhase(phase: HeldWritePhase): boolean {
   return (
-    phase === 'inflight' || phase === 'unknown' || phase === 'waiting_for_sync'
+    phase === 'inflight' ||
+    phase === 'unknown' ||
+    phase === 'waiting_for_sync' ||
+    phase === 'awaiting_reconfirm'
   );
 }
 
@@ -256,6 +269,9 @@ function parseRecord(raw: string): HeldWriteRecord | null {
     record.kind = row.kind;
   }
   if (typeof row.claimId === 'string') record.claimId = row.claimId;
+  if (record.phase === 'posted_reload' && typeof row.postedBy === 'string') {
+    record.postedBy = row.postedBy;
+  }
   if (typeof row.readTarget === 'string' && row.readTarget.length > 0) {
     record.readTarget = row.readTarget;
   }
@@ -349,6 +365,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   let userScope: UserScopeState = { mode: 'uninitialized' };
   let writesLocked = false;
   let sessionGeneration = 0;
+  let postedOwner: { generation: number; id: string } | undefined;
   let hydrationRunId = 0;
   let hydratedScopeKey: string | null = null;
   let hydrationPromise: Promise<void> = Promise.resolve();
@@ -804,6 +821,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         return false;
       }
       if (!sameClaim(stored, expected)) return false;
+      if (stored.phase !== 'inflight') return false;
       const posted =
         readPostedCopy(stored, userId, projectUrl) ??
         readAliasPostedCopy(stored, userId, projectUrl);
@@ -1518,12 +1536,42 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     return stored as HeldWriteRecord<T>;
   }
 
+  function readBlockingPostedCopy(
+    subject: string,
+    userId: string,
+    readTarget: string | undefined,
+    ownerId: string | undefined,
+  ): HeldWriteRecord | null {
+    for (const key of safeListKeys(
+      postedSubjectPrefix(subject, userId),
+      true,
+    )) {
+      const record = readDurableRecord(key);
+      if (
+        !record ||
+        record.subject !== subject ||
+        record.phase !== 'posted_reload' ||
+        (ownerId !== undefined && record.postedBy === ownerId)
+      ) {
+        continue;
+      }
+      if (
+        readTarget === undefined ||
+        readTarget === '*' ||
+        record.readTarget === undefined ||
+        record.readTarget === '*' ||
+        record.readTarget === readTarget
+      ) {
+        return record;
+      }
+    }
+    return null;
+  }
+
   /**
-   * Atomically claim a fresh write on `subject` using Web Locks when available.
-   * Captures (or uses) the write session before awaiting the lock, then under
-   * the lock rechecks session generation + user + `navigator.onLine`, refuses
-   * if any unresolved pin exists in localStorage, and persists `inflight`.
-   * The caller MUST invoke `release()` after updating storage on completion.
+   * Atomically claim a fresh write on `subject` under its Web Lock. Rechecks
+   * the write session, connectivity and applicable pins before persisting
+   * `inflight`. The caller must release after settling its claim.
    */
   async function claimFreshHeldWrite<T>(
     subject: string,
@@ -1531,6 +1579,9 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     opts?: {
       requestId?: string;
       kind?: HeldWriteKind;
+      readTarget?: string;
+      /** A new operation may proceed while this tab verifies its own earlier posts. */
+      allowOwnPostedReloads?: boolean;
       session?: WriteSession | null;
       checkConflict?: () => HeldWriteRecord | null;
     },
@@ -1582,13 +1633,19 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
           opts?.requestId === undefined
             ? null
             : readPostedCopy({ subject, requestId: opts.requestId }, userId);
+        const ownerId =
+          opts?.allowOwnPostedReloads &&
+          postedOwner?.generation === session.generation
+            ? postedOwner.id
+            : undefined;
         const posted =
           requestedPosted ??
           (stored?.phase === 'posted_reload'
             ? stored
             : stored && stored.requestId !== opts?.requestId
               ? readPostedCopy(stored, userId)
-              : null);
+              : null) ??
+          readBlockingPostedCopy(subject, userId, opts?.readTarget, ownerId);
         if (posted) {
           observePostedCopy(posted);
           emit();
@@ -1797,7 +1854,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         (opts?.payload !== undefined &&
           (!expected ||
             !sameClaim(stored, expected) ||
-            stored.phase !== 'inflight'))
+            (stored.phase !== 'inflight' &&
+              stored.phase !== 'awaiting_reconfirm')))
       ) {
         records.set(subject, preserved);
         emit();
@@ -1868,7 +1926,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   function abortClaimBeforeDispatch(
     subject: string,
     requestId: string,
-    priorPhase: 'inflight' | 'unknown' | 'waiting_for_sync' | null,
+    priorPhase:
+      'inflight' | 'unknown' | 'waiting_for_sync' | 'awaiting_reconfirm' | null,
     release: () => void,
   ): void {
     try {
@@ -2293,10 +2352,20 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       payload: phase === 'posted_reload' ? null : preserved.payload,
       phase,
     };
-    if (phase === 'posted_reload' && phaseOptions?.readTarget) {
-      next.readTarget = phaseOptions.readTarget;
-    } else if (phase !== 'posted_reload') {
+    if (phase === 'posted_reload') {
+      if (stored.claimId !== undefined && claimSessions.has(stored.claimId)) {
+        if (postedOwner?.generation !== sessionGeneration) {
+          postedOwner = {
+            generation: sessionGeneration,
+            id: crypto.randomUUID(),
+          };
+        }
+        next.postedBy = postedOwner.id;
+      }
+      if (phaseOptions?.readTarget) next.readTarget = phaseOptions.readTarget;
+    } else {
       delete next.readTarget;
+      delete next.postedBy;
     }
     if (phase !== 'unknown') {
       delete next.awaitingReviewReload;
@@ -2732,6 +2801,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   }): void {
     cancelPendingPromotions();
     releaseAllLocks();
+    postedOwner = undefined;
     const shouldClearStorage = resetOptions?.clearStorage !== false;
     if (shouldClearStorage) {
       const userId = activeUserId();

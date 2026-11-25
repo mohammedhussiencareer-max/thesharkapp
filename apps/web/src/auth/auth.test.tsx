@@ -758,13 +758,123 @@ describe('login', () => {
       );
 
       expect(
-        await screen.findByText('البريد أو كلمة السر غلط'),
+        await screen.findByText('تعذر تسجيل الدخول، حاول مرة أخرى'),
       ).toBeInTheDocument();
+      expect(screen.queryByText('البريد أو كلمة السر غلط')).toBeNull();
       expect(
         screen.getByRole('button', { name: 'تسجيل الدخول' }),
       ).toBeEnabled();
     } finally {
       authState.signInThrow = null;
+    }
+  });
+
+  it('item 8a: signIn returns failed and LoginPage shows neutral Arabic error for thrown network/storage errors while keeping wrong credentials as invalid', async () => {
+    authState.signInThrow = new TypeError('Failed to fetch');
+    try {
+      renderApp('/login');
+      await screen.findByRole('heading', { name: 'تسجيل الدخول' });
+
+      fillForm();
+      fireEvent.submit(
+        screen.getByRole('button', { name: 'تسجيل الدخول' }).closest('form')!,
+      );
+
+      expect(
+        await screen.findByText('تعذر تسجيل الدخول، حاول مرة أخرى'),
+      ).toBeInTheDocument();
+      expect(screen.queryByText('البريد أو كلمة السر غلط')).toBeNull();
+      expect(
+        screen.getByRole('button', { name: 'تسجيل الدخول' }),
+      ).toBeEnabled();
+    } finally {
+      authState.signInThrow = null;
+    }
+  });
+
+  it('item 8b: throw after server accepted sign-in returns failed and leaves a consistent signed-out state with server session revoked', async () => {
+    const { createAuthStore } = await import('@/lib/auth-store');
+    type StoreClient = ReturnType<
+      NonNullable<
+        NonNullable<Parameters<typeof createAuthStore>[0]>['getClient']
+      >
+    >;
+    const acceptedUser = {
+      id: 'owner-post-throw',
+      email: 'owner@theshark.test',
+    };
+    const acceptedSession: NonNullable<Session> = {
+      access_token: 'tok-accepted',
+      refresh_token: 'rt-accepted',
+      user: acceptedUser,
+    };
+    const listeners = new Set<
+      (event: string, session: Session | null) => void
+    >();
+    const signOutMock = vi.fn(() => Promise.resolve({ error: null }));
+    const fakeClient = {
+      auth: {
+        getSession: vi.fn(() =>
+          Promise.resolve({ data: { session: null }, error: null }),
+        ),
+        onAuthStateChange: vi.fn(
+          (cb: (event: string, session: Session | null) => void) => {
+            listeners.add(cb);
+            return {
+              data: {
+                subscription: {
+                  unsubscribe: () => {
+                    listeners.delete(cb);
+                  },
+                },
+              },
+            };
+          },
+        ),
+        signInWithPassword: vi.fn(() => {
+          // Server accepted sign-in and SDK emitted SIGNED_IN.
+          for (const cb of listeners) cb('SIGNED_IN', acceptedSession);
+          return Promise.resolve({
+            data: { user: acceptedUser, session: acceptedSession },
+            error: null,
+          });
+        }),
+        signOut: signOutMock,
+      },
+      schema: vi.fn(() => ({
+        rpc: vi.fn(() => Promise.resolve({ data: true, error: null })),
+      })),
+    };
+
+    let throwOnSubscribe = false;
+    const store = createAuthStore({
+      getClient: () => fakeClient as unknown as StoreClient,
+      getStorage: () => window.localStorage,
+      getSessionStorage: () => window.sessionStorage,
+      getProjectUrl: () => 'https://post-throw.example.test',
+      syncGlobalStores: false,
+    });
+    try {
+      store.startAuth();
+      const unsub = store.subscribeAuth(() => {
+        if (throwOnSubscribe) {
+          throw new Error('post-accept failure');
+        }
+      });
+      throwOnSubscribe = true;
+      const result = await store.signIn(
+        'owner@theshark.test',
+        'ValidPassword123',
+      );
+      unsub();
+
+      // Must return 'failed' (not 'invalid') AND leave a consistent state:
+      // if failed, session must be rolled back (signed-out) and server session revoked.
+      expect(result).toBe('failed');
+      expect(store.getAuthSnapshot().status).toBe('signed-out');
+      expect(signOutMock).toHaveBeenCalled();
+    } finally {
+      store.resetAuthStore();
     }
   });
 });

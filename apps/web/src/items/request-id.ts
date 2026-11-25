@@ -202,7 +202,7 @@ export function pinActivationReviewReload(
   requestId: string,
 ): void {
   updateHeldWritePayload(subject, requestId, undefined, {
-    phase: 'inflight',
+    phase: 'awaiting_reconfirm',
     awaitingReviewReload: true,
   });
 }
@@ -210,6 +210,8 @@ export function pinActivationReviewReload(
 /**
  * Keeps the request id, replaces the payload, and clears unknown.
  * Used after `opening manifest changed`, which proved this id stored nothing.
+ * Stored in the `awaiting_reconfirm` draft phase so recovery in another tab
+ * never promotes it to an `unknown` retry.
  */
 export function replaceActivationPayload<T extends { requestId: string }>(
   subject: string,
@@ -221,7 +223,7 @@ export function replaceActivationPayload<T extends { requestId: string }>(
     return false;
   return updateHeldWritePayload(subject, requestId, next, {
     expected,
-    phase: 'inflight',
+    phase: 'awaiting_reconfirm',
     awaitingReviewReload: false,
   });
 }
@@ -244,12 +246,9 @@ export function updateActionPayload<T>(
 export function claimFreshAction<T>(
   subject: string,
   create: (requestId: string) => T,
-  opts?: { session?: WriteSession | null },
+  opts?: { session?: WriteSession | null; allowOwnPostedReloads?: boolean },
 ): Promise<ClaimHeldWriteResult<T>> {
-  return claimFreshHeldWrite<T>(subject, create, {
-    kind: 'action',
-    ...(opts?.session !== undefined ? { session: opts.session } : {}),
-  });
+  return claimFreshHeldWrite<T>(subject, create, { ...opts, kind: 'action' });
 }
 
 /**

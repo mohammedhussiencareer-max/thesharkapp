@@ -11,6 +11,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   addExpenseCategory,
   addExpenseEntry,
+  hasExpenseRequest,
   loadExpenseMonth,
   renameExpenseCategory,
   setExpenseCategoryActive,
@@ -30,13 +31,14 @@ import {
 } from '@/expenses/errors';
 import { genericCatalogError } from '@/items/errors';
 import { formatMonth } from '@/lib/cairo';
-import { hasPostedReload } from '@/lib/held-writes';
+import { getHeldWrite, hasPostedReload } from '@/lib/held-writes';
 import { formatEgpText } from '@/lib/money';
 import { ExpensesPage } from '@/pages/ExpensesPage';
 
 vi.mock('@/expenses/api', () => ({
   loadExpenseMonth: vi.fn(),
   addExpenseEntry: vi.fn(),
+  hasExpenseRequest: vi.fn(),
   voidExpenseEntry: vi.fn(),
   addExpenseCategory: vi.fn(),
   renameExpenseCategory: vi.fn(),
@@ -128,6 +130,7 @@ describe('ExpensesPage', () => {
       Promise.resolve(monthData(monthStart)),
     );
     vi.mocked(addExpenseEntry).mockResolvedValue(undefined);
+    vi.mocked(hasExpenseRequest).mockResolvedValue(false);
     vi.mocked(voidExpenseEntry).mockResolvedValue(undefined);
     vi.mocked(setMonthExpenseComplete).mockResolvedValue(undefined);
     vi.mocked(addExpenseCategory).mockResolvedValue(undefined);
@@ -378,7 +381,7 @@ describe('ExpensesPage', () => {
     const [first, second, third] = vi.mocked(addExpenseEntry).mock.calls;
     expect(second?.[0]).toEqual(first?.[0]);
     expect(third?.[0]).toMatchObject({ amount: '2000.00' });
-    expect(third?.[0]?.requestId).toBe(first?.[0]?.requestId);
+    expect(third?.[0]?.requestId).not.toBe(first?.[0]?.requestId);
   });
 
   it('clears a pinned expense after that payload succeeds', async () => {
@@ -949,7 +952,7 @@ describe('ExpensesPage', () => {
     const [first, second, third] = vi.mocked(voidExpenseEntry).mock.calls;
     expect(second).toEqual(first);
     expect(third?.[1]).toBe('سبب صحيح');
-    expect(third?.[2]).toBe(first?.[2]);
+    expect(third?.[2]).not.toBe(first?.[2]);
   });
 
   it('clears a pinned void after the same payload succeeds', async () => {
@@ -1241,5 +1244,87 @@ describe('ExpensesPage', () => {
     // Visible data still shows May, NOT overwritten with April's entries.
     expect(screen.getByText('مصروف مايو')).toBeInTheDocument();
     expect(screen.queryByText('مصروف أبريل')).toBeNull();
+  });
+
+  it('P2 item 1a: stale expense retry sends claim.record.payload instead of stale render draft', async () => {
+    vi.mocked(addExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    renderPage();
+    await saveRent('1000');
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    // Update the durable expense:new record in localStorage without firing a
+    // storage event so this tab's React state still holds the stale draft.
+    let updatedKey: string | null = null;
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const k = localStorage.key(i);
+      if (!k || !k.includes(encodeURIComponent('expense:new'))) continue;
+      const raw = localStorage.getItem(k);
+      if (!raw) continue;
+      const parsed = JSON.parse(raw) as {
+        payload: Record<string, unknown>;
+      };
+      parsed.payload = { ...parsed.payload, note: 'من التاب الأول' };
+      localStorage.setItem(k, JSON.stringify(parsed));
+      updatedKey = k;
+    }
+    expect(updatedKey).not.toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(addExpenseEntry).mock.calls[1]?.[0]).toMatchObject({
+      note: 'من التاب الأول',
+    });
+  });
+
+  it('P2 item 1b: request_id mismatch refusal does not blindly clear the recovery pin', async () => {
+    vi.mocked(addExpenseEntry)
+      .mockRejectedValueOnce(new Error(retrySafeMessage))
+      .mockRejectedValueOnce(
+        new Error(
+          'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع مصاريف الشهر قبل ما تسجّل تاني',
+          {
+            cause: {
+              code: '22023',
+              message: 'request_id already used for a different expense',
+            },
+          },
+        ),
+      );
+    renderPage();
+    await saveRent('1000');
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع مصاريف الشهر قبل ما تسجّل تاني',
+    );
+    // Recovery pin must NOT be blindly erased on a request_id mismatch.
+    expect(
+      getHeldWrite('expense:new') !== null || hasPostedReload('expense:new'),
+    ).toBe(true);
+  });
+
+  it('P2 item 1c: definitive refusal of an unknown expense mints a new request id for the next submit', async () => {
+    vi.mocked(addExpenseEntry)
+      .mockRejectedValueOnce(new Error(retrySafeMessage))
+      .mockRejectedValueOnce(phoneRefusal());
+    renderPage();
+    await saveRent('1000');
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(phoneMessage);
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(2));
+
+    fireEvent.change(screen.getByLabelText('المبلغ'), {
+      target: { value: '2000' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(3));
+    const [first, , third] = vi.mocked(addExpenseEntry).mock.calls;
+    expect(third?.[0]?.requestId).not.toBe(first?.[0]?.requestId);
   });
 });

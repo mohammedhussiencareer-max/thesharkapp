@@ -14,15 +14,18 @@ import {
   retrySafeMessage,
 } from '@/purchases/errors';
 import {
+  getPurchaseById,
   listPurchases,
   listStockChoices,
   listUnitsAt,
   recordPurchase,
 } from '@/purchases/api';
+import { hasPostedReload } from '@/lib/held-writes';
 import { PurchasesPage } from '@/pages/PurchasesPage';
 import type { Purchase, StockChoice, UnitOption } from '@/purchases/types';
 
 vi.mock('@/purchases/api', () => ({
+  getPurchaseById: vi.fn(),
   listStockChoices: vi.fn(),
   listPurchases: vi.fn(),
   recordPurchase: vi.fn(),
@@ -74,9 +77,11 @@ async function renderPage() {
 
 describe('PurchasesPage', () => {
   beforeEach(() => {
+    vi.mocked(getPurchaseById).mockReset();
     vi.mocked(listStockChoices).mockReset();
     vi.mocked(listPurchases).mockReset();
     vi.mocked(recordPurchase).mockReset();
+    vi.mocked(getPurchaseById).mockResolvedValue(purchase('مورد'));
     vi.mocked(listStockChoices).mockResolvedValue([oil]);
     vi.mocked(listPurchases).mockResolvedValue([]);
     vi.mocked(recordPurchase).mockResolvedValue(undefined);
@@ -179,7 +184,7 @@ describe('PurchasesPage', () => {
     let releaseSave: () => void = () => undefined;
     vi.mocked(recordPurchase).mockReturnValueOnce(
       new Promise((resolve) => {
-        releaseSave = () => resolve();
+        releaseSave = () => resolve(undefined);
       }),
     );
     fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
@@ -344,5 +349,78 @@ describe('PurchasesPage', () => {
     expect(vi.mocked(recordPurchase).mock.calls[1]?.[0]?.requestId).toBe(
       vi.mocked(recordPurchase).mock.calls[0]?.[0]?.requestId,
     );
+  });
+
+  it('P2 item 3: inverted date filter does not block purchase verification or filter edits', async () => {
+    await renderPage();
+    fireEvent.change(screen.getByLabelText('من'), {
+      target: { value: '2026-07-20' },
+    });
+    fireEvent.change(screen.getByLabelText('إلى'), {
+      target: { value: '2026-07-01' },
+    });
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'تاريخ البداية لازم يكون قبل تاريخ النهاية',
+    );
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'مراجعة' })).toBeEnabled();
+    });
+
+    fillAndReview();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'اتسجلت المشتريات',
+    );
+
+    // Verification must succeed independently of the inverted filter, clearing
+    // posted_reload and leaving both filter inputs and the form usable.
+    await waitFor(() => {
+      expect(hasPostedReload('purchase:new')).toBe(false);
+    });
+    expect(screen.getByLabelText('من')).toBeEnabled();
+    expect(screen.getByLabelText('إلى')).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'مراجعة' })).toBeEnabled();
+  });
+
+  it('P2 item 3b: purchase verification checks the saved purchase by id independently of an excluding history filter', async () => {
+    await renderPage();
+    // Filter excludes the saved purchase's date; listPurchases returns [].
+    fireEvent.change(screen.getByLabelText('من'), {
+      target: { value: '2025-01-01' },
+    });
+    fireEvent.change(screen.getByLabelText('إلى'), {
+      target: { value: '2025-01-31' },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'مراجعة' })).toBeEnabled();
+    });
+
+    vi.mocked(recordPurchase).mockResolvedValueOnce('purch-saved-1');
+    vi.mocked(getPurchaseById)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(purchase('مورد محفوظ'));
+
+    fillAndReview();
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'اتسجلت المشتريات',
+    );
+
+    // Even though filtered listPurchases returned [], posted_reload must NOT
+    // clear when getPurchaseById does not find the saved purchase.
+    await waitFor(() => {
+      expect(getPurchaseById).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'purch-saved-1' }),
+      );
+    });
+    expect(hasPostedReload('purchase:new', 'purch-saved-1')).toBe(true);
+    expect(screen.getByRole('button', { name: 'مراجعة' })).toBeDisabled();
+
+    // Retry succeeds once getPurchaseById returns the saved purchase.
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => {
+      expect(hasPostedReload('purchase:new', 'purch-saved-1')).toBe(false);
+    });
+    expect(screen.getByRole('button', { name: 'مراجعة' })).toBeEnabled();
   });
 });

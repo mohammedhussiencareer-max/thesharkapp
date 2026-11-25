@@ -11,6 +11,8 @@ export type LogoutPhase =
   | 'revocation_failed'
   | 'retrying_revocation';
 
+export type SignInResult = 'ok' | 'invalid' | 'failed';
+
 export type AuthValue = {
   status: AuthStatus;
   email: string | null;
@@ -19,7 +21,7 @@ export type AuthValue = {
   logoutFailed?: boolean;
   logoutRevocationFailed?: boolean;
   canRetryLogoutRevocation?: boolean;
-  signIn: (email: string, password: string) => Promise<'ok' | 'invalid'>;
+  signIn: (email: string, password: string) => Promise<SignInResult>;
   signOut: () => Promise<void>;
   retryLogoutRevocation?: () => Promise<void>;
   retry: () => void;

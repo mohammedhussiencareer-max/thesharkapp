@@ -1953,9 +1953,9 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
   async function signIn(
     email: string,
     password: string,
-  ): Promise<'ok' | 'invalid'> {
+  ): Promise<'ok' | 'invalid' | 'failed'> {
     const client = deps.getClient();
-    if (!client) return 'invalid';
+    if (!client) return 'failed';
     if (pendingSignOutPromise) {
       await pendingSignOutPromise.catch(() => {});
     }
@@ -1977,12 +1977,14 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     }
 
     signInInProgress = true;
+    let acceptedSession: Session | null = null;
     try {
       const { data, error } = await client.auth.signInWithPassword({
         email,
         password,
       });
       if (error) return 'invalid';
+      acceptedSession = data?.session ?? machine.session ?? null;
 
       const attemptId = nextAttemptId(storage);
       const newSessionKey =
@@ -2006,7 +2008,41 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       }
       return 'ok';
     } catch {
-      return 'invalid';
+      const sessionToClear = acceptedSession ?? machine.session;
+      const persistedToClear = readPersistedSupabaseSession(storage);
+      const retained =
+        extractRevocationSession(sessionToClear) ?? persistedToClear;
+      if (sessionToClear !== null || persistedToClear !== null) {
+        const targetKey = sessionKeyOf(retained);
+        lockSessionForSignOut({ clearResolvedPins: false });
+        machine.status = 'signed-out';
+        machine.email = null;
+        machine.logoutPhase = 'idle';
+        machine.activeAttemptId = null;
+        machine.backedByStorage = false;
+        machine.retainedRevocationSession = null;
+        if (targetKey !== null) {
+          machine.revokedSessionKey = targetKey;
+        }
+        if (storage) {
+          removePersistedSupabaseCredentials(storage, targetKey);
+        }
+        try {
+          if (retained && hasDirectRevocationTransport(client)) {
+            await revokeSessionGlobally(client, retained);
+          } else {
+            await client.auth.signOut();
+          }
+        } catch {
+          // Best-effort server session revocation on post-accept rollback.
+        }
+        try {
+          emit();
+        } catch {
+          // Never re-throw from subscriber during rollback.
+        }
+      }
+      return 'failed';
     } finally {
       signInInProgress = false;
     }
@@ -2317,7 +2353,7 @@ export function isAuthResolved(): boolean {
 export function signIn(
   email: string,
   password: string,
-): Promise<'ok' | 'invalid'> {
+): Promise<'ok' | 'invalid' | 'failed'> {
   return defaultAuthStore.signIn(email, password);
 }
 

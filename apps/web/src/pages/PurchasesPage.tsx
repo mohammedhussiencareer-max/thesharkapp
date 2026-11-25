@@ -16,6 +16,7 @@ import {
   snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
+  type PostedReloadSnapshot,
 } from '@/lib/held-writes';
 import {
   isOnline,
@@ -25,6 +26,7 @@ import {
 } from '@/lib/online';
 import { isPayloadRefusal, isUnknownOutcome } from '@/lib/write-outcome';
 import {
+  getPurchaseById,
   listPurchases,
   listStockChoices,
   listUnitsAt,
@@ -64,6 +66,27 @@ const secondaryButton =
   'w-fit rounded border border-neutral-300 px-3 py-2 disabled:opacity-60';
 
 type Snapshot = { choices: StockChoice[]; purchases: Purchase[] };
+
+async function verifyPostedPurchases(
+  items: PostedReloadSnapshot,
+): Promise<void> {
+  if (items.length === 0 || typeof getPurchaseById !== 'function') return;
+  await Promise.all(
+    items.map(async (item) => {
+      const id =
+        item.readTarget && item.readTarget !== '*'
+          ? item.readTarget
+          : undefined;
+      const verified = await getPurchaseById({
+        ...(id ? { id } : {}),
+        requestId: item.requestId,
+      });
+      if (!verified) {
+        throw new Error(genericPurchaseError);
+      }
+    }),
+  );
+}
 
 /** Persist only retry fields (no itemName, baseQuantity, or unitCost) in localStorage. */
 function toStoredPurchaseDraft(draft: PurchaseDraft): StoredPurchaseDraft {
@@ -185,27 +208,53 @@ export function PurchasesPage() {
   const postedReload = stored?.phase === 'posted_reload';
   const needsReload = localNeedsReload || postedReload;
   const editingLocked = saving || inflight || needsReload;
+  const filterLocked =
+    saving || inflight || (needsReload && filterError === null);
   const busy = editingLocked || loads > 0;
   const writeLocked = busy || !online;
 
-  async function readSnapshot(): Promise<Snapshot | null> {
+  async function readSnapshot(options?: {
+    verifyPins?: PostedReloadSnapshot;
+  }): Promise<{ choices: StockChoice[]; purchases: Purchase[] | null } | null> {
+    const verifyPins = options?.verifyPins ?? [];
     const range = dateRangeError(filterRef.current.from, filterRef.current.to);
-    if (range) {
-      setFilterError(range);
-      return null;
-    }
-    const fromIso = filterRef.current.from
-      ? cairoDateStartIso(filterRef.current.from)
-      : null;
-    const toExclusive = filterRef.current.to
-      ? cairoNextDateStartIso(filterRef.current.to)
-      : null;
-    if (
-      (filterRef.current.from && !fromIso) ||
+    const fromIso =
+      !range && filterRef.current.from
+        ? cairoDateStartIso(filterRef.current.from)
+        : null;
+    const toExclusive =
+      !range && filterRef.current.to
+        ? cairoNextDateStartIso(filterRef.current.to)
+        : null;
+    const dateError =
+      range ??
+      ((filterRef.current.from && !fromIso) ||
       (filterRef.current.to && !toExclusive)
-    ) {
-      setFilterError('التاريخ مش مظبوط');
-      return null;
+        ? 'التاريخ مش مظبوط'
+        : null);
+    if (dateError) {
+      setFilterError(dateError);
+      if (verifyPins.length === 0) {
+        return null;
+      }
+      const seq = ++seqRef.current;
+      loadsRef.current += 1;
+      setLoads(loadsRef.current);
+      try {
+        const [nextChoices] = await Promise.all([
+          listStockChoices(),
+          verifyPostedPurchases(verifyPins),
+        ]);
+        return seq === seqRef.current
+          ? { choices: nextChoices, purchases: null }
+          : null;
+      } catch (error) {
+        if (seq !== seqRef.current) return null;
+        throw error;
+      } finally {
+        loadsRef.current -= 1;
+        setLoads(loadsRef.current);
+      }
     }
     setFilterError(null);
     const seq = ++seqRef.current;
@@ -218,6 +267,7 @@ export function PurchasesPage() {
           from: fromIso ?? undefined,
           toExclusive: toExclusive ?? undefined,
         }),
+        verifyPostedPurchases(verifyPins),
       ]);
       return seq === seqRef.current
         ? { choices: nextChoices, purchases }
@@ -236,9 +286,12 @@ export function PurchasesPage() {
     const pendingReloads = snapshotPostedReloads({ subject: PURCHASE_SUBJECT });
     void (async () => {
       try {
-        const next = await readSnapshot();
+        const next = await readSnapshot({ verifyPins: pendingReloads });
         if (cancelled || !next) return;
-        setSnapshot(next);
+        setSnapshot((current) => ({
+          choices: next.choices,
+          purchases: next.purchases ?? current?.purchases ?? [],
+        }));
         rememberChoiceNames(next.choices);
         setLoadError(null);
         await clearPostedReloadSnapshot(pendingReloads);
@@ -283,7 +336,7 @@ export function PurchasesPage() {
   }
 
   function changeFilter(next: { from: string; to: string }) {
-    if (editingLocked) return;
+    if (filterLocked) return;
     filterRef.current = next;
     setFrom(next.from);
     setTo(next.to);
@@ -347,18 +400,37 @@ export function PurchasesPage() {
     const hydratedDraft =
       hydratePurchaseDraft(claim.record.payload, choices, knownNames) ?? draft;
     try {
-      await recordPurchase(hydratedDraft);
+      const savedPurchaseId = await recordPurchase(hydratedDraft);
       saved = true;
-      setHeldWritePhase(PURCHASE_SUBJECT, draft.requestId, 'posted_reload');
+      setHeldWritePhase(
+        PURCHASE_SUBJECT,
+        draft.requestId,
+        'posted_reload',
+        savedPurchaseId ? { readTarget: savedPurchaseId } : undefined,
+      );
       setLocalNeedsReload(true);
       setFormEpoch((value) => value + 1);
       setSuccess('اتسجلت المشتريات');
-      const next = await readSnapshot();
+      const verifyPins: PostedReloadSnapshot = [
+        {
+          subject: PURCHASE_SUBJECT,
+          requestId: draft.requestId,
+          ...(savedPurchaseId ? { readTarget: savedPurchaseId } : {}),
+        },
+      ];
+      const next = await readSnapshot({ verifyPins });
       if (next) {
-        setSnapshot(next);
+        setSnapshot((current) => ({
+          choices: next.choices,
+          purchases: next.purchases ?? current?.purchases ?? [],
+        }));
         rememberChoiceNames(next.choices);
         setLoadError(null);
-        await clearPostedReload(PURCHASE_SUBJECT, undefined, draft.requestId);
+        await clearPostedReload(
+          PURCHASE_SUBJECT,
+          savedPurchaseId,
+          draft.requestId,
+        );
         setLocalNeedsReload(false);
       }
     } catch (error) {
@@ -412,7 +484,7 @@ export function PurchasesPage() {
           <input
             className={fieldClass}
             type="date"
-            disabled={editingLocked}
+            disabled={filterLocked}
             value={from}
             onChange={(event) =>
               changeFilter({
@@ -427,7 +499,7 @@ export function PurchasesPage() {
           <input
             className={fieldClass}
             type="date"
-            disabled={editingLocked}
+            disabled={filterLocked}
             value={to}
             onChange={(event) =>
               changeFilter({

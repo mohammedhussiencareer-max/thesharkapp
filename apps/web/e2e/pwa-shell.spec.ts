@@ -194,6 +194,22 @@ test('serves Arabic RTL manifest, registers shell-only service worker, and keeps
     expect(secondFetch).toEqual({ ok: true, status: 200, hit: 2 });
     expect(networkHits).toBe(2);
 
+    const cachedUrlsAfterProbes = await page.evaluate<string[]>(`(async () => {
+      const urls = [];
+      const cacheNames = await caches.keys();
+      for (const name of cacheNames) {
+        const cache = await caches.open(name);
+        const keys = await cache.keys();
+        for (const req of keys) urls.push(req.url);
+      }
+      return urls;
+    })()`);
+    expect(
+      cachedUrlsAfterProbes.some(
+        (url) => url.includes('/rest/v1/') || url.includes('/auth/v1/'),
+      ),
+    ).toBe(false);
+
     await context.setOffline(true);
     try {
       // Loopback API read MUST fail offline (never served from SW cache or HTTP cache).

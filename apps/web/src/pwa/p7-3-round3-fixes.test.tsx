@@ -51,6 +51,7 @@ import { cairoMonthInput } from '@/lib/cairo';
 import {
   claimFreshHeldWrite,
   clearHeldWrite,
+  createHeldWriteStore,
   getHeldWrite,
   hasPostedReload,
   putHeldWrite,
@@ -597,29 +598,46 @@ describe('P7-3 round-3 review fixes', () => {
     expect(hasPostedReload(subjectA, subjectA)).toBe(true);
   });
 
-  it('R3-2c: claimFreshAction does not discard an existing posted_reload pin on a second submit', async () => {
-    const subject = 'mapping:base:pos-1:';
-    const first = await claimFreshAction(subject, (requestId) => ({
-      requestId,
-      n: 1,
-    }));
-    expect(first.ok).toBe(true);
-    if (!first.ok) return;
-    markActionPostedReload(subject, first.record.requestId, subject);
-    first.release();
-    await Promise.resolve();
-    expect(hasPostedReload(subject, subject)).toBe(true);
+  it('R3-2c: a newer mapping claim preserves the earlier posted pin and a stale tab is blocked', async () => {
+    const subject = baseSubject('pos-1', '');
+    const staleTab = createHeldWriteStore();
+    const opts = { allowOwnPostedReloads: true };
+    try {
+      const first = await claimFreshAction(
+        subject,
+        (requestId) => ({
+          requestId,
+          n: 1,
+        }),
+        opts,
+      );
+      expect(first.ok).toBe(true);
+      if (!first.ok) return;
+      markActionPostedReload(subject, first.record.requestId, subject);
+      first.release();
+      await Promise.resolve();
+      expect(hasPostedReload(subject, subject)).toBe(true);
 
-    const second = await claimFreshAction(subject, (requestId) => ({
-      requestId,
-      n: 2,
-    }));
-    expect(second.ok).toBe(true);
-    if (!second.ok) return;
-    expect(second.record.requestId).not.toBe(first.record.requestId);
-    second.release();
-    // First posted_reload pin MUST NOT be discarded by the second submit.
-    expect(hasPostedReload(subject, subject)).toBe(true);
+      const create = (requestId: string) => ({ requestId, n: 2 });
+      const blocked = await staleTab.claimFreshHeldWrite(subject, create, opts);
+      expect(blocked.ok).toBe(false);
+      if (!blocked.ok) {
+        expect(blocked.reason).toBe('conflict');
+        expect(blocked.existing?.phase).toBe('posted_reload');
+        expect(blocked.existing?.requestId).toBe(first.record.requestId);
+      }
+
+      const second = await claimFreshAction(subject, create, opts);
+      expect(second.ok).toBe(true);
+      if (!second.ok) return;
+      expect(second.record.requestId).not.toBe(first.record.requestId);
+      second.release();
+      expect(hasPostedReload(subject, subject, first.record.requestId)).toBe(
+        true,
+      );
+    } finally {
+      staleTab.dispose();
+    }
   });
 
   it('R3-2d: activation moves to posted_reload after activateInventory succeeds and clears only after loadOpeningReview succeeds', async () => {

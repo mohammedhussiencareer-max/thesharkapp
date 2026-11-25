@@ -263,7 +263,7 @@ export function useActivationAction(
     const session = captureWriteSession();
     let action: ActivationWrite;
     let releaseLock: () => void;
-    let priorPhase: 'unknown' | 'inflight' | null = null;
+    let priorPhase: 'unknown' | 'awaiting_reconfirm' | null = null;
     if (unknownHeld) {
       priorPhase = 'unknown';
       const claim = await claimReplayAction<ActivationWrite>(
@@ -289,9 +289,10 @@ export function useActivationAction(
       action = claim.record.payload;
       releaseLock = claim.release;
     } else if (current && !activationReviewReloadPending(ACTIVATION_SUBJECT)) {
-      priorPhase = 'inflight';
+      priorPhase = 'awaiting_reconfirm';
       const nextPayload: ActivationWrite = {
         ...current,
+        manifestHash: review.openingManifestHash ?? current.manifestHash,
         explicitZeroItemIds: zerosOf(checked),
       };
       const claim = await claimReplayAction<ActivationWrite>(

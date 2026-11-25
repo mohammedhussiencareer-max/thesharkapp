@@ -9,7 +9,9 @@ export type PwaUpdateSnapshot = {
 };
 
 let snapshot: PwaUpdateSnapshot = { waiting: false };
+let activeRegistration: ServiceWorkerRegistration | null = null;
 let waitingWorker: ServiceWorker | null = null;
+let approvedWorker: ServiceWorker | null = null;
 let waitingStateTarget: ServiceWorker | null = null;
 let waitingStateListener: (() => void) | null = null;
 let started = false;
@@ -78,14 +80,6 @@ function isActivatedWorker(worker: ServiceWorker | null): boolean {
   );
 }
 
-function hasServiceWorkerController(): boolean {
-  return (
-    typeof navigator !== 'undefined' &&
-    'serviceWorker' in navigator &&
-    Boolean(navigator.serviceWorker?.controller)
-  );
-}
-
 function canCompleteApprovedReload(): boolean {
   const resolved = approvedAuthResolved ?? authResolvedState;
   return (
@@ -104,6 +98,7 @@ function completeApprovedReload(fallbackReload?: () => void): void {
     (() => window.location.reload());
   reloadRequested = false;
   reloadDeferred = false;
+  approvedWorker = null;
   pendingReload = null;
   approvedAuthResolved = null;
   detachWaitingListener();
@@ -118,6 +113,7 @@ function completeApprovedReload(fallbackReload?: () => void): void {
 function markWorkerActivated(): void {
   detachWaitingListener();
   waitingWorker = null;
+  approvedWorker = null;
   reloadRequested = false;
   reloadDeferred = true;
   pendingReload = null;
@@ -134,18 +130,27 @@ function setWaiting(worker: ServiceWorker | null): void {
     markWorkerActivated();
     return;
   }
+  if (worker !== null && worker !== approvedWorker) {
+    // A newer waiting worker arrived; never carry an earlier worker's approval
+    // forward to it.
+    reloadRequested = false;
+    approvedWorker = null;
+    pendingReload = null;
+    approvedAuthResolved = null;
+  }
   waitingWorker = worker;
   if (worker && typeof worker.addEventListener === 'function') {
     const onStateChange = () => {
       if (waitingWorker !== worker) return;
       if (isActivatedWorker(worker)) {
-        if (!reloadRequested) {
+        if (!reloadRequested || approvedWorker !== worker) {
           markWorkerActivated();
           return;
         }
-        // An uncontrolled tab receives `activated` without `controllerchange`;
-        // complete the approved reload once activated after rechecking auth and pins.
-        if (worker.state === 'activated' && !hasServiceWorkerController()) {
+        // Complete the approved reload once the approved waiting worker
+        // activates after rechecking auth and held writes (including tabs
+        // without a controller or mock workers that emit statechange).
+        if (worker.state === 'activated') {
           if (!canCompleteApprovedReload()) {
             markWorkerActivated();
             return;
@@ -155,9 +160,12 @@ function setWaiting(worker: ServiceWorker | null): void {
       } else if (worker.state === 'redundant') {
         detachWaitingListener();
         waitingWorker = null;
-        reloadRequested = false;
-        pendingReload = null;
-        approvedAuthResolved = null;
+        if (approvedWorker === worker) {
+          reloadRequested = false;
+          approvedWorker = null;
+          pendingReload = null;
+          approvedAuthResolved = null;
+        }
         if (!reloadDeferred && snapshot.waiting) {
           snapshot = { waiting: false };
           emit();
@@ -192,10 +200,11 @@ export function subscribePwaUpdate(listener: () => void): () => void {
 /**
  * Activate a waiting service worker and reload, ONLY when auth has resolved,
  * local logout is not pending, the owner explicitly asks, and NO held write pin
- * is active in storage or memory. If the worker already activated (either after
- * a prior explicit approval deferred by a pin, or because another tab sent
- * `SKIP_WAITING`), the next explicit click reloads directly once auth and pins
- * permit without waiting for a second `controllerchange`.
+ * is active in storage or memory. If a newer waiting worker is queued, bind
+ * approval to that specific worker and send `SKIP_WAITING` rather than
+ * reloading prematurely for an older deferred activation. If no non-activated
+ * waiting worker remains and an earlier worker already activated, reload
+ * directly once auth and pins permit.
  */
 export function applyPwaUpdate(
   reload?: () => void,
@@ -206,24 +215,28 @@ export function applyPwaUpdate(
   if (hasAnyHeldWrite() || hasLiveHeldWriteClaims()) return false;
   const effectiveReload =
     reload ?? initReload ?? (() => window.location.reload());
+  if (waitingWorker !== null && !isActivatedWorker(waitingWorker)) {
+    reloadDeferred = false;
+    reloadRequested = true;
+    approvedWorker = waitingWorker;
+    pendingReload = effectiveReload;
+    approvedAuthResolved = resolved;
+    waitingWorker.postMessage({ type: 'SKIP_WAITING' });
+    if (
+      typeof navigator === 'undefined' ||
+      !('serviceWorker' in navigator) ||
+      !navigator.serviceWorker
+    ) {
+      completeApprovedReload(effectiveReload);
+    }
+    return true;
+  }
   if (reloadDeferred || isActivatedWorker(waitingWorker)) {
     pendingReload = effectiveReload;
     completeApprovedReload(effectiveReload);
     return true;
   }
-  if (!waitingWorker) return false;
-  reloadRequested = true;
-  pendingReload = effectiveReload;
-  approvedAuthResolved = resolved;
-  waitingWorker.postMessage({ type: 'SKIP_WAITING' });
-  if (
-    typeof navigator === 'undefined' ||
-    !('serviceWorker' in navigator) ||
-    !navigator.serviceWorker
-  ) {
-    completeApprovedReload(effectiveReload);
-  }
-  return true;
+  return false;
 }
 
 export function initPwa(
@@ -245,10 +258,25 @@ export function initPwa(
       reloadRequested || waitingWorker !== null || hadController;
     hadController = true;
     if (!activatedUpdate) return;
-    if (!reloadRequested) {
-      // Another tab activated the waiting worker: never auto-reload this tab,
-      // but mark activation so the next explicit click reloads directly after
-      // checking auth and held writes.
+    const matchesApproved =
+      reloadRequested &&
+      (approvedWorker === null ||
+        container.controller === approvedWorker ||
+        waitingWorker === null ||
+        waitingWorker === approvedWorker);
+    if (!matchesApproved) {
+      // Another tab activated a waiting worker (or an older worker activated
+      // while a newer worker is waiting): never auto-reload this tab.
+      const queuedWaiting = activeRegistration?.waiting ?? null;
+      if (
+        queuedWaiting !== null &&
+        queuedWaiting !== container.controller &&
+        !isActivatedWorker(queuedWaiting)
+      ) {
+        reloadDeferred = true;
+        setWaiting(queuedWaiting);
+        return;
+      }
       markWorkerActivated();
       return;
     }
@@ -265,17 +293,36 @@ export function initPwa(
   void container
     .register('/sw.js', { scope: '/' })
     .then((registration) => {
-      if (registration.waiting) {
+      activeRegistration = registration;
+      const hasPriorWorkerFor = (candidate: ServiceWorker) =>
+        (registration.active !== null && registration.active !== candidate) ||
+        (container.controller !== null && container.controller !== candidate);
+
+      const watchInstalling = (installing: ServiceWorker) => {
+        const checkInstalled = () => {
+          if (
+            installing.state === 'installed' &&
+            hasPriorWorkerFor(installing)
+          ) {
+            setWaiting(registration.waiting ?? installing);
+          }
+        };
+        if (installing.state === 'installed') {
+          checkInstalled();
+        } else if (typeof installing.addEventListener === 'function') {
+          installing.addEventListener('statechange', checkInstalled);
+        }
+      };
+
+      if (registration.waiting && hasPriorWorkerFor(registration.waiting)) {
         setWaiting(registration.waiting);
+      } else if (registration.installing) {
+        watchInstalling(registration.installing);
       }
       registration.addEventListener('updatefound', () => {
         const installing = registration.installing;
         if (!installing) return;
-        installing.addEventListener('statechange', () => {
-          if (installing.state === 'installed' && container.controller) {
-            setWaiting(registration.waiting ?? installing);
-          }
-        });
+        watchInstalling(installing);
       });
     })
     .catch(() => {
@@ -290,7 +337,9 @@ export function setTestWaitingWorker(worker: ServiceWorker | null): void {
 
 export function resetPwaState(): void {
   detachWaitingListener();
+  activeRegistration = null;
   waitingWorker = null;
+  approvedWorker = null;
   started = false;
   reloadRequested = false;
   reloadDeferred = false;

@@ -396,7 +396,10 @@ export function SubjectPanel({
     try {
       const claim =
         mode.kind === 'fresh'
-          ? await claimFreshAction<BaseHeld>(subject, mode.create, { session })
+          ? await claimFreshAction<BaseHeld>(subject, mode.create, {
+              session,
+              allowOwnPostedReloads: true,
+            })
           : await claimReplayAction<BaseHeld>(
               subject,
               mode.action.write.requestId,
@@ -1169,6 +1172,7 @@ function OptionMappingForm({
         mode.kind === 'fresh'
           ? await claimFreshAction<OptionMappingWrite>(subject, mode.create, {
               session,
+              allowOwnPostedReloads: true,
             })
           : await claimReplayAction<OptionMappingWrite>(
               subject,

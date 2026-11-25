@@ -1963,4 +1963,170 @@ describe('held-writes store', () => {
       prodStore.dispose();
     }
   });
+
+  it.each([
+    'pos-option:["global","","","grilled"]',
+    'accounting:run',
+    'accounting:retry:order-1',
+  ])('allows a fresh %s claim past an own posted pin only', async (subject) => {
+    const { client } = makeAuditedLocks();
+    const tab1 = createHeldWriteStore({ getLocks: () => client('tab-1') });
+    const tab2 = createHeldWriteStore({ getLocks: () => client('tab-2') });
+    const opts = { kind: 'action', allowOwnPostedReloads: true };
+    const create = (requestId: string) => ({ requestId });
+    try {
+      tab1.setHeldWriteUser('user-a');
+      tab2.setHeldWriteUser('user-a');
+      const first = await tab1.claimFreshHeldWrite(subject, create, opts);
+      expect(first.ok).toBe(true);
+      if (!first.ok) return;
+      const { requestId } = first.record;
+      tab1.setHeldWritePhase(subject, requestId, 'posted_reload', {
+        readTarget: subject,
+      });
+      first.release();
+      await Promise.resolve();
+
+      // Seeing a post in storage (including after hydration) never confers ownership.
+      const conflict = {
+        ok: false,
+        reason: 'conflict',
+        existing: { requestId, phase: 'posted_reload' },
+      };
+      expect(
+        await tab2.claimFreshHeldWrite(subject, create, opts),
+      ).toMatchObject(conflict);
+      await tab2.rehydrateHeldWritesAsync();
+      expect(
+        await tab2.claimFreshHeldWrite(subject, create, opts),
+      ).toMatchObject(conflict);
+      expect(
+        await tab1.claimFreshHeldWrite(subject, create, { ...opts, requestId }),
+      ).toMatchObject(conflict);
+
+      // An applicable older pin with no proven owner must still block.
+      const legacy = tab2.tryPutHeldWrite(subject, {
+        requestId: 'legacy-post',
+        phase: 'posted_reload',
+        payload: null,
+      });
+      expect(legacy.ok).toBe(true);
+      expect(
+        await tab1.claimFreshHeldWrite(subject, create, opts),
+      ).toMatchObject({
+        ok: false,
+        reason: 'conflict',
+        existing: { requestId: 'legacy-post', phase: 'posted_reload' },
+      });
+      await tab2.clearPostedReload(subject, undefined, 'legacy-post');
+
+      const second = await tab1.claimFreshHeldWrite(subject, create, opts);
+      expect(second.ok).toBe(true);
+      if (!second.ok) return;
+      second.release();
+      expect(second.record.requestId).not.toBe(requestId);
+      expect(tab1.hasPostedReload(subject, subject, requestId)).toBe(true);
+      expect(tab1.getHeldWrite(subject)?.requestId).toBe(
+        second.record.requestId,
+      );
+    } finally {
+      tab1.dispose();
+      tab2.dispose();
+    }
+  });
+
+  it('P2 item 2: stale tab claimFreshHeldWrite conflicts under lock when a posted_reload record awaits verification (month-scoped for expenses)', async () => {
+    const { client } = makeAuditedLocks();
+    const tab1 = createHeldWriteStore({ getLocks: () => client('tab-1') });
+    const tab2 = createHeldWriteStore({ getLocks: () => client('tab-2') });
+    try {
+      tab1.setHeldWriteUser('user-a');
+      tab2.setHeldWriteUser('user-a');
+
+      // Non-scoped subject: tab1 posts and moves to posted_reload, releasing the active slot.
+      const purchaseClaim = await tab1.claimFreshHeldWrite(
+        'purchase:new',
+        (requestId) => ({ requestId, supplier: 'مورد' }),
+        { requestId: 'req-p1', kind: 'purchase' },
+      );
+      expect(purchaseClaim.ok).toBe(true);
+      if (!purchaseClaim.ok) return;
+      tab1.setHeldWritePhase('purchase:new', 'req-p1', 'posted_reload');
+      purchaseClaim.release();
+      await Promise.resolve();
+
+      const sameTabPurchase = await tab1.claimFreshHeldWrite(
+        'purchase:new',
+        (requestId) => ({ requestId, supplier: 'مورد تاني' }),
+        { requestId: 'req-p2', kind: 'purchase' },
+      );
+      expect(sameTabPurchase).toMatchObject({
+        ok: false,
+        reason: 'conflict',
+        existing: { requestId: 'req-p1', phase: 'posted_reload' },
+      });
+
+      // Stale tab2 (no storage event delivered) attempts a fresh claim with a different requestId.
+      const stalePurchase = await tab2.claimFreshHeldWrite(
+        'purchase:new',
+        (requestId) => ({ requestId, supplier: 'مورد تاني' }),
+        { requestId: 'req-p2', kind: 'purchase' },
+      );
+      expect(stalePurchase.ok).toBe(false);
+      if (!stalePurchase.ok) {
+        expect(stalePurchase.reason).toBe('conflict');
+        expect(stalePurchase.existing?.phase).toBe('posted_reload');
+        expect(stalePurchase.existing?.requestId).toBe('req-p1');
+      }
+
+      // Month-scoped expense: tab1 posts for April 2030.
+      const expenseClaim = await tab1.claimFreshHeldWrite(
+        'expense:new',
+        (requestId) => ({ requestId, periodMonth: '2030-04-01' }),
+        { requestId: 'req-e1', kind: 'expense' },
+      );
+      expect(expenseClaim.ok).toBe(true);
+      if (!expenseClaim.ok) return;
+      tab1.setHeldWritePhase('expense:new', 'req-e1', 'posted_reload', {
+        readTarget: '2030-04-01',
+      });
+      expenseClaim.release();
+      await Promise.resolve();
+
+      const sameTabExpense = await tab1.claimFreshHeldWrite(
+        'expense:new',
+        (requestId) => ({ requestId, periodMonth: '2030-04-01' }),
+        { requestId: 'req-e2', kind: 'expense', readTarget: '2030-04-01' },
+      );
+      expect(sameTabExpense).toMatchObject({
+        ok: false,
+        reason: 'conflict',
+        existing: { requestId: 'req-e1', phase: 'posted_reload' },
+      });
+
+      // Stale tab2 claiming April 2030 must conflict.
+      const sameMonth = await tab2.claimFreshHeldWrite(
+        'expense:new',
+        (requestId) => ({ requestId, periodMonth: '2030-04-01' }),
+        { requestId: 'req-e2', kind: 'expense', readTarget: '2030-04-01' },
+      );
+      expect(sameMonth.ok).toBe(false);
+      if (!sameMonth.ok) {
+        expect(sameMonth.reason).toBe('conflict');
+        expect(sameMonth.existing?.phase).toBe('posted_reload');
+      }
+
+      // Stale tab2 claiming May 2030 must be allowed because the pending verification is scoped to April.
+      const otherMonth = await tab2.claimFreshHeldWrite(
+        'expense:new',
+        (requestId) => ({ requestId, periodMonth: '2030-05-01' }),
+        { requestId: 'req-e3', kind: 'expense', readTarget: '2030-05-01' },
+      );
+      expect(otherMonth.ok).toBe(true);
+      if (otherMonth.ok) otherMonth.release();
+    } finally {
+      tab1.dispose();
+      tab2.dispose();
+    }
+  });
 });

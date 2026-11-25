@@ -19,7 +19,9 @@ export function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [invalid, setInvalid] = useState(false);
+  const [errorState, setErrorState] = useState<'invalid' | 'failed' | null>(
+    null,
+  );
 
   const formBlocked = submitting || logoutPending || logoutFailed;
 
@@ -28,11 +30,11 @@ export function LoginPage() {
     if (logoutPending || logoutFailed) return;
     void (async () => {
       setSubmitting(true);
-      setInvalid(false);
+      setErrorState(null);
       try {
         const result = await signIn(email, password);
-        if (result === 'invalid') {
-          setInvalid(true);
+        if (result === 'invalid' || result === 'failed') {
+          setErrorState(result);
           return;
         }
         void navigate('/');
@@ -120,7 +122,11 @@ export function LoginPage() {
             onChange={(event) => setPassword(event.target.value)}
           />
         </label>
-        {invalid ? <p role="alert">البريد أو كلمة السر غلط</p> : null}
+        {errorState === 'invalid' ? (
+          <p role="alert">البريد أو كلمة السر غلط</p>
+        ) : errorState === 'failed' ? (
+          <p role="alert">تعذر تسجيل الدخول، حاول مرة أخرى</p>
+        ) : null}
         <button
           className="rounded bg-neutral-900 px-3 py-2 text-white disabled:opacity-60"
           type="submit"

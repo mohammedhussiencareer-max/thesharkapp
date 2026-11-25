@@ -259,6 +259,8 @@ test('daily count retries the exact request id and payload across a reload at 39
     sentBodies.push(body);
     if (dropNext) {
       dropNext = false;
+      const upstream = await route.fetch();
+      expect(upstream.ok()).toBe(true);
       await route.abort('failed');
       return;
     }
@@ -296,6 +298,26 @@ test('daily count retries the exact request id and payload across a reload at 39
   const saved = page.getByRole('article', { name: stamp, exact: true });
   await expect(saved).toBeVisible(visible);
   await expect(saved.getByText('عجز 150.00 ج.م')).toBeVisible();
+
+  assertLocalSupabaseUrl(supabaseUrl);
+  const verifyClient = createClient<Database>(
+    supabaseUrl,
+    localServiceRoleKey,
+    {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+    },
+  );
+  const { data: storedCounts, error: verifyError } = await verifyClient
+    .schema('app')
+    .from('stock_counts')
+    .select('id, note')
+    .eq('note', stamp);
+  expect(verifyError).toBeNull();
+  expect(storedCounts).toHaveLength(1);
 });
 
 test('mapping list renders and filters cleanly at 390px without horizontal overflow', async ({

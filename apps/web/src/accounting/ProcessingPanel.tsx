@@ -464,7 +464,7 @@ export function ProcessingPanel({
         requestId,
         report: null,
       }),
-      { session },
+      { session, allowOwnPostedReloads: true },
     );
     if (!claim.ok) {
       if (claim.reason === 'storage') {
@@ -513,7 +513,7 @@ export function ProcessingPanel({
         orderId: order.orderId,
         ...(workGeneration !== undefined ? { workGeneration } : {}),
       }),
-      { session },
+      { session, allowOwnPostedReloads: true },
     );
     if (!claim.ok) {
       if (claim.reason === 'storage') {

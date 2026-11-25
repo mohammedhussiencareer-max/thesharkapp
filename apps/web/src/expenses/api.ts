@@ -331,6 +331,16 @@ export async function addExpenseEntry(draft: ExpenseDraft): Promise<void> {
   await writeEntry(() => appDb().rpc('add_expense_entry', args));
 }
 
+export async function hasExpenseRequest(requestId: string): Promise<boolean> {
+  const { data, error } = await appDb()
+    .from('expense_entries')
+    .select('id')
+    .eq('request_id', requestId)
+    .limit(1);
+  throwIfError(error);
+  return Array.isArray(data) && data.length > 0;
+}
+
 export async function voidExpenseEntry(
   id: string,
   reason: string,
