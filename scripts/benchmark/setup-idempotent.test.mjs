@@ -5,9 +5,13 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import {
+  BENCH_META_SCHEMA,
   setupSql,
   historySql,
   postSql,
+  persistBuildAnchorSql,
+  persistedBuildAnchorSql,
+  committedSortResultsSql,
   histories,
   lateSql,
   resumeGuardSql,
@@ -22,6 +26,8 @@ import {
   sortBuffersNote,
   sortGrowthFailed,
   hasCompletePassingSortResults,
+  persistedBuildAnchor,
+  committedSortResults,
   resolveBuildAnchor,
   resolveResumePlan,
 } from './accounting-history.mjs';
@@ -32,7 +38,7 @@ const benchmark = fileURLToPath(
 const runBenchmark = promisify(execFile);
 const resetMessage = /--resume is supported only before measurement starts/;
 
-function psql(sql, { notices = false } = {}) {
+function psql(sql, { notices = false, full = false } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       'docker',
@@ -63,12 +69,46 @@ function psql(sql, { notices = false } = {}) {
       err += chunk;
     });
     child.on('close', (code) => {
-      if (code === 0) resolve((notices ? err : out).trim());
-      else reject(new Error((err || out).trim()));
+      if (code === 0) {
+        if (full) resolve({ out: out.trim(), err: err.trim() });
+        else resolve((notices ? err : out).trim());
+      } else {
+        reject(new Error((err || out).trim()));
+      }
     });
     child.stdin.end(sql);
   });
 }
+
+test('startup metadata queries return empty with no SQL errors when metadata tables do not exist', async () => {
+  const freshAnchor = await persistedBuildAnchor(async (sql) => {
+    const res = await psql(sql, { full: true });
+    assert.equal(res.err, '', `unexpected stderr: ${res.err}`);
+    return res;
+  });
+  assert.equal(freshAnchor, null);
+
+  const freshSorts = await committedSortResults(async (sql) => {
+    const res = await psql(sql, { full: true });
+    assert.equal(res.err, '', `unexpected stderr: ${res.err}`);
+    return res;
+  });
+  assert.deepEqual(freshSorts, []);
+
+  // Also verify the missing-table path explicitly inside a rolled-back transaction
+  // in case metadata tables already exist on a non-fresh database.
+  const absent = await psql(
+    `begin;
+     set local client_min_messages = warning;
+     drop schema if exists ${BENCH_META_SCHEMA} cascade;
+     ${persistedBuildAnchorSql()}
+     ${committedSortResultsSql()}
+     rollback;`,
+    { full: true },
+  );
+  assert.equal(absent.err, '', `unexpected stderr: ${absent.err}`);
+  assert.match(absent.out, /\[\]/);
+});
 
 test('benchmark setup can run again after a committed fixture', async () => {
   const anchor = await psql(
@@ -602,6 +642,137 @@ test('build-resume SQL commits day counts with the last order and reuses persist
   );
 });
 
+test('startup metadata readers guard table existence without raising and propagate query failures', async () => {
+  const seenSql = [];
+  const emptyAnchor = await persistedBuildAnchor(async (sql) => {
+    seenSql.push(sql);
+    return { out: '\n anchor \n--------\n \n(1 row)\n', err: '' };
+  });
+  assert.equal(emptyAnchor, null);
+  assert.match(
+    seenSql[0],
+    /pg_catalog\.to_regclass\('bench_internal\.bench_build_state'\)/,
+  );
+  assert.doesNotMatch(seenSql[0], /\bpublic\.bench_build_state\b/);
+
+  const validAnchor = await persistedBuildAnchor(async () => ({
+    out: ' 2026-11-25 00:00:00+02\n',
+    err: '',
+  }));
+  assert.equal(validAnchor, '2026-11-25 00:00:00+02');
+
+  await assert.rejects(
+    () =>
+      persistedBuildAnchor(async () => {
+        throw new Error('unexpected anchor query failure');
+      }),
+    /unexpected anchor query failure/,
+  );
+
+  const emptySorts = await committedSortResults(async (sql) => {
+    seenSql.push(sql);
+    return { out: '\n rows \n------\n []\n(1 row)\n', err: '' };
+  });
+  assert.deepEqual(emptySorts, []);
+  assert.match(
+    seenSql[1],
+    /pg_catalog\.to_regclass\('bench_internal\.bench_sort_results'\)/,
+  );
+  assert.doesNotMatch(seenSql[1], /\bpublic\.bench_sort_results\b/);
+
+  const parsedSorts = await committedSortResults(async () => ({
+    out: '[{"kind":"sort-traversal","name":"35-day sorts","pass":true}]',
+    err: '',
+  }));
+  assert.deepEqual(parsedSorts, [
+    { kind: 'sort-traversal', name: '35-day sorts', pass: true },
+  ]);
+
+  await assert.rejects(
+    () =>
+      committedSortResults(async () => {
+        throw new Error('unexpected sort query failure');
+      }),
+    /unexpected sort query failure/,
+  );
+
+  await assert.rejects(
+    () =>
+      committedSortResults(async () => ({
+        out: 'not-a-json-array',
+        err: '',
+      })),
+    /unexpected committed sort results output/,
+  );
+});
+
+test('resume metadata tables live in a non-exposed private schema with API-role access revoked before commit', () => {
+  const configPath = fileURLToPath(
+    new URL('../../supabase/config.toml', import.meta.url),
+  );
+  const configToml = readFileSync(configPath, 'utf8');
+  const schemasMatch = configToml.match(/^schemas\s*=\s*\[([^\]]+)\]/m);
+  assert.ok(schemasMatch, 'expected api.schemas in supabase/config.toml');
+  const exposedSchemas = [...schemasMatch[1].matchAll(/"([^"]+)"/g)].map(
+    (m) => m[1],
+  );
+  assert.ok(exposedSchemas.includes('public'));
+  assert.ok(
+    !exposedSchemas.includes('bench_internal'),
+    'bench_internal must not be API-exposed',
+  );
+
+  const anchor = '2026-11-25 00:00:00+02';
+  const anchorSql = persistBuildAnchorSql(anchor);
+  const fullSetupSql = setupSql(anchor);
+  const fullPostSql = postSql(histories[0], anchor, {
+    remaining: 1,
+    reset: true,
+    already: 0,
+  });
+  const fullSortMeasureSql = sortMeasureSql(sortHistories[0], anchor);
+
+  for (const [label, sql] of [
+    ['persistBuildAnchorSql', anchorSql],
+    ['setupSql', fullSetupSql],
+    ['postSql', fullPostSql],
+    ['sortMeasureSql', fullSortMeasureSql],
+  ]) {
+    for (const schema of exposedSchemas) {
+      assert.doesNotMatch(
+        sql,
+        new RegExp(`\\b${schema}\\.bench_`, 'i'),
+        `${label} must not place benchmark metadata in exposed schema ${schema}`,
+      );
+    }
+  }
+
+  assert.match(
+    anchorSql,
+    /create schema if not exists bench_internal;\s*revoke all on schema bench_internal from public, anon, authenticated, service_role;/i,
+  );
+  assert.match(
+    anchorSql,
+    /create table if not exists bench_internal\.bench_build_state\b[\s\S]*revoke all on table bench_internal\.bench_build_state from public, anon, authenticated, service_role;/i,
+  );
+  assert.ok(
+    fullSetupSql.indexOf(
+      'revoke all on table bench_internal.bench_build_state',
+    ) < fullSetupSql.lastIndexOf('commit;'),
+    'setupSql must revoke bench_build_state privileges before commit',
+  );
+
+  assert.match(
+    fullPostSql,
+    /create schema if not exists bench_internal;\s*revoke all on schema bench_internal from public, anon, authenticated, service_role;[\s\S]*create table if not exists bench_internal\.bench_build_progress\b[\s\S]*revoke all on table bench_internal\.bench_build_progress from public, anon, authenticated, service_role;[\s\S]*commit;/i,
+  );
+
+  assert.match(
+    fullSortMeasureSql,
+    /create schema if not exists bench_internal;\s*revoke all on schema bench_internal\s+from public, anon, authenticated, service_role;[\s\S]*create table if not exists bench_internal\.bench_sort_results\b[\s\S]*revoke all on table bench_internal\.bench_sort_results\s+from public, anon, authenticated, service_role;[\s\S]*commit;/i,
+  );
+});
+
 test('sort build interruption between history commit and suffix commit is resumable', async () => {
   const anchor = await psql(
     `select to_char((date_trunc('day', pg_catalog.clock_timestamp() at time zone 'Africa/Cairo') at time zone 'Africa/Cairo'), 'YYYY-MM-DD HH24:MI:SSOF');`,
@@ -800,17 +971,17 @@ test('sort build resumed after Cairo midnight reuses the persisted build anchor'
   };
   await psql(setupSql(todayAnchor));
   const savedAnchor = await psql(
-    `select coalesce((select anchor from public.bench_build_state where id = 1), '');`,
+    `select coalesce((select anchor from ${BENCH_META_SCHEMA}.bench_build_state where id = 1), '');`,
   );
   try {
-    await psql(`delete from public.bench_build_state;`);
+    await psql(`delete from ${BENCH_META_SCHEMA}.bench_build_state;`);
     const catalog = await psql(
       `select exists (select from app.stock_items where id = '${history.mixed}')`,
     );
     if (catalog === 'f') await psql(sortBuildSql(history, prevDayAnchor));
 
     const persistedAnchor = await psql(
-      `select anchor from public.bench_build_state where id = 1;`,
+      `select anchor from ${BENCH_META_SCHEMA}.bench_build_state where id = 1;`,
     );
     assert.equal(persistedAnchor, prevDayAnchor);
 
@@ -844,12 +1015,115 @@ test('sort build resumed after Cairo midnight reuses the persisted build anchor'
   } finally {
     if (savedAnchor) {
       await psql(`
-        insert into public.bench_build_state (id, anchor)
+        insert into ${BENCH_META_SCHEMA}.bench_build_state (id, anchor)
         values (1, '${savedAnchor}')
         on conflict (id) do update set anchor = excluded.anchor;
       `);
     }
   }
+});
+
+test('resume metadata tables are not in public and deny API-role read and write access', async () => {
+  const prevDayAnchor = await psql(
+    `select to_char(((date_trunc('day', pg_catalog.clock_timestamp() at time zone 'Africa/Cairo') - interval '1 day') at time zone 'Africa/Cairo'), 'YYYY-MM-DD HH24:MI:SSOF');`,
+  );
+  const history = {
+    name: 'cross-midnight sorts',
+    prefix: 's-midnight',
+    days: 2,
+    mixed: 'b9e00000-0000-4000-8000-000000009301',
+    size: 'b9e00000-0000-4000-8000-000000009302',
+    openingRequest: 'b9e00000-0000-4000-8000-000000009303',
+    activationRequest: 'b9e00000-0000-4000-8000-000000009304',
+    suffixPurchaseRequest: 'b9e00000-0000-4000-8000-000000009305',
+    purchaseRequest: 'b9e00000-0000-4000-8000-000000009306',
+  };
+  await psql(setupSql(prevDayAnchor));
+  const catalog = await psql(
+    `select exists (select from app.stock_items where id = '${history.mixed}')`,
+  );
+  if (catalog === 'f') await psql(sortBuildSql(history, prevDayAnchor));
+
+  // Verify public schema has no benchmark metadata tables and that API roles
+  // cannot read or write bench_build_state, bench_sort_results, or
+  // bench_build_progress inside the exact sortMeasureSql transaction.
+  const verifySql = sortMeasureSql(history, prevDayAnchor).replace(
+    'commit;',
+    `
+do $verify$
+declare
+  v_role text;
+  v_table text;
+  v_denied boolean;
+begin
+  if pg_catalog.to_regclass('public.bench_build_state') is not null
+    or pg_catalog.to_regclass('public.bench_sort_results') is not null
+    or pg_catalog.to_regclass('public.bench_build_progress') is not null then
+    raise exception 'benchmark metadata table found in public schema';
+  end if;
+
+  foreach v_role in array array['anon', 'authenticated', 'service_role'] loop
+    if pg_catalog.has_schema_privilege(v_role, '${BENCH_META_SCHEMA}', 'USAGE')
+      or pg_catalog.has_schema_privilege(v_role, '${BENCH_META_SCHEMA}', 'CREATE') then
+      raise exception 'role % unexpectedly has schema privileges on ${BENCH_META_SCHEMA}', v_role;
+    end if;
+
+    foreach v_table in array array[
+      '${BENCH_META_SCHEMA}.bench_build_state',
+      '${BENCH_META_SCHEMA}.bench_sort_results',
+      '${BENCH_META_SCHEMA}.bench_build_progress'
+    ] loop
+      if pg_catalog.to_regclass(v_table) is not null then
+        if pg_catalog.has_table_privilege(v_role, v_table, 'SELECT,INSERT,UPDATE,DELETE') then
+          raise exception 'role % unexpectedly has table privileges on %', v_role, v_table;
+        end if;
+      end if;
+    end loop;
+
+    v_denied := false;
+    begin
+      execute format('set local role %I', v_role);
+      execute 'select count(*) from ${BENCH_META_SCHEMA}.bench_build_state';
+    exception
+      when insufficient_privilege then
+        v_denied := true;
+    end;
+    reset role;
+    if not v_denied then
+      raise exception 'role % was able to select ${BENCH_META_SCHEMA}.bench_build_state', v_role;
+    end if;
+
+    v_denied := false;
+    begin
+      execute format('set local role %I', v_role);
+      execute 'update ${BENCH_META_SCHEMA}.bench_build_state set anchor = ''tampered''';
+    exception
+      when insufficient_privilege then
+        v_denied := true;
+    end;
+    reset role;
+    if not v_denied then
+      raise exception 'role % was able to update ${BENCH_META_SCHEMA}.bench_build_state', v_role;
+    end if;
+
+    v_denied := false;
+    begin
+      execute format('set local role %I', v_role);
+      execute 'update ${BENCH_META_SCHEMA}.bench_sort_results set payload = ''{}''::jsonb';
+    exception
+      when insufficient_privilege then
+        v_denied := true;
+    end;
+    reset role;
+    if not v_denied then
+      raise exception 'role % was able to update ${BENCH_META_SCHEMA}.bench_sort_results', v_role;
+    end if;
+  end loop;
+end
+$verify$;
+rollback;`,
+  );
+  await psql(verifySql);
 });
 
 test('benchmark CLI refuses committed measurements before sort skip or --skip-build', async () => {
@@ -941,19 +1215,22 @@ test('benchmark CLI refuses full --resume when committed sort results failed the
   );
   await psql(setupSql(anchor));
   // Mark order build started and commit all 3 sort purchases with a failing 2-year
-  // growth result (>10% over 35-day) in public.bench_sort_results. Full --resume
+  // growth result (>10% over 35-day) in bench_internal.bench_sort_results. Full --resume
   // must refuse on the sort-traversal gate before running order guards.
   await psql(`
     insert into app.stock_items (id, name, kind, base_unit, count_frequency)
     values ('${histories[0].item}', 'order build started marker', 'seafood', 'kg', 'daily')
     on conflict (id) do nothing;
-    create table if not exists public.bench_sort_results (
+    create schema if not exists ${BENCH_META_SCHEMA};
+    revoke all on schema ${BENCH_META_SCHEMA} from public, anon, authenticated, service_role;
+    create table if not exists ${BENCH_META_SCHEMA}.bench_sort_results (
       name text primary key,
       purchase_request uuid not null,
       anchor text not null,
       payload jsonb not null,
       recorded_at timestamptz not null default pg_catalog.clock_timestamp()
     );
+    revoke all on table ${BENCH_META_SCHEMA}.bench_sort_results from public, anon, authenticated, service_role;
   `);
   const failingGrowth = passingSortResults(anchor);
   failingGrowth[0].buffers = 1000;
@@ -981,7 +1258,7 @@ test('benchmark CLI refuses full --resume when committed sort results failed the
       insert into app.purchases (request_id, purchased_at, total_paid, batch_id)
       values ('${history.purchaseRequest}', now(), 0, gen_random_uuid())
       on conflict (request_id) do nothing;
-      insert into public.bench_sort_results (name, purchase_request, anchor, payload)
+      insert into ${BENCH_META_SCHEMA}.bench_sort_results (name, purchase_request, anchor, payload)
       values ('${history.name}', '${history.purchaseRequest}', '${anchor}', '${payload}'::jsonb)
       on conflict (name) do update
       set purchase_request = excluded.purchase_request,

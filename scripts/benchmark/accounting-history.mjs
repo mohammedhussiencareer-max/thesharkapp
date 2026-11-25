@@ -36,6 +36,7 @@ const owner = 'b9e00000-0000-4000-8000-0000000000a1';
 // (the 2-year large share was 2136 including dirtied and written) and below
 // a sequence scan of a multi-year deficit table.
 const SHARED_HIT_READ_LIMIT = 5000;
+const BENCH_META_SCHEMA = 'bench_internal';
 const RESUME_REFUSAL =
   '--resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun.';
 
@@ -183,14 +184,21 @@ function claims(local = true) {
   return `select set_config('request.jwt.claims', jsonb_build_object('sub', '${owner}', 'role', 'authenticated')::text, ${local});`;
 }
 
-function persistBuildAnchorSql(anchor) {
+function benchMetaSchemaSql() {
   return `
-create table if not exists public.bench_build_state (
+create schema if not exists ${BENCH_META_SCHEMA};
+revoke all on schema ${BENCH_META_SCHEMA} from public, anon, authenticated, service_role;`;
+}
+
+function persistBuildAnchorSql(anchor) {
+  return `${benchMetaSchemaSql()}
+create table if not exists ${BENCH_META_SCHEMA}.bench_build_state (
   id integer primary key check (id = 1),
   anchor text not null,
   created_at timestamptz not null default pg_catalog.clock_timestamp()
 );
-insert into public.bench_build_state (id, anchor)
+revoke all on table ${BENCH_META_SCHEMA}.bench_build_state from public, anon, authenticated, service_role;
+insert into ${BENCH_META_SCHEMA}.bench_build_state (id, anchor)
 values (1, '${anchor}')
 on conflict (id) do nothing;`;
 }
@@ -526,26 +534,30 @@ function postSql(
   const startAt = reset ? 0 : already;
   const callSql = postCallSql(history, startAt, calls, post, anchor);
   const progressSql = reset
-    ? `insert into public.bench_build_progress (history, posted, started_at, updated_at)
+    ? `insert into ${BENCH_META_SCHEMA}.bench_build_progress (history, posted, started_at, updated_at)
 values ('${history.name}', 0, pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp())
 on conflict (history) do update
 set posted = 0,
   started_at = excluded.started_at,
   updated_at = excluded.updated_at;`
-    : `insert into public.bench_build_progress (history, posted, started_at, updated_at)
+    : `insert into ${BENCH_META_SCHEMA}.bench_build_progress (history, posted, started_at, updated_at)
 values ('${history.name}', 0, pg_catalog.clock_timestamp(), pg_catalog.clock_timestamp())
 on conflict (history) do nothing;`;
   return `
 set statement_timeout = 0;
 set lock_timeout = 0;
 ${claims(false)}
-create table if not exists public.bench_build_progress (
+begin;
+${benchMetaSchemaSql()}
+create table if not exists ${BENCH_META_SCHEMA}.bench_build_progress (
   history text primary key,
   posted integer not null,
   started_at timestamptz not null,
   updated_at timestamptz not null
 );
+revoke all on table ${BENCH_META_SCHEMA}.bench_build_progress from public, anon, authenticated, service_role;
 ${progressSql}
+commit;
 create function pg_temp.post_next_bench_order(p_prefix text) returns void
 language plpgsql as $$
 declare
@@ -573,7 +585,7 @@ begin
     or coalesce((v ->> 'applied')::integer, 0) <> 1 then
     raise exception 'history gate failed: worker returned %', v;
   end if;
-  update public.bench_build_progress progress
+  update ${BENCH_META_SCHEMA}.bench_build_progress progress
   set posted = progress.posted + 1,
     updated_at = pg_catalog.clock_timestamp()
   where progress.history = '${history.name}'
@@ -589,11 +601,11 @@ do $$
 begin
   if (
     select posted
-    from public.bench_build_progress
+    from ${BENCH_META_SCHEMA}.bench_build_progress
     where history = '${history.name}'
   ) <> ${startAt + calls} then
     raise exception 'history gate failed: applied % of % orders',
-      (select posted from public.bench_build_progress where history = '${history.name}'),
+      (select posted from ${BENCH_META_SCHEMA}.bench_build_progress where history = '${history.name}'),
       ${startAt + calls};
   end if;
   if ${startAt + calls} = ${orders}
@@ -1080,15 +1092,21 @@ begin
     'pass', v_pass
   );
 
-  create table if not exists public.bench_sort_results (
+  create schema if not exists ${BENCH_META_SCHEMA};
+  revoke all on schema ${BENCH_META_SCHEMA}
+    from public, anon, authenticated, service_role;
+
+  create table if not exists ${BENCH_META_SCHEMA}.bench_sort_results (
     name text primary key,
     purchase_request uuid not null,
     anchor text not null,
     payload jsonb not null,
     recorded_at timestamptz not null default pg_catalog.clock_timestamp()
   );
+  revoke all on table ${BENCH_META_SCHEMA}.bench_sort_results
+    from public, anon, authenticated, service_role;
 
-  insert into public.bench_sort_results (
+  insert into ${BENCH_META_SCHEMA}.bench_sort_results (
     name, purchase_request, anchor, payload, recorded_at
   )
   values (
@@ -2051,7 +2069,21 @@ async function postedReceipts(history) {
 async function postedCount(historyName) {
   try {
     const result = await psqlCaptured(
-      `select coalesce((select posted::text from public.bench_build_progress where history = '${historyName}'), 'none');`,
+      `create function pg_temp.read_bench_build_progress(p_history text) returns text
+       language plpgsql as $$
+       declare
+         v_posted text;
+       begin
+         if pg_catalog.to_regclass('${BENCH_META_SCHEMA}.bench_build_progress') is null then
+           return 'none';
+         end if;
+         execute 'select posted::text from ${BENCH_META_SCHEMA}.bench_build_progress where history = $1'
+           into v_posted
+           using p_history;
+         return coalesce(v_posted, 'none');
+       end
+       $$;
+       select pg_temp.read_bench_build_progress('${historyName}');`,
     );
     return result.out.trim();
   } catch {
@@ -2092,42 +2124,75 @@ async function sortSuffixReady(history) {
   }
 }
 
-async function persistedBuildAnchor() {
-  try {
-    const result = await psqlCaptured(
-      `select anchor from public.bench_build_state where id = 1;`,
-    );
-    const match = result.out.match(
-      /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}/,
-    );
-    return match ? match[0] : null;
-  } catch {
+function persistedBuildAnchorSql() {
+  return `
+create function pg_temp.read_bench_build_anchor() returns text
+language plpgsql as $$
+declare
+  v_anchor text;
+begin
+  if pg_catalog.to_regclass('${BENCH_META_SCHEMA}.bench_build_state') is null then
     return null;
-  }
+  end if;
+  execute 'select anchor from ${BENCH_META_SCHEMA}.bench_build_state where id = 1'
+    into v_anchor;
+  return v_anchor;
+end
+$$;
+select coalesce(pg_temp.read_bench_build_anchor(), '') as anchor;
+`;
 }
 
-async function committedSortResults() {
-  try {
-    const result = await psqlCaptured(`
-      select coalesce(
-        jsonb_agg(
-          r.payload || jsonb_build_object(
-            'anchor', r.anchor,
-            'purchase_request', r.purchase_request::text
-          )
-          order by r.name
-        ),
-        '[]'::jsonb
-      )::text
-      from public.bench_sort_results r
-      join app.purchases p on p.request_id = r.purchase_request;
-    `);
-    const text = result.out.trim();
-    const match = text.match(/\[[\s\S]*\]/);
-    return match ? JSON.parse(match[0]) : [];
-  } catch {
-    return [];
+async function persistedBuildAnchor(query = psqlCaptured) {
+  const result = await query(persistedBuildAnchorSql());
+  const match = String(result.out).match(
+    /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}/,
+  );
+  return match ? match[0] : null;
+}
+
+function committedSortResultsSql() {
+  return `
+create function pg_temp.read_bench_sort_results() returns jsonb
+language plpgsql as $$
+declare
+  v_rows jsonb;
+begin
+  if pg_catalog.to_regclass('${BENCH_META_SCHEMA}.bench_sort_results') is null then
+    return '[]'::jsonb;
+  end if;
+  execute $q$
+    select coalesce(
+      jsonb_agg(
+        r.payload || jsonb_build_object(
+          'anchor', r.anchor,
+          'purchase_request', r.purchase_request::text
+        )
+        order by r.name
+      ),
+      '[]'::jsonb
+    )
+    from ${BENCH_META_SCHEMA}.bench_sort_results r
+    join app.purchases p on p.request_id = r.purchase_request
+  $q$
+    into v_rows;
+  return coalesce(v_rows, '[]'::jsonb);
+end
+$$;
+select pg_temp.read_bench_sort_results()::text as rows;
+`;
+}
+
+async function committedSortResults(query = psqlCaptured) {
+  const result = await query(committedSortResultsSql());
+  const text = String(result.out).trim();
+  const match = text.match(/\[[\s\S]*\]/);
+  if (!match) {
+    throw new Error(
+      `unexpected committed sort results output: ${text.slice(0, 200)}`,
+    );
   }
+  return JSON.parse(match[0]);
 }
 
 function isWarmedSortRow(row) {
@@ -2516,10 +2581,13 @@ if (
 }
 
 export {
+  BENCH_META_SCHEMA,
   setupSql,
   historySql,
   postSql,
   persistBuildAnchorSql,
+  persistedBuildAnchorSql,
+  committedSortResultsSql,
   histories,
   lateSql,
   resumeGuardSql,
@@ -2535,6 +2603,8 @@ export {
   sortBuffersNote,
   sortGrowthFailed,
   hasCompletePassingSortResults,
+  persistedBuildAnchor,
+  committedSortResults,
   resolveBuildAnchor,
   resolveResumePlan,
 };
