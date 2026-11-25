@@ -4119,4 +4119,433 @@ describe('P7-3 round-10 review fixes', () => {
       }
     }
   });
+
+  it('R22-1: skips delayed forwarded completion and reload error once the remounted CountsPage has already verified the request', async () => {
+    const makeSyntheticJwt = (payload: Record<string, unknown>): string => {
+      const encode = (value: Record<string, unknown>) =>
+        btoa(
+          String.fromCharCode(
+            ...new TextEncoder().encode(JSON.stringify(value)),
+          ),
+        )
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/g, '');
+      return `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode(payload)}.sig`;
+    };
+    const emitAuth = (event: string, session: AuthMockSession) => {
+      authMock.session = session;
+      for (const listener of [...authMock.listeners]) {
+        listener(event, session);
+      }
+    };
+
+    const userId = 'owner-r22-1';
+    const jwtSid1 = makeSyntheticJwt({
+      sub: userId,
+      session_id: 'sid-r22-1',
+      exp: 2_000_000_000,
+    });
+    const { locks, nested } = makeAuditedLocks();
+    const origLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: locks,
+    });
+
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    let postedCounts: CountRecord[] = [];
+    let holdNextListCounts = false;
+    let resolveHeldRead: ((rows: CountRecord[]) => void) | null = null;
+    let rejectHeldRead: ((error: Error) => void) | null = null;
+    vi.mocked(listCounts).mockImplementation(() => {
+      if (holdNextListCounts) {
+        holdNextListCounts = false;
+        return new Promise<CountRecord[]>((resolve, reject) => {
+          resolveHeldRead = resolve;
+          rejectHeldRead = reject;
+        });
+      }
+      return Promise.resolve([...postedCounts]);
+    });
+    vi.mocked(listPendingCounts).mockResolvedValue([]);
+
+    let resolveFirstCount!: (value: {
+      status: 'posted';
+      countId: string;
+    }) => void;
+    let resolveSecondCount!: (value: {
+      status: 'posted';
+      countId: string;
+    }) => void;
+    vi.mocked(recordCount)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirstCount = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveSecondCount = resolve;
+          }),
+      );
+
+    try {
+      authMock.listeners.splice(0, authMock.listeners.length);
+      authMock.rpcResult = { data: true, error: null };
+      authMock.session = {
+        user: { id: userId, email: 'owner@theshark.test' },
+        access_token: jwtSid1,
+        refresh_token: 'rt-r22-1',
+      };
+      startAuth();
+
+      render(
+        <MemoryRouter>
+          <AuthProvider>
+            <RequireOwner>
+              <CountsPage />
+            </RequireOwner>
+          </AuthProvider>
+        </MemoryRouter>,
+      );
+
+      // Part A: delayed old post-save read resolves after remounted page already verified and unlocked.
+      const firstInput = await screen.findByLabelText('الكمية المعدودة بلطي');
+      fireEvent.change(firstInput, { target: { value: '7' } });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(1));
+
+      const firstPosted: CountRecord = {
+        id: 'cnt-r22-1',
+        countedAt: '2026-10-22T12:00:00.000Z',
+        createdAt: '2026-10-22T12:00:00.000Z',
+        frequency: 'daily',
+        note: 'جرد أول محقق',
+        itemCount: 1,
+        shortageValue: '0',
+        surplusValue: '0',
+        revisedDifference: '0',
+        compensatorSum: '0',
+        hasCompensator: false,
+        hasSurplus: false,
+      };
+      postedCounts = [firstPosted];
+      holdNextListCounts = true;
+      await act(async () => {
+        resolveFirstCount({ status: 'posted', countId: firstPosted.id });
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(resolveHeldRead).not.toBeNull());
+      expect(getHeldWrite(COUNT_DAILY_SUBJECT)?.phase).toBe('posted_reload');
+
+      // Unmount old CountsPage via transient owner-check error, then remount and verify.
+      authMock.rpcResult = { data: null, error: { message: 'temporary' } };
+      act(() => {
+        emitAuth('SIGNED_IN', {
+          user: { id: userId, email: 'owner@theshark.test' },
+          access_token: jwtSid1,
+          refresh_token: 'rt-r22-1',
+        });
+      });
+      expect(
+        await screen.findByText('تعذر التحقق من صلاحية الحساب'),
+      ).toBeInTheDocument();
+
+      authMock.rpcResult = { data: true, error: null };
+      fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+
+      expect(await screen.findByText('جرد أول محقق')).toBeInTheDocument();
+      const remountedInput = screen.getByLabelText('الكمية المعدودة بلطي');
+      await waitFor(() => expect(remountedInput).toBeEnabled());
+      expect(hasAnyHeldWrite()).toBe(false);
+
+      // User enters a new unsaved draft on the remounted page.
+      fireEvent.change(remountedInput, { target: { value: '4' } });
+      const remountedNote = screen.getByLabelText('ملاحظة');
+      fireEvent.change(remountedNote, { target: { value: 'مسودة جديدة' } });
+      const readsBeforeRelease = vi.mocked(listCounts).mock.calls.length;
+
+      // Release the old page's delayed post-save read: must be skipped completely.
+      const releaseFirstRead = resolveHeldRead!;
+      resolveHeldRead = null;
+      rejectHeldRead = null;
+      await act(async () => {
+        releaseFirstRead([firstPosted]);
+        await Promise.resolve();
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+
+      expect(screen.getByLabelText('الكمية المعدودة بلطي')).toBe(
+        remountedInput,
+      );
+      expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('4');
+      expect(screen.getByLabelText('ملاحظة')).toHaveValue('مسودة جديدة');
+      expect(screen.getByLabelText('الكمية المعدودة بلطي')).toBeEnabled();
+      expect(screen.queryByText('اتسجل الجرد')).not.toBeInTheDocument();
+      expect(vi.mocked(listCounts).mock.calls.length).toBe(readsBeforeRelease);
+
+      // Part B: delayed old post-save read rejects after remounted page already verified and unlocked.
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(2));
+
+      const secondPosted: CountRecord = {
+        ...firstPosted,
+        id: 'cnt-r22-2',
+        countedAt: '2026-10-22T13:00:00.000Z',
+        createdAt: '2026-10-22T13:00:00.000Z',
+        note: 'جرد ثاني محقق',
+      };
+      postedCounts = [secondPosted, firstPosted];
+      holdNextListCounts = true;
+      await act(async () => {
+        resolveSecondCount({ status: 'posted', countId: secondPosted.id });
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(rejectHeldRead).not.toBeNull());
+      expect(getHeldWrite(COUNT_DAILY_SUBJECT)?.phase).toBe('posted_reload');
+
+      authMock.rpcResult = { data: null, error: { message: 'temporary' } };
+      act(() => {
+        emitAuth('SIGNED_IN', {
+          user: { id: userId, email: 'owner@theshark.test' },
+          access_token: jwtSid1,
+          refresh_token: 'rt-r22-1',
+        });
+      });
+      expect(
+        await screen.findByText('تعذر التحقق من صلاحية الحساب'),
+      ).toBeInTheDocument();
+
+      authMock.rpcResult = { data: true, error: null };
+      fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+
+      expect(await screen.findByText('جرد ثاني محقق')).toBeInTheDocument();
+      const thirdInput = screen.getByLabelText('الكمية المعدودة بلطي');
+      await waitFor(() => expect(thirdInput).toBeEnabled());
+      expect(hasAnyHeldWrite()).toBe(false);
+
+      fireEvent.change(thirdInput, { target: { value: '9' } });
+      fireEvent.change(screen.getByLabelText('ملاحظة'), {
+        target: { value: 'مسودة محمية' },
+      });
+
+      const failSecondRead = rejectHeldRead!;
+      resolveHeldRead = null;
+      rejectHeldRead = null;
+      await act(async () => {
+        failSecondRead(new Error('delayed old read failed'));
+        await Promise.resolve();
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+
+      expect(screen.getByLabelText('الكمية المعدودة بلطي')).toBe(thirdInput);
+      expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('9');
+      expect(screen.getByLabelText('ملاحظة')).toHaveValue('مسودة محمية');
+      expect(screen.getByLabelText('الكمية المعدودة بلطي')).toBeEnabled();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(nested).toEqual([]);
+    } finally {
+      authMock.session = null;
+      authMock.rpcResult = { data: true, error: null };
+      authMock.listeners.splice(0, authMock.listeners.length);
+      resetAuthStore();
+      if (origLocks) {
+        Object.defineProperty(navigator, 'locks', origLocks);
+      } else {
+        Reflect.deleteProperty(navigator, 'locks');
+      }
+    }
+  });
+
+  it('R22-2: forwarded post-save refresh still loads fresh counts without erasing a newer draft on the receiving CountsPage', async () => {
+    const makeSyntheticJwt = (payload: Record<string, unknown>): string => {
+      const encode = (value: Record<string, unknown>) =>
+        btoa(
+          String.fromCharCode(
+            ...new TextEncoder().encode(JSON.stringify(value)),
+          ),
+        )
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/g, '');
+      return `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode(payload)}.sig`;
+    };
+    const emitAuth = (event: string, session: AuthMockSession) => {
+      authMock.session = session;
+      for (const listener of [...authMock.listeners]) {
+        listener(event, session);
+      }
+    };
+
+    const userId = 'owner-r22-2';
+    const jwtSid1 = makeSyntheticJwt({
+      sub: userId,
+      session_id: 'sid-r22-2',
+      exp: 2_000_000_000,
+    });
+    const { locks, nested } = makeAuditedLocks();
+    const origLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: locks,
+    });
+
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    let posted = false;
+    const freshCount: CountRecord = {
+      id: 'cnt-r22-refresh',
+      countedAt: '2026-10-22T14:00:00.000Z',
+      createdAt: '2026-10-22T14:00:00.000Z',
+      frequency: 'daily',
+      note: 'جرد محدث مع الحفاظ على المسودة',
+      itemCount: 1,
+      shortageValue: '0',
+      surplusValue: '0',
+      revisedDifference: '0',
+      compensatorSum: '0',
+      hasCompensator: false,
+      hasSurplus: false,
+    };
+    vi.mocked(listCounts).mockImplementation(() =>
+      Promise.resolve(posted ? [freshCount] : []),
+    );
+    vi.mocked(listPendingCounts).mockResolvedValue([]);
+
+    let resolveCount!: (value: { status: 'posted'; countId: string }) => void;
+    vi.mocked(recordCount).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveCount = resolve;
+        }),
+    );
+
+    try {
+      authMock.listeners.splice(0, authMock.listeners.length);
+      authMock.rpcResult = { data: true, error: null };
+      authMock.session = {
+        user: { id: userId, email: 'owner@theshark.test' },
+        access_token: jwtSid1,
+        refresh_token: 'rt-r22-2',
+      };
+      startAuth();
+
+      render(
+        <MemoryRouter>
+          <AuthProvider>
+            <RequireOwner>
+              <CountsPage />
+            </RequireOwner>
+          </AuthProvider>
+        </MemoryRouter>,
+      );
+
+      const firstInput = await screen.findByLabelText('الكمية المعدودة بلطي');
+      fireEvent.change(firstInput, { target: { value: '7' } });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(1));
+
+      // Unmount old CountsPage while the daily write is still in flight, then remount with stale counts.
+      authMock.rpcResult = { data: null, error: { message: 'temporary' } };
+      act(() => {
+        emitAuth('SIGNED_IN', {
+          user: { id: userId, email: 'owner@theshark.test' },
+          access_token: jwtSid1,
+          refresh_token: 'rt-r22-2',
+        });
+      });
+      expect(
+        await screen.findByText('تعذر التحقق من صلاحية الحساب'),
+      ).toBeInTheDocument();
+
+      authMock.rpcResult = { data: true, error: null };
+      fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+
+      const remountedInput = await screen.findByLabelText(
+        'الكمية المعدودة بلطي',
+      );
+      expect(screen.getByText('لسه مفيش جرد')).toBeInTheDocument();
+
+      // Simulate a cross-tab pin clear unlocking the receiving page before it has verified the count,
+      // then the user starts entering a newer draft before the forwarded post-save refresh runs.
+      const activeKey = `${userStoragePrefix(userId)}${encodeURIComponent(COUNT_DAILY_SUBJECT)}`;
+      const savedActive = localStorage.getItem(activeKey);
+      localStorage.removeItem(activeKey);
+      act(() => {
+        window.dispatchEvent(
+          new StorageEvent('storage', {
+            key: activeKey,
+            oldValue: savedActive,
+            newValue: null,
+          }),
+        );
+      });
+      await waitFor(() => expect(remountedInput).toBeEnabled());
+      fireEvent.change(remountedInput, { target: { value: '3' } });
+      fireEvent.change(screen.getByLabelText('ملاحظة'), {
+        target: { value: 'مسودة أثناء التحديث' },
+      });
+
+      // Restore the durable active record before resolving so applyPosted completes normally.
+      if (savedActive !== null) {
+        localStorage.setItem(activeKey, savedActive);
+      }
+      posted = true;
+      await act(async () => {
+        resolveCount({ status: 'posted', countId: freshCount.id });
+        await Promise.resolve();
+      });
+
+      expect(
+        await screen.findByText('جرد محدث مع الحفاظ على المسودة'),
+      ).toBeInTheDocument();
+      expect(await screen.findByText('اتسجل الجرد')).toBeInTheDocument();
+      expect(screen.getByLabelText('الكمية المعدودة بلطي')).toBe(
+        remountedInput,
+      );
+      expect(screen.getByLabelText('الكمية المعدودة بلطي')).toHaveValue('3');
+      expect(screen.getByLabelText('ملاحظة')).toHaveValue(
+        'مسودة أثناء التحديث',
+      );
+      await waitFor(() =>
+        expect(screen.getByLabelText('الكمية المعدودة بلطي')).toBeEnabled(),
+      );
+      expect(hasAnyHeldWrite()).toBe(false);
+      expect(nested).toEqual([]);
+    } finally {
+      authMock.session = null;
+      authMock.rpcResult = { data: true, error: null };
+      authMock.listeners.splice(0, authMock.listeners.length);
+      resetAuthStore();
+      if (origLocks) {
+        Object.defineProperty(navigator, 'locks', origLocks);
+      } else {
+        Reflect.deleteProperty(navigator, 'locks');
+      }
+    }
+  });
 });

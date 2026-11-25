@@ -72,7 +72,13 @@ type ReadResult = { status: 'ready'; snapshot: Snapshot } | { status: 'stale' };
 type PostedRefreshOptions = {
   fromPosted?: boolean;
   requestId?: string | null;
-  resetForm?: boolean;
+  postedSeq?: number | null;
+};
+
+type ReloadErrorOptions = {
+  session?: WriteSession | null;
+  requestId?: string | null;
+  postedSeq?: number | null;
 };
 
 type MountedCountsHandle = {
@@ -86,10 +92,11 @@ type MountedCountsHandle = {
     noticeRequestId: string | null,
     hop?: number,
   ) => Promise<void>;
-  showReloadError: (message: string) => void;
+  showReloadError: (message: string, options?: ReloadErrorOptions) => void;
 };
 
 const mountedCountsPages = new Set<MountedCountsHandle>();
+let countPostedSeq = 0;
 
 function activeMountedCountsPage(): MountedCountsHandle | null {
   let latest: MountedCountsHandle | null = null;
@@ -168,6 +175,13 @@ function snapshotCountPostedReloads(): PostedReloadSnapshot {
   ];
 }
 
+function hasPendingPostedReloadFor(requestId: string): boolean {
+  return (
+    hasPostedReload(COUNT_DAILY_SUBJECT, undefined, requestId) ||
+    hasPostedReload(`${COUNT_STORED_PREFIX}${requestId}`, undefined, requestId)
+  );
+}
+
 export function CountsPage() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -193,7 +207,47 @@ export function CountsPage() {
   const seqRef = useRef(0);
   const loadsRef = useRef(0);
   const mountedRef = useRef(true);
+  const verifiedSeqRef = useRef(0);
+  const verifiedRequestsRef = useRef<Set<string>>(new Set());
   const handleRef = useRef<MountedCountsHandle | null>(null);
+
+  function markVerified(
+    readStartedAtSeq: number,
+    cleared: PostedReloadSnapshot,
+    requestId?: string | null,
+  ): void {
+    if (readStartedAtSeq > verifiedSeqRef.current) {
+      verifiedSeqRef.current = readStartedAtSeq;
+    }
+    for (const item of cleared) {
+      verifiedRequestsRef.current.add(item.requestId);
+    }
+    if (requestId) {
+      verifiedRequestsRef.current.add(requestId);
+    }
+  }
+
+  function isPostedRefreshVerified(
+    options?: Pick<PostedRefreshOptions, 'requestId' | 'postedSeq'>,
+  ): boolean {
+    if (!options) return false;
+    if (
+      options.postedSeq !== undefined &&
+      options.postedSeq !== null &&
+      options.postedSeq <= verifiedSeqRef.current
+    ) {
+      return true;
+    }
+    if (
+      options.requestId !== undefined &&
+      options.requestId !== null &&
+      (options.postedSeq === undefined || options.postedSeq === null) &&
+      verifiedRequestsRef.current.has(options.requestId)
+    ) {
+      return true;
+    }
+    return false;
+  }
 
   useEffect(() => {
     mountedRef.current = true;
@@ -206,8 +260,8 @@ export function CountsPage() {
         handleRef.current
           ? handleRef.current.refreshWait(session, noticeRequestId, hop)
           : Promise.resolve(),
-      showReloadError: (message) => {
-        handleRef.current?.showReloadError(message);
+      showReloadError: (message, options) => {
+        handleRef.current?.showReloadError(message, options);
       },
     };
     mountedCountsPages.add(entry);
@@ -300,6 +354,8 @@ export function CountsPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const session = captureWriteSession();
+    const readStartedAtSeq = countPostedSeq;
     const pendingReloads = snapshotCountPostedReloads();
     void (async () => {
       try {
@@ -308,7 +364,10 @@ export function CountsPage() {
         setSnapshot(next.snapshot);
         rememberItemNames(next.snapshot.items);
         setLoadError(null);
-        await clearPostedReloadSnapshot(pendingReloads);
+        await clearPostedReloadSnapshot(pendingReloads, undefined, session);
+        if (isCurrentWriteSession(session)) {
+          markVerified(readStartedAtSeq, pendingReloads);
+        }
         if (cancelled) return;
         setLocalNeedsReload(false);
       } catch (error) {
@@ -357,6 +416,14 @@ export function CountsPage() {
           await target.refreshWait(session, noticeRequestId, hop + 1);
         }
       }
+      return;
+    }
+    if (
+      hop > 0 &&
+      noticeRequestId !== null &&
+      (verifiedRequestsRef.current.has(noticeRequestId) ||
+        hasPendingPostedReloadFor(noticeRequestId))
+    ) {
       return;
     }
     if (hop > 0 && noticeRequestId !== null) {
@@ -484,6 +551,7 @@ export function CountsPage() {
     stored: HeldWriteRecord<Json> | null,
     release: () => void,
     session: WriteSession | null,
+    postedSeq: number | null,
   ): Promise<boolean> {
     if (!isCurrentWriteSession(session)) {
       release();
@@ -529,7 +597,6 @@ export function CountsPage() {
       await refreshAfterWait(session, noticeRequestId);
       return false;
     }
-    const matchesDaily = requestId !== null && daily?.requestId === requestId;
     applyPosted(
       requestId,
       draft !== null,
@@ -543,7 +610,7 @@ export function CountsPage() {
     await reloadPostedCounts(session, {
       fromPosted: true,
       requestId,
-      resetForm: draft !== null || matchesDaily,
+      postedSeq,
     });
     return true;
   }
@@ -563,16 +630,17 @@ export function CountsPage() {
       }
       return;
     }
+    if (hop > 0 && isPostedRefreshVerified(options)) {
+      return;
+    }
     if (hop > 0 && options?.fromPosted) {
-      if (options.resetForm) {
-        setFormEpoch((value) => value + 1);
-      }
       setWaitNotice((current) =>
         current !== null && current === options.requestId ? null : current,
       );
       setLocalNeedsReload(true);
       setSuccess('اتسجل الجرد');
     }
+    const readStartedAtSeq = countPostedSeq;
     const pendingReloads = snapshotCountPostedReloads();
     const next = await readSnapshot();
     if (!isCurrentWriteSession(session)) return;
@@ -591,6 +659,12 @@ export function CountsPage() {
       setLoadError(null);
       setLoading(false);
       await clearPostedReloadSnapshot(pendingReloads, undefined, session);
+      if (!isCurrentWriteSession(session)) return;
+      markVerified(
+        readStartedAtSeq,
+        pendingReloads,
+        options?.fromPosted ? options.requestId : null,
+      );
     }
     if (mountedRef.current) {
       setLocalNeedsReload(false);
@@ -603,7 +677,7 @@ export function CountsPage() {
         await reloadPostedCounts(session, options, hop);
       } catch (error) {
         if (!isCurrentWriteSession(session)) return;
-        if (mountedRef.current) {
+        if (mountedRef.current && !isPostedRefreshVerified(options)) {
           setLocalNeedsReload(true);
           setLoadError(messageFrom(error));
         }
@@ -611,8 +685,15 @@ export function CountsPage() {
     },
     refreshWait: (session, noticeRequestId, hop = 0) =>
       refreshAfterWait(session, noticeRequestId, hop),
-    showReloadError: (message) => {
+    showReloadError: (message, options) => {
       if (!mountedRef.current) return;
+      if (
+        options?.session !== undefined &&
+        !isCurrentWriteSession(options.session)
+      ) {
+        return;
+      }
+      if (isPostedRefreshVerified(options)) return;
       setLocalNeedsReload(true);
       setLoadError(message);
     },
@@ -686,9 +767,11 @@ export function CountsPage() {
       ) {
         setLocalNeedsReload(true);
         try {
-          await reloadPostedCounts(session);
+          await reloadPostedCounts(session, {
+            requestId: claim.existing.requestId,
+          });
         } catch (error) {
-          setLoadError(messageFrom(error));
+          if (mountedRef.current) setLoadError(messageFrom(error));
         }
       } else if (claim.reason === 'storage' || claim.reason === 'missing') {
         setServerError(storageWriteFailedMessage);
@@ -714,10 +797,14 @@ export function CountsPage() {
     setCardError(null);
     setSuccess(null);
     let saved = false;
+    let postedSeq: number | null = null;
     try {
       const result = await recordCount(draft);
       if (!isCurrentWriteSession(session)) return;
-      if (result.status === 'posted') saved = true;
+      if (result.status === 'posted') {
+        saved = true;
+        postedSeq = ++countPostedSeq;
+      }
       await finishWrite(
         result,
         draft,
@@ -727,6 +814,7 @@ export function CountsPage() {
         matchingStored.record,
         claim.release,
         session,
+        postedSeq,
       );
     } catch (error) {
       if (!isCurrentWriteSession(session)) return;
@@ -743,7 +831,11 @@ export function CountsPage() {
         setLocalNeedsReload(true);
         setLoadError(messageFrom(error));
       } else {
-        activeMountedCountsPage()?.showReloadError(messageFrom(error));
+        activeMountedCountsPage()?.showReloadError(messageFrom(error), {
+          session,
+          requestId: draft.requestId,
+          postedSeq,
+        });
       }
     } finally {
       claim.release();
@@ -816,9 +908,11 @@ export function CountsPage() {
         ) {
           setLocalNeedsReload(true);
           try {
-            await reloadPostedCounts(session);
+            await reloadPostedCounts(session, {
+              requestId: claim.existing.requestId,
+            });
           } catch (error) {
-            setLoadError(messageFrom(error));
+            if (mountedRef.current) setLoadError(messageFrom(error));
           }
         } else if (claim.reason === 'storage' || claim.reason === 'missing') {
           setCardError(storageWriteFailedMessage);
@@ -859,11 +953,15 @@ export function CountsPage() {
     setCardError(null);
     setSuccess(null);
     let saved = false;
+    let postedSeq: number | null = null;
     try {
       const dispatchPayload = storedRecord ? storedRecord.payload : payload;
       const result = await recordStoredCount(dispatchPayload);
       if (!isCurrentWriteSession(session)) return;
-      if (result.status === 'posted') saved = true;
+      if (result.status === 'posted') {
+        saved = true;
+        postedSeq = ++countPostedSeq;
+      }
       await finishWrite(
         result,
         null,
@@ -873,6 +971,7 @@ export function CountsPage() {
         storedRecord,
         releaseLock,
         session,
+        postedSeq,
       );
     } catch (error) {
       if (!isCurrentWriteSession(session)) return;
@@ -912,7 +1011,11 @@ export function CountsPage() {
         setLocalNeedsReload(true);
         setLoadError(messageFrom(error));
       } else {
-        activeMountedCountsPage()?.showReloadError(messageFrom(error));
+        activeMountedCountsPage()?.showReloadError(messageFrom(error), {
+          session,
+          requestId,
+          postedSeq,
+        });
       }
     } finally {
       releaseLock();
