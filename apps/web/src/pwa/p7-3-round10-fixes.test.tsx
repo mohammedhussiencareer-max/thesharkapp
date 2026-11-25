@@ -19,6 +19,7 @@ import {
   recordStoredCount,
 } from '@/counts/api';
 import { pendingResendMessage, waitingForSyncMessage } from '@/counts/errors';
+import type { CountRecord } from '@/counts/types';
 import {
   addConversion,
   addCustomUnit,
@@ -77,6 +78,8 @@ import {
   setPwaAuthResolved,
   setTestWaitingWorker,
 } from '@/lib/pwa';
+import { AuthProvider } from '@/auth/AuthProvider';
+import { RequireOwner } from '@/auth/RequireOwner';
 import { ActivationPage } from '@/pages/ActivationPage';
 import { CountsPage } from '@/pages/CountsPage';
 import { ExpensesPage } from '@/pages/ExpensesPage';
@@ -89,10 +92,17 @@ type AuthMockSession = {
   refresh_token?: string;
 } | null;
 
-const authMock = vi.hoisted(() => ({
-  session: null as AuthMockSession,
-  listeners: [] as Array<(event: string, session: AuthMockSession) => void>,
-}));
+const authMock = vi.hoisted(() => {
+  const rpcResult: {
+    data: boolean | null;
+    error: { message: string } | null;
+  } = { data: true, error: null };
+  return {
+    session: null as AuthMockSession,
+    listeners: [] as Array<(event: string, session: AuthMockSession) => void>,
+    rpcResult,
+  };
+});
 
 vi.mock('@/lib/supabase', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/supabase')>();
@@ -127,7 +137,7 @@ vi.mock('@/lib/supabase', async (importOriginal) => {
         },
       },
       schema: () => ({
-        rpc: () => Promise.resolve({ data: true, error: null }),
+        rpc: () => Promise.resolve(authMock.rpcResult),
       }),
     },
   };
@@ -3724,12 +3734,16 @@ describe('P7-3 round-10 review fixes', () => {
         avgCost: '10.00',
       },
     ]);
-    vi.mocked(listCounts).mockResolvedValue([]);
+    let postedCounts: CountRecord[] = [];
+    vi.mocked(listCounts).mockImplementation(() =>
+      Promise.resolve([...postedCounts]),
+    );
     vi.mocked(listPendingCounts).mockResolvedValue([]);
 
     let resolveFirst!: (value: { status: 'posted'; countId: string }) => void;
     let resolveSecond!: (value: { status: 'posted'; countId: string }) => void;
     let resolveThird!: (value: { status: 'posted'; countId: string }) => void;
+    let resolveFourth!: (value: { status: 'posted'; countId: string }) => void;
     vi.mocked(recordCount)
       .mockImplementationOnce(
         () =>
@@ -3748,21 +3762,31 @@ describe('P7-3 round-10 review fixes', () => {
           new Promise((resolve) => {
             resolveThird = resolve;
           }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFourth = resolve;
+          }),
       );
 
     try {
       authMock.listeners.splice(0, authMock.listeners.length);
+      authMock.rpcResult = { data: true, error: null };
       authMock.session = {
         user: { id: userId, email: 'owner@theshark.test' },
         access_token: jwtSid1,
         refresh_token: 'rt-r20-1',
       };
       startAuth();
-      setPwaAuthResolved(true);
 
       render(
         <MemoryRouter>
-          <CountsPage />
+          <AuthProvider>
+            <RequireOwner>
+              <CountsPage />
+            </RequireOwner>
+          </AuthProvider>
         </MemoryRouter>,
       );
 
@@ -3782,13 +3806,33 @@ describe('P7-3 round-10 review fixes', () => {
           refresh_token: 'rt-r20-1',
         });
       });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      });
 
-      // The in-flight count succeeds after refocus and must settle cleanly.
+      // The in-flight count succeeds after refocus and must settle cleanly on the visible page.
+      postedCounts = [
+        {
+          id: 'cnt-r20-1',
+          countedAt: '2026-10-22T10:00:00.000Z',
+          createdAt: '2026-10-22T10:00:00.000Z',
+          frequency: 'daily',
+          note: 'جرد بعد الرجوع',
+          itemCount: 1,
+          shortageValue: '0',
+          surplusValue: '0',
+          revisedDifference: '0',
+          compensatorSum: '0',
+          hasCompensator: false,
+          hasSurplus: false,
+        },
+      ];
       await act(async () => {
         resolveFirst({ status: 'posted', countId: 'cnt-r20-1' });
         await Promise.resolve();
       });
 
+      expect(await screen.findByText('جرد بعد الرجوع')).toBeInTheDocument();
       expect(await screen.findByText('اتسجل الجرد')).toBeInTheDocument();
       await waitFor(() => expect(hasLiveHeldWriteClaims()).toBe(false));
       expect(getHeldWrite(COUNT_DAILY_SUBJECT)).toBeNull();
@@ -3814,6 +3858,7 @@ describe('P7-3 round-10 review fixes', () => {
           refresh_token: 'rt-r20-2',
         });
       });
+      await screen.findByLabelText('الكمية المعدودة بلطي');
 
       await act(async () => {
         resolveSecond({ status: 'posted', countId: 'cnt-r20-2' });
@@ -3827,12 +3872,16 @@ describe('P7-3 round-10 review fixes', () => {
       expect(nested).toEqual([]);
 
       // Direct same-user session switch (new session_id without SIGNED_OUT) also rejects
-      // the late reply and releases the claim lock cleanly without nesting.
+      // the late reply, promotes the pin to unknown once released, and allows retrying the same request.
       fireEvent.change(screen.getByLabelText('الكمية المعدودة بلطي'), {
         target: { value: '5' },
       });
       fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
       await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(3));
+      const thirdRequestId =
+        vi.mocked(recordCount).mock.calls[2]?.[0]?.requestId;
+      expect(typeof thirdRequestId).toBe('string');
+      expect(thirdRequestId).toBeTruthy();
       expect(hasLiveHeldWriteClaims()).toBe(true);
 
       act(() => {
@@ -3842,6 +3891,7 @@ describe('P7-3 round-10 review fixes', () => {
           refresh_token: 'rt-r20-3',
         });
       });
+      await screen.findByLabelText('الكمية المعدودة بلطي');
 
       await act(async () => {
         resolveThird({ status: 'posted', countId: 'cnt-r20-3' });
@@ -3850,9 +3900,216 @@ describe('P7-3 round-10 review fixes', () => {
 
       await waitFor(() => expect(hasLiveHeldWriteClaims()).toBe(false));
       expect(hasPostedReload(COUNT_DAILY_SUBJECT)).toBe(false);
+      await waitFor(() => {
+        const recovered = getHeldWrite(COUNT_DAILY_SUBJECT);
+        expect(recovered?.phase).toBe('unknown');
+        expect(recovered?.requestId).toBe(thirdRequestId);
+      });
+      expect(
+        JSON.parse(localStorage.getItem(dailyKey) ?? 'null'),
+      ).toMatchObject({
+        requestId: thirdRequestId,
+        phase: 'unknown',
+      });
+
+      // The same request can be retried after lock release and settles cleanly.
+      const retryButton = screen.getByRole('button', { name: 'حفظ' });
+      await waitFor(() => expect(retryButton).toBeEnabled());
+      fireEvent.click(retryButton);
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(4));
+      expect(vi.mocked(recordCount).mock.calls[3]?.[0]?.requestId).toBe(
+        thirdRequestId,
+      );
+
+      postedCounts = [
+        ...postedCounts,
+        {
+          id: 'cnt-r20-3',
+          countedAt: '2026-10-22T11:00:00.000Z',
+          createdAt: '2026-10-22T11:00:00.000Z',
+          frequency: 'daily',
+          note: 'جرد بعد تبديل الجلسة',
+          itemCount: 1,
+          shortageValue: '0',
+          surplusValue: '0',
+          revisedDifference: '0',
+          compensatorSum: '0',
+          hasCompensator: false,
+          hasSurplus: false,
+        },
+      ];
+      await act(async () => {
+        resolveFourth({ status: 'posted', countId: 'cnt-r20-3' });
+        await Promise.resolve();
+      });
+
+      expect(
+        await screen.findByText('جرد بعد تبديل الجلسة'),
+      ).toBeInTheDocument();
+      await waitFor(() => expect(hasLiveHeldWriteClaims()).toBe(false));
+      expect(getHeldWrite(COUNT_DAILY_SUBJECT)).toBeNull();
+      expect(localStorage.getItem(dailyKey)).toBeNull();
+      expect(hasAnyHeldWrite()).toBe(false);
+      expect(screen.getByLabelText('الكمية المعدودة بلطي')).toBeEnabled();
       expect(nested).toEqual([]);
     } finally {
       authMock.session = null;
+      authMock.rpcResult = { data: true, error: null };
+      authMock.listeners.splice(0, authMock.listeners.length);
+      resetAuthStore();
+      if (origLocks) {
+        Object.defineProperty(navigator, 'locks', origLocks);
+      } else {
+        Reflect.deleteProperty(navigator, 'locks');
+      }
+    }
+  });
+
+  it('R21-1: when RequireOwner unmounts and remounts CountsPage while a daily count is in flight, post-save refresh routes to the mounted page', async () => {
+    const makeSyntheticJwt = (payload: Record<string, unknown>): string => {
+      const encode = (value: Record<string, unknown>) =>
+        btoa(
+          String.fromCharCode(
+            ...new TextEncoder().encode(JSON.stringify(value)),
+          ),
+        )
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/g, '');
+      return `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode(payload)}.sig`;
+    };
+    const emitAuth = (event: string, session: AuthMockSession) => {
+      authMock.session = session;
+      for (const listener of [...authMock.listeners]) {
+        listener(event, session);
+      }
+    };
+
+    const userId = 'owner-r21';
+    const jwtSid1 = makeSyntheticJwt({
+      sub: userId,
+      session_id: 'sid-r21-1',
+      exp: 2_000_000_000,
+    });
+    const prefix = userStoragePrefix(userId);
+    const dailyKey = `${prefix}${encodeURIComponent(COUNT_DAILY_SUBJECT)}`;
+    const { locks, nested } = makeAuditedLocks();
+    const origLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: locks,
+    });
+
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    let posted = false;
+    const freshCount: CountRecord = {
+      id: 'cnt-r21-1',
+      countedAt: '2026-10-22T12:00:00.000Z',
+      createdAt: '2026-10-22T12:00:00.000Z',
+      frequency: 'daily',
+      note: 'جرد بعد إعادة التحميل',
+      itemCount: 1,
+      shortageValue: '0',
+      surplusValue: '0',
+      revisedDifference: '0',
+      compensatorSum: '0',
+      hasCompensator: false,
+      hasSurplus: false,
+    };
+    vi.mocked(listCounts).mockImplementation(() =>
+      Promise.resolve(posted ? [freshCount] : []),
+    );
+    vi.mocked(listPendingCounts).mockResolvedValue([]);
+
+    let resolveCount!: (value: { status: 'posted'; countId: string }) => void;
+    vi.mocked(recordCount).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveCount = resolve;
+        }),
+    );
+
+    try {
+      authMock.listeners.splice(0, authMock.listeners.length);
+      authMock.rpcResult = { data: true, error: null };
+      authMock.session = {
+        user: { id: userId, email: 'owner@theshark.test' },
+        access_token: jwtSid1,
+        refresh_token: 'rt-r21-1',
+      };
+      startAuth();
+
+      render(
+        <MemoryRouter>
+          <AuthProvider>
+            <RequireOwner>
+              <CountsPage />
+            </RequireOwner>
+          </AuthProvider>
+        </MemoryRouter>,
+      );
+
+      const firstInput = await screen.findByLabelText('الكمية المعدودة بلطي');
+      fireEvent.change(firstInput, { target: { value: '7' } });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(1));
+      expect(getHeldWrite(COUNT_DAILY_SUBJECT)?.phase).toBe('inflight');
+
+      // Force RequireOwner to unmount CountsPage via a transient owner-check error,
+      // then retry so a fresh CountsPage mounts and reads empty counts before the write posts.
+      authMock.rpcResult = { data: null, error: { message: 'temporary' } };
+      act(() => {
+        emitAuth('SIGNED_IN', {
+          user: { id: userId, email: 'owner@theshark.test' },
+          access_token: jwtSid1,
+          refresh_token: 'rt-r21-1',
+        });
+      });
+      expect(
+        await screen.findByText('تعذر التحقق من صلاحية الحساب'),
+      ).toBeInTheDocument();
+
+      authMock.rpcResult = { data: true, error: null };
+      fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+
+      const remountedInput = await screen.findByLabelText(
+        'الكمية المعدودة بلطي',
+      );
+      expect(remountedInput).not.toBe(firstInput);
+      expect(screen.getByText('لسه مفيش جرد')).toBeInTheDocument();
+      expect(remountedInput).toBeDisabled();
+
+      // Now the in-flight count posts on the server. The mounted page must receive
+      // the fresh readback before the pin clears and unlocks the form.
+      posted = true;
+      await act(async () => {
+        resolveCount({ status: 'posted', countId: freshCount.id });
+        await Promise.resolve();
+      });
+
+      expect(
+        await screen.findByText('جرد بعد إعادة التحميل'),
+      ).toBeInTheDocument();
+      expect(screen.queryByText('لسه مفيش جرد')).not.toBeInTheDocument();
+      expect(await screen.findByText('اتسجل الجرد')).toBeInTheDocument();
+      await waitFor(() => expect(hasLiveHeldWriteClaims()).toBe(false));
+      expect(getHeldWrite(COUNT_DAILY_SUBJECT)).toBeNull();
+      expect(localStorage.getItem(dailyKey)).toBeNull();
+      expect(hasAnyHeldWrite()).toBe(false);
+      expect(screen.getByLabelText('الكمية المعدودة بلطي')).toBeEnabled();
+      expect(nested).toEqual([]);
+    } finally {
+      authMock.session = null;
+      authMock.rpcResult = { data: true, error: null };
       authMock.listeners.splice(0, authMock.listeners.length);
       resetAuthStore();
       if (origLocks) {

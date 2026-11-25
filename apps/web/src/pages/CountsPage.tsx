@@ -69,6 +69,36 @@ type Snapshot = {
 
 type ReadResult = { status: 'ready'; snapshot: Snapshot } | { status: 'stale' };
 
+type PostedRefreshOptions = {
+  fromPosted?: boolean;
+  requestId?: string | null;
+  resetForm?: boolean;
+};
+
+type MountedCountsHandle = {
+  reloadPosted: (
+    session: WriteSession | null,
+    options?: PostedRefreshOptions,
+    hop?: number,
+  ) => Promise<void>;
+  refreshWait: (
+    session: WriteSession | null,
+    noticeRequestId: string | null,
+    hop?: number,
+  ) => Promise<void>;
+  showReloadError: (message: string) => void;
+};
+
+const mountedCountsPages = new Set<MountedCountsHandle>();
+
+function activeMountedCountsPage(): MountedCountsHandle | null {
+  let latest: MountedCountsHandle | null = null;
+  for (const entry of mountedCountsPages) {
+    latest = entry;
+  }
+  return latest;
+}
+
 function requestIdOf(payload: Json): string | null {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return null;
@@ -162,6 +192,30 @@ export function CountsPage() {
   );
   const seqRef = useRef(0);
   const loadsRef = useRef(0);
+  const mountedRef = useRef(true);
+  const handleRef = useRef<MountedCountsHandle | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    const entry: MountedCountsHandle = {
+      reloadPosted: (session, options, hop = 0) =>
+        handleRef.current
+          ? handleRef.current.reloadPosted(session, options, hop)
+          : Promise.resolve(),
+      refreshWait: (session, noticeRequestId, hop = 0) =>
+        handleRef.current
+          ? handleRef.current.refreshWait(session, noticeRequestId, hop)
+          : Promise.resolve(),
+      showReloadError: (message) => {
+        handleRef.current?.showReloadError(message);
+      },
+    };
+    mountedCountsPages.add(entry);
+    return () => {
+      mountedRef.current = false;
+      mountedCountsPages.delete(entry);
+    };
+  }, []);
 
   const online = useReconnectReload(() => {
     if (!saving && loadsRef.current === 0) {
@@ -211,7 +265,11 @@ export function CountsPage() {
   const postedReload =
     heldEpoch >= 0 &&
     (storedDaily?.phase === 'posted_reload' ||
-      storedCountPins.some((record) => record.phase === 'posted_reload'));
+      hasPostedReload(COUNT_DAILY_SUBJECT) ||
+      storedCountPins.some(
+        (record) =>
+          record.phase === 'posted_reload' || hasPostedReload(record.subject),
+      ));
 
   const needsReload = localNeedsReload || postedReload;
   const editingLocked = saving || inflightDaily || needsReload;
@@ -236,7 +294,7 @@ export function CountsPage() {
       throw error;
     } finally {
       loadsRef.current -= 1;
-      setLoads(loadsRef.current);
+      if (mountedRef.current) setLoads(loadsRef.current);
     }
   }
 
@@ -251,6 +309,7 @@ export function CountsPage() {
         rememberItemNames(next.snapshot.items);
         setLoadError(null);
         await clearPostedReloadSnapshot(pendingReloads);
+        if (cancelled) return;
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -285,17 +344,47 @@ export function CountsPage() {
     return mapCountError(error);
   }
 
-  async function refreshAfterWait(session: WriteSession | null): Promise<void> {
+  async function refreshAfterWait(
+    session: WriteSession | null,
+    noticeRequestId: string | null = null,
+    hop = 0,
+  ): Promise<void> {
+    if (!isCurrentWriteSession(session)) return;
+    if (!mountedRef.current) {
+      if (hop < 4) {
+        const target = activeMountedCountsPage();
+        if (target) {
+          await target.refreshWait(session, noticeRequestId, hop + 1);
+        }
+      }
+      return;
+    }
+    if (hop > 0 && noticeRequestId !== null) {
+      setWaitNotice(noticeRequestId);
+      setSuccess(null);
+    }
     try {
       const next = await readSnapshot();
       if (!isCurrentWriteSession(session)) return;
+      if (!mountedRef.current) {
+        if (hop < 4) {
+          const target = activeMountedCountsPage();
+          if (target) {
+            await target.refreshWait(session, noticeRequestId, hop + 1);
+          }
+        }
+        return;
+      }
       if (next.status === 'ready') {
         setSnapshot(next.snapshot);
+        rememberItemNames(next.snapshot.items);
         setLoadError(null);
       }
     } catch (error) {
       if (!isCurrentWriteSession(session)) return;
-      setLoadError(messageFrom(error));
+      if (mountedRef.current) {
+        setLoadError(messageFrom(error));
+      }
     }
   }
 
@@ -336,17 +425,19 @@ export function CountsPage() {
           error instanceof Error ? error : new Error(messageFrom(error));
       }
     }
-    if (fromForm || matchesDaily) {
-      setFormEpoch((value) => value + 1);
+    if (mountedRef.current) {
+      if (fromForm || matchesDaily) {
+        setFormEpoch((value) => value + 1);
+      }
+      setWaitNotice((current) =>
+        current !== null && current === requestId ? null : current,
+      );
+      // Stays set until the reload applies data, or a visible retryable error
+      // replaces it. A stale read clears the local lock while posted_reload waits
+      // for a successful read.
+      setLocalNeedsReload(true);
+      setSuccess('اتسجل الجرد');
     }
-    setWaitNotice((current) =>
-      current !== null && current === requestId ? null : current,
-    );
-    // Stays set until the reload applies data, or a visible retryable error
-    // replaces it. A stale read clears the local lock while posted_reload waits
-    // for a successful read.
-    setLocalNeedsReload(true);
-    setSuccess('اتسجل الجرد');
     if (firstError !== null) {
       throw firstError;
     }
@@ -429,12 +520,16 @@ export function CountsPage() {
           }
         }
       }
-      setWaitNotice(requestId ?? draft?.requestId ?? null);
-      setSuccess(null);
+      const noticeRequestId = requestId ?? draft?.requestId ?? null;
+      if (mountedRef.current) {
+        setWaitNotice(noticeRequestId);
+        setSuccess(null);
+      }
       release();
-      await refreshAfterWait(session);
+      await refreshAfterWait(session, noticeRequestId);
       return false;
     }
+    const matchesDaily = requestId !== null && daily?.requestId === requestId;
     applyPosted(
       requestId,
       draft !== null,
@@ -445,22 +540,83 @@ export function CountsPage() {
     );
     // The readback may cover pins owned by other count writers.
     release();
-    await reloadPostedCounts(session);
+    await reloadPostedCounts(session, {
+      fromPosted: true,
+      requestId,
+      resetForm: draft !== null || matchesDaily,
+    });
     return true;
   }
 
   async function reloadPostedCounts(
     session: WriteSession | null,
+    options?: PostedRefreshOptions,
+    hop = 0,
   ): Promise<void> {
+    if (!isCurrentWriteSession(session)) return;
+    if (!mountedRef.current) {
+      if (hop < 4) {
+        const target = activeMountedCountsPage();
+        if (target) {
+          await target.reloadPosted(session, options, hop + 1);
+        }
+      }
+      return;
+    }
+    if (hop > 0 && options?.fromPosted) {
+      if (options.resetForm) {
+        setFormEpoch((value) => value + 1);
+      }
+      setWaitNotice((current) =>
+        current !== null && current === options.requestId ? null : current,
+      );
+      setLocalNeedsReload(true);
+      setSuccess('اتسجل الجرد');
+    }
     const pendingReloads = snapshotCountPostedReloads();
     const next = await readSnapshot();
+    if (!isCurrentWriteSession(session)) return;
+    if (!mountedRef.current) {
+      if (hop < 4) {
+        const target = activeMountedCountsPage();
+        if (target) {
+          await target.reloadPosted(session, options, hop + 1);
+        }
+      }
+      return;
+    }
     if (next.status === 'ready') {
       setSnapshot(next.snapshot);
+      rememberItemNames(next.snapshot.items);
       setLoadError(null);
+      setLoading(false);
       await clearPostedReloadSnapshot(pendingReloads, undefined, session);
     }
-    setLocalNeedsReload(false);
+    if (mountedRef.current) {
+      setLocalNeedsReload(false);
+    }
   }
+
+  handleRef.current = {
+    reloadPosted: async (session, options, hop = 0) => {
+      try {
+        await reloadPostedCounts(session, options, hop);
+      } catch (error) {
+        if (!isCurrentWriteSession(session)) return;
+        if (mountedRef.current) {
+          setLocalNeedsReload(true);
+          setLoadError(messageFrom(error));
+        }
+      }
+    },
+    refreshWait: (session, noticeRequestId, hop = 0) =>
+      refreshAfterWait(session, noticeRequestId, hop),
+    showReloadError: (message) => {
+      if (!mountedRef.current) return;
+      setLocalNeedsReload(true);
+      setLoadError(message);
+    },
+  };
 
   async function handleSubmit(draft: CountDraft) {
     if (busy || loadsRef.current > 0 || !isOnline()) return;
@@ -583,13 +739,15 @@ export function CountsPage() {
         ) {
           clearHeldWrite(storedSubject, draft.requestId, matchingStored.record);
         }
-      } else {
+      } else if (mountedRef.current) {
         setLocalNeedsReload(true);
         setLoadError(messageFrom(error));
+      } else {
+        activeMountedCountsPage()?.showReloadError(messageFrom(error));
       }
     } finally {
       claim.release();
-      setSaving(false);
+      if (mountedRef.current) setSaving(false);
     }
   }
 
@@ -750,13 +908,15 @@ export function CountsPage() {
           clearHeldWrite(COUNT_DAILY_SUBJECT, requestId, daily);
           setWaitNotice(null);
         }
-      } else {
+      } else if (mountedRef.current) {
         setLocalNeedsReload(true);
         setLoadError(messageFrom(error));
+      } else {
+        activeMountedCountsPage()?.showReloadError(messageFrom(error));
       }
     } finally {
       releaseLock();
-      setSaving(false);
+      if (mountedRef.current) setSaving(false);
     }
   }
 

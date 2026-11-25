@@ -5,7 +5,11 @@ import { AuthProvider } from '@/auth/AuthProvider';
 import { AppRoutes } from '@/App';
 import { getAuthSnapshot, resetAuthStore } from '@/lib/auth-store';
 
-type Session = { user: { id: string; email: string } } | null;
+type Session = {
+  user: { id: string; email: string };
+  access_token?: string;
+  refresh_token?: string;
+} | null;
 type RpcResult = {
   data: boolean | null;
   error: { message: string } | null;
@@ -230,6 +234,46 @@ describe('owner access', () => {
       screen.queryByRole('heading', { name: 'الحساب ده مش مسموح له يدخل' }),
     ).toBeNull();
     expect(authState.signOut).not.toHaveBeenCalled();
+  });
+
+  it('keeps the owner view mounted during same-session refocus recheck while still revoking if ownership is denied', async () => {
+    const payload = btoa(JSON.stringify({ session_id: 'sid-owner-refocus' }))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
+    const session = {
+      user: { id: 'owner', email: 'owner@theshark.test' },
+      access_token: `eyJhbGciOiJIUzI1NiJ9.${payload}.sig`,
+      refresh_token: 'rt-owner-1',
+    };
+    authState.session = session;
+    authState.isOwner = true;
+
+    renderApp('/');
+    expect(await screen.findByText('owner@theshark.test')).toBeInTheDocument();
+
+    authState.holdRpc = true;
+    notifySession({ ...session });
+
+    expect(getAuthSnapshot().status).toBe('owner');
+    expect(screen.getByText('owner@theshark.test')).toBeInTheDocument();
+    expect(screen.queryByText('جاري التحقق…')).toBeNull();
+
+    await vi.waitFor(() => {
+      expect(authState.rpcHolds).toHaveLength(1);
+    });
+
+    await act(async () => {
+      authState.rpcHolds[0]?.({ data: false, error: null });
+      await Promise.resolve();
+    });
+
+    expect(
+      await screen.findByRole('heading', {
+        name: 'الحساب ده مش مسموح له يدخل',
+      }),
+    ).toBeInTheDocument();
+    expect(getAuthSnapshot().status).toBe('denied');
   });
 });
 

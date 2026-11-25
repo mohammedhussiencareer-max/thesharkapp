@@ -111,12 +111,19 @@ function isSameAuthenticatedSession(
   return true;
 }
 
-function checkOwner(session: Session) {
+function checkOwner(
+  session: Session,
+  options?: { keepCurrentOwner?: boolean },
+) {
   const client = supabase;
   if (!client) return;
   const id = ++checkId;
   const email = emailOf(session);
-  emit({ status: 'checking', email });
+  if (options?.keepCurrentOwner && snapshot.status === 'owner') {
+    emit({ status: 'owner', email });
+  } else {
+    emit({ status: 'checking', email });
+  }
 
   // The auth callback holds a lock; defer the owner lookup so it cannot deadlock.
   setTimeout(() => {
@@ -178,7 +185,7 @@ export function startAuth() {
     ) {
       rehydrateHeldWrites();
     }
-    checkOwner(session);
+    checkOwner(session, { keepCurrentOwner: sameSession });
   });
 
   unsubscribeAuth = () => subscription.unsubscribe();
