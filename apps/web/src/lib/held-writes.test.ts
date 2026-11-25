@@ -1839,7 +1839,7 @@ describe('held-writes store', () => {
         localStorage.getItem(
           `theshark:auth:logout-pending:v1:${encodeURIComponent('http://127.0.0.1:55421')}`,
         ),
-      ).toBe('1');
+      ).toMatch(/^logout-\d+-.+/);
       expect(reloadedAuth.getAuthSnapshot().logoutFailed).toBe(true);
       expect(reloadedAuth.isAuthResolved()).toBe(false);
     } finally {

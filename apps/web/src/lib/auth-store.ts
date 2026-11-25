@@ -14,6 +14,19 @@ import type { AuthStatus } from '@/lib/auth-context';
 
 const LOGOUT_PENDING_KEY_PREFIX = 'theshark:auth:logout-pending:v1:';
 const FALLBACK_PROJECT = 'default';
+const ACCESS_TOKEN_EXPIRY_MARGIN_MS = 30_000;
+let logoutAttemptSeq = 0;
+
+function createLogoutAttemptId(): string {
+  logoutAttemptSeq += 1;
+  if (
+    typeof crypto !== 'undefined' &&
+    typeof crypto.randomUUID === 'function'
+  ) {
+    return `logout-${logoutAttemptSeq}-${crypto.randomUUID()}`;
+  }
+  return `logout-${logoutAttemptSeq}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
 
 function logoutPendingStorageKey(): string {
   let url: string | undefined;
@@ -43,14 +56,60 @@ function logoutStorage(): Storage | null {
   }
 }
 
-function hasPersistedLogoutIntent(): boolean {
+function readPersistedLogoutAttemptId(): string | null {
   const storage = logoutStorage();
-  if (!storage) return false;
+  if (!storage) return null;
   try {
-    return storage.getItem(logoutPendingStorageKey()) === '1';
+    const value = storage.getItem(logoutPendingStorageKey());
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+function hasPersistedLogoutIntent(): boolean {
+  return readPersistedLogoutAttemptId() !== null;
+}
+
+type RetainedRevocationSession = {
+  accessToken: string | null;
+  refreshToken: string | null;
+  expiresAt: number | null;
+};
+
+type PersistLogoutResult = {
+  backedByStorage: boolean;
+  removedLocalCredentials: boolean;
+  removedSession: RetainedRevocationSession | null;
+};
+
+function extractRevocationSession(
+  source: unknown,
+): RetainedRevocationSession | null {
+  if (typeof source !== 'object' || source === null) return null;
+  const record = source as {
+    access_token?: unknown;
+    refresh_token?: unknown;
+    expires_at?: unknown;
+    currentSession?: unknown;
+  };
+  if (
+    typeof record.currentSession === 'object' &&
+    record.currentSession !== null
+  ) {
+    const nested = extractRevocationSession(record.currentSession);
+    if (nested) return nested;
+  }
+  const accessToken = nonEmptyString(record.access_token);
+  const refreshToken = nonEmptyString(record.refresh_token);
+  if (!accessToken && !refreshToken) return null;
+  const expiresAt =
+    typeof record.expires_at === 'number' && Number.isFinite(record.expires_at)
+      ? record.expires_at
+      : null;
+  return { accessToken, refreshToken, expiresAt };
 }
 
 function extractHostname(url: string): string | null {
@@ -104,6 +163,35 @@ function supabaseAuthStorageKeys(): string[] {
   return [...keys];
 }
 
+function readPersistedSupabaseSession(
+  storage: Storage,
+): RetainedRevocationSession | null {
+  for (const key of supabaseAuthStorageKeys()) {
+    try {
+      const raw = storage.getItem(key);
+      if (!raw) continue;
+      const parsed: unknown = JSON.parse(raw);
+      const extracted = extractRevocationSession(parsed);
+      if (extracted) return extracted;
+    } catch {
+      // Ignore malformed storage entries.
+    }
+  }
+  return null;
+}
+
+function hasPersistedSupabaseCredentials(storage: Storage | null): boolean {
+  if (!storage) return false;
+  for (const key of supabaseAuthStorageKeys()) {
+    try {
+      if (storage.getItem(key) !== null) return true;
+    } catch {
+      // Ignore storage read errors.
+    }
+  }
+  return false;
+}
+
 function removePersistedSupabaseCredentials(storage: Storage): void {
   const baseKeys = supabaseAuthStorageKeys();
   const keysToRemove = new Set<string>();
@@ -140,36 +228,274 @@ function removePersistedSupabaseCredentials(storage: Storage): void {
   }
 }
 
-function persistLogoutIntent(): boolean {
+function persistLogoutIntent(attemptId: string): PersistLogoutResult {
   const storage = logoutStorage();
-  if (!storage) return false;
+  if (!storage) {
+    return {
+      backedByStorage: false,
+      removedLocalCredentials: false,
+      removedSession: null,
+    };
+  }
   const key = logoutPendingStorageKey();
   try {
-    storage.setItem(key, '1');
-    return true;
+    storage.setItem(key, attemptId);
+    return {
+      backedByStorage: true,
+      removedLocalCredentials: false,
+      removedSession: null,
+    };
   } catch {
-    // Storage rejected the logout marker (e.g. QuotaExceededError). Remove the
-    // persisted Supabase SDK credentials directly so a reload cannot restore
-    // the owner session, then retry writing the marker into the freed space.
+    // Storage rejected the logout marker (e.g. QuotaExceededError). Capture
+    // any persisted session in memory for server-side global revocation,
+    // remove the persisted Supabase SDK credentials directly so a reload
+    // cannot restore the owner session, then retry writing the marker into
+    // the freed space.
+    const removedSession = readPersistedSupabaseSession(storage);
     removePersistedSupabaseCredentials(storage);
     try {
-      storage.setItem(key, '1');
-      return true;
+      storage.setItem(key, attemptId);
+      return {
+        backedByStorage: true,
+        removedLocalCredentials: true,
+        removedSession,
+      };
     } catch {
       // Keep the in-memory logoutUnresolved guard active even if storage still refuses writes.
-      return hasPersistedLogoutIntent();
+      return {
+        backedByStorage: readPersistedLogoutAttemptId() === attemptId,
+        removedLocalCredentials: true,
+        removedSession,
+      };
     }
   }
 }
 
-function clearPersistedLogoutIntent(): void {
+function clearPersistedLogoutIntent(expectedAttemptId?: string): void {
   const storage = logoutStorage();
   if (!storage) return;
+  const key = logoutPendingStorageKey();
   try {
-    storage.removeItem(logoutPendingStorageKey());
+    if (expectedAttemptId !== undefined) {
+      const current = readPersistedLogoutAttemptId();
+      if (current !== expectedAttemptId) return;
+    }
+    storage.removeItem(key);
   } catch {
     // Ignore storage cleanup errors.
   }
+}
+
+function isRetainedSessionExpired(session: RetainedRevocationSession): boolean {
+  return (
+    session.expiresAt !== null &&
+    session.expiresAt * 1000 - Date.now() < ACCESS_TOKEN_EXPIRY_MARGIN_MS
+  );
+}
+
+type AuthClientInternals = {
+  url?: unknown;
+  headers?: unknown;
+  fetch?: unknown;
+  admin?: {
+    url?: unknown;
+    headers?: unknown;
+    fetch?: unknown;
+    signOut?: (
+      jwt: string,
+      scope?: 'global' | 'local' | 'others',
+    ) => Promise<{ data: null; error: unknown }>;
+  };
+};
+
+type RefreshOutcome =
+  | { status: 'refreshed'; session: RetainedRevocationSession }
+  | { status: 'already_revoked' }
+  | { status: 'failed' }
+  | { status: 'unavailable' };
+
+async function refreshRetainedSessionInMemory(
+  client: NonNullable<typeof supabase>,
+  session: RetainedRevocationSession,
+): Promise<RefreshOutcome> {
+  if (!session.refreshToken) return { status: 'unavailable' };
+  const auth = client.auth as unknown as AuthClientInternals;
+  const rawUrl =
+    typeof auth.url === 'string'
+      ? auth.url
+      : typeof auth.admin?.url === 'string'
+        ? auth.admin.url
+        : null;
+  const fetcher =
+    typeof auth.fetch === 'function'
+      ? (auth.fetch as typeof fetch)
+      : typeof auth.admin?.fetch === 'function'
+        ? (auth.admin.fetch as typeof fetch)
+        : null;
+  if (!rawUrl || !fetcher) return { status: 'unavailable' };
+
+  const rawHeaders =
+    typeof auth.headers === 'object' && auth.headers !== null
+      ? (auth.headers as Record<string, string>)
+      : typeof auth.admin?.headers === 'object' && auth.admin.headers !== null
+        ? (auth.admin.headers as Record<string, string>)
+        : {};
+  const endpoint = `${rawUrl.replace(/\/+$/, '')}/token?grant_type=refresh_token`;
+
+  try {
+    const response = await fetcher(endpoint, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        ...rawHeaders,
+        'Content-Type': 'application/json;charset=UTF-8',
+      },
+      body: JSON.stringify({ refresh_token: session.refreshToken }),
+    });
+    if (response.ok) {
+      const payload: unknown = await response.json();
+      const refreshed = extractRevocationSession(payload);
+      if (refreshed?.accessToken) {
+        return {
+          status: 'refreshed',
+          session: {
+            accessToken: refreshed.accessToken,
+            refreshToken: refreshed.refreshToken ?? session.refreshToken,
+            expiresAt: refreshed.expiresAt,
+          },
+        };
+      }
+      return { status: 'failed' };
+    }
+    if (
+      response.status === 400 ||
+      response.status === 401 ||
+      response.status === 403 ||
+      response.status === 404
+    ) {
+      return { status: 'already_revoked' };
+    }
+    return { status: 'failed' };
+  } catch {
+    return { status: 'failed' };
+  }
+}
+
+function errorStatusOf(error: unknown): number | null {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'status' in error &&
+    typeof (error as { status?: unknown }).status === 'number'
+  ) {
+    return (error as { status: number }).status;
+  }
+  return null;
+}
+
+function errorNameOf(error: unknown): string {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'name' in error &&
+    typeof (error as { name?: unknown }).name === 'string'
+  ) {
+    return (error as { name: string }).name;
+  }
+  return '';
+}
+
+function isIgnorableServerRevocationError(error: unknown): boolean {
+  const status = errorStatusOf(error);
+  const name = errorNameOf(error);
+  return (
+    status === 404 ||
+    status === 401 ||
+    status === 403 ||
+    name === 'AuthSessionMissingError'
+  );
+}
+
+async function revokeRetainedSessionGlobally(
+  client: NonNullable<typeof supabase>,
+  session: RetainedRevocationSession,
+): Promise<{ ok: boolean; session: RetainedRevocationSession | null }> {
+  const auth = client.auth as unknown as AuthClientInternals;
+  const adminSignOut = auth.admin?.signOut;
+  if (typeof adminSignOut !== 'function') {
+    return { ok: false, session };
+  }
+
+  let active = session;
+  let refreshed = false;
+
+  if (
+    (!active.accessToken || isRetainedSessionExpired(active)) &&
+    active.refreshToken
+  ) {
+    const refreshResult = await refreshRetainedSessionInMemory(client, active);
+    if (refreshResult.status === 'refreshed') {
+      active = refreshResult.session;
+      refreshed = true;
+    } else if (refreshResult.status === 'already_revoked') {
+      return { ok: true, session: null };
+    } else if (refreshResult.status === 'failed') {
+      return { ok: false, session: active };
+    }
+  }
+
+  if (!active.accessToken) {
+    return { ok: false, session: active };
+  }
+
+  const callAdminSignOut = async (jwt: string): Promise<{ error: unknown }> => {
+    try {
+      const result = await adminSignOut.call(auth.admin, jwt, 'global');
+      const err =
+        result && typeof result === 'object' && 'error' in result
+          ? result.error
+          : null;
+      return { error: err };
+    } catch (error) {
+      return { error };
+    }
+  };
+
+  const first = await callAdminSignOut(active.accessToken);
+  if (!first.error) {
+    return { ok: true, session: null };
+  }
+
+  const firstStatus = errorStatusOf(first.error);
+  if (
+    (firstStatus === 401 || firstStatus === 403) &&
+    !refreshed &&
+    active.refreshToken
+  ) {
+    const refreshResult = await refreshRetainedSessionInMemory(client, active);
+    if (refreshResult.status === 'refreshed') {
+      active = refreshResult.session;
+      if (!active.accessToken) {
+        return { ok: false, session: active };
+      }
+      const retry = await callAdminSignOut(active.accessToken);
+      if (!retry.error || isIgnorableServerRevocationError(retry.error)) {
+        return { ok: true, session: null };
+      }
+      return { ok: false, session: active };
+    }
+    if (refreshResult.status === 'already_revoked') {
+      return { ok: true, session: null };
+    }
+    if (refreshResult.status === 'failed') {
+      return { ok: false, session: active };
+    }
+  }
+
+  if (isIgnorableServerRevocationError(first.error)) {
+    return { ok: true, session: null };
+  }
+  return { ok: false, session: active };
 }
 
 type Snapshot = {
@@ -177,6 +503,7 @@ type Snapshot = {
   email: string | null;
   logoutPending: boolean;
   logoutFailed: boolean;
+  logoutRevocationFailed: boolean;
 };
 
 let snapshot: Snapshot = {
@@ -184,6 +511,7 @@ let snapshot: Snapshot = {
   email: null,
   logoutPending: false,
   logoutFailed: false,
+  logoutRevocationFailed: false,
 };
 let started = false;
 let checkId = 0;
@@ -192,27 +520,40 @@ let lastUserId: string | null = null;
 let pendingSignOuts = 0;
 let logoutUnresolved = false;
 let logoutBackedByStorage = false;
+let logoutRevocationFailed = false;
+let pendingRevocationSession: RetainedRevocationSession | null = null;
 let signOutRunId = 0;
+let activeSignOutAttemptId: string | null = null;
+let activeSignOutBackedByStorage = false;
+let activeSignOutSuperseded = false;
 let storeEpoch = 0;
 let pendingSignOutPromise: Promise<void> | null = null;
+let pendingRevocationPromise: Promise<void> | null = null;
 let unsubscribeAuth: (() => void) | null = null;
 const listeners = new Set<() => void>();
 
 function emit(
   next: Pick<Snapshot, 'status' | 'email'> &
-    Partial<Pick<Snapshot, 'logoutPending' | 'logoutFailed'>>,
+    Partial<
+      Pick<
+        Snapshot,
+        'logoutPending' | 'logoutFailed' | 'logoutRevocationFailed'
+      >
+    >,
 ) {
   const full: Snapshot = {
     status: next.status,
     email: next.email,
     logoutPending: next.logoutPending ?? false,
     logoutFailed: next.logoutFailed ?? false,
+    logoutRevocationFailed: next.logoutRevocationFailed ?? false,
   };
   if (
     snapshot.status === full.status &&
     snapshot.email === full.email &&
     snapshot.logoutPending === full.logoutPending &&
-    snapshot.logoutFailed === full.logoutFailed
+    snapshot.logoutFailed === full.logoutFailed &&
+    snapshot.logoutRevocationFailed === full.logoutRevocationFailed
   ) {
     return;
   }
@@ -349,8 +690,9 @@ function reconcileClearedLogoutMarker(): void {
   emit({
     status: 'signed-out',
     email: null,
-    logoutPending: false,
+    logoutPending: pendingRevocationPromise !== null,
     logoutFailed: false,
+    logoutRevocationFailed,
   });
   setPwaAuthResolved(
     snapshot.status !== 'loading' && snapshot.status !== 'checking',
@@ -379,6 +721,7 @@ function reconcilePersistedLogoutFromStorage(): void {
       email: null,
       logoutPending: false,
       logoutFailed: true,
+      logoutRevocationFailed,
     });
     return;
   }
@@ -407,6 +750,7 @@ export function startAuth() {
       email: null,
       logoutPending: false,
       logoutFailed: true,
+      logoutRevocationFailed,
     });
   }
 
@@ -415,6 +759,13 @@ export function startAuth() {
     if (event.key !== null && event.key !== expectedKey) return;
     const storage = logoutStorage();
     if (event.storageArea && storage && event.storageArea !== storage) return;
+    const currentPersistedId = readPersistedLogoutAttemptId();
+    if (
+      activeSignOutAttemptId !== null &&
+      currentPersistedId !== activeSignOutAttemptId
+    ) {
+      activeSignOutSuperseded = true;
+    }
     reconcilePersistedLogoutFromStorage();
   };
   if (
@@ -470,9 +821,10 @@ export function startAuth() {
       emit({
         status: 'signed-out',
         email: null,
-        logoutPending: pendingSignOuts > 0,
+        logoutPending: pendingSignOuts > 0 || pendingRevocationPromise !== null,
         logoutFailed:
           pendingSignOuts === 0 ? logoutUnresolved : snapshot.logoutFailed,
+        logoutRevocationFailed,
       });
       setPwaAuthResolved(
         !logoutUnresolved &&
@@ -499,7 +851,24 @@ export function startAuth() {
       // Local logout has not completed yet: ignore any initial or refocus
       // session event so writes and PWA reload stay locked until logout finishes.
       logoutUnresolved = true;
-      logoutBackedByStorage = persistedLogout ? true : persistLogoutIntent();
+      const supersededInFlight =
+        pendingSignOuts > 0 &&
+        (activeSignOutSuperseded ||
+          (activeSignOutBackedByStorage && !persistedLogout));
+      if (persistedLogout) {
+        logoutBackedByStorage = true;
+      } else if (!supersededInFlight) {
+        const attemptId = activeSignOutAttemptId ?? createLogoutAttemptId();
+        const persistResult = persistLogoutIntent(attemptId);
+        logoutBackedByStorage = persistResult.backedByStorage;
+        if (persistResult.removedLocalCredentials) {
+          const retained =
+            extractRevocationSession(session) ?? persistResult.removedSession;
+          if (retained) {
+            pendingRevocationSession = retained;
+          }
+        }
+      }
       currentSession = null;
       setWritesLocked(true);
       setHeldWriteUser(null);
@@ -510,9 +879,12 @@ export function startAuth() {
         email: null,
         logoutPending: pendingSignOuts > 0,
         logoutFailed: pendingSignOuts === 0 ? true : snapshot.logoutFailed,
+        logoutRevocationFailed,
       });
       return;
     }
+    pendingRevocationSession = null;
+    logoutRevocationFailed = false;
     currentSession = session;
     const wasWritesLocked = isWritesLocked();
     const sameSession =
@@ -587,10 +959,95 @@ export async function signIn(
   return 'ok';
 }
 
+export async function retryLogoutRevocation(): Promise<void> {
+  const client = supabase;
+  if (!client) return;
+  if (pendingRevocationPromise) {
+    await pendingRevocationPromise;
+    return;
+  }
+  const sessionToRevoke = pendingRevocationSession;
+  if (!sessionToRevoke) {
+    if (logoutRevocationFailed) {
+      logoutRevocationFailed = false;
+      emit({
+        status: snapshot.status,
+        email: snapshot.email,
+        logoutPending: snapshot.logoutPending,
+        logoutFailed: snapshot.logoutFailed,
+        logoutRevocationFailed: false,
+      });
+    }
+    return;
+  }
+  const epoch = storeEpoch;
+  emit({
+    status: 'signed-out',
+    email: null,
+    logoutPending: true,
+    logoutFailed: snapshot.logoutFailed,
+    logoutRevocationFailed: true,
+  });
+  let task: Promise<void> | null = null;
+  task = (async () => {
+    try {
+      const revocation = await revokeRetainedSessionGlobally(
+        client,
+        sessionToRevoke,
+      );
+      if (epoch !== storeEpoch) return;
+      if (revocation.ok) {
+        if (pendingRevocationSession === sessionToRevoke) {
+          pendingRevocationSession = null;
+        }
+        logoutRevocationFailed = false;
+      } else {
+        pendingRevocationSession = revocation.session;
+        logoutRevocationFailed = true;
+      }
+      if (currentSession !== null) {
+        return;
+      }
+      emit({
+        status: 'signed-out',
+        email: null,
+        logoutPending: pendingSignOuts > 0,
+        logoutFailed: snapshot.logoutFailed,
+        logoutRevocationFailed,
+      });
+    } finally {
+      if (epoch === storeEpoch && pendingRevocationPromise === task) {
+        pendingRevocationPromise = null;
+      }
+    }
+  })();
+  pendingRevocationPromise = task;
+  await task;
+}
+
 export async function signOut() {
   const client = supabase;
   if (!client) return;
+  const storage = logoutStorage();
+  const hasStoredSdkCreds = hasPersistedSupabaseCredentials(storage);
+  if (
+    currentSession === null &&
+    !logoutUnresolved &&
+    !hasPersistedLogoutIntent() &&
+    !hasStoredSdkCreds &&
+    pendingSignOuts === 0 &&
+    pendingRevocationSession !== null
+  ) {
+    await retryLogoutRevocation();
+    return;
+  }
+
   const userId = currentSession?.user.id ?? lastUserId;
+  const capturedSession =
+    extractRevocationSession(currentSession) ??
+    (storage ? readPersistedSupabaseSession(storage) : null) ??
+    pendingRevocationSession;
+
   // Lock all writes and PWA reload immediately and keep them locked until local
   // logout completes without error, ignoring any refocus session callbacks in
   // the interim (including if the SDK fails to remove a retained refresh token).
@@ -601,10 +1058,21 @@ export async function signOut() {
   // store because keys are partitioned per user. Only committed `posted_reload`
   // markers are removed on sign-out.
   const runId = ++signOutRunId;
+  const attemptId = createLogoutAttemptId();
   const epoch = storeEpoch;
   pendingSignOuts += 1;
   logoutUnresolved = true;
-  logoutBackedByStorage = persistLogoutIntent();
+  activeSignOutAttemptId = attemptId;
+  activeSignOutSuperseded = false;
+  const persistResult = persistLogoutIntent(attemptId);
+  logoutBackedByStorage = persistResult.backedByStorage;
+  activeSignOutBackedByStorage = persistResult.backedByStorage;
+
+  const sessionForRevocation = capturedSession ?? persistResult.removedSession;
+  if (persistResult.removedLocalCredentials && sessionForRevocation) {
+    pendingRevocationSession = sessionForRevocation;
+  }
+
   setWritesLocked(true);
   setPwaLogoutPending(true);
   setPwaAuthResolved(false);
@@ -615,6 +1083,7 @@ export async function signOut() {
     email: null,
     logoutPending: true,
     logoutFailed: snapshot.logoutFailed,
+    logoutRevocationFailed,
   });
   if (userId) {
     clearResolvedHeldWritesForUser(userId);
@@ -623,41 +1092,136 @@ export async function signOut() {
   setHeldWriteUser(null);
   let task: Promise<void> | null = null;
   task = (async () => {
-    let succeeded = false;
+    let localSucceeded = false;
+    let revocationFailed = false;
+    const shouldRunServerRevocation =
+      (persistResult.removedLocalCredentials ||
+        pendingRevocationSession !== null) &&
+      sessionForRevocation !== null;
     try {
       const result = await client.auth.signOut();
       const signOutError =
         result && typeof result === 'object' && 'error' in result
           ? result.error
           : null;
-      succeeded = !signOutError;
+      localSucceeded = !signOutError;
+      if (
+        !localSucceeded &&
+        hasStoredSdkCreds &&
+        !hasPersistedSupabaseCredentials(logoutStorage()) &&
+        sessionForRevocation
+      ) {
+        // GoTrueClient removed local credentials even though server logout failed;
+        // retain the session in memory so a subsequent retry still revokes globally.
+        pendingRevocationSession = sessionForRevocation;
+      }
+      if (localSucceeded && shouldRunServerRevocation && sessionForRevocation) {
+        const revocation = await revokeRetainedSessionGlobally(
+          client,
+          sessionForRevocation,
+        );
+        if (epoch === storeEpoch) {
+          if (revocation.ok) {
+            if (pendingRevocationSession === sessionForRevocation) {
+              pendingRevocationSession = null;
+            }
+            revocationFailed = false;
+          } else {
+            pendingRevocationSession = revocation.session;
+            revocationFailed = true;
+          }
+        }
+      } else if (localSucceeded && epoch === storeEpoch) {
+        pendingRevocationSession = null;
+        revocationFailed = false;
+      }
     } catch {
-      succeeded = false;
+      localSucceeded = false;
     } finally {
       if (epoch === storeEpoch) {
         pendingSignOuts = Math.max(0, pendingSignOuts - 1);
-        if (pendingSignOuts === 0) {
-          if (pendingSignOutPromise === task) {
-            pendingSignOutPromise = null;
-          }
-          if (succeeded && runId === signOutRunId) {
-            clearPersistedLogoutIntent();
-            logoutUnresolved = false;
-            logoutBackedByStorage = false;
-            setPwaLogoutPending(false);
-            emit({
-              status: 'signed-out',
-              email: null,
-              logoutPending: false,
-              logoutFailed: false,
-            });
-            setPwaAuthResolved(
-              !hasPersistedLogoutIntent() &&
-                snapshot.status !== 'loading' &&
-                snapshot.status !== 'checking',
-            );
+        if (pendingSignOutPromise === task) {
+          pendingSignOutPromise = null;
+        }
+        const isLatestRun = runId === signOutRunId;
+        if (isLatestRun) {
+          const currentPersistedId = readPersistedLogoutAttemptId();
+          const supersededByStorage =
+            activeSignOutSuperseded ||
+            (persistResult.backedByStorage &&
+              currentPersistedId !== attemptId) ||
+            (currentPersistedId !== null && currentPersistedId !== attemptId);
+          activeSignOutAttemptId = null;
+          activeSignOutBackedByStorage = false;
+          activeSignOutSuperseded = false;
+
+          if (localSucceeded) {
+            clearPersistedLogoutIntent(attemptId);
+            logoutRevocationFailed = revocationFailed;
+            const remainingPersistedId = readPersistedLogoutAttemptId();
+            if (remainingPersistedId !== null) {
+              logoutUnresolved = true;
+              logoutBackedByStorage = true;
+              setPwaLogoutPending(true);
+              setPwaAuthResolved(false);
+              emit({
+                status: 'signed-out',
+                email: null,
+                logoutPending: false,
+                logoutFailed: true,
+                logoutRevocationFailed,
+              });
+            } else {
+              logoutUnresolved = false;
+              logoutBackedByStorage = false;
+              setPwaLogoutPending(false);
+              emit({
+                status: 'signed-out',
+                email: null,
+                logoutPending: false,
+                logoutFailed: false,
+                logoutRevocationFailed,
+              });
+              setPwaAuthResolved(isAuthResolved());
+            }
+          } else if (supersededByStorage) {
+            // Another tab's newer attempt already superseded this call; never
+            // rewrite the shared marker from an older failed logout.
+            if (currentPersistedId === null) {
+              logoutUnresolved = false;
+              logoutBackedByStorage = false;
+              setPwaLogoutPending(false);
+              emit({
+                status: 'signed-out',
+                email: null,
+                logoutPending: false,
+                logoutFailed: false,
+                logoutRevocationFailed,
+              });
+              setPwaAuthResolved(isAuthResolved());
+            } else {
+              logoutUnresolved = true;
+              logoutBackedByStorage = true;
+              setPwaLogoutPending(true);
+              setPwaAuthResolved(false);
+              emit({
+                status: 'signed-out',
+                email: null,
+                logoutPending: false,
+                logoutFailed: true,
+                logoutRevocationFailed,
+              });
+            }
           } else {
-            logoutBackedByStorage = persistLogoutIntent();
+            const retryPersist = persistLogoutIntent(attemptId);
+            logoutBackedByStorage = retryPersist.backedByStorage;
+            if (
+              retryPersist.removedLocalCredentials &&
+              (sessionForRevocation ?? retryPersist.removedSession)
+            ) {
+              pendingRevocationSession =
+                sessionForRevocation ?? retryPersist.removedSession;
+            }
             logoutUnresolved = true;
             currentSession = null;
             setWritesLocked(true);
@@ -669,8 +1233,11 @@ export async function signOut() {
               email: null,
               logoutPending: false,
               logoutFailed: true,
+              logoutRevocationFailed,
             });
           }
+        } else if (pendingSignOuts === 0) {
+          setPwaAuthResolved(isAuthResolved());
         }
       }
     }
@@ -693,8 +1260,14 @@ export function resetAuthStore(options?: { clearStorage?: boolean }) {
   pendingSignOuts = 0;
   logoutUnresolved = false;
   logoutBackedByStorage = false;
+  logoutRevocationFailed = false;
+  pendingRevocationSession = null;
   signOutRunId = 0;
+  activeSignOutAttemptId = null;
+  activeSignOutBackedByStorage = false;
+  activeSignOutSuperseded = false;
   pendingSignOutPromise = null;
+  pendingRevocationPromise = null;
   if (options?.clearStorage ?? true) {
     clearPersistedLogoutIntent();
   }
@@ -706,6 +1279,7 @@ export function resetAuthStore(options?: { clearStorage?: boolean }) {
     email: null,
     logoutPending: false,
     logoutFailed: false,
+    logoutRevocationFailed: false,
   };
   setPwaLogoutPending(false);
   setPwaAuthResolved(false);

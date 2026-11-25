@@ -8,8 +8,10 @@ export type AuthValue = {
   email: string | null;
   logoutPending?: boolean;
   logoutFailed?: boolean;
+  logoutRevocationFailed?: boolean;
   signIn: (email: string, password: string) => Promise<'ok' | 'invalid'>;
   signOut: () => Promise<void>;
+  retryLogoutRevocation?: () => Promise<void>;
   retry: () => void;
 };
 

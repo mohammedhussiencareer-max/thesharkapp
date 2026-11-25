@@ -34,11 +34,25 @@ const authState = vi.hoisted(() => ({
   listeners: [] as Array<(event: string, session: Session) => void>,
   signOut: vi.fn(),
   signOutError: null as { message: string } | null,
+  adminSignOut: vi.fn(),
+  adminSignOutError: null as { message: string; status?: number } | null,
 }));
 
 vi.mock('@/lib/supabase', () => ({
   supabase: {
     auth: {
+      admin: {
+        signOut: (jwt: string, scope?: string) => {
+          authState.adminSignOut(jwt, scope);
+          if (authState.adminSignOutError) {
+            return Promise.resolve({
+              data: null,
+              error: authState.adminSignOutError,
+            });
+          }
+          return Promise.resolve({ data: null, error: null });
+        },
+      },
       onAuthStateChange: (
         callback: (event: string, session: Session) => void,
       ) => {
@@ -121,6 +135,8 @@ function resetMock() {
   authState.listeners.splice(0, authState.listeners.length);
   authState.signOut.mockClear();
   authState.signOutError = null;
+  authState.adminSignOut.mockClear();
+  authState.adminSignOutError = null;
   resetAuthStore();
 }
 
@@ -441,7 +457,8 @@ describe('owner access', () => {
     expect(
       await screen.findByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
     ).toBeInTheDocument();
-    expect(localStorage.getItem(markerKey)).toBe('1');
+    const markerValue = localStorage.getItem(markerKey);
+    expect(markerValue).toMatch(/^logout-\d+-.+/);
     expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
 
     // Another tab's SDK signOut emits SIGNED_OUT while the marker is still present.
@@ -461,7 +478,7 @@ describe('owner access', () => {
       window.dispatchEvent(
         new StorageEvent('storage', {
           key: markerKey,
-          oldValue: '1',
+          oldValue: markerValue,
           newValue: null,
         }),
       );
@@ -502,7 +519,7 @@ describe('owner access', () => {
     expect(
       await screen.findByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
     ).toBeInTheDocument();
-    expect(localStorage.getItem(markerKey)).toBe('1');
+    expect(localStorage.getItem(markerKey)).toMatch(/^logout-\d+-.+/);
     expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
 
     // Marker is removed first without delivering a storage event, then SIGNED_OUT arrives.
@@ -528,6 +545,89 @@ describe('owner access', () => {
     expect(isAuthResolved()).toBe(true);
     expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeEnabled();
     expect(await signIn('owner@theshark.test', 'ValidPassword123')).toBe('ok');
+  });
+
+  it('surfaces global revocation failure separately on /login after quota fallback removes local credentials and clears it on retry', async () => {
+    const sdkStorageKey = 'sb-127-auth-token';
+    const session = {
+      user: { id: 'owner', email: 'owner@theshark.test' },
+      access_token: 'tok-owner-quota-ui',
+      refresh_token: 'rt-owner-quota-ui',
+    };
+    const setItemDesc = Object.getOwnPropertyDescriptor(
+      Storage.prototype,
+      'setItem',
+    );
+    const origSetItem = setItemDesc?.value as (
+      this: Storage,
+      key: string,
+      value: string,
+    ) => void;
+    let rejectNewWrites = false;
+    const setItemSpy = vi
+      .spyOn(Storage.prototype, 'setItem')
+      .mockImplementation(function (this: Storage, key: string, value: string) {
+        if (rejectNewWrites && this.getItem(key) === null) {
+          throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+        }
+        origSetItem.call(this, key, value);
+      });
+
+    try {
+      localStorage.setItem(sdkStorageKey, JSON.stringify(session));
+      authState.session = session;
+      authState.isOwner = true;
+      authState.adminSignOutError = {
+        message: 'service unavailable',
+        status: 503,
+      };
+
+      renderApp('/');
+      expect(
+        await screen.findByText('owner@theshark.test'),
+      ).toBeInTheDocument();
+
+      rejectNewWrites = true;
+      fireEvent.click(screen.getByRole('button', { name: 'تسجيل الخروج' }));
+
+      const retryRevokeBtn = await screen.findByRole('button', {
+        name: 'إعادة محاولة إنهاء الجلسات الأخرى',
+      });
+      expect(localStorage.getItem(sdkStorageKey)).toBeNull();
+      expect(authState.adminSignOut).toHaveBeenCalledWith(
+        'tok-owner-quota-ui',
+        'global',
+      );
+      expect(
+        screen.queryByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
+      ).toBeNull();
+      expect(getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPending: false,
+        logoutFailed: false,
+        logoutRevocationFailed: true,
+      });
+      expect(
+        screen.getByRole('button', { name: 'تسجيل الدخول' }),
+      ).toBeEnabled();
+
+      // Retry global revocation after connectivity returns.
+      authState.adminSignOutError = null;
+      fireEvent.click(retryRevokeBtn);
+      await vi.waitFor(() => {
+        expect(screen.queryByRole('alert')).toBeNull();
+      });
+      expect(authState.adminSignOut).toHaveBeenCalledTimes(2);
+      expect(getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPending: false,
+        logoutFailed: false,
+        logoutRevocationFailed: false,
+      });
+    } finally {
+      setItemSpy.mockRestore();
+      localStorage.removeItem(sdkStorageKey);
+    }
   });
 });
 

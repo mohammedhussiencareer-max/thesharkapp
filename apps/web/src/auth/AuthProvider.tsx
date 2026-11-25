@@ -2,6 +2,7 @@ import { useMemo, useSyncExternalStore, type ReactNode } from 'react';
 import { AuthContext, type AuthValue } from '@/lib/auth-context';
 import {
   getAuthSnapshot,
+  retryLogoutRevocation,
   retryOwnerCheck,
   signIn,
   signOut,
@@ -20,8 +21,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       email: snapshot.email,
       logoutPending: snapshot.logoutPending,
       logoutFailed: snapshot.logoutFailed,
+      logoutRevocationFailed: snapshot.logoutRevocationFailed,
       signIn,
       signOut,
+      retryLogoutRevocation,
       retry: retryOwnerCheck,
     }),
     [snapshot],
