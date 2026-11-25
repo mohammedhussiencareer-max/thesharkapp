@@ -14931,6 +14931,876 @@ select
     'resumed suffix load uses stock_count_lines_movement_id_idx and stock_movements_item_id_idx with unrelated counts present'
   );
 
+-- ============================================================================
+-- Round 7l regressions:
+-- 1. Retired in-window application links must not inflate cover transfer value.
+-- 2. Zero-value COGS-to-waste reclassification must record durable transfer legs.
+-- 3. Single cover lookups (transfers, transfer value, recognized cover) must
+--    stay bounded with unrelated closed orders and carriers present.
+-- ============================================================================
+-- 1. Retired application excluded from cover_transfer_value:
+--    In-window sale 4/40 retired and reposted as 5/50, aged and reclassified
+--    to waste, then covered by backdated 5/100 -> must transfer 100, not 140.
+do $$
+declare
+  v_item uuid := 'f6e00000-0000-4000-8000-000000000070';
+  v_order text := 'round7l-retired';
+  v_at timestamptz;
+  v_input_id bigint;
+  v_snap_id bigint;
+  v_app1 bigint;
+  v_app2 bigint;
+  v_m1 bigint;
+  v_m2 bigint;
+begin
+  select anchor.at - interval '40 days' + interval '1 hour'
+  into v_at
+  from f6_anchor anchor;
+
+  insert into app.stock_items (id, name, kind, base_unit, count_frequency)
+  values (v_item, v_order, 'seafood', 'kg', 'daily');
+
+  perform app.set_item_opening_price (
+    gen_random_uuid (), v_item, 10, null, null, 'kg|seafood||'
+  );
+
+  insert into app.pos_orders (
+    id, shift_id, status, order_type, ordered_at,
+    subtotal, discount, tax, service_tax, delivery_fee, total,
+    pos_update_time, content_hash, missing_from_pos
+  )
+  values (
+    v_order, 'p24h-sale', 'complete', 'hall', v_at,
+    0, 0, 0, 0, 0, 0, v_at, rpad(md5(v_order), 64, 'a'), false
+  );
+
+  perform app.append_pos_cost_input (v_order, null, 'sync');
+
+  select input.id, input.snapshot_id
+  into v_input_id, v_snap_id
+  from app.pos_cost_inputs input
+  where input.order_id = v_order;
+
+  -- First in-window posting: 4/40.
+  perform app.post_engine_outflows (
+    jsonb_build_array(jsonb_build_object(
+      'item_id', v_item,
+      'movement_type', 'sale',
+      'occurred_at', v_at,
+      'quantity', 4,
+      'source_id', v_order,
+      'shift_id', 'p24h-sale'
+    ))
+  );
+
+  select sm.id
+  into v_m1
+  from app.stock_movements sm
+  where sm.item_id = v_item and sm.movement_type = 'sale';
+
+  insert into app.order_cost_applications (
+    order_id, cost_input_id, snapshot_id, receipt_kind, disposition,
+    occurred_at, shift_id, signature, requirements, work_generation
+  )
+  values (
+    v_order, v_input_id, v_snap_id, 'posting', 'sale',
+    v_at, 'p24h-sale', md5(v_order || '-app1'), '[]'::jsonb, 1
+  )
+  returning id into v_app1;
+
+  insert into app.order_cost_movement_links (movement_id, application_id, order_id, item_id)
+  values (v_m1, v_app1, v_order, v_item);
+
+  -- Retire first posting in-window and repost as 5/50.
+  perform app.retire_movements (array[v_m1], gen_random_uuid ());
+
+  perform app.post_engine_outflows (
+    jsonb_build_array(jsonb_build_object(
+      'item_id', v_item,
+      'movement_type', 'sale',
+      'occurred_at', v_at,
+      'quantity', 5,
+      'source_id', v_order,
+      'shift_id', 'p24h-sale'
+    ))
+  );
+
+  select sm.id
+  into v_m2
+  from app.stock_movements sm
+  where sm.item_id = v_item
+    and sm.movement_type = 'sale'
+    and sm.id <> v_m1;
+
+  insert into app.order_cost_applications (
+    order_id, cost_input_id, snapshot_id, receipt_kind, disposition,
+    predecessor_id, retired_application_id,
+    occurred_at, shift_id, signature, requirements, work_generation
+  )
+  values (
+    v_order, v_input_id, v_snap_id, 'posting', 'sale',
+    v_app1, v_app1,
+    v_at, 'p24h-sale', md5(v_order || '-app2'), '[]'::jsonb, 2
+  )
+  returning id into v_app2;
+
+  insert into app.order_cost_movement_links (movement_id, application_id, order_id, item_id)
+  values (v_m2, v_app2, v_order, v_item);
+
+  insert into app.order_cost_state (
+    order_id, latest_input_id, latest_application_id, owner_application_id,
+    disposition, signature
+  )
+  values (
+    v_order, v_input_id, v_app2, v_app2,
+    'sale', md5(v_order || '-app2')
+  );
+
+  perform app.seed_order_recognized (v_order);
+
+  perform set_config('app.t_change_chosen', '1', true);
+  perform set_config(
+    'app.t_change',
+    (select (anchor.at - interval '10 days')::text from f6_anchor anchor),
+    true
+  );
+
+  perform app.post_closed_order_difference (
+    v_order,
+    jsonb_build_array(jsonb_build_object('stock_item_id', v_item, 'quantity', 5)),
+    'waste',
+    'waste'
+  );
+
+  perform set_config('app.t_change_chosen', '', true);
+  perform set_config('app.t_change', '', true);
+  perform set_config('app.restatement_window_start', '', true);
+end;
+$$;
+
+select
+  pg_temp.round7k_cover ('f6e00000-0000-4000-8000-000000000070', 11, 5, 20);
+
+select
+  is (
+    (
+      select
+        sum(sm.total_cost)
+      from
+        app.stock_movements sm
+        join app.closed_period_sources src on src.movement_id = sm.id
+      where
+        src.source_kind = 'order'
+        and src.source_id = 'round7l-retired'
+        and sm.closed_bucket = 'cogs'
+        and sm.quantity = 0
+    ),
+    100.00::numeric,
+    'a late cover after retired-and-reposted sale transfers only active source value (100, not 140)'
+  );
+
+select
+  is (
+    (
+      select
+        sum(sm.total_cost)
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-000000000070'
+        and coalesce(
+          sm.closed_bucket,
+          app.profit_bucket (sm.movement_type)
+        ) = 'cogs'
+    ),
+    0.00::numeric,
+    'a late cover after retired-and-reposted sale leaves zero residual in COGS'
+  );
+
+select
+  is (
+    (
+      select
+        sum(sm.total_cost)
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-000000000070'
+        and coalesce(
+          sm.closed_bucket,
+          app.profit_bucket (sm.movement_type)
+        ) = 'waste'
+    ),
+    -100.00::numeric,
+    'a late cover after retired-and-reposted sale moves the full 100 into waste'
+  );
+
+-- 2. Zero-value transfer durable direction:
+--    A 5/0 COGS deficit reclassified to prepared waste must record transfer
+--    legs so both a later 5/50 cover and a backdated 5/50 cover resolve to waste.
+create function pg_temp.post_round7l_zero_order (p_item uuid, v_order text) returns bigint language plpgsql as $$
+declare
+  v_at timestamptz;
+  v_deficit bigint;
+begin
+  select anchor.at - interval '40 days' + interval '1 hour'
+  into v_at
+  from f6_anchor anchor;
+
+  insert into app.stock_items (id, name, kind, base_unit, count_frequency)
+  values (p_item, v_order, 'seafood', 'kg', 'daily');
+
+  perform app.set_item_opening_price (
+    gen_random_uuid (),
+    p_item,
+    0,
+    'synthetic zero-cost opening price',
+    null,
+    'kg|seafood||'
+  );
+
+  perform app.post_engine_outflows (
+    jsonb_build_array(jsonb_build_object(
+      'item_id', p_item,
+      'movement_type', 'sale',
+      'occurred_at', v_at,
+      'quantity', 5,
+      'source_id', v_order,
+      'shift_id', 'p24h-sale'
+    ))
+  );
+
+  select sm.id
+  into v_deficit
+  from app.stock_movements sm
+  where sm.item_id = p_item and sm.movement_type = 'sale';
+
+  insert into app.pos_orders (
+    id, shift_id, status, order_type, ordered_at,
+    subtotal, discount, tax, service_tax, delivery_fee, total,
+    pos_update_time, content_hash, missing_from_pos
+  )
+  values (
+    v_order, 'p24h-sale', 'complete', 'hall', v_at,
+    0, 0, 0, 0, 0, 0, v_at, rpad(md5(v_order), 64, 'a'), false
+  );
+
+  perform app.append_pos_cost_input (v_order, null, 'sync');
+
+  insert into app.order_cost_applications (
+    order_id, cost_input_id, snapshot_id, receipt_kind, disposition,
+    occurred_at, shift_id, signature, requirements, work_generation
+  )
+  select
+    v_order, input.id, input.snapshot_id, 'posting', 'sale',
+    v_at, 'p24h-sale', md5(v_order || '-app'), '[]'::jsonb, 1
+  from app.pos_cost_inputs input
+  where input.order_id = v_order;
+
+  insert into app.order_cost_state (
+    order_id, latest_input_id, latest_application_id, owner_application_id,
+    disposition, signature
+  )
+  select
+    v_order, input.id, application.id, application.id,
+    'sale', md5(v_order || '-app')
+  from app.pos_cost_inputs input
+  join app.order_cost_applications application on application.order_id = input.order_id
+  where input.order_id = v_order;
+
+  insert into app.order_cost_movement_links (movement_id, application_id, order_id, item_id)
+  select
+    v_deficit, application.id, v_order, p_item
+  from app.order_cost_applications application
+  where application.order_id = v_order;
+
+  perform app.seed_order_recognized (v_order);
+
+  perform set_config('app.t_change_chosen', '1', true);
+  perform set_config(
+    'app.t_change',
+    (select (anchor.at - interval '10 days')::text from f6_anchor anchor),
+    true
+  );
+
+  perform app.post_closed_order_difference (
+    v_order,
+    jsonb_build_array(jsonb_build_object('stock_item_id', p_item, 'quantity', 5)),
+    'waste',
+    'waste'
+  );
+
+  perform set_config('app.t_change_chosen', '', true);
+  perform set_config('app.t_change', '', true);
+  perform set_config('app.restatement_window_start', '', true);
+
+  return v_deficit;
+end;
+$$;
+
+create temp table f7l_zero_deficits as
+select
+  pg_temp.post_round7l_zero_order (
+    'f6e00000-0000-4000-8000-000000000071',
+    'round7l-zero-xfer'
+  ) as later_id,
+  pg_temp.post_round7l_zero_order (
+    'f6e00000-0000-4000-8000-000000000072',
+    'round7l-zero-backdated'
+  ) as backdated_id;
+
+select
+  is (
+    (
+      select
+        count(*)
+      from
+        f7l_zero_deficits d
+        cross join lateral app.cover_transfers (d.later_id) t
+      where
+        t.from_bucket = 'cogs'
+        and t.to_bucket = 'waste'
+    ),
+    1::bigint,
+    'reclassifying a zero-value COGS deficit to waste records durable transfer legs'
+  );
+
+select
+  pg_temp.round7k_cover ('f6e00000-0000-4000-8000-000000000071', 9, 5, 10);
+
+select
+  is (
+    (
+      select
+        sm.closed_bucket
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-000000000071'
+        and sm.cover_deficit_movement_id is not null
+    ),
+    'waste',
+    'a later 5/50 cover after a zero-value COGS-to-waste reclassification posts to waste'
+  );
+
+select
+  is (
+    (
+      select
+        sum(sm.total_cost)
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-000000000071'
+        and coalesce(
+          sm.closed_bucket,
+          app.profit_bucket (sm.movement_type)
+        ) = 'cogs'
+    ),
+    0.00::numeric,
+    'a later 5/50 cover after a zero-value COGS-to-waste reclassification leaves zero residual in COGS'
+  );
+
+select
+  pg_temp.round7k_cover ('f6e00000-0000-4000-8000-000000000072', 11, 5, 10);
+
+select
+  is (
+    (
+      select
+        sum(sm.total_cost)
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-000000000072'
+        and coalesce(
+          sm.closed_bucket,
+          app.profit_bucket (sm.movement_type)
+        ) = 'cogs'
+    ),
+    0.00::numeric,
+    'a backdated 5/50 cover before a zero-value COGS-to-waste transfer compensates COGS back to zero'
+  );
+
+select
+  is (
+    (
+      select
+        sum(sm.total_cost)
+      from
+        app.stock_movements sm
+      where
+        sm.item_id = 'f6e00000-0000-4000-8000-000000000072'
+        and coalesce(
+          sm.closed_bucket,
+          app.profit_bucket (sm.movement_type)
+        ) = 'waste'
+    ),
+    -50.00::numeric,
+    'a backdated 5/50 cover before a zero-value COGS-to-waste transfer moves 50 into waste'
+  );
+
+-- 3. Cover path read bounds with unrelated closed orders and carriers present:
+--    Keep one covered order fixed and measure buffers before vs after inserting
+--    5,000 unrelated closed orders, 5,000 unrelated recognized contributions,
+--    and 5,000 unrelated cover carriers.
+select
+  pg_temp.post_round7k_order (
+    'f6e00000-0000-4000-8000-000000000073',
+    'round7l-cover-bound',
+    0
+  );
+
+create temp table f7l_bound_target as
+select
+  sm.id as deficit_id,
+  xfer.transfer_id,
+  xfer.occurred_at as transfer_at
+from
+  app.stock_movements sm
+  cross join lateral app.cover_transfers (sm.id) xfer
+where
+  sm.item_id = 'f6e00000-0000-4000-8000-000000000073'
+  and sm.movement_type = 'sale'
+limit
+  1;
+
+create function pg_temp.measure_round7l_cover_buffers () returns table (
+  transfers_buffers bigint,
+  value_buffers bigint,
+  recognized_buffers bigint,
+  cover_call_buffers bigint
+) language plpgsql as $$
+declare
+  v_deficit bigint;
+  v_transfer_id bigint;
+  v_transfer_at timestamptz;
+  v_line text;
+  v_plan text;
+  v_b1 bigint;
+  v_b2 bigint;
+  v_b3 bigint;
+  v_b4 bigint;
+begin
+  select deficit_id, transfer_id, transfer_at
+  into v_deficit, v_transfer_id, v_transfer_at
+  from f7l_bound_target;
+
+  v_plan := '';
+  for v_line in execute pg_catalog.format(
+    'explain (analyze, buffers) select * from app.cover_transfers (%s)',
+    v_deficit
+  ) loop
+    v_plan := v_plan || v_line || e'\n';
+  end loop;
+  v_b1 := app.replay_plan_shared_buffers (v_plan);
+
+  v_plan := '';
+  for v_line in execute pg_catalog.format(
+    $ex$explain (analyze, buffers) select app.cover_transfer_value ('round7l-cover-bound', 'f6e00000-0000-4000-8000-000000000073'::uuid, 'cogs', %L::timestamptz, %s)$ex$,
+    v_transfer_at,
+    v_transfer_id
+  ) loop
+    v_plan := v_plan || v_line || e'\n';
+  end loop;
+  v_b2 := app.replay_plan_shared_buffers (v_plan);
+
+  begin
+    v_plan := '';
+    for v_line in execute pg_catalog.format(
+      'explain (analyze, buffers) select app.note_recognized_cover (%s, 10.00)',
+      v_deficit
+    ) loop
+      v_plan := v_plan || v_line || e'\n';
+    end loop;
+    v_b3 := app.replay_plan_shared_buffers (v_plan);
+
+    v_plan := '';
+    for v_line in execute pg_catalog.format(
+      $ex$explain (analyze, buffers) select app.post_movements(jsonb_build_array(jsonb_build_object(
+        'item_id', 'f6e00000-0000-4000-8000-000000000073',
+        'movement_type', 'purchase',
+        'occurred_at', %L::timestamptz,
+        'quantity', 5,
+        'unit_cost', 20
+      )))$ex$,
+      (select at - interval '11 days' from f6_anchor)
+    ) loop
+      v_plan := v_plan || v_line || e'\n';
+    end loop;
+    v_b4 := app.replay_plan_shared_buffers (v_plan);
+
+    raise exception 'round7l_bound:%:%:%:%', v_b1, v_b2, v_b3, v_b4 using errcode = 'P0001';
+  exception
+    when sqlstate 'P0001' then
+      if sqlerrm like 'round7l_bound:%' then
+        transfers_buffers := split_part(sqlerrm, ':', 2)::bigint;
+        value_buffers := split_part(sqlerrm, ':', 3)::bigint;
+        recognized_buffers := split_part(sqlerrm, ':', 4)::bigint;
+        cover_call_buffers := split_part(sqlerrm, ':', 5)::bigint;
+        return next;
+        return;
+      end if;
+      raise;
+  end;
+end;
+$$;
+
+-- Refresh stats on tables populated by earlier tests and warm past Postgres's
+-- 5-call generic-plan threshold before capturing baseline.
+analyze app.stock_count_anchors;
+
+analyze app.stock_movements;
+
+analyze app.closed_period_sources;
+
+analyze app.recognized_contribution;
+
+do $$
+begin
+  for i in 1..6 loop
+    perform * from pg_temp.measure_round7l_cover_buffers ();
+  end loop;
+end;
+$$;
+
+create temp table f7l_bound_before as
+select
+  *
+from
+  pg_temp.measure_round7l_cover_buffers ();
+
+-- Insert 5,000 unrelated closed orders, 5,000 unrelated recognized
+-- contributions, and 5,000 unrelated cover carriers.
+do $$
+declare
+  v_unrelated_item uuid := 'f6e00000-0000-4000-8000-000000000074';
+  v_cause uuid := gen_random_uuid ();
+  v_at timestamptz;
+  v_inflow_id bigint;
+  v_deficit_id bigint;
+begin
+  select anchor.at - interval '20 days'
+  into v_at
+  from f6_anchor anchor;
+
+  insert into app.stock_items (id, name, kind, base_unit, count_frequency)
+  values (v_unrelated_item, 'round7l-unrelated-history', 'seafood', 'kg', 'daily');
+
+  insert into app.stock_movements (
+    batch_id, item_id, movement_type, occurred_at, quantity, unit_cost, total_cost,
+    is_provisional, source_type, source_id
+  )
+  values (
+    v_cause, v_unrelated_item, 'purchase', v_at, 1, 10, 10,
+    false, 'purchase', 'round7l-noise-inflow'
+  )
+  returning id into v_inflow_id;
+
+  insert into app.stock_movements (
+    batch_id, item_id, movement_type, occurred_at, quantity, unit_cost, total_cost,
+    is_provisional, source_type, source_id
+  )
+  values (
+    v_cause, v_unrelated_item, 'sale', v_at - interval '1 day', -1, 10, -10,
+    true, 'engine', 'round7l-noise-deficit'
+  )
+  returning id into v_deficit_id;
+
+  with inserted_orders as (
+    insert into app.stock_movements (
+      batch_id, item_id, movement_type, occurred_at, quantity, unit_cost, total_cost,
+      is_provisional, source_type, source_id, closed_bucket, closed_cause_id, closed_economic_kind
+    )
+    select
+      v_cause,
+      v_unrelated_item,
+      'closed_period'::app.movement_type,
+      v_at,
+      0,
+      0,
+      10,
+      false,
+      'closed_period',
+      'round7l-noise-order-' || g,
+      'cogs',
+      v_cause,
+      'sale'
+    from generate_series(1, 5000) as g
+    returning id, source_id
+  )
+  insert into app.closed_period_sources (movement_id, closed_cause_id, source_kind, source_id)
+  select id, v_cause, 'order', source_id
+  from inserted_orders;
+
+  insert into app.recognized_contribution (source_kind, source_id, item_id, bucket, quantity, amount)
+  select 'order', 'round7l-noise-order-' || g, v_unrelated_item, 'cogs', 1, 10
+  from generate_series(1, 5000) as g;
+
+  insert into app.stock_movements (
+    batch_id, item_id, movement_type, occurred_at, quantity, unit_cost, total_cost,
+    is_provisional, source_type, source_id, closed_bucket, closed_cause_id,
+    cover_inflow_movement_id, cover_deficit_movement_id
+  )
+  select
+    v_cause,
+    v_unrelated_item,
+    'closed_period'::app.movement_type,
+    v_at,
+    0,
+    0,
+    -1,
+    false,
+    'closed_period',
+    'round7l-noise-carrier-' || g,
+    'cogs',
+    v_cause,
+    v_inflow_id,
+    v_deficit_id
+  from generate_series(1, 5000) as g;
+end;
+$$;
+
+analyze app.stock_movements;
+
+analyze app.closed_period_sources;
+
+analyze app.recognized_contribution;
+
+-- Warm past Postgres's 5-call generic-plan threshold after ANALYZE so
+-- relcache and plan-cache invalidation is not counted as table scans.
+do $$
+begin
+  for i in 1..6 loop
+    perform * from pg_temp.measure_round7l_cover_buffers ();
+  end loop;
+end;
+$$;
+
+create temp table f7l_bound_after as
+select
+  *
+from
+  pg_temp.measure_round7l_cover_buffers ();
+
+select
+  ok (
+    exists (
+      select
+        1
+      from
+        pg_indexes
+      where
+        schemaname = 'app'
+        and tablename = 'stock_movements'
+        and indexname = 'stock_movements_cover_deficit_idx'
+    ),
+    'stock_movements_cover_deficit_idx exists for deficit-leading cover carrier lookups'
+  );
+
+create function pg_temp.explain_cover_carrier_by_deficit () returns text language plpgsql as $$
+declare
+  v_deficit bigint;
+  v_line text;
+  v_plan text := '';
+begin
+  select deficit_id into v_deficit from f7l_bound_target;
+
+  for v_line in execute pg_catalog.format(
+    $ex$
+    explain (analyze, buffers)
+    select carrier.id, carrier.total_cost
+    from app.stock_movements carrier
+    where carrier.cover_deficit_movement_id = %s
+      and carrier.cover_inflow_movement_id is not null
+      and carrier.movement_type = 'closed_period'::app.movement_type
+    $ex$,
+    v_deficit
+  ) loop
+    v_plan := v_plan || v_line || e'\n';
+  end loop;
+
+  return v_plan;
+end;
+$$;
+
+select
+  ok (
+    (
+      select
+        p.plan like '%stock_movements_cover_deficit_idx%'
+        and p.plan not like '%Seq Scan on stock_movements%'
+        and p.plan not like '%stock_movements_cover_pair_idx%'
+      from
+        (
+          select
+            pg_temp.explain_cover_carrier_by_deficit () as plan
+        ) p
+    ),
+    'cover carrier lookup by deficit_movement_id uses stock_movements_cover_deficit_idx with 5000 unrelated carriers present'
+  );
+
+create function pg_temp.explain_cover_transfers_driver () returns text language plpgsql as $$
+declare
+  v_deficit bigint;
+  v_line text;
+  v_plan text := '';
+begin
+  select deficit_id into v_deficit from f7l_bound_target;
+
+  for v_line in execute pg_catalog.format(
+    $ex$
+    explain (analyze, buffers)
+    with deficit as (
+      select sm.id, sm.item_id
+      from app.stock_movements sm
+      where sm.id = %1$s
+    ),
+    order_ids as materialized (
+      select link.order_id
+      from app.order_cost_movement_links link
+      where link.movement_id = %1$s
+      union
+      select origin.source_id as order_id
+      from app.closed_period_sources origin
+      where origin.movement_id = %1$s
+        and origin.source_kind = 'order'
+    )
+    select first_leg.id
+    from deficit
+    join order_ids on true
+    join app.closed_period_sources source
+      on source.source_kind = 'order'
+      and source.source_id = order_ids.order_id
+    join app.stock_movements first_leg on first_leg.id = source.movement_id
+    join app.closed_period_sources companion
+      on companion.closed_cause_id = source.closed_cause_id
+      and companion.source_kind = source.source_kind
+      and companion.source_id = source.source_id
+    join app.stock_movements second_leg on second_leg.id = companion.movement_id
+    where first_leg.item_id = deficit.item_id
+      and first_leg.quantity = 0
+      and first_leg.event_position is null
+      and first_leg.cover_inflow_movement_id is null
+      and second_leg.item_id = first_leg.item_id
+      and second_leg.occurred_at = first_leg.occurred_at
+      and second_leg.event_position = first_leg.id
+      and second_leg.piece_position = first_leg.piece_position + 1
+      and second_leg.quantity = 0
+      and second_leg.closed_bucket <> first_leg.closed_bucket
+    $ex$,
+    v_deficit
+  ) loop
+    v_plan := v_plan || v_line || e'\n';
+  end loop;
+
+  return v_plan;
+end;
+$$;
+
+select
+  ok (
+    (
+      select
+        p.plan like '%closed_period_sources_source_idx%'
+        and p.plan not like '%Seq Scan on closed_period_sources%'
+      from
+        (
+          select
+            pg_temp.explain_cover_transfers_driver () as plan
+        ) p
+    ),
+    'cover_transfers driver uses closed_period_sources_source_idx without scanning unrelated closed orders'
+  );
+
+select
+  ok (
+    (
+      select
+        after_row.transfers_buffers <= 50
+        and after_row.transfers_buffers <= before_row.transfers_buffers + 25
+      from
+        f7l_bound_before before_row,
+        f7l_bound_after after_row
+    ),
+    'cover_transfers shared buffers stay flat (<= 50) with 5000 unrelated closed orders present'
+  );
+
+select
+  ok (
+    (
+      select
+        after_row.value_buffers <= before_row.value_buffers + 25
+      from
+        f7l_bound_before before_row,
+        f7l_bound_after after_row
+    ),
+    'cover_transfer_value shared buffers stay flat with 5000 unrelated carriers and closed orders present'
+  );
+
+select
+  ok (
+    (
+      select
+        after_row.recognized_buffers <= before_row.recognized_buffers + 25
+      from
+        f7l_bound_before before_row,
+        f7l_bound_after after_row
+    ),
+    'note_recognized_cover shared buffers stay flat with 5000 unrelated recognized contributions present'
+  );
+
+select
+  ok (
+    (
+      select
+        after_row.cover_call_buffers <= before_row.cover_call_buffers + 150
+        and after_row.cover_call_buffers < 2500
+      from
+        f7l_bound_before before_row,
+        f7l_bound_after after_row
+    ),
+    'single cover call shared buffers stay bounded with 5000 unrelated closed orders and carriers present'
+  );
+
+create temp table f7l_xstat_before as
+select
+  relname,
+  seq_scan,
+  seq_tup_read
+from
+  pg_stat_xact_user_tables
+where
+  schemaname = 'app'
+  and relname in (
+    'stock_movements',
+    'closed_period_sources',
+    'recognized_contribution'
+  );
+
+select
+  pg_temp.round7k_cover ('f6e00000-0000-4000-8000-000000000073', 11, 5, 20);
+
+select
+  is (
+    (
+      select
+        coalesce(sum(a.seq_scan - coalesce(b.seq_scan, 0)), 0)::bigint
+      from
+        pg_stat_xact_user_tables a
+        left join f7l_xstat_before b on b.relname = a.relname
+      where
+        a.schemaname = 'app'
+        and a.relname in (
+          'stock_movements',
+          'closed_period_sources',
+          'recognized_contribution'
+        )
+    ),
+    0::bigint,
+    'single cover call performs zero sequential scans on stock_movements, closed_period_sources, or recognized_contribution with 5000 unrelated rows present'
+  );
+
 select
   finish ();
 

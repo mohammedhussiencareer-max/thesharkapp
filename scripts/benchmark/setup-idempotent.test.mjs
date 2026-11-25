@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import {
@@ -9,10 +10,14 @@ import {
   lateSql,
   resumeGuardSql,
   sortHistories,
+  sortHistorySql,
+  sortSuffixSql,
   sortBuildSql,
   sortMeasureSql,
+  formatSortResult,
   sortBuffersNote,
   sortGrowthFailed,
+  resolveResumePlan,
 } from './accounting-history.mjs';
 
 const benchmark = fileURLToPath(
@@ -226,10 +231,131 @@ test('sort growth gate rejects 2-year buffers more than 10% over 35-day buffers'
     },
   ];
   assert.equal(sortGrowthFailed(rows), false);
+  assert.match(sortBuffersNote(rows), /warmed/i);
   assert.match(sortBuffersNote(rows), /stayed flat/);
   rows[2].buffers = 441;
   assert.equal(sortGrowthFailed(rows), true);
+  assert.match(sortBuffersNote(rows), /warmed/i);
   assert.match(sortBuffersNote(rows), /grew/);
+  const formatted = formatSortResult({
+    ...rows[0],
+    days: 35,
+    sorts: 35,
+    suffix_movements: 1,
+    open_deficits: 3,
+    resumed: true,
+    warmed: true,
+    crossed_2s: false,
+    pass: true,
+  });
+  assert.match(
+    formatted,
+    /session warmup: rolled-back record_purchase \(warmed\)/,
+  );
+  assert.match(formatted, /warmed rpc buffers: 400/);
+  assert.match(formatted, /warmed rpc seconds: 0\.1/);
+});
+
+test('resume plan scopes refusal to the workload being resumed', () => {
+  // Full run interrupted during order build after sorts already committed.
+  assert.deepEqual(
+    resolveResumePlan({
+      startName: null,
+      sortOnly: false,
+      resume: true,
+      sortCommittedCount: sortHistories.length,
+      orderCatalogStarted: true,
+    }),
+    { runSorts: false, orderHistories: histories },
+  );
+  // Explicit order workload resume ignores committed sorts and earlier order histories.
+  assert.deepEqual(
+    resolveResumePlan({
+      startName: histories[1].name,
+      sortOnly: false,
+      resume: true,
+      sortCommittedCount: sortHistories.length,
+      orderCatalogStarted: false,
+    }),
+    { runSorts: false, orderHistories: histories.slice(1) },
+  );
+  // Partial sort measurements still refuse on full --resume.
+  assert.throws(
+    () =>
+      resolveResumePlan({
+        startName: null,
+        sortOnly: false,
+        resume: true,
+        sortCommittedCount: 1,
+        orderCatalogStarted: true,
+      }),
+    resetMessage,
+  );
+  // Committed sorts with no order build in progress still refuse on full --resume.
+  assert.throws(
+    () =>
+      resolveResumePlan({
+        startName: null,
+        sortOnly: false,
+        resume: true,
+        sortCommittedCount: sortHistories.length,
+        orderCatalogStarted: false,
+      }),
+    resetMessage,
+  );
+  // --sort-only still refuses when any sort measurement is committed.
+  assert.throws(
+    () =>
+      resolveResumePlan({
+        startName: null,
+        sortOnly: true,
+        resume: true,
+        sortCommittedCount: 1,
+        orderCatalogStarted: false,
+      }),
+    resetMessage,
+  );
+});
+
+test('sort build interruption between history commit and suffix commit is resumable', async () => {
+  const anchor = await psql(
+    `select to_char((date_trunc('day', pg_catalog.clock_timestamp() at time zone 'Africa/Cairo') at time zone 'Africa/Cairo'), 'YYYY-MM-DD HH24:MI:SSOF');`,
+  );
+  const history = {
+    name: 'interrupted suffix sorts',
+    prefix: 's-int-suffix',
+    days: 2,
+    mixed: 'b9e00000-0000-4000-8000-000000009101',
+    size: 'b9e00000-0000-4000-8000-000000009102',
+    openingRequest: 'b9e00000-0000-4000-8000-000000009103',
+    activationRequest: 'b9e00000-0000-4000-8000-000000009104',
+    suffixPurchaseRequest: 'b9e00000-0000-4000-8000-000000009105',
+    purchaseRequest: 'b9e00000-0000-4000-8000-000000009106',
+  };
+  await psql(setupSql(anchor));
+  // Commit ONLY the sort-history transaction (simulating interruption before suffix commit).
+  const catalog = await psql(
+    `select exists (select from app.stock_items where id = '${history.mixed}')`,
+  );
+  if (catalog === 'f') await psql(sortHistorySql(history, anchor));
+  await assert.rejects(
+    () => psql(sortMeasureSql(history, anchor).replace('commit;', 'rollback;')),
+    /required committed sort suffix fixture is missing or incomplete/,
+  );
+  // Resuming the suffix transaction repairs the fixture idempotently.
+  await psql(sortSuffixSql(history, anchor));
+  await psql(sortSuffixSql(history, anchor));
+  const notices = await psql(
+    sortMeasureSql(history, anchor).replace('commit;', 'rollback;'),
+    { notices: true },
+  );
+  const match = notices.match(/MEASURE (\{[^\r\n]+\})/);
+  assert.ok(match, notices);
+  const valid = JSON.parse(match[1]);
+  assert.deepEqual(
+    { pass: valid.pass, resumed: valid.resumed, warmed: valid.warmed },
+    { pass: true, resumed: true, warmed: true },
+  );
 });
 
 test('sort acceptance checks the committed suffix and reports the cut used by the RPC', async () => {
@@ -347,5 +473,32 @@ test('benchmark CLI refuses committed measurements before sort skip or --skip-bu
           : result.reason.stderr,
     ),
     ['reset required', 'reset required'],
+  );
+
+  // Committed sort measurements and earlier completed order histories must not
+  // block resuming a later order history whose own measurement has not started.
+  const nextOrder = histories[1];
+  const resultsPath = fileURLToPath(new URL('./RESULTS.md', import.meta.url));
+  const savedResults = existsSync(resultsPath)
+    ? readFileSync(resultsPath, 'utf8')
+    : null;
+  let scopedOrderResult;
+  try {
+    scopedOrderResult = await Promise.allSettled([
+      runBenchmark(process.execPath, [
+        benchmark,
+        nextOrder.name,
+        '--skip-build',
+        '--resume',
+      ]),
+    ]);
+  } finally {
+    if (savedResults !== null) writeFileSync(resultsPath, savedResults);
+  }
+  assert.equal(scopedOrderResult[0].status, 'rejected');
+  assert.doesNotMatch(scopedOrderResult[0].reason.stderr, resetMessage);
+  assert.match(
+    scopedOrderResult[0].reason.stderr,
+    /measured order is not the queue head/,
   );
 });

@@ -118,6 +118,13 @@ create index stock_movements_cover_pair_idx on app.stock_movements (
 where
   cover_inflow_movement_id is not null;
 
+create index stock_movements_cover_deficit_idx on app.stock_movements (
+  cover_deficit_movement_id,
+  cover_inflow_movement_id
+)
+where
+  cover_deficit_movement_id is not null;
+
 create index stock_movements_opening_idx on app.stock_movements (item_id, occurred_at)
 where
   movement_type = 'opening'::app.movement_type;
@@ -2907,9 +2914,36 @@ create function app.cover_transfers (p_movement_id bigint) returns table (
   from_bucket text,
   to_bucket text,
   order_id text
-) language sql stable security definer
+) language plpgsql stable security definer
 set
   search_path = '' as $$
+begin
+  return query
+  with deficit as (
+    select
+      sm.id,
+      sm.item_id
+    from
+      app.stock_movements sm
+    where
+      sm.id = p_movement_id
+  ),
+  order_ids as materialized (
+    select
+      link.order_id
+    from
+      app.order_cost_movement_links link
+    where
+      link.movement_id = p_movement_id
+    union
+    select
+      origin.source_id as order_id
+    from
+      app.closed_period_sources origin
+    where
+      origin.movement_id = p_movement_id
+      and origin.source_kind = 'order'
+  )
   select
     first_leg.id,
     first_leg.occurred_at,
@@ -2918,8 +2952,11 @@ set
     second_leg.closed_bucket,
     source.source_id
   from
-    app.stock_movements deficit
-    join app.closed_period_sources source on source.source_kind = 'order'
+    deficit
+    join order_ids on true
+    join app.closed_period_sources source
+      on source.source_kind = 'order'
+      and source.source_id = order_ids.order_id
     join app.stock_movements first_leg on first_leg.id = source.movement_id
     join app.closed_period_sources companion
       on companion.closed_cause_id = source.closed_cause_id
@@ -2927,22 +2964,7 @@ set
       and companion.source_id = source.source_id
     join app.stock_movements second_leg on second_leg.id = companion.movement_id
   where
-    deficit.id = p_movement_id
-    and (
-      exists (
-        select 1
-        from app.order_cost_movement_links link
-        where link.movement_id = deficit.id and link.order_id = source.source_id
-      )
-      or exists (
-        select 1
-        from app.closed_period_sources origin
-        where origin.movement_id = deficit.id
-          and origin.source_kind = source.source_kind
-          and origin.source_id = source.source_id
-      )
-    )
-    and first_leg.item_id = deficit.item_id
+    first_leg.item_id = deficit.item_id
     and first_leg.quantity = 0
     and first_leg.event_position is null
     and first_leg.cover_inflow_movement_id is null
@@ -2952,6 +2974,7 @@ set
     and second_leg.piece_position = first_leg.piece_position + 1
     and second_leg.quantity = 0
     and second_leg.closed_bucket <> first_leg.closed_bucket;
+end;
 $$;
 
 revoke all on function app.cover_transfers (bigint)
@@ -3010,9 +3033,12 @@ create function app.cover_transfer_value (
   p_bucket text,
   p_at timestamptz,
   p_transfer_id bigint
-) returns numeric language sql stable security definer
+) returns numeric language plpgsql stable security definer
 set
   search_path = '' as $$
+declare
+  v_value numeric;
+begin
   with piece_ids as (
     select link.movement_id
     from app.order_cost_movement_links link
@@ -3034,6 +3060,12 @@ set
     where sm.item_id = p_item_id
       and (sm.occurred_at, coalesce(sm.event_position, sm.id)) < (p_at, p_transfer_id)
       and sm.movement_type <> 'cost_adjustment'::app.movement_type
+      and not exists (
+        select 1
+        from app.stock_movements rev
+        where rev.reverses_movement_id = sm.id
+          and (rev.occurred_at, coalesce(rev.event_position, rev.id)) < (p_at, p_transfer_id)
+      )
   ),
   value_rows as (
     select piece.total_cost, piece.bucket
@@ -3057,8 +3089,12 @@ set
       < (p_at, p_transfer_id)
   )
   select -coalesce(sum(total_cost), 0)
+  into v_value
   from value_rows
   where bucket = p_bucket;
+
+  return v_value;
+end;
 $$;
 
 revoke all on function app.cover_transfer_value (text, uuid, text, timestamptz, bigint)
@@ -9083,83 +9119,65 @@ from
 create function app.note_recognized_cover (p_movement_id bigint, p_consumption_delta numeric) returns void language plpgsql security definer
 set
   search_path = '' as $$
+declare
+  v_item uuid;
+  v_bucket text;
 begin
   if coalesce(p_consumption_delta, 0) = 0 then
     return;
   end if;
 
+  select
+    sm.item_id
+  into v_item
+  from
+    app.stock_movements sm
+  where
+    sm.id = p_movement_id;
+
+  if not found then
+    return;
+  end if;
+
+  v_bucket := app.cover_profit_bucket (p_movement_id);
+
+  with
+    sources as materialized (
+      select
+        'order'::text as source_kind,
+        link.order_id as source_id
+      from
+        app.order_cost_movement_links link
+      where
+        link.movement_id = p_movement_id
+      union
+      select
+        src.source_kind,
+        src.source_id
+      from
+        app.closed_period_sources src
+      where
+        src.movement_id = p_movement_id
+        and src.source_kind in ('order', 'waste', 'count')
+      union
+      select
+        'waste'::text as source_kind,
+        app.waste_document_root (line.document_id)::text as source_id
+      from
+        app.waste_line_movements line
+      where
+        line.movement_id = p_movement_id
+    )
   update app.recognized_contribution contribution
   set
     amount = pg_catalog.round(contribution.amount + p_consumption_delta, 2)
   from
-    app.stock_movements sm
+    sources
   where
-    sm.id = p_movement_id
-    and contribution.item_id = sm.item_id
-    and contribution.bucket = app.cover_profit_bucket (sm.id)
-    and (
-      (
-        contribution.source_kind = 'order'
-        and (
-          exists (
-            select
-              1
-            from
-              app.order_cost_movement_links link
-            where
-              link.movement_id = sm.id
-              and link.order_id = contribution.source_id
-          )
-          or exists (
-            select
-              1
-            from
-              app.closed_period_sources src
-            where
-              src.movement_id = sm.id
-              and src.source_kind = 'order'
-              and src.source_id = contribution.source_id
-          )
-        )
-      )
-      or (
-        contribution.source_kind = 'waste'
-        and (
-          exists (
-            select
-              1
-            from
-              app.closed_period_sources src
-            where
-              src.movement_id = sm.id
-              and src.source_kind = 'waste'
-              and src.source_id = contribution.source_id
-          )
-          or exists (
-            select
-              1
-            from
-              app.waste_line_movements line
-            where
-              line.movement_id = sm.id
-              and app.waste_document_root (line.document_id)::text = contribution.source_id
-          )
-        )
-      )
-      or (
-        contribution.source_kind = 'count'
-        and exists (
-          select
-            1
-          from
-            app.closed_period_sources src
-          where
-            src.movement_id = sm.id
-            and src.source_kind = 'count'
-            and src.source_id = contribution.source_id
-        )
-      )
-    );
+    contribution.source_kind = sources.source_kind
+    and contribution.source_id = sources.source_id
+    and contribution.item_id = v_item
+    and contribution.bucket = v_bucket;
 end;
 $$;
 
@@ -9553,7 +9571,8 @@ begin
         end if;
       end if;
 
-      if v_other_amt <> 0 then
+      if v_other_qty > 0
+      or v_other_amt <> 0 then
         v_change := app.note_change_instant ();
         v_shift := app.closed_containing_shift (v_change);
         v_piece := v_piece + 1;
