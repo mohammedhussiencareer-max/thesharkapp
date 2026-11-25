@@ -1835,11 +1835,14 @@ describe('held-writes store', () => {
       await reloadedAuth.signOut();
 
       expect(localStorage.getItem(sdkStorageKey)).toBeNull();
-      expect(
-        localStorage.getItem(
-          `theshark:auth:logout-pending:v1:${encodeURIComponent('http://127.0.0.1:55421')}`,
-        ),
-      ).toMatch(/^logout-\d+-.+/);
+      const persistedCoord = localStorage.getItem(
+        `theshark:auth:logout-pending:v1:${encodeURIComponent('http://127.0.0.1:55421')}`,
+      );
+      expect(persistedCoord).not.toBeNull();
+      expect(JSON.parse(persistedCoord!)).toMatchObject({
+        attemptId: 1,
+        state: 'local_failed',
+      });
       expect(reloadedAuth.getAuthSnapshot().logoutFailed).toBe(true);
       expect(reloadedAuth.isAuthResolved()).toBe(false);
     } finally {

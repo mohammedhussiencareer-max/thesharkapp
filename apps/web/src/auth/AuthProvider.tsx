@@ -19,9 +19,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     () => ({
       status: snapshot.status,
       email: snapshot.email,
+      logoutPhase: snapshot.logoutPhase,
       logoutPending: snapshot.logoutPending,
       logoutFailed: snapshot.logoutFailed,
       logoutRevocationFailed: snapshot.logoutRevocationFailed,
+      canRetryLogoutRevocation: snapshot.canRetryLogoutRevocation,
       signIn,
       signOut,
       retryLogoutRevocation,

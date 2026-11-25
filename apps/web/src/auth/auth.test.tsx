@@ -458,7 +458,11 @@ describe('owner access', () => {
       await screen.findByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
     ).toBeInTheDocument();
     const markerValue = localStorage.getItem(markerKey);
-    expect(markerValue).toMatch(/^logout-\d+-.+/);
+    expect(markerValue).not.toBeNull();
+    expect(JSON.parse(markerValue!)).toMatchObject({
+      attemptId: 1,
+      state: 'local_failed',
+    });
     expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
 
     // Another tab's SDK signOut emits SIGNED_OUT while the marker is still present.
@@ -519,7 +523,12 @@ describe('owner access', () => {
     expect(
       await screen.findByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
     ).toBeInTheDocument();
-    expect(localStorage.getItem(markerKey)).toMatch(/^logout-\d+-.+/);
+    const markerValue = localStorage.getItem(markerKey);
+    expect(markerValue).not.toBeNull();
+    expect(JSON.parse(markerValue!)).toMatchObject({
+      attemptId: 1,
+      state: 'local_failed',
+    });
     expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
 
     // Marker is removed first without delivering a storage event, then SIGNED_OUT arrives.
@@ -628,6 +637,38 @@ describe('owner access', () => {
       setItemSpy.mockRestore();
       localStorage.removeItem(sdkStorageKey);
     }
+  });
+
+  it('I2: keeps unconfirmed global revocation notice across reload without offering a fake retry when no retained token exists', async () => {
+    const markerKey = `theshark:auth:logout-pending:v1:${encodeURIComponent('http://127.0.0.1:55421')}`;
+    localStorage.setItem(
+      markerKey,
+      JSON.stringify({
+        attemptId: 4,
+        ownerTabId: 'previous-tab',
+        state: 'revocation_failed',
+        sessionKey: 'rt:old-token',
+      }),
+    );
+
+    renderApp('/login');
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'تم تسجيل الخروج من هذا الجهاز، لكن تعذر تأكيد إنهاء الجلسة على الأجهزة الأخرى',
+    );
+    expect(
+      screen.queryByRole('button', {
+        name: 'إعادة محاولة إنهاء الجلسات الأخرى',
+      }),
+    ).toBeNull();
+    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeEnabled();
+    expect(getAuthSnapshot()).toMatchObject({
+      status: 'signed-out',
+      logoutPhase: 'revocation_failed',
+      logoutFailed: false,
+      logoutRevocationFailed: true,
+      canRetryLogoutRevocation: false,
+    });
   });
 });
 

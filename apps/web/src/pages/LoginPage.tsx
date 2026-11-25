@@ -13,6 +13,7 @@ export function LoginPage() {
     logoutPending = false,
     logoutFailed = false,
     logoutRevocationFailed = false,
+    canRetryLogoutRevocation = true,
   } = useAuth();
   const navigate = useNavigate();
   const [email, setEmail] = useState('');
@@ -63,20 +64,29 @@ export function LoginPage() {
           role="alert"
           className="flex flex-col gap-2 rounded border border-amber-300 bg-amber-50 p-3 text-sm"
         >
-          <p>
-            تم تسجيل الخروج من هذا الجهاز، لكن تعذر إنهاء الجلسة على الأجهزة
-            الأخرى — أعد المحاولة
-          </p>
-          <button
-            className="w-fit rounded bg-neutral-900 px-3 py-2 text-white disabled:opacity-60"
-            type="button"
-            disabled={logoutPending}
-            onClick={() => void (retryLogoutRevocation ?? signOut)()}
-          >
-            {logoutPending
-              ? 'جاري إنهاء الجلسات…'
-              : 'إعادة محاولة إنهاء الجلسات الأخرى'}
-          </button>
+          {canRetryLogoutRevocation ? (
+            <>
+              <p>
+                تم تسجيل الخروج من هذا الجهاز، لكن تعذر إنهاء الجلسة على الأجهزة
+                الأخرى — أعد المحاولة
+              </p>
+              <button
+                className="w-fit rounded bg-neutral-900 px-3 py-2 text-white disabled:opacity-60"
+                type="button"
+                disabled={logoutPending}
+                onClick={() => void (retryLogoutRevocation ?? signOut)()}
+              >
+                {logoutPending
+                  ? 'جاري إنهاء الجلسات…'
+                  : 'إعادة محاولة إنهاء الجلسات الأخرى'}
+              </button>
+            </>
+          ) : (
+            <p>
+              تم تسجيل الخروج من هذا الجهاز، لكن تعذر تأكيد إنهاء الجلسة على
+              الأجهزة الأخرى — سجّل الدخول ثم أعد تسجيل الخروج لإنهاء كل الجلسات
+            </p>
+          )}
         </div>
       ) : null}
       <form className="flex flex-col gap-3" onSubmit={onSubmit}>
