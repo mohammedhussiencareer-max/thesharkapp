@@ -259,7 +259,7 @@ test('daily count retries the exact request id and payload across a reload at 39
     sentBodies.push(body);
     if (dropNext) {
       dropNext = false;
-      const upstream = await route.fetch();
+      const upstream = await route.fetch({ maxRedirects: 0 });
       expect(upstream.ok()).toBe(true);
       await route.abort('failed');
       return;

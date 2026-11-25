@@ -4,6 +4,7 @@ import {
   addExpenseEntry,
   instantKey,
   loadExpenseMonth,
+  loadExpenseRequestMonth,
   renameExpenseCategory,
   setExpenseCategoryActive,
   setMonthExpenseComplete,
@@ -140,6 +141,48 @@ describe('expense api', () => {
   beforeEach(() => {
     mocks.schema.mockReset();
     rpcCalls.length = 0;
+  });
+
+  it('resolves a stored expense request month from its entry or the original entry of a void', async () => {
+    const added = query({
+      data: { period_month: '2030-05-01', expense_date: null, voids_id: null },
+      error: null,
+    });
+    const voided = query({
+      data: { period_month: null, expense_date: null, voids_id: 'original' },
+      error: null,
+    });
+    const original = query({
+      data: { period_month: null, expense_date: '2030-06-18' },
+      error: null,
+    });
+    const from = vi
+      .fn()
+      .mockReturnValueOnce(added.chain)
+      .mockReturnValueOnce(voided.chain)
+      .mockReturnValueOnce(original.chain);
+    mocks.schema.mockReturnValue({ from });
+
+    await expect(loadExpenseRequestMonth('add-request')).resolves.toBe(
+      '2030-05-01',
+    );
+    await expect(loadExpenseRequestMonth('void-request')).resolves.toBe(
+      '2030-06-01',
+    );
+    expect(added.captured.eq).toEqual({
+      column: 'request_id',
+      value: 'add-request',
+    });
+    expect(voided.captured.eq).toEqual({
+      column: 'request_id',
+      value: 'void-request',
+    });
+    expect(original.captured.eq).toEqual({ column: 'id', value: 'original' });
+    expect(from.mock.calls).toEqual([
+      ['expense_entries'],
+      ['expense_entries'],
+      ['expense_lines'],
+    ]);
   });
 
   it('reads exact decimal text for the month, newest first', async () => {

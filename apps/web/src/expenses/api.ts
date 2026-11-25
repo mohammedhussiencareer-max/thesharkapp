@@ -295,6 +295,16 @@ export async function loadExpenseMonth(
   };
 }
 
+function expenseEntryMonth(row: {
+  period_month: string | null;
+  expense_date: string | null;
+}): string | null {
+  const periodMonth = optionalDate(row.period_month);
+  if (periodMonth) return periodMonth;
+  const expenseDate = optionalDate(row.expense_date);
+  return expenseDate ? `${expenseDate.slice(0, 7)}-01` : null;
+}
+
 export async function loadExpenseEntryMonth(
   id: string,
 ): Promise<string | null> {
@@ -304,10 +314,7 @@ export async function loadExpenseEntryMonth(
     .eq('id', id)
     .maybeSingle();
   if (error || !data) return null;
-  const periodMonth = optionalDate(data.period_month);
-  if (periodMonth) return periodMonth;
-  const expenseDate = optionalDate(data.expense_date);
-  return expenseDate ? `${expenseDate.slice(0, 7)}-01` : null;
+  return expenseEntryMonth(data);
 }
 
 export async function addExpenseEntry(draft: ExpenseDraft): Promise<void> {
@@ -331,14 +338,18 @@ export async function addExpenseEntry(draft: ExpenseDraft): Promise<void> {
   await writeEntry(() => appDb().rpc('add_expense_entry', args));
 }
 
-export async function hasExpenseRequest(requestId: string): Promise<boolean> {
+export async function loadExpenseRequestMonth(
+  requestId: string,
+): Promise<string | null> {
   const { data, error } = await appDb()
     .from('expense_entries')
-    .select('id')
+    .select('period_month, expense_date, voids_id')
     .eq('request_id', requestId)
-    .limit(1);
+    .maybeSingle();
   throwIfError(error);
-  return Array.isArray(data) && data.length > 0;
+  if (!data) return null;
+  if (data.voids_id) return loadExpenseEntryMonth(data.voids_id);
+  return expenseEntryMonth(data);
 }
 
 export async function voidExpenseEntry(

@@ -82,6 +82,16 @@ describe('PWA Vite configuration', () => {
     expect(names.some((name) => name.includes('pwa'))).toBe(false);
   });
 
+  it('does not follow redirects when forwarding the count write in the mobile smoke test', () => {
+    const mobileSpec = readFileSync(
+      resolve(import.meta.dirname, '../../e2e/mobile-pwa.spec.ts'),
+      'utf8',
+    );
+    expect(mobileSpec).toMatch(
+      /const upstream = await route\.fetch\(\{\s*maxRedirects:\s*0\s*,?\s*\}\)/,
+    );
+  });
+
   it('builds the desktop Tauri frontend with VITE_PWA=0 and keeps detectSessionInUrl false', () => {
     const tauriConf = JSON.parse(
       readFileSync(

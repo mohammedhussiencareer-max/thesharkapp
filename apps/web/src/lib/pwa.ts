@@ -215,6 +215,22 @@ export function applyPwaUpdate(
   if (hasAnyHeldWrite() || hasLiveHeldWriteClaims()) return false;
   const effectiveReload =
     reload ?? initReload ?? (() => window.location.reload());
+  const registeredWaiting = activeRegistration?.waiting;
+  if (registeredWaiting && registeredWaiting !== waitingWorker) {
+    const controller = navigator.serviceWorker?.controller ?? null;
+    const active = activeRegistration?.active;
+    // The registration can expose the new worker before its statechange.
+    // A first install has no older controller, active worker or deferred reload.
+    if (
+      registeredWaiting !== controller &&
+      !isActivatedWorker(registeredWaiting) &&
+      (reloadDeferred ||
+        controller !== null ||
+        (active && active !== registeredWaiting))
+    ) {
+      setWaiting(registeredWaiting);
+    }
+  }
   if (waitingWorker !== null && !isActivatedWorker(waitingWorker)) {
     reloadDeferred = false;
     reloadRequested = true;

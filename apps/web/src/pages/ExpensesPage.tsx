@@ -4,9 +4,9 @@ import { AllocationTable } from '@/expenses/AllocationTable';
 import {
   addExpenseCategory,
   addExpenseEntry,
-  hasExpenseRequest,
   loadExpenseEntryMonth,
   loadExpenseMonth,
+  loadExpenseRequestMonth,
   renameExpenseCategory,
   setExpenseCategoryActive,
   setMonthExpenseComplete,
@@ -41,6 +41,8 @@ import {
   clearHeldWrite,
   clearVerifiedHeldWrite,
   clearPostedReloadSnapshot,
+  EXPENSE_NEW_SUBJECT,
+  EXPENSE_VOID_PREFIX,
   getHeldWrite,
   hasDurableHeldWrite,
   listHeldWritesByPrefix,
@@ -60,9 +62,6 @@ import {
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { isRequestlessDefiniteRefusal } from '@/lib/write-outcome';
 
-const EXPENSE_NEW_SUBJECT = 'expense:new';
-const EXPENSE_VOID_PREFIX = 'expense:void:';
-
 type RequestlessVerifyState = {
   targetMonth: string;
   status: 'verifying' | 'read_failed' | 'verified';
@@ -80,6 +79,7 @@ type StoredVoidPayload = {
   requestId: string;
   reason: string;
   targetMonth?: string;
+  awaitingRequestMonth?: true;
 };
 
 type VoidAttempt = {
@@ -94,15 +94,12 @@ function voidSubject(id: string): string {
   return `${EXPENSE_VOID_PREFIX}${id}`;
 }
 
-function expenseTargetMonth(
-  draft: ExpenseDraft,
-  fallbackMonth: string,
-): string {
+function expenseDraftMonth(draft: ExpenseDraft): string | undefined {
   if (draft.periodMonth) return draft.periodMonth;
   if (draft.expenseDate && draft.expenseDate.length >= 7) {
     return `${draft.expenseDate.slice(0, 7)}-01`;
   }
-  return `${fallbackMonth}-01`;
+  return undefined;
 }
 
 function voidTargetMonthFromEntry(entry: ExpenseLine | null): string | null {
@@ -111,13 +108,6 @@ function voidTargetMonthFromEntry(entry: ExpenseLine | null): string | null {
     return `${entry.expenseDate.slice(0, 7)}-01`;
   }
   return null;
-}
-
-function voidTargetMonth(
-  entry: ExpenseLine | null,
-  fallbackMonth: string,
-): string {
-  return voidTargetMonthFromEntry(entry) ?? `${fallbackMonth}-01`;
 }
 
 function snapshotExpensePostedReloads(): PostedReloadSnapshot {
@@ -158,12 +148,13 @@ function reportedExpenseError(error: unknown): string {
   return mapExpenseError(error);
 }
 
-async function checkExpenseRequestExists(requestId: string): Promise<boolean> {
+async function resolveExpenseRequestMonth(
+  requestId: string,
+): Promise<string | null> {
   try {
-    if (typeof hasExpenseRequest !== 'function') return false;
-    return await hasExpenseRequest(requestId);
+    return await loadExpenseRequestMonth(requestId);
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -278,7 +269,12 @@ export function ExpensesPage() {
     for (const record of listHeldWritesByPrefix<StoredVoidPayload>(
       EXPENSE_VOID_PREFIX,
     )) {
-      if (record.phase !== 'unknown' || !record.payload) continue;
+      if (
+        record.phase !== 'unknown' ||
+        !record.payload ||
+        record.payload.awaitingRequestMonth
+      )
+        continue;
       if (voidedIds.has(record.payload.id)) {
         await clearVerifiedHeldWrite(record);
         voidRequestIdsRef.current.delete(record.payload.id);
@@ -835,7 +831,8 @@ export function ExpensesPage() {
   }
 
   async function submitExpense(draft: ExpenseDraft) {
-    const targetMonth = expenseTargetMonth(draft, monthRef.current);
+    const draftMonth = expenseDraftMonth(draft);
+    const targetMonth = draftMonth ?? `${monthRef.current}-01`;
     if (
       savingRef.current ||
       reloadLockRef.current !== null ||
@@ -856,7 +853,7 @@ export function ExpensesPage() {
       ? await claimReplayHeldWrite<ExpenseDraft>(
           EXPENSE_NEW_SUBJECT,
           draft.requestId,
-          { session },
+          { session, readTarget: expenseDraftMonth },
         )
       : await claimFreshHeldWrite<ExpenseDraft>(
           EXPENSE_NEW_SUBJECT,
@@ -864,7 +861,7 @@ export function ExpensesPage() {
           {
             requestId: draft.requestId,
             kind: 'expense',
-            readTarget: targetMonth,
+            readTarget: draftMonth,
             session,
           },
         );
@@ -885,7 +882,8 @@ export function ExpensesPage() {
     };
     const payload = claim.record.payload;
     const requestId = claim.record.requestId;
-    const resolvedExpenseTarget = expenseTargetMonth(payload, monthRef.current);
+    const resolvedExpenseTarget =
+      expenseDraftMonth(payload) ?? `${monthRef.current}-01`;
     let result: WriteResult;
     try {
       result = await runWrite(
@@ -918,14 +916,17 @@ export function ExpensesPage() {
       if (!result.saved && result.error) {
         setFormError(reportedExpenseError(result.error));
         if (isRequestIdMismatchError(result.error)) {
-          const existsOnServer = await checkExpenseRequestExists(requestId);
-          if (existsOnServer) {
+          const storedMonth = await resolveExpenseRequestMonth(requestId);
+          if (storedMonth !== null) {
             setHeldWritePhase(EXPENSE_NEW_SUBJECT, requestId, 'posted_reload', {
-              readTarget: resolvedExpenseTarget,
+              readTarget: storedMonth,
+              session,
             });
             setFormEpoch((value) => value + 1);
           } else {
-            setHeldWritePhase(EXPENSE_NEW_SUBJECT, requestId, 'unknown');
+            setHeldWritePhase(EXPENSE_NEW_SUBJECT, requestId, 'unknown', {
+              session,
+            });
           }
         } else if (wasPinned) {
           if (isPayloadRefusal(result.error)) {
@@ -981,10 +982,12 @@ export function ExpensesPage() {
     const freshTargetMonth =
       fromCurrentMonth && data
         ? data.monthStart
-        : voidTargetMonth(visible, monthRef.current);
+        : (voidTargetMonthFromEntry(visible) ?? undefined);
     const claim = wasPinned
       ? await claimReplayHeldWrite<StoredVoidPayload>(subject, requestId, {
           session,
+          readTarget: (payload) =>
+            payload.awaitingRequestMonth ? undefined : payload.targetMonth,
         })
       : await claimFreshHeldWrite<StoredVoidPayload>(
           subject,
@@ -1077,16 +1080,21 @@ export function ExpensesPage() {
       if (!result.saved && result.error) {
         setListError(reportedExpenseError(result.error));
         if (isRequestIdMismatchError(result.error)) {
-          const existsOnServer =
-            await checkExpenseRequestExists(claimedRequestId);
-          if (existsOnServer) {
+          const storedMonth =
+            await resolveExpenseRequestMonth(claimedRequestId);
+          if (storedMonth !== null) {
             voidRequestIdsRef.current.delete(id);
             setVoidSnapshot(null);
             setHeldWritePhase(subject, claimedRequestId, 'posted_reload', {
-              readTarget: initialVoidTarget,
+              readTarget: storedMonth,
+              session,
             });
           } else {
-            setHeldWritePhase(subject, claimedRequestId, 'unknown');
+            // A voided row from the rejected payload cannot verify this request.
+            setHeldWritePhase(subject, claimedRequestId, 'unknown', {
+              payload: { ...claimedPayload, awaitingRequestMonth: true },
+              session,
+            });
           }
         } else if (wasPinned) {
           if (isPayloadRefusal(result.error)) {

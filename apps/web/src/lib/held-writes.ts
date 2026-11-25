@@ -322,6 +322,14 @@ function sameAcknowledgedClaim(
 
 export const COUNT_DAILY_SUBJECT = 'count:daily';
 export const COUNT_STORED_PREFIX = 'count:stored:';
+export const EXPENSE_NEW_SUBJECT = 'expense:new';
+export const EXPENSE_VOID_PREFIX = 'expense:void:';
+
+function isExpenseSubject(subject: string): boolean {
+  return (
+    subject === EXPENSE_NEW_SUBJECT || subject.startsWith(EXPENSE_VOID_PREFIX)
+  );
+}
 
 function countAliasSubject(subject: string, requestId: string): string | null {
   if (subject === COUNT_DAILY_SUBJECT) {
@@ -414,9 +422,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     userId: string,
     projectUrl = getProjectUrl(),
   ): string {
-    const lockSubject = subject.startsWith(COUNT_STORED_PREFIX)
-      ? COUNT_DAILY_SUBJECT
-      : subject;
+    let lockSubject = subject;
+    if (subject.startsWith(COUNT_STORED_PREFIX))
+      lockSubject = COUNT_DAILY_SUBJECT;
+    if (isExpenseSubject(subject)) lockSubject = EXPENSE_NEW_SUBJECT;
     return entryStorageKey(lockSubject, userId, projectUrl);
   }
 
@@ -1542,25 +1551,37 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     readTarget: string | undefined,
     ownerId: string | undefined,
   ): HeldWriteRecord | null {
-    for (const key of safeListKeys(
-      postedSubjectPrefix(subject, userId),
-      true,
-    )) {
+    const expense = isExpenseSubject(subject);
+    const scope = userStoragePrefix(userId, getProjectUrl());
+    const add = encodeURIComponent(EXPENSE_NEW_SUBJECT);
+    const voidPrefix = encodeURIComponent(EXPENSE_VOID_PREFIX);
+    const keys = expense
+      ? safeListKeys(scope, true).filter((key) => {
+          const suffix = key.slice(scope.length);
+          return (
+            suffix === add ||
+            suffix.startsWith(voidPrefix) ||
+            suffix.startsWith(`${POSTED_SEGMENT}${add}:`) ||
+            suffix.startsWith(`${POSTED_SEGMENT}${voidPrefix}`)
+          );
+        })
+      : safeListKeys(postedSubjectPrefix(subject, userId), true);
+    for (const key of keys) {
       const record = readDurableRecord(key);
       if (
         !record ||
-        record.subject !== subject ||
+        (expense
+          ? !isExpenseSubject(record.subject)
+          : record.subject !== subject) ||
         record.phase !== 'posted_reload' ||
-        (ownerId !== undefined && record.postedBy === ownerId)
+        (!expense && ownerId !== undefined && record.postedBy === ownerId)
       ) {
         continue;
       }
       if (
         readTarget === undefined ||
         readTarget === '*' ||
-        record.readTarget === undefined ||
-        record.readTarget === '*' ||
-        record.readTarget === readTarget
+        matchesPostedTarget(record, readTarget)
       ) {
         return record;
       }
@@ -1731,6 +1752,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     requestId: string,
     opts?: {
       payload?: T;
+      /** Expense month derived under lock from the payload that will be sent. */
+      readTarget?: (payload: T) => string | undefined;
       awaitingReviewReload?: boolean;
       session?: WriteSession | null;
       checkConflict?: () => HeldWriteRecord | null;
@@ -1828,7 +1851,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         };
       }
       try {
-        const posted = readPostedCopy(stored, userId);
+        const posted =
+          readPostedCopy(stored, userId) ??
+          (isExpenseSubject(subject)
+            ? readBlockingPostedCopy(
+                subject,
+                userId,
+                opts?.readTarget?.(opts.payload ?? (stored.payload as T)),
+                undefined,
+              )
+            : null);
         if (posted) {
           observePostedCopy(posted);
           emit();
@@ -2254,6 +2286,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     phase: HeldWritePhase,
     phaseOptions?: {
       readTarget?: string;
+      payload?: unknown;
       expected?: HeldWriteRecord;
       session?: WriteSession | null;
     },
@@ -2349,10 +2382,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const preserved = preservePayloadIdentity(subject, stored);
     const next: HeldWriteRecord = {
       ...preserved,
-      payload: phase === 'posted_reload' ? null : preserved.payload,
       phase,
     };
     if (phase === 'posted_reload') {
+      next.payload = null;
       if (stored.claimId !== undefined && claimSessions.has(stored.claimId)) {
         if (postedOwner?.generation !== sessionGeneration) {
           postedOwner = {
@@ -2364,6 +2397,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       }
       if (phaseOptions?.readTarget) next.readTarget = phaseOptions.readTarget;
     } else {
+      if (phaseOptions?.payload !== undefined)
+        next.payload = phaseOptions.payload;
       delete next.readTarget;
       delete next.postedBy;
     }

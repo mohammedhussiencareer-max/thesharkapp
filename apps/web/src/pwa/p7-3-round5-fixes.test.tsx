@@ -633,8 +633,10 @@ describe('P7-3 round-5 review fixes', () => {
 
   it('R5-5: second expense claim hitting busy guard cleans up its fresh inflight pin instead of stranding the page', async () => {
     let releaseVoidLockGate!: () => void;
-    const mockLocks = installMockLocks(async (name) => {
-      if (name.includes(encodeURIComponent('expense:void:exp-1'))) {
+    let pauseNextLock = false;
+    const mockLocks = installMockLocks(async () => {
+      if (pauseNextLock) {
+        pauseNextLock = false;
         await new Promise<void>((resolve) => {
           releaseVoidLockGate = resolve;
         });
@@ -643,17 +645,22 @@ describe('P7-3 round-5 review fixes', () => {
     try {
       const currentMonth = cairoMonthInput();
       const currentMonthStart = `${currentMonth}-01`;
-      vi.mocked(loadExpenseMonth).mockResolvedValue({
+      const loadedMonth = {
         monthStart: currentMonthStart,
         categories: [
-          { id: 'cat-1', name: 'إيجار', kind: 'fixed_monthly', active: true },
+          {
+            id: 'cat-1',
+            name: 'إيجار',
+            kind: 'fixed_monthly' as const,
+            active: true,
+          },
         ],
         entries: [
           {
             id: 'exp-1',
             categoryId: 'cat-1',
             categoryName: 'إيجار',
-            categoryKind: 'fixed_monthly',
+            categoryKind: 'fixed_monthly' as const,
             amount: '500.00',
             periodMonth: currentMonthStart,
             expenseDate: null,
@@ -672,15 +679,9 @@ describe('P7-3 round-5 review fixes', () => {
         days: [],
         complete: false,
         confirmedAt: null,
-      });
-
-      let resolveAdd!: () => void;
-      vi.mocked(addExpenseEntry).mockImplementation(
-        () =>
-          new Promise<void>((resolve) => {
-            resolveAdd = resolve;
-          }),
-      );
+      };
+      vi.mocked(loadExpenseMonth).mockResolvedValue(loadedMonth);
+      vi.mocked(addExpenseEntry).mockResolvedValue(undefined);
       vi.mocked(voidExpenseEntry).mockResolvedValue(undefined);
 
       render(
@@ -689,17 +690,7 @@ describe('P7-3 round-5 review fixes', () => {
         </MemoryRouter>,
       );
 
-      // Prepare void on exp-1
-      fireEvent.click(
-        await screen.findByRole('button', { name: 'إلغاء المصروف' }),
-      );
-      fireEvent.change(screen.getByLabelText('سبب الإلغاء'), {
-        target: { value: 'مكرر' },
-      });
-      // Click confirm void -> pauses waiting for expense:void:exp-1 lock
-      fireEvent.click(screen.getByRole('button', { name: 'تأكيد الإلغاء' }));
-
-      // Meanwhile, submit a new expense -> acquires expense:new lock immediately and sets savingRef=true!
+      await screen.findByRole('button', { name: 'إلغاء المصروف' });
       fireEvent.change(screen.getByLabelText('التصنيف'), {
         target: { value: 'cat-1' },
       });
@@ -710,21 +701,48 @@ describe('P7-3 round-5 review fixes', () => {
 
       await waitFor(() => {
         expect(addExpenseEntry).toHaveBeenCalledTimes(1);
+        expect(screen.getByLabelText('مصاريف الشهر كاملة')).toBeEnabled();
       });
 
-      // Now let the void claim finish acquiring its lock -> it hits runWrite's busy guard!
+      fireEvent.click(screen.getByRole('button', { name: 'إلغاء المصروف' }));
+      fireEvent.change(screen.getByLabelText('سبب الإلغاء'), {
+        target: { value: 'مكرر' },
+      });
+      pauseNextLock = true;
+      fireEvent.click(screen.getByRole('button', { name: 'تأكيد الإلغاء' }));
+      expect(releaseVoidLockGate).toBeDefined();
+
+      // A month read starts while the void is waiting for the shared lock.
+      let finishRead!: () => void;
+      vi.mocked(loadExpenseMonth).mockImplementationOnce(
+        (monthStart) =>
+          new Promise((resolve) => {
+            finishRead = () =>
+              resolve({ ...loadedMonth, monthStart, entries: [] });
+          }),
+      );
+      fireEvent.change(screen.getByLabelText('الشهر'), {
+        target: { value: currentMonth === '2030-04' ? '2030-05' : '2030-04' },
+      });
+      await waitFor(() => expect(finishRead).toBeDefined());
+      const storeWrite = vi.spyOn(Storage.prototype, 'setItem');
       await act(async () => {
         releaseVoidLockGate();
         await Promise.resolve();
       });
 
       // The undispatched fresh void claim MUST be cleaned up, NOT stranded as inflight!
+      expect(storeWrite).toHaveBeenCalledWith(
+        expect.stringContaining(encodeURIComponent('expense:void:exp-1')),
+        expect.stringContaining('"phase":"inflight"'),
+      );
+      storeWrite.mockRestore();
       expect(voidExpenseEntry).not.toHaveBeenCalled();
       expect(getHeldWrite('expense:void:exp-1')).toBeNull();
 
-      // Finish the first expense; page must become unlocked again.
+      // The page unlocks once the month read finishes.
       await act(async () => {
-        resolveAdd();
+        finishRead();
         await Promise.resolve();
       });
       await waitFor(() => {

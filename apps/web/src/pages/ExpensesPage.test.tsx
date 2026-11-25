@@ -11,8 +11,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   addExpenseCategory,
   addExpenseEntry,
-  hasExpenseRequest,
   loadExpenseMonth,
+  loadExpenseRequestMonth,
   renameExpenseCategory,
   setExpenseCategoryActive,
   setMonthExpenseComplete,
@@ -38,7 +38,7 @@ import { ExpensesPage } from '@/pages/ExpensesPage';
 vi.mock('@/expenses/api', () => ({
   loadExpenseMonth: vi.fn(),
   addExpenseEntry: vi.fn(),
-  hasExpenseRequest: vi.fn(),
+  loadExpenseRequestMonth: vi.fn(),
   voidExpenseEntry: vi.fn(),
   addExpenseCategory: vi.fn(),
   renameExpenseCategory: vi.fn(),
@@ -130,7 +130,8 @@ describe('ExpensesPage', () => {
       Promise.resolve(monthData(monthStart)),
     );
     vi.mocked(addExpenseEntry).mockResolvedValue(undefined);
-    vi.mocked(hasExpenseRequest).mockResolvedValue(false);
+    vi.mocked(loadExpenseRequestMonth).mockReset();
+    vi.mocked(loadExpenseRequestMonth).mockResolvedValue(null);
     vi.mocked(voidExpenseEntry).mockResolvedValue(undefined);
     vi.mocked(setMonthExpenseComplete).mockResolvedValue(undefined);
     vi.mocked(addExpenseCategory).mockResolvedValue(undefined);
@@ -1306,6 +1307,107 @@ describe('ExpensesPage', () => {
       getHeldWrite('expense:new') !== null || hasPostedReload('expense:new'),
     ).toBe(true);
   });
+
+  it.each([
+    ['add', '2030-05-01'],
+    ['void', '2030-05-01'],
+    ['add', null],
+    ['void', null],
+  ])(
+    'verifies a mismatched expense %s in its stored month (%s)',
+    async (operation, storedMonth) => {
+      const subject =
+        operation === 'add' ? 'expense:new' : 'expense:void:entry-1';
+      const mismatch = new Error('request_id mismatch', {
+        cause: {
+          code: '22023',
+          message: 'request_id already used for a different expense',
+        },
+      });
+      if (storedMonth) {
+        vi.mocked(loadExpenseRequestMonth).mockResolvedValueOnce(storedMonth);
+      } else {
+        vi.mocked(loadExpenseRequestMonth).mockRejectedValueOnce(
+          new Error('lookup failed'),
+        );
+      }
+      renderPage();
+      await screen.findByText('إيجار الاختبار');
+      fireEvent.change(screen.getByLabelText('الشهر'), {
+        target: { value: '2030-04' },
+      });
+      await waitFor(() =>
+        expect(loadExpenseMonth).toHaveBeenCalledWith('2030-04-01'),
+      );
+      await waitFor(() =>
+        expect(
+          screen.getByRole('button', { name: 'إلغاء المصروف' }),
+        ).toBeEnabled(),
+      );
+      vi.mocked(loadExpenseMonth).mockClear();
+
+      let requestId: string | undefined;
+      if (operation === 'add') {
+        vi.mocked(addExpenseEntry).mockRejectedValueOnce(mismatch);
+        await act(async () => saveRent());
+        requestId = vi.mocked(addExpenseEntry).mock.lastCall?.[0].requestId;
+      } else {
+        vi.mocked(voidExpenseEntry).mockRejectedValueOnce(mismatch);
+        fireEvent.click(screen.getByRole('button', { name: 'إلغاء المصروف' }));
+        fireEvent.change(screen.getByLabelText('سبب الإلغاء'), {
+          target: { value: 'تكرار' },
+        });
+        await act(async () => {
+          fireEvent.click(
+            screen.getByRole('button', { name: 'تأكيد الإلغاء' }),
+          );
+          await Promise.resolve();
+        });
+        requestId = vi.mocked(voidExpenseEntry).mock.lastCall?.[2];
+      }
+      expect(requestId).toBeDefined();
+      expect(hasPostedReload(subject, '2030-04-01', requestId)).toBe(false);
+      expect(loadExpenseRequestMonth).toHaveBeenCalledWith(requestId);
+      if (!storedMonth) {
+        expect(getHeldWrite(subject)).toMatchObject({
+          phase: 'unknown',
+          requestId,
+        });
+        expect(loadExpenseMonth).not.toHaveBeenCalled();
+        if (operation === 'void') {
+          vi.mocked(loadExpenseMonth).mockImplementation((month) =>
+            Promise.resolve(
+              monthData(month, {
+                entries: [entry({ voided: month === '2030-04-01' })],
+              }),
+            ),
+          );
+          const picker = screen.getByLabelText('الشهر');
+          await act(async () => {
+            fireEvent.change(picker, { target: { value: '2030-05' } });
+            await Promise.resolve();
+          });
+          await act(async () => {
+            fireEvent.change(picker, { target: { value: '2030-04' } });
+            await Promise.resolve();
+          });
+          expect(loadExpenseMonth).toHaveBeenLastCalledWith('2030-04-01');
+          expect(getHeldWrite(subject)).toMatchObject({
+            phase: 'unknown',
+            requestId,
+          });
+        }
+        return;
+      }
+      expect(hasPostedReload(subject, storedMonth, requestId)).toBe(true);
+      expect(loadExpenseMonth).not.toHaveBeenCalled();
+      fireEvent.click(await screen.findByRole('button', { name: 'تحقق تاني' }));
+      await waitFor(() => {
+        expect(hasPostedReload(subject, storedMonth, requestId)).toBe(false);
+      });
+      expect(loadExpenseMonth).toHaveBeenCalledExactlyOnceWith(storedMonth);
+    },
+  );
 
   it('P2 item 1c: definitive refusal of an unknown expense mints a new request id for the next submit', async () => {
     vi.mocked(addExpenseEntry)

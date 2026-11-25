@@ -39,6 +39,7 @@ import { unknownSaveMessage } from '@/items/request-id';
 import {
   claimFreshHeldWrite,
   clearHeldWrite,
+  hasPostedReload,
   rehydrateHeldWrites,
   rehydrateHeldWritesAsync,
   resetHeldWritesStore,
@@ -64,6 +65,7 @@ import { OpeningPage } from '@/pages/OpeningPage';
 import { PurchasesPage } from '@/pages/PurchasesPage';
 import { SortingPage } from '@/pages/SortingPage';
 import {
+  getPurchaseById,
   listPurchases,
   listStockChoices,
   listUnitsAt,
@@ -85,6 +87,7 @@ vi.mock('@/counts/api', () => ({
 }));
 
 vi.mock('@/purchases/api', () => ({
+  getPurchaseById: vi.fn(),
   listStockChoices: vi.fn(),
   listPurchases: vi.fn(),
   recordPurchase: vi.fn(),
@@ -525,6 +528,15 @@ describe('held writes and offline behavior across writers', () => {
 
   it('reload restores purchase payload', async () => {
     vi.mocked(recordPurchase).mockRejectedValueOnce(new Error('socket'));
+    vi.mocked(getPurchaseById).mockResolvedValueOnce({
+      id: 'purchase-verified',
+      purchasedAt: '2030-04-01T08:00:00Z',
+      supplier: 'مورد تجريبي',
+      invoiceNo: null,
+      note: null,
+      totalPaid: '75',
+      lines: [],
+    });
     const view = render(
       <MemoryRouter>
         <PurchasesPage />
@@ -566,6 +578,12 @@ describe('held writes and offline behavior across writers', () => {
       expect(recordPurchase).toHaveBeenCalledTimes(2);
     });
     expect(vi.mocked(recordPurchase).mock.calls[1]?.[0]).toEqual(first);
+    await waitFor(() => {
+      expect(hasPostedReload('purchase:new')).toBe(false);
+    });
+    expect(getPurchaseById).toHaveBeenCalledWith({
+      requestId: first?.requestId,
+    });
   });
 
   it('reload restores opening stock payload', async () => {
@@ -1039,94 +1057,97 @@ describe('held writes and offline behavior across writers', () => {
     }
   });
 
-  it('P2 item 6b: clicking update after a prior deferred reload activates a newer waiting worker instead of reloading without SKIP_WAITING', async () => {
-    const controllerListeners: Array<() => void> = [];
-    const originalSw = Object.getOwnPropertyDescriptor(
-      navigator,
-      'serviceWorker',
-    );
-    Object.defineProperty(navigator, 'serviceWorker', {
-      configurable: true,
-      value: {
-        controller: {},
-        register: vi.fn(() =>
-          Promise.resolve({
-            active: { state: 'activated' },
-            waiting: null,
-            installing: null,
-            addEventListener: vi.fn(),
-          }),
-        ),
-        addEventListener: (event: string, cb: () => void) => {
-          if (event === 'controllerchange') controllerListeners.push(cb);
-        },
-      },
-    });
-    try {
-      resetPwaState();
-      vi.stubEnv('PROD', true);
-      const reload = vi.fn();
-      const { initPwa } = await import('@/lib/pwa');
-      initPwa(reload);
-      setPwaAuthResolved(true);
-
-      // Worker 1 activates while a pin blocks reload -> reloadDeferred becomes true.
-      const w1Listeners: Array<() => void> = [];
-      const w1 = {
-        state: 'installed',
-        postMessage: vi.fn(),
-        addEventListener: (event: string, cb: () => void) => {
-          if (event === 'statechange') w1Listeners.push(cb);
-        },
-        removeEventListener: vi.fn(),
+  it.each([true, false])(
+    'P2 item 6b: approves the newer worker before reloading (statechange delivered: %s)',
+    async (stateChangeDelivered) => {
+      const controllerListeners: Array<() => void> = [];
+      const originalSw = Object.getOwnPropertyDescriptor(
+        navigator,
+        'serviceWorker',
+      );
+      const registration = {
+        active: { state: 'activated' },
+        waiting: null as ServiceWorker | null,
+        installing: null,
+        addEventListener: vi.fn(),
       };
-      setTestWaitingWorker(w1 as unknown as ServiceWorker);
-      expect(applyPwaUpdate(reload)).toBe(true);
-      expect(w1.postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
-
-      const pin = await claimFreshHeldWrite('count:daily', (requestId) => ({
-        requestId,
-      }));
-      if (!pin.ok) throw new Error('expected pin');
-      w1.state = 'activated';
-      for (const cb of w1Listeners) cb();
-      for (const cb of controllerListeners) cb();
-      expect(reload).not.toHaveBeenCalled();
-
-      clearHeldWrite('count:daily', pin.record.requestId);
-      pin.release();
-
-      // A newer waiting worker w2 arrives before the user clicks again.
-      const w2Listeners: Array<() => void> = [];
-      const w2 = {
-        state: 'installed',
-        postMessage: vi.fn(),
-        addEventListener: (event: string, cb: () => void) => {
-          if (event === 'statechange') w2Listeners.push(cb);
+      Object.defineProperty(navigator, 'serviceWorker', {
+        configurable: true,
+        value: {
+          controller: {},
+          register: vi.fn(() => Promise.resolve(registration)),
+          addEventListener: (event: string, cb: () => void) => {
+            if (event === 'controllerchange') controllerListeners.push(cb);
+          },
         },
-        removeEventListener: vi.fn(),
-      };
-      setTestWaitingWorker(w2 as unknown as ServiceWorker);
+      });
+      try {
+        resetPwaState();
+        vi.stubEnv('PROD', true);
+        const reload = vi.fn();
+        const { initPwa } = await import('@/lib/pwa');
+        initPwa(reload);
+        setPwaAuthResolved(true);
 
-      // Clicking update MUST activate w2 (send SKIP_WAITING) and NOT reload before w2 activates.
-      expect(applyPwaUpdate(reload)).toBe(true);
-      expect(w2.postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
-      expect(reload).not.toHaveBeenCalled();
+        // Worker 1 activates while a pin blocks reload -> reloadDeferred becomes true.
+        const w1Listeners: Array<() => void> = [];
+        const w1 = {
+          state: 'installed',
+          postMessage: vi.fn(),
+          addEventListener: (event: string, cb: () => void) => {
+            if (event === 'statechange') w1Listeners.push(cb);
+          },
+          removeEventListener: vi.fn(),
+        };
+        setTestWaitingWorker(w1 as unknown as ServiceWorker);
+        expect(applyPwaUpdate(reload)).toBe(true);
+        expect(w1.postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
 
-      // Once w2 activates, reload completes.
-      w2.state = 'activated';
-      for (const cb of w2Listeners) cb();
-      expect(reload).toHaveBeenCalledTimes(1);
-    } finally {
-      resetPwaState();
-      vi.unstubAllEnvs();
-      if (originalSw) {
-        Object.defineProperty(navigator, 'serviceWorker', originalSw);
-      } else {
-        delete (navigator as { serviceWorker?: unknown }).serviceWorker;
+        const pin = await claimFreshHeldWrite('count:daily', (requestId) => ({
+          requestId,
+        }));
+        if (!pin.ok) throw new Error('expected pin');
+        w1.state = 'activated';
+        for (const cb of w1Listeners) cb();
+        for (const cb of controllerListeners) cb();
+        expect(reload).not.toHaveBeenCalled();
+
+        clearHeldWrite('count:daily', pin.record.requestId);
+        pin.release();
+
+        // A newer waiting worker w2 arrives before the user clicks again.
+        const w2Listeners: Array<() => void> = [];
+        const w2 = {
+          state: 'installed',
+          postMessage: vi.fn(),
+          addEventListener: (event: string, cb: () => void) => {
+            if (event === 'statechange') w2Listeners.push(cb);
+          },
+          removeEventListener: vi.fn(),
+        };
+        registration.waiting = w2 as unknown as ServiceWorker;
+        if (stateChangeDelivered) setTestWaitingWorker(registration.waiting);
+
+        // Clicking update MUST activate w2 (send SKIP_WAITING) and NOT reload before w2 activates.
+        expect(applyPwaUpdate(reload)).toBe(true);
+        expect(w2.postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
+        expect(reload).not.toHaveBeenCalled();
+
+        // Once w2 activates, reload completes.
+        w2.state = 'activated';
+        for (const cb of w2Listeners) cb();
+        expect(reload).toHaveBeenCalledTimes(1);
+      } finally {
+        resetPwaState();
+        vi.unstubAllEnvs();
+        if (originalSw) {
+          Object.defineProperty(navigator, 'serviceWorker', originalSw);
+        } else {
+          delete (navigator as { serviceWorker?: unknown }).serviceWorker;
+        }
       }
-    }
-  });
+    },
+  );
 
   it('P2 item 6c: first install with no active worker and no controller does not flag a waiting update or post SKIP_WAITING', async () => {
     const originalSw = Object.getOwnPropertyDescriptor(
@@ -1186,6 +1207,8 @@ describe('held writes and offline behavior across writers', () => {
       for (const cb of installingStateListeners) cb();
 
       expect(getPwaUpdateSnapshot().waiting).toBe(false);
+      expect(applyPwaUpdate(reload)).toBe(false);
+      expect(installingWorker.postMessage).not.toHaveBeenCalled();
 
       // First-install worker proceeds to activate automatically.
       registration.waiting = null;

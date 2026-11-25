@@ -2035,6 +2035,142 @@ describe('held-writes store', () => {
     }
   });
 
+  it.each([
+    ['expense:new', 'expense:void:entry-1', '2030-04-01'],
+    ['expense:void:entry-1', 'expense:new', '2030-04-01'],
+    ['expense:void:entry-1', 'expense:void:entry-2', undefined],
+  ])(
+    'shares the expense lock and checks posted pins from %s before claiming %s (target %s)',
+    async (postedSubject, nextSubject, postedMonth) => {
+      const { client } = makeAuditedLocks();
+      const tab1 = createHeldWriteStore({ getLocks: () => client('tab-1') });
+      const tab2 = createHeldWriteStore({ getLocks: () => client('tab-2') });
+      const create = (requestId: string) => ({ requestId });
+      try {
+        const first = await tab1.claimFreshHeldWrite(postedSubject, create);
+        expect(first.ok).toBe(true);
+        if (!first.ok) return;
+        const next = { readTarget: '2030-04-01' };
+        const inFlight = await tab2.claimFreshHeldWrite(
+          nextSubject,
+          create,
+          next,
+        );
+        if (inFlight.ok) {
+          tab2.clearHeldWrite(nextSubject, inFlight.record.requestId);
+          inFlight.release();
+        }
+        tab1.setHeldWritePhase(
+          postedSubject,
+          first.record.requestId,
+          'posted_reload',
+          {
+            readTarget: postedMonth,
+          },
+        );
+        first.release();
+        await Promise.resolve();
+
+        expect(
+          await tab2.claimFreshHeldWrite(nextSubject, create, next),
+        ).toMatchObject({
+          ok: false,
+          reason: 'conflict',
+          existing: {
+            subject: postedSubject,
+            requestId: first.record.requestId,
+          },
+        });
+        expect(inFlight).toMatchObject({ ok: false, reason: 'locked' });
+
+        const other = await tab2.claimFreshHeldWrite(nextSubject, create, {
+          readTarget: '2030-05-01',
+        });
+        expect(other.ok).toBe(postedMonth !== undefined);
+        if (other.ok) {
+          tab2.clearHeldWrite(nextSubject, other.record.requestId);
+          other.release();
+          await Promise.resolve();
+        }
+
+        expect(
+          await tab2.claimFreshHeldWrite(nextSubject, create),
+        ).toMatchObject({
+          ok: false,
+          reason: 'conflict',
+          existing: {
+            subject: postedSubject,
+            requestId: first.record.requestId,
+          },
+        });
+      } finally {
+        tab1.dispose();
+        tab2.dispose();
+      }
+    },
+  );
+
+  it('rechecks other expense pins using the durable replay payload month', async () => {
+    const { client } = makeAuditedLocks();
+    const tab1 = createHeldWriteStore({ getLocks: () => client('tab-1') });
+    const tab2 = createHeldWriteStore({ getLocks: () => client('tab-2') });
+    try {
+      const subject = 'expense:void:entry-1';
+      const held = await tab2.claimFreshHeldWrite(subject, () => ({
+        targetMonth: '2030-04-01',
+      }));
+      expect(held.ok).toBe(true);
+      if (!held.ok) return;
+      tab2.setHeldWritePhase(subject, held.record.requestId, 'unknown');
+      held.release();
+      await Promise.resolve();
+
+      const add = await tab1.claimFreshHeldWrite('expense:new', () => ({}));
+      expect(add.ok).toBe(true);
+      if (!add.ok) return;
+      tab1.setHeldWritePhase(
+        'expense:new',
+        add.record.requestId,
+        'posted_reload',
+        {
+          readTarget: '2030-04-01',
+        },
+      );
+      add.release();
+      await Promise.resolve();
+
+      const opts = {
+        readTarget: (payload: { targetMonth: string }) => payload.targetMonth,
+      };
+      expect(
+        await tab2.claimReplayHeldWrite(subject, held.record.requestId, opts),
+      ).toMatchObject({
+        ok: false,
+        reason: 'conflict',
+        existing: { subject: 'expense:new', requestId: add.record.requestId },
+      });
+      expect(tab2.getHeldWrite(subject)).toMatchObject({
+        phase: 'unknown',
+        requestId: held.record.requestId,
+      });
+      await tab1.clearPostedReload(
+        'expense:new',
+        '2030-04-01',
+        add.record.requestId,
+      );
+      const replay = await tab2.claimReplayHeldWrite(
+        subject,
+        held.record.requestId,
+        opts,
+      );
+      expect(replay.ok).toBe(true);
+      if (replay.ok) replay.release();
+    } finally {
+      tab1.dispose();
+      tab2.dispose();
+    }
+  });
+
   it('P2 item 2: stale tab claimFreshHeldWrite conflicts under lock when a posted_reload record awaits verification (month-scoped for expenses)', async () => {
     const { client } = makeAuditedLocks();
     const tab1 = createHeldWriteStore({ getLocks: () => client('tab-1') });

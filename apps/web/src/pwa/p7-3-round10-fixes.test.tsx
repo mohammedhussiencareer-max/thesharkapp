@@ -1003,15 +1003,11 @@ describe('P7-3 round-10 review fixes', () => {
       const draft = vi.mocked(addExpenseEntry).mock.calls[0]?.[0];
       if (!draft) throw new Error('expected expense draft');
 
-      const voidClaim = await other.claimFreshHeldWrite(
-        otherSubject,
-        () => ({ id: 'synthetic-void' }),
-        { requestId: otherId },
-      );
-      if (!voidClaim.ok)
-        throw new Error('expected the second tab to hold the void lock');
-      releaseOther = voidClaim.release;
-      other.setHeldWritePhase(otherSubject, otherId, 'posted_reload', {
+      // An older app could post the void while the add was in flight.
+      other.putHeldWrite(otherSubject, {
+        requestId: otherId,
+        payload: null,
+        phase: 'posted_reload',
         readTarget: month,
       });
       vi.mocked(loadExpenseMonth).mockImplementationOnce(
@@ -1025,6 +1021,10 @@ describe('P7-3 round-10 review fixes', () => {
         await Promise.resolve();
       });
       await waitFor(() => expect(settleRead).toBeDefined());
+      const cleanupLock = await other.acquireHeldWriteLock(otherSubject);
+      if (!cleanupLock.acquired)
+        throw new Error('expected the second tab to hold the expense lock');
+      releaseOther = cleanupLock.release;
 
       const bothPins = [
         ...other.snapshotPostedReloads({ subject: 'expense:new' }),
