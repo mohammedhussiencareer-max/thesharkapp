@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   activateInventory,
   loadOpeningReview,
+  loadOrderWorkState,
   loadProcessingSummary,
   recordRunFailure,
   retryParkedOrder,
@@ -96,6 +97,7 @@ import { itemA, stockChoice, wasteResult } from '@/waste/test-fixtures';
 vi.mock('@/accounting/api', () => ({
   loadOpeningReview: vi.fn(),
   activateInventory: vi.fn(),
+  loadOrderWorkState: vi.fn(),
   loadProcessingSummary: vi.fn(),
   runDeductions: vi.fn(),
   recordRunFailure: vi.fn(),
@@ -1005,6 +1007,11 @@ describe('mechanical lock-nesting audit', () => {
 
     // ProcessingPanel: run & parked-order retry clearing sibling pins on reload
     const siblingRetry = accountingRetrySubject('order-sibling');
+    vi.mocked(loadOrderWorkState).mockResolvedValue({
+      orderId: 'order-parked-1',
+      workGeneration: 1,
+      failedAt: '2026-02-01T00:00:00.000Z',
+    });
     vi.mocked(loadProcessingSummary).mockResolvedValue(processingSummary);
     vi.mocked(runDeductions)
       .mockResolvedValueOnce({

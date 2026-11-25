@@ -2655,7 +2655,7 @@ isOneToOne: true
 { Args: { "p_cause": string,"p_movement_ids": (number)[] }; Returns: (number)[]
                            },
 "retry_accounting_work":
-{ Args: { "p_order_id": string,"p_work_generation"?: number }; Returns: Json
+{ Args: { "p_order_id": string }; Returns: Json
                            },
 "round_order_requirements":
 { Args: { "p_exact": Json }; Returns: Json

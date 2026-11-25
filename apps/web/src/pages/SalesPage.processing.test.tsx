@@ -8,6 +8,7 @@ import {
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  loadOrderWorkState,
   loadProcessingSummary,
   loadShiftStatuses,
   recordRunFailure,
@@ -41,6 +42,7 @@ vi.mock('@/sales/api', () => ({
 }));
 
 vi.mock('@/accounting/api', () => ({
+  loadOrderWorkState: vi.fn(),
   loadProcessingSummary: vi.fn(),
   loadShiftStatuses: vi.fn(),
   runDeductions: vi.fn(),
@@ -180,6 +182,12 @@ describe('SalesPage processing refresh', () => {
   beforeEach(() => {
     resetHeldWrites();
     vi.mocked(loadSalesHome).mockReset();
+    vi.mocked(loadOrderWorkState).mockReset();
+    vi.mocked(loadOrderWorkState).mockResolvedValue({
+      orderId: 'order-parked',
+      workGeneration: 2,
+      failedAt: '2026-02-01T00:00:00.000Z',
+    });
     vi.mocked(loadProcessingSummary).mockReset();
     vi.mocked(loadShiftStatuses).mockReset();
     vi.mocked(runDeductions).mockReset();
@@ -536,8 +544,8 @@ describe('SalesPage processing refresh', () => {
     expect(screen.queryByText('order-parked')).toBeNull();
     expect(screen.queryByRole('button', { name: 'إعادة المحاولة' })).toBeNull();
     expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
-    expect(retryParkedOrder).toHaveBeenNthCalledWith(1, 'order-parked', 2);
-    expect(retryParkedOrder).toHaveBeenNthCalledWith(2, 'order-parked', 2);
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(1, 'order-parked');
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(2, 'order-parked');
     expect(retryParkedOrder).toHaveBeenCalledTimes(2);
   });
 });

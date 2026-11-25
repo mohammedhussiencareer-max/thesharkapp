@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  loadOrderWorkState,
   loadProcessingSummary,
   recordRunFailure,
   retryParkedOrder,
   runDeductions,
+  type OrderWorkState,
+  type RetryOrderStatus,
 } from '@/accounting/api';
 import {
   formatCountPair,
@@ -345,10 +348,45 @@ export function ProcessingPanel({
     setRunning(true);
     setNotice(null);
     try {
-      let status: 'retried' | 'not_failed' | 'stale' | 'busy';
+      if (isReplay) {
+        // Client-side guard before replaying retry_accounting_work(p_order_id):
+        // the atomic server-side compare lands in the follow-up migration after PR 63.
+        let currentState: OrderWorkState | null;
+        try {
+          currentState = await loadOrderWorkState(action.orderId);
+        } catch (error) {
+          setHeldWritePhase(subject, action.requestId, 'unknown');
+          setNotice(messageFrom(error));
+          return;
+        }
+        const matchesStoredGeneration =
+          action.workGeneration !== undefined &&
+          currentState !== null &&
+          currentState.workGeneration === action.workGeneration;
+        if (!matchesStoredGeneration) {
+          settleAction(subject, action.requestId);
+          setNotice(
+            currentState !== null && currentState.failedAt !== null
+              ? staleRetryNotice
+              : notFailedNotice,
+          );
+          publishAcknowledged();
+          return;
+        }
+        if (!canDispatchAction(subject, action.requestId, session)) {
+          const missingPin = !hasDurableAction(subject, action.requestId);
+          if (!missingPin) {
+            setHeldWritePhase(subject, action.requestId, 'unknown');
+          }
+          if (!isOnline()) setNotice(offlineWriteMessage);
+          else if (missingPin) setNotice(storageWriteFailedMessage);
+          return;
+        }
+      }
+      let status: RetryOrderStatus;
       let persisted = false;
       try {
-        status = await retryParkedOrder(action.orderId, action.workGeneration);
+        status = await retryParkedOrder(action.orderId);
         if (status === 'busy') {
           if (isReplay) {
             setHeldWritePhase(subject, action.requestId, 'unknown');
@@ -371,13 +409,7 @@ export function ProcessingPanel({
         setNotice(messageFrom(error));
         return;
       }
-      setNotice(
-        status === 'not_failed'
-          ? notFailedNotice
-          : status === 'stale'
-            ? staleRetryNotice
-            : retriedNotice,
-      );
+      setNotice(status === 'not_failed' ? notFailedNotice : retriedNotice);
       publishAcknowledged();
     } finally {
       release();

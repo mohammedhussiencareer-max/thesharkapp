@@ -651,19 +651,52 @@ export function failureReportOf(value: unknown): FailureReport {
   return row.status as FailureReport;
 }
 
-export type RetryOrderStatus = 'retried' | 'not_failed' | 'stale' | 'busy';
+export type RetryOrderStatus = 'retried' | 'not_failed' | 'busy';
 
 export function retryResultOf(value: unknown): RetryOrderStatus {
   const row = record(value);
   if (
     row.status !== 'retried' &&
     row.status !== 'not_failed' &&
-    row.status !== 'stale' &&
     row.status !== 'busy'
   ) {
     bad();
   }
   return row.status;
+}
+
+export type OrderWorkState = {
+  orderId: string;
+  workGeneration: number;
+  failedAt: string | null;
+};
+
+export async function loadOrderWorkState(
+  orderId: string,
+): Promise<OrderWorkState | null> {
+  const { data, error } = await appDb()
+    .from('accounting_work_state')
+    .select('order_id, work_generation, failed_at')
+    .eq('order_id', orderId)
+    .maybeSingle();
+  if (error) throw readError(error);
+  if (data === null) return null;
+  const row = record(data);
+  const generation = row.work_generation;
+  if (
+    typeof row.order_id !== 'string' ||
+    row.order_id.length === 0 ||
+    typeof generation !== 'number' ||
+    !Number.isInteger(generation) ||
+    generation < 0
+  ) {
+    bad();
+  }
+  return {
+    orderId: row.order_id,
+    workGeneration: generation,
+    failedAt: looseText(row.failed_at),
+  };
 }
 
 export async function loadProcessingSummary(): Promise<ProcessingSummary> {
@@ -896,14 +929,8 @@ export async function activateInventory(
 
 export async function retryParkedOrder(
   orderId: string,
-  workGeneration?: number,
 ): Promise<RetryOrderStatus> {
   return retryResultOf(
-    await writeRpc('retry_accounting_work', {
-      p_order_id: orderId,
-      ...(workGeneration !== undefined
-        ? { p_work_generation: workGeneration }
-        : {}),
-    }),
+    await writeRpc('retry_accounting_work', { p_order_id: orderId }),
   );
 }

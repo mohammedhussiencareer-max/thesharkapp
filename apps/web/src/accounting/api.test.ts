@@ -3,6 +3,7 @@ import {
   accountingRunOf,
   countDerivationOf,
   loadOpeningReview,
+  loadOrderWorkState,
   loadProcessingSummary,
   loadShiftStatuses,
   nextWorkOf,
@@ -16,10 +17,21 @@ import {
 import { ownerReadMessage } from '@/accounting/errors';
 import { genericCatalogError } from '@/items/errors';
 
-const mocks = vi.hoisted(() => ({ rpc: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  rpc: vi.fn(),
+  maybeSingle: vi.fn(),
+  eq: vi.fn(),
+  select: vi.fn(),
+  from: vi.fn(),
+}));
 
 vi.mock('@/lib/supabase', () => ({
-  supabase: { schema: () => ({ rpc: mocks.rpc }) },
+  supabase: {
+    schema: () => ({
+      rpc: mocks.rpc,
+      from: mocks.from,
+    }),
+  },
 }));
 
 const itemA = 'a7800000-0000-4000-8000-0000000000a1';
@@ -58,6 +70,13 @@ function emptyRun(status: string) {
 describe('accounting mappers', () => {
   beforeEach(() => {
     mocks.rpc.mockReset();
+    mocks.maybeSingle.mockReset();
+    mocks.eq.mockReset();
+    mocks.select.mockReset();
+    mocks.from.mockReset();
+    mocks.eq.mockReturnValue({ maybeSingle: mocks.maybeSingle });
+    mocks.select.mockReturnValue({ eq: mocks.eq });
+    mocks.from.mockReturnValue({ select: mocks.select });
   });
 
   it('rejects a reason outside the allow-list', () => {
@@ -592,21 +611,46 @@ describe('accounting mappers', () => {
     );
   });
 
-  it('retries a parked order through the worker RPC', async () => {
+  it('retries a parked order through the worker RPC without sending p_work_generation', async () => {
     mocks.rpc.mockResolvedValue(ok({ status: 'not_failed' }));
-    await expect(retryParkedOrder('order-1')).resolves.toBe('not_failed');
+    await expect(
+      (
+        retryParkedOrder as unknown as (
+          orderId: string,
+          extra?: number,
+        ) => Promise<string>
+      )('order-1', 2),
+    ).resolves.toBe('not_failed');
     expect(mocks.rpc).toHaveBeenCalledWith('retry_accounting_work', {
       p_order_id: 'order-1',
     });
+    const payload = mocks.rpc.mock.calls[0]?.[1] as
+      Record<string, unknown> | undefined;
+    expect(payload).toEqual({ p_order_id: 'order-1' });
+    expect('p_work_generation' in (payload ?? {})).toBe(false);
   });
 
-  it('P2: retryParkedOrder sends p_work_generation and accepts stale status', async () => {
-    mocks.rpc.mockResolvedValueOnce(ok({ status: 'stale' }));
-    await expect(retryParkedOrder('order-1', 2)).resolves.toBe('stale');
-    expect(mocks.rpc).toHaveBeenCalledWith('retry_accounting_work', {
-      p_order_id: 'order-1',
-      p_work_generation: 2,
+  it('loads an order current work state from accounting_work_state', async () => {
+    mocks.maybeSingle.mockResolvedValueOnce(
+      ok({
+        order_id: 'order-1',
+        work_generation: 3,
+        failed_at: '2026-02-02T00:00:00.000Z',
+      }),
+    );
+    await expect(loadOrderWorkState('order-1')).resolves.toEqual({
+      orderId: 'order-1',
+      workGeneration: 3,
+      failedAt: '2026-02-02T00:00:00.000Z',
     });
+    expect(mocks.from).toHaveBeenCalledWith('accounting_work_state');
+    expect(mocks.select).toHaveBeenCalledWith(
+      'order_id, work_generation, failed_at',
+    );
+    expect(mocks.eq).toHaveBeenCalledWith('order_id', 'order-1');
+
+    mocks.maybeSingle.mockResolvedValueOnce(ok(null));
+    await expect(loadOrderWorkState('order-missing')).resolves.toBeNull();
   });
 
   it('P1-3: recordRunFailure reconciles an interrupted attempt with null failureKind via record_accounting_call_failure instead of throwing', async () => {

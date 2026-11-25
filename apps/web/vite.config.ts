@@ -63,6 +63,11 @@ export const pwaOptions: Partial<VitePWAOptions> = {
           url.pathname.startsWith('/storage/') ||
           url.pathname.startsWith('/functions/'),
         handler: 'NetworkOnly',
+        options: {
+          fetchOptions: {
+            cache: 'no-store',
+          } as RequestInit,
+        },
       },
     ],
   },

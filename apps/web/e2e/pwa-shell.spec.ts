@@ -1,3 +1,5 @@
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { expect, test } from './fixtures';
 import { assertLocalSupabaseUrl } from './local-guard';
 
@@ -69,53 +71,78 @@ test('serves Arabic RTL manifest, registers shell-only service worker, and keeps
     ),
   ).toBe(false);
 
-  // Intercept the loopback Supabase REST path at the browser context level
-  // (covering service-worker-owned requests too) and prove it succeeds online,
-  // is NOT cached by the service worker, and FAILS offline while the cached
-  // app shell still loads.
-  const restProbeUrl = new URL(
-    '/rest/v1/pwa_network_only_probe',
-    supabaseUrl,
-  ).toString();
+  // Serve a real loopback cacheable API response WITHOUT Playwright context
+  // routing (which disables Chromium's HTTP cache and would mask HTTP caching).
+  // Prove that consecutive online reads bypass the browser HTTP cache (hitting
+  // the loopback server twice), are NOT stored in Cache Storage, and FAIL
+  // offline while the cached app shell still loads.
   let networkHits = 0;
-  await context.route(restProbeUrl, async (route) => {
-    networkHits += 1;
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      headers: {
+  const probeServer = createServer((req, res) => {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
         'access-control-allow-origin': '*',
-        'cache-control': 'public, max-age=3600',
-      },
-      body: JSON.stringify({ ok: true }),
+        'access-control-allow-methods': 'GET, OPTIONS',
+        'access-control-allow-headers': '*',
+      });
+      res.end();
+      return;
+    }
+    networkHits += 1;
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'access-control-allow-origin': '*',
+      'cache-control': 'public, max-age=3600',
     });
+    res.end(JSON.stringify({ ok: true, hit: networkHits }));
   });
+  await new Promise<void>((resolve) => {
+    probeServer.listen(0, '127.0.0.1', () => resolve());
+  });
+  const address = probeServer.address() as AddressInfo;
+  const restProbeUrl = `http://127.0.0.1:${String(address.port)}/rest/v1/pwa_network_only_probe`;
 
-  const onlineFetch = await page.evaluate<{ ok: boolean; status: number }>(
-    `fetch(${JSON.stringify(restProbeUrl)}).then((res) => ({ ok: res.ok, status: res.status }))`,
-  );
-  expect(onlineFetch.ok).toBe(true);
-  expect(onlineFetch.status).toBe(200);
-  expect(networkHits).toBe(1);
-
-  // Remove the mock route before going offline so Playwright cannot fulfill
-  // the probe without network; the request must hit the offline network stack
-  // (or service worker NetworkOnly handler) and fail.
-  await context.unroute(restProbeUrl);
-  await context.setOffline(true);
   try {
-    // Loopback API read MUST fail offline (proving NetworkOnly, never served from SW cache).
-    const offlineFetchFailed = await page.evaluate<boolean>(
-      `fetch(${JSON.stringify(restProbeUrl)}).then(() => false).catch(() => true)`,
+    const firstFetch = await page.evaluate<{
+      ok: boolean;
+      status: number;
+      hit: number;
+    }>(
+      `fetch(${JSON.stringify(restProbeUrl)}).then(async (res) => ({ ok: res.ok, status: res.status, hit: (await res.json()).hit }))`,
     );
-    expect(offlineFetchFailed).toBe(true);
+    expect(firstFetch).toEqual({ ok: true, status: 200, hit: 1 });
+    expect(networkHits).toBe(1);
 
-    // Cached shell navigation MUST still load while offline.
-    await page.goto('/login');
-    await expect(page.locator('html')).toHaveAttribute('lang', 'ar');
-    await expect(page.locator('html')).toHaveAttribute('dir', 'rtl');
+    // Second online read against the Cache-Control: max-age=3600 endpoint MUST
+    // still hit the loopback server (proving cache: 'no-store' bypasses the
+    // browser HTTP cache).
+    const secondFetch = await page.evaluate<{
+      ok: boolean;
+      status: number;
+      hit: number;
+    }>(
+      `fetch(${JSON.stringify(restProbeUrl)}).then(async (res) => ({ ok: res.ok, status: res.status, hit: (await res.json()).hit }))`,
+    );
+    expect(secondFetch).toEqual({ ok: true, status: 200, hit: 2 });
+    expect(networkHits).toBe(2);
+
+    await context.setOffline(true);
+    try {
+      // Loopback API read MUST fail offline (never served from SW cache or HTTP cache).
+      const offlineFetchFailed = await page.evaluate<boolean>(
+        `fetch(${JSON.stringify(restProbeUrl)}).then(() => false).catch(() => true)`,
+      );
+      expect(offlineFetchFailed).toBe(true);
+
+      // Cached shell navigation MUST still load while offline.
+      await page.goto('/login');
+      await expect(page.locator('html')).toHaveAttribute('lang', 'ar');
+      await expect(page.locator('html')).toHaveAttribute('dir', 'rtl');
+    } finally {
+      await context.setOffline(false);
+    }
   } finally {
-    await context.setOffline(false);
-    await context.unroute(restProbeUrl);
+    await new Promise<void>((resolve) => {
+      probeServer.close(() => resolve());
+    });
   }
 });
