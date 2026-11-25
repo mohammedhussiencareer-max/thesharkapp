@@ -1,6 +1,9 @@
 begin;
 
 select
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
+
+select
   no_plan ();
 
 -- Clean up any existing test rows in the transaction.
@@ -2462,7 +2465,7 @@ select
     $$insert into app.opening_stocks (id, request_id, occurred_at)
       values (gen_random_uuid(), gen_random_uuid(), now())$$,
     '42501',
-    null::text,
+    'permission denied for table opening_stocks',
     'owner cannot insert an opening batch directly'
   );
 
@@ -2510,7 +2513,7 @@ select
 
 select
   throws_ok (
-    $$select app.record_opening_stock(now(), '[]'::jsonb, 'a1000000-0000-4000-8000-00000000000a')$$,
+    $$select app.record_opening_stock('2026-11-15 12:00:00+00', '[]'::jsonb, 'a1000000-0000-4000-8000-00000000000a')$$,
     '42501',
     'insufficient_privilege',
     'non-owner cannot record opening stock'
@@ -2564,7 +2567,7 @@ select
 
 select
   throws_ok (
-    $$select app.record_opening_stock(now(), '[]'::jsonb, 'a1000000-0000-4000-8000-00000000000b')$$,
+    $$select app.record_opening_stock('2026-11-15 12:00:00+00', '[]'::jsonb, 'a1000000-0000-4000-8000-00000000000b')$$,
     '42501',
     null::text,
     'anon cannot execute record_opening_stock'

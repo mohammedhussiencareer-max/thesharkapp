@@ -103,8 +103,8 @@ select
 select
   is (
     app.accounting_scaling_ready (),
-    false,
-    'scaling stays unready until the checkpoint migration replaces the function'
+    true,
+    'the checkpoint migration makes scaling ready'
   );
 
 select
@@ -227,6 +227,18 @@ values
   );
 
 select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config('app.test_clock', '2026-04-01 12:00:00+00', true);
+
+select
   app.record_opening_stock (
     '2026-04-01 08:00:00+00',
     jsonb_build_array(
@@ -247,6 +259,18 @@ select
     ),
     'a7900000-0000-4000-8000-000000000022'
   );
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config('app.test_clock', '', true);
 
 select
   is (
@@ -446,6 +470,18 @@ rollback to savepoint legacy_row;
 savepoint unreceipted_sale;
 
 select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config('app.test_clock', '2026-04-02 12:00:00+00', true);
+
+select
   app.post_movements (
     jsonb_build_array(
       jsonb_build_object(
@@ -462,6 +498,18 @@ select
   );
 
 select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config('app.test_clock', '', true);
+
+select
   throws_ok (
     $$select app.activate_inventory(
       'a7900000-0000-4000-8000-000000000017',
@@ -476,6 +524,15 @@ select
 rollback to savepoint unreceipted_sale;
 
 savepoint scaling_not_ready;
+
+-- The shipped function returns true. Install the old false body so this
+-- block still proves the refusal gate, then the stored-result path.
+create or replace function app.accounting_scaling_ready () returns boolean language sql stable security definer
+set
+  search_path = '' as $$
+  select
+    false;
+$$;
 
 select
   throws_ok (

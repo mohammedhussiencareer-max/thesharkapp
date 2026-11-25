@@ -1,6 +1,9 @@
 begin;
 
 select
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
+
+select
   plan (49);
 
 -- Synthetic ids only. No POS documents and no customer data.
@@ -202,7 +205,7 @@ select
         shift_id, tx_id, tx_type, amount, occurred_at
       ) values ('shift-x', 'tx-x', 3, 1, now())$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for table pos_shift_transactions',
     'non-owner cannot insert pos_shift_transactions'
   );
 
@@ -229,7 +232,7 @@ select
         shift_id, tx_id, tx_type, amount, occurred_at
       ) values ('shift-x', 'tx-x', 3, 1, now())$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for table pos_shift_transactions',
     'owner cannot insert pos_shift_transactions directly'
   );
 
@@ -251,7 +254,7 @@ select
         shift_id, tx_id, tx_type, amount, occurred_at
       ) values ('shift-x', 'tx-x', 3, 1, now())$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for table pos_shift_transactions',
     'service_role cannot insert pos_shift_transactions directly'
   );
 

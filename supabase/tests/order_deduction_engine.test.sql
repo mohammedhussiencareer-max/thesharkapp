@@ -3,6 +3,9 @@
 begin;
 
 select
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
+
+select
   no_plan ();
 
 insert into
@@ -902,33 +905,30 @@ select
   );
 
 select
-  is (
-    pg_temp.state_of (
-      $$insert into app.inventory_activation (
-          id, stock_started_at, request_id, opening_manifest_hash
-        ) values (2, now(), 'a5400000-0000-4000-8000-0000000000e2', repeat('a', 32))$$
-    ),
+  throws_ok (
+    $$insert into app.inventory_activation (
+        id, stock_started_at, request_id, opening_manifest_hash
+      ) values (2, now(), 'a5400000-0000-4000-8000-0000000000e2', repeat('a', 32))$$,
     '23514',
+    'new row for relation "inventory_activation" violates check constraint "inventory_activation_id_check"',
     'only the singleton id is allowed'
   );
 
 select
-  is (
-    pg_temp.state_of (
-      $$insert into app.inventory_activation (
-          stock_started_at, request_id, opening_manifest_hash
-        ) values (now(), 'a5400000-0000-4000-8000-0000000000e2', repeat('a', 32))$$
-    ),
+  throws_ok (
+    $$insert into app.inventory_activation (
+        stock_started_at, request_id, opening_manifest_hash
+      ) values (now(), 'a5400000-0000-4000-8000-0000000000e2', repeat('a', 32))$$,
     '23505',
+    'duplicate key value violates unique constraint "inventory_activation_pkey"',
     'a second activation row is refused'
   );
 
 select
-  is (
-    pg_temp.state_of (
-      $$update app.inventory_activation set stock_started_at = now()$$
-    ),
+  throws_ok (
+    $$update app.inventory_activation set stock_started_at = now()$$,
     '55000',
+    'app.inventory_activation is append-only; UPDATE is not allowed',
     'the activation row cannot be updated'
   );
 
@@ -4382,11 +4382,10 @@ select
   );
 
 select
-  is (
-    pg_temp.state_of (
-      $$update app.accounting_work_events set processed_at = now() where processed_at is not null$$
-    ),
+  throws_ok (
+    $$update app.accounting_work_events set processed_at = now() where processed_at is not null$$,
     '55000',
+    'app.accounting_work_events identity columns are immutable',
     'a processed event keeps its processed time'
   );
 
@@ -4916,7 +4915,7 @@ select
     $$insert into app.inventory_activation (stock_started_at, request_id, opening_manifest_hash)
       values (now(), gen_random_uuid(), repeat('a', 32))$$,
     '42501',
-    null::text,
+    'permission denied for table inventory_activation',
     'no API role can write the activation row'
   );
 

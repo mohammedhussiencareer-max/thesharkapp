@@ -53,6 +53,7 @@ const zero: DifferenceVector = {
   cogsDifference: '0.00',
   wasteDifference: '0.00',
   countDifference: '0.00',
+  inventoryDifference: '0.00',
   profitDifference: '0.00',
 };
 

@@ -23,6 +23,7 @@ const RPC_NAMES = new Set([
   'run_accounting_work',
   'record_accounting_call_failure',
   'record_accounting_recompute_timeout',
+  'recover_accounting_attempt',
   'accounting_next_work',
 ]);
 
@@ -119,6 +120,7 @@ export type AccountingDb = {
     orderId: string,
     workGeneration: number,
   ): Promise<FailureReport>;
+  recoverAccountingAttempt(attemptId: string): Promise<'committed' | 'absent'>;
 };
 
 export function createSupabaseDb(
@@ -237,6 +239,23 @@ export function createSupabaseDb(
           ACCOUNTING_CALL_TIMEOUT_MS,
         ),
       );
+    },
+    async recoverAccountingAttempt(attemptId) {
+      const row = await rpc(
+        'recover_accounting_attempt',
+        { p_attempt_id: attemptId },
+        ACCOUNTING_CALL_TIMEOUT_MS,
+      );
+      if (
+        !isRecord(row) ||
+        (row.status !== 'committed' && row.status !== 'absent')
+      ) {
+        throw new SupabaseRpcError(
+          'Supabase RPC failed: unreadable recovery',
+          'response',
+        );
+      }
+      return row.status;
     },
     async recordAccountingRecomputeTimeout(attemptId, orderId, workGeneration) {
       return parseFailureReport(

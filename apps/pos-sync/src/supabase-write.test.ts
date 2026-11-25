@@ -687,6 +687,7 @@ describe('accounting RPCs', () => {
       'ingest',
       'recordAccountingCallFailure',
       'recordAccountingRecomputeTimeout',
+      'recoverAccountingAttempt',
       'runAccountingWork',
       'startRun',
     ]);

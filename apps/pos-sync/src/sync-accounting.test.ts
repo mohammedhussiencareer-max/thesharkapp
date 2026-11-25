@@ -101,6 +101,9 @@ describe('runPosSync accounting drain', () => {
         async recordAccountingRecomputeTimeout() {
           throw new Error('must not be called');
         },
+        async recoverAccountingAttempt() {
+          return 'absent';
+        },
       },
     });
     expect(events).toEqual(['start', 'ingest', 'finish:ok', 'drain']);
@@ -131,6 +134,9 @@ describe('runPosSync accounting drain', () => {
         async recordAccountingRecomputeTimeout() {
           throw new Error('must not be called');
         },
+        async recoverAccountingAttempt() {
+          return 'absent';
+        },
       },
     });
     expect(events).toEqual(['start', 'ingest', 'finish:ok']);
@@ -155,6 +161,9 @@ describe('runPosSync accounting drain', () => {
         async recordAccountingRecomputeTimeout(attemptId, orderId, generation) {
           reported.push([attemptId, orderId, generation]);
           return 'recorded';
+        },
+        async recoverAccountingAttempt() {
+          return 'absent';
         },
       },
     });
@@ -189,6 +198,9 @@ describe('runPosSync accounting drain', () => {
         },
         async recordAccountingRecomputeTimeout() {
           throw new Error('must not be called');
+        },
+        async recoverAccountingAttempt() {
+          return 'absent';
         },
       },
       logger: (line) => {
@@ -271,6 +283,9 @@ describe('runPosSync accounting drain', () => {
           },
           async recordAccountingRecomputeTimeout() {
             throw new Error('must not be called');
+          },
+          async recoverAccountingAttempt() {
+            return 'absent';
           },
         },
       }),

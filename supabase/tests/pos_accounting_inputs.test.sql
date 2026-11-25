@@ -1,6 +1,9 @@
 begin;
 
 select
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
+
+select
   no_plan ();
 
 -- Synthetic ids only. No POS documents and no customer data.
@@ -538,7 +541,7 @@ select
         1, 0, 0, 0, 0, 1, now(), repeat('ab', 32), '[]', 'sync'
       )$$,
     '42501',
-    null::text,
+    'permission denied for table pos_order_snapshots',
     'non-owner cannot insert a snapshot'
   );
 
@@ -566,7 +569,7 @@ select
         shift_id, tx_id, tx_type, amount, occurred_at, present, origin
       ) values ('s', 't', 3, 1, now(), true, 'sync')$$,
     '42501',
-    null::text,
+    'permission denied for table pos_refund_revisions',
     'service_role cannot insert a refund revision'
   );
 

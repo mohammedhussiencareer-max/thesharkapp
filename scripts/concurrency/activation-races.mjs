@@ -10,6 +10,8 @@ const itemB = 'c9e00000-0000-4000-8000-000000000002';
 const itemC = 'c9e00000-0000-4000-8000-000000000003';
 const holdMs = 1.2;
 const minWaitMs = 700;
+let raceShiftOpened = '2026-08-02T08:00:00Z';
+let raceShiftClosed = '2026-08-02T20:00:00Z';
 
 function claims() {
   return `select set_config('request.jwt.claims', jsonb_build_object('sub', '${owner}', 'role', 'authenticated')::text, true);`;
@@ -40,10 +42,15 @@ async function containerName() {
     return process.env.E2E_SUPABASE_DB_CONTAINER;
   }
   const names = await dockerText(['ps', '--format', '{{.Names}}']);
-  const found = names
+  const lines = names
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .find((line) => line.startsWith('supabase_db_'));
+    .filter((line) => line.length > 0);
+  const found =
+    lines.find((line) => line === 'supabase_db_thesharkapp') ??
+    (lines.filter((line) => line.startsWith('supabase_db_')).length === 1
+      ? lines.find((line) => line.startsWith('supabase_db_'))
+      : undefined);
   if (!found)
     throw new Error('the local supabase database container is not running');
   return found;
@@ -156,12 +163,61 @@ async function execOk(sql) {
 function shiftJson(stamp) {
   return JSON.stringify({
     id: 'race-shift',
-    opened_at: '2026-08-02T08:00:00Z',
-    closed_at: '2026-08-02T20:00:00Z',
+    opened_at: raceShiftOpened,
+    closed_at: raceShiftClosed,
     is_active: false,
     pos_update_time: stamp,
     transactions: [],
   }).replaceAll("'", "''");
+}
+
+async function dbClock() {
+  return (
+    await execOk(
+      `select to_char(pg_catalog.clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');`,
+    )
+  ).trim();
+}
+
+function workerShiftJson(stamp) {
+  return JSON.stringify({
+    id: 'race-w-shift',
+    opened_at: '2026-08-10T08:00:00Z',
+    closed_at: '2026-08-10T20:00:00Z',
+    is_active: false,
+    pos_update_time: stamp,
+    transactions: [],
+  }).replaceAll("'", "''");
+}
+
+async function pinForwardMarks() {
+  const line = (
+    await execOk(`
+select
+  to_char((t.base + interval '2 seconds') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  || '|' ||
+  to_char((t.base + interval '2 minutes') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  || '|' ||
+  to_char((t.base + interval '3 minutes') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+from (
+  select greatest(
+    app.restatement_window_start() + interval '1 day',
+    coalesce(
+      (
+        select balance.last_occurred_at
+        from app.item_balances balance
+        where balance.item_id = '${itemA}'
+      ),
+      '-infinity'::timestamptz
+    ),
+    pg_catalog.clock_timestamp()
+  ) as base
+) t;
+`)
+  )
+    .trim()
+    .split('|');
+  return { early: line[0], mid: line[1], late: line[2] };
 }
 
 function movementSql(type, at) {
@@ -174,11 +230,12 @@ function movementSql(type, at) {
   )));`;
 }
 
-function countPayload(requestId, qty, countedAt) {
+function countPayload(requestId, qty, countedAt, raw = false) {
+  const at = raw ? countedAt : `'${countedAt}'`;
   return `jsonb_build_object(
     'request_id', '${requestId}',
     'frequency', 'daily',
-    'counted_at', '${countedAt}',
+    'counted_at', ${at},
     'lines', jsonb_build_array(jsonb_build_object(
       'item_id', '${itemA}',
       'counted_qty', '${qty}',
@@ -337,8 +394,8 @@ insert into app.pos_orders (
   id, shift_id, status, order_type, ordered_at, subtotal, discount, tax,
   service_tax, delivery_fee, total, pos_update_time, content_hash, missing_from_pos
 ) values (
-  '${orderId}', 'race-w-shift', 'complete', 'hall-race', '${at}',
-  0, 0, 0, 0, 0, 0, '${at}', rpad(md5('${orderId}'), 64, 'a'), false
+  '${orderId}', 'race-w-shift', 'complete', 'hall-race', ${at},
+  0, 0, 0, 0, 0, 0, ${at}, rpad(md5('${orderId}'), 64, 'a'), false
 );
 insert into app.pos_order_lines (
   order_id, line_id, item_id, item_name, quantity, options, line_total
@@ -444,7 +501,8 @@ insert into auth.users (
   'authenticated', 'authenticated', 'owner-race@theshark.test', '',
   '2026-01-01 00:00:00+00', '', '', '', ''
 ) on conflict (id) do nothing;
-insert into app.owner (user_id) values ('${owner}') on conflict (user_id) do nothing;
+insert into app.owner (user_id) values ('${owner}')
+on conflict (id) do update set user_id = excluded.user_id;
 create or replace function app.accounting_scaling_ready() returns boolean
 language sql stable security definer set search_path = '' as $$ select true; $$;
 ${claims()}
@@ -635,18 +693,53 @@ commit;
     'inventory is already activated',
   );
 
+  const timeline = (
+    await execOk(`
+select
+  to_char((t.base - interval '6 hours') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  || '|' ||
+  to_char((t.base - interval '1 second') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  || '|' ||
+  to_char((t.base + interval '2 seconds') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  || '|' ||
+  to_char((t.base + interval '2 minutes') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  || '|' ||
+  to_char((t.base + interval '3 minutes') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+from (
+  select greatest(
+    app.restatement_window_start() + interval '1 day',
+    coalesce(
+      (
+        select balance.last_occurred_at
+        from app.item_balances balance
+        where balance.item_id = '${itemA}'
+      ),
+      '-infinity'::timestamptz
+    ),
+    pg_catalog.clock_timestamp()
+  ) as base
+) t;
+`)
+  )
+    .trim()
+    .split('|');
+  const [shiftOpen, shiftClose, purchasedAt, countAt1, countAt2] = timeline;
+  raceShiftOpened = shiftOpen;
+  raceShiftClosed = shiftClose;
+
   await execOk(`
 begin;
 ${claims()}
+${movementSql('purchase', purchasedAt)}
 insert into app.pos_shifts (id, opened_at, closed_at, is_active, pos_update_time)
 values (
   'race-shift',
-  '2026-08-02 08:00:00+00',
-  '2026-08-02 20:00:00+00',
+  '${shiftOpen}',
+  '${shiftClose}',
   false,
-  '2026-08-02 20:00:00+00'
+  '${shiftClose}'
 );
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000021', '19', '2026-08-03T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000021', '19', countAt1)});
 commit;
 `);
   await execOk(`
@@ -656,7 +749,7 @@ ${claims()}
 select app.start_pos_sync_run('recent') as run_id \\gset
 select app.ingest_pos_batch(
   :run_id,
-  jsonb_build_array('${shiftJson('2026-08-02T21:00:00Z')}'::jsonb),
+  jsonb_build_array('${shiftJson(await dbClock())}'::jsonb),
   '[]'::jsonb,
   '{"shift_ids":["race-shift"]}'::jsonb
 );
@@ -669,7 +762,7 @@ commit;
 \\set VERBOSITY verbose
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000021', '19', '2026-08-03T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000021', '19', countAt1)});
 select pg_sleep(${holdMs});
 commit;
 `,
@@ -680,7 +773,7 @@ ${claims()}
 select app.start_pos_sync_run('recent') as run_id \\gset
 select app.ingest_pos_batch(
   :run_id,
-  jsonb_build_array('${shiftJson('2026-08-02T22:00:00Z')}'::jsonb),
+  jsonb_build_array('${shiftJson(await dbClock())}'::jsonb),
   '[]'::jsonb,
   '{"shift_ids":["race-shift"]}'::jsonb
 );
@@ -700,7 +793,7 @@ commit;
   await execOk(`
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000022', '18', '2026-08-04T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000022', '18', countAt2)});
 commit;
 `);
   await execOk(`
@@ -710,7 +803,7 @@ ${claims()}
 select app.start_pos_sync_run('recent') as run_id \\gset
 select app.ingest_pos_batch(
   :run_id,
-  jsonb_build_array('${shiftJson('2026-08-02T23:00:00Z')}'::jsonb),
+  jsonb_build_array('${shiftJson(await dbClock())}'::jsonb),
   '[]'::jsonb,
   '{"shift_ids":["race-shift"]}'::jsonb
 );
@@ -726,7 +819,7 @@ ${claims()}
 select app.start_pos_sync_run('recent') as run_id \\gset
 select app.ingest_pos_batch(
   :run_id,
-  jsonb_build_array('${shiftJson('2026-08-02T23:30:00Z')}'::jsonb),
+  jsonb_build_array('${shiftJson(await dbClock())}'::jsonb),
   '[]'::jsonb,
   '{"shift_ids":["race-shift"]}'::jsonb
 );
@@ -738,7 +831,7 @@ commit;
 \\set VERBOSITY verbose
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000022', '18', '2026-08-04T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000022', '18', countAt2)});
 commit;
 `,
   );
@@ -901,13 +994,18 @@ commit;
   }
   await checkLedger('ingest holds, worker waits', secondHead.orderId);
 
+  await drain();
   const countedFirst = await countedTarget();
+  const firstMarks = await pinForwardMarks();
+  const saleAtFirst = firstMarks.early;
+  const countedAtFirst = firstMarks.mid;
   await execOk(`
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000023', countedFirst, '2026-08-11T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000025', countedFirst, countedAtFirst)});
 commit;
 `);
+  const stampFirst = await dbClock();
   await execOk(`
 begin;
 ${claims()}
@@ -915,15 +1013,8 @@ select app.start_pos_sync_run('recent') as run_id \\gset
 select app.ingest_pos_batch(
   :run_id,
   jsonb_build_array(
-    '${shiftJson('2026-08-11T11:00:00Z')}'::jsonb,
-    '${JSON.stringify({
-      id: 'race-w-shift',
-      opened_at: '2026-08-10T08:00:00Z',
-      closed_at: '2026-08-10T20:00:00Z',
-      is_active: false,
-      pos_update_time: '2026-08-11T11:00:00Z',
-      transactions: [],
-    }).replaceAll("'", "''")}'::jsonb
+    '${shiftJson(stampFirst)}'::jsonb,
+    '${workerShiftJson(stampFirst)}'::jsonb
   ),
   '[]'::jsonb,
   '{"shift_ids":["race-shift","race-w-shift"]}'::jsonb
@@ -931,14 +1022,14 @@ select app.ingest_pos_batch(
 select app.finish_pos_sync_run(:run_id, 'ok', '{}'::jsonb, '');
 commit;
 `);
-  const countOrder = await queueDeductible('race-c1', '2026-08-10 09:30:00+00');
+  const countOrder = await queueDeductible('race-c1', `'${saleAtFirst}'`);
   const workerHoldsCount = await race(
     workerSql(countOrder.orderId, countOrder.generation, true),
     `
 \\set VERBOSITY verbose
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000023', countedFirst, '2026-08-11T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000025', countedFirst, countedAtFirst)});
 commit;
 `,
   );
@@ -953,17 +1044,22 @@ commit;
   await assertCountRace(
     'worker holds, record_count posting waits',
     countOrder.orderId,
-    'c9e00000-0000-4000-8000-000000000023',
+    'c9e00000-0000-4000-8000-000000000025',
     countedFirst,
   );
 
+  await drain();
   const countedSecond = await countedTarget();
+  const secondMarks = await pinForwardMarks();
+  const countedAtSecond = secondMarks.mid;
+  const saleAtSecond = secondMarks.late;
   await execOk(`
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000024', countedSecond, '2026-08-12T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000026', countedSecond, countedAtSecond)});
 commit;
 `);
+  const stampSecond = await dbClock();
   await execOk(`
 begin;
 ${claims()}
@@ -971,15 +1067,8 @@ select app.start_pos_sync_run('recent') as run_id \\gset
 select app.ingest_pos_batch(
   :run_id,
   jsonb_build_array(
-    '${shiftJson('2026-08-12T11:00:00Z')}'::jsonb,
-    '${JSON.stringify({
-      id: 'race-w-shift',
-      opened_at: '2026-08-10T08:00:00Z',
-      closed_at: '2026-08-10T20:00:00Z',
-      is_active: false,
-      pos_update_time: '2026-08-12T11:00:00Z',
-      transactions: [],
-    }).replaceAll("'", "''")}'::jsonb
+    '${shiftJson(stampSecond)}'::jsonb,
+    '${workerShiftJson(stampSecond)}'::jsonb
   ),
   '[]'::jsonb,
   '{"shift_ids":["race-shift","race-w-shift"]}'::jsonb
@@ -987,16 +1076,14 @@ select app.ingest_pos_batch(
 select app.finish_pos_sync_run(:run_id, 'ok', '{}'::jsonb, '');
 commit;
 `);
-  const reverseOrder = await queueDeductible(
-    'race-c2',
-    '2026-08-10 09:15:00+00',
-  );
+  await drain();
+  const reverseOrder = await queueDeductible('race-c2', `'${saleAtSecond}'`);
   const countHoldsWorker = await race(
     `
 \\set VERBOSITY verbose
 begin;
 ${claims()}
-select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000024', countedSecond, '2026-08-12T10:00:00Z')});
+select app.record_count(${countPayload('c9e00000-0000-4000-8000-000000000026', countedSecond, countedAtSecond)});
 select pg_sleep(${holdMs});
 commit;
 `,
@@ -1016,11 +1103,14 @@ commit;
     reverseOrder.orderId,
     reverseOrder.generation,
   );
+  const countedAfterReverseSale = (
+    await execOk(`select trim_scale('${countedSecond}'::numeric - 1)::text;`)
+  ).trim();
   await assertCountRace(
     'record_count posting holds, worker waits',
     reverseOrder.orderId,
-    'c9e00000-0000-4000-8000-000000000024',
-    countedSecond,
+    'c9e00000-0000-4000-8000-000000000026',
+    countedAfterReverseSale,
   );
 
   const lossHoldsWorker = await race(

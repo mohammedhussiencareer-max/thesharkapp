@@ -938,6 +938,18 @@ select
   );
 
 select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config('app.test_clock', '2020-07-01 12:00:00+00', true);
+
+select
   app.post_movements (
     jsonb_build_array(
       jsonb_build_object(
@@ -971,6 +983,18 @@ select
     24::numeric,
     'post_movements converts كرتونة with the dated factor'
   );
+
+select
+  set_config('app.t_change_chosen', '', true);
+
+select
+  set_config('app.t_change', '', true);
+
+select
+  set_config('app.restatement_window_start', '', true);
+
+select
+  set_config('app.test_clock', '', true);
 
 -- ============================================================================
 -- Read models.

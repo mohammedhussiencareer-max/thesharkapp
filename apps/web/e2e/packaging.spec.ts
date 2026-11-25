@@ -20,7 +20,7 @@ async function seedPackagingOrder(
   stamp: string,
   itemName: string,
   orderType: string,
-): Promise<void> {
+): Promise<string> {
   assertLocalSupabaseUrl(apiUrl);
   const env = developmentPublicEnv();
   const owner = createClient<Database>(
@@ -84,9 +84,14 @@ async function seedPackagingOrder(
       detectSessionInUrl: false,
     },
   });
-  // A day the other specs do not use, so today's line coverage stays theirs.
-  const stampIso = '2030-06-15T10:00:00.000Z';
-  const ordered = '2030-06-15T10:02:00.000Z';
+  // A future day of this run, so the order stays inside the window and
+  // today's line coverage stays with the other specs.
+  const anchor = new Date();
+  const future = new Date(anchor.getTime() + 400 * 24 * 60 * 60 * 1000);
+  future.setUTCHours(10, 0, 0, 0);
+  const stampIso = future.toISOString();
+  const ordered = new Date(future.getTime() + 2 * 60 * 1000).toISOString();
+  const stampDay = stampIso.slice(0, 10);
   for (let attempt = 0; attempt < 6; attempt += 1) {
     const started = await service.schema('app').rpc('start_pos_sync_run', {
       p_mode: 'recent',
@@ -158,7 +163,7 @@ async function seedPackagingOrder(
         p_error: '',
       });
       if (finished.error) throw finished.error;
-      return;
+      return stampDay;
     } catch (error) {
       await service.schema('app').rpc('finish_pos_sync_run', {
         p_run_id: runId,
@@ -169,6 +174,7 @@ async function seedPackagingOrder(
       throw error;
     }
   }
+  throw new Error('packaging seed did not open a sync run');
 }
 
 function orderCoverage(text: string | null): {
@@ -318,7 +324,12 @@ test('owner approves packaging and order coverage counts the order', async ({
   const salt = `ملح تغليف ${stamp}`;
   const orderType = `نوع ${stamp}`;
   const visible = { timeout: 20_000 };
-  await seedPackagingOrder(supabaseUrl, stamp, sold, orderType);
+  const stampDay = await seedPackagingOrder(
+    supabaseUrl,
+    stamp,
+    sold,
+    orderType,
+  );
 
   await page.goto('/login');
   await page.getByLabel('البريد').fill(ownerEmail);
@@ -357,7 +368,7 @@ test('owner approves packaging and order coverage counts the order', async ({
   await policy.getByRole('button', { name: 'احفظ السياسة' }).click();
   await expect(page.getByText('السياسة اتحفظت')).toBeVisible(visible);
   await expect(subject).toContainText('جاهز', visible);
-  await showDay(page, '2030-06-15');
+  await showDay(page, stampDay);
 
   const beforeReady = orderCoverage(
     await page.getByText(/تغطية الطلبات /).textContent(),
@@ -385,7 +396,7 @@ test('owner approves packaging and order coverage counts the order', async ({
 
   await page.getByRole('link', { name: 'ربط الكاشير' }).click();
   await expect(page).toHaveURL('/mapping');
-  await showDay(page, '2030-06-15');
+  await showDay(page, stampDay);
   await expect
     .poll(async () => {
       const ready = orderCoverage(

@@ -1,7 +1,10 @@
 begin;
 
 select
-  plan (142);
+  set_config('app.test_clock', '2026-11-15 12:00:00+00', true);
+
+select
+  plan (149);
 
 -- Synthetic users only. No POS documents and no customer data.
 delete from app.owner;
@@ -421,8 +424,8 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-bad-status', 'shift-test-x', 'nope', now(),
-        1, 0, 0, 0, 0, 1, now(), repeat('ab', 32)
+        'order-test-bad-status', 'shift-test-x', 'nope', app.test_clock_pin(),
+        1, 0, 0, 0, 0, 1, app.test_clock_pin(), repeat('ab', 32)
       )$$,
     '23514'::char(5),
     null::text,
@@ -436,8 +439,8 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-nan', 'shift-test-x', 'complete', now(),
-        1, 0, 0, 0, 0, 'NaN', now(), repeat('ab', 32)
+        'order-test-nan', 'shift-test-x', 'complete', app.test_clock_pin(),
+        1, 0, 0, 0, 0, 'NaN', app.test_clock_pin(), repeat('ab', 32)
       )$$,
     '23514'::char(5),
     null::text,
@@ -451,8 +454,8 @@ select
         subtotal, discount, tax, service_tax, delivery_fee, total,
         pos_update_time, content_hash
       ) values (
-        'order-test-bad-hash', 'shift-test-x', 'complete', now(),
-        1, 0, 0, 0, 0, 1, now(), 'not-a-hash'
+        'order-test-bad-hash', 'shift-test-x', 'complete', app.test_clock_pin(),
+        1, 0, 0, 0, 0, 1, app.test_clock_pin(), 'not-a-hash'
       )$$,
     '23514'::char(5),
     null::text,
@@ -495,14 +498,14 @@ values
     'order-test-constraint',
     'shift-test-x',
     'complete',
-    now(),
+    app.test_clock_pin (),
     1,
     0,
     0,
     0,
     0,
     1,
-    now(),
+    app.test_clock_pin (),
     repeat('ab', 32)
   );
 
@@ -625,7 +628,7 @@ select
         1, 0, 0, 0, 0, 1, now(), repeat('ab', 32)
       )$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for schema app',
     'anon cannot insert pos_orders'
   );
 
@@ -638,6 +641,59 @@ select
   );
 
 reset role;
+
+select
+  is (
+    has_table_privilege('anon', 'app.pos_orders', 'insert'),
+    false,
+    'catalog: anon has no insert on pos_orders'
+  );
+
+select
+  is (
+    has_table_privilege('authenticated', 'app.pos_orders', 'insert'),
+    false,
+    'catalog: authenticated has no insert on pos_orders'
+  );
+
+select
+  is (
+    has_table_privilege('service_role', 'app.pos_orders', 'insert'),
+    false,
+    'catalog: service_role has no insert on pos_orders'
+  );
+
+select
+  is (
+    has_table_privilege('anon', 'app.pos_orders', 'select'),
+    false,
+    'catalog: anon has no select on pos_orders'
+  );
+
+select
+  is (
+    has_table_privilege('authenticated', 'app.pos_orders', 'select'),
+    true,
+    'catalog: authenticated select on pos_orders is granted'
+  );
+
+select
+  is (
+    has_table_privilege('service_role', 'app.pos_orders', 'select'),
+    true,
+    'catalog: service_role select on pos_orders is granted'
+  );
+
+select
+  is (
+    has_function_privilege(
+      'anon',
+      'app.ingest_pos_batch(bigint, jsonb, jsonb, jsonb)',
+      'execute'
+    ),
+    false,
+    'catalog: anon has no execute on ingest_pos_batch'
+  );
 
 select
   set_config(
@@ -665,7 +721,7 @@ select
         1, 0, 0, 0, 0, 1, now(), repeat('ab', 32)
       )$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for table pos_orders',
     'owner cannot insert pos_orders directly'
   );
 
@@ -690,7 +746,7 @@ select
     $$insert into app.pos_shifts (id, opened_at, is_active, pos_update_time)
       values ('shift-test-direct', now(), true, now())$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for table pos_shifts',
     'owner cannot insert pos_shifts directly'
   );
 
@@ -2688,7 +2744,7 @@ select
     $$insert into app.pos_shifts (id, opened_at, is_active, pos_update_time)
       values ('shift-test-intruder', now(), true, now())$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for table pos_shifts',
     'non-owner cannot insert pos_shifts'
   );
 
@@ -2736,7 +2792,7 @@ select
         1, 0, 0, 0, 0, 1, now(), repeat('ab', 32)
       )$$,
     '42501'::char(5),
-    null::text,
+    'permission denied for table pos_orders',
     'service_role cannot insert pos_orders directly'
   );
 
