@@ -9,13 +9,18 @@ import {
   checkRestoreTarget,
   clientMajor,
   diagnosticsAllowed,
+  DUMP_SCHEMA,
   formatError,
   isLoopbackAddress,
+  OWNER_COLUMNS,
   parseDbPort,
   parsePinnedMajor,
   repoRoot,
   RESTORE_CONFIRM,
   serverMajor,
+  SETTLEMENT_DURABLE_TABLES,
+  SETTLEMENT_SCRATCH_TABLES,
+  STRUCTURE_ONLY_SCHEMA,
 } from './config.mjs';
 import { sanitizeStderr } from './sanitize.mjs';
 
@@ -327,4 +332,46 @@ test('sanitizeStderr keeps only error lines and masks hosts and values', () => {
   assert.ok(!out.includes('select 1'));
   assert.ok(out.includes('DETAIL:  Key (<redacted>)=(<redacted>) already'));
   assert.ok(out.includes('ERROR:  duplicate key'));
+});
+
+test('settlement-identity durable and scratch tables are registered for backup without owner remap columns', () => {
+  assert.equal(SETTLEMENT_DURABLE_TABLES.length, 16);
+  assert.equal(SETTLEMENT_SCRATCH_TABLES.length, 3);
+
+  for (const table of SETTLEMENT_DURABLE_TABLES) {
+    assert.ok(
+      table.startsWith(`${DUMP_SCHEMA}.`),
+      `${table} must live in schema ${DUMP_SCHEMA} for pg_dump and manifest coverage`,
+    );
+    assert.ok(
+      !OWNER_COLUMNS.some((col) => col.startsWith(`${table}.`)),
+      `${table} must not introduce owner-remap columns`,
+    );
+  }
+
+  for (const table of SETTLEMENT_SCRATCH_TABLES) {
+    assert.ok(
+      table.startsWith(`${STRUCTURE_ONLY_SCHEMA}.`),
+      `${table} must live in schema ${STRUCTURE_ONLY_SCHEMA} for structure-only dump coverage`,
+    );
+  }
+
+  const migration = readFileSync(
+    join(
+      repoRoot,
+      'supabase',
+      'migrations',
+      '20261108090000_replay_checkpoint.sql',
+    ),
+    'utf8',
+  );
+  for (const table of [
+    ...SETTLEMENT_DURABLE_TABLES,
+    ...SETTLEMENT_SCRATCH_TABLES,
+  ]) {
+    assert.ok(
+      migration.includes(`create table ${table}`),
+      `migration must define ${table}`,
+    );
+  }
 });

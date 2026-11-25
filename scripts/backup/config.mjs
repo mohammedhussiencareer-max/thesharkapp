@@ -20,6 +20,36 @@ export const DUMP_SCHEMA = 'app';
 export const STRUCTURE_ONLY_SCHEMA = 'ledger_scratch';
 export const SCOPE_SCHEMAS = [DUMP_SCHEMA, STRUCTURE_ONLY_SCHEMA];
 
+// Durable settlement-identity tables in schema app (Design §2 & §8). Dumped
+// with data by pg_dump (--schema=app) and hashed dynamically by manifest.sql.
+// None of these tables carry auth.users FKs or owner audit columns.
+export const SETTLEMENT_DURABLE_TABLES = [
+  'app.accounting_runs',
+  'app.accounting_piece_keys',
+  'app.deficit_settlements',
+  'app.deficit_settlement_effects',
+  'app.deficit_settlement_events',
+  'app.deficit_settlement_event_deltas',
+  'app.movement_value_heads',
+  'app.dependent_operation_heads',
+  'app.source_classification_intervals',
+  'app.recognized_class_amounts',
+  'app.reversal_settlement_splits',
+  'app.legacy_certification_groups',
+  'app.legacy_certification_members',
+  'app.legacy_certification_splits',
+  'app.open_deficit_queue',
+  'app.sort_group_items',
+];
+
+// Transient run-state and privileged-probe scratch tables in ledger_scratch
+// (Design §3 & §8). Dumped structure-only alongside other ledger_scratch tables.
+export const SETTLEMENT_SCRATCH_TABLES = [
+  'ledger_scratch.accounting_run_context',
+  'ledger_scratch.replay_probe_control',
+  'ledger_scratch.replay_probe_pieces',
+];
+
 // Owner foreign keys to auth.users. Add a column here when a new table
 // references auth.users; never remove one while old archives may exist.
 export const OWNER_FK_COLUMNS = [

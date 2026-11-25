@@ -11,26 +11,26 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 35
 - weekly anchors: 5
 - events plus anchors: 3538
-- queue depth 1 ms: 0.75
-- queue depth 50000 ms: 0.557
+- queue depth 1 ms: 0.496
+- queue depth 50000 ms: 0.529
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 16.675
+- confirming replay ms: 17.606
 - prefix rows: 0
 - resumed from checkpoint: true
 - shared hit+read limit: 5000
 - fresh buffers: 3
-- selective restore seconds: 0.011
+- selective restore seconds: 0.01
 - selective restore crossed 2s: false
 - selective prefix rows: 0
 - selective deficit rows: 1
 - selective buffers: 9
 - selective resumed: true
-- large-share restore seconds: 0.016
+- large-share restore seconds: 0.014
 - large-share restore crossed 2s: false
 - large-share prefix rows: 0
 - large-share deficit rows: 201
@@ -45,7 +45,7 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - split normal and provisional: true
 - wall clock seconds: 0.07
 - crossed 2s: false
-- aged cover seconds: 0.024
+- aged cover seconds: 0.021
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1
@@ -63,15 +63,15 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 365
 - weekly anchors: 52
 - events plus anchors: 36868
-- queue depth 1 ms: 6.308
-- queue depth 50000 ms: 5.825
+- queue depth 1 ms: 5.961
+- queue depth 50000 ms: 5.733
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 43.889
+- confirming replay ms: 33.86
 - prefix rows: 0
 - resumed from checkpoint: true
 - shared hit+read limit: 5000
@@ -82,7 +82,7 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - selective deficit rows: 1
 - selective buffers: 10
 - selective resumed: true
-- large-share restore seconds: 0.022
+- large-share restore seconds: 0.02
 - large-share restore crossed 2s: false
 - large-share prefix rows: 0
 - large-share deficit rows: 404
@@ -95,9 +95,9 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.141
+- wall clock seconds: 0.102
 - crossed 2s: false
-- aged cover seconds: 0.032
+- aged cover seconds: 0.037
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1
@@ -115,26 +115,26 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - stock_count_anchors: 730
 - weekly anchors: 104
 - events plus anchors: 73733
-- queue depth 1 ms: 12.226
-- queue depth 50000 ms: 11.576
+- queue depth 1 ms: 11.062
+- queue depth 50000 ms: 11.875
 - suffix index range: true
 - suffix rows: 4
 - time arm rows: 2
 - id arm rows: 2
 - time arm index: true
 - id arm index: true
-- confirming replay ms: 128.379
+- confirming replay ms: 118.875
 - prefix rows: 0
 - resumed from checkpoint: true
 - shared hit+read limit: 5000
 - fresh buffers: 4
-- selective restore seconds: 0.011
+- selective restore seconds: 0.013
 - selective restore crossed 2s: false
 - selective prefix rows: 0
 - selective deficit rows: 1
 - selective buffers: 10
 - selective resumed: true
-- large-share restore seconds: 0.03
+- large-share restore seconds: 0.025
 - large-share restore crossed 2s: false
 - large-share prefix rows: 0
 - large-share deficit rows: 810
@@ -147,9 +147,9 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - receipt_kind: posting
 - per-item movement links match negated requirements: true
 - split normal and provisional: true
-- wall clock seconds: 0.313
+- wall clock seconds: 0.281
 - crossed 2s: false
-- aged cover seconds: 0.092
+- aged cover seconds: 0.077
 - aged cover crossed 2s: false
 - aged prefix rows: 0
 - aged deficit rows: 1
@@ -166,10 +166,10 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - open deficits: 3
 - resumed from checkpoint: true
 - checkpoint ID: 4
-- checkpoint cut: 2026-11-24T10:00:00+00:00
+- checkpoint cut: 2026-11-25T10:00:00+00:00
 - session warmup: rolled-back record_purchase (warmed)
 - shared hit+read limit: 5000
-- warmed rpc buffers: 1408
+- warmed rpc buffers: 1693
 - warmed rpc seconds: 0.015
 - crossed 2s: false
 - gate: PASS
@@ -182,11 +182,11 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - open deficits: 3
 - resumed from checkpoint: true
 - checkpoint ID: 10
-- checkpoint cut: 2026-11-24T10:00:00+00:00
+- checkpoint cut: 2026-11-25T10:00:00+00:00
 - session warmup: rolled-back record_purchase (warmed)
 - shared hit+read limit: 5000
-- warmed rpc buffers: 1256
-- warmed rpc seconds: 0.015
+- warmed rpc buffers: 1664
+- warmed rpc seconds: 0.016
 - crossed 2s: false
 - gate: PASS
 
@@ -198,12 +198,12 @@ Synthetic catalog. Each history ends yesterday: past orders are frozen activatio
 - open deficits: 3
 - resumed from checkpoint: true
 - checkpoint ID: 16
-- checkpoint cut: 2026-11-24T10:00:00+00:00
+- checkpoint cut: 2026-11-25T10:00:00+00:00
 - session warmup: rolled-back record_purchase (warmed)
 - shared hit+read limit: 5000
-- warmed rpc buffers: 1292
-- warmed rpc seconds: 0.016
+- warmed rpc buffers: 1556
+- warmed rpc seconds: 0.014
 - crossed 2s: false
 - gate: PASS
 
-The 35-day, 1-year, and 2-year histories passed the gate. --resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun. Sort-traversal warmed RPC buffers stayed flat within 10%: 35-day sorts 1408 warmed buffers / 0.015s; 1-year sorts 1256 warmed buffers / 0.015s; 2-year sorts 1292 warmed buffers / 0.016s.
+The 35-day, 1-year, and 2-year histories passed the gate. --resume is supported only before measurement starts. A committed measurement needs pnpm db:reset and a rerun. Sort-traversal warmed RPC buffers stayed flat within 10%: 35-day sorts 1693 warmed buffers / 0.015s; 1-year sorts 1664 warmed buffers / 0.016s; 2-year sorts 1556 warmed buffers / 0.014s.
