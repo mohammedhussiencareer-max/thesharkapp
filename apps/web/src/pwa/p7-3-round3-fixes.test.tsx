@@ -62,6 +62,7 @@ import {
 } from '@/lib/held-writes';
 import {
   applyPwaUpdate,
+  getPwaUpdateSnapshot,
   initPwa,
   resetPwaState,
   setPwaAuthResolved,
@@ -1133,6 +1134,121 @@ describe('P7-3 round-3 review fixes', () => {
       expect(applyPwaUpdate(reload, { authResolved: true })).toBe(true);
       expect(reload).toHaveBeenCalledTimes(1);
       expect(postMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      if (originalSw) {
+        Object.defineProperty(navigator, 'serviceWorker', originalSw);
+      } else {
+        delete (navigator as unknown as { serviceWorker?: unknown })
+          .serviceWorker;
+      }
+    }
+  });
+
+  it('P3: uncontrolled tab completes approved update reload on activated without controllerchange, still rechecking auth and held writes', async () => {
+    const register = vi.fn().mockResolvedValue({
+      waiting: null,
+      installing: null,
+      addEventListener: vi.fn(),
+    });
+    const originalSw = Object.getOwnPropertyDescriptor(
+      navigator,
+      'serviceWorker',
+    );
+    Object.defineProperty(navigator, 'serviceWorker', {
+      configurable: true,
+      value: {
+        register,
+        addEventListener: vi.fn(),
+        controller: null,
+      },
+    });
+    vi.stubEnv('PROD', true);
+    vi.stubEnv('VITE_PWA', '1');
+
+    const makeWorker = () => {
+      const stateListeners = new Set<() => void>();
+      const postMessage = vi.fn();
+      const worker = {
+        state: 'installed',
+        postMessage,
+        addEventListener: (event: string, fn: () => void) => {
+          if (event === 'statechange') stateListeners.add(fn);
+        },
+        removeEventListener: (event: string, fn: () => void) => {
+          if (event === 'statechange') stateListeners.delete(fn);
+        },
+      };
+      const transition = (state: string) => {
+        worker.state = state;
+        for (const fn of [...stateListeners]) fn();
+      };
+      return { worker, postMessage, transition };
+    };
+
+    try {
+      // 1) Happy path: uncontrolled tab activates without controllerchange -> completes reload on first click.
+      const reload = vi.fn();
+      const w1 = makeWorker();
+      initPwa(reload);
+      setPwaAuthResolved(true);
+      setTestWaitingWorker(w1.worker as unknown as ServiceWorker);
+
+      expect(applyPwaUpdate(reload, { authResolved: true })).toBe(true);
+      expect(w1.postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
+
+      w1.transition('activating');
+      expect(reload).not.toHaveBeenCalled();
+
+      w1.transition('activated');
+      expect(reload).toHaveBeenCalledTimes(1);
+      expect(getPwaUpdateSnapshot().waiting).toBe(false);
+
+      // 2) Pin appears before activated -> defers reload until pin clears and next explicit click.
+      resetPwaState();
+      const reload2 = vi.fn();
+      const w2 = makeWorker();
+      initPwa(reload2);
+      setPwaAuthResolved(true);
+      setTestWaitingWorker(w2.worker as unknown as ServiceWorker);
+
+      expect(applyPwaUpdate(reload2, { authResolved: true })).toBe(true);
+      const pinClaim = await claimFreshHeldWrite(
+        'count:daily',
+        (requestId) => ({
+          requestId,
+        }),
+      );
+      expect(pinClaim.ok).toBe(true);
+      if (!pinClaim.ok) return;
+
+      w2.transition('activated');
+      expect(reload2).not.toHaveBeenCalled();
+      expect(getPwaUpdateSnapshot().waiting).toBe(true);
+
+      clearHeldWrite('count:daily', pinClaim.record.requestId);
+      pinClaim.release();
+      expect(applyPwaUpdate(reload2, { authResolved: true })).toBe(true);
+      expect(reload2).toHaveBeenCalledTimes(1);
+
+      // 3) Auth becomes unresolved before activated -> defers reload until auth resolves and next click.
+      resetPwaState();
+      const reload3 = vi.fn();
+      const w3 = makeWorker();
+      initPwa(reload3);
+      setPwaAuthResolved(true);
+      setTestWaitingWorker(w3.worker as unknown as ServiceWorker);
+
+      expect(applyPwaUpdate(reload3, { authResolved: true })).toBe(true);
+      setPwaAuthResolved(false);
+      w3.transition('activated');
+      expect(reload3).not.toHaveBeenCalled();
+      expect(getPwaUpdateSnapshot().waiting).toBe(true);
+
+      expect(applyPwaUpdate(reload3)).toBe(false);
+      setPwaAuthResolved(true);
+      expect(applyPwaUpdate(reload3)).toBe(true);
+      expect(reload3).toHaveBeenCalledTimes(1);
     } finally {
       vi.unstubAllEnvs();
       if (originalSw) {

@@ -9,6 +9,7 @@ import {
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  loadOrderWorkState,
   loadProcessingSummary,
   retryParkedOrder,
   runDeductions,
@@ -73,6 +74,7 @@ vi.mock('@/lib/supabase', () => ({
 }));
 
 vi.mock('@/accounting/api', () => ({
+  loadOrderWorkState: vi.fn(),
   loadProcessingSummary: vi.fn(),
   runDeductions: vi.fn(),
   recordRunFailure: vi.fn(),
@@ -229,6 +231,11 @@ describe('P7-3 round-5 review fixes', () => {
     setHeldWriteUser('owner-r5');
     setNavigatorOnline(true);
     vi.resetAllMocks();
+    vi.mocked(loadOrderWorkState).mockResolvedValue({
+      orderId: 'order-parked',
+      workGeneration: 2,
+      failedAt: '2026-10-01T00:00:00.000Z',
+    });
     vi.mocked(getItemById).mockImplementation((id: string) =>
       Promise.resolve({
         id,

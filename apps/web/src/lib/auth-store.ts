@@ -15,25 +15,52 @@ import type { AuthStatus } from '@/lib/auth-context';
 type Snapshot = {
   status: AuthStatus;
   email: string | null;
+  logoutPending: boolean;
+  logoutFailed: boolean;
 };
 
-let snapshot: Snapshot = { status: 'loading', email: null };
+let snapshot: Snapshot = {
+  status: 'loading',
+  email: null,
+  logoutPending: false,
+  logoutFailed: false,
+};
 let started = false;
 let checkId = 0;
 let currentSession: Session | null = null;
 let lastUserId: string | null = null;
 let pendingSignOuts = 0;
+let logoutUnresolved = false;
+let signOutRunId = 0;
+let storeEpoch = 0;
 let pendingSignOutPromise: Promise<void> | null = null;
 let unsubscribeAuth: (() => void) | null = null;
 const listeners = new Set<() => void>();
 
-function emit(next: Snapshot) {
-  if (snapshot.status === next.status && snapshot.email === next.email) return;
-  snapshot = next;
+function emit(
+  next: Pick<Snapshot, 'status' | 'email'> &
+    Partial<Pick<Snapshot, 'logoutPending' | 'logoutFailed'>>,
+) {
+  const full: Snapshot = {
+    status: next.status,
+    email: next.email,
+    logoutPending: next.logoutPending ?? false,
+    logoutFailed: next.logoutFailed ?? false,
+  };
+  if (
+    snapshot.status === full.status &&
+    snapshot.email === full.email &&
+    snapshot.logoutPending === full.logoutPending &&
+    snapshot.logoutFailed === full.logoutFailed
+  ) {
+    return;
+  }
+  snapshot = full;
   setPwaAuthResolved(
-    pendingSignOuts === 0 &&
-      next.status !== 'loading' &&
-      next.status !== 'checking',
+    !logoutUnresolved &&
+      pendingSignOuts === 0 &&
+      full.status !== 'loading' &&
+      full.status !== 'checking',
   );
   for (const listener of listeners) listener();
 }
@@ -175,10 +202,15 @@ export function startAuth() {
       lastUserId = null;
       setHeldWriteUser(null);
       checkId += 1;
-      emit({ status: 'signed-out', email: null });
+      emit({
+        status: 'signed-out',
+        email: null,
+        logoutPending: pendingSignOuts > 0,
+        logoutFailed: snapshot.logoutFailed,
+      });
       return;
     }
-    if (pendingSignOuts > 0) {
+    if (pendingSignOuts > 0 || logoutUnresolved) {
       // Local logout has not completed yet: ignore any refocus/reconfirmation
       // session event so writes and PWA reload stay locked until logout finishes.
       currentSession = null;
@@ -224,6 +256,7 @@ export function getAuthSnapshot(): Snapshot {
 
 export function isAuthResolved(): boolean {
   return (
+    !logoutUnresolved &&
     pendingSignOuts === 0 &&
     snapshot.status !== 'loading' &&
     snapshot.status !== 'checking'
@@ -239,6 +272,9 @@ export async function signIn(
   if (pendingSignOutPromise) {
     await pendingSignOutPromise.catch(() => {});
   }
+  if (logoutUnresolved) {
+    return 'invalid';
+  }
   const { error } = await client.auth.signInWithPassword({ email, password });
   if (error) return 'invalid';
   return 'ok';
@@ -249,20 +285,29 @@ export async function signOut() {
   if (!client) return;
   const userId = currentSession?.user.id ?? lastUserId;
   // Lock all writes and PWA reload immediately and keep them locked until local
-  // logout completes, ignoring any refocus session callbacks in the interim.
+  // logout completes without error, ignoring any refocus session callbacks in
+  // the interim (including if the SDK fails to remove a retained refresh token).
   // Privacy trade-off: unresolved pins (inflight/unknown/waiting_for_sync) stay
   // durable in localStorage scoped to `(projectUrl, userId)` across sign-out so
   // the same user can verify or replay an ambiguous write with the same request
   // id instead of double-posting it; other users cannot read them through the
   // store because keys are partitioned per user. Only committed `posted_reload`
   // markers are removed on sign-out.
+  const runId = ++signOutRunId;
+  const epoch = storeEpoch;
   pendingSignOuts += 1;
+  logoutUnresolved = true;
   setWritesLocked(true);
   setPwaLogoutPending(true);
   setPwaAuthResolved(false);
   currentSession = null;
   checkId += 1;
-  emit({ status: 'signed-out', email: null });
+  emit({
+    status: 'signed-out',
+    email: null,
+    logoutPending: true,
+    logoutFailed: snapshot.logoutFailed,
+  });
   if (userId) {
     clearResolvedHeldWritesForUser(userId);
   }
@@ -270,18 +315,50 @@ export async function signOut() {
   setHeldWriteUser(null);
   let task: Promise<void> | null = null;
   task = (async () => {
+    let succeeded = false;
     try {
-      await client.auth.signOut();
+      const result = await client.auth.signOut();
+      const signOutError =
+        result && typeof result === 'object' && 'error' in result
+          ? result.error
+          : null;
+      succeeded = !signOutError;
+    } catch {
+      succeeded = false;
     } finally {
-      pendingSignOuts = Math.max(0, pendingSignOuts - 1);
-      if (pendingSignOuts === 0) {
-        if (pendingSignOutPromise === task) {
-          pendingSignOutPromise = null;
+      if (epoch === storeEpoch) {
+        pendingSignOuts = Math.max(0, pendingSignOuts - 1);
+        if (pendingSignOuts === 0) {
+          if (pendingSignOutPromise === task) {
+            pendingSignOutPromise = null;
+          }
+          if (succeeded && runId === signOutRunId) {
+            logoutUnresolved = false;
+            setPwaLogoutPending(false);
+            emit({
+              status: 'signed-out',
+              email: null,
+              logoutPending: false,
+              logoutFailed: false,
+            });
+            setPwaAuthResolved(
+              snapshot.status !== 'loading' && snapshot.status !== 'checking',
+            );
+          } else {
+            logoutUnresolved = true;
+            currentSession = null;
+            setWritesLocked(true);
+            setHeldWriteUser(null);
+            setPwaLogoutPending(true);
+            setPwaAuthResolved(false);
+            emit({
+              status: 'signed-out',
+              email: null,
+              logoutPending: false,
+              logoutFailed: true,
+            });
+          }
         }
-        setPwaLogoutPending(false);
-        setPwaAuthResolved(
-          snapshot.status !== 'loading' && snapshot.status !== 'checking',
-        );
       }
     }
   })();
@@ -296,15 +373,23 @@ export function retryOwnerCheck() {
 }
 
 export function resetAuthStore() {
+  storeEpoch += 1;
   checkId += 1;
   currentSession = null;
   lastUserId = null;
   pendingSignOuts = 0;
+  logoutUnresolved = false;
+  signOutRunId = 0;
   pendingSignOutPromise = null;
   unsubscribeAuth?.();
   unsubscribeAuth = null;
   started = false;
-  snapshot = { status: 'loading', email: null };
+  snapshot = {
+    status: 'loading',
+    email: null,
+    logoutPending: false,
+    logoutFailed: false,
+  };
   setPwaLogoutPending(false);
   setPwaAuthResolved(false);
   listeners.clear();

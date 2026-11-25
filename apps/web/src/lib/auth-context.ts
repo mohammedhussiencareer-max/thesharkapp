@@ -6,6 +6,8 @@ export type AuthStatus =
 export type AuthValue = {
   status: AuthStatus;
   email: string | null;
+  logoutPending?: boolean;
+  logoutFailed?: boolean;
   signIn: (email: string, password: string) => Promise<'ok' | 'invalid'>;
   signOut: () => Promise<void>;
   retry: () => void;

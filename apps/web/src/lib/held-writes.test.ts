@@ -22,12 +22,14 @@ import {
 } from '@/lib/held-writes';
 import {
   getAuthSnapshot,
+  isAuthResolved,
   resetAuthStore,
   signOut,
   startAuth,
 } from '@/lib/auth-store';
 import {
   applyPwaUpdate,
+  isPwaLogoutPending,
   resetPwaState,
   setPwaAuthResolved,
   setTestWaitingWorker,
@@ -1511,6 +1513,91 @@ describe('held-writes store', () => {
       );
       expect(safeReplay.ok).toBe(true);
       if (safeReplay.ok) safeReplay.release();
+    } finally {
+      signOutSpy.mockRestore();
+      resetPwaState();
+      if (origLocks) {
+        Object.defineProperty(navigator, 'locks', origLocks);
+      } else {
+        Reflect.deleteProperty(navigator, 'locks');
+      }
+    }
+  });
+
+  it('P2: failed signOut keeps logout unresolved, blocks PWA reload and session reconfirmation, and resolves only after a successful retry', async () => {
+    const { locks } = makeAuditedLocks();
+    const origLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: locks,
+    });
+    const emitAuth = (event: string, session: Session) => {
+      authMock.session = session;
+      for (const listener of [...authMock.listeners]) {
+        listener(event, session);
+      }
+    };
+    const sessionA: NonNullable<Session> = {
+      user: { id: 'owner-a', email: 'a@theshark.test' },
+      access_token: 'tok-a-1',
+      refresh_token: 'rt-a-1',
+    };
+    const supabaseMod = await import('@/lib/supabase');
+    const signOutSpy = vi
+      .spyOn(supabaseMod.supabase!.auth, 'signOut')
+      .mockResolvedValueOnce({
+        error: new Error('session refresh failed') as never,
+      })
+      .mockImplementationOnce(() => {
+        emitAuth('SIGNED_OUT', null);
+        return Promise.resolve({ error: null });
+      });
+
+    try {
+      authMock.session = sessionA;
+      startAuth();
+      setPwaAuthResolved(true);
+      const postMessage = vi.fn();
+      const reload = vi.fn();
+      setTestWaitingWorker({ postMessage } as unknown as ServiceWorker);
+
+      await signOut();
+
+      // Failed SDK signOut must keep logout unresolved and PWA reload blocked.
+      expect(getAuthSnapshot().status).toBe('signed-out');
+      expect(isPwaLogoutPending()).toBe(true);
+      expect(isAuthResolved()).toBe(false);
+      expect(applyPwaUpdate(reload, { authResolved: true })).toBe(false);
+      expect(postMessage).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
+
+      // Reconfirming the retained session must NOT reopen owner access or unlock writes.
+      emitAuth('SIGNED_IN', { ...sessionA });
+      emitAuth('TOKEN_REFRESHED', { ...sessionA });
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      expect(getAuthSnapshot().status).toBe('signed-out');
+      expect(isPwaLogoutPending()).toBe(true);
+      expect(isAuthResolved()).toBe(false);
+      const blockedAfterFailedLogout = await claimFreshHeldWrite(
+        'count:daily',
+        (requestId) => ({ requestId }),
+      );
+      expect(blockedAfterFailedLogout).toEqual({
+        ok: false,
+        reason: 'signed_out',
+      });
+
+      // Retrying signOut and succeeding clears the unresolved logout state.
+      await signOut();
+      expect(isPwaLogoutPending()).toBe(false);
+      expect(isAuthResolved()).toBe(true);
+      expect(getAuthSnapshot().status).toBe('signed-out');
+
+      // Once logout cleanly finished, a subsequent fresh sign-in works again.
+      emitAuth('SIGNED_IN', { ...sessionA });
+      await vi.waitFor(() => {
+        expect(getAuthSnapshot().status).toBe('owner');
+      });
     } finally {
       signOutSpy.mockRestore();
       resetPwaState();

@@ -531,4 +531,38 @@ describe('ProcessingPanel', () => {
     expect(hasAction(accountingRetrySubject('order-parked'))).toBe(true);
     expect(screen.getByText(unknownSaveMessage)).toBeInTheDocument();
   });
+
+  it('does not call retry_accounting_work on a fresh click when current work_generation is newer than the rendered parked order', async () => {
+    vi.mocked(loadOrderWorkState).mockResolvedValueOnce({
+      orderId: 'order-parked',
+      workGeneration: 3,
+      failedAt: '2026-02-02T00:00:00.000Z',
+    });
+
+    render(<ProcessingPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'رجّع الطلب' }));
+
+    expect(
+      await screen.findByText('حالة الطلب اتغيرت — راجع الطلبات المتوقفة'),
+    ).toBeInTheDocument();
+    expect(loadOrderWorkState).toHaveBeenCalledWith('order-parked');
+    expect(retryParkedOrder).not.toHaveBeenCalled();
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
+    expect(loadProcessingSummary).toHaveBeenCalledTimes(2);
+  });
+
+  it('clears the fresh retry pin if preflight order work state read fails before a fresh retry', async () => {
+    vi.mocked(loadOrderWorkState).mockRejectedValueOnce(
+      new Error('read timeout'),
+    );
+
+    render(<ProcessingPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'رجّع الطلب' }));
+
+    expect(await screen.findByText('read timeout')).toBeInTheDocument();
+    expect(loadOrderWorkState).toHaveBeenCalledWith('order-parked');
+    expect(retryParkedOrder).not.toHaveBeenCalled();
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
+    expect(screen.queryByText(unknownSaveMessage)).toBeNull();
+  });
 });

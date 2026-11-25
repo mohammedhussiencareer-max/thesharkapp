@@ -22,7 +22,11 @@ export function UpdateBanner({
     getAuthSnapshot,
   );
   const authStatus = authContext?.status ?? authStore.status;
-  const authResolved = authStatus !== 'loading' && authStatus !== 'checking';
+  const authLogoutBlocked =
+    (authContext?.logoutPending ?? authStore.logoutPending) ||
+    (authContext?.logoutFailed ?? authStore.logoutFailed);
+  const authResolved =
+    authStatus !== 'loading' && authStatus !== 'checking' && !authLogoutBlocked;
 
   const update = useSyncExternalStore(
     subscribePwaUpdate,

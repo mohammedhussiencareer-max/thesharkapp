@@ -3,7 +3,11 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AuthProvider } from '@/auth/AuthProvider';
 import { AppRoutes } from '@/App';
-import { getAuthSnapshot, resetAuthStore } from '@/lib/auth-store';
+import {
+  getAuthSnapshot,
+  isAuthResolved,
+  resetAuthStore,
+} from '@/lib/auth-store';
 
 type Session = {
   user: { id: string; email: string };
@@ -28,6 +32,7 @@ const authState = vi.hoisted(() => ({
   rpcHolds: [] as Array<(result: RpcResult) => void>,
   listeners: [] as Array<(event: string, session: Session) => void>,
   signOut: vi.fn(),
+  signOutError: null as { message: string } | null,
 }));
 
 vi.mock('@/lib/supabase', () => ({
@@ -64,6 +69,9 @@ vi.mock('@/lib/supabase', () => ({
       },
       signOut: () => {
         authState.signOut();
+        if (authState.signOutError) {
+          return Promise.resolve({ error: authState.signOutError });
+        }
         authState.session = null;
         for (const listener of [...authState.listeners]) {
           listener('SIGNED_OUT', null);
@@ -111,6 +119,7 @@ function resetMock() {
   authState.rpcHolds.splice(0, authState.rpcHolds.length);
   authState.listeners.splice(0, authState.listeners.length);
   authState.signOut.mockClear();
+  authState.signOutError = null;
   resetAuthStore();
 }
 
@@ -274,6 +283,49 @@ describe('owner access', () => {
       }),
     ).toBeInTheDocument();
     expect(getAuthSnapshot().status).toBe('denied');
+  });
+
+  it('keeps logout unresolved and surfaces a retry button on /login when signOut returns an error', async () => {
+    const session = {
+      user: { id: 'owner', email: 'owner@theshark.test' },
+      access_token: 'tok-owner',
+      refresh_token: 'rt-owner',
+    };
+    authState.session = session;
+    authState.isOwner = true;
+    authState.signOutError = { message: 'session refresh failed' };
+
+    renderApp('/');
+    expect(await screen.findByText('owner@theshark.test')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'تسجيل الخروج' }));
+
+    const retryLogoutBtn = await screen.findByRole('button', {
+      name: 'إعادة محاولة تسجيل الخروج',
+    });
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+    expect(authState.signOut).toHaveBeenCalledTimes(1);
+
+    // Reconfirming the retained session must NOT reopen owner access.
+    notifySession({ ...session });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    });
+    expect(getAuthSnapshot().status).toBe('signed-out');
+    expect(screen.queryByText('owner@theshark.test')).toBeNull();
+    expect(
+      screen.getByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
+    ).toBeInTheDocument();
+
+    // Retrying after connectivity returns completes logout and clears the alert.
+    authState.signOutError = null;
+    fireEvent.click(retryLogoutBtn);
+    await vi.waitFor(() => {
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+    expect(authState.signOut).toHaveBeenCalledTimes(2);
+    expect(isAuthResolved()).toBe(true);
+    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeEnabled();
   });
 });
 

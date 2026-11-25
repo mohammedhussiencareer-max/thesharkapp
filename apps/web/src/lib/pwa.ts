@@ -16,8 +16,11 @@ let started = false;
 let reloadRequested = false;
 let reloadDeferred = false;
 let authResolvedState = false;
+let approvedAuthResolved: boolean | null = null;
 let logoutPending = false;
 let lastHadLiveClaims = false;
+let initReload: (() => void) | null = null;
+let pendingReload: (() => void) | null = null;
 const listeners = new Set<() => void>();
 
 subscribeHeldWritesStore(() => {
@@ -33,6 +36,9 @@ subscribeHeldWritesStore(() => {
 
 export function setPwaAuthResolved(resolved: boolean): void {
   authResolvedState = resolved;
+  if (approvedAuthResolved !== null) {
+    approvedAuthResolved = resolved;
+  }
 }
 
 export function isPwaAuthResolved(): boolean {
@@ -72,11 +78,50 @@ function isActivatedWorker(worker: ServiceWorker | null): boolean {
   );
 }
 
+function hasServiceWorkerController(): boolean {
+  return (
+    typeof navigator !== 'undefined' &&
+    'serviceWorker' in navigator &&
+    Boolean(navigator.serviceWorker?.controller)
+  );
+}
+
+function canCompleteApprovedReload(): boolean {
+  const resolved = approvedAuthResolved ?? authResolvedState;
+  return (
+    resolved &&
+    !logoutPending &&
+    !hasAnyHeldWrite() &&
+    !hasLiveHeldWriteClaims()
+  );
+}
+
+function completeApprovedReload(fallbackReload?: () => void): void {
+  const runReload =
+    pendingReload ??
+    fallbackReload ??
+    initReload ??
+    (() => window.location.reload());
+  reloadRequested = false;
+  reloadDeferred = false;
+  pendingReload = null;
+  approvedAuthResolved = null;
+  detachWaitingListener();
+  waitingWorker = null;
+  if (snapshot.waiting) {
+    snapshot = { waiting: false };
+    emit();
+  }
+  runReload();
+}
+
 function markWorkerActivated(): void {
   detachWaitingListener();
   waitingWorker = null;
   reloadRequested = false;
   reloadDeferred = true;
+  pendingReload = null;
+  approvedAuthResolved = null;
   if (!snapshot.waiting) {
     snapshot = { waiting: true };
     emit();
@@ -96,10 +141,23 @@ function setWaiting(worker: ServiceWorker | null): void {
       if (isActivatedWorker(worker)) {
         if (!reloadRequested) {
           markWorkerActivated();
+          return;
+        }
+        // An uncontrolled tab receives `activated` without `controllerchange`;
+        // complete the approved reload once activated after rechecking auth and pins.
+        if (worker.state === 'activated' && !hasServiceWorkerController()) {
+          if (!canCompleteApprovedReload()) {
+            markWorkerActivated();
+            return;
+          }
+          completeApprovedReload();
         }
       } else if (worker.state === 'redundant') {
         detachWaitingListener();
         waitingWorker = null;
+        reloadRequested = false;
+        pendingReload = null;
+        approvedAuthResolved = null;
         if (!reloadDeferred && snapshot.waiting) {
           snapshot = { waiting: false };
           emit();
@@ -140,34 +198,30 @@ export function subscribePwaUpdate(listener: () => void): () => void {
  * permit without waiting for a second `controllerchange`.
  */
 export function applyPwaUpdate(
-  reload: () => void = () => window.location.reload(),
+  reload?: () => void,
   options?: { authResolved?: boolean },
 ): boolean {
   const resolved = options?.authResolved ?? authResolvedState;
   if (!resolved || logoutPending) return false;
   if (hasAnyHeldWrite() || hasLiveHeldWriteClaims()) return false;
+  const effectiveReload =
+    reload ?? initReload ?? (() => window.location.reload());
   if (reloadDeferred || isActivatedWorker(waitingWorker)) {
-    reloadDeferred = false;
-    reloadRequested = false;
-    detachWaitingListener();
-    waitingWorker = null;
-    if (snapshot.waiting) {
-      snapshot = { waiting: false };
-      emit();
-    }
-    reload();
+    pendingReload = effectiveReload;
+    completeApprovedReload(effectiveReload);
     return true;
   }
   if (!waitingWorker) return false;
   reloadRequested = true;
+  pendingReload = effectiveReload;
+  approvedAuthResolved = resolved;
   waitingWorker.postMessage({ type: 'SKIP_WAITING' });
   if (
     typeof navigator === 'undefined' ||
     !('serviceWorker' in navigator) ||
     !navigator.serviceWorker
   ) {
-    reloadRequested = false;
-    reload();
+    completeApprovedReload(effectiveReload);
   }
   return true;
 }
@@ -182,6 +236,7 @@ export function initPwa(
     return;
   }
   started = true;
+  initReload = reload;
 
   const container = navigator.serviceWorker;
   let hadController = Boolean(container.controller);
@@ -197,18 +252,14 @@ export function initPwa(
       markWorkerActivated();
       return;
     }
-    if (logoutPending || hasAnyHeldWrite() || hasLiveHeldWriteClaims()) {
-      // Worker already activated after explicit approval, but a pin or pending
-      // logout appeared in the race window: keep the banner visible and defer
-      // reload until the next explicit click after checks pass.
+    if (!canCompleteApprovedReload()) {
+      // Worker already activated after explicit approval, but a pin, unresolved
+      // auth, or pending logout appeared in the race window: keep the banner
+      // visible and defer reload until the next explicit click after checks pass.
       markWorkerActivated();
       return;
     }
-    reloadRequested = false;
-    reloadDeferred = false;
-    detachWaitingListener();
-    waitingWorker = null;
-    reload();
+    completeApprovedReload(reload);
   });
 
   void container
@@ -244,8 +295,11 @@ export function resetPwaState(): void {
   reloadRequested = false;
   reloadDeferred = false;
   authResolvedState = false;
+  approvedAuthResolved = null;
   logoutPending = false;
   lastHadLiveClaims = false;
+  initReload = null;
+  pendingReload = null;
   snapshot = { waiting: false };
   listeners.clear();
 }

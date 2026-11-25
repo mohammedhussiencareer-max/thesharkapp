@@ -1,7 +1,10 @@
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { loadEnv } from 'vite';
 
 const localHosts = new Set(['127.0.0.1', 'localhost', '::1']);
+export const LOOPBACK_PROXY_BYPASS = '127.0.0.1,localhost,[::1]';
 
 const webRoot = join(import.meta.dirname, '..');
 
@@ -102,4 +105,59 @@ export async function installLoopbackGuard(
     }
     ws.connectToServer();
   });
+}
+
+export type LoopbackOnlyProxy = {
+  proxyConfig: {
+    server: string;
+    bypass: string;
+  };
+  blockedRequests: string[];
+  close: () => Promise<void>;
+};
+
+/**
+ * Starts a loopback-bound proxy that refuses every proxied request without
+ * opening any outbound connection. Paired with `bypass: LOOPBACK_PROXY_BYPASS`,
+ * loopback traffic goes directly to localhost with Chromium's real HTTP cache
+ * enabled (no `context.route()` interception), while every non-loopback HTTP,
+ * HTTPS, or WebSocket request is rejected.
+ */
+export async function createLoopbackOnlyProxy(): Promise<LoopbackOnlyProxy> {
+  const blockedRequests: string[] = [];
+  const server = createServer((req, res) => {
+    blockedRequests.push(req.url ?? req.headers.host ?? 'unknown');
+    res.writeHead(403, {
+      'content-type': 'text/plain',
+      connection: 'close',
+    });
+    res.end('blocked by e2e loopback-only proxy');
+  });
+  server.on('connect', (req, socket) => {
+    blockedRequests.push(`CONNECT ${req.url ?? 'unknown'}`);
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+
+  const address = server.address() as AddressInfo;
+  return {
+    proxyConfig: {
+      server: `http://127.0.0.1:${String(address.port)}`,
+      bypass: LOOPBACK_PROXY_BYPASS,
+    },
+    blockedRequests,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      }),
+  };
 }

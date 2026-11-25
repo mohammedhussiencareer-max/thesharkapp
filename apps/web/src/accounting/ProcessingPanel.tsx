@@ -348,40 +348,47 @@ export function ProcessingPanel({
     setRunning(true);
     setNotice(null);
     try {
-      if (isReplay) {
-        // Client-side guard before replaying retry_accounting_work(p_order_id):
-        // the atomic server-side compare lands in the follow-up migration after PR 63.
-        let currentState: OrderWorkState | null;
-        try {
-          currentState = await loadOrderWorkState(action.orderId);
-        } catch (error) {
+      // Client-side guard before calling retry_accounting_work(p_order_id) for
+      // both fresh clicks and replays; the atomic server-side compare lands in
+      // the follow-up migration after PR 63.
+      let currentState: OrderWorkState | null;
+      try {
+        currentState = await loadOrderWorkState(action.orderId);
+      } catch (error) {
+        if (isReplay) {
           setHeldWritePhase(subject, action.requestId, 'unknown');
-          setNotice(messageFrom(error));
-          return;
-        }
-        const matchesStoredGeneration =
-          action.workGeneration !== undefined &&
-          currentState !== null &&
-          currentState.workGeneration === action.workGeneration;
-        if (!matchesStoredGeneration) {
+        } else {
           settleAction(subject, action.requestId);
-          setNotice(
-            currentState !== null && currentState.failedAt !== null
-              ? staleRetryNotice
-              : notFailedNotice,
-          );
-          publishAcknowledged();
-          return;
         }
-        if (!canDispatchAction(subject, action.requestId, session)) {
-          const missingPin = !hasDurableAction(subject, action.requestId);
-          if (!missingPin) {
+        setNotice(messageFrom(error));
+        return;
+      }
+      const matchesStoredGeneration =
+        action.workGeneration !== undefined &&
+        currentState !== null &&
+        currentState.workGeneration === action.workGeneration;
+      if (!matchesStoredGeneration) {
+        settleAction(subject, action.requestId);
+        setNotice(
+          currentState !== null && currentState.failedAt !== null
+            ? staleRetryNotice
+            : notFailedNotice,
+        );
+        publishAcknowledged();
+        return;
+      }
+      if (!canDispatchAction(subject, action.requestId, session)) {
+        const missingPin = !hasDurableAction(subject, action.requestId);
+        if (!missingPin) {
+          if (isReplay) {
             setHeldWritePhase(subject, action.requestId, 'unknown');
+          } else {
+            settleAction(subject, action.requestId);
           }
-          if (!isOnline()) setNotice(offlineWriteMessage);
-          else if (missingPin) setNotice(storageWriteFailedMessage);
-          return;
         }
+        if (!isOnline()) setNotice(offlineWriteMessage);
+        else if (missingPin) setNotice(storageWriteFailedMessage);
+        return;
       }
       let status: RetryOrderStatus;
       let persisted = false;
