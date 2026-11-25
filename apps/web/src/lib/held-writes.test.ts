@@ -935,4 +935,134 @@ describe('held-writes store', () => {
       store.dispose();
     }
   });
+
+  it('R19-1b: stale claim fallback does not publish previous session pin after sign-out and sign-in without Web Locks', async () => {
+    const values = new Map<string, string>();
+    let failRead = false;
+    const storage: Storage = {
+      get length() {
+        return values.size;
+      },
+      clear: () => values.clear(),
+      key: (index) => Array.from(values.keys())[index] ?? null,
+      getItem: (key) => {
+        if (failRead) throw new Error('synthetic temporary read failure');
+        return values.get(key) ?? null;
+      },
+      setItem: (key, value) => {
+        values.set(key, value);
+      },
+      removeItem: (key) => {
+        values.delete(key);
+      },
+    };
+    const store = createHeldWriteStore({
+      getStorage: () => storage,
+      getLocks: () => null,
+      getProjectUrl: () => 'https://example.invalid',
+      allowTestLocalUser: false,
+    });
+    const subject = 'count:stored:test-count-a';
+    try {
+      // Cross-user sign-out and sign-in: waiting_for_sync fallback must not leak owner-a payload into owner-b.
+      store.setHeldWriteUser('owner-a');
+      const claimA = await store.claimFreshHeldWrite(
+        subject,
+        () => ({
+          request_id: 'test-count-a',
+          note: 'previous-session-test-payload',
+        }),
+        { requestId: 'test-count-a', kind: 'count_stored' },
+      );
+      expect(claimA.ok).toBe(true);
+      if (!claimA.ok) return;
+
+      store.setWritesLocked(true);
+      store.clearHeldWritesForUser('owner-a');
+      store.setHeldWriteUser(null);
+      store.setHeldWriteUser('owner-b');
+
+      failRead = true;
+      try {
+        store.clearHeldWrite(subject, claimA.record.requestId, claimA.record);
+      } catch {
+        try {
+          store.setHeldWritePhase(
+            subject,
+            claimA.record.requestId,
+            'waiting_for_sync',
+            { expected: claimA.record },
+          );
+        } catch {
+          // Expected when storage lookup throws.
+        }
+      }
+      try {
+        store.setHeldWritePhase(
+          subject,
+          claimA.record.requestId,
+          'waiting_for_sync',
+          { expected: claimA.record },
+        );
+      } catch {
+        // Expected when storage lookup throws.
+      }
+      try {
+        store.setHeldWritePhase(
+          subject,
+          claimA.record.requestId,
+          'posted_reload',
+          { expected: claimA.record },
+        );
+      } catch {
+        // Expected when storage lookup throws.
+      }
+      claimA.release();
+      failRead = false;
+
+      expect(values.size).toBe(0);
+      expect(store.getHeldWrite(subject)).toBeNull();
+      expect(store.hasPostedReload(subject, undefined, 'test-count-a')).toBe(
+        false,
+      );
+      expect(store.hasAnyHeldWrite()).toBe(false);
+
+      // Same-user sign-out and re-sign-in: older session generation must also not publish fallback.
+      const claimB = await store.claimFreshHeldWrite(
+        subject,
+        () => ({
+          request_id: 'test-count-b',
+          note: 'older-generation-payload',
+        }),
+        { requestId: 'test-count-b', kind: 'count_stored' },
+      );
+      expect(claimB.ok).toBe(true);
+      if (!claimB.ok) return;
+
+      store.setWritesLocked(true);
+      store.clearHeldWritesForUser('owner-b');
+      store.setHeldWriteUser(null);
+      store.setHeldWriteUser('owner-b');
+
+      failRead = true;
+      try {
+        store.setHeldWritePhase(
+          subject,
+          claimB.record.requestId,
+          'waiting_for_sync',
+          { expected: claimB.record, session: claimB.session },
+        );
+      } catch {
+        // Expected when storage lookup throws.
+      }
+      claimB.release();
+      failRead = false;
+
+      expect(values.size).toBe(0);
+      expect(store.getHeldWrite(subject)).toBeNull();
+      expect(store.hasAnyHeldWrite()).toBe(false);
+    } finally {
+      store.dispose();
+    }
+  });
 });

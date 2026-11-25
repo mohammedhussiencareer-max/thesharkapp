@@ -41,6 +41,7 @@ import {
   getHeldWrite,
   hasDurableHeldWrite,
   hasPostedReload,
+  isCurrentWriteSession,
   listHeldWritesByPrefix,
   readLockedHeldWrite,
   readLockedPostedWrite,
@@ -284,14 +285,16 @@ export function CountsPage() {
     return mapCountError(error);
   }
 
-  async function refreshAfterWait(): Promise<void> {
+  async function refreshAfterWait(session: WriteSession | null): Promise<void> {
     try {
       const next = await readSnapshot();
+      if (!isCurrentWriteSession(session)) return;
       if (next.status === 'ready') {
         setSnapshot(next.snapshot);
         setLoadError(null);
       }
     } catch (error) {
+      if (!isCurrentWriteSession(session)) return;
       setLoadError(messageFrom(error));
     }
   }
@@ -302,7 +305,9 @@ export function CountsPage() {
     storedSubject: string | null,
     daily: HeldWriteRecord<CountDraft> | null,
     stored: HeldWriteRecord<Json> | null,
+    session: WriteSession | null,
   ): void {
+    if (!isCurrentWriteSession(session)) return;
     const matchesDaily = requestId !== null && daily?.requestId === requestId;
     const matchesStored =
       storedSubject !== null &&
@@ -313,6 +318,7 @@ export function CountsPage() {
       try {
         setHeldWritePhase(COUNT_DAILY_SUBJECT, requestId, 'posted_reload', {
           expected: daily,
+          session,
         });
       } catch (error) {
         firstError =
@@ -323,6 +329,7 @@ export function CountsPage() {
       try {
         setHeldWritePhase(storedSubject, requestId, 'posted_reload', {
           expected: stored,
+          session,
         });
       } catch (error) {
         firstError ??=
@@ -385,7 +392,12 @@ export function CountsPage() {
     daily: HeldWriteRecord<CountDraft> | null,
     stored: HeldWriteRecord<Json> | null,
     release: () => void,
+    session: WriteSession | null,
   ): Promise<boolean> {
+    if (!isCurrentWriteSession(session)) {
+      release();
+      return false;
+    }
     if (result.status === 'waiting_for_sync') {
       if (daily && requestId === daily.requestId) {
         try {
@@ -395,6 +407,7 @@ export function CountsPage() {
             'waiting_for_sync',
             {
               expected: daily,
+              session,
             },
           );
         } catch (error) {
@@ -403,12 +416,13 @@ export function CountsPage() {
       }
       if (storedSubject && stored && requestId === stored.requestId) {
         try {
-          clearHeldWrite(storedSubject, requestId, stored);
+          clearHeldWrite(storedSubject, requestId, stored, session);
         } catch (error) {
           setCardError(messageFrom(error));
           try {
             setHeldWritePhase(storedSubject, requestId, 'waiting_for_sync', {
               expected: stored,
+              session,
             });
           } catch {
             // Keep the card error visible; in-tab wait acknowledgement stays bound to this claim.
@@ -418,13 +432,20 @@ export function CountsPage() {
       setWaitNotice(requestId ?? draft?.requestId ?? null);
       setSuccess(null);
       release();
-      await refreshAfterWait();
+      await refreshAfterWait(session);
       return false;
     }
-    applyPosted(requestId, draft !== null, storedSubject, daily, stored);
+    applyPosted(
+      requestId,
+      draft !== null,
+      storedSubject,
+      daily,
+      stored,
+      session,
+    );
     // The readback may cover pins owned by other count writers.
     release();
-    await reloadPostedCounts(captureWriteSession());
+    await reloadPostedCounts(session);
     return true;
   }
 
@@ -539,6 +560,7 @@ export function CountsPage() {
     let saved = false;
     try {
       const result = await recordCount(draft);
+      if (!isCurrentWriteSession(session)) return;
       if (result.status === 'posted') saved = true;
       await finishWrite(
         result,
@@ -548,8 +570,10 @@ export function CountsPage() {
         claim.record,
         matchingStored.record,
         claim.release,
+        session,
       );
     } catch (error) {
+      if (!isCurrentWriteSession(session)) return;
       if (!saved) {
         holdUnknown(draft, error, priorPhase);
         if (
@@ -680,6 +704,7 @@ export function CountsPage() {
     try {
       const dispatchPayload = storedRecord ? storedRecord.payload : payload;
       const result = await recordStoredCount(dispatchPayload);
+      if (!isCurrentWriteSession(session)) return;
       if (result.status === 'posted') saved = true;
       await finishWrite(
         result,
@@ -689,8 +714,10 @@ export function CountsPage() {
         daily,
         storedRecord,
         releaseLock,
+        session,
       );
     } catch (error) {
+      if (!isCurrentWriteSession(session)) return;
       if (!saved) {
         setCardError(reportedCountError(error));
         if (

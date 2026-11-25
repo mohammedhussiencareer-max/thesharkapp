@@ -55,15 +55,18 @@ import {
   COUNT_DAILY_SUBJECT,
   COUNT_STORED_PREFIX,
   createHeldWriteStore,
+  clearHeldWritesForUser,
   clearPostedReload,
   claimFreshHeldWrite,
   getHeldWrite,
   hasAnyHeldWrite,
+  hasLiveHeldWriteClaims,
   HeldWriteStorageError,
   putHeldWrite,
   resetHeldWritesStore,
   setHeldWritePhase,
   setHeldWriteUser,
+  setWritesLocked,
   userStoragePrefix,
 } from '@/lib/held-writes';
 import {
@@ -3382,6 +3385,14 @@ describe('P7-3 round-10 review fixes', () => {
     const storedSubject = `${COUNT_STORED_PREFIX}${requestId}`;
     const prefix = userStoragePrefix('owner-r10');
     const storedKey = `${prefix}${encodeURIComponent(storedSubject)}`;
+    const sharedCountLockKey = `${prefix}${encodeURIComponent(COUNT_DAILY_SUBJECT)}`;
+    const { locks, nested } = makeAuditedLocks();
+    const requestSpy = vi.spyOn(locks, 'request');
+    const origLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: locks,
+    });
     const storedPayload = {
       request_id: requestId,
       frequency: 'daily',
@@ -3472,9 +3483,17 @@ describe('P7-3 round-10 review fixes', () => {
           screen.getByRole('button', { name: 'سجّل الجرد' }),
         ).toBeEnabled(),
       );
+      requestSpy.mockClear();
       fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
 
-      // Revalidation under the shared lock must reject the stale wait ack without dispatching.
+      // Revalidation under the shared lock must request the shared count lock and reject the stale wait ack without dispatching.
+      await waitFor(() =>
+        expect(requestSpy).toHaveBeenCalledWith(
+          sharedCountLockKey,
+          { mode: 'exclusive', ifAvailable: true },
+          expect.any(Function),
+        ),
+      );
       await waitFor(() =>
         expect(getHeldWrite(storedSubject)).toMatchObject({
           requestId,
@@ -3483,6 +3502,7 @@ describe('P7-3 round-10 review fixes', () => {
         }),
       );
       expect(recordStoredCount).toHaveBeenCalledTimes(1);
+      expect(nested).toEqual([]);
 
       // A subsequent cross-tab storage event also keeps the replacement inflight claim intact.
       act(() => {
@@ -3494,8 +3514,106 @@ describe('P7-3 round-10 review fixes', () => {
         phase: 'inflight',
       });
     } finally {
+      if (origLocks) {
+        Object.defineProperty(navigator, 'locks', origLocks);
+      } else {
+        Reflect.deleteProperty(navigator, 'locks');
+      }
+      requestSpy.mockRestore();
       removeSpy.mockRestore();
       setSpy.mockRestore();
+    }
+  });
+
+  it('R19-1a: late waiting_for_sync reply after sign-out and sign-in without Web Locks does not restore previous session pin and still releases claim', async () => {
+    expect((navigator as unknown as { locks?: unknown }).locks).toBeUndefined();
+    const requestId = 'd1900000-0000-4000-8000-000000000089';
+    const countedAt = '2026-10-22T10:00:00.000Z';
+    const storedSubject = `${COUNT_STORED_PREFIX}${requestId}`;
+    const ownerBPrefix = userStoragePrefix('owner-b');
+    const ownerBStoredKey = `${ownerBPrefix}${encodeURIComponent(storedSubject)}`;
+    const storedPayload = {
+      request_id: requestId,
+      frequency: 'daily',
+      counted_at: countedAt,
+      note: 'جلسة سابقة',
+      lines: [
+        { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+      ],
+    };
+    const pendingCard = {
+      requestId,
+      preparedAt: '2026-10-22T10:05:00.000Z',
+      countedAt,
+      itemCount: 1,
+      payload: storedPayload,
+    };
+    setHeldWriteUser('owner-a');
+    vi.mocked(listDailyItems).mockResolvedValue([
+      {
+        id: 'tilapia',
+        name: 'بلطي',
+        baseUnit: 'kg',
+        onHandQty: '10',
+        onHandValue: '100.00',
+        avgCost: '10.00',
+      },
+    ]);
+    vi.mocked(listCounts).mockResolvedValue([]);
+    vi.mocked(listPendingCounts).mockResolvedValue([pendingCard]);
+
+    const origGet = localStorage.getItem.bind(localStorage);
+    let blockStoredRead = false;
+    const getSpy = vi
+      .spyOn(Storage.prototype, 'getItem')
+      .mockImplementation((key) => {
+        if (blockStoredRead && key === ownerBStoredKey) {
+          throw new Error('storage read failed after session switch');
+        }
+        return origGet(key);
+      });
+
+    let resolveStored!: (value: { status: 'waiting_for_sync' }) => void;
+    vi.mocked(recordStoredCount).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveStored = resolve;
+        }),
+    );
+
+    try {
+      render(
+        <MemoryRouter>
+          <CountsPage />
+        </MemoryRouter>,
+      );
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'سجّل الجرد' }),
+      );
+      await waitFor(() => expect(recordStoredCount).toHaveBeenCalledTimes(1));
+      expect(hasLiveHeldWriteClaims()).toBe(true);
+
+      act(() => {
+        setWritesLocked(true);
+        clearHeldWritesForUser('owner-a');
+        setHeldWriteUser(null);
+        setHeldWriteUser('owner-b');
+      });
+
+      blockStoredRead = true;
+      await act(async () => {
+        resolveStored({ status: 'waiting_for_sync' });
+        await Promise.resolve();
+      });
+
+      await waitFor(() => expect(hasLiveHeldWriteClaims()).toBe(false));
+      blockStoredRead = false;
+      expect(getHeldWrite(storedSubject)).toBeNull();
+      expect(hasAnyHeldWrite()).toBe(false);
+      expect(localStorage.getItem(ownerBStoredKey)).toBeNull();
+      expect(screen.queryByText(waitingForSyncMessage)).not.toBeInTheDocument();
+    } finally {
+      getSpy.mockRestore();
     }
   });
 });

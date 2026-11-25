@@ -357,6 +357,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   // record so cross-tab storage syncs preserve the wait phase without masking
   // a different claim or posted outcome.
   const acknowledgedWait = new Map<string, HeldWriteRecord>();
+  const claimSessions = new Map<string, WriteSession>();
   const activeLockReleases = new Map<string, () => void>();
   let liveClaimCount = 0;
   const listeners = new Set<() => void>();
@@ -586,12 +587,18 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       : { acquired: false, release: () => {} };
   }
 
-  function wrapClaimRelease(lockRelease: () => void): () => void {
+  function wrapClaimRelease(
+    lockRelease: () => void,
+    claimId?: string,
+  ): () => void {
     liveClaimCount += 1;
     let released = false;
     return () => {
       if (released) return;
       released = true;
+      if (claimId !== undefined) {
+        claimSessions.delete(claimId);
+      }
       lockRelease();
       liveClaimCount = Math.max(0, liveClaimCount - 1);
       if (liveClaimCount === 0) {
@@ -603,6 +610,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   function releaseAllLocks(): void {
     const releases = [...activeLockReleases.values()];
     activeLockReleases.clear();
+    claimSessions.clear();
     liveClaimCount = 0;
     for (const release of releases) {
       release();
@@ -1449,12 +1457,13 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         return { ok: false, reason: 'conflict', existing: preserved };
       }
       const requestId = opts?.requestId ?? crypto.randomUUID();
+      const claimId = crypto.randomUUID();
       const payload = create(requestId);
       const next: HeldWriteRecord<T> = {
         v: 1,
         subject,
         requestId,
-        claimId: crypto.randomUUID(),
+        claimId,
         payload,
         phase: 'inflight',
         ...(opts?.kind ? { kind: opts.kind } : {}),
@@ -1464,7 +1473,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       }
       acknowledgedWait.delete(subject);
       records.set(subject, next);
-      const release = wrapClaimRelease(lock.release);
+      claimSessions.set(claimId, session);
+      const release = wrapClaimRelease(lock.release, claimId);
       emit();
       handedOff = true;
       return { ok: true, record: next, release, session };
@@ -1613,9 +1623,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         emit();
         return { ok: false, reason: 'conflict', existing: preserved };
       }
+      const claimId = crypto.randomUUID();
       const next: HeldWriteRecord<T> = {
         ...preserved,
-        claimId: crypto.randomUUID(),
+        claimId,
         payload: opts?.payload !== undefined ? opts.payload : preserved.payload,
         phase: 'inflight',
       };
@@ -1627,7 +1638,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       }
       acknowledgedWait.delete(subject);
       records.set(subject, next);
-      const release = wrapClaimRelease(lock.release);
+      claimSessions.set(claimId, session);
+      const release = wrapClaimRelease(lock.release, claimId);
       emit();
       handedOff = true;
       return { ok: true, record: next, release, session };
@@ -1988,16 +2000,51 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       : null;
   }
 
+  function isClaimSessionStale(record: HeldWriteRecord | undefined): boolean {
+    if (record?.claimId === undefined) return false;
+    const claimSession = claimSessions.get(record.claimId);
+    return claimSession !== undefined && !isCurrentWriteSession(claimSession);
+  }
+
   function setHeldWritePhase(
     subject: string,
     requestId: string,
     phase: HeldWritePhase,
-    phaseOptions?: { readTarget?: string; expected?: HeldWriteRecord },
+    phaseOptions?: {
+      readTarget?: string;
+      expected?: HeldWriteRecord;
+      session?: WriteSession | null;
+    },
   ): void {
     ensureHydrated();
     const userId = activeUserId();
     if (userId === null) return;
+    if (
+      phaseOptions?.session !== undefined &&
+      !isCurrentWriteSession(phaseOptions.session)
+    ) {
+      return;
+    }
     const expected = phaseOptions?.expected ?? records.get(subject);
+    if (isClaimSessionStale(expected)) return;
+    const canFallbackAcknowledge = (
+      claimedRecord: HeldWriteRecord | undefined = expected,
+    ): boolean => {
+      if (!claimedRecord || claimedRecord.requestId !== requestId) {
+        return false;
+      }
+      if (phaseOptions?.session !== undefined) {
+        return isCurrentWriteSession(phaseOptions.session);
+      }
+      if (claimedRecord.claimId !== undefined) {
+        const claimSession = claimSessions.get(claimedRecord.claimId);
+        if (claimSession !== undefined) {
+          return isCurrentWriteSession(claimSession);
+        }
+      }
+      const current = records.get(subject);
+      return current !== undefined && sameClaim(current, claimedRecord);
+    };
     const acknowledgePosted = (
       claimedRecord: HeldWriteRecord | undefined = expected,
     ) => {
@@ -2032,7 +2079,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     try {
       stored = readLockedHeldWrite(subject);
     } catch (error) {
-      if (error instanceof HeldWriteStorageError) {
+      if (error instanceof HeldWriteStorageError && canFallbackAcknowledge()) {
         acknowledgePosted();
         acknowledgeWait();
       }
@@ -2115,12 +2162,17 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       phase?: HeldWritePhase;
       awaitingReviewReload?: boolean;
       expected?: HeldWriteRecord;
+      session?: WriteSession | null;
     },
   ): boolean {
     ensureHydrated();
     const userId = activeUserId();
     if (userId === null) return false;
+    if (extra?.session !== undefined && !isCurrentWriteSession(extra.session)) {
+      return false;
+    }
     const expected = extra?.expected ?? records.get(subject);
+    if (isClaimSessionStale(expected)) return false;
     const stored = readLockedHeldWrite(subject);
     if (
       !stored ||
@@ -2152,14 +2204,17 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     subject: string,
     requestId?: string,
     expected?: HeldWriteRecord,
+    session?: WriteSession | null,
   ): void {
     ensureHydrated();
     const userId = activeUserId();
     if (userId === null) return;
+    if (session !== undefined && !isCurrentWriteSession(session)) return;
     const captured = expected ?? records.get(subject);
     if (
       !captured ||
-      (requestId !== undefined && captured.requestId !== requestId)
+      (requestId !== undefined && captured.requestId !== requestId) ||
+      isClaimSessionStale(captured)
     )
       return;
     const stored = readLockedHeldWrite(subject);
@@ -2528,6 +2583,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     setWritesLocked,
     isWritesLocked,
     captureWriteSession,
+    isCurrentWriteSession,
     canDispatchWriteFor,
     setHeldWriteUser,
     clearHeldWritesForUser,
@@ -2572,6 +2628,7 @@ export const bumpSessionGeneration = defaultStore.bumpSessionGeneration;
 export const setWritesLocked = defaultStore.setWritesLocked;
 export const isWritesLocked = defaultStore.isWritesLocked;
 export const captureWriteSession = defaultStore.captureWriteSession;
+export const isCurrentWriteSession = defaultStore.isCurrentWriteSession;
 export const canDispatchWriteFor = defaultStore.canDispatchWriteFor;
 export const setHeldWriteUser = defaultStore.setHeldWriteUser;
 export const clearHeldWritesForUser = defaultStore.clearHeldWritesForUser;
