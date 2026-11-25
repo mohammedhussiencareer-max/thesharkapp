@@ -15,6 +15,7 @@ import {
   sortBuildSql,
   sortMeasureSql,
   formatSortResult,
+  existingResultRows,
   sortBuffersNote,
   sortGrowthFailed,
   resolveResumePlan,
@@ -254,6 +255,28 @@ test('sort growth gate rejects 2-year buffers more than 10% over 35-day buffers'
   );
   assert.match(formatted, /warmed rpc buffers: 400/);
   assert.match(formatted, /warmed rpc seconds: 0\.1/);
+});
+
+test('cold sort row round-trips with warmed false and unwarmed rpc labels', () => {
+  const formatted = formatSortResult({
+    kind: 'sort-traversal',
+    name: 'legacy cold sorts',
+    days: 35,
+    sorts: 35,
+    suffix_movements: 1,
+    open_deficits: 3,
+    resumed: false,
+    warmed: false,
+    buffers: 400,
+    seconds: 0.1,
+    crossed_2s: false,
+    pass: true,
+  });
+  const [parsed] = existingResultRows(formatted);
+  assert.equal(parsed.warmed, false);
+  assert.doesNotMatch(formatted, /warmed/i);
+  assert.match(formatted, /^- rpc buffers: 400$/m);
+  assert.match(formatted, /^- rpc seconds: 0\.1$/m);
 });
 
 test('resume plan scopes refusal to the workload being resumed', () => {

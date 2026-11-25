@@ -1692,8 +1692,8 @@ function formatSortResult(row) {
         ]),
     `- session warmup: ${row.warmed === false ? 'none (cold)' : 'rolled-back record_purchase (warmed)'}`,
     `- shared hit+read limit: ${row.buffer_limit ?? SHARED_HIT_READ_LIMIT}`,
-    `- warmed rpc buffers: ${row.buffers}`,
-    `- warmed rpc seconds: ${row.seconds}`,
+    `- ${row.warmed === false ? 'rpc' : 'warmed rpc'} buffers: ${row.buffers}`,
+    `- ${row.warmed === false ? 'rpc' : 'warmed rpc'} seconds: ${row.seconds}`,
     `- crossed 2s: ${row.crossed_2s}`,
     `- gate: ${row.pass ? 'PASS' : 'FAIL'}`,
     '',
@@ -1767,10 +1767,13 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function existingResultRows() {
-  const path = join(here, 'RESULTS.md');
-  if (!existsSync(path)) return [];
-  const text = readFileSync(path, 'utf8');
+function existingResultRows(markdown) {
+  let text = markdown;
+  if (text == null) {
+    const path = join(here, 'RESULTS.md');
+    if (!existsSync(path)) return [];
+    text = readFileSync(path, 'utf8');
+  }
   const parts = text.split(/^## /m).slice(1);
   return parts
     .map((part) => {
@@ -2300,6 +2303,7 @@ export {
   sortBuildSql,
   sortMeasureSql,
   formatSortResult,
+  existingResultRows,
   sortBuffersNote,
   sortGrowthFailed,
   resolveResumePlan,
