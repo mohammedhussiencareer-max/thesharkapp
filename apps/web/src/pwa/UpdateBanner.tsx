@@ -6,6 +6,7 @@ import { primaryButton } from '@/lib/page-style';
 import {
   applyPwaUpdate,
   getPwaUpdateSnapshot,
+  isPwaLogoutPending,
   subscribePwaUpdate,
 } from '@/lib/pwa';
 
@@ -28,6 +29,11 @@ export function UpdateBanner({
     getPwaUpdateSnapshot,
     getPwaUpdateSnapshot,
   );
+  const logoutPending = useSyncExternalStore(
+    subscribePwaUpdate,
+    isPwaLogoutPending,
+    () => false,
+  );
   const pinned = useSyncExternalStore(
     subscribeHeldWritesStore,
     hasAnyHeldWrite,
@@ -36,7 +42,7 @@ export function UpdateBanner({
 
   if (!update.waiting) return null;
 
-  const disabled = !authResolved || pinned;
+  const disabled = !authResolved || logoutPending || pinned;
 
   return (
     <aside

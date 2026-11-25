@@ -232,16 +232,21 @@ export function OpeningPage() {
           </button>
         </div>
       ) : null}
-      {items !== null && loadError ? (
+      {items !== null &&
+      (loadError || (postedReload && !saving && loads === 0)) ? (
         <div className="flex flex-col gap-2">
-          <p role="alert">{loadError}</p>
+          {loadError ? (
+            <p role="alert">{loadError}</p>
+          ) : (
+            <p role="status">في حفظ اتسجل ومحتاج تحديث قبل ما تكمل</p>
+          )}
           <button
             className={secondaryButton}
             type="button"
-            disabled={saving || loads > 0}
+            disabled={saving || loads > 0 || (!loadError && !online)}
             onClick={retry}
           >
-            إعادة المحاولة
+            {loadError ? 'إعادة المحاولة' : 'تحقق تاني'}
           </button>
         </div>
       ) : null}

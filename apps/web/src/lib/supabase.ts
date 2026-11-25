@@ -11,12 +11,24 @@ export function readSupabaseEnv(): { url: string; anonKey: string } | null {
 
 const env = readSupabaseEnv();
 
+function noStoreFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> {
+  // Always bypass the browser HTTP cache for Supabase API/auth calls so reads
+  // never return stale financial or inventory state.
+  return globalThis.fetch(input, { ...init, cache: 'no-store' });
+}
+
 export const supabase: SupabaseClient<Database> | null = env
   ? createClient<Database>(env.url, env.anonKey, {
       auth: {
         persistSession: true,
         autoRefreshToken: true,
         detectSessionInUrl: false,
+      },
+      global: {
+        fetch: noStoreFetch,
       },
     })
   : null;

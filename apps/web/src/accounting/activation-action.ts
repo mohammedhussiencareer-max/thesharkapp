@@ -206,7 +206,12 @@ export function useActivationAction(
           return;
         }
         const lock = await acquireHeldWriteLock(ACTIVATION_SUBJECT);
-        if (!lock.acquired) return;
+        if (!lock.acquired) {
+          if (lock.reason === 'storage') {
+            setNotice(storageWriteFailedMessage);
+          }
+          return;
+        }
         releaseReloadLock = lock.release;
         const durable = readLockedHeldWrite<ActivationWrite>(
           ACTIVATION_SUBJECT,

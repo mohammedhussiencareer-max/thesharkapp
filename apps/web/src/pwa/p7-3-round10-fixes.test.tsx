@@ -65,6 +65,7 @@ import {
   hasPostedReload,
   HeldWriteStorageError,
   putHeldWrite,
+  rehydrateHeldWrites,
   resetHeldWritesStore,
   setHeldWritePhase,
   setHeldWriteUser,
@@ -831,10 +832,7 @@ describe('P7-3 round-10 review fixes', () => {
       const subject = lossSubject('oil');
       const activeKey = `${userStoragePrefix('owner-r10')}${encodeURIComponent(subject)}`;
       const { locks } = makeFakeLocks();
-      const options = {
-        getLocks: () => (stage === 'hydrate with Web Locks' ? locks : null),
-      };
-      const writer = createHeldWriteStore(options);
+      const writer = createHeldWriteStore({ getLocks: () => locks });
       writer.setHeldWriteUser('owner-r10');
       const claim = await writer.claimFreshHeldWrite(subject, () => ({
         loss: '10',
@@ -856,7 +854,10 @@ describe('P7-3 round-10 review fixes', () => {
         removal.mockRestore();
         claim.release();
       }
-      const tab = createHeldWriteStore(options);
+      await Promise.resolve();
+      const tab = createHeldWriteStore({
+        getLocks: () => (stage === 'hydrate' ? null : locks),
+      });
       try {
         tab.setHeldWriteUser('owner-r10');
         await tab.rehydrateHeldWritesAsync();
@@ -1562,6 +1563,7 @@ describe('P7-3 round-10 review fixes', () => {
       ).toThrow(HeldWriteStorageError);
       storage.mockRestore();
       claim.release();
+      await Promise.resolve();
       const replay = await tab.claimReplayHeldWrite(
         ACTIVATION_SUBJECT,
         claim.record.requestId,
@@ -3448,7 +3450,8 @@ describe('P7-3 round-10 review fixes', () => {
     const prefix = userStoragePrefix('owner-r10');
     const storedKey = `${prefix}${encodeURIComponent(storedSubject)}`;
     const sharedCountLockKey = `${prefix}${encodeURIComponent(COUNT_DAILY_SUBJECT)}`;
-    const { locks, nested } = makeAuditedLocks();
+    const { locks, client, nested } = makeAuditedLocks();
+    const otherTabLocks = client('other-tab-r18');
     const requestSpy = vi.spyOn(locks, 'request');
     const origLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
     Object.defineProperty(navigator, 'locks', {
@@ -3566,15 +3569,35 @@ describe('P7-3 round-10 review fixes', () => {
       expect(recordStoredCount).toHaveBeenCalledTimes(1);
       expect(nested).toEqual([]);
 
-      // A subsequent cross-tab storage event also keeps the replacement inflight claim intact.
-      act(() => {
-        window.dispatchEvent(new StorageEvent('storage', { key: storedKey }));
+      // A subsequent cross-tab storage event while the other tab holds the lock keeps the replacement inflight claim intact.
+      let releaseOtherTab!: () => void;
+      let otherTabReady!: () => void;
+      const otherAcquired = new Promise<void>((resolve) => {
+        otherTabReady = resolve;
       });
-      expect(getHeldWrite(storedSubject)).toMatchObject({
-        requestId,
-        claimId: replacementClaimId,
-        phase: 'inflight',
-      });
+      const otherTabHolder = otherTabLocks.request(
+        sharedCountLockKey,
+        { mode: 'exclusive' },
+        () =>
+          new Promise<void>((resolve) => {
+            releaseOtherTab = resolve;
+            otherTabReady();
+          }),
+      );
+      await otherAcquired;
+      try {
+        act(() => {
+          window.dispatchEvent(new StorageEvent('storage', { key: storedKey }));
+        });
+        expect(getHeldWrite(storedSubject)).toMatchObject({
+          requestId,
+          claimId: replacementClaimId,
+          phase: 'inflight',
+        });
+      } finally {
+        releaseOtherTab();
+        await otherTabHolder;
+      }
     } finally {
       if (origLocks) {
         Object.defineProperty(navigator, 'locks', origLocks);
@@ -3587,8 +3610,7 @@ describe('P7-3 round-10 review fixes', () => {
     }
   });
 
-  it('R19-1a: late waiting_for_sync reply after sign-out and sign-in without Web Locks does not restore previous session pin and still releases claim', async () => {
-    expect((navigator as unknown as { locks?: unknown }).locks).toBeUndefined();
+  it('R19-1a: late waiting_for_sync reply after sign-out and sign-in does not restore previous session pin and still releases claim', async () => {
     const requestId = 'd1900000-0000-4000-8000-000000000089';
     const countedAt = '2026-10-22T10:00:00.000Z';
     const storedSubject = `${COUNT_STORED_PREFIX}${requestId}`;
@@ -3867,9 +3889,17 @@ describe('P7-3 round-10 review fixes', () => {
 
       await waitFor(() => expect(hasLiveHeldWriteClaims()).toBe(false));
       expect(hasPostedReload(COUNT_DAILY_SUBJECT)).toBe(false);
-      expect(localStorage.getItem(dailyKey)).toBeNull();
-      expect(hasAnyHeldWrite()).toBe(false);
+      // Unresolved pin stays durable across sign-out and promotes to unknown
+      // once the old session's lock releases, so the user can safely replay.
+      await waitFor(() => {
+        expect(getHeldWrite(COUNT_DAILY_SUBJECT)?.phase).toBe('unknown');
+      });
+      expect(localStorage.getItem(dailyKey)).not.toBeNull();
       expect(nested).toEqual([]);
+      act(() => {
+        clearHeldWritesForUser(userId);
+        rehydrateHeldWrites();
+      });
 
       // Direct same-user session switch (new session_id without SIGNED_OUT) also rejects
       // the late reply, promotes the pin to unknown once released, and allows retrying the same request.

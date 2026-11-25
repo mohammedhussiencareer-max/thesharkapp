@@ -46,6 +46,7 @@ describe('PWA Vite configuration', () => {
     for (const rule of rules) {
       expect(rule.handler).toBe('NetworkOnly');
       expect(rule.options?.backgroundSync).toBeUndefined();
+      expect(rule.options?.fetchOptions?.cache).toBe('no-store');
     }
     const matcher = rules[0]?.urlPattern;
     expect(typeof matcher).toBe('function');

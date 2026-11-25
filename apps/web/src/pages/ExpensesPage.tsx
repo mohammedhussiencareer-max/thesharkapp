@@ -162,6 +162,9 @@ export function ExpensesPage() {
   const monthRef = useRef(initialMonth);
   const [data, setData] = useState<ExpenseMonth | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [postedVerifyErrors, setPostedVerifyErrors] = useState<
+    ReadonlyMap<string, string>
+  >(() => new Map());
   const [formError, setFormError] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [categoryError, setCategoryError] = useState<string | null>(null);
@@ -339,6 +342,9 @@ export function ExpensesPage() {
     (record) => record.phase === 'inflight',
   );
 
+  const pendingPostedSnapshot =
+    heldEpoch < 0 ? [] : snapshotExpensePostedReloads();
+
   function postedReloadForTarget(target: string): boolean {
     if (heldEpoch < 0) return false;
     const matchesTarget = (readTarget: string | undefined) =>
@@ -352,12 +358,28 @@ export function ExpensesPage() {
       storedVoids.some(
         (record) =>
           record.phase === 'posted_reload' && matchesTarget(record.readTarget),
-      )
+      ) ||
+      pendingPostedSnapshot.some((record) => matchesTarget(record.readTarget))
     );
   }
 
   const monthStart = `${month}-01`;
   const postedReloadForCurrentMonth = postedReloadForTarget(monthStart);
+  const postedReloadTargets = [
+    ...new Set(
+      pendingPostedSnapshot.map((record) =>
+        record.readTarget && record.readTarget !== '*'
+          ? record.readTarget
+          : monthStart,
+      ),
+    ),
+  ];
+  const verifyTargetsToShow =
+    saving || readLoads > 0
+      ? []
+      : postedReloadTargets.filter(
+          (target) => target !== monthStart || loadError === null,
+        );
 
   const completeVerifyBlocked =
     completeVerify !== null &&
@@ -438,15 +460,26 @@ export function ExpensesPage() {
     [isLatestMonthSeq, nextMonthSeq],
   );
 
-  async function readMonth(monthValue: string): Promise<ExpenseMonth | null> {
-    const targetMonth = `${monthValue}-01`;
-    const result = await readExpenseMonthTarget(targetMonth);
-    if (!result || result.data.monthStart !== `${monthRef.current}-01`) {
-      return null;
-    }
-    dataSessionRef.current = result.readSession;
-    return result.data;
-  }
+  const clearPostedVerifyError = useCallback((targetMonth: string) => {
+    setPostedVerifyErrors((current) => {
+      if (!current.has(targetMonth)) return current;
+      const next = new Map(current);
+      next.delete(targetMonth);
+      return next;
+    });
+  }, []);
+
+  const setPostedVerifyError = useCallback(
+    (targetMonth: string, message: string) => {
+      setPostedVerifyErrors((current) => {
+        if (current.get(targetMonth) === message) return current;
+        const next = new Map(current);
+        next.set(targetMonth, message);
+        return next;
+      });
+    },
+    [],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -468,13 +501,18 @@ export function ExpensesPage() {
         dataSessionRef.current = result.readSession;
         setData(result.data);
         setLoadError(null);
+        clearPostedVerifyError(result.data.monthStart);
         reconcileRequestlessVerifyOnMonth(
           result.data,
           completeAttempt,
           categoryAttempt,
         );
         await reconcileCommittedVoids(result.data.entries);
-        await clearPostedReloadSnapshot(pendingReloads, result.data.monthStart);
+        await clearPostedReloadSnapshot(
+          pendingReloads,
+          result.data.monthStart,
+          result.readSession,
+        );
         releaseLocalReloadLock(capturedReloadLock, result.data.monthStart);
       } catch (error) {
         if (cancelled) return;
@@ -487,6 +525,7 @@ export function ExpensesPage() {
   }, [
     month,
     loadId,
+    clearPostedVerifyError,
     readExpenseMonthTarget,
     reconcileRequestlessVerifyOnMonth,
     releaseLocalReloadLock,
@@ -496,6 +535,37 @@ export function ExpensesPage() {
     if (savingRef.current || readsRef.current > 0 || !isOnline()) return;
     setLoadError(null);
     setLoadId((value) => value + 1);
+  }
+
+  async function verifyPostedReloadTarget(targetMonth: string): Promise<void> {
+    if (savingRef.current || readsRef.current > 0 || !isOnline()) return;
+    clearPostedVerifyError(targetMonth);
+    const pendingReloads = snapshotExpensePostedReloads();
+    const capturedReloadLock = reloadLockRef.current;
+    try {
+      const result = await readExpenseMonthTarget(targetMonth);
+      if (!result) return;
+      if (result.data.monthStart === `${monthRef.current}-01`) {
+        dataSessionRef.current = result.readSession;
+        setData(result.data);
+        setLoadError(null);
+      }
+      await reconcileCommittedVoids(result.data.entries);
+      await clearPostedReloadSnapshot(
+        pendingReloads,
+        result.data.monthStart,
+        result.readSession,
+      );
+      releaseLocalReloadLock(capturedReloadLock, result.data.monthStart);
+      clearPostedVerifyError(result.data.monthStart);
+    } catch (error) {
+      const msg = messageFrom(error);
+      if (targetMonth === `${monthRef.current}-01`) {
+        setLoadError(msg);
+      } else {
+        setPostedVerifyError(targetMonth, msg);
+      }
+    }
   }
 
   function changeMonth(next: string) {
@@ -656,7 +726,7 @@ export function ExpensesPage() {
   async function runWrite(
     action: () => Promise<void>,
     setError: (message: string | null) => void,
-    onSaved: () => void | Promise<void>,
+    onSaved: () => string | null | void | Promise<string | null | void>,
     guard: {
       subject: string;
       requestId: string;
@@ -691,26 +761,54 @@ export function ExpensesPage() {
     try {
       await action();
       saved = true;
-      const reloadLock = raiseLocalReloadLock(displayedMonthStart);
+      const reloadLock = raiseLocalReloadLock(effectiveTarget);
+      let verifyTarget: string | null = effectiveTarget;
       try {
         try {
-          await onSaved();
+          const resolved = await onSaved();
+          if (resolved !== undefined) {
+            verifyTarget = resolved;
+          }
         } finally {
           guard.release();
         }
-        const pendingReloads = snapshotExpensePostedReloads();
-        const next = await readMonth(monthRef.current);
-        if (next) {
-          setData(next);
-          setLoadError(null);
-          await reconcileCommittedVoids(next.entries);
-          await clearPostedReloadSnapshot(pendingReloads, next.monthStart);
-          releaseLocalReloadLock(reloadLock, next.monthStart);
+        if (verifyTarget === null) {
+          if (reloadLockRef.current === reloadLock) {
+            reloadLockRef.current = null;
+            setLocalNeedsReload(false);
+          }
+        } else {
+          reloadLock.targetMonth = verifyTarget;
+          const pendingReloads = snapshotExpensePostedReloads();
+          const result = await readExpenseMonthTarget(verifyTarget);
+          if (result) {
+            if (result.data.monthStart === `${monthRef.current}-01`) {
+              dataSessionRef.current = result.readSession;
+              setData(result.data);
+              setLoadError(null);
+            }
+            await reconcileCommittedVoids(result.data.entries);
+            await clearPostedReloadSnapshot(
+              pendingReloads,
+              result.data.monthStart,
+              result.readSession,
+            );
+            releaseLocalReloadLock(reloadLock, result.data.monthStart);
+            clearPostedVerifyError(result.data.monthStart);
+          }
         }
       } catch (error) {
-        // The write is already stored. Stay locked until a later read applies,
-        // and leave the error up so the owner can retry this load.
-        setLoadError(messageFrom(error));
+        // The write is already stored. Stay locked until a later read of the
+        // write's target month succeeds, and expose verification for that month.
+        const msg = messageFrom(error);
+        if (
+          verifyTarget === null ||
+          verifyTarget === `${monthRef.current}-01`
+        ) {
+          setLoadError(msg);
+        } else {
+          setPostedVerifyError(verifyTarget, msg);
+        }
       }
     } catch (error) {
       if (!saved) {
@@ -768,6 +866,10 @@ export function ExpensesPage() {
         claim.release();
       }
     };
+    const resolvedExpenseTarget = expenseTargetMonth(
+      claim.record.payload,
+      monthRef.current,
+    );
     let result: WriteResult;
     try {
       result = await runWrite(
@@ -778,14 +880,16 @@ export function ExpensesPage() {
             EXPENSE_NEW_SUBJECT,
             draft.requestId,
             'posted_reload',
-            { readTarget: targetMonth },
+            { readTarget: resolvedExpenseTarget },
           );
           setFormEpoch((value) => value + 1);
+          return resolvedExpenseTarget;
         },
         {
           subject: EXPENSE_NEW_SUBJECT,
           requestId: draft.requestId,
           session,
+          readTarget: resolvedExpenseTarget,
           release: releaseOnce,
         },
       );
@@ -838,10 +942,9 @@ export function ExpensesPage() {
       voidRequestIdsRef.current.get(id) ??
       crypto.randomUUID();
     const reason = pinned?.reason ?? typedReason;
-    const visible =
-      voidSnapshots.get(id) ??
-      data?.entries.find((line) => line.id === id) ??
-      null;
+    const fromCurrentMonth =
+      data?.entries.find((line) => line.id === id) ?? null;
+    const visible = voidSnapshots.get(id) ?? fromCurrentMonth;
     const setVoidSnapshot = (entry: ExpenseLine | null) => {
       setVoidSnapshots((current) => {
         if (entry === null && !current.has(id)) return current;
@@ -851,7 +954,10 @@ export function ExpensesPage() {
         return next;
       });
     };
-    const freshTargetMonth = voidTargetMonth(visible, monthRef.current);
+    const freshTargetMonth =
+      fromCurrentMonth && data
+        ? data.monthStart
+        : voidTargetMonth(visible, monthRef.current);
     const claim = wasPinned
       ? await claimReplayHeldWrite<StoredVoidPayload>(subject, requestId, {
           session,
@@ -877,6 +983,10 @@ export function ExpensesPage() {
       }
     };
     if (visible) setVoidSnapshot({ ...visible });
+    const initialVoidTarget =
+      claim.record.payload.targetMonth ??
+      voidTargetMonthFromEntry(visible) ??
+      freshTargetMonth;
     let result: WriteResult;
     try {
       result = await runWrite(
@@ -887,7 +997,9 @@ export function ExpensesPage() {
           setVoidSnapshot(null);
           let resolvedTarget: string | null =
             claim.record.payload.targetMonth ??
-            voidTargetMonthFromEntry(visible);
+            (fromCurrentMonth && data
+              ? data.monthStart
+              : voidTargetMonthFromEntry(visible));
           if (resolvedTarget === null) {
             if (typeof loadExpenseEntryMonth === 'function') {
               try {
@@ -901,13 +1013,21 @@ export function ExpensesPage() {
             setHeldWritePhase(subject, requestId, 'posted_reload', {
               readTarget: resolvedTarget,
             });
+            return resolvedTarget;
           } else {
             // Legacy void pin whose month could not be resolved: do NOT fall
             // back to the displayed month — keep the pin held until verified.
             setHeldWritePhase(subject, requestId, 'unknown');
+            return null;
           }
         },
-        { subject, requestId, session, release: releaseOnce },
+        {
+          subject,
+          requestId,
+          session,
+          readTarget: initialVoidTarget,
+          release: releaseOnce,
+        },
       );
       if (!result.dispatched) {
         abortClaimBeforeDispatch(
@@ -1027,6 +1147,32 @@ export function ExpensesPage() {
           </button>
         </div>
       ) : null}
+      {verifyTargetsToShow.map((target) => {
+        const targetError = postedVerifyErrors.get(target) ?? null;
+        return (
+          <section
+            key={target}
+            aria-label={`التحقق من ${formatMonth(target)}`}
+            className="flex flex-col gap-2 rounded border border-neutral-300 p-3"
+          >
+            {targetError ? (
+              <p role="alert">{targetError}</p>
+            ) : (
+              <p role="status">
+                في حفظ اتسجل لشهر {formatMonth(target)} ومحتاج تحديث
+              </p>
+            )}
+            <button
+              className={secondaryButton}
+              type="button"
+              disabled={saving || readLoads > 0 || !online}
+              onClick={() => void verifyPostedReloadTarget(target)}
+            >
+              تحقق تاني
+            </button>
+          </section>
+        );
+      })}
       {detachedVoids.length > 0 ? (
         <section
           aria-label="إلغاءات مش متأكد إنها اتسجلت"

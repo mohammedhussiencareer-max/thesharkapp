@@ -26,6 +26,10 @@ import {
   resetHeldWrites,
   unknownSaveMessage,
 } from '@/items/request-id';
+import {
+  rehydrateHeldWritesAsync,
+  resetHeldWritesStore,
+} from '@/lib/held-writes';
 
 vi.mock('@/accounting/api', () => ({
   loadProcessingSummary: vi.fn(),
@@ -253,7 +257,7 @@ describe('ProcessingPanel', () => {
     render(<ProcessingPanel />);
     fireEvent.click(await screen.findByRole('button', { name: 'رجّع الطلب' }));
     expect(await screen.findByText('الطلب رجع للشغل')).toBeInTheDocument();
-    expect(retryParkedOrder).toHaveBeenCalledWith('order-parked');
+    expect(retryParkedOrder).toHaveBeenCalledWith('order-parked', 2);
 
     vi.mocked(retryParkedOrder).mockResolvedValueOnce('not_failed');
     fireEvent.click(screen.getByRole('button', { name: 'رجّع الطلب' }));
@@ -414,5 +418,50 @@ describe('ProcessingPanel', () => {
     expect(onShiftDataStale).toHaveBeenCalledTimes(4);
     expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
     expect(loadProcessingSummary).toHaveBeenCalledTimes(1);
+  });
+
+  it('P2: parked order retry persists original workGeneration across reload, keeps unresolved pin on busy, and settles stale without clearing a newer failure', async () => {
+    vi.mocked(retryParkedOrder).mockRejectedValueOnce(new Error('socket'));
+    const view = render(<ProcessingPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'رجّع الطلب' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(1, 'order-parked', 2);
+
+    // Reload after the order has already parked again on a newer workGeneration (3).
+    view.unmount();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
+    vi.mocked(loadProcessingSummary).mockResolvedValue({
+      ...summary,
+      parked: [
+        {
+          ...summary.parked[0]!,
+          workGeneration: '3',
+        },
+      ],
+    });
+
+    render(<ProcessingPanel />);
+    const retryBtn = await screen.findByRole('button', {
+      name: 'إعادة المحاولة',
+    });
+
+    // Busy on replay of an unresolved pin MUST keep the pin held.
+    vi.mocked(retryParkedOrder).mockResolvedValueOnce('busy');
+    fireEvent.click(retryBtn);
+    expect(
+      await screen.findByText('الحساب مشغول، حاول تاني'),
+    ).toBeInTheDocument();
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(2, 'order-parked', 2);
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(true);
+    expect(screen.getByText(unknownSaveMessage)).toBeInTheDocument();
+
+    // Server answers stale because generation 2 is superseded by generation 3.
+    vi.mocked(retryParkedOrder).mockResolvedValueOnce('stale');
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => {
+      expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
+    });
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(3, 'order-parked', 2);
   });
 });

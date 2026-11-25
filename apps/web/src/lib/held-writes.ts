@@ -327,6 +327,13 @@ export type HeldWriteStoreOptions = {
    * builds never fall back to a synthetic local user.
    */
   allowTestLocalUser?: boolean;
+  /**
+   * Only enabled in Vitest (`import.meta.env.MODE === 'test'`) when `getLocks`
+   * is not overridden, so unit tests running in jsdom without a polyfilled
+   * `navigator.locks` can exercise held-write helpers. Production builds always
+   * fail closed when Web Locks are unavailable.
+   */
+  allowTestUnlocked?: boolean;
 };
 
 export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
@@ -335,6 +342,9 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   const getLocks = options.getLocks ?? defaultLocks;
   const allowTestLocalUser =
     options.allowTestLocalUser ?? import.meta.env.MODE === 'test';
+  const allowTestUnlocked =
+    options.allowTestUnlocked ??
+    (import.meta.env.MODE === 'test' && options.getLocks === undefined);
 
   let userScope: UserScopeState = { mode: 'uninitialized' };
   let writesLocked = false;
@@ -343,6 +353,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   let hydratedScopeKey: string | null = null;
   let hydrationPromise: Promise<void> = Promise.resolve();
   const deferredPromotions: Array<() => void> = [];
+  const queuedInflightRechecks = new Set<string>();
   const records = new Map<string, HeldWriteRecord>();
   const postedReloads = new Map<string, HeldWriteRecord>();
   // Tracks commits whose RPC succeeded but whose `posted_reload` storage write
@@ -517,13 +528,21 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   async function acquireSubjectLock(
     lockName: string,
     wait = false,
-  ): Promise<{ acquired: boolean; release: () => void }> {
+  ): Promise<
+    | { acquired: true; release: () => void }
+    | { acquired: false; reason: 'locked' | 'unavailable'; release: () => void }
+  > {
     const locks = getLocks();
     if (!locks) {
-      return { acquired: true, release: () => {} };
+      if (allowTestUnlocked) {
+        return { acquired: true, release: () => {} };
+      }
+      // Fail closed for durable claims when Web Locks are unavailable so two
+      // tabs cannot race on non-atomic localStorage reads and writes.
+      return { acquired: false, reason: 'unavailable', release: () => {} };
     }
     if (activeLockReleases.has(lockName)) {
-      return { acquired: false, release: () => {} };
+      return { acquired: false, reason: 'locked', release: () => {} };
     }
     let releaseFn: () => void = () => {};
     let acquired: boolean;
@@ -584,7 +603,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
     return acquired
       ? { acquired: true, release: releaseFn }
-      : { acquired: false, release: () => {} };
+      : { acquired: false, reason: 'locked', release: () => {} };
   }
 
   function wrapClaimRelease(
@@ -675,6 +694,88 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   function cancelPendingPromotions(): void {
     hydrationRunId += 1;
     deferredPromotions.length = 0;
+    queuedInflightRechecks.clear();
+  }
+
+  function inflightRecheckKey(
+    scopeKey: string,
+    record: HeldWriteRecord,
+  ): string {
+    return `${scopeKey}\0${record.subject}\0${record.requestId}\0${record.claimId ?? ''}`;
+  }
+
+  function queueExactInflightRechecks(
+    userId: string,
+    projectUrl: string,
+    byLock: ReadonlyMap<string, HeldWriteRecord[]>,
+    runId: number,
+  ): void {
+    const scopeKey = userStoragePrefix(userId, projectUrl);
+    for (const [lockName, rawGroup] of byLock) {
+      const group: HeldWriteRecord[] = [];
+      const keys: string[] = [];
+      for (const item of rawGroup) {
+        const recheckKey = inflightRecheckKey(scopeKey, item);
+        if (queuedInflightRechecks.has(recheckKey)) continue;
+        queuedInflightRechecks.add(recheckKey);
+        group.push(item);
+        keys.push(recheckKey);
+      }
+      if (group.length === 0) continue;
+      const releaseKeys = () => {
+        for (const key of keys) queuedInflightRechecks.delete(key);
+      };
+      const queueRecheck = () => {
+        if (
+          hydrationRunId !== runId ||
+          activeUserId() !== userId ||
+          hydratedScopeKey !== scopeKey
+        ) {
+          releaseKeys();
+          return;
+        }
+        if (activeLockReleases.size > 0) {
+          deferredPromotions.push(queueRecheck);
+          return;
+        }
+        const currentLocks = getLocks();
+        if (!currentLocks) {
+          releaseKeys();
+          return;
+        }
+        void Promise.resolve(
+          currentLocks.request(lockName, { mode: 'exclusive' }, (lock) => {
+            try {
+              if (
+                !lock ||
+                hydrationRunId !== runId ||
+                activeUserId() !== userId ||
+                hydratedScopeKey !== scopeKey
+              ) {
+                return;
+              }
+              let promotedAny = false;
+              for (const item of group) {
+                if (promoteExpectedUnderLock(userId, projectUrl, item)) {
+                  promotedAny = true;
+                }
+              }
+              if (promotedAny) emit();
+            } finally {
+              releaseKeys();
+            }
+          }),
+        ).catch(() => {
+          releaseKeys();
+          // Ignore lock errors on best-effort deferred promotion.
+        });
+      };
+      if (activeLockReleases.size > 0) {
+        deferredPromotions.push(queueRecheck);
+      } else {
+        queueRecheck();
+      }
+    }
   }
 
   function promoteExpectedUnderLock(
@@ -687,7 +788,22 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       const stored = readDurableRecord(
         entryStorageKey(subject, userId, projectUrl),
       );
-      if (!stored || !sameClaim(stored, expected)) return false;
+      if (!stored) {
+        const posted =
+          readPostedCopy(expected, userId, projectUrl) ??
+          readAliasPostedCopy(expected, userId, projectUrl);
+        if (posted) {
+          observePostedCopy(posted);
+          return true;
+        }
+        const current = records.get(subject);
+        if (current && sameClaim(current, expected)) {
+          records.delete(subject);
+          return true;
+        }
+        return false;
+      }
+      if (!sameClaim(stored, expected)) return false;
       const posted =
         readPostedCopy(stored, userId, projectUrl) ??
         readAliasPostedCopy(stored, userId, projectUrl);
@@ -950,49 +1066,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
 
     // Recheck any exact pins skipped on a busy lock once that lock frees,
     // without blocking hydrationPromise or nesting on local locks.
-    for (const [lockName, group] of busyByLock) {
-      const queueRecheck = () => {
-        if (
-          hydrationRunId !== runId ||
-          activeUserId() !== userId ||
-          hydratedScopeKey !== scopeKey
-        ) {
-          return;
-        }
-        if (activeLockReleases.size > 0) {
-          deferredPromotions.push(queueRecheck);
-          return;
-        }
-        const currentLocks = getLocks();
-        if (!currentLocks) return;
-        void Promise.resolve(
-          currentLocks.request(lockName, { mode: 'exclusive' }, (lock) => {
-            if (
-              !lock ||
-              hydrationRunId !== runId ||
-              activeUserId() !== userId ||
-              hydratedScopeKey !== scopeKey
-            ) {
-              return;
-            }
-            let promotedAny = false;
-            for (const item of group) {
-              if (promoteExpectedUnderLock(userId, projectUrl, item)) {
-                promotedAny = true;
-              }
-            }
-            if (promotedAny) emit();
-          }),
-        ).catch(() => {
-          // Ignore lock errors on best-effort deferred promotion.
-        });
-      };
-      if (activeLockReleases.size > 0) {
-        deferredPromotions.push(queueRecheck);
-      } else {
-        queueRecheck();
-      }
-    }
+    queueExactInflightRechecks(userId, projectUrl, busyByLock, runId);
   }
 
   function ensureHydrated(): void {
@@ -1029,10 +1103,31 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   function syncFromStorage(): void {
     const userId = activeUserId();
     if (userId === null) return;
-    hydratedScopeKey = userStoragePrefix(userId, getProjectUrl());
-    // Cross-tab storage sync must NOT promote another tab's live `inflight` to `unknown`.
-    loadScopeFromStorage(userId, false);
+    const projectUrl = getProjectUrl();
+    const scopeKey = userStoragePrefix(userId, projectUrl);
+    if (hydratedScopeKey !== scopeKey) {
+      cancelPendingPromotions();
+      hydratedScopeKey = scopeKey;
+    }
+    const runId = hydrationRunId;
+    // Cross-tab storage sync must NOT promote another tab's live `inflight` to `unknown`
+    // immediately, but MUST queue an exact-claim recheck on the subject lock so a writer tab
+    // closing without another storage event cannot strand the surviving tab in `inflight`.
+    const inflightRecords = loadScopeFromStorage(userId, false);
     emit();
+    if (inflightRecords.length > 0 && getLocks() !== null) {
+      const byLock = new Map<string, HeldWriteRecord[]>();
+      for (const record of inflightRecords) {
+        const lockName = subjectLockKey(record.subject, userId, projectUrl);
+        if (activeLockReleases.has(lockName)) continue;
+        const group = byLock.get(lockName);
+        if (group) group.push(record);
+        else byLock.set(lockName, [record]);
+      }
+      if (byLock.size > 0) {
+        queueExactInflightRechecks(userId, projectUrl, byLock, runId);
+      }
+    }
   }
 
   function onStorageEvent(event: StorageEvent): void {
@@ -1158,6 +1253,85 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     hydratedScopeKey = null;
     ensureHydrated();
     emit();
+  }
+
+  /**
+   * Sign-out cleanup: removes already-committed `posted_reload` pins and
+   * legacy reload markers for `userId`, while keeping unresolved pins
+   * (`inflight`, `unknown`, `waiting_for_sync`) durable under this user's
+   * isolated key prefix.
+   *
+   * Privacy trade-off: on a shared browser, unresolved retry records (request
+   * IDs and minimal retry payload fields — never cached catalog names or read
+   * snapshots) remain in localStorage scoped to `(projectUrl, userId)` until
+   * that same user signs back in and settles them; other users cannot read
+   * them through the app because every store read is partitioned by userId.
+   * Deleting unresolved pins on sign-out would destroy the only idempotency
+   * key for an in-flight or lost-reply financial write (such as a purchase),
+   * allowing the next session to submit a fresh request ID and double-post it.
+   */
+  function clearResolvedHeldWritesForUser(
+    userId: string,
+    projectUrl = getProjectUrl(),
+  ): void {
+    const trimmed = userId.trim();
+    if (trimmed === '') return;
+    const prefix = userStoragePrefix(trimmed, projectUrl);
+    const signedOutGeneration = sessionGeneration;
+    for (const key of safeListKeys(prefix)) {
+      const current = strictReadItem(key);
+      if (!current.ok || current.value === null) continue;
+      const record = parseRecord(current.value);
+      if (record && isUnresolvedPhase(record.phase)) {
+        continue;
+      }
+      pruneUnderSubjectLock(
+        record ? subjectLockKey(record.subject, trimmed, projectUrl) : key,
+        () => {
+          if (!record || record.claimId === undefined) {
+            const latest = strictReadItem(key);
+            if (latest.ok && latest.value === current.value)
+              safeRemoveItem(key);
+            return;
+          }
+          const postedKey = postedStorageKey(
+            record.subject,
+            record.requestId,
+            trimmed,
+            projectUrl,
+          );
+          try {
+            const copy = readPostedCopy(record, trimmed, projectUrl);
+            if (
+              copy?.subject === record.subject &&
+              copy.requestId === record.requestId &&
+              copy.claimId === record.claimId
+            ) {
+              safeRemoveItem(postedKey);
+            }
+          } catch {
+            // An unreadable posted slot is not proof that the captured claim is absent.
+          }
+        },
+        () =>
+          activeUserId() !== trimmed ||
+          sessionGeneration === signedOutGeneration,
+        true,
+      );
+    }
+    for (const key of safeListKeys(
+      legacyReloadMarkerPrefix(trimmed, projectUrl),
+    )) {
+      safeRemoveItem(key);
+    }
+    if (
+      activeUserId() === trimmed &&
+      getProjectUrl() === projectUrl &&
+      postedReloads.size > 0
+    ) {
+      postedReloads.clear();
+      emit();
+    }
   }
 
   function clearHeldWritesForUser(
@@ -1374,7 +1548,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const key = entryStorageKey(subject, userId);
     const lock = await acquireSubjectLock(subjectLockKey(subject, userId));
     if (!lock.acquired) {
-      return { ok: false, reason: 'locked' };
+      return {
+        ok: false,
+        reason: lock.reason === 'unavailable' ? 'storage' : 'locked',
+      };
     }
     let handedOff = false;
     try {
@@ -1517,7 +1694,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const initialAckWait = acknowledgedWait.get(subject);
     const lock = await acquireSubjectLock(subjectLockKey(subject, userId));
     if (!lock.acquired) {
-      return { ok: false, reason: 'locked' };
+      return {
+        ok: false,
+        reason: lock.reason === 'unavailable' ? 'storage' : 'locked',
+      };
     }
     let handedOff = false;
     try {
@@ -1891,7 +2071,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     subject: string,
   ): Promise<
     | { acquired: true; release: () => void }
-    | { acquired: false; reason: 'signed_out' | 'locked' }
+    | { acquired: false; reason: 'signed_out' | 'locked' | 'storage' }
   > {
     ensureHydrated();
     const userId = activeUserId();
@@ -1900,7 +2080,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
     const lock = await acquireSubjectLock(subjectLockKey(subject, userId));
     if (!lock.acquired) {
-      return { acquired: false, reason: 'locked' };
+      return {
+        acquired: false,
+        reason: lock.reason === 'unavailable' ? 'storage' : 'locked',
+      };
     }
     return { acquired: true, release: wrapClaimRelease(lock.release) };
   }
@@ -2587,6 +2770,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     canDispatchWriteFor,
     setHeldWriteUser,
     clearHeldWritesForUser,
+    clearResolvedHeldWritesForUser,
     rehydrateHeldWrites,
     rehydrateHeldWritesAsync,
     getHeldWrite,
@@ -2632,6 +2816,8 @@ export const isCurrentWriteSession = defaultStore.isCurrentWriteSession;
 export const canDispatchWriteFor = defaultStore.canDispatchWriteFor;
 export const setHeldWriteUser = defaultStore.setHeldWriteUser;
 export const clearHeldWritesForUser = defaultStore.clearHeldWritesForUser;
+export const clearResolvedHeldWritesForUser =
+  defaultStore.clearResolvedHeldWritesForUser;
 export const rehydrateHeldWrites = defaultStore.rehydrateHeldWrites;
 export const rehydrateHeldWritesAsync = defaultStore.rehydrateHeldWritesAsync;
 export const getHeldWrite = defaultStore.getHeldWrite;

@@ -17,6 +17,7 @@ import {
   recordOpeningStock,
 } from '@/purchases/api';
 import { OpeningPage } from '@/pages/OpeningPage';
+import { hasPostedReload, putHeldWrite } from '@/lib/held-writes';
 import type { StockChoice, UnitOption } from '@/purchases/types';
 
 vi.mock('@/purchases/api', () => ({
@@ -236,5 +237,41 @@ describe('OpeningPage', () => {
     expect(second?.lines[0]?.unit).toBe('لتر');
     expect(second?.occurredAt).toBe(first?.occurredAt);
     expect(second?.requestId).toBe(first?.requestId);
+  });
+
+  it('P2: exposes a read-only verification action as soon as a surviving tab sees posted_reload without a local load error', async () => {
+    vi.mocked(listStockChoices).mockResolvedValueOnce([oil]);
+    render(
+      <MemoryRouter>
+        <OpeningPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText('كمية زيت')).toBeEnabled();
+
+    // Another tab committed opening stock and left posted_reload (no local load error).
+    act(() => {
+      putHeldWrite('opening:new', {
+        requestId: 'req-other-tab-open',
+        payload: null,
+        phase: 'posted_reload',
+        kind: 'opening',
+      });
+    });
+
+    expect(screen.getByLabelText('كمية زيت')).toBeDisabled();
+    const verifyBtn = await screen.findByRole('button', { name: 'تحقق تاني' });
+    expect(verifyBtn).toBeEnabled();
+
+    vi.mocked(listStockChoices).mockResolvedValueOnce([
+      { ...oil, hasMovements: true },
+    ]);
+    fireEvent.click(verifyBtn);
+    expect(
+      await screen.findByText('كل الأصناف ليها رصيد افتتاحي'),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(hasPostedReload('opening:new')).toBe(false);
+    });
+    expect(recordOpeningStock).not.toHaveBeenCalled();
   });
 });

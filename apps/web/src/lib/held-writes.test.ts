@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   beginHeldWrite,
   claimFreshHeldWrite,
+  claimReplayHeldWrite,
   clearHeldWritesForUser,
   clearPostedReload,
   createHeldWriteStore,
@@ -12,6 +13,7 @@ import {
   listHeldWritesByPrefix,
   putHeldWrite,
   rehydrateHeldWrites,
+  rehydrateHeldWritesAsync,
   resetHeldWritesStore,
   setHeldWritePhase,
   setHeldWriteUser,
@@ -24,6 +26,13 @@ import {
   signOut,
   startAuth,
 } from '@/lib/auth-store';
+import {
+  applyPwaUpdate,
+  resetPwaState,
+  setPwaAuthResolved,
+  setTestWaitingWorker,
+} from '@/lib/pwa';
+import { makeAuditedLocks } from '@/test/held-write-locks';
 
 type Session = {
   user: { id: string; email: string };
@@ -178,7 +187,7 @@ describe('held-writes store', () => {
     expect(getHeldWrite('sort:new')).toBeNull();
   });
 
-  it('sign-out removes only that user keys and leaves other users and unrelated keys untouched', async () => {
+  it('sign-out removes resolved markers for that user while keeping unresolved pins durable per user and isolated from other users', async () => {
     localStorage.setItem('unrelated-key', 'keep-me');
 
     setHeldWriteUser('user-b');
@@ -186,8 +195,20 @@ describe('held-writes store', () => {
 
     authMock.session = { user: { id: 'user-a', email: 'a@theshark.test' } };
     startAuth();
-    beginHeldWrite('count:daily', (requestId) => ({ requestId, qty: '4' }));
-    beginHeldWrite('expense:new', (requestId) => ({ requestId, amount: '50' }));
+    const countA = beginHeldWrite('count:daily', (requestId) => ({
+      requestId,
+      qty: '4',
+    }));
+    const expenseA = beginHeldWrite('expense:new', (requestId) => ({
+      requestId,
+      amount: '50',
+    }));
+    putHeldWrite('sort:new', {
+      requestId: 'req-sort-resolved',
+      payload: null,
+      phase: 'posted_reload',
+      kind: 'sort',
+    });
 
     expect(
       Object.keys(localStorage).some((k) =>
@@ -202,12 +223,27 @@ describe('held-writes store', () => {
 
     await signOut();
 
-    // User A's keys are completely removed.
+    // User A's committed posted_reload marker is removed on sign-out,
+    // while unresolved pins remain durable under User A's key prefix.
     expect(
-      Object.keys(localStorage).some((k) =>
-        k.startsWith(userStoragePrefix('user-a')),
+      localStorage.getItem(
+        `${userStoragePrefix('user-a')}posted:${encodeURIComponent('sort:new')}:${encodeURIComponent('req-sort-resolved')}`,
       ),
-    ).toBe(false);
+    ).toBeNull();
+    expect(
+      JSON.parse(
+        localStorage.getItem(
+          `${userStoragePrefix('user-a')}${encodeURIComponent('count:daily')}`,
+        ) ?? 'null',
+      ),
+    ).toMatchObject({ requestId: countA.requestId });
+    expect(
+      JSON.parse(
+        localStorage.getItem(
+          `${userStoragePrefix('user-a')}${encodeURIComponent('expense:new')}`,
+        ) ?? 'null',
+      ),
+    ).toMatchObject({ requestId: expenseA.requestId });
     // User B's keys and unrelated keys remain untouched.
     expect(
       Object.keys(localStorage).some((k) =>
@@ -221,6 +257,11 @@ describe('held-writes store', () => {
     beginHeldWrite('count:daily', (requestId) => ({ requestId, qty: '1' }));
     expect(getHeldWrite('count:daily')).toBeNull();
 
+    // Another user signing in sees only their own pins, never User A's.
+    setHeldWriteUser('user-b');
+    expect(getHeldWrite<{ qty: string }>('count:daily')?.payload.qty).toBe('9');
+    expect(getHeldWrite('expense:new')).toBeNull();
+
     // Explicit cleanup helper also isolates by user.
     clearHeldWritesForUser('user-b');
     expect(
@@ -228,6 +269,11 @@ describe('held-writes store', () => {
         k.startsWith(userStoragePrefix('user-b')),
       ),
     ).toBe(false);
+    expect(
+      localStorage.getItem(
+        `${userStoragePrefix('user-a')}${encodeURIComponent('count:daily')}`,
+      ),
+    ).not.toBeNull();
   });
 
   it('P2-4: degrades safely on reads when localStorage throws or has corrupt data, and reports write failure so writers refuse to send', async () => {
@@ -640,8 +686,8 @@ describe('held-writes store', () => {
       tab2.dispose();
     }
 
-    // Fallback when navigator.locks is missing: inflight promotes to unknown on hydration,
-    // and claimFreshHeldWrite still refuses an existing unresolved pin via storage re-read.
+    // When navigator.locks is unavailable, durable claims MUST fail closed instead
+    // of granting non-atomic localStorage access across tabs.
     localStorage.clear();
     const fallbackA = createHeldWriteStore({ getLocks: () => null });
     const fallbackB = createHeldWriteStore({ getLocks: () => null });
@@ -651,18 +697,14 @@ describe('held-writes store', () => {
         'count:daily',
         (requestId) => ({ requestId }),
       );
-      expect(claimed.ok).toBe(true);
-      if (claimed.ok) claimed.release();
+      expect(claimed).toEqual({ ok: false, reason: 'storage' });
 
       fallbackB.setHeldWriteUser('user-a');
-      expect(fallbackB.getHeldWrite('count:daily')?.phase).toBe('unknown');
-
       const refused = await fallbackB.claimFreshHeldWrite(
         'count:daily',
         (requestId) => ({ requestId }),
       );
-      expect(refused.ok).toBe(false);
-      if (!refused.ok) expect(refused.reason).toBe('conflict');
+      expect(refused).toEqual({ ok: false, reason: 'storage' });
     } finally {
       fallbackA.dispose();
       fallbackB.dispose();
@@ -670,6 +712,12 @@ describe('held-writes store', () => {
   });
 
   it('R4-2: failed posted_reload storage write keeps the old durable inflight pin and throws HeldWriteStorageError', async () => {
+    const { locks } = makeAuditedLocks();
+    const origLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: locks,
+    });
     const { HeldWriteStorageError, claimFreshHeldWrite } =
       await import('@/lib/held-writes');
     setHeldWriteUser('user-a');
@@ -680,30 +728,38 @@ describe('held-writes store', () => {
     );
     expect(claimed.ok).toBe(true);
     if (!claimed.ok) return;
-    const reqId = claimed.record.requestId;
-    claimed.release();
+    try {
+      const reqId = claimed.record.requestId;
 
-    const activeKey = `${userStoragePrefix('user-a')}${encodeURIComponent('purchase:new')}`;
-    expect(localStorage.getItem(activeKey)).not.toBeNull();
+      const activeKey = `${userStoragePrefix('user-a')}${encodeURIComponent('purchase:new')}`;
+      expect(localStorage.getItem(activeKey)).not.toBeNull();
 
-    // Simulate quota error when writing the replacement posted_reload key.
-    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
-      throw new Error('QuotaExceededError');
-    });
+      // Simulate quota error when writing the replacement posted_reload key.
+      vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+        throw new Error('QuotaExceededError');
+      });
 
-    expect(() =>
-      setHeldWritePhase('purchase:new', reqId, 'posted_reload', {
-        readTarget: 'purchase:new',
-      }),
-    ).toThrow(HeldWriteStorageError);
+      expect(() =>
+        setHeldWritePhase('purchase:new', reqId, 'posted_reload', {
+          readTarget: 'purchase:new',
+        }),
+      ).toThrow(HeldWriteStorageError);
 
-    // The old durable inflight record MUST still exist in localStorage!
-    const remaining = localStorage.getItem(activeKey);
-    expect(remaining).not.toBeNull();
-    expect(JSON.parse(remaining ?? '{}')).toMatchObject({
-      requestId: reqId,
-      phase: 'inflight',
-    });
+      // The old durable inflight record MUST still exist in localStorage!
+      const remaining = localStorage.getItem(activeKey);
+      expect(remaining).not.toBeNull();
+      expect(JSON.parse(remaining ?? '{}')).toMatchObject({
+        requestId: reqId,
+        phase: 'inflight',
+      });
+    } finally {
+      claimed.release();
+      if (origLocks) {
+        Object.defineProperty(navigator, 'locks', origLocks);
+      } else {
+        Reflect.deleteProperty(navigator, 'locks');
+      }
+    }
   });
 
   it('R4-4a: async claims reject if user signs out and re-signs in as same user OR goes offline during lock acquisition', async () => {
@@ -962,9 +1018,10 @@ describe('held-writes store', () => {
         values.delete(key);
       },
     };
+    const { locks } = makeAuditedLocks();
     const store = createHeldWriteStore({
       getStorage: () => storage,
-      getLocks: () => null,
+      getLocks: () => locks,
       getProjectUrl: () => 'https://example.invalid',
       allowTestLocalUser: false,
     });
@@ -1073,6 +1130,12 @@ describe('held-writes store', () => {
   });
 
   it('R20-1a: same-session SIGNED_IN reconfirmation preserves write settlement while sign-out and session switches reject late settlement', async () => {
+    const { locks } = makeAuditedLocks();
+    const origLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: locks,
+    });
     const makeSyntheticJwt = (payload: Record<string, unknown>): string => {
       const encode = (value: Record<string, unknown>) =>
         btoa(
@@ -1194,7 +1257,11 @@ describe('held-writes store', () => {
     ).toBe(false);
 
     // 4. Sign-out followed by re-sign-in as the same user (even with identical token) must reject late settlement.
+    await Promise.resolve();
     clearHeldWritesForUser('owner-a');
+    await vi.waitFor(() => {
+      expect(localStorage.length).toBe(0);
+    });
     rehydrateHeldWrites();
     const claim4 = await claimFreshHeldWrite(
       'count:daily',
@@ -1219,6 +1286,13 @@ describe('held-writes store', () => {
     expect(
       hasPostedReload('count:daily', undefined, claim4.record.requestId),
     ).toBe(false);
+    // Unresolved pin from claim4 stayed durable across sign-out; clear before case 5.
+    await Promise.resolve();
+    clearHeldWritesForUser('owner-a');
+    await vi.waitFor(() => {
+      expect(localStorage.length).toBe(0);
+    });
+    rehydrateHeldWrites();
 
     // 5. Direct cross-user SIGNED_IN must reject late settlement.
     const claim5 = await claimFreshHeldWrite(
@@ -1305,5 +1379,249 @@ describe('held-writes store', () => {
     expect(
       hasPostedReload('count:daily', undefined, claim7.record.requestId),
     ).toBe(false);
+    if (origLocks) {
+      Object.defineProperty(navigator, 'locks', origLocks);
+    } else {
+      Reflect.deleteProperty(navigator, 'locks');
+    }
+  });
+
+  it('P1: signOut keeps writes and PWA reload locked during refocus while logout is pending, and preserves unresolved pins per user across sign-out while isolating other users', async () => {
+    const { locks } = makeAuditedLocks();
+    const origLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: locks,
+    });
+    const emitAuth = (event: string, session: Session) => {
+      authMock.session = session;
+      for (const listener of [...authMock.listeners]) {
+        listener(event, session);
+      }
+    };
+    const sessionA: NonNullable<Session> = {
+      user: { id: 'owner-a', email: 'a@theshark.test' },
+      access_token: 'tok-a-1',
+      refresh_token: 'rt-a-1',
+    };
+    let resolveSignOut!: () => void;
+    const supabaseMod = await import('@/lib/supabase');
+    const signOutSpy = vi
+      .spyOn(supabaseMod.supabase!.auth, 'signOut')
+      .mockImplementationOnce(
+        () =>
+          new Promise<{ error: null }>((resolve) => {
+            resolveSignOut = () => {
+              emitAuth('SIGNED_OUT', null);
+              resolve({ error: null });
+            };
+          }),
+      );
+
+    try {
+      authMock.session = sessionA;
+      startAuth();
+      setPwaAuthResolved(true);
+      const postMessage = vi.fn();
+      const reload = vi.fn();
+      setTestWaitingWorker({ postMessage } as unknown as ServiceWorker);
+
+      // Owner A has an unresolved purchase pin and a resolved posted_reload pin.
+      const purchaseClaim = await claimFreshHeldWrite(
+        'purchase:new',
+        (requestId) => ({ requestId, supplier: 'مورد أ' }),
+        { requestId: 'req-purch-p1', kind: 'purchase' },
+      );
+      expect(purchaseClaim.ok).toBe(true);
+      if (!purchaseClaim.ok) return;
+      setHeldWritePhase('purchase:new', 'req-purch-p1', 'unknown');
+      purchaseClaim.release();
+
+      const sortClaim = await claimFreshHeldWrite(
+        'sort:new',
+        (requestId) => ({ requestId }),
+        { requestId: 'req-sort-p1', kind: 'sort' },
+      );
+      expect(sortClaim.ok).toBe(true);
+      if (!sortClaim.ok) return;
+      setHeldWritePhase('sort:new', 'req-sort-p1', 'posted_reload');
+      sortClaim.release();
+
+      const pendingLogout = signOut();
+
+      // While logout is pending, PWA reload MUST stay locked even if authResolved is passed.
+      expect(applyPwaUpdate(reload, { authResolved: true })).toBe(false);
+      expect(postMessage).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
+
+      // A same-session refocus firing SIGNED_IN while logout is pending MUST NOT reopen writes or PWA reload.
+      emitAuth('SIGNED_IN', { ...sessionA });
+      expect(getAuthSnapshot().status).toBe('signed-out');
+      expect(getHeldWrite('purchase:new')).toBeNull();
+      const blockedDuringLogout = await claimFreshHeldWrite(
+        'count:daily',
+        (requestId) => ({ requestId }),
+      );
+      expect(blockedDuringLogout).toEqual({ ok: false, reason: 'signed_out' });
+      expect(applyPwaUpdate(reload, { authResolved: true })).toBe(false);
+
+      resolveSignOut();
+      await pendingLogout;
+
+      // Resolved posted_reload pin was cleared on sign-out, while unresolved purchase pin stayed durable.
+      const purchaseKey = `${userStoragePrefix('owner-a')}${encodeURIComponent('purchase:new')}`;
+      const sortPostedKey = `${userStoragePrefix('owner-a')}posted:${encodeURIComponent('sort:new')}:${encodeURIComponent('req-sort-p1')}`;
+      expect(localStorage.getItem(sortPostedKey)).toBeNull();
+      expect(
+        JSON.parse(localStorage.getItem(purchaseKey) ?? 'null'),
+      ).toMatchObject({
+        subject: 'purchase:new',
+        requestId: 'req-purch-p1',
+        phase: 'unknown',
+      });
+
+      // Another user signing in cannot read owner-a's unresolved pin.
+      emitAuth('SIGNED_IN', {
+        user: { id: 'owner-b', email: 'b@theshark.test' },
+        access_token: 'tok-b-1',
+        refresh_token: 'rt-b-1',
+      });
+      expect(getHeldWrite('purchase:new')).toBeNull();
+
+      // When owner-a signs back in, the original requestId is restored and blocks fresh duplicate submits.
+      emitAuth('SIGNED_IN', {
+        user: { id: 'owner-a', email: 'a@theshark.test' },
+        access_token: 'tok-a-2',
+        refresh_token: 'rt-a-2',
+      });
+      await rehydrateHeldWritesAsync();
+      expect(getHeldWrite('purchase:new')).toMatchObject({
+        requestId: 'req-purch-p1',
+        phase: 'unknown',
+      });
+      const dupFresh = await claimFreshHeldWrite(
+        'purchase:new',
+        (requestId) => ({ requestId }),
+        { requestId: 'req-purch-dup' },
+      );
+      expect(dupFresh).toMatchObject({ ok: false, reason: 'conflict' });
+      const safeReplay = await claimReplayHeldWrite(
+        'purchase:new',
+        'req-purch-p1',
+      );
+      expect(safeReplay.ok).toBe(true);
+      if (safeReplay.ok) safeReplay.release();
+    } finally {
+      signOutSpy.mockRestore();
+      resetPwaState();
+      if (origLocks) {
+        Object.defineProperty(navigator, 'locks', origLocks);
+      } else {
+        Reflect.deleteProperty(navigator, 'locks');
+      }
+    }
+  });
+
+  it('P2: surviving tab queues exact-claim recheck on storage sync so inflight promotes to unknown when writer releases lock without another storage event', async () => {
+    const { client } = makeAuditedLocks();
+    const tab1 = createHeldWriteStore({ getLocks: () => client('writer-tab') });
+    const tab2 = createHeldWriteStore({
+      getLocks: () => client('surviving-tab'),
+    });
+    try {
+      tab1.setHeldWriteUser('user-a');
+      tab2.setHeldWriteUser('user-a');
+
+      const claim = await tab1.claimFreshHeldWrite(
+        'purchase:new',
+        (requestId) => ({ requestId, supplier: 'مورد' }),
+        { requestId: 'req-survive-1', kind: 'purchase' },
+      );
+      expect(claim.ok).toBe(true);
+      if (!claim.ok) return;
+
+      // Deliver the storage event to tab2 while tab1 still holds the subject lock.
+      window.dispatchEvent(
+        new StorageEvent('storage', {
+          key: `${userStoragePrefix('user-a')}${encodeURIComponent('purchase:new')}`,
+        }),
+      );
+      expect(tab2.getHeldWrite('purchase:new')).toMatchObject({
+        requestId: 'req-survive-1',
+        phase: 'inflight',
+      });
+
+      const listener = vi.fn();
+      const unsub = tab2.subscribeHeldWritesStore(listener);
+      try {
+        // Writer tab closes/crashes and releases its lock WITHOUT firing another storage event.
+        tab1.dispose();
+
+        await vi.waitFor(() => {
+          expect(tab2.getHeldWrite('purchase:new')).toMatchObject({
+            requestId: 'req-survive-1',
+            phase: 'unknown',
+          });
+        });
+        expect(listener).toHaveBeenCalled();
+      } finally {
+        unsub();
+      }
+    } finally {
+      tab1.dispose();
+      tab2.dispose();
+    }
+  });
+
+  it('P2: durable claims fail closed when Web Locks are unavailable instead of granting non-atomic access', async () => {
+    const store = createHeldWriteStore({ getLocks: () => null });
+    try {
+      store.setHeldWriteUser('user-a');
+
+      const fresh = await store.claimFreshHeldWrite(
+        'purchase:new',
+        (requestId) => ({ requestId }),
+        { kind: 'purchase' },
+      );
+      expect(fresh).toEqual({ ok: false, reason: 'storage' });
+      expect(store.getHeldWrite('purchase:new')).toBeNull();
+      expect(localStorage.length).toBe(0);
+
+      // Even if a pre-existing unknown pin exists in storage, replay claim fails closed without Web Locks.
+      localStorage.setItem(
+        `${userStoragePrefix('user-a')}${encodeURIComponent('purchase:new')}`,
+        JSON.stringify({
+          v: 1,
+          subject: 'purchase:new',
+          requestId: 'req-no-locks',
+          payload: { requestId: 'req-no-locks' },
+          phase: 'unknown',
+        }),
+      );
+      store.rehydrateHeldWrites();
+      const replay = await store.claimReplayHeldWrite(
+        'purchase:new',
+        'req-no-locks',
+      );
+      expect(replay).toEqual({ ok: false, reason: 'storage' });
+
+      const lockAttempt = await store.acquireHeldWriteLock('purchase:new');
+      expect(lockAttempt).toEqual({ acquired: false, reason: 'storage' });
+    } finally {
+      store.dispose();
+    }
+
+    // Production builds (`allowTestUnlocked: false`) fail closed on defaultLocks when navigator.locks is absent.
+    const prodStore = createHeldWriteStore({ allowTestUnlocked: false });
+    try {
+      prodStore.setHeldWriteUser('user-a');
+      expect(
+        await prodStore.claimFreshHeldWrite('sort:new', (requestId) => ({
+          requestId,
+        })),
+      ).toEqual({ ok: false, reason: 'storage' });
+    } finally {
+      prodStore.dispose();
+    }
   });
 });

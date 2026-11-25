@@ -628,8 +628,9 @@ describe('P7-3 review fixes', () => {
     const itemClaim = await claimFreshAction(itemSubj, (id) => id);
     expect(itemClaim.ok).toBe(true);
     if (!itemClaim.ok) return;
-    itemClaim.release();
     settleAction(itemSubj, itemClaim.record.requestId, new Error('socket'));
+    itemClaim.release();
+    await Promise.resolve();
     rehydrateHeldWrites();
 
     const onItemSubmit = vi.fn(() => Promise.resolve(true));
@@ -656,8 +657,9 @@ describe('P7-3 review fixes', () => {
     const recClaim = await claimFreshAction(recSubj, (id) => id);
     expect(recClaim.ok).toBe(true);
     if (!recClaim.ok) return;
-    recClaim.release();
     settleAction(recSubj, recClaim.record.requestId, new Error('socket'));
+    recClaim.release();
+    await Promise.resolve();
     rehydrateHeldWrites();
 
     const recView = render(

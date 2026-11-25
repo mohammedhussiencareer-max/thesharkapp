@@ -11,6 +11,7 @@ const auditedWriterSuites = new Set([
   'accounting/ProcessingPanel.test.tsx',
   'accounting/activation-action.test.tsx',
   'items/ConversionsPanel.test.tsx',
+  'items/ItemList.test.tsx',
   'items/api.test.ts',
   'mapping/SubjectPanel.test.tsx',
   'order-decisions/DecisionCard.test.tsx',
@@ -33,7 +34,20 @@ const auditedWriterSuites = new Set([
   'pwa/pwa-held-writes.test.tsx',
   'recipes/api.test.ts',
 ]);
+const suitesWithDefaultLocks = new Set([
+  ...auditedWriterSuites,
+  'pwa/p7-3-requestless-writers.test.tsx',
+  'pwa/p7-3-review-fixes.test.tsx',
+  'pwa/p7-3-round3-fixes.test.tsx',
+  'pwa/p7-3-round4-fixes.test.tsx',
+  'pwa/p7-3-round5-fixes.test.tsx',
+  'pwa/p7-3-round6-fixes.test.tsx',
+  'pwa/p7-3-round8-fixes.test.tsx',
+  'pwa/p7-3-round9-fixes.test.tsx',
+  'pwa/p7-3-round10-fixes.test.tsx',
+]);
 let audit: ReturnType<typeof makeAuditedLocks> | undefined;
+let enforceNestingAudit = false;
 let originalLocks: PropertyDescriptor | undefined;
 let auditedNavigator: Navigator | undefined;
 
@@ -43,8 +57,9 @@ beforeEach(() => {
     .testPath?.replaceAll('\\', '/')
     .split('/src/')
     .at(-1);
-  if (!path || !auditedWriterSuites.has(path)) return;
+  if (!path || !suitesWithDefaultLocks.has(path)) return;
   audit = makeAuditedLocks();
+  enforceNestingAudit = auditedWriterSuites.has(path);
   auditedNavigator = navigator;
   originalLocks = Object.getOwnPropertyDescriptor(auditedNavigator, 'locks');
   Object.defineProperty(auditedNavigator, 'locks', {
@@ -58,7 +73,7 @@ afterEach(() => {
     cleanup();
     resetHeldWritesStore({ clearStorage: true, resetUser: true });
     resetPwaState();
-    if (audit)
+    if (audit && enforceNestingAudit)
       expect(
         audit.nested,
         'writer requested another subject lock before releasing its current subject',
@@ -71,5 +86,6 @@ afterEach(() => {
     }
     auditedNavigator = undefined;
     audit = undefined;
+    enforceNestingAudit = false;
   }
 });

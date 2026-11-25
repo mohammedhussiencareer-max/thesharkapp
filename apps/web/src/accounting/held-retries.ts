@@ -5,6 +5,7 @@ import { listHeldWritesByPrefix } from '@/lib/held-writes';
 export type RetryHeld = {
   requestId: string;
   orderId: string;
+  workGeneration?: number;
 };
 
 const RETRY_PREFIX = 'accounting:retry:';

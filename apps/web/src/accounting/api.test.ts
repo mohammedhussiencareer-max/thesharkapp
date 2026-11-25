@@ -600,6 +600,15 @@ describe('accounting mappers', () => {
     });
   });
 
+  it('P2: retryParkedOrder sends p_work_generation and accepts stale status', async () => {
+    mocks.rpc.mockResolvedValueOnce(ok({ status: 'stale' }));
+    await expect(retryParkedOrder('order-1', 2)).resolves.toBe('stale');
+    expect(mocks.rpc).toHaveBeenCalledWith('retry_accounting_work', {
+      p_order_id: 'order-1',
+      p_work_generation: 2,
+    });
+  });
+
   it('P1-3: recordRunFailure reconciles an interrupted attempt with null failureKind via record_accounting_call_failure instead of throwing', async () => {
     const { recordRunFailure } = await import('@/accounting/api');
     mocks.rpc.mockResolvedValueOnce(ok({ status: 'committed' }));

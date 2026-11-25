@@ -386,25 +386,41 @@ describe('P7-3 round-9 review fixes', () => {
       if (!claim.ok) return;
       const reqId = claim.record.requestId;
       claim.release();
+      await Promise.resolve();
 
-      // Another tab clears the durable record from localStorage directly (before storage event fires in tab1).
-      const durable = tab2.readLockedHeldWrite('purchase:new');
-      expect(durable?.requestId).toBe(reqId);
-      tab2.clearHeldWrite('purchase:new', reqId, durable ?? undefined);
-      expect(localStorage.length).toBe(0);
+      // Another tab acquires the lock and clears the durable record (before storage event fires in tab1).
+      const tab2Lock = await tab2.acquireHeldWriteLock('purchase:new');
+      expect(tab2Lock.acquired).toBe(true);
+      if (!tab2Lock.acquired) return;
+      try {
+        const durable = tab2.readLockedHeldWrite('purchase:new');
+        expect(durable?.requestId).toBe(reqId);
+        tab2.clearHeldWrite('purchase:new', reqId, durable ?? undefined);
+        expect(localStorage.length).toBe(0);
+      } finally {
+        tab2Lock.release();
+      }
+      await Promise.resolve();
 
-      // Tab 1 attempts to update phase or payload -> MUST re-read durable storage and skip (NOT resurrect!).
-      tab1.setHeldWritePhase('purchase:new', reqId, 'unknown');
-      expect(localStorage.length).toBe(0);
-      expect(tab1.getHeldWrite('purchase:new')).toBeNull();
+      // Tab 1 attempts to update phase or payload under lock -> MUST re-read durable storage and skip (NOT resurrect!).
+      const tab1Lock = await tab1.acquireHeldWriteLock('purchase:new');
+      expect(tab1Lock.acquired).toBe(true);
+      if (!tab1Lock.acquired) return;
+      try {
+        tab1.setHeldWritePhase('purchase:new', reqId, 'unknown');
+        expect(localStorage.length).toBe(0);
+        expect(tab1.getHeldWrite('purchase:new')).toBeNull();
+
+        tab1.updateHeldWritePayload('purchase:new', reqId, {
+          requestId: reqId,
+          total: 200,
+        });
+        expect(localStorage.length).toBe(0);
+        expect(tab1.getHeldWrite('purchase:new')).toBeNull();
+      } finally {
+        tab1Lock.release();
+      }
       expect(tab1.hasAnyHeldWrite()).toBe(false);
-
-      tab1.updateHeldWritePayload('purchase:new', reqId, {
-        requestId: reqId,
-        total: 200,
-      });
-      expect(localStorage.length).toBe(0);
-      expect(tab1.getHeldWrite('purchase:new')).toBeNull();
     } finally {
       tab1.dispose();
       tab2.dispose();

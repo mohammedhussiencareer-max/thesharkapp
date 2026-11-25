@@ -39,11 +39,7 @@ import {
   listUnitOptions,
 } from '@/items/api';
 import { ConversionsPanel } from '@/items/ConversionsPanel';
-import {
-  createSubject,
-  markActionPostedReload,
-  resetHeldWrites,
-} from '@/items/request-id';
+import { createSubject, resetHeldWrites } from '@/items/request-id';
 import type { CatalogItem, ItemDraft } from '@/items/types';
 import { cairoMonthInput } from '@/lib/cairo';
 import {
@@ -737,17 +733,10 @@ describe('P7-3 round-5 review fixes', () => {
     const subject = decisionSubject(closedOrderId);
     putHeldWrite(subject, {
       requestId: 'req-closed-99',
-      payload: {
-        requestId: 'req-closed-99',
-        orderId: closedOrderId,
-        decision: 'made',
-        token: 'tok-1',
-        reason: null,
-        returned: null,
-      },
-      phase: 'inflight',
+      payload: null,
+      phase: 'posted_reload',
+      readTarget: subject,
     });
-    markActionPostedReload(subject, 'req-closed-99', subject);
     rehydrateHeldWrites();
 
     vi.mocked(loadUnlinkedRefunds).mockResolvedValue([]);

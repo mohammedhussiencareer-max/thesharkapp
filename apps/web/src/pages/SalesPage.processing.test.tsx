@@ -536,8 +536,8 @@ describe('SalesPage processing refresh', () => {
     expect(screen.queryByText('order-parked')).toBeNull();
     expect(screen.queryByRole('button', { name: 'إعادة المحاولة' })).toBeNull();
     expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
-    expect(retryParkedOrder).toHaveBeenNthCalledWith(1, 'order-parked');
-    expect(retryParkedOrder).toHaveBeenNthCalledWith(2, 'order-parked');
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(1, 'order-parked', 2);
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(2, 'order-parked', 2);
     expect(retryParkedOrder).toHaveBeenCalledTimes(2);
   });
 });

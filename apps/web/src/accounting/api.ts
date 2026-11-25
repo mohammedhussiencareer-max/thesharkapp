@@ -651,13 +651,14 @@ export function failureReportOf(value: unknown): FailureReport {
   return row.status as FailureReport;
 }
 
-export function retryResultOf(
-  value: unknown,
-): 'retried' | 'not_failed' | 'busy' {
+export type RetryOrderStatus = 'retried' | 'not_failed' | 'stale' | 'busy';
+
+export function retryResultOf(value: unknown): RetryOrderStatus {
   const row = record(value);
   if (
     row.status !== 'retried' &&
     row.status !== 'not_failed' &&
+    row.status !== 'stale' &&
     row.status !== 'busy'
   ) {
     bad();
@@ -895,8 +896,14 @@ export async function activateInventory(
 
 export async function retryParkedOrder(
   orderId: string,
-): Promise<'retried' | 'not_failed' | 'busy'> {
+  workGeneration?: number,
+): Promise<RetryOrderStatus> {
   return retryResultOf(
-    await writeRpc('retry_accounting_work', { p_order_id: orderId }),
+    await writeRpc('retry_accounting_work', {
+      p_order_id: orderId,
+      ...(workGeneration !== undefined
+        ? { p_work_generation: workGeneration }
+        : {}),
+    }),
   );
 }

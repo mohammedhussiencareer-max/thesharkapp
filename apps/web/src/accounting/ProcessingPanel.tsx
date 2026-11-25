@@ -50,12 +50,13 @@ import {
   type WriteSession,
 } from '@/lib/held-writes';
 import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
-import { isDefiniteRefusal } from '@/lib/write-outcome';
+import { isDefiniteRefusal, isPayloadRefusal } from '@/lib/write-outcome';
 import { primaryButton, secondaryButton } from '@/lib/page-style';
 
 const recordedNotice = 'اتسجل إن المكالمة اتقطعت';
 const busyNotice = 'الحساب مشغول، حاول تاني';
 const notFailedNotice = 'الطلب مش متوقف';
+const staleRetryNotice = 'حالة الطلب اتغيرت — راجع الطلبات المتوقفة';
 const retriedNotice = 'الطلب رجع للشغل';
 const dormantNotice = 'الخصم لسه ما اتفعّلش. التشغيل بيرجع من غير ما يكتب.';
 
@@ -344,12 +345,16 @@ export function ProcessingPanel({
     setRunning(true);
     setNotice(null);
     try {
-      let status: 'retried' | 'not_failed' | 'busy';
+      let status: 'retried' | 'not_failed' | 'stale' | 'busy';
       let persisted = false;
       try {
-        status = await retryParkedOrder(action.orderId);
+        status = await retryParkedOrder(action.orderId, action.workGeneration);
         if (status === 'busy') {
-          settleAction(subject, action.requestId);
+          if (isReplay) {
+            setHeldWritePhase(subject, action.requestId, 'unknown');
+          } else {
+            settleAction(subject, action.requestId);
+          }
           setNotice(busyNotice);
           return;
         }
@@ -357,7 +362,7 @@ export function ProcessingPanel({
         markActionPostedReload(subject, action.requestId, subject);
       } catch (error) {
         if (!persisted) {
-          if (isDefiniteRefusal(error)) {
+          if (isReplay ? isPayloadRefusal(error) : isDefiniteRefusal(error)) {
             retireRefusal(subject, action.requestId, error);
           } else {
             settleAction(subject, action.requestId, error);
@@ -366,7 +371,13 @@ export function ProcessingPanel({
         setNotice(messageFrom(error));
         return;
       }
-      setNotice(status === 'not_failed' ? notFailedNotice : retriedNotice);
+      setNotice(
+        status === 'not_failed'
+          ? notFailedNotice
+          : status === 'stale'
+            ? staleRetryNotice
+            : retriedNotice,
+      );
       publishAcknowledged();
     } finally {
       release();
@@ -450,12 +461,18 @@ export function ProcessingPanel({
   async function retryOrder(order: ParkedOrder): Promise<void> {
     const subject = accountingRetrySubject(order.orderId);
     if (flight.current || running || !isOnline() || hasAction(subject)) return;
+    const parsedGeneration = Number(order.workGeneration);
+    const workGeneration =
+      Number.isSafeInteger(parsedGeneration) && parsedGeneration >= 1
+        ? parsedGeneration
+        : undefined;
     const session = captureWriteSession();
     const claim = await claimFreshAction<RetryHeld>(
       subject,
       (requestId) => ({
         requestId,
         orderId: order.orderId,
+        ...(workGeneration !== undefined ? { workGeneration } : {}),
       }),
       { session },
     );

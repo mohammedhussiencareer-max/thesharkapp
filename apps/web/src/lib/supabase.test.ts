@@ -29,4 +29,27 @@ describe('readSupabaseEnv', () => {
       anonKey: 'anon-key',
     });
   });
+
+  it('P2: Supabase client requests enforce cache: no-store to bypass the browser HTTP cache', async () => {
+    vi.stubEnv('VITE_SUPABASE_URL', 'http://127.0.0.1:55421');
+    vi.stubEnv('VITE_SUPABASE_ANON_KEY', 'anon-key');
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(true), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+    try {
+      vi.resetModules();
+      const mod = await import('@/lib/supabase');
+      expect(mod.supabase).not.toBeNull();
+      await mod.supabase!.schema('app').rpc('is_owner');
+      expect(fetchSpy).toHaveBeenCalled();
+      const init = fetchSpy.mock.calls[0]?.[1];
+      expect(init?.cache).toBe('no-store');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

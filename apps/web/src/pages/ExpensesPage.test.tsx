@@ -30,6 +30,7 @@ import {
 } from '@/expenses/errors';
 import { genericCatalogError } from '@/items/errors';
 import { formatMonth } from '@/lib/cairo';
+import { hasPostedReload } from '@/lib/held-writes';
 import { formatEgpText } from '@/lib/money';
 import { ExpensesPage } from '@/pages/ExpensesPage';
 
@@ -1134,5 +1135,111 @@ describe('ExpensesPage', () => {
     await waitFor(() =>
       expect(addExpenseCategory).toHaveBeenCalledWith('كهربا', 'daily'),
     );
+  });
+
+  it('P2: void replay from another month verifies the original target month without overwriting displayed month and keeps verification available when that read fails', async () => {
+    const aprilEntry = entry({
+      id: 'exp-april',
+      periodMonth: '2030-04-01',
+      note: 'مصروف أبريل',
+    });
+    const mayEntry = entry({
+      id: 'exp-may',
+      periodMonth: '2030-05-01',
+      note: 'مصروف مايو',
+    });
+    vi.mocked(loadExpenseMonth).mockImplementation((targetMonth) => {
+      if (targetMonth === '2030-04-01') {
+        return Promise.resolve(
+          monthData('2030-04-01', { entries: [aprilEntry] }),
+        );
+      }
+      if (targetMonth === '2030-05-01') {
+        return Promise.resolve(
+          monthData('2030-05-01', { entries: [mayEntry] }),
+        );
+      }
+      return Promise.resolve(monthData(targetMonth, { entries: [] }));
+    });
+    renderPage();
+
+    const picker = await screen.findByLabelText('الشهر');
+    fireEvent.change(picker, { target: { value: '2030-04' } });
+    expect(await screen.findByText('مصروف أبريل')).toBeInTheDocument();
+
+    // Start void on April entry and drop reply so it stays pinned unknown.
+    vi.mocked(voidExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'إلغاء المصروف' }));
+    fireEvent.change(screen.getByLabelText('سبب الإلغاء'), {
+      target: { value: 'تكرار أبريل' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد الإلغاء' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      retrySafeMessage,
+    );
+
+    // Switch displayed month to May; pinned April card stays visible for replay.
+    fireEvent.change(screen.getByLabelText('الشهر'), {
+      target: { value: '2030-05' },
+    });
+    expect(await screen.findByText('مصروف مايو')).toBeInTheDocument();
+    const aprilCard = screen.getByRole('article', {
+      name: 'إيجار 1000.00 ج.م أبريل 2030',
+    });
+
+    // Replay void from May: void succeeds, first verification read for April fails, second succeeds.
+    vi.mocked(voidExpenseEntry).mockResolvedValueOnce(undefined);
+    let aprilVerifyCalls = 0;
+    vi.mocked(loadExpenseMonth).mockImplementation((targetMonth) => {
+      if (targetMonth === '2030-04-01') {
+        aprilVerifyCalls += 1;
+        if (aprilVerifyCalls === 1) {
+          return Promise.reject(new Error('تعذر تحميل أبريل'));
+        }
+        return Promise.resolve(
+          monthData('2030-04-01', {
+            entries: [
+              { ...aprilEntry, voided: true, voidReason: 'تكرار أبريل' },
+            ],
+          }),
+        );
+      }
+      if (targetMonth === '2030-05-01') {
+        return Promise.resolve(
+          monthData('2030-05-01', { entries: [mayEntry] }),
+        );
+      }
+      return Promise.resolve(monthData(targetMonth, { entries: [] }));
+    });
+
+    fireEvent.click(
+      within(aprilCard).getByRole('button', { name: 'إلغاء المصروف' }),
+    );
+    fireEvent.click(
+      within(aprilCard).getByRole('button', { name: 'تأكيد الإلغاء' }),
+    );
+
+    await waitFor(() => {
+      expect(aprilVerifyCalls).toBe(1);
+    });
+    // April posted_reload pin stays held because April read failed, and verification button is visible.
+    expect(hasPostedReload('expense:void:exp-april', '2030-04-01')).toBe(true);
+    const verifyBtn = await screen.findByRole('button', { name: 'تحقق تاني' });
+    expect(verifyBtn).toBeEnabled();
+    // Displayed month is still May and shows May's entry.
+    expect(screen.getByText('مصروف مايو')).toBeInTheDocument();
+
+    fireEvent.click(verifyBtn);
+    await waitFor(() => {
+      expect(hasPostedReload('expense:void:exp-april', '2030-04-01')).toBe(
+        false,
+      );
+    });
+    expect(aprilVerifyCalls).toBe(2);
+    // Visible data still shows May, NOT overwritten with April's entries.
+    expect(screen.getByText('مصروف مايو')).toBeInTheDocument();
+    expect(screen.queryByText('مصروف أبريل')).toBeNull();
   });
 });

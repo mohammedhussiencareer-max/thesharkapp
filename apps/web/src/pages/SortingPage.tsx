@@ -366,16 +366,23 @@ export function SortingPage() {
           </button>
         </div>
       ) : null}
-      {snapshot !== null && loadError ? (
+      {snapshot !== null &&
+      (loadError || (postedReload && !saving && loads === 0)) ? (
         <div className="flex flex-col gap-2">
-          {loadError !== filterError ? <p role="alert">{loadError}</p> : null}
+          {loadError ? (
+            loadError !== filterError ? (
+              <p role="alert">{loadError}</p>
+            ) : null
+          ) : (
+            <p role="status">في حفظ اتسجل ومحتاج تحديث قبل ما تكمل</p>
+          )}
           <button
             className={secondaryButton}
             type="button"
-            disabled={saving || loads > 0}
+            disabled={saving || loads > 0 || (!loadError && !online)}
             onClick={retry}
           >
-            إعادة المحاولة
+            {loadError ? 'إعادة المحاولة' : 'تحقق تاني'}
           </button>
         </div>
       ) : null}

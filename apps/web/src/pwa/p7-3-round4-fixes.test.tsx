@@ -870,14 +870,15 @@ describe('P7-3 round-4 review fixes', () => {
     await waitFor(() => {
       expect(voidExpenseEntry).toHaveBeenCalledTimes(2);
     });
-    // Wait for currentMonth's post-write reload to settle.
-    await new Promise((r) => setTimeout(r, 20));
-
-    // The void's posted_reload MUST still be held for `otherMonthStart` because
-    // only `currentMonthStart` was reloaded, NOT the voided expense's month!
-    expect(hasPostedReload('expense:void:exp-april', otherMonthStart)).toBe(
-      true,
-    );
+    // Wait for the original target month's post-write verification read to settle.
+    await waitFor(() => {
+      expect(loadExpenseMonth).toHaveBeenCalledWith(otherMonthStart);
+      expect(hasPostedReload('expense:void:exp-april', otherMonthStart)).toBe(
+        false,
+      );
+    });
+    // Displayed month data must NOT be overwritten by the verified off-month read.
+    expect(screen.getByText('مفيش مصاريف في الشهر ده')).toBeInTheDocument();
     expect(addExpenseEntry).not.toHaveBeenCalled();
   });
 

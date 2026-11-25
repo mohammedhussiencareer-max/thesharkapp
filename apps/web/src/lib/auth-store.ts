@@ -1,14 +1,14 @@
 import type { Session } from '@supabase/supabase-js';
 import {
   bumpSessionGeneration,
-  clearHeldWritesForUser,
+  clearResolvedHeldWritesForUser,
   isWritesLocked,
   rehydrateHeldWrites,
   resetHeldWritesStore,
   setHeldWriteUser,
   setWritesLocked,
 } from '@/lib/held-writes';
-import { setPwaAuthResolved } from '@/lib/pwa';
+import { setPwaAuthResolved, setPwaLogoutPending } from '@/lib/pwa';
 import { supabase } from '@/lib/supabase';
 import type { AuthStatus } from '@/lib/auth-context';
 
@@ -22,13 +22,19 @@ let started = false;
 let checkId = 0;
 let currentSession: Session | null = null;
 let lastUserId: string | null = null;
+let pendingSignOuts = 0;
+let pendingSignOutPromise: Promise<void> | null = null;
 let unsubscribeAuth: (() => void) | null = null;
 const listeners = new Set<() => void>();
 
 function emit(next: Snapshot) {
   if (snapshot.status === next.status && snapshot.email === next.email) return;
   snapshot = next;
-  setPwaAuthResolved(next.status !== 'loading' && next.status !== 'checking');
+  setPwaAuthResolved(
+    pendingSignOuts === 0 &&
+      next.status !== 'loading' &&
+      next.status !== 'checking',
+  );
   for (const listener of listeners) listener();
 }
 
@@ -155,12 +161,16 @@ export function startAuth() {
   } = client.auth.onAuthStateChange((event, session) => {
     const previousSession = currentSession;
     const previousUserId = previousSession?.user.id ?? lastUserId;
-    currentSession = session;
     if (!session) {
+      currentSession = null;
       setWritesLocked(true);
       bumpSessionGeneration();
       if (event === 'SIGNED_OUT' && previousUserId) {
-        clearHeldWritesForUser(previousUserId);
+        // Preserve unresolved per-user pins (inflight/unknown/waiting_for_sync)
+        // across sign-out so the same user can verify or replay with the original
+        // request id on next sign-in, while other users stay isolated by userId
+        // key prefix. Clear only already-committed posted_reload markers.
+        clearResolvedHeldWritesForUser(previousUserId);
       }
       lastUserId = null;
       setHeldWriteUser(null);
@@ -168,6 +178,15 @@ export function startAuth() {
       emit({ status: 'signed-out', email: null });
       return;
     }
+    if (pendingSignOuts > 0) {
+      // Local logout has not completed yet: ignore any refocus/reconfirmation
+      // session event so writes and PWA reload stay locked until logout finishes.
+      currentSession = null;
+      setWritesLocked(true);
+      setHeldWriteUser(null);
+      return;
+    }
+    currentSession = session;
     const wasWritesLocked = isWritesLocked();
     const sameSession =
       !wasWritesLocked &&
@@ -204,7 +223,11 @@ export function getAuthSnapshot(): Snapshot {
 }
 
 export function isAuthResolved(): boolean {
-  return snapshot.status !== 'loading' && snapshot.status !== 'checking';
+  return (
+    pendingSignOuts === 0 &&
+    snapshot.status !== 'loading' &&
+    snapshot.status !== 'checking'
+  );
 }
 
 export async function signIn(
@@ -213,6 +236,9 @@ export async function signIn(
 ): Promise<'ok' | 'invalid'> {
   const client = supabase;
   if (!client) return 'invalid';
+  if (pendingSignOutPromise) {
+    await pendingSignOutPromise.catch(() => {});
+  }
   const { error } = await client.auth.signInWithPassword({ email, password });
   if (error) return 'invalid';
   return 'ok';
@@ -222,18 +248,45 @@ export async function signOut() {
   const client = supabase;
   if (!client) return;
   const userId = currentSession?.user.id ?? lastUserId;
-  // Lock all writes and drop active session immediately, BEFORE clearing keys
-  // or awaiting the network sign-out call.
+  // Lock all writes and PWA reload immediately and keep them locked until local
+  // logout completes, ignoring any refocus session callbacks in the interim.
+  // Privacy trade-off: unresolved pins (inflight/unknown/waiting_for_sync) stay
+  // durable in localStorage scoped to `(projectUrl, userId)` across sign-out so
+  // the same user can verify or replay an ambiguous write with the same request
+  // id instead of double-posting it; other users cannot read them through the
+  // store because keys are partitioned per user. Only committed `posted_reload`
+  // markers are removed on sign-out.
+  pendingSignOuts += 1;
   setWritesLocked(true);
+  setPwaLogoutPending(true);
+  setPwaAuthResolved(false);
   currentSession = null;
   checkId += 1;
   emit({ status: 'signed-out', email: null });
   if (userId) {
-    clearHeldWritesForUser(userId);
+    clearResolvedHeldWritesForUser(userId);
   }
   lastUserId = null;
   setHeldWriteUser(null);
-  await client.auth.signOut();
+  let task: Promise<void> | null = null;
+  task = (async () => {
+    try {
+      await client.auth.signOut();
+    } finally {
+      pendingSignOuts = Math.max(0, pendingSignOuts - 1);
+      if (pendingSignOuts === 0) {
+        if (pendingSignOutPromise === task) {
+          pendingSignOutPromise = null;
+        }
+        setPwaLogoutPending(false);
+        setPwaAuthResolved(
+          snapshot.status !== 'loading' && snapshot.status !== 'checking',
+        );
+      }
+    }
+  })();
+  pendingSignOutPromise = task;
+  await task;
 }
 
 export function retryOwnerCheck() {
@@ -246,10 +299,13 @@ export function resetAuthStore() {
   checkId += 1;
   currentSession = null;
   lastUserId = null;
+  pendingSignOuts = 0;
+  pendingSignOutPromise = null;
   unsubscribeAuth?.();
   unsubscribeAuth = null;
   started = false;
   snapshot = { status: 'loading', email: null };
+  setPwaLogoutPending(false);
   setPwaAuthResolved(false);
   listeners.clear();
   resetHeldWritesStore({ clearStorage: false, resetUser: true });

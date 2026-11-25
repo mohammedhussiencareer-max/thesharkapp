@@ -49,7 +49,7 @@ import {
 import type { CatalogItem } from '@/items/types';
 import { cairoMonthInput } from '@/lib/cairo';
 import {
-  beginHeldWrite,
+  claimFreshHeldWrite,
   clearHeldWrite,
   getHeldWrite,
   hasPostedReload,
@@ -606,6 +606,7 @@ describe('P7-3 round-3 review fixes', () => {
     if (!first.ok) return;
     markActionPostedReload(subject, first.record.requestId, subject);
     first.release();
+    await Promise.resolve();
     expect(hasPostedReload(subject, subject)).toBe(true);
 
     const second = await claimFreshAction(subject, (requestId) => ({
@@ -1003,7 +1004,7 @@ describe('P7-3 round-3 review fixes', () => {
     expect(await screen.findByText(/زيت عباد/)).toBeInTheDocument();
   });
 
-  it('R3-6: deferred PWA reload does not get stuck if a pin appears between approval and controllerchange', () => {
+  it('R3-6: deferred PWA reload does not get stuck if a pin appears between approval and controllerchange', async () => {
     const swListeners = new Map<string, Array<() => void>>();
     const register = vi.fn().mockResolvedValue({
       waiting: null,
@@ -1040,16 +1041,98 @@ describe('P7-3 round-3 review fixes', () => {
       expect(postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
 
       // A pin appears before controllerchange fires!
-      const pin = beginHeldWrite('count:daily', (requestId) => ({ requestId }));
+      const pinClaim = await claimFreshHeldWrite(
+        'count:daily',
+        (requestId) => ({
+          requestId,
+        }),
+      );
+      expect(pinClaim.ok).toBe(true);
+      if (!pinClaim.ok) return;
       for (const fn of swListeners.get('controllerchange') ?? []) fn();
       // Reload MUST be skipped while pinned.
       expect(reload).not.toHaveBeenCalled();
 
       // Now the pin clears and owner clicks update again — worker already activated
       // so there will be NO second controllerchange!
-      clearHeldWrite('count:daily', pin.requestId);
+      clearHeldWrite('count:daily', pinClaim.record.requestId);
+      pinClaim.release();
       expect(applyPwaUpdate(reload, { authResolved: true })).toBe(true);
       expect(reload).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllEnvs();
+      if (originalSw) {
+        Object.defineProperty(navigator, 'serviceWorker', originalSw);
+      } else {
+        delete (navigator as unknown as { serviceWorker?: unknown })
+          .serviceWorker;
+      }
+    }
+  });
+
+  it('P2: reloads on next explicit click after another tab activates the waiting service worker, still gating on auth and held writes', async () => {
+    const swListeners = new Map<string, Array<() => void>>();
+    const register = vi.fn().mockResolvedValue({
+      waiting: null,
+      installing: null,
+      addEventListener: vi.fn(),
+    });
+    const originalSw = Object.getOwnPropertyDescriptor(
+      navigator,
+      'serviceWorker',
+    );
+    Object.defineProperty(navigator, 'serviceWorker', {
+      configurable: true,
+      value: {
+        register,
+        addEventListener: (event: string, fn: () => void) => {
+          const list = swListeners.get(event) ?? [];
+          list.push(fn);
+          swListeners.set(event, list);
+        },
+        controller: {},
+      },
+    });
+    vi.stubEnv('PROD', true);
+    vi.stubEnv('VITE_PWA', '1');
+
+    try {
+      const reload = vi.fn();
+      const postMessage = vi.fn();
+      initPwa(reload);
+      setPwaAuthResolved(true);
+      setTestWaitingWorker({
+        state: 'installed',
+        postMessage,
+      } as unknown as ServiceWorker);
+
+      // Another tab sends SKIP_WAITING -> controllerchange fires here WITHOUT reloadRequested!
+      for (const fn of swListeners.get('controllerchange') ?? []) fn();
+      // Never auto-reloads this tab.
+      expect(reload).not.toHaveBeenCalled();
+
+      // Still gates on auth and held writes before reloading.
+      const pinClaim = await claimFreshHeldWrite(
+        'count:daily',
+        (requestId) => ({
+          requestId,
+        }),
+      );
+      expect(pinClaim.ok).toBe(true);
+      if (!pinClaim.ok) return;
+      expect(applyPwaUpdate(reload, { authResolved: true })).toBe(false);
+      expect(reload).not.toHaveBeenCalled();
+      expect(postMessage).not.toHaveBeenCalled();
+
+      clearHeldWrite('count:daily', pinClaim.record.requestId);
+      pinClaim.release();
+      expect(applyPwaUpdate(reload, { authResolved: false })).toBe(false);
+      expect(reload).not.toHaveBeenCalled();
+
+      // Next explicit click with auth resolved and no held writes reloads directly without re-sending SKIP_WAITING.
+      expect(applyPwaUpdate(reload, { authResolved: true })).toBe(true);
+      expect(reload).toHaveBeenCalledTimes(1);
+      expect(postMessage).not.toHaveBeenCalled();
     } finally {
       vi.unstubAllEnvs();
       if (originalSw) {

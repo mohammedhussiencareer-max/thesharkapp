@@ -129,15 +129,16 @@ function Workspace({
   const [fileError, setFileError] = useState<string | null>(null);
   const [showIssues, setShowIssues] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [stale, setStale] = useState(() =>
-    hasPostedReload(recipeImportSubject),
-  );
+  const [refreshing, setRefreshing] = useState(false);
   const [reloadError, setReloadError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ImportResult | null>(null);
   const [pickerKey, setPickerKey] = useState(0);
   const flight = useRef(false);
   const held = heldEpoch < 0 ? null : unknownAction<ImportAction>(subject);
+  const postedReload =
+    heldEpoch < 0 ? false : hasPostedReload(recipeImportSubject);
+  const stale = postedReload || refreshing;
   const disabled = saving || reading || stale || held !== null || !online;
   const timing = useDatedTiming(
     undefined,
@@ -197,6 +198,7 @@ function Workspace({
   }
 
   async function refresh() {
+    setRefreshing(true);
     setReloadError(null);
     const pendingReloads = snapshotActionPostedReloads({
       subject: recipeImportSubject,
@@ -207,9 +209,10 @@ function Workspace({
         pendingReloads,
         recipeImportSubject,
       );
-      setStale(false);
     } catch (failure) {
       setReloadError(messageFrom(failure) || genericCatalogError);
+    } finally {
+      setRefreshing(false);
     }
   }
 
@@ -254,7 +257,6 @@ function Workspace({
     setLoaded(null);
     setShowIssues(false);
     setPickerKey((value) => value + 1);
-    setStale(true);
     flight.current = false;
     setSaving(false);
     await refresh();
@@ -383,7 +385,19 @@ function Workspace({
         </section>
       ) : null}
       {stale && reloadError === null ? (
-        <p role="status">جاري تحديث بيانات الوصفات قبل استيراد جديد…</p>
+        <div className="flex flex-col gap-2">
+          <p role="status">جاري تحديث بيانات الوصفات قبل استيراد جديد…</p>
+          {postedReload && !refreshing ? (
+            <button
+              className={secondaryButton}
+              type="button"
+              disabled={saving || !online}
+              onClick={() => void refresh()}
+            >
+              حدّث البيانات
+            </button>
+          ) : null}
+        </div>
       ) : null}
       {stale && reloadError !== null ? (
         <div className="flex flex-col gap-2">
@@ -391,6 +405,7 @@ function Workspace({
           <button
             className={secondaryButton}
             type="button"
+            disabled={saving || refreshing || !online}
             onClick={() => void refresh()}
           >
             حدّث البيانات
