@@ -403,7 +403,7 @@ describe('owner access', () => {
     expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
     expect(
       await freshAuthStore.signIn('owner@theshark.test', 'ValidPassword123'),
-    ).toBe('invalid');
+    ).toBe('failed');
 
     // Retrying logout after connectivity returns removes local credentials and clears the guard.
     authState.signOutError = null;
@@ -1012,6 +1012,17 @@ describe('production GoTrueClient UI integration (hasDirectRevocationTransport =
       view1.unmount();
       storeMod1.resetAuthStore({ clearStorage: false });
 
+      // Simulate the abandoned owner's lease expiring (>10s since last heartbeat)
+      // before reload (under P3-2, a fresh no-locks pending stays in signing_out
+      // while the owner's lease is active so a second tab cannot interrupt a live logout).
+      const pendingRaw = JSON.parse(
+        window.localStorage.getItem(coordKey) ?? 'null',
+      ) as Record<string, unknown> | null;
+      if (pendingRaw && typeof pendingRaw.heartbeatAt === 'number') {
+        pendingRaw.heartbeatAt = Date.now() - 15_000;
+        window.localStorage.setItem(coordKey, JSON.stringify(pendingRaw));
+      }
+
       // Simulate reload while coordKey is still state:'pending' (P1-1)!
       vi.resetModules();
       const clientReloaded = createClient(url, anonKey, {
@@ -1072,6 +1083,7 @@ describe('production GoTrueClient UI integration (hasDirectRevocationTransport =
         ownerTabId: 'other-tab',
         state: 'pending',
         sessionKey: 'sid:sid-ui-2',
+        heartbeatAt: Date.now(),
       });
       window.localStorage.setItem(coordKey, pendingCoord);
       act(() => {
