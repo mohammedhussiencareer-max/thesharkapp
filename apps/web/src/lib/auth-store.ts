@@ -3241,12 +3241,19 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
           (incomingKey !== null &&
             persistedKeyInStorage !== null &&
             persistedKeyInStorage !== incomingKey));
+      // DELTA19 model: A logout coord with sessionKey === null (e.g. from an
+      // empty-storage signOut) must never act as a wildcard that evicts a
+      // concrete persisted session (sid:/at:). Only match null against null or
+      // non-JWT mock sessions.
       const sharedMatchesIncoming =
         shared !== null &&
         shared.state !== 'signed_in' &&
-        (shared.sessionKey === null ||
-          incomingKey === null ||
-          shared.sessionKey === incomingKey);
+        (incomingKey === null
+          ? shared.sessionKey === null
+          : shared.sessionKey === incomingKey ||
+            (shared.sessionKey === null &&
+              !incomingKey.startsWith('sid:') &&
+              !incomingKey.startsWith('at:')));
       const isStaleRefreshWhileSignedOut =
         event === 'TOKEN_REFRESHED' &&
         !isDistinctNewerSid &&

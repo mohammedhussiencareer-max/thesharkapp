@@ -14601,4 +14601,140 @@ describe('auth-store PR 65 verified findings (P1-1..P3-4)', () => {
       tabA.resetAuthStore({ clearStorage: false });
     }
   });
+
+  it('DELTA19-P2-1: completed(sessionKey: null) from an earlier empty-storage signOut never evicts a later concrete sid: session on TOKEN_REFRESHED under coord_blocked quota (I3)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { createAuthStore, getLogoutCoordStorageKey } =
+      await import('@/lib/auth-store');
+    const url = 'https://delta19-p2-1-null-completed-wildcard.test';
+    const sdkKey = 'sb-delta19-p2-1-null-completed-wildcard-auth-token';
+    const coordKey = getLogoutCoordStorageKey(url);
+    const values = new Map<string, string>();
+    let blockCoordWrites = false;
+
+    const storage: Storage = {
+      get length() {
+        return values.size;
+      },
+      clear() {
+        values.clear();
+      },
+      getItem(k: string) {
+        return values.get(k) ?? null;
+      },
+      key(i: number) {
+        return [...values.keys()][i] ?? null;
+      },
+      removeItem(k: string) {
+        values.delete(k);
+      },
+      setItem(k: string, v: string) {
+        if (blockCoordWrites && k === coordKey) {
+          throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+        }
+        values.set(k, String(v));
+      },
+    };
+
+    const server = createStatefulAuthServer();
+    const fetchFn: typeof fetch = (input, init) => {
+      const href = requestUrlOf(input);
+      const headers = new Headers(init?.headers);
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/token?grant_type=password')) {
+        return Promise.resolve(server.handlePasswordSignIn());
+      }
+      if (href.includes('/auth/v1/logout')) {
+        return Promise.resolve(
+          server.handleLogout(headers.get('authorization')),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    const makeClient = () =>
+      createClient(url, TEST_ANON_KEY, {
+        auth: {
+          storage,
+          storageKey: sdkKey,
+          persistSession: true,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+        },
+        global: { fetch: fetchFn },
+      });
+
+    const clientA = makeClient();
+    const clientB = makeClient();
+    const tabA = createAuthStore({
+      getClient: () => clientA as never,
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      addStorageListener: () => () => {},
+      createBroadcastChannel: () => null,
+      tabId: 'tabA',
+      syncGlobalStores: false,
+    });
+    const tabB = createAuthStore({
+      getClient: () => clientB as never,
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      addStorageListener: () => () => {},
+      createBroadcastChannel: () => null,
+      tabId: 'tabB',
+      syncGlobalStores: false,
+    });
+
+    try {
+      tabA.startAuth();
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('signed-out');
+      });
+
+      // Earlier empty-storage signOut writes completed(1, sessionKey: null).
+      await tabA.signOut();
+      expect(JSON.parse(values.get(coordKey) ?? 'null')).toMatchObject({
+        state: 'completed',
+        sessionKey: null,
+      });
+
+      // Under coord_blocked quota, Tab B boots and signs in as concrete sid:sid-1;
+      // coordKey stays completed(1, sessionKey: null).
+      blockCoordWrites = true;
+      tabB.startAuth();
+      await vi.waitFor(() => {
+        expect(tabB.getAuthSnapshot().status).toBe('signed-out');
+      });
+      const sid1 = server.issueSession();
+      values.set(sdkKey, JSON.stringify(sid1));
+
+      // TOKEN_REFRESHED arrives on signed-out Tab B while coordKey is still
+      // completed(1, sessionKey: null): MUST NOT evict live sid:sid-1!
+      const internalsB = clientB.auth as unknown as {
+        _notifyAllSubscribers: (
+          event: string,
+          session: unknown,
+          broadcast?: boolean,
+        ) => Promise<void>;
+      };
+      await internalsB._notifyAllSubscribers('TOKEN_REFRESHED', sid1, false);
+      await vi.waitFor(() => {
+        expect(tabB.getAuthSnapshot().status).toBe('owner');
+      });
+      expect(values.get(sdkKey)).toBeDefined();
+    } finally {
+      blockCoordWrites = false;
+      await clientA.auth.stopAutoRefresh();
+      await clientB.auth.stopAutoRefresh();
+      tabA.resetAuthStore({ clearStorage: false });
+      tabB.resetAuthStore({ clearStorage: false });
+    }
+  });
 });

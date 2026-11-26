@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { createClient } from '@supabase/supabase-js';
-import { afterEach, beforeEach, describe, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createAuthStore,
   getLogoutCoordStorageKey,
@@ -191,6 +191,9 @@ type IssuedSession = {
   expiresAt: number;
   generation: number;
   revoked: boolean;
+  revokedBySessionKey: string | null;
+  revokedAtOrderIndex: number | null;
+  issuedOrderIndex: number;
   expiredOnce: boolean;
 };
 
@@ -217,6 +220,7 @@ function createModelAuthServer() {
   const sidByAccess = new Map<string, string>();
   const sidByRefresh = new Map<string, string>();
   const confirmedRevokedKeys = new Set<string>();
+  const confirmedRevokedAtOrder = new Map<string, number>();
   const issuedOrder: string[] = [];
 
   function toPayload(s: IssuedSession): SessionPayload {
@@ -250,6 +254,7 @@ function createModelAuthServer() {
       jti: `at-${sidCounter}-0`,
     });
     const refreshToken = `rt-${sidCounter}-0`;
+    const issuedOrderIndex = issuedOrder.length;
     const record: IssuedSession = {
       sid,
       sessionKey: `sid:${sid}`,
@@ -259,6 +264,9 @@ function createModelAuthServer() {
       expiresAt,
       generation: 0,
       revoked: false,
+      revokedBySessionKey: null,
+      revokedAtOrderIndex: null,
+      issuedOrderIndex,
       expiredOnce: false,
     };
     sessionsBySid.set(sid, record);
@@ -341,10 +349,22 @@ function createModelAuthServer() {
       });
     }
     if (rec.revoked) {
+      // Once this session is already revoked, a duplicate/delayed logout using
+      // its token is a server no-op and never wipes newer sessions issued after.
       return new Response(null, { status: 204 });
     }
-    rec.revoked = true;
-    confirmedRevokedKeys.add(rec.sessionKey);
+    // Match real GoTrue POST /auth/v1/logout?scope=global semantics: revoking
+    // an active session revokes ALL active sessions belonging to rec.user.id.
+    const revokeOrderIndex = issuedOrder.length;
+    for (const s of sessionsBySid.values()) {
+      if (s.user.id === rec.user.id && !s.revoked) {
+        s.revoked = true;
+        s.revokedBySessionKey = rec.sessionKey;
+        s.revokedAtOrderIndex = revokeOrderIndex;
+        confirmedRevokedKeys.add(s.sessionKey);
+        confirmedRevokedAtOrder.set(s.sessionKey, revokeOrderIndex);
+      }
+    }
     return new Response(null, { status: 204 });
   }
 
@@ -381,6 +401,8 @@ function createModelAuthServer() {
     latestActiveSessions,
     isConfirmedRevoked: (sessionKey: string) =>
       confirmedRevokedKeys.has(sessionKey),
+    getConfirmedRevokedAtOrder: (sessionKey: string) =>
+      confirmedRevokedAtOrder.get(sessionKey) ?? null,
     getIssuedIndex: (sessionKey: string) => issuedOrder.indexOf(sessionKey),
     getIssuedOrder: () => [...issuedOrder],
     getSessionByKey: (sessionKey: string) => {
@@ -428,6 +450,7 @@ type TabHandle = {
   // Model-tracking fields for I2/I3 verification:
   lastHeldSid: string | null;
   attemptedSignOutSids: Set<string>;
+  revocationOriginSids: Set<string>;
   differentSessionAppearedAfterSignOut: boolean;
   sawUnbackedLocalFailedWithNullCoord: boolean;
   destroyed: boolean;
@@ -471,7 +494,17 @@ function readCoordRecord(raw: string | undefined): {
   }
 }
 
-async function runModelSeed(seed: number): Promise<void> {
+type ModelCoverageStats = {
+  revocationFailedPostSettle: number;
+  revocationRetriesConverged: number;
+  localFailedRecoveries: number;
+  globalMultiSessionRevokes: number;
+};
+
+async function runModelSeed(
+  seed: number,
+  stats: ModelCoverageStats,
+): Promise<void> {
   const rand = makePrng(seed);
   const pick = <T>(items: readonly T[]): T =>
     items[Math.floor(rand() * items.length)]!;
@@ -511,8 +544,12 @@ async function runModelSeed(seed: number): Promise<void> {
   let everHadCoordKey = false;
   let maxIssuedIndexSeen = -1;
   // Track every sessionKey that ANY tab ever targeted for sign-out (explicitly
-  // or by inheriting persisted sdkKey on signOut).
+  // or by inheriting persisted sdkKey on signOut), every Bearer sessionKey sent
+  // directly to POST /logout, and every session erased from sdkKey.
   const everSignOutTargetedSids = new Set<string>();
+  const directLogoutDispatchedSids = new Set<string>();
+  const erasedUntargetedSdkViolations: string[] = [];
+  const staleDispatchWhileNewerPersistedViolations: string[] = [];
   let tab0LastOwnerEmail: string | null = null;
   let tab0SignedOutDirectlyFromUserA = false;
   const tabs: TabHandle[] = [];
@@ -595,6 +632,14 @@ async function runModelSeed(seed: number): Promise<void> {
         }
         const oldValue = values.get(k) ?? null;
         if (!values.delete(k)) return;
+        if (k === sdkKey) {
+          const erasedSid = readPersistedSid(oldValue ?? undefined);
+          if (erasedSid !== null && !everSignOutTargetedSids.has(erasedSid)) {
+            erasedUntargetedSdkViolations.push(
+              `tab${slot} removed untargeted sdkKey=${erasedSid}`,
+            );
+          }
+        }
         dispatchStorageEvent(slot, k, oldValue, null);
       },
       setItem(k: string, v: string) {
@@ -611,6 +656,14 @@ async function runModelSeed(seed: number): Promise<void> {
           throw new DOMException('QuotaExceededError', 'QuotaExceededError');
         }
         const oldValue = values.get(k) ?? null;
+        if (isTombstone) {
+          const erasedSid = readPersistedSid(oldValue ?? undefined);
+          if (erasedSid !== null && !everSignOutTargetedSids.has(erasedSid)) {
+            erasedUntargetedSdkViolations.push(
+              `tab${slot} tombstoned untargeted sdkKey=${erasedSid}`,
+            );
+          }
+        }
         values.set(k, str);
         dispatchStorageEvent(slot, k, oldValue, str);
       },
@@ -678,6 +731,31 @@ async function runModelSeed(seed: number): Promise<void> {
         const logoutSid = decodeJwtSid(
           authHeader?.replace(/^Bearer\s+/i, '') ?? '',
         );
+        if (logoutSid !== null) {
+          directLogoutDispatchedSids.add(logoutSid);
+          const persistedNow = readPersistedSid(values.get(sdkKey));
+          if (
+            persistedNow !== null &&
+            persistedNow !== logoutSid &&
+            !everSignOutTargetedSids.has(persistedNow) &&
+            quotaMode === 'normal' &&
+            storageEventMode === 'immediate' &&
+            !bcDropped
+          ) {
+            const logoutRec = server.getSessionByKey(logoutSid);
+            const persistedRec = server.getSessionByKey(persistedNow);
+            if (
+              logoutRec &&
+              persistedRec &&
+              logoutRec.user.id === persistedRec.user.id &&
+              persistedRec.issuedOrderIndex > logoutRec.issuedOrderIndex
+            ) {
+              staleDispatchWhileNewerPersistedViolations.push(
+                `tab${slot} dispatched /logout(${logoutSid}) while newer untargeted ${persistedNow} of same user was persisted`,
+              );
+            }
+          }
+        }
         const immediateMode =
           mode === 'slow_204' ? '204' : mode === 'slow_503' ? '503' : mode;
         trace.push(
@@ -700,6 +778,34 @@ async function runModelSeed(seed: number): Promise<void> {
       ) {
         const headers = new Headers(init?.headers);
         const authHeader = headers.get('authorization');
+        const logoutSid = decodeJwtSid(
+          authHeader?.replace(/^Bearer\s+/i, '') ?? '',
+        );
+        if (logoutSid !== null) {
+          directLogoutDispatchedSids.add(logoutSid);
+          const persistedNow = readPersistedSid(values.get(sdkKey));
+          if (
+            persistedNow !== null &&
+            persistedNow !== logoutSid &&
+            !everSignOutTargetedSids.has(persistedNow) &&
+            quotaMode === 'normal' &&
+            storageEventMode === 'immediate' &&
+            !bcDropped
+          ) {
+            const logoutRec = server.getSessionByKey(logoutSid);
+            const persistedRec = server.getSessionByKey(persistedNow);
+            if (
+              logoutRec &&
+              persistedRec &&
+              logoutRec.user.id === persistedRec.user.id &&
+              persistedRec.issuedOrderIndex > logoutRec.issuedOrderIndex
+            ) {
+              staleDispatchWhileNewerPersistedViolations.push(
+                `tab${slot} dispatched slow /logout(${logoutSid}) while newer untargeted ${persistedNow} of same user was persisted`,
+              );
+            }
+          }
+        }
         const resolvedMode = logoutMode === 'slow_204' ? '204' : '503';
         const signal = init?.signal;
         return new Promise<Response>((resolve, reject) => {
@@ -789,6 +895,7 @@ async function runModelSeed(seed: number): Promise<void> {
       inFlightPromises: new Set(),
       lastHeldSid: null,
       attemptedSignOutSids: new Set(),
+      revocationOriginSids: new Set(),
       differentSessionAppearedAfterSignOut: false,
       sawUnbackedLocalFailedWithNullCoord: false,
       destroyed: false,
@@ -848,13 +955,16 @@ async function runModelSeed(seed: number): Promise<void> {
     // (owner-approved DELTA14-P3-5 full-storage exception), and whether a
     // different session appeared in sdkKey or signed_in coord after a tab's
     // sign-out attempt (Rule B intentionally clears stale logout notice).
+    // Reset sawUnbackedLocalFailedWithNullCoord once coordKey exists (and tab
+    // is not in local_failed) or a different session appears so I2-dishonest-idle
+    // stays armed for all later attempts in the same seed.
     for (const t of tabs) {
       if (t.destroyed) continue;
-      if (
-        coord === null &&
-        t.store.getAuthSnapshot().logoutPhase === 'local_failed'
-      ) {
+      const snap = t.store.getAuthSnapshot();
+      if (coord === null && snap.logoutPhase === 'local_failed') {
         t.sawUnbackedLocalFailedWithNullCoord = true;
+      } else if (coord !== null && snap.logoutPhase !== 'local_failed') {
+        t.sawUnbackedLocalFailedWithNullCoord = false;
       }
       if (t.attemptedSignOutSids.size > 0) {
         const latestAttemptedSid = [...t.attemptedSignOutSids].at(-1)!;
@@ -866,6 +976,7 @@ async function runModelSeed(seed: number): Promise<void> {
             coord.sessionKey !== latestAttemptedSid)
         ) {
           t.differentSessionAppearedAfterSignOut = true;
+          t.sawUnbackedLocalFailedWithNullCoord = false;
         }
       }
     }
@@ -888,13 +999,58 @@ async function runModelSeed(seed: number): Promise<void> {
       maxObservedCoordAttemptId = coord.attemptId;
     }
 
-    // I3-b: Never globally revoke a session that no tab ever targeted for sign-out.
-    for (const s of server.latestActiveSessions()) {
-      if (s.revoked && !everSignOutTargetedSids.has(s.sessionKey)) {
+    // I3-b: Under real GoTrue scope=global semantics:
+    //  1. Every POST /logout Bearer token must belong to a session explicitly
+    //     targeted by a signOut/retryLogoutRevocation call.
+    //  2. No untargeted persisted sdkKey may ever be erased/tombstoned.
+    //  3. A global logout of user A never revokes any session of user B.
+    //  4. A session issued AFTER its revoker's target session was already
+    //     confirmed revoked is never revoked by that stale target.
+    //  5. Under normal coordinated storage/events/BC, a stale logout for an
+    //     older session is never dispatched while a newer untargeted session
+    //     of the same user is already persisted in sdkKey.
+    for (const dispatchedSid of directLogoutDispatchedSids) {
+      if (!everSignOutTargetedSids.has(dispatchedSid)) {
         throw formatFailure(
-          'I3-untargeted-revocation',
-          `Session ${s.sessionKey} was globally revoked even though no signOut targeted it (at ${stepLabel})`,
+          'I3-untargeted-direct-logout',
+          `POST /logout dispatched with untargeted session ${dispatchedSid} (at ${stepLabel})`,
         );
+      }
+    }
+    if (erasedUntargetedSdkViolations.length > 0) {
+      throw formatFailure(
+        'I3-erased-untargeted-sdkKey',
+        `${erasedUntargetedSdkViolations[0]} (at ${stepLabel})`,
+      );
+    }
+    if (staleDispatchWhileNewerPersistedViolations.length > 0) {
+      throw formatFailure(
+        'I3-stale-logout-dispatched-over-newer-session',
+        `${staleDispatchWhileNewerPersistedViolations[0]} (at ${stepLabel})`,
+      );
+    }
+    for (const s of server.latestActiveSessions()) {
+      if (!s.revoked) continue;
+      if (s.revokedBySessionKey !== null) {
+        const revoker = server.getSessionByKey(s.revokedBySessionKey);
+        if (revoker && revoker.user.id !== s.user.id) {
+          throw formatFailure(
+            'I3-cross-user-revocation',
+            `Session ${s.sessionKey} (${s.user.id}) was revoked by ${s.revokedBySessionKey} (${revoker.user.id}) at ${stepLabel}`,
+          );
+        }
+        const revokerConfirmedAt = server.getConfirmedRevokedAtOrder(
+          s.revokedBySessionKey,
+        );
+        if (
+          revokerConfirmedAt !== null &&
+          s.issuedOrderIndex >= revokerConfirmedAt
+        ) {
+          throw formatFailure(
+            'I3-revoked-session-issued-after-confirmed-logout',
+            `Session ${s.sessionKey} (order=${s.issuedOrderIndex}) was revoked by already-confirmed ${s.revokedBySessionKey} (confirmedAt=${revokerConfirmedAt}) at ${stepLabel}`,
+          );
+        }
       }
     }
 
@@ -1054,7 +1210,9 @@ async function runModelSeed(seed: number): Promise<void> {
         snap.logoutPhase === 'revocation_failed'
       ) {
         tab.attemptedSignOutSids.add(persistedSid);
+        tab.revocationOriginSids.add(persistedSid);
         tab.differentSessionAppearedAfterSignOut = false;
+        tab.sawUnbackedLocalFailedWithNullCoord = false;
       }
     }
     if (
@@ -1062,6 +1220,10 @@ async function runModelSeed(seed: number): Promise<void> {
       (!isSignedOutRetryForDifferentSid || persistedSid === null)
     ) {
       everSignOutTargetedSids.add(tab.lastHeldSid);
+      if (isSignedInTab) {
+        tab.revocationOriginSids.add(tab.lastHeldSid);
+        tab.sawUnbackedLocalFailedWithNullCoord = false;
+      }
     }
     if (coord?.sessionKey && !isSignedInTab && coord.state !== 'signed_in') {
       everSignOutTargetedSids.add(coord.sessionKey);
@@ -1373,6 +1535,32 @@ async function runModelSeed(seed: number): Promise<void> {
             `${t.tabId} left login disabled after settle with no sdkKey (phase=${snap.logoutPhase}, resolved=${t.store.isAuthResolved()})`,
           );
         }
+        // I2 propagation: when coordKey holds revocation_failed for an
+        // unconfirmed session, every open tab must report logoutRevocationFailed,
+        // and any non-reloaded originating tab must keep canRetryLogoutRevocation.
+        if (coordAfterSettle?.state === 'revocation_failed') {
+          const coordSid = coordAfterSettle.sessionKey;
+          const sidConfirmed =
+            coordSid !== null && server.isConfirmedRevoked(coordSid);
+          if (!sidConfirmed && !snap.logoutRevocationFailed) {
+            throw formatFailure(
+              'I2-missing-revocation-failed-on-open-tab',
+              `${t.tabId} reported logoutRevocationFailed=false (phase=${snap.logoutPhase}) while coordKey is revocation_failed for unconfirmed ${coordSid ?? 'null'}`,
+            );
+          }
+          if (
+            coordSid !== null &&
+            !sidConfirmed &&
+            t.revocationOriginSids.has(coordSid) &&
+            !t.differentSessionAppearedAfterSignOut &&
+            !snap.canRetryLogoutRevocation
+          ) {
+            throw formatFailure(
+              'I2-missing-retry-capability-on-origin-tab',
+              `Originating non-reloaded tab ${t.tabId} lost canRetryLogoutRevocation for unconfirmed ${coordSid}`,
+            );
+          }
+        }
       } else if (
         coordAfterSettle?.state === 'local_failed' &&
         (coordAfterSettle.sessionKey === null ||
@@ -1405,6 +1593,15 @@ async function runModelSeed(seed: number): Promise<void> {
             `Fresh reloaded tab booted into status=${probeSnap.status} phase=${probeSnap.logoutPhase} resolved=${probeTab.store.isAuthResolved()} with no sdkKey`,
           );
         }
+        if (
+          coordAfterSettle?.state === 'revocation_failed' &&
+          !probeSnap.logoutRevocationFailed
+        ) {
+          throw formatFailure(
+            'I2-fresh-reload-missing-revocation-failed',
+            `Fresh reloaded tab booted into phase=${probeSnap.logoutPhase} (logoutRevocationFailed=false) while coordKey is revocation_failed`,
+          );
+        }
       } else if (
         coordAfterSettle?.state === 'local_failed' &&
         (coordAfterSettle.sessionKey === null ||
@@ -1425,6 +1622,55 @@ async function runModelSeed(seed: number): Promise<void> {
       await destroyTab(probeTab);
     }
 
+    // If coordKey holds revocation_failed after settle and any tab retains the
+    // token (canRetryLogoutRevocation === true), calling retryLogoutRevocation()
+    // under the recovered 204 server MUST confirm revocation on the server and
+    // converge every open tab to clean idle (I2, I4).
+    if (
+      persistedAfterSettle === null &&
+      coordAfterSettle?.state === 'revocation_failed'
+    ) {
+      stats.revocationFailedPostSettle += 1;
+      const retryTab = tabs.find(
+        (t) =>
+          !t.destroyed && t.store.getAuthSnapshot().canRetryLogoutRevocation,
+      );
+      if (retryTab) {
+        const retryTargetSid = coordAfterSettle.sessionKey;
+        if (retryTargetSid !== null) {
+          everSignOutTargetedSids.add(retryTargetSid);
+        }
+        await retryTab.store.retryLogoutRevocation();
+        await vi.advanceTimersByTimeAsync(50);
+        await flushMicrotasks();
+        if (
+          retryTargetSid !== null &&
+          !server.isConfirmedRevoked(retryTargetSid)
+        ) {
+          throw formatFailure(
+            'I2-retry-did-not-revoke-on-server',
+            `retryLogoutRevocation() on ${retryTab.tabId} did not confirm global revocation for ${retryTargetSid}`,
+          );
+        }
+        for (const t of tabs) {
+          if (t.destroyed) continue;
+          const snap = t.store.getAuthSnapshot();
+          if (
+            snap.status !== 'signed-out' ||
+            snap.logoutPhase !== 'idle' ||
+            snap.logoutRevocationFailed ||
+            !t.store.isAuthResolved()
+          ) {
+            throw formatFailure(
+              'I2-retry-did-not-converge-to-idle',
+              `${t.tabId} stayed in status=${snap.status} phase=${snap.logoutPhase} logoutRevocationFailed=${snap.logoutRevocationFailed} after retryLogoutRevocation()`,
+            );
+          }
+        }
+        stats.revocationRetriesConverged += 1;
+      }
+    }
+
     // If local_failed holds persistedAfterSettle, retrying signOut now (with
     // storage recovered) MUST converge every tab to signed-out / idle (I4).
     if (
@@ -1433,6 +1679,7 @@ async function runModelSeed(seed: number): Promise<void> {
       (coordAfterSettle.sessionKey === null ||
         coordAfterSettle.sessionKey === persistedAfterSettle)
     ) {
+      stats.localFailedRecoveries += 1;
       everSignOutTargetedSids.add(persistedAfterSettle);
       await tabs[0]!.store.signOut();
       await vi.advanceTimersByTimeAsync(50);
@@ -1484,6 +1731,20 @@ async function runModelSeed(seed: number): Promise<void> {
         );
       }
     }
+    // Record whether real GoTrue scope=global revoked multiple sessions of the
+    // same user in this seed so the suite verifies non-vacuous coverage.
+    if (
+      server
+        .latestActiveSessions()
+        .some(
+          (s) =>
+            s.revoked &&
+            s.revokedBySessionKey !== null &&
+            s.revokedBySessionKey !== s.sessionKey,
+        )
+    ) {
+      stats.globalMultiSessionRevokes += 1;
+    }
   } finally {
     // Release any lingering deferred promises cleanly before teardown.
     while (deferredNets.length > 0) {
@@ -1524,14 +1785,27 @@ describe('auth-store deterministic model-based interleaving suite (I1-I5)', () =
   // clear progress and keeps per-test timeouts comfortable (< 60s total).
   const BATCH_SIZE = 40;
   const BATCH_COUNT = SEED_COUNT / BATCH_SIZE;
+  const suiteStats: ModelCoverageStats = {
+    revocationFailedPostSettle: 0,
+    revocationRetriesConverged: 0,
+    localFailedRecoveries: 0,
+    globalMultiSessionRevokes: 0,
+  };
 
   for (let batch = 0; batch < BATCH_COUNT; batch += 1) {
     const startSeed = batch * BATCH_SIZE + 1;
     const endSeed = startSeed + BATCH_SIZE - 1;
     it(`preserves invariants I1-I5 across seeds ${startSeed}..${endSeed} (${STEPS_PER_SEED} randomized steps each)`, async () => {
       for (let seed = startSeed; seed <= endSeed; seed += 1) {
-        await runModelSeed(seed);
+        await runModelSeed(seed, suiteStats);
       }
     }, 30_000);
   }
+
+  it('exercises revocation_failed retry convergence, local_failed recovery, and GoTrue global multi-session revocations non-vacuously', () => {
+    expect(suiteStats.revocationFailedPostSettle).toBeGreaterThan(0);
+    expect(suiteStats.revocationRetriesConverged).toBeGreaterThan(0);
+    expect(suiteStats.localFailedRecoveries).toBeGreaterThan(0);
+    expect(suiteStats.globalMultiSessionRevokes).toBeGreaterThan(0);
+  });
 });
