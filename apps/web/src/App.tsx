@@ -10,7 +10,12 @@ import {
   takeOverActiveTab,
 } from '@/lib/active-tab';
 import { useAuth } from '@/lib/auth-context';
-import { activateAuthStore, deactivateAuthStore } from '@/lib/auth-store';
+import {
+  activateAuthStore,
+  deactivateAuthStore,
+  startAuth,
+} from '@/lib/auth-store';
+import { setHeldWritesTabActive } from '@/lib/held-writes';
 import { initPwa, setPwaTabActive } from '@/lib/pwa';
 import * as supabaseMod from '@/lib/supabase';
 import { ExpensesPage } from '@/pages/ExpensesPage';
@@ -201,15 +206,25 @@ export function AppRoutes() {
 }
 
 function handleTabBecomeActive(): void {
-  supabaseMod.activateSupabaseClient?.();
+  setHeldWritesTabActive(true);
+  // Enable Supabase lazily without eagerly constructing GoTrueClient;
+  // startAuth() reconciles durable logout records first so auto-refresh
+  // cannot race before boot reconciliation (P2-2).
+  if (typeof supabaseMod.enableSupabaseClient === 'function') {
+    supabaseMod.enableSupabaseClient();
+  } else {
+    supabaseMod.activateSupabaseClient?.();
+  }
   setPwaTabActive(true);
   initPwa();
   activateAuthStore();
+  startAuth();
 }
 
 function handleTabBecomeInactive(): void {
   deactivateAuthStore();
   supabaseMod.deactivateSupabaseClient?.();
+  setHeldWritesTabActive(false);
   setPwaTabActive(false);
 }
 

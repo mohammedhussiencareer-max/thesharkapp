@@ -7,6 +7,7 @@ import {
   rehydrateHeldWrites,
   resetHeldWritesStore,
   setHeldWriteUser,
+  setHeldWritesTabActive,
   setWritesLocked,
 } from '@/lib/held-writes';
 import { setPwaAuthResolved, setPwaLogoutPending } from '@/lib/pwa';
@@ -49,7 +50,14 @@ type AuthClientInternals = {
   fetch?: unknown;
   storageKey?: unknown;
   _sessionRemovalEpoch?: unknown;
+  autoRefreshToken?: unknown;
+  __thesharkManagedAutoRefresh?: unknown;
+  initializePromise?: Promise<unknown> | null;
+  broadcastChannel?: { close?: () => void } | null;
+  stateChangeEmitters?: { clear?: () => void } | null;
+  startAutoRefresh?: () => Promise<void> | void;
   stopAutoRefresh?: () => Promise<void> | void;
+  dispose?: () => Promise<void> | void;
   admin?: {
     url?: unknown;
     headers?: unknown;
@@ -66,10 +74,23 @@ type RefreshOutcome =
   | { status: 'failed' }
   | { status: 'unavailable' };
 
+type HeldWritesAdapter = {
+  bumpSessionGeneration: typeof bumpSessionGeneration;
+  clearResolvedHeldWritesForUser: typeof clearResolvedHeldWritesForUser;
+  isWritesLocked: typeof isWritesLocked;
+  rehydrateHeldWrites: typeof rehydrateHeldWrites;
+  resetHeldWritesStore: typeof resetHeldWritesStore;
+  setHeldWriteUser: typeof setHeldWriteUser;
+  setHeldWritesTabActive: typeof setHeldWritesTabActive;
+  setWritesLocked: typeof setWritesLocked;
+};
+
 type AuthStoreDeps = {
   getClient: () => typeof supabase;
   getProjectUrl: () => string | undefined;
   getStorage: () => Storage | null;
+  storageKey?: string;
+  heldWrites?: HeldWritesAdapter;
   syncGlobalStores?: boolean;
   initiallyActive?: boolean;
 };
@@ -700,11 +721,23 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     getClient: customDeps?.getClient ?? (() => supabase),
     getProjectUrl: customDeps?.getProjectUrl ?? defaultProjectUrl,
     getStorage: customDeps?.getStorage ?? defaultStorage,
+    storageKey: customDeps?.storageKey,
+    heldWrites: customDeps?.heldWrites,
     syncGlobalStores: customDeps?.syncGlobalStores ?? true,
     initiallyActive: customDeps?.initiallyActive ?? true,
   };
 
   const syncGlobal = deps.syncGlobalStores !== false;
+  const hw: HeldWritesAdapter = deps.heldWrites ?? {
+    bumpSessionGeneration,
+    clearResolvedHeldWritesForUser,
+    isWritesLocked,
+    rehydrateHeldWrites,
+    resetHeldWritesStore,
+    setHeldWriteUser,
+    setHeldWritesTabActive,
+    setWritesLocked,
+  };
 
   let active = deps.initiallyActive !== false;
   let machine: MachineState = initialMachineState();
@@ -714,6 +747,8 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
   let checkId = 0;
   let storeEpoch = 0;
   let lastAttemptId = 0;
+  let signOutEpoch = 0;
+  let latestSignInStartSignOutEpoch = -1;
   let signInInProgressCount = 0;
   let signInRejectedOwnSession: { session: Session; error: unknown } | null =
     null;
@@ -800,7 +835,10 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
 
   function supabaseAuthStorageKeys(): string[] {
     const keys = new Set<string>();
-    const client = (activeClient ?? (active ? deps.getClient() : null)) as
+    if (typeof deps.storageKey === 'string' && deps.storageKey.trim() !== '') {
+      keys.add(deps.storageKey.trim());
+    }
+    const client = activeClient as
       | ({
           storageKey?: unknown;
           auth?: { storageKey?: unknown };
@@ -833,8 +871,93 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     return [...keys];
   }
 
+  function disposeAuthClient(
+    client: NonNullable<typeof supabase> | null | undefined,
+  ): void {
+    const auth = client?.auth as unknown as AuthClientInternals | undefined;
+    if (!auth) return;
+    const tearDown = () => {
+      try {
+        auth.broadcastChannel?.close?.();
+        if ('broadcastChannel' in auth) {
+          auth.broadcastChannel = null;
+        }
+        auth.stateChangeEmitters?.clear?.();
+      } catch {
+        // Ignore on mock or frozen auth objects.
+      }
+      try {
+        if (typeof auth.stopAutoRefresh === 'function') {
+          void Promise.resolve(auth.stopAutoRefresh()).catch(() => {});
+        }
+        if (typeof auth.dispose === 'function') {
+          void Promise.resolve(auth.dispose()).catch(() => {});
+        }
+      } catch {
+        // Ignore teardown errors on demoted clients.
+      }
+    };
+    tearDown();
+    if (
+      auth.initializePromise &&
+      typeof auth.initializePromise.then === 'function'
+    ) {
+      void auth.initializePromise.then(
+        () => tearDown(),
+        () => tearDown(),
+      );
+    }
+  }
+
+  function startClientAutoRefresh(
+    client: NonNullable<typeof supabase> | null | undefined,
+  ): void {
+    if (!client || !active) return;
+    if (machine.logoutPhase !== 'idle' || machine.session === null) return;
+    const auth = client.auth as unknown as AuthClientInternals;
+    const autoRefreshManaged =
+      auth.__thesharkManagedAutoRefresh === true ||
+      auth.autoRefreshToken === true;
+    if (!autoRefreshManaged) return;
+    if (typeof auth.startAutoRefresh === 'function') {
+      void Promise.resolve(auth.startAutoRefresh()).catch(() => {});
+    }
+  }
+
+  function stopClientAutoRefresh(
+    client: NonNullable<typeof supabase> | null | undefined,
+  ): void {
+    if (!client) return;
+    const auth = client.auth as unknown as AuthClientInternals;
+    const stop = () => {
+      if (typeof auth.stopAutoRefresh === 'function') {
+        void Promise.resolve(auth.stopAutoRefresh()).catch(() => {});
+      }
+    };
+    stop();
+    if (
+      auth.initializePromise &&
+      typeof auth.initializePromise.then === 'function'
+    ) {
+      const epoch = storeEpoch;
+      void auth.initializePromise.then(
+        () => {
+          if (
+            epoch !== storeEpoch ||
+            !active ||
+            machine.logoutPhase !== 'idle' ||
+            machine.session === null
+          ) {
+            stop();
+          }
+        },
+        () => stop(),
+      );
+    }
+  }
+
   function bumpClientSessionRemovalEpoch(): void {
-    const client = activeClient ?? (active ? deps.getClient() : null);
+    const client = activeClient;
     if (!client) return;
     const auth = client.auth as unknown as AuthClientInternals;
     if (typeof auth._sessionRemovalEpoch === 'number') {
@@ -1082,12 +1205,12 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     machine.session = null;
     checkId += 1;
     if (syncGlobal) {
-      setWritesLocked(true);
-      bumpSessionGeneration();
-      if (options?.clearResolvedPins && previousUserId) {
-        clearResolvedHeldWritesForUser(previousUserId);
+      hw.setWritesLocked(true);
+      hw.bumpSessionGeneration();
+      if (options?.clearResolvedPins && previousUserId && active) {
+        hw.clearResolvedHeldWritesForUser(previousUserId);
       }
-      setHeldWriteUser(null);
+      hw.setHeldWriteUser(null);
     }
     machine.lastUserId = null;
   }
@@ -1153,7 +1276,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     machine.retainedRevocationSession = null;
     machine.revokedSessionKey = null;
     machine.session = session;
-    const wasWritesLocked = syncGlobal ? isWritesLocked() : false;
+    const wasWritesLocked = syncGlobal ? hw.isWritesLocked() : false;
     const sameSession =
       !wasWritesLocked &&
       isSameAuthenticatedSession(previousSession, session, event);
@@ -1161,21 +1284,22 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     machine.lastUserId = session.user.id;
     if (syncGlobal) {
       if (!sameSession) {
-        bumpSessionGeneration();
+        hw.bumpSessionGeneration();
       }
       if (previousUserId !== null && previousUserId !== session.user.id) {
-        setHeldWriteUser(null);
+        hw.setHeldWriteUser(null);
       }
-      setWritesLocked(false);
-      setHeldWriteUser(session.user.id);
+      hw.setWritesLocked(false);
+      hw.setHeldWriteUser(session.user.id);
       if (
         !sameSession &&
         !wasWritesLocked &&
         previousSession?.user.id === session.user.id
       ) {
-        rehydrateHeldWrites();
+        hw.rehydrateHeldWrites();
       }
     }
+    startClientAutoRefresh(activeClient);
     checkOwner(session, { keepCurrentOwner: sameSession });
   }
 
@@ -1269,9 +1393,10 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       machine.status = 'signed-out';
       machine.email = null;
       if (syncGlobal) {
-        setWritesLocked(true);
-        setHeldWriteUser(null);
+        hw.setWritesLocked(true);
+        hw.setHeldWriteUser(null);
       }
+      stopClientAutoRefresh(currentClient);
       emit();
       return;
     }
@@ -1287,6 +1412,8 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       machine.session = null;
       machine.status = 'signed-out';
       machine.email = null;
+      stopClientAutoRefresh(currentClient);
+      ensureAuthSubscribed(currentClient);
       emit();
       return;
     }
@@ -1303,126 +1430,17 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     machine.session = null;
     machine.status = 'signed-out';
     machine.email = null;
+    stopClientAutoRefresh(currentClient);
+    ensureAuthSubscribed(currentClient);
     emit();
   }
 
-  function startAuth(): void {
-    if (started || !active) return;
-    const client = deps.getClient();
-    if (!client) return;
-    started = true;
+  function ensureAuthSubscribed(
+    client: NonNullable<typeof supabase> | null,
+  ): void {
+    if (!client || !active || unsubscribeAll !== null) return;
     activeClient = client;
     const epoch = storeEpoch;
-    if (syncGlobal) {
-      setHeldWriteUser(null);
-    }
-
-    // Boot reconciliation BEFORE subscribing to onAuthStateChange so
-    // INITIAL_SESSION cannot reopen owner access after an unfinished or failed
-    // sign-out (after reload, crash, or takeover).
-    const storage = deps.getStorage();
-    const initialRecord = readDurableLogoutRecord(storage);
-    const isDirect = hasDirectRevocationTransport(client);
-
-    if (initialRecord !== null) {
-      lastAttemptId = Math.max(lastAttemptId, initialRecord.attemptId);
-      const persistedKey = sessionKeyOf(readPersistedSupabaseSession(storage));
-      const isStaleForOlderSession =
-        initialRecord.sessionKey !== null &&
-        persistedKey !== null &&
-        initialRecord.sessionKey !== persistedKey;
-
-      if (isStaleForOlderSession) {
-        // Storage already holds a newer distinct session; discard stale logout record.
-        clearDurableLogoutRecord(storage);
-      } else {
-        rememberRevokedSessionKey(initialRecord.sessionKey);
-        if (
-          initialRecord.state === 'pending' ||
-          initialRecord.state === 'local_failed'
-        ) {
-          // Under the single-active-tab model, any pending record on boot came
-          // from a tab that is now gone (reloaded, crashed, or demoted by
-          // takeover), so resolve immediately based on persisted credentials.
-          if (isDirect && !hasPersistedSupabaseCredentials(storage)) {
-            const wrote = writeDurableLogoutRecord(storage, {
-              attemptId: initialRecord.attemptId,
-              state: 'revocation_failed',
-              sessionKey: initialRecord.sessionKey,
-            });
-            machine.status = 'signed-out';
-            machine.email = null;
-            machine.session = null;
-            machine.logoutPhase = 'revocation_failed';
-            machine.backedByStorage = wrote || true;
-            machine.retainedRevocationSession = null;
-            machine.revokedSessionKey = initialRecord.sessionKey;
-            if (syncGlobal) {
-              setWritesLocked(true);
-              setHeldWriteUser(null);
-            }
-            emit();
-          } else {
-            const wrote =
-              initialRecord.state === 'local_failed'
-                ? true
-                : writeDurableLogoutRecord(storage, {
-                    attemptId: initialRecord.attemptId,
-                    state: 'local_failed',
-                    sessionKey: initialRecord.sessionKey,
-                  });
-            machine.status = 'signed-out';
-            machine.email = null;
-            machine.session = null;
-            machine.logoutPhase = 'local_failed';
-            machine.backedByStorage = wrote || true;
-            machine.retainedRevocationSession = null;
-            machine.revokedSessionKey = initialRecord.sessionKey;
-            if (syncGlobal) {
-              setWritesLocked(true);
-              setHeldWriteUser(null);
-            }
-            emit();
-          }
-        } else if (initialRecord.state === 'revocation_failed') {
-          let blockedLocally = false;
-          if (
-            isDirect &&
-            storage !== null &&
-            hasPersistedSupabaseCredentials(storage)
-          ) {
-            const removal = removePersistedSupabaseCredentials(
-              storage,
-              initialRecord.sessionKey,
-            );
-            if (removal.stillPresentForTarget) {
-              blockedLocally = true;
-            }
-          }
-          if (blockedLocally) {
-            writeDurableLogoutRecord(storage, {
-              attemptId: initialRecord.attemptId,
-              state: 'local_failed',
-              sessionKey: initialRecord.sessionKey,
-            });
-            machine.logoutPhase = 'local_failed';
-          } else {
-            machine.logoutPhase = 'revocation_failed';
-          }
-          machine.status = 'signed-out';
-          machine.email = null;
-          machine.session = null;
-          machine.backedByStorage = true;
-          machine.retainedRevocationSession = null;
-          machine.revokedSessionKey = initialRecord.sessionKey;
-          if (syncGlobal) {
-            setWritesLocked(true);
-            setHeldWriteUser(null);
-          }
-          emit();
-        }
-      }
-    }
 
     const {
       data: { subscription },
@@ -1431,9 +1449,27 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       const previousSession = machine.session;
 
       if (!session) {
+        const currentStorage = deps.getStorage();
+        if (
+          event === 'SIGNED_OUT' &&
+          machine.session !== null &&
+          currentStorage !== null &&
+          hasDirectRevocationTransport(client)
+        ) {
+          const currentKey = sessionKeyOf(machine.session);
+          const persistedKey = sessionKeyOf(
+            readPersistedSupabaseSession(currentStorage),
+          );
+          if (currentKey !== null && persistedKey === currentKey) {
+            // Defensively ignore a spurious SIGNED_OUT broadcast that did not
+            // clear this active tab's live session in localStorage (P1-1 / I3).
+            return;
+          }
+        }
         lockSessionForSignOut({ clearResolvedPins: event === 'SIGNED_OUT' });
         machine.status = 'signed-out';
         machine.email = null;
+        stopClientAutoRefresh(client);
         emit();
         return;
       }
@@ -1444,16 +1480,51 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         incomingKey !== null &&
         (incomingKey === machine.revokedSessionKey ||
           revokedSessionKeys.has(incomingKey));
+      const isStaleSupersededSignIn =
+        event === 'SIGNED_IN' &&
+        signInInProgressCount > 0 &&
+        latestSignInStartSignOutEpoch !== signOutEpoch;
       const isOwnFreshSignIn =
         signInInProgressCount > 0 &&
+        latestSignInStartSignOutEpoch === signOutEpoch &&
         event === 'SIGNED_IN' &&
-        (machine.revokedSessionKey === null ||
-          incomingKey !== machine.revokedSessionKey);
+        !isRevokedSessionReplay;
+
+      // I3: An earlier in-flight signIn superseded by a later signOut must
+      // never be accepted or leave its session persisted.
+      if (isStaleSupersededSignIn) {
+        if (currentStorage !== null && incomingKey !== null) {
+          rememberRevokedSessionKey(incomingKey);
+          removePersistedSupabaseCredentials(currentStorage, incomingKey);
+          if (
+            machine.logoutPhase === 'local_failed' &&
+            !hasPersistedSupabaseCredentials(currentStorage)
+          ) {
+            // Persisted credentials are now gone; move from local_failed to
+            // revocation_failed so login is not left blocked with empty storage (I4).
+            const attemptId = nextAttemptId(currentStorage);
+            const wrote = writeDurableLogoutRecord(currentStorage, {
+              attemptId,
+              state: 'revocation_failed',
+              sessionKey: machine.revokedSessionKey,
+            });
+            machine.logoutPhase = 'revocation_failed';
+            machine.backedByStorage = wrote;
+            machine.status = 'signed-out';
+            machine.email = null;
+            machine.session = null;
+            emit();
+          }
+        }
+        stopClientAutoRefresh(client);
+        return;
+      }
 
       // Block incoming session callbacks while local logout is in progress or
       // failed (I1), unless this tab's own deliberate signIn produced a fresh
       // session. Never reopen owner access on refocus/reload.
       if (isBlockingLogoutPhase(machine.logoutPhase) && !isOwnFreshSignIn) {
+        stopClientAutoRefresh(client);
         if (machine.activeAttemptId === null && !machine.backedByStorage) {
           const attemptId = nextAttemptId(currentStorage);
           const targetKey = machine.revokedSessionKey ?? incomingKey;
@@ -1534,8 +1605,8 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
           machine.status = 'signed-out';
           machine.email = null;
           if (syncGlobal) {
-            setWritesLocked(true);
-            setHeldWriteUser(null);
+            hw.setWritesLocked(true);
+            hw.setHeldWriteUser(null);
           }
           emit();
           return;
@@ -1544,6 +1615,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
 
       // Reject stale callbacks while global revocation retry is in flight.
       if (machine.logoutPhase === 'retrying_revocation' && !isOwnFreshSignIn) {
+        stopClientAutoRefresh(client);
         const isDistinctNewerSid = isDistinctSidSession(
           machine.revokedSessionKey,
           incomingKey,
@@ -1586,8 +1658,8 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         } else {
           checkId += 1;
           if (syncGlobal) {
-            setWritesLocked(true);
-            setHeldWriteUser(null);
+            hw.setWritesLocked(true);
+            hw.setHeldWriteUser(null);
           }
         }
         machine.session = null;
@@ -1667,13 +1739,14 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         } else {
           checkId += 1;
           if (syncGlobal) {
-            setWritesLocked(true);
-            setHeldWriteUser(null);
+            hw.setWritesLocked(true);
+            hw.setHeldWriteUser(null);
           }
         }
         machine.session = null;
         machine.status = 'signed-out';
         machine.email = null;
+        stopClientAutoRefresh(client);
         emit();
         return;
       }
@@ -1692,6 +1765,182 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     unsubscribeAll = () => {
       subscription.unsubscribe();
     };
+  }
+
+  function startAuth(): void {
+    if (started || !active) return;
+
+    // Step 1 (P2-2): Reconcile durable logout storage BEFORE touching
+    // deps.getClient() so GoTrueClient cannot be constructed or fire a token
+    // refresh for a logged-out / blocked session on boot or takeover.
+    const storage = deps.getStorage();
+    const initialRecord = readDurableLogoutRecord(storage);
+
+    if (initialRecord !== null) {
+      started = true;
+      if (syncGlobal) {
+        hw.setHeldWritesTabActive(true);
+        hw.setHeldWriteUser(null);
+      }
+      lastAttemptId = Math.max(lastAttemptId, initialRecord.attemptId);
+      const persistedKey = sessionKeyOf(readPersistedSupabaseSession(storage));
+      const isStaleForOlderSession =
+        initialRecord.sessionKey !== null &&
+        persistedKey !== null &&
+        initialRecord.sessionKey !== persistedKey;
+
+      if (isStaleForOlderSession) {
+        // Storage already holds a newer distinct session; discard stale logout record.
+        clearDurableLogoutRecord(storage);
+      } else {
+        rememberRevokedSessionKey(initialRecord.sessionKey);
+        if (
+          initialRecord.state === 'pending' ||
+          initialRecord.state === 'local_failed'
+        ) {
+          if (hasPersistedSupabaseCredentials(storage)) {
+            // Credentials are still persisted: stay blocked in local_failed
+            // WITHOUT instantiating GoTrueClient or starting auto-refresh (P2-2).
+            const wrote =
+              initialRecord.state === 'local_failed'
+                ? true
+                : writeDurableLogoutRecord(storage, {
+                    attemptId: initialRecord.attemptId,
+                    state: 'local_failed',
+                    sessionKey: initialRecord.sessionKey,
+                  });
+            machine.status = 'signed-out';
+            machine.email = null;
+            machine.session = null;
+            machine.logoutPhase = 'local_failed';
+            machine.backedByStorage = wrote || true;
+            machine.retainedRevocationSession = null;
+            machine.revokedSessionKey = initialRecord.sessionKey;
+            if (syncGlobal) {
+              hw.setWritesLocked(true);
+              hw.setHeldWriteUser(null);
+            }
+            emit();
+            return;
+          }
+
+          // Credentials are absent in storage -> safe to obtain client to
+          // check direct vs mock transport (no stored session to refresh).
+          const client = deps.getClient();
+          if (!client) {
+            started = false;
+            return;
+          }
+          activeClient = client;
+          stopClientAutoRefresh(client);
+          const isDirect = hasDirectRevocationTransport(client);
+          if (isDirect) {
+            const wrote = writeDurableLogoutRecord(storage, {
+              attemptId: initialRecord.attemptId,
+              state: 'revocation_failed',
+              sessionKey: initialRecord.sessionKey,
+            });
+            machine.status = 'signed-out';
+            machine.email = null;
+            machine.session = null;
+            machine.logoutPhase = 'revocation_failed';
+            machine.backedByStorage = wrote || true;
+            machine.retainedRevocationSession = null;
+            machine.revokedSessionKey = initialRecord.sessionKey;
+          } else {
+            const wrote =
+              initialRecord.state === 'local_failed'
+                ? true
+                : writeDurableLogoutRecord(storage, {
+                    attemptId: initialRecord.attemptId,
+                    state: 'local_failed',
+                    sessionKey: initialRecord.sessionKey,
+                  });
+            machine.status = 'signed-out';
+            machine.email = null;
+            machine.session = null;
+            machine.logoutPhase = 'local_failed';
+            machine.backedByStorage = wrote || true;
+            machine.retainedRevocationSession = null;
+            machine.revokedSessionKey = initialRecord.sessionKey;
+          }
+          if (syncGlobal) {
+            hw.setWritesLocked(true);
+            hw.setHeldWriteUser(null);
+          }
+          emit();
+          ensureAuthSubscribed(client);
+          return;
+        }
+
+        if (initialRecord.state === 'revocation_failed') {
+          let blockedLocally = false;
+          if (storage !== null && hasPersistedSupabaseCredentials(storage)) {
+            // Evict re-persisted sdkKey BEFORE instantiating GoTrueClient (P2-2).
+            const removal = removePersistedSupabaseCredentials(
+              storage,
+              initialRecord.sessionKey,
+            );
+            if (removal.stillPresentForTarget) {
+              blockedLocally = true;
+            }
+          }
+          if (blockedLocally) {
+            writeDurableLogoutRecord(storage, {
+              attemptId: initialRecord.attemptId,
+              state: 'local_failed',
+              sessionKey: initialRecord.sessionKey,
+            });
+            machine.logoutPhase = 'local_failed';
+            machine.status = 'signed-out';
+            machine.email = null;
+            machine.session = null;
+            machine.backedByStorage = true;
+            machine.retainedRevocationSession = null;
+            machine.revokedSessionKey = initialRecord.sessionKey;
+            if (syncGlobal) {
+              hw.setWritesLocked(true);
+              hw.setHeldWriteUser(null);
+            }
+            emit();
+            return;
+          }
+          machine.logoutPhase = 'revocation_failed';
+          machine.status = 'signed-out';
+          machine.email = null;
+          machine.session = null;
+          machine.backedByStorage = true;
+          machine.retainedRevocationSession = null;
+          machine.revokedSessionKey = initialRecord.sessionKey;
+          if (syncGlobal) {
+            hw.setWritesLocked(true);
+            hw.setHeldWriteUser(null);
+          }
+          emit();
+          const client = deps.getClient();
+          if (!client) {
+            started = false;
+            return;
+          }
+          activeClient = client;
+          stopClientAutoRefresh(client);
+          ensureAuthSubscribed(client);
+          return;
+        }
+      }
+    }
+
+    const client = deps.getClient();
+    if (!client) {
+      started = false;
+      return;
+    }
+    started = true;
+    if (syncGlobal) {
+      hw.setHeldWritesTabActive(true);
+      hw.setHeldWriteUser(null);
+    }
+    ensureAuthSubscribed(client);
   }
 
   function subscribeAuth(listener: () => void): () => void {
@@ -1749,6 +1998,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     };
 
     const attemptId = nextAttemptId(storage);
+    signOutEpoch += 1;
     const epoch = storeEpoch;
     const nextPhase: LogoutPhase =
       machine.logoutPhase === 'local_failed' ||
@@ -1775,6 +2025,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       machine.retainedRevocationSession = capturedSession;
     }
     lockSessionForSignOut({ clearResolvedPins });
+    stopClientAutoRefresh(client);
     machine.status = 'signed-out';
     machine.email = null;
     safeEmit();
@@ -1984,6 +2235,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     if (!active) return 'failed';
     const client = activeClient ?? deps.getClient();
     if (!client) return 'failed';
+    ensureAuthSubscribed(client);
     const epoch = storeEpoch;
     if (pendingSignOutPromise) {
       await pendingSignOutPromise.catch(() => {});
@@ -2014,6 +2266,8 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     }
 
     const preSignInMachineSession = machine.session;
+    const capturedSignOutEpoch = signOutEpoch;
+    latestSignInStartSignOutEpoch = capturedSignOutEpoch;
     signInInProgressCount += 1;
     let decrementedSignIn = false;
     const endSignInProgress = () => {
@@ -2032,6 +2286,18 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         password,
       });
       if (epoch !== storeEpoch || !active) return 'failed';
+      if (signOutEpoch !== capturedSignOutEpoch) {
+        // I3: A later signOut() ran while this earlier signIn() was in flight.
+        // Never override the later sign-out or leave this stale session persisted.
+        if (data?.session && storage) {
+          const staleKey = sessionKeyOf(data.session);
+          if (staleKey) {
+            rememberRevokedSessionKey(staleKey);
+            removePersistedSupabaseCredentials(storage, staleKey);
+          }
+        }
+        return 'failed';
+      }
       if (error) return classifySignInError(error);
       acceptedSession =
         data?.session ??
@@ -2187,6 +2453,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     machine.backedByStorage = wrotePending;
     machine.status = 'signed-out';
     machine.email = null;
+    stopClientAutoRefresh(client);
     emit();
 
     let task: Promise<void> | null = null;
@@ -2337,6 +2604,8 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     storeEpoch += 1;
     checkId += 1;
     signInInProgressCount = 0;
+    signOutEpoch += 1;
+    latestSignInStartSignOutEpoch = -1;
     signInRejectedOwnSession = null;
     activeAttemptRotatedSession = null;
     abortInFlightRevocations();
@@ -2348,18 +2617,16 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     const previousClient = activeClient;
     activeClient = null;
     if (previousClient) {
-      const auth = previousClient.auth as unknown as AuthClientInternals;
-      if (typeof auth.stopAutoRefresh === 'function') {
-        void auth.stopAutoRefresh();
-      }
+      disposeAuthClient(previousClient);
     }
     started = false;
     machine = initialMachineState();
     snapshot = deriveSnapshot(machine);
     if (syncGlobal) {
-      setWritesLocked(true);
-      bumpSessionGeneration();
-      setHeldWriteUser(null);
+      hw.setHeldWritesTabActive(false);
+      hw.setWritesLocked(true);
+      hw.bumpSessionGeneration();
+      hw.setHeldWriteUser(null);
       setPwaLogoutPending(false);
       setPwaAuthResolved(false);
     }
@@ -2369,6 +2636,9 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
   function activate(): void {
     if (active) return;
     active = true;
+    if (syncGlobal) {
+      hw.setHeldWritesTabActive(true);
+    }
     if (listeners.size > 0) {
       startAuth();
     }
@@ -2380,6 +2650,8 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     storeEpoch += 1;
     checkId += 1;
     signInInProgressCount = 0;
+    signOutEpoch += 1;
+    latestSignInStartSignOutEpoch = -1;
     signInRejectedOwnSession = null;
     lastAttemptId = 0;
     activeAttemptRotatedSession = null;
@@ -2397,7 +2669,11 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     }
     unsubscribeAll?.();
     unsubscribeAll = null;
+    const previousClient = activeClient;
     activeClient = null;
+    if (previousClient) {
+      disposeAuthClient(previousClient);
+    }
     started = false;
     active = deps.initiallyActive !== false;
     machine = initialMachineState();
@@ -2405,7 +2681,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     if (syncGlobal) {
       setPwaLogoutPending(false);
       setPwaAuthResolved(false);
-      resetHeldWritesStore({ clearStorage: false, resetUser: true });
+      hw.resetHeldWritesStore({ clearStorage: false, resetUser: true });
     }
     listeners.clear();
   }

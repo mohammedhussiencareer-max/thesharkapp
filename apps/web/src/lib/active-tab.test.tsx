@@ -8,6 +8,7 @@ import {
   type ActiveTabLockManager,
 } from '@/lib/active-tab';
 import { createAuthStore, getLogoutCoordStorageKey } from '@/lib/auth-store';
+import { createHeldWriteStore, userStoragePrefix } from '@/lib/held-writes';
 import {
   applyPwaUpdate,
   resetPwaState,
@@ -15,6 +16,7 @@ import {
   setPwaTabActive,
   setTestWaitingWorker,
 } from '@/lib/pwa';
+import { createManagedSupabaseClient } from '@/lib/supabase';
 
 /**
  * Spec-faithful in-memory Web Locks manager supporting `ifAvailable` and
@@ -1097,6 +1099,648 @@ describe('I6 real createClient path and takeover during auth operations', () => 
       storeB.resetAuthStore();
       await clientA.auth.stopAutoRefresh();
       await clientB.auth.stopAutoRefresh();
+    }
+  });
+
+  it('DELTA-OT1 P1-1: demotion aborts in-flight refresh fetch and closes BroadcastChannel so a failing refresh in inactive Tab A never signs out active Tab B', async () => {
+    const url = 'https://delta-ot1-p1-1-refresh.example.test';
+    const anonKey = 'anon-key-delta-ot1-p1-1';
+    const sdkKey = 'sb-delta-ot1-p1-1-refresh-auth-token';
+    const { locks } = createStealableLockManager();
+
+    // Real in-memory BroadcastChannel hub so undisposed GoTrueClients actually
+    // broadcast SIGNED_OUT / SIGNED_IN across tabs!
+    type BcListener = (ev: { data: unknown }) => void;
+    const channelsByName = new Map<string, Set<FakeBc>>();
+    const postedBroadcasts: Array<{ name: string; data: unknown }> = [];
+    class FakeBc {
+      readonly name: string;
+      private readonly listeners = new Set<BcListener>();
+      closed = false;
+      constructor(name: string) {
+        this.name = name;
+        let group = channelsByName.get(name);
+        if (!group) {
+          group = new Set();
+          channelsByName.set(name, group);
+        }
+        group.add(this);
+      }
+      addEventListener(type: string, fn: BcListener) {
+        if (type === 'message') this.listeners.add(fn);
+      }
+      removeEventListener(type: string, fn: BcListener) {
+        if (type === 'message') this.listeners.delete(fn);
+      }
+      postMessage(data: unknown) {
+        if (this.closed) return;
+        postedBroadcasts.push({ name: this.name, data });
+        const group = channelsByName.get(this.name);
+        if (!group) return;
+        for (const peer of [...group]) {
+          if (peer === this || peer.closed) continue;
+          for (const fn of [...peer.listeners]) fn({ data });
+        }
+      }
+      close() {
+        this.closed = true;
+        channelsByName.get(this.name)?.delete(this);
+      }
+    }
+    const origBc = globalThis.BroadcastChannel;
+    Object.defineProperty(globalThis, 'BroadcastChannel', {
+      configurable: true,
+      writable: true,
+      value: FakeBc,
+    });
+
+    const backing = new Map<string, string>();
+    backing.set(sdkKey, JSON.stringify(makeSession('sid-p1-1-A')));
+
+    let tabADemoted = false;
+    const tabAWritesAfterDemotion: string[] = [];
+    const tabAStorage: Storage = {
+      get length() {
+        return backing.size;
+      },
+      clear: () => backing.clear(),
+      getItem: (k) => backing.get(k) ?? null,
+      key: (i) => [...backing.keys()][i] ?? null,
+      removeItem: (k) => {
+        if (tabADemoted) tabAWritesAfterDemotion.push(`removeItem:${k}`);
+        backing.delete(k);
+      },
+      setItem: (k, v) => {
+        if (tabADemoted) tabAWritesAfterDemotion.push(`setItem:${k}`);
+        backing.set(k, String(v));
+      },
+    };
+    const tabBStorage: Storage = {
+      get length() {
+        return backing.size;
+      },
+      clear: () => backing.clear(),
+      getItem: (k) => backing.get(k) ?? null,
+      key: (i) => [...backing.keys()][i] ?? null,
+      removeItem: (k) => {
+        backing.delete(k);
+      },
+      setItem: (k, v) => {
+        backing.set(k, String(v));
+      },
+    };
+
+    let tabARefreshSignal: AbortSignal | undefined;
+    let resolveTabARefresh!: (res: Response) => void;
+    const rawFetchA: typeof fetch = (input, init) => {
+      const href = requestUrlOf(input);
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/token?grant_type=refresh_token')) {
+        tabARefreshSignal = init?.signal ?? undefined;
+        // Intentionally do NOT auto-reject on abort so we ALSO prove that even
+        // a late HTTP 400 response arriving after demotion is blocked by the
+        // generation fetch wrapper and never triggers SIGNED_OUT broadcast!
+        return new Promise<Response>((resolve) => {
+          resolveTabARefresh = resolve;
+        });
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+    const rawFetchB: typeof fetch = (input) => {
+      const href = requestUrlOf(input);
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/token?grant_type=password')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(makeSession('sid-p1-1-B')), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    const managedA = createManagedSupabaseClient({
+      url,
+      anonKey,
+      storageKey: sdkKey,
+      getStorage: () => tabAStorage,
+      getFetch: () => rawFetchA,
+    });
+    managedA.deactivate();
+    const managedB = createManagedSupabaseClient({
+      url,
+      anonKey,
+      storageKey: sdkKey,
+      getStorage: () => tabBStorage,
+      getFetch: () => rawFetchB,
+    });
+    managedB.deactivate();
+
+    const storeA = createAuthStore({
+      getClient: () => managedA.getClient(),
+      getProjectUrl: () => url,
+      getStorage: () => tabAStorage,
+      storageKey: sdkKey,
+      syncGlobalStores: false,
+      initiallyActive: false,
+    });
+    const storeB = createAuthStore({
+      getClient: () => managedB.getClient(),
+      getProjectUrl: () => url,
+      getStorage: () => tabBStorage,
+      storageKey: sdkKey,
+      syncGlobalStores: false,
+      initiallyActive: false,
+    });
+
+    const tabACtrl = createActiveTabController({
+      getLocks: () => locks,
+      getProjectUrl: () => url,
+    });
+    const tabBCtrl = createActiveTabController({
+      getLocks: () => locks,
+      getProjectUrl: () => url,
+    });
+
+    tabACtrl.registerLifecycle({
+      onBecomeActive: () => {
+        managedA.enable();
+        storeA.activate();
+        storeA.startAuth();
+      },
+      onBecomeInactive: () => {
+        tabADemoted = true;
+        storeA.deactivate();
+        managedA.deactivate();
+      },
+    });
+    tabBCtrl.registerLifecycle({
+      onBecomeActive: () => {
+        managedB.enable();
+        storeB.activate();
+        storeB.startAuth();
+      },
+      onBecomeInactive: () => {
+        storeB.deactivate();
+        managedB.deactivate();
+      },
+    });
+
+    try {
+      tabACtrl.start();
+      await vi.waitFor(() => {
+        expect(storeA.getAuthSnapshot().status).toBe('owner');
+      });
+      tabBCtrl.start();
+      await vi.waitFor(() => {
+        expect(tabBCtrl.getSnapshot().status).toBe('inactive');
+      });
+
+      // Start an in-flight token refresh in Tab A on the production managed client.
+      const clientA = managedA.getClient()!;
+      const refreshPromise = clientA.auth.refreshSession();
+      await vi.waitFor(() => {
+        expect(resolveTabARefresh).toBeDefined();
+      });
+      expect(tabARefreshSignal?.aborted).toBe(false);
+
+      // Tab B takes over and signs in as a brand-new session sid-p1-1-B!
+      expect(await tabBCtrl.takeOver()).toBe(true);
+      await vi.waitFor(() => {
+        expect(tabACtrl.getSnapshot().status).toBe('inactive');
+      });
+
+      // P1-1 assertion 1: Tab A's in-flight refresh fetch AbortSignal MUST be aborted!
+      expect(tabARefreshSignal?.aborted).toBe(true);
+      // P1-1 assertion 2: Tab A's BroadcastChannel MUST be closed & nulled!
+      const authA = clientA.auth as unknown as { broadcastChannel: unknown };
+      expect(authA.broadcastChannel).toBeNull();
+
+      expect(
+        await storeB.signIn('owner@example.test', 'ValidPassword123'),
+      ).toBe('ok');
+      await vi.waitFor(() => {
+        expect(storeB.getAuthSnapshot().status).toBe('owner');
+      });
+
+      postedBroadcasts.length = 0;
+
+      // Now Tab A's stale refresh resolves with HTTP 400 refresh_token_not_found!
+      resolveTabARefresh(
+        new Response(
+          JSON.stringify({
+            error: 'invalid_grant',
+            error_description: 'refresh_token_not_found',
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      await refreshPromise.catch(() => {});
+      await new Promise((r) => setTimeout(r, 30));
+
+      // P1-1 assertion 3: ZERO SIGNED_OUT broadcast from inactive Tab A,
+      // ZERO storage writes after demotion, and Tab B stays owner on sid-p1-1-B!
+      expect(
+        postedBroadcasts.some(
+          (m) => (m.data as { event?: string })?.event === 'SIGNED_OUT',
+        ),
+      ).toBe(false);
+      expect(tabAWritesAfterDemotion).toEqual([]);
+      expect(storeB.getAuthSnapshot().status).toBe('owner');
+      expect(JSON.parse(backing.get(sdkKey) ?? '{}')).toMatchObject({
+        refresh_token: 'rt-sid-p1-1-B',
+      });
+    } finally {
+      tabACtrl.dispose();
+      tabBCtrl.dispose();
+      storeA.resetAuthStore();
+      storeB.resetAuthStore();
+      managedA.deactivate();
+      managedB.deactivate();
+      Object.defineProperty(globalThis, 'BroadcastChannel', {
+        configurable: true,
+        writable: true,
+        value: origBc,
+      });
+    }
+  });
+
+  it('DELTA-OT1 P2-1: queued Web Lock clearResolvedHeldWritesForUser never writes/removes storage after Tab A is demoted by takeover', async () => {
+    const url = 'https://delta-ot1-p2-1.example.test';
+    const userId = 'owner-p2-1';
+    const postedKey = `${userStoragePrefix(userId, url)}posted:purchase%3Anew:req-1`;
+    const subjectLockName = `${userStoragePrefix(userId, url)}purchase%3Anew`;
+
+    // Lock manager supporting BOTH stealable leadership lock AND queued exclusive subject locks!
+    type QueuedWaiter = { grant: () => void };
+    const subjectHeld = new Set<string>();
+    const subjectWaiters = new Map<string, QueuedWaiter[]>();
+    const { locks: activeTabLocks } = createStealableLockManager();
+
+    const combinedLocks = {
+      request<T>(
+        name: string,
+        options: {
+          mode?: 'exclusive' | 'shared';
+          ifAvailable?: boolean;
+          steal?: boolean;
+        },
+        callback: (
+          lock: { name: string; mode: string } | null,
+        ) => Promise<T> | T,
+      ): Promise<T> {
+        if (name.startsWith('theshark:app:active-tab:')) {
+          return activeTabLocks.request(name, options, callback);
+        }
+        const run = async (): Promise<T> => {
+          try {
+            return await callback({ name, mode: options.mode ?? 'exclusive' });
+          } finally {
+            subjectHeld.delete(name);
+            const q = subjectWaiters.get(name);
+            const next = q?.shift();
+            if (next) {
+              subjectHeld.add(name);
+              next.grant();
+            }
+          }
+        };
+        if (!subjectHeld.has(name)) {
+          subjectHeld.add(name);
+          return run();
+        }
+        if (options.ifAvailable) {
+          return Promise.resolve().then(() => callback(null));
+        }
+        return new Promise<T>((resolve, reject) => {
+          let q = subjectWaiters.get(name);
+          if (!q) {
+            q = [];
+            subjectWaiters.set(name, q);
+          }
+          q.push({
+            grant: () => {
+              run().then(resolve, reject);
+            },
+          });
+        });
+      },
+    };
+
+    const backing = new Map<string, string>();
+    backing.set(
+      postedKey,
+      JSON.stringify({
+        v: 1,
+        subject: 'purchase:new',
+        requestId: 'req-1',
+        claimId: 'claim-1',
+        phase: 'posted_reload',
+        payload: {},
+      }),
+    );
+
+    let tabADemoted = false;
+    const tabAStorageWritesAfterDemotion: string[] = [];
+    const tabAStorage: Storage = {
+      get length() {
+        return backing.size;
+      },
+      clear: () => backing.clear(),
+      getItem: (k) => backing.get(k) ?? null,
+      key: (i) => [...backing.keys()][i] ?? null,
+      removeItem: (k) => {
+        if (tabADemoted) {
+          tabAStorageWritesAfterDemotion.push(`removeItem:${k}`);
+        }
+        backing.delete(k);
+      },
+      setItem: (k, v) => {
+        if (tabADemoted) {
+          tabAStorageWritesAfterDemotion.push(`setItem:${k}`);
+        }
+        backing.set(k, String(v));
+      },
+    };
+
+    const hwA = createHeldWriteStore({
+      getStorage: () => tabAStorage,
+      getProjectUrl: () => url,
+      getLocks: () => combinedLocks,
+    });
+    const tabACtrl = createActiveTabController({
+      getLocks: () => combinedLocks,
+      getProjectUrl: () => url,
+    });
+    const tabBCtrl = createActiveTabController({
+      getLocks: () => combinedLocks,
+      getProjectUrl: () => url,
+    });
+
+    tabACtrl.registerLifecycle({
+      onBecomeActive: () => hwA.setHeldWritesTabActive(true),
+      onBecomeInactive: () => {
+        tabADemoted = true;
+        hwA.setHeldWritesTabActive(false);
+      },
+    });
+
+    let releaseSubjectBlocker!: () => void;
+    const blockerP = combinedLocks.request(
+      subjectLockName,
+      { mode: 'exclusive' },
+      () =>
+        new Promise<void>((resolve) => {
+          releaseSubjectBlocker = resolve;
+        }),
+    );
+
+    try {
+      tabACtrl.start();
+      await vi.waitFor(() => {
+        expect(tabACtrl.isActive()).toBe(true);
+      });
+      tabBCtrl.start();
+      await vi.waitFor(() => {
+        expect(tabBCtrl.getSnapshot().status).toBe('inactive');
+      });
+
+      hwA.setHeldWriteUser(userId);
+      // Tab A signs out -> queues pruneUnderSubjectLock behind the held subject lock.
+      hwA.setWritesLocked(true);
+      hwA.bumpSessionGeneration();
+      hwA.clearResolvedHeldWritesForUser(userId, url);
+      hwA.setHeldWriteUser(null);
+
+      // Before the subject lock releases, Tab B takes over -> Tab A becomes inactive!
+      expect(await tabBCtrl.takeOver()).toBe(true);
+      await vi.waitFor(() => {
+        expect(tabACtrl.getSnapshot().status).toBe('inactive');
+      });
+
+      // Now release the subject lock so Tab A's queued prune callback fires while Tab A is INACTIVE!
+      releaseSubjectBlocker();
+      await blockerP;
+      await new Promise((r) => setTimeout(r, 20));
+
+      // P2-1 / I6: Inactive Tab A MUST NOT remove postedKey from localStorage!
+      expect(tabAStorageWritesAfterDemotion).toEqual([]);
+      expect(backing.has(postedKey)).toBe(true);
+    } finally {
+      tabACtrl.dispose();
+      tabBCtrl.dispose();
+      hwA.dispose();
+    }
+  });
+
+  it('DELTA-OT1 P2-2: boot reconciles durable logout records BEFORE GoTrueClient refreshes expired tokens, and auto-refresh stays stopped in local_failed', async () => {
+    vi.useFakeTimers();
+    const url = 'https://delta-ot1-p2-2.example.test';
+    const anonKey = 'anon-key-delta-ot1-p2-2';
+    const sdkKey = 'sb-delta-ot1-p2-2-auth-token';
+    const recordKey = getLogoutCoordStorageKey(url);
+
+    // Expired access token (past EXPIRY_MARGIN_MS) that GoTrueClient WOULD try
+    // to refresh if constructed with autoRefreshToken: true before reconciliation!
+    const expiredSession = {
+      ...makeSession('sid-p2-2-expired'),
+      expires_at: Math.floor(Date.now() / 1000) - 60,
+    };
+
+    const backing = new Map<string, string>();
+    let blockSdkErase = true;
+    const storage: Storage = {
+      get length() {
+        return backing.size;
+      },
+      clear: () => backing.clear(),
+      getItem: (k) => backing.get(k) ?? null,
+      key: (i) => [...backing.keys()][i] ?? null,
+      removeItem: (k) => {
+        if (blockSdkErase && k === sdkKey) {
+          throw new DOMException('Blocked remove', 'QuotaExceededError');
+        }
+        backing.delete(k);
+      },
+      setItem: (k, v) => {
+        if (blockSdkErase && k === sdkKey) {
+          throw new DOMException('Blocked overwrite', 'QuotaExceededError');
+        }
+        backing.set(k, String(v));
+      },
+    };
+
+    let refreshFetchCount = 0;
+    const rawFetch: typeof fetch = (input) => {
+      const href = requestUrlOf(input);
+      if (href.includes('/auth/v1/token?grant_type=refresh_token')) {
+        refreshFetchCount += 1;
+        return Promise.resolve(
+          new Response(JSON.stringify(makeSession('sid-p2-2-expired')), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/logout')) {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    // Part A: Boot with durable `local_failed` + unremovable expired sdkKey.
+    backing.set(sdkKey, JSON.stringify(expiredSession));
+    backing.set(
+      recordKey,
+      JSON.stringify({
+        attemptId: 1,
+        state: 'local_failed',
+        sessionKey: 'sid:sid-p2-2-expired',
+      }),
+    );
+
+    const managedA = createManagedSupabaseClient({
+      url,
+      anonKey,
+      storageKey: sdkKey,
+      getStorage: () => storage,
+      getFetch: () => rawFetch,
+    });
+    const storeA = createAuthStore({
+      getClient: () => managedA.getClient(),
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      storageKey: sdkKey,
+      syncGlobalStores: false,
+    });
+
+    try {
+      storeA.startAuth();
+      expect(storeA.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'local_failed',
+        logoutFailed: true,
+      });
+      // Client was NOT eagerly constructed before reconciliation!
+      expect(managedA.hasInstantiatedClient()).toBe(false);
+
+      // Advance fake timers 95 seconds (3× the 30 s auto-refresh ticker) -> ZERO refresh fetches!
+      await vi.advanceTimersByTimeAsync(95_000);
+      expect(refreshFetchCount).toBe(0);
+
+      // Part B: Boot with durable `revocation_failed` + removable expired sdkKey.
+      storeA.resetAuthStore({ clearStorage: false });
+      managedA.deactivate();
+      blockSdkErase = false;
+      backing.set(sdkKey, JSON.stringify(expiredSession));
+      backing.set(
+        recordKey,
+        JSON.stringify({
+          attemptId: 2,
+          state: 'revocation_failed',
+          sessionKey: 'sid:sid-p2-2-expired',
+        }),
+      );
+
+      const managedB = createManagedSupabaseClient({
+        url,
+        anonKey,
+        storageKey: sdkKey,
+        getStorage: () => storage,
+        getFetch: () => rawFetch,
+      });
+      const storeB = createAuthStore({
+        getClient: () => managedB.getClient(),
+        getProjectUrl: () => url,
+        getStorage: () => storage,
+        storageKey: sdkKey,
+        syncGlobalStores: false,
+      });
+
+      try {
+        storeB.startAuth();
+        // sdkKey was evicted BEFORE GoTrueClient initialized -> ZERO refresh fetches!
+        expect(backing.get(sdkKey)).toBeUndefined();
+        expect(storeB.getAuthSnapshot()).toMatchObject({
+          status: 'signed-out',
+          logoutPhase: 'revocation_failed',
+          logoutRevocationFailed: true,
+        });
+        await vi.advanceTimersByTimeAsync(95_000);
+        expect(refreshFetchCount).toBe(0);
+      } finally {
+        storeB.resetAuthStore({ clearStorage: false });
+        managedB.deactivate();
+      }
+
+      // Part C: Mid-session sign-out landing in local_failed stops running auto-refresh!
+      backing.clear();
+      const nearExpirySession = {
+        ...makeSession('sid-p2-2-live'),
+        expires_at: Math.floor(Date.now() / 1000) + 120,
+      };
+      backing.set(sdkKey, JSON.stringify(nearExpirySession));
+
+      const managedC = createManagedSupabaseClient({
+        url,
+        anonKey,
+        storageKey: sdkKey,
+        getStorage: () => storage,
+        getFetch: () => rawFetch,
+      });
+      const storeC = createAuthStore({
+        getClient: () => managedC.getClient(),
+        getProjectUrl: () => url,
+        getStorage: () => storage,
+        storageKey: sdkKey,
+        syncGlobalStores: false,
+      });
+
+      try {
+        storeC.startAuth();
+        await vi.advanceTimersByTimeAsync(50);
+        expect(storeC.getAuthSnapshot().status).toBe('owner');
+
+        // Block erase and attempt sign-out -> lands in local_failed and stops auto-refresh!
+        blockSdkErase = true;
+        await storeC.signOut();
+        expect(storeC.getAuthSnapshot().logoutPhase).toBe('local_failed');
+        refreshFetchCount = 0;
+
+        // Advance past expiry + multiple 30 s ticker intervals -> ZERO refresh fetches!
+        await vi.advanceTimersByTimeAsync(150_000);
+        expect(refreshFetchCount).toBe(0);
+      } finally {
+        storeC.resetAuthStore({ clearStorage: false });
+        managedC.deactivate();
+      }
+    } finally {
+      storeA.resetAuthStore({ clearStorage: false });
+      managedA.deactivate();
+      vi.useRealTimers();
     }
   });
 });

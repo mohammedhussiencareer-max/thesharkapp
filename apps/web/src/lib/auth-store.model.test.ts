@@ -1,5 +1,4 @@
 // @vitest-environment jsdom
-import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createActiveTabController,
@@ -10,13 +9,11 @@ import {
   getLogoutCoordStorageKey,
   type AuthSnapshot,
 } from '@/lib/auth-store';
+import { createHeldWriteStore, userStoragePrefix } from '@/lib/held-writes';
 import {
-  getHeldWrite,
-  isWritesLocked,
-  rehydrateHeldWrites,
-  resetHeldWritesStore,
-  userStoragePrefix,
-} from '@/lib/held-writes';
+  createManagedSupabaseClient,
+  type ManagedSupabaseController,
+} from '@/lib/supabase';
 
 const TEST_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.model.sig';
 const SEED_COUNT = 400;
@@ -76,21 +73,104 @@ function requestUrlOf(input: RequestInfo | URL): string {
 }
 
 /**
- * Spec-faithful stealable Web Locks manager for testing the one-active-tab
- * exclusive leadership lock (`ifAvailable: true` + `{ steal: true }`).
+ * In-memory BroadcastChannel hub installed on `globalThis.BroadcastChannel` so
+ * GoTrueClient instances open real cross-tab channels. If a demoted tab fails
+ * to dispose its channel (P1-1), messages flow to the newly active tab!
  */
-function createStealableLockManager() {
+function createFakeBroadcastHub(onChannelOpened: () => void) {
+  type Listener = (ev: { data: unknown }) => void;
+  const channelsByName = new Map<string, Set<FakeChannel>>();
+
+  class FakeChannel {
+    readonly name: string;
+    onmessage: ((ev: { data: unknown }) => void) | null = null;
+    private readonly listeners = new Set<Listener>();
+    closed = false;
+
+    constructor(name: string) {
+      this.name = name;
+      onChannelOpened();
+      let group = channelsByName.get(name);
+      if (!group) {
+        group = new Set();
+        channelsByName.set(name, group);
+      }
+      group.add(this);
+    }
+
+    addEventListener(type: string, fn: Listener): void {
+      if (type === 'message') this.listeners.add(fn);
+    }
+
+    removeEventListener(type: string, fn: Listener): void {
+      if (type === 'message') this.listeners.delete(fn);
+    }
+
+    postMessage(data: unknown): void {
+      if (this.closed) return;
+      const group = channelsByName.get(this.name);
+      if (!group) return;
+      for (const peer of [...group]) {
+        if (peer === this || peer.closed) continue;
+        peer.onmessage?.({ data });
+        for (const fn of [...peer.listeners]) fn({ data });
+      }
+    }
+
+    close(): void {
+      this.closed = true;
+      channelsByName.get(this.name)?.delete(this);
+    }
+  }
+
+  return {
+    BroadcastChannel: FakeChannel,
+    closeAll() {
+      for (const group of channelsByName.values()) {
+        for (const ch of [...group]) ch.close();
+      }
+      channelsByName.clear();
+    },
+  };
+}
+
+/**
+ * Spec-faithful Web Locks manager supporting:
+ * - exclusive `ifAvailable` + `steal: true` (for `active-tab.ts` leadership)
+ * - queued asynchronous exclusive locks (for `held-writes.ts` subject locks)
+ */
+function createCombinedLockManager(onSubjectLockUsed: () => void) {
   type HeldLock = {
     id: number;
     broken: boolean;
     rejectRequest: (err: unknown) => void;
     resolveRequest: (value: unknown) => void;
   };
+  type Waiter = {
+    grant: () => void;
+  };
   let nextId = 1;
   const heldByName = new Map<string, HeldLock>();
+  const waitersByName = new Map<string, Waiter[]>();
+
+  function pumpNext(name: string): void {
+    if (heldByName.has(name)) return;
+    const queue = waitersByName.get(name);
+    if (!queue || queue.length === 0) {
+      waitersByName.delete(name);
+      return;
+    }
+    const next = queue.shift()!;
+    if (queue.length === 0) waitersByName.delete(name);
+    next.grant();
+  }
 
   const locks: LockManager = {
-    query: () => Promise.resolve({ held: [], pending: [] }),
+    query: () =>
+      Promise.resolve({
+        held: [...heldByName.keys()].map((name) => ({ name })),
+        pending: [],
+      }),
     request<T = unknown>(
       name: string,
       optionsOrCb: LockOptions | LockGrantedCallback<T>,
@@ -101,14 +181,46 @@ function createStealableLockManager() {
       const callback: LockGrantedCallback<T> =
         typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb!;
 
-      const existing = heldByName.get(name);
-      if (existing && !options.steal) {
-        if (options.ifAvailable) {
-          return Promise.resolve().then(() => callback(null));
-        }
-        return Promise.resolve().then(() => callback(null));
+      if (!name.startsWith('theshark:app:active-tab:')) {
+        onSubjectLockUsed();
       }
 
+      const grantNow = (): Promise<T> =>
+        new Promise<T>((resolve, reject) => {
+          const entry: HeldLock = {
+            id: nextId++,
+            broken: false,
+            rejectRequest: reject,
+            resolveRequest: resolve as (value: unknown) => void,
+          };
+          heldByName.set(name, entry);
+
+          void Promise.resolve()
+            .then(() =>
+              callback({
+                name,
+                mode: options.mode ?? 'exclusive',
+              }),
+            )
+            .then(
+              (val) => {
+                if (!entry.broken && heldByName.get(name)?.id === entry.id) {
+                  heldByName.delete(name);
+                  entry.resolveRequest(val);
+                  pumpNext(name);
+                }
+              },
+              (err) => {
+                if (!entry.broken && heldByName.get(name)?.id === entry.id) {
+                  heldByName.delete(name);
+                  entry.rejectRequest(err);
+                  pumpNext(name);
+                }
+              },
+            );
+        });
+
+      const existing = heldByName.get(name);
       if (existing && options.steal) {
         existing.broken = true;
         heldByName.delete(name);
@@ -118,38 +230,28 @@ function createStealableLockManager() {
             'AbortError',
           ),
         );
+        return grantNow();
+      }
+
+      if (!existing) {
+        return grantNow();
+      }
+
+      if (options.ifAvailable) {
+        return Promise.resolve().then(() => callback(null));
       }
 
       return new Promise<T>((resolve, reject) => {
-        const entry: HeldLock = {
-          id: nextId++,
-          broken: false,
-          rejectRequest: reject,
-          resolveRequest: resolve as (value: unknown) => void,
-        };
-        heldByName.set(name, entry);
-
-        void Promise.resolve()
-          .then(() =>
-            callback({
-              name,
-              mode: options.mode ?? 'exclusive',
-            }),
-          )
-          .then(
-            (val) => {
-              if (!entry.broken && heldByName.get(name)?.id === entry.id) {
-                heldByName.delete(name);
-                entry.resolveRequest(val);
-              }
-            },
-            (err) => {
-              if (!entry.broken && heldByName.get(name)?.id === entry.id) {
-                heldByName.delete(name);
-                entry.rejectRequest(err);
-              }
-            },
-          );
+        let queue = waitersByName.get(name);
+        if (!queue) {
+          queue = [];
+          waitersByName.set(name, queue);
+        }
+        queue.push({
+          grant: () => {
+            grantNow().then(resolve, reject);
+          },
+        });
       });
     },
   };
@@ -218,12 +320,12 @@ class ModelAuthServer {
   private readonly sessionByRefreshToken = new Map<string, IssuedSession>();
   private readonly logoutAttempts = new Map<string, number>();
 
-  issueSession(user: UserProfile): IssuedSession {
+  issueSession(user: UserProfile, ttlSeconds = 3600): IssuedSession {
     const order = this.nextSid++;
     const sid = `m-${order}`;
     const sessionKey = `sid:${sid}`;
     const nowSec = Math.floor(Date.now() / 1000);
-    const expiresAt = nowSec + 3600;
+    const expiresAt = nowSec + ttlSeconds;
     const accessToken = makeFakeJwt({
       sub: user.id,
       email: user.email,
@@ -321,6 +423,7 @@ class ModelAuthServer {
 
 type QuotaMode = 'normal' | 'coord_blocked' | 'zero_byte';
 type LogoutMode = '204' | '503' | 'slow_204' | 'slow_503' | '401_once';
+type RefreshMode = 'ok' | 'slow_ok' | 'slow_400';
 
 type DurableRecord = {
   attemptId: number;
@@ -330,7 +433,7 @@ type DurableRecord = {
 
 type DeferredNet = {
   id: number;
-  kind: 'logout' | 'signin';
+  kind: 'logout' | 'signin' | 'refresh';
   tabId: string;
   sessionKey: string | null;
   resolve: () => void;
@@ -340,16 +443,20 @@ type TabHandle = {
   slot: number;
   tabId: string;
   activeCtrl: ActiveTabController;
-  client: SupabaseClient | null;
-  clientGeneration: number;
+  managedClient: ManagedSupabaseController;
+  heldWrites: ReturnType<typeof createHeldWriteStore>;
   store: ReturnType<typeof createAuthStore>;
   destroyed: boolean;
   inFlightSignOuts: number;
   inFlightSignIns: number;
   inFlightRetries: number;
+  inFlightRefreshes: number;
+  /** Live fetch AbortSignals of the current active generation (verified aborted on demotion). */
+  inFlightFetchSignals: Set<AbortSignal>;
   /** I6 counters: MUST remain 0 for every tab across the entire run! */
   inactiveFetchCount: number;
   inactiveStorageWriteCount: number;
+  unabortedDemotedFetchCount: number;
   /** Sessions for which THIS live tab originated a sign-out while active (cleared on demotion). */
   revocationOriginSids: Set<string>;
   differentSessionAppearedAfterSignOut: boolean;
@@ -359,6 +466,11 @@ type ModelCoverageStats = {
   takeovers: number;
   takeoversDuringSignOut: number;
   takeoversDuringSignIn: number;
+  takeoversDuringRefresh: number;
+  inFlightFetchesAbortedOnTakeover: number;
+  broadcastChannelsOpened: number;
+  heldWriteWebLocksUsed: number;
+  refreshCallsAttempted: number;
   tabCloses: number;
   tabReloads: number;
   revocationFailedPostSettle: number;
@@ -368,6 +480,8 @@ type ModelCoverageStats = {
   lateRevokedRefreshEvents: number;
   globalMultiSessionRevokes: number;
   inactiveTabsVerifiedSilent: number;
+  postedReloadClearedVerified: number;
+  noActiveTabLockedVerified: number;
 };
 
 function readPersistedSid(raw: string | undefined): string | null {
@@ -423,16 +537,28 @@ function readDurableRecord(raw: string | undefined): DurableRecord | null {
   }
 }
 
-async function flushMicrotasks(rounds = 8): Promise<void> {
+async function flushMicrotasks(rounds = 10): Promise<void> {
   for (let i = 0; i < rounds; i += 1) {
     await Promise.resolve();
   }
 }
 
-function seedHeldWritesForBothUsers(): void {
-  resetHeldWritesStore({ clearStorage: true, resetUser: true });
-  window.localStorage.setItem(
-    `${userStoragePrefix(USER_A.id)}model:op-a`,
+function seedHeldWritesInBacking(
+  values: Map<string, string>,
+  projectUrl: string,
+): {
+  opAKey: string;
+  postedAKey: string;
+  opBKey: string;
+  postedBKey: string;
+} {
+  const opAKey = `${userStoragePrefix(USER_A.id, projectUrl)}model%3Aop-a`;
+  const postedAKey = `${userStoragePrefix(USER_A.id, projectUrl)}posted:model%3Aposted-a:req-a-post`;
+  const opBKey = `${userStoragePrefix(USER_B.id, projectUrl)}model%3Aop-b`;
+  const postedBKey = `${userStoragePrefix(USER_B.id, projectUrl)}posted:model%3Aposted-b:req-b-post`;
+
+  values.set(
+    opAKey,
     JSON.stringify({
       v: 1,
       subject: 'model:op-a',
@@ -441,18 +567,19 @@ function seedHeldWritesForBothUsers(): void {
       payload: { user: 'a' },
     }),
   );
-  window.localStorage.setItem(
-    `${userStoragePrefix(USER_A.id)}posted:model:posted-a:req-a-post`,
+  values.set(
+    postedAKey,
     JSON.stringify({
       v: 1,
       subject: 'model:posted-a',
       requestId: 'req-a-post',
+      claimId: 'claim-a-post',
       phase: 'posted_reload',
       payload: { user: 'a' },
     }),
   );
-  window.localStorage.setItem(
-    `${userStoragePrefix(USER_B.id)}model:op-b`,
+  values.set(
+    opBKey,
     JSON.stringify({
       v: 1,
       subject: 'model:op-b',
@@ -461,6 +588,18 @@ function seedHeldWritesForBothUsers(): void {
       payload: { user: 'b' },
     }),
   );
+  values.set(
+    postedBKey,
+    JSON.stringify({
+      v: 1,
+      subject: 'model:posted-b',
+      requestId: 'req-b-post',
+      claimId: 'claim-b-post',
+      phase: 'posted_reload',
+      payload: { user: 'b' },
+    }),
+  );
+  return { opAKey, postedAKey, opBKey, postedBKey };
 }
 
 async function runModelSeed(
@@ -477,13 +616,27 @@ async function runModelSeed(
   const sdkKey = `sb-${projectRef}-auth-token`;
   const coordKey = getLogoutCoordStorageKey(projectUrl);
 
+  const originalBroadcastChannel = globalThis.BroadcastChannel;
+  const bcHub = createFakeBroadcastHub(() => {
+    stats.broadcastChannelsOpened += 1;
+  });
+  Object.defineProperty(globalThis, 'BroadcastChannel', {
+    configurable: true,
+    writable: true,
+    value: bcHub.BroadcastChannel,
+  });
+
   const server = new ModelAuthServer();
-  const lockManager = createStealableLockManager();
+  const lockManager = createCombinedLockManager(() => {
+    stats.heldWriteWebLocksUsed += 1;
+  });
   const values = new Map<string, string>();
+  const hwKeys = seedHeldWritesInBacking(values, projectUrl);
 
   // Environment fault knobs
   let quotaMode: QuotaMode = 'normal';
   let logoutMode: LogoutMode = '204';
+  let refreshMode: RefreshMode = 'ok';
   let slowSignIn = false;
   let failSdkRemove = false;
   let failSdkTombstone = false;
@@ -498,27 +651,28 @@ async function runModelSeed(
   const signOutOriginUsers = new Map<string, string>(); // sessionKey -> userId
   let latestCleanSignedInSid: string | null = null;
   let latestSignOutSessionKey: string | null = null;
-  // Tracks whether the latest sign-out failed to persist ANY durable record
-  // because localStorage was full when it ran (I2 full-storage exception after reload/takeover).
-  let latestSignOutCoordUnpersisted = false;
-  // Tracks whether the latest sign-out failed BOTH sdkKey erase/tombstone AND coord persistence
-  // (I1 extreme-storage exception where browser refused every write & delete).
+  // Tracks ONLY the extreme case where browser refused BOTH sdkKey erase/tombstone
+  // AND writing durable coordKey (I1 extreme storage exception). Notice we do NOT
+  // exempt `coord_blocked`, because `sdkKey` removal still succeeds under `coord_blocked`!
   let latestSignOutUnpersistedAndUnerased = false;
-  // Tracks whether a sign-out occurred cleanly on USER_A so we can check posted_reload cleanup.
-  let userASignedOut = false;
+  // Tracks whether User A completed a sign-out while remaining active so its
+  // queued Web Lock `clearResolvedHeldWritesForUser` callback had a chance to
+  // clear `posted_reload` without being aborted by a mid-sign-out takeover (I5/I6).
+  let userACleanSignOutSettledWhileActive = false;
 
   const tabCount = chance(0.5) ? 2 : 3;
   const tabs: TabHandle[] = [];
 
-  seedHeldWritesForBothUsers();
-
-  // Seed initial signed-in session in ~70% of seeds so both signed-in and signed-out boots get tested.
+  // Seed initial signed-in session in ~70% of seeds (sometimes near-expiry to exercise auto-refresh!)
   if (chance(0.7)) {
     const initialUser = chance(0.65) ? USER_A : USER_B;
-    const initialSession = server.issueSession(initialUser);
+    const ttl = chance(0.3) ? 75 : 3600;
+    const initialSession = server.issueSession(initialUser, ttl);
     values.set(sdkKey, JSON.stringify(toSessionPayload(initialSession)));
     latestCleanSignedInSid = initialSession.sessionKey;
-    trace.push(`init: seeded ${initialSession.sessionKey} (${initialUser.id})`);
+    trace.push(
+      `init: seeded ${initialSession.sessionKey} (${initialUser.id}, ttl=${ttl}s)`,
+    );
   } else {
     trace.push('init: signed-out');
   }
@@ -528,7 +682,7 @@ async function runModelSeed(
       .map((t) => {
         if (t.destroyed) return `${t.tabId}(destroyed)`;
         const s: AuthSnapshot = t.store.getAuthSnapshot();
-        return `${t.tabId}[active=${t.activeCtrl.isActive()} client=${t.client !== null} status=${s.status} phase=${s.logoutPhase} retry=${s.canRetryLogoutRevocation} email=${s.email ?? '-'} inactFetch=${t.inactiveFetchCount} inactWrite=${t.inactiveStorageWriteCount}]`;
+        return `${t.tabId}[active=${t.activeCtrl.isActive()} client=${t.managedClient.hasInstantiatedClient()} status=${s.status} phase=${s.logoutPhase} retry=${s.canRetryLogoutRevocation} email=${s.email ?? '-'} inactFetch=${t.inactiveFetchCount} inactWrite=${t.inactiveStorageWriteCount} unaborted=${t.unabortedDemotedFetchCount}]`;
       })
       .join(' | ');
     const recentTrace = trace.slice(-25).join('\n  ');
@@ -543,50 +697,32 @@ async function runModelSeed(
   }
 
   /**
-   * Builds a storage adapter for a tab.
-   * - For `auth-store` (`isSdkClient = false`): does NOT swallow writes silently —
-   *   instead it increments `tab.inactiveStorageWriteCount` if `auth-store` ever
-   *   attempts a write while inactive, so I6 catches any bug in `auth-store`!
-   * - For the real `createClient` (`isSdkClient = true` with `clientGen`):
-   *   mirrors production `supabase.ts` (`createActiveGatedStorage`) so a demoted
-   *   client generation silently drops writes and NEVER touches backing storage,
-   *   while any write while `!tab.activeCtrl.isActive()` is still impossible.
+   * Unfiltered spy storage passed to `auth-store`, `held-writes`, and as the
+   * backing store inside production `createManagedSupabaseClient`.
+   * ANY `setItem`/`removeItem`/`clear` that reaches this adapter while
+   * `!tab.activeCtrl.isActive()` increments `tab.inactiveStorageWriteCount`
+   * and trips `I6-inactive-storage-write`!
    */
-  function makeStorageForTab(
-    tab: TabHandle,
-    opts: { isSdkClient: boolean; clientGen?: number },
-  ): Storage {
-    const isClientCurrent = () =>
-      !tab.destroyed &&
-      tab.activeCtrl.isActive() &&
-      tab.clientGeneration === opts.clientGen;
-
+  function makeTrackedBackingStorage(tab: TabHandle): Storage {
     return {
       get length() {
-        if (opts.isSdkClient && !isClientCurrent()) return 0;
         return values.size;
       },
       clear() {
-        if (opts.isSdkClient) {
-          if (!isClientCurrent()) return;
-        } else if (!tab.activeCtrl.isActive()) {
+        if (!tab.activeCtrl.isActive()) {
           tab.inactiveStorageWriteCount += 1;
           return;
         }
         values.clear();
       },
       getItem(k: string): string | null {
-        if (opts.isSdkClient && !isClientCurrent()) return null;
         return values.get(k) ?? null;
       },
       key(i: number): string | null {
-        if (opts.isSdkClient && !isClientCurrent()) return null;
         return [...values.keys()][i] ?? null;
       },
       removeItem(k: string): void {
-        if (opts.isSdkClient) {
-          if (!isClientCurrent()) return;
-        } else if (!tab.activeCtrl.isActive()) {
+        if (!tab.activeCtrl.isActive()) {
           tab.inactiveStorageWriteCount += 1;
           return;
         }
@@ -599,9 +735,7 @@ async function runModelSeed(
         values.delete(k);
       },
       setItem(k: string, v: string): void {
-        if (opts.isSdkClient) {
-          if (!isClientCurrent()) return;
-        } else if (!tab.activeCtrl.isActive()) {
+        if (!tab.activeCtrl.isActive()) {
           tab.inactiveStorageWriteCount += 1;
           return;
         }
@@ -632,20 +766,27 @@ async function runModelSeed(
     };
   }
 
-  function makeFetchForTab(tab: TabHandle, clientGen: number): typeof fetch {
+  /**
+   * Raw network fetch passed into production `createManagedSupabaseClient`.
+   * Because production `createGenerationFetch` sits in front of this function,
+   * ANY call reaching here while `!tab.activeCtrl.isActive()` is a REAL,
+   * REACHABLE I6 violation (`tab.inactiveFetchCount += 1`)!
+   * Also tracks `init.signal` in `tab.inFlightFetchSignals` so demotion verifies
+   * every in-flight fetch was aborted (P1-1)!
+   */
+  function makeRawNetworkFetchForTab(tab: TabHandle): typeof fetch {
     return (input, init) => {
-      // Production supabase.ts gates every fetch on active + generation match!
-      // If a demoted client somehow still tries to call fetch, return aborted
-      // error without hitting the network (matching supabase.ts).
-      if (
-        tab.destroyed ||
-        !tab.activeCtrl.isActive() ||
-        tab.clientGeneration !== clientGen
-      ) {
-        return Promise.reject(
-          new DOMException('Tab is no longer active', 'AbortError'),
-        );
+      if (!tab.activeCtrl.isActive()) {
+        tab.inactiveFetchCount += 1;
       }
+
+      const signal = init?.signal ?? undefined;
+      if (signal) {
+        tab.inFlightFetchSignals.add(signal);
+      }
+      const untrack = () => {
+        if (signal) tab.inFlightFetchSignals.delete(signal);
+      };
 
       const href = requestUrlOf(input);
       const headers = new Headers(
@@ -655,12 +796,6 @@ async function runModelSeed(
       const bearer = authHeader.startsWith('Bearer ')
         ? authHeader.slice(7)
         : null;
-
-      // Double-check I6: if this tab was somehow NOT active when fetch entered
-      // the network layer, record an I6 violation.
-      if (!tab.activeCtrl.isActive()) {
-        tab.inactiveFetchCount += 1;
-      }
 
       // 1) Password sign-in
       if (href.includes('/auth/v1/token?grant_type=password')) {
@@ -681,9 +816,10 @@ async function runModelSeed(
             const onAbort = () => {
               if (settled) return;
               settled = true;
+              untrack();
               reject(new DOMException('Aborted', 'AbortError'));
             };
-            init?.signal?.addEventListener('abort', onAbort, { once: true });
+            signal?.addEventListener('abort', onAbort, { once: true });
             deferredNets.push({
               id: netId,
               kind: 'signin',
@@ -692,36 +828,78 @@ async function runModelSeed(
               resolve: () => {
                 if (settled) return;
                 settled = true;
-                init?.signal?.removeEventListener('abort', onAbort);
+                signal?.removeEventListener('abort', onAbort);
+                untrack();
                 resolve(respond());
               },
             });
           });
         }
+        untrack();
         return Promise.resolve(respond());
       }
 
       // 2) Refresh token
       if (href.includes('/auth/v1/token?grant_type=refresh_token')) {
+        stats.refreshCallsAttempted += 1;
         const bodyRaw = typeof init?.body === 'string' ? init.body : '{}';
         const parsed = JSON.parse(bodyRaw) as { refresh_token?: string };
-        const rotated = parsed.refresh_token
-          ? server.refresh(parsed.refresh_token)
-          : null;
-        if (!rotated) {
-          return Promise.resolve(
-            new Response(JSON.stringify({ error: 'invalid_grant' }), {
+        const mode = refreshMode;
+        const respond = (): Response => {
+          if (mode === 'slow_400') {
+            return new Response(
+              JSON.stringify({
+                error: 'invalid_grant',
+                error_description: 'refresh_token_not_found',
+              }),
+              {
+                status: 400,
+                headers: { 'content-type': 'application/json' },
+              },
+            );
+          }
+          const rotated = parsed.refresh_token
+            ? server.refresh(parsed.refresh_token)
+            : null;
+          if (!rotated) {
+            return new Response(JSON.stringify({ error: 'invalid_grant' }), {
               status: 400,
               headers: { 'content-type': 'application/json' },
-            }),
-          );
-        }
-        return Promise.resolve(
-          new Response(JSON.stringify(toSessionPayload(rotated)), {
+            });
+          }
+          return new Response(JSON.stringify(toSessionPayload(rotated)), {
             status: 200,
             headers: { 'content-type': 'application/json' },
-          }),
-        );
+          });
+        };
+        if (mode === 'slow_ok' || mode === 'slow_400') {
+          return new Promise<Response>((resolve, reject) => {
+            const netId = nextNetId++;
+            let settled = false;
+            const onAbort = () => {
+              if (settled) return;
+              settled = true;
+              untrack();
+              reject(new DOMException('Aborted', 'AbortError'));
+            };
+            signal?.addEventListener('abort', onAbort, { once: true });
+            deferredNets.push({
+              id: netId,
+              kind: 'refresh',
+              tabId: tab.tabId,
+              sessionKey: null,
+              resolve: () => {
+                if (settled) return;
+                settled = true;
+                signal?.removeEventListener('abort', onAbort);
+                untrack();
+                resolve(respond());
+              },
+            });
+          });
+        }
+        untrack();
+        return Promise.resolve(respond());
       }
 
       // 3) Logout
@@ -770,9 +948,10 @@ async function runModelSeed(
             const onAbort = () => {
               if (settled) return;
               settled = true;
+              untrack();
               reject(new DOMException('Aborted', 'AbortError'));
             };
-            init?.signal?.addEventListener('abort', onAbort, { once: true });
+            signal?.addEventListener('abort', onAbort, { once: true });
             deferredNets.push({
               id: netId,
               kind: 'logout',
@@ -781,17 +960,20 @@ async function runModelSeed(
               resolve: () => {
                 if (settled) return;
                 settled = true;
-                init?.signal?.removeEventListener('abort', onAbort);
+                signal?.removeEventListener('abort', onAbort);
+                untrack();
                 resolve(finishLogout());
               },
             });
           });
         }
+        untrack();
         return Promise.resolve(finishLogout());
       }
 
       // 4) RPC is_owner
       if (href.includes('/rest/v1/rpc/is_owner')) {
+        untrack();
         const session = server.lookupByAccessToken(bearer);
         if (!session || session.revoked) {
           return Promise.resolve(
@@ -809,6 +991,7 @@ async function runModelSeed(
         );
       }
 
+      untrack();
       return Promise.resolve(new Response(null, { status: 404 }));
     };
   }
@@ -824,31 +1007,51 @@ async function runModelSeed(
       slot,
       tabId,
       activeCtrl,
-      client: null,
-      clientGeneration: 0,
+      managedClient: null as never,
+      heldWrites: null as never,
       store: null as never,
       destroyed: false,
       inFlightSignOuts: 0,
       inFlightSignIns: 0,
       inFlightRetries: 0,
+      inFlightRefreshes: 0,
+      inFlightFetchSignals: new Set(),
       inactiveFetchCount: 0,
       inactiveStorageWriteCount: 0,
+      unabortedDemotedFetchCount: 0,
       revocationOriginSids: new Set(),
       differentSessionAppearedAfterSignOut: false,
     };
 
-    const storeStorage = makeStorageForTab(tab, { isSdkClient: false });
-    const store = createAuthStore({
-      getClient: () => {
-        if (!tab.client) {
-          throw new Error(
-            `I6 violation: ${tabId} accessed client while inactive`,
-          );
-        }
-        return tab.client as never;
-      },
+    const backingStorage = makeTrackedBackingStorage(tab);
+    const managedClient = createManagedSupabaseClient({
+      url: projectUrl,
+      anonKey: TEST_ANON_KEY,
+      storageKey: sdkKey,
+      getStorage: () => backingStorage,
+      getFetch: () => makeRawNetworkFetchForTab(tab),
+      manageAutoRefresh: true,
+    });
+    // Tabs start inactive until Web Lock leadership is granted!
+    managedClient.deactivate();
+    tab.managedClient = managedClient;
+
+    const heldWrites = createHeldWriteStore({
+      getStorage: () => backingStorage,
       getProjectUrl: () => projectUrl,
-      getStorage: () => storeStorage,
+      getLocks: () => lockManager.locks,
+      allowTestLocalUser: false,
+      allowTestUnlocked: false,
+    });
+    heldWrites.setHeldWritesTabActive(false);
+    tab.heldWrites = heldWrites;
+
+    const store = createAuthStore({
+      getClient: () => managedClient.getClient(),
+      getProjectUrl: () => projectUrl,
+      getStorage: () => backingStorage,
+      storageKey: sdkKey,
+      heldWrites,
       syncGlobalStores: true,
       initiallyActive: false,
     });
@@ -857,38 +1060,27 @@ async function runModelSeed(
     activeCtrl.registerLifecycle({
       onBecomeActive: () => {
         if (tab.destroyed) return;
-        tab.clientGeneration += 1;
-        const gen = tab.clientGeneration;
-        const sdkStorage = makeStorageForTab(tab, {
-          isSdkClient: true,
-          clientGen: gen,
-        });
-        tab.client = createClient(projectUrl, TEST_ANON_KEY, {
-          auth: {
-            storage: sdkStorage,
-            storageKey: sdkKey,
-            persistSession: true,
-            autoRefreshToken: false,
-            detectSessionInUrl: false,
-          },
-          global: {
-            fetch: makeFetchForTab(tab, gen),
-          },
-        });
+        heldWrites.setHeldWritesTabActive(true);
+        managedClient.enable();
         store.activate();
         store.startAuth();
       },
       onBecomeInactive: () => {
+        const prevSignals = [...tab.inFlightFetchSignals];
         store.deactivate();
-        tab.clientGeneration += 1;
-        const prev = tab.client;
-        tab.client = null;
-        // Demoting a tab clears its in-memory revocation-retry origin tracking
-        // (matching the design: after takeover, retry is no longer available).
+        managedClient.deactivate();
+        heldWrites.setHeldWritesTabActive(false);
         tab.revocationOriginSids.clear();
-        if (prev) {
-          void prev.auth.stopAutoRefresh();
+        // P1-1: Every in-flight fetch of the demoted generation MUST have its
+        // AbortSignal aborted synchronously upon demotion!
+        for (const sig of prevSignals) {
+          if (sig.aborted) {
+            stats.inFlightFetchesAbortedOnTakeover += 1;
+          } else {
+            tab.unabortedDemotedFetchCount += 1;
+          }
         }
+        tab.inFlightFetchSignals.clear();
       },
     });
 
@@ -896,19 +1088,14 @@ async function runModelSeed(
     return tab;
   }
 
-  async function destroyTab(tab: TabHandle): Promise<void> {
+  function destroyTab(tab: TabHandle): void {
     if (tab.destroyed) return;
     tab.destroyed = true;
-    const prev = tab.client;
-    tab.client = null;
-    tab.clientGeneration += 1;
-    // Simulates browser tab close: releases the exclusive Web Lock and halts
-    // this tab's in-memory store without wiping shared localStorage coordKey!
     tab.activeCtrl.dispose();
     tab.store.deactivate();
-    if (prev) {
-      await prev.auth.stopAutoRefresh();
-    }
+    tab.managedClient.deactivate();
+    tab.heldWrites.setHeldWritesTabActive(false);
+    tab.heldWrites.dispose();
   }
 
   function getActiveTab(): TabHandle | null {
@@ -921,7 +1108,8 @@ async function runModelSeed(
         !t.destroyed &&
         (t.inFlightSignOuts > 0 ||
           t.inFlightSignIns > 0 ||
-          t.inFlightRetries > 0),
+          t.inFlightRetries > 0 ||
+          t.inFlightRefreshes > 0),
     );
   }
 
@@ -930,7 +1118,7 @@ async function runModelSeed(
     const activeTabs = liveTabs.filter((t) => t.activeCtrl.isActive());
     const inactiveTabs = liveTabs.filter((t) => !t.activeCtrl.isActive());
 
-    // === I6: At most ONE active tab; inactive tabs have zero fetches, zero storage writes, no client ===
+    // === I6: At most ONE active tab; inactive tabs have zero fetches, zero storage writes, no unaborted fetches, no live client ===
     if (activeTabs.length > 1) {
       throw formatFailure(
         'I6-multiple-active-tabs',
@@ -950,10 +1138,16 @@ async function runModelSeed(
           `At ${label}: ${t.tabId} wrote storage ${t.inactiveStorageWriteCount} times while inactive`,
         );
       }
+      if (t.unabortedDemotedFetchCount > 0) {
+        throw formatFailure(
+          'I6-demoted-fetch-not-aborted',
+          `At ${label}: ${t.tabId} left ${t.unabortedDemotedFetchCount} in-flight fetch(es) unaborted on demotion`,
+        );
+      }
     }
     for (const t of inactiveTabs) {
       stats.inactiveTabsVerifiedSilent += 1;
-      if (t.client !== null) {
+      if (t.managedClient.hasInstantiatedClient()) {
         throw formatFailure(
           'I6-inactive-has-client',
           `At ${label}: inactive ${t.tabId} still holds a SupabaseClient instance`,
@@ -986,7 +1180,7 @@ async function runModelSeed(
       }
     }
 
-    // === I1: Active tab never remains status=owner during failed/in-progress logout or with confirmed-revoked session ===
+    // === I1 & I2 & I5 on active tab ===
     if (activeTab) {
       const snap = activeTab.store.getAuthSnapshot();
       if (
@@ -1048,7 +1242,7 @@ async function runModelSeed(
       if (snap.status === 'owner' && snap.email) {
         if (
           snap.email === USER_A.email &&
-          getHeldWrite('model:op-b') !== null
+          activeTab.heldWrites.getHeldWrite('model:op-b') !== null
         ) {
           throw formatFailure(
             'I5-user-b-leaked-into-user-a',
@@ -1057,7 +1251,7 @@ async function runModelSeed(
         }
         if (
           snap.email === USER_B.email &&
-          getHeldWrite('model:op-a') !== null
+          activeTab.heldWrites.getHeldWrite('model:op-a') !== null
         ) {
           throw formatFailure(
             'I5-user-a-leaked-into-user-b',
@@ -1074,43 +1268,56 @@ async function runModelSeed(
             `At ${label}: active ${activeTab.tabId} is owner as ${snap.email} while sdkKey holds ${persistedEmail}`,
           );
         }
-      } else if (snap.status === 'signed-out' && !isWritesLocked()) {
+      } else if (
+        snap.status === 'signed-out' &&
+        !activeTab.heldWrites.isWritesLocked()
+      ) {
         throw formatFailure(
           'I5-writes-unlocked-while-signed-out',
           `At ${label}: writes unlocked while active ${activeTab.tabId} is signed-out`,
         );
       }
-    } else if (liveTabs.length > 0 && !isWritesLocked()) {
-      throw formatFailure(
-        'I5-writes-unlocked-with-no-active-tab',
-        `At ${label}: writes unlocked while all tabs are inactive`,
-      );
+    } else if (liveTabs.length > 0) {
+      stats.noActiveTabLockedVerified += 1;
+      for (const t of liveTabs) {
+        if (!t.heldWrites.isWritesLocked()) {
+          throw formatFailure(
+            'I5-writes-unlocked-with-no-active-tab',
+            `At ${label}: writes unlocked on ${t.tabId} while all tabs are inactive`,
+          );
+        }
+      }
+    }
+
+    // Every inactive tab must also keep its held-writes store locked (I5/I6).
+    for (const t of inactiveTabs) {
+      if (!t.heldWrites.isWritesLocked()) {
+        throw formatFailure(
+          'I5-writes-unlocked-with-no-active-tab',
+          `At ${label}: writes unlocked on inactive ${t.tabId}`,
+        );
+      }
     }
 
     // Both users' unresolved held writes must survive every sign-out & takeover!
-    if (
-      window.localStorage.getItem(
-        `${userStoragePrefix(USER_A.id)}model:op-a`,
-      ) === null ||
-      window.localStorage.getItem(
-        `${userStoragePrefix(USER_B.id)}model:op-b`,
-      ) === null
-    ) {
+    if (!values.has(hwKeys.opAKey) || !values.has(hwKeys.opBKey)) {
       throw formatFailure(
         'I5-unresolved-held-write-lost',
         `At ${label}: unresolved held write was unexpectedly erased from storage`,
       );
     }
-    if (
-      userASignedOut &&
-      window.localStorage.getItem(
-        `${userStoragePrefix(USER_A.id)}posted:model:posted-a:req-a-post`,
-      ) !== null
-    ) {
-      throw formatFailure(
-        'I5-posted-reload-not-cleared',
-        `At ${label}: User A posted_reload held write was not cleared on sign-out`,
-      );
+
+    // Restored I5 check: once User A signs out while active (and the tab stayed
+    // active long enough for the queued Web Lock prune to run), User A's
+    // `posted_reload` pin must be cleared from storage.
+    if (userACleanSignOutSettledWhileActive) {
+      stats.postedReloadClearedVerified += 1;
+      if (values.has(hwKeys.postedAKey)) {
+        throw formatFailure(
+          'I5-posted-reload-not-cleared',
+          `At ${label}: User A posted_reload held write was not cleared after sign-out`,
+        );
+      }
     }
   }
 
@@ -1132,20 +1339,22 @@ async function runModelSeed(
       );
 
       if (r < 0.16 && inactiveTabs.length > 0) {
-        // Explicit takeover by an inactive tab (including during in-flight sign-out or sign-in!)
+        // Explicit takeover by an inactive tab (including during in-flight sign-out, sign-in, or refresh!)
         const challenger = pick(inactiveTabs);
         const wasDuringSignOut = (activeTab?.inFlightSignOuts ?? 0) > 0;
         const wasDuringSignIn = (activeTab?.inFlightSignIns ?? 0) > 0;
+        const wasDuringRefresh = (activeTab?.inFlightRefreshes ?? 0) > 0;
         stats.takeovers += 1;
         if (wasDuringSignOut) stats.takeoversDuringSignOut += 1;
         if (wasDuringSignIn) stats.takeoversDuringSignIn += 1;
+        if (wasDuringRefresh) stats.takeoversDuringRefresh += 1;
         trace.push(
-          `step ${step}: takeOver(${challenger.tabId}) from=${activeTab?.tabId ?? 'none'} duringSignOut=${wasDuringSignOut} duringSignIn=${wasDuringSignIn}`,
+          `step ${step}: takeOver(${challenger.tabId}) from=${activeTab?.tabId ?? 'none'} duringSignOut=${wasDuringSignOut} duringSignIn=${wasDuringSignIn} duringRefresh=${wasDuringRefresh}`,
         );
         await challenger.activeCtrl.takeOver();
         await vi.advanceTimersByTimeAsync(25);
         await flushMicrotasks();
-      } else if (r < 0.3 && activeTab) {
+      } else if (r < 0.28 && activeTab) {
         // Sign in on the active tab
         const user = chance(0.55) ? USER_A : USER_B;
         trace.push(`step ${step}: signIn(${activeTab.tabId}, ${user.id})`);
@@ -1162,7 +1371,6 @@ async function runModelSeed(
                 if (sid !== latestSignOutSessionKey) {
                   activeTab.differentSessionAppearedAfterSignOut = true;
                   latestSignOutSessionKey = null;
-                  latestSignOutCoordUnpersisted = false;
                   latestSignOutUnpersistedAndUnerased = false;
                 }
               }
@@ -1176,7 +1384,7 @@ async function runModelSeed(
         }
         await vi.advanceTimersByTimeAsync(20);
         await flushMicrotasks();
-      } else if (r < 0.48 && activeTab) {
+      } else if (r < 0.44 && activeTab) {
         // Sign out on the active tab
         const targetSid = readPersistedSid(values.get(sdkKey));
         const targetSession = targetSid ? server.lookupByKey(targetSid) : null;
@@ -1186,22 +1394,24 @@ async function runModelSeed(
             signOutOriginUsers.set(targetSid, targetSession.user.id);
           }
           latestSignOutSessionKey = targetSid;
-          latestSignOutCoordUnpersisted =
+          const sdkEraseBlocked =
+            failSdkRemove && (failSdkTombstone || quotaMode === 'zero_byte');
+          const coordWriteBlocked =
             quotaMode === 'coord_blocked' || quotaMode === 'zero_byte';
           latestSignOutUnpersistedAndUnerased =
-            quotaMode === 'zero_byte' && failSdkRemove && failSdkTombstone;
+            sdkEraseBlocked && coordWriteBlocked;
           activeTab.revocationOriginSids.add(targetSid);
           activeTab.differentSessionAppearedAfterSignOut = false;
         }
-        if (activeTab.store.getAuthSnapshot().email === USER_A.email) {
-          userASignedOut = true;
-        }
+        const signOutOriginEmail = activeTab.store.getAuthSnapshot().email;
+        const signOutOriginStatus = activeTab.store.getAuthSnapshot().status;
         trace.push(
           `step ${step}: signOut(${activeTab.tabId}) target=${targetSid ?? 'none'} mode=${logoutMode} quota=${quotaMode} rmFail=${failSdkRemove} tombFail=${failSdkTombstone}`,
         );
         const canAwaitSync =
           logoutMode !== 'slow_204' &&
           logoutMode !== 'slow_503' &&
+          refreshMode === 'ok' &&
           deferredNets.length === 0 &&
           !hasAnyInFlight();
         activeTab.inFlightSignOuts += 1;
@@ -1213,7 +1423,15 @@ async function runModelSeed(
         }
         await vi.advanceTimersByTimeAsync(20);
         await flushMicrotasks();
-      } else if (r < 0.56 && activeTab) {
+        if (
+          signOutOriginStatus === 'owner' &&
+          signOutOriginEmail === USER_A.email &&
+          !activeTab.destroyed &&
+          activeTab.activeCtrl.isActive()
+        ) {
+          userACleanSignOutSettledWhileActive = true;
+        }
+      } else if (r < 0.51 && activeTab) {
         // Retry logout revocation on the active tab
         const canRetry =
           activeTab.store.getAuthSnapshot().canRetryLogoutRevocation;
@@ -1223,6 +1441,7 @@ async function runModelSeed(
         const canAwaitSync =
           logoutMode !== 'slow_204' &&
           logoutMode !== 'slow_503' &&
+          refreshMode === 'ok' &&
           deferredNets.length === 0 &&
           !hasAnyInFlight();
         activeTab.inFlightRetries += 1;
@@ -1234,8 +1453,30 @@ async function runModelSeed(
         }
         await vi.advanceTimersByTimeAsync(20);
         await flushMicrotasks();
-      } else if (r < 0.66) {
-        // Reload a tab (active or inactive): destroy and spawn fresh tab in that slot
+      } else if (
+        r < 0.59 &&
+        activeTab &&
+        activeTab.managedClient.hasInstantiatedClient()
+      ) {
+        // Trigger a real token refresh on the active tab's production GoTrueClient
+        // (exercises in-flight refresh abortion + BroadcastChannel isolation on takeover!)
+        const client = activeTab.managedClient.getClient();
+        if (client && activeTab.store.getAuthSnapshot().status === 'owner') {
+          trace.push(
+            `step ${step}: refreshSession(${activeTab.tabId}, mode=${refreshMode})`,
+          );
+          activeTab.inFlightRefreshes += 1;
+          void client.auth
+            .refreshSession()
+            .catch(() => {})
+            .finally(() => {
+              activeTab.inFlightRefreshes -= 1;
+            });
+          await vi.advanceTimersByTimeAsync(15);
+          await flushMicrotasks();
+        }
+      } else if (r < 0.67) {
+        // Reload a tab (active or inactive)
         const slot = Math.floor(rand() * tabCount);
         const existing = tabs[slot]!;
         const wasActive = !existing.destroyed && existing.activeCtrl.isActive();
@@ -1243,12 +1484,12 @@ async function runModelSeed(
         trace.push(
           `step ${step}: reload(${existing.tabId}) wasActive=${wasActive}`,
         );
-        await destroyTab(existing);
+        destroyTab(existing);
         tabs[slot] = createTab(slot);
         await vi.advanceTimersByTimeAsync(30);
         await flushMicrotasks();
       } else if (r < 0.72) {
-        // Close a tab (keep at least 1 live tab in the browser)
+        // Close a tab (keep at least 1 live tab)
         const live = tabs.filter((t) => !t.destroyed);
         if (live.length > 1) {
           const victim = pick(live);
@@ -1256,7 +1497,7 @@ async function runModelSeed(
           trace.push(
             `step ${step}: close(${victim.tabId}) wasActive=${victim.activeCtrl.isActive()}`,
           );
-          await destroyTab(victim);
+          destroyTab(victim);
           await vi.advanceTimersByTimeAsync(20);
           await flushMicrotasks();
         }
@@ -1270,14 +1511,19 @@ async function runModelSeed(
         net.resolve();
         await vi.advanceTimersByTimeAsync(25);
         await flushMicrotasks();
-      } else if (r < 0.87 && activeTab && activeTab.client) {
-        // Inject a late TOKEN_REFRESHED on the active tab (either for a revoked session or an older session)
+      } else if (
+        r < 0.86 &&
+        activeTab &&
+        activeTab.managedClient.hasInstantiatedClient()
+      ) {
+        // Inject a late TOKEN_REFRESHED on the active tab for a revoked session
         const revokedSessions = server.allSessions().filter((s) => s.revoked);
         const target =
           revokedSessions.length > 0
             ? pick(revokedSessions)
             : server.allSessions()[0];
-        if (target) {
+        const client = activeTab.managedClient.getClient();
+        if (target && client) {
           if (target.revoked) {
             stats.lateRevokedRefreshEvents += 1;
           }
@@ -1285,9 +1531,7 @@ async function runModelSeed(
             `step ${step}: lateRefresh(${activeTab.tabId}, ${target.sessionKey}, revoked=${target.revoked})`,
           );
           const payload = toSessionPayload(target);
-          // Emit TOKEN_REFRESHED through GoTrue internals / setSession path when safe,
-          // or invoke the client's auth state listener via a real refresh/callback simulation.
-          const clientAuth = activeTab.client.auth as unknown as {
+          const clientAuth = client.auth as unknown as {
             _notifyAllSubscribers?: (
               event: string,
               session: unknown,
@@ -1300,14 +1544,14 @@ async function runModelSeed(
           await flushMicrotasks();
         }
       } else if (r < 0.93) {
-        // Advance fake timers (including crossing the 10s /logout timeout!)
-        const ms = pick([500, 3_000, 11_000] as const);
+        // Advance fake timers (crossing 10s /logout timeout and 30s autoRefreshTicker!)
+        const ms = pick([500, 3_000, 11_000, 31_000] as const);
         trace.push(`step ${step}: advanceTime(${ms}ms)`);
         await vi.advanceTimersByTimeAsync(ms);
         await flushMicrotasks();
       } else {
         // Flip environment fault knobs
-        const knob = Math.floor(rand() * 4);
+        const knob = Math.floor(rand() * 5);
         if (knob === 0) {
           quotaMode = pick(['normal', 'coord_blocked', 'zero_byte'] as const);
           trace.push(`step ${step}: env quotaMode=${quotaMode}`);
@@ -1326,6 +1570,9 @@ async function runModelSeed(
             '401_once',
           ] as const);
           trace.push(`step ${step}: env logoutMode=${logoutMode}`);
+        } else if (knob === 3) {
+          refreshMode = pick(['ok', 'slow_ok', 'slow_400'] as const);
+          trace.push(`step ${step}: env refreshMode=${refreshMode}`);
         } else {
           slowSignIn = chance(0.35);
           trace.push(`step ${step}: env slowSignIn=${slowSignIn}`);
@@ -1339,11 +1586,11 @@ async function runModelSeed(
     trace.push('--- SETTLE PHASE ---');
     quotaMode = 'normal';
     logoutMode = '204';
+    refreshMode = 'ok';
     slowSignIn = false;
     failSdkRemove = false;
     failSdkTombstone = false;
 
-    // Resolve all deferred network responses and let timers settle.
     let guard = 0;
     while ((deferredNets.length > 0 || hasAnyInFlight()) && guard < 25) {
       guard += 1;
@@ -1356,7 +1603,6 @@ async function runModelSeed(
     await vi.advanceTimersByTimeAsync(11_500);
     await flushMicrotasks();
 
-    // Ensure at least one tab is active (if the active tab was closed during the seed, take over in a live tab).
     let activeAfterSettle = getActiveTab();
     if (!activeAfterSettle) {
       const live = tabs.find((t) => !t.destroyed);
@@ -1391,7 +1637,6 @@ async function runModelSeed(
 
     if (activeAfterSettle) {
       const snap = activeAfterSettle.store.getAuthSnapshot();
-      // I4: Active tab must never remain stuck in an in-flight logout phase after 11.5s settle.
       if (
         snap.logoutPhase === 'signing_out' ||
         snap.logoutPhase === 'retrying_local' ||
@@ -1419,7 +1664,6 @@ async function runModelSeed(
             `Active ${activeAfterSettle.tabId} left login disabled with no sdkKey (phase=${snap.logoutPhase})`,
           );
         }
-        // I2: Unconfirmed revocation must show revocation_failed, with retry iff originating tab is still alive & active.
         if (durableAfterSettle?.state === 'revocation_failed') {
           const sid = durableAfterSettle.sessionKey;
           const sidConfirmed = sid !== null && server.isConfirmedRevoked(sid);
@@ -1462,7 +1706,7 @@ async function runModelSeed(
       }
     }
 
-    // === I2 Retry Convergence Check (if active tab retained retry token) ===
+    // === I2 Retry Convergence Check ===
     if (
       activeAfterSettle &&
       persistedAfterSettle === null &&
@@ -1496,9 +1740,7 @@ async function runModelSeed(
       }
     }
 
-    // === I1/I4 Fresh Takeover Probe ===
-    // Spawn a brand-new tab: it MUST boot INACTIVE (zero fetch/storage writes),
-    // then explicitly take over and verify I1/I2/I4 after takeover!
+    // === I1/I4/I6 Fresh Takeover Probe ===
     const probeTab = createTab(tabCount);
     try {
       await vi.advanceTimersByTimeAsync(30);
@@ -1512,15 +1754,14 @@ async function runModelSeed(
       if (
         probeTab.inactiveFetchCount > 0 ||
         probeTab.inactiveStorageWriteCount > 0 ||
-        probeTab.client !== null
+        probeTab.managedClient.hasInstantiatedClient()
       ) {
         throw formatFailure(
           'I6-probe-touched-network-or-storage-while-inactive',
-          `Inactive probeTab touched fetch=${probeTab.inactiveFetchCount} storage=${probeTab.inactiveStorageWriteCount} client=${probeTab.client !== null}`,
+          `Inactive probeTab touched fetch=${probeTab.inactiveFetchCount} storage=${probeTab.inactiveStorageWriteCount} client=${probeTab.managedClient.hasInstantiatedClient()}`,
         );
       }
 
-      // Take over with probeTab -> previous active tab becomes inactive immediately!
       await probeTab.activeCtrl.takeOver();
       await vi.advanceTimersByTimeAsync(50);
       await flushMicrotasks();
@@ -1573,7 +1814,13 @@ async function runModelSeed(
             `probeTab booted into status=${probeSnap.status} phase=${probeSnap.logoutPhase} under local_failed`,
           );
         }
-        // Recover local_failed with storage now healthy -> MUST reach clean idle!
+        // P2-2 check: probe booted into local_failed with sdkKey present MUST NOT have instantiated GoTrueClient!
+        if (probeTab.managedClient.hasInstantiatedClient()) {
+          throw formatFailure(
+            'P2-2-probe-instantiated-client-in-local-failed',
+            'probeTab instantiated GoTrueClient while booted into local_failed',
+          );
+        }
         stats.localFailedRecoveries += 1;
         await probeTab.store.signOut();
         await vi.advanceTimersByTimeAsync(50);
@@ -1605,7 +1852,6 @@ async function runModelSeed(
         );
       } else if (
         !latestSignOutUnpersistedAndUnerased &&
-        !latestSignOutCoordUnpersisted &&
         latestCleanSignedInSid !== null &&
         everSignOutTargetedSids.has(postProbePersisted) &&
         postProbePersisted === latestSignOutSessionKey &&
@@ -1617,8 +1863,8 @@ async function runModelSeed(
         );
       }
 
-      // If no credentials remain, verify login is ACTUALLY functional on probeTab (I4)
-      // and verify I5 held-write isolation after signing in as USER_B!
+      // If no credentials remain, verify login is functional on probeTab (I4)
+      // and check I5 held-write isolation after signing in as USER_B!
       if (readPersistedSid(values.get(sdkKey)) === null) {
         const signInResult = await probeTab.store.signIn(
           USER_B.email,
@@ -1635,14 +1881,14 @@ async function runModelSeed(
             `probeTab signIn returned ${signInResult} with status=${probeTab.store.getAuthSnapshot().status}`,
           );
         }
-        rehydrateHeldWrites();
-        if (getHeldWrite('model:op-a') !== null) {
+        probeTab.heldWrites.rehydrateHeldWrites();
+        if (probeTab.heldWrites.getHeldWrite('model:op-a') !== null) {
           throw formatFailure(
             'I5-post-settle-cross-user-leak',
             'User A held write leaked into User B after post-settle signIn',
           );
         }
-        if (getHeldWrite('model:op-b') === null) {
+        if (probeTab.heldWrites.getHeldWrite('model:op-b') === null) {
           throw formatFailure(
             'I5-user-b-held-write-missing',
             'User B held write disappeared after post-settle signIn',
@@ -1650,7 +1896,7 @@ async function runModelSeed(
         }
       }
     } finally {
-      await destroyTab(probeTab);
+      destroyTab(probeTab);
     }
 
     if (
@@ -1671,10 +1917,15 @@ async function runModelSeed(
     }
     for (const t of tabs) {
       if (!t.destroyed) {
-        await destroyTab(t);
+        destroyTab(t);
       }
     }
-    resetHeldWritesStore({ clearStorage: true, resetUser: true });
+    bcHub.closeAll();
+    Object.defineProperty(globalThis, 'BroadcastChannel', {
+      configurable: true,
+      writable: true,
+      value: originalBroadcastChannel,
+    });
   }
 }
 
@@ -1705,6 +1956,11 @@ describe('auth-store one-active-tab model-based suite (I1-I6)', () => {
     takeovers: 0,
     takeoversDuringSignOut: 0,
     takeoversDuringSignIn: 0,
+    takeoversDuringRefresh: 0,
+    inFlightFetchesAbortedOnTakeover: 0,
+    broadcastChannelsOpened: 0,
+    heldWriteWebLocksUsed: 0,
+    refreshCallsAttempted: 0,
     tabCloses: 0,
     tabReloads: 0,
     revocationFailedPostSettle: 0,
@@ -1714,6 +1970,8 @@ describe('auth-store one-active-tab model-based suite (I1-I6)', () => {
     lateRevokedRefreshEvents: 0,
     globalMultiSessionRevokes: 0,
     inactiveTabsVerifiedSilent: 0,
+    postedReloadClearedVerified: 0,
+    noActiveTabLockedVerified: 0,
   };
 
   for (let batch = 0; batch < BATCH_COUNT; batch += 1) {
@@ -1726,10 +1984,15 @@ describe('auth-store one-active-tab model-based suite (I1-I6)', () => {
     }, 30_000);
   }
 
-  it('exercises takeovers (including during sign-out & sign-in), retries, recoveries, tombstones, late refreshes, and inactive silence non-vacuously', () => {
+  it('exercises production client factory, BroadcastChannel, in-flight aborts, held-write Web Locks, takeovers, retries, recoveries, tombstones, late refreshes, and inactive silence non-vacuously', () => {
     expect(suiteStats.takeovers).toBeGreaterThan(0);
     expect(suiteStats.takeoversDuringSignOut).toBeGreaterThan(0);
     expect(suiteStats.takeoversDuringSignIn).toBeGreaterThan(0);
+    expect(suiteStats.takeoversDuringRefresh).toBeGreaterThan(0);
+    expect(suiteStats.inFlightFetchesAbortedOnTakeover).toBeGreaterThan(0);
+    expect(suiteStats.broadcastChannelsOpened).toBeGreaterThan(0);
+    expect(suiteStats.heldWriteWebLocksUsed).toBeGreaterThan(0);
+    expect(suiteStats.refreshCallsAttempted).toBeGreaterThan(0);
     expect(suiteStats.tabCloses).toBeGreaterThan(0);
     expect(suiteStats.tabReloads).toBeGreaterThan(0);
     expect(suiteStats.revocationFailedPostSettle).toBeGreaterThan(0);
@@ -1739,5 +2002,7 @@ describe('auth-store one-active-tab model-based suite (I1-I6)', () => {
     expect(suiteStats.lateRevokedRefreshEvents).toBeGreaterThan(0);
     expect(suiteStats.globalMultiSessionRevokes).toBeGreaterThan(0);
     expect(suiteStats.inactiveTabsVerifiedSilent).toBeGreaterThan(0);
+    expect(suiteStats.postedReloadClearedVerified).toBeGreaterThan(0);
+    expect(suiteStats.noActiveTabLockedVerified).toBeGreaterThan(0);
   });
 });

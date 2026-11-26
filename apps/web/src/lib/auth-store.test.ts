@@ -5239,4 +5239,163 @@ describe('auth-store single-active-tab edge cases and regression coverage', () =
       tab.resetAuthStore({ clearStorage: false });
     }
   });
+
+  it('DELTA-OT1 P3-1: isOwnFreshSignIn rejects an older revoked session in revokedSessionKeys during a later in-flight signIn', async () => {
+    const { createAuthStore } = await import('@/lib/auth-store');
+    const url = 'https://delta-ot1-p3-1.test';
+    const sdkKey = 'sb-delta-ot1-p3-1-auth-token';
+    const values = new Map<string, string>();
+    const storage: Storage = {
+      get length() {
+        return values.size;
+      },
+      clear: () => values.clear(),
+      getItem: (k) => values.get(k) ?? null,
+      key: (i) => [...values.keys()][i] ?? null,
+      removeItem: (k) => {
+        values.delete(k);
+      },
+      setItem: (k, v) => {
+        values.set(k, String(v));
+      },
+    };
+
+    let signInStep = 0;
+    let resolveThirdSignIn!: (res: Response) => void;
+    const makeSidSession = (sid: string) => ({
+      access_token: makeJwt({
+        sub: 'owner-1',
+        email: 'owner@test.local',
+        session_id: sid,
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      }),
+      refresh_token: `rt-${sid}`,
+      token_type: 'bearer',
+      expires_in: 3600,
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      user: {
+        id: 'owner-1',
+        email: 'owner@test.local',
+        aud: 'authenticated',
+        app_metadata: {},
+        user_metadata: {},
+        created_at: '2026-01-01T00:00:00Z',
+      },
+    });
+    const session1 = makeSidSession('p31-sid-1');
+    const session2 = makeSidSession('p31-sid-2');
+    const session3 = makeSidSession('p31-sid-3');
+
+    const fetchFn: typeof fetch = (input) => {
+      const href = requestUrlOf(input);
+      if (href.includes('/auth/v1/token?grant_type=password')) {
+        signInStep += 1;
+        if (signInStep === 1) {
+          return Promise.resolve(
+            new Response(JSON.stringify(session1), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            }),
+          );
+        }
+        if (signInStep === 2) {
+          return Promise.resolve(
+            new Response(JSON.stringify(session2), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            }),
+          );
+        }
+        return new Promise<Response>((resolve) => {
+          resolveThirdSignIn = resolve;
+        });
+      }
+      if (href.includes('/auth/v1/logout')) {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    const client = createClient(url, TEST_ANON_KEY, {
+      auth: {
+        storage,
+        storageKey: sdkKey,
+        persistSession: true,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+      global: { fetch: fetchFn },
+    });
+    const tab = createAuthStore({
+      getClient: () => client as never,
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      syncGlobalStores: false,
+    });
+
+    try {
+      tab.startAuth();
+      // 1. Sign in as sid-1 and revoke sid-1 (sid-1 recorded in revokedSessionKeys).
+      expect(await tab.signIn('owner@test.local', 'ValidPassword123')).toBe(
+        'ok',
+      );
+      await vi.waitFor(() => {
+        expect(tab.getAuthSnapshot().status).toBe('owner');
+      });
+      await tab.signOut();
+      expect(tab.getAuthSnapshot().status).toBe('signed-out');
+
+      // 2. Sign in as sid-2 and revoke sid-2 (machine.revokedSessionKey is now sid-2,
+      //    while sid-1 lives only in revokedSessionKeys).
+      expect(await tab.signIn('owner@test.local', 'ValidPassword123')).toBe(
+        'ok',
+      );
+      await vi.waitFor(() => {
+        expect(tab.getAuthSnapshot().status).toBe('owner');
+      });
+      await tab.signOut();
+      expect(tab.getAuthSnapshot().status).toBe('signed-out');
+
+      // 3. Start a third signIn (signInInProgressCount === 1). While in flight,
+      //    deliver a stale SIGNED_IN callback for sid-1 -> MUST be rejected!
+      const thirdSignInP = tab.signIn('owner@test.local', 'ValidPassword123');
+      await vi.waitFor(() => {
+        expect(resolveThirdSignIn).toBeDefined();
+      });
+
+      const clientAuth = client.auth as unknown as {
+        _notifyAllSubscribers: (
+          event: string,
+          session: unknown,
+        ) => Promise<void>;
+      };
+      await clientAuth._notifyAllSubscribers('SIGNED_IN', session1);
+      await new Promise((r) => setTimeout(r, 20));
+      // Stale revoked sid-1 must NEVER be accepted as owner!
+      expect(tab.getAuthSnapshot().status).toBe('signed-out');
+
+      // Complete the genuine third sign-in as sid-3 -> accepted cleanly!
+      resolveThirdSignIn(
+        new Response(JSON.stringify(session3), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+      expect(await thirdSignInP).toBe('ok');
+      await vi.waitFor(() => {
+        expect(tab.getAuthSnapshot().status).toBe('owner');
+      });
+    } finally {
+      await client.auth.stopAutoRefresh();
+      tab.resetAuthStore({ clearStorage: false });
+    }
+  });
 });

@@ -278,6 +278,7 @@ export function initPwa(
   reload: () => void = () => window.location.reload(),
 ): void {
   if (started) return;
+  if (!tabActive) return;
   if (!isPwaRuntimeEnabled()) return;
   if (!import.meta.env.PROD) return;
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
@@ -336,6 +337,7 @@ export function initPwa(
 
       const watchInstalling = (installing: ServiceWorker) => {
         const checkInstalled = () => {
+          if (!tabActive) return;
           if (
             installing.state === 'installed' &&
             hasPriorWorkerFor(installing)
@@ -350,12 +352,14 @@ export function initPwa(
         }
       };
 
+      if (!tabActive) return;
       if (registration.waiting && hasPriorWorkerFor(registration.waiting)) {
         setWaiting(registration.waiting);
       } else if (registration.installing) {
         watchInstalling(registration.installing);
       }
       registration.addEventListener('updatefound', () => {
+        if (!tabActive) return;
         const installing = registration.installing;
         if (!installing) return;
         watchInstalling(installing);

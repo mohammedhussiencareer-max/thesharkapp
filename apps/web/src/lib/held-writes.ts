@@ -386,6 +386,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
 
   let userScope: UserScopeState = { mode: 'uninitialized' };
   let writesLocked = false;
+  let tabActive = true;
+  let tabGeneration = 0;
   let sessionGeneration = 0;
   let postedOwner: { generation: number; id: string } | undefined;
   let hydrationRunId = 0;
@@ -461,6 +463,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   }
 
   function safeSetItem(key: string, value: string): boolean {
+    if (!tabActive) return false;
     const storage = getStorage();
     if (!storage) return false;
     try {
@@ -472,6 +475,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   }
 
   function safeRemoveItem(key: string): void {
+    if (!tabActive) return;
     const storage = getStorage();
     if (!storage) return;
     try {
@@ -688,8 +692,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     stillCurrent: () => boolean,
     queue = false,
   ): void {
+    if (!tabActive) return;
+    const capturedTabGeneration = tabGeneration;
     const pruneIfCurrent = () => {
-      if (stillCurrent()) prune();
+      if (
+        tabActive &&
+        tabGeneration === capturedTabGeneration &&
+        stillCurrent()
+      ) {
+        prune();
+      }
     };
     const locks = getLocks();
     if (!locks || activeLockReleases.has(subjectLock)) {
@@ -1321,10 +1333,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     userId: string,
     projectUrl = getProjectUrl(),
   ): void {
+    if (!tabActive) return;
     const trimmed = userId.trim();
     if (trimmed === '') return;
     const prefix = userStoragePrefix(trimmed, projectUrl);
     const signedOutGeneration = sessionGeneration;
+    const capturedTabGeneration = tabGeneration;
     for (const key of safeListKeys(prefix)) {
       const current = strictReadItem(key);
       if (!current.ok || current.value === null) continue;
@@ -1361,8 +1375,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
           }
         },
         () =>
-          activeUserId() !== trimmed ||
-          sessionGeneration === signedOutGeneration,
+          tabActive &&
+          tabGeneration === capturedTabGeneration &&
+          (activeUserId() !== trimmed ||
+            sessionGeneration === signedOutGeneration),
         true,
       );
     }
@@ -1385,10 +1401,12 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     userId: string,
     projectUrl = getProjectUrl(),
   ): void {
+    if (!tabActive) return;
     const trimmed = userId.trim();
     if (trimmed === '') return;
     const prefix = userStoragePrefix(trimmed, projectUrl);
     const signedOutGeneration = sessionGeneration;
+    const capturedTabGeneration = tabGeneration;
     for (const key of safeListKeys(prefix)) {
       const current = strictReadItem(key);
       if (!current.ok || current.value === null) continue;
@@ -1432,8 +1450,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
           }
         },
         () =>
-          activeUserId() !== trimmed ||
-          sessionGeneration === signedOutGeneration,
+          tabActive &&
+          tabGeneration === capturedTabGeneration &&
+          (activeUserId() !== trimmed ||
+            sessionGeneration === signedOutGeneration),
         true,
       );
     }
@@ -3030,10 +3050,29 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
   }
 
+  function setHeldWritesTabActive(active: boolean): void {
+    if (tabActive === active) return;
+    tabActive = active;
+    tabGeneration += 1;
+    if (!active) {
+      writesLocked = true;
+      sessionGeneration += 1;
+      userScope = { mode: 'signed_out' };
+      cancelPendingPromotions();
+      releaseAllLocks();
+    }
+  }
+
+  function isHeldWritesTabActive(): boolean {
+    return tabActive;
+  }
+
   function resetHeldWritesStore(resetOptions?: {
     clearStorage?: boolean;
     resetUser?: boolean;
   }): void {
+    tabActive = true;
+    tabGeneration += 1;
     cancelPendingPromotions();
     releaseAllLocks();
     postedOwner = undefined;
@@ -3070,6 +3109,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     bumpSessionGeneration,
     setWritesLocked,
     isWritesLocked,
+    setHeldWritesTabActive,
+    isHeldWritesTabActive,
     captureWriteSession,
     isCurrentWriteSession,
     canDispatchWriteFor,
@@ -3116,6 +3157,8 @@ export const subscribeHeldWritesStore = defaultStore.subscribeHeldWritesStore;
 export const bumpSessionGeneration = defaultStore.bumpSessionGeneration;
 export const setWritesLocked = defaultStore.setWritesLocked;
 export const isWritesLocked = defaultStore.isWritesLocked;
+export const setHeldWritesTabActive = defaultStore.setHeldWritesTabActive;
+export const isHeldWritesTabActive = defaultStore.isHeldWritesTabActive;
 export const captureWriteSession = defaultStore.captureWriteSession;
 export const isCurrentWriteSession = defaultStore.isCurrentWriteSession;
 export const canDispatchWriteFor = defaultStore.canDispatchWriteFor;
