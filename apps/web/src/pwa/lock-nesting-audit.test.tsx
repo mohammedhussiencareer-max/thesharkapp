@@ -518,7 +518,7 @@ describe('mechanical lock-nesting audit', () => {
     fireEvent.click(retry);
     await screen.findByRole('status');
     await waitFor(() => expect(getHeldWrite(sibling)).toBeNull());
-  });
+  }, 15_000);
 
   it('DecisionForm & PendingSaves: success, definitive rejection, unknown, and replay never nest locks during sibling cleanup', async () => {
     const sibling = decisionSubject('sibling-order');

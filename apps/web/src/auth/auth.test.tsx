@@ -1119,4 +1119,77 @@ describe('production GoTrueClient UI integration (hasDirectRevocationTransport =
       vi.resetModules();
     }
   });
+
+  it('DELTA9-P3-1: LoginPage ignores synchronous double-submit before React re-renders submitting state', async () => {
+    let resolveSignIn!: (result: 'ok' | 'invalid' | 'failed') => void;
+    const signInMock = vi.fn(
+      () =>
+        new Promise<'ok' | 'invalid' | 'failed'>((resolve) => {
+          resolveSignIn = resolve;
+        }),
+    );
+    const { AuthContext } = await import('@/lib/auth-context');
+    const { LoginPage } = await import('@/pages/LoginPage');
+
+    const view = render(
+      <MemoryRouter initialEntries={['/login']}>
+        <AuthContext.Provider
+          value={{
+            status: 'signed-out',
+            email: null,
+            logoutPending: false,
+            logoutFailed: false,
+            logoutRevocationFailed: false,
+            canRetryLogoutRevocation: false,
+            signIn: signInMock,
+            signOut: vi.fn(async () => {}),
+            retryLogoutRevocation: vi.fn(async () => {}),
+            retry: vi.fn(),
+          }}
+        >
+          <LoginPage />
+        </AuthContext.Provider>
+      </MemoryRouter>,
+    );
+
+    try {
+      fireEvent.change(screen.getByLabelText('البريد'), {
+        target: { value: 'owner@theshark.test' },
+      });
+      fireEvent.change(screen.getByLabelText('كلمة السر'), {
+        target: { value: 'ValidPassword123' },
+      });
+      const form = screen
+        .getByRole('button', { name: 'تسجيل الدخول' })
+        .closest('form')!;
+
+      // Dispatch two form submissions synchronously in the same tick.
+      act(() => {
+        fireEvent.submit(form);
+        fireEvent.submit(form);
+      });
+
+      expect(signInMock).toHaveBeenCalledTimes(1);
+
+      // Once the first attempt finishes with 'invalid', a new submit works again.
+      await act(async () => {
+        resolveSignIn('invalid');
+        await Promise.resolve();
+      });
+      expect(
+        await screen.findByText('البريد أو كلمة السر غلط'),
+      ).toBeInTheDocument();
+
+      act(() => {
+        fireEvent.submit(form);
+      });
+      expect(signInMock).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        resolveSignIn('ok');
+        await Promise.resolve();
+      });
+    } finally {
+      view.unmount();
+    }
+  });
 });

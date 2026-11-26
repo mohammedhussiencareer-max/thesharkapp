@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useRef, useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/lib/auth-context';
 
@@ -19,6 +19,7 @@ export function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const [errorState, setErrorState] = useState<'invalid' | 'failed' | null>(
     null,
   );
@@ -27,7 +28,10 @@ export function LoginPage() {
 
   function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (logoutPending || logoutFailed) return;
+    if (submittingRef.current || submitting || logoutPending || logoutFailed) {
+      return;
+    }
+    submittingRef.current = true;
     void (async () => {
       setSubmitting(true);
       setErrorState(null);
@@ -39,6 +43,7 @@ export function LoginPage() {
         }
         void navigate('/');
       } finally {
+        submittingRef.current = false;
         setSubmitting(false);
       }
     })();
