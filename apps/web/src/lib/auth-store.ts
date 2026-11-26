@@ -1199,13 +1199,6 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     return next;
   }
 
-  function resetKnownCoord(): void {
-    machine.knownCoord = null;
-    machine.knownSeq = 0;
-    machine.knownStateRank = 0;
-    machine.knownOwnerTabId = null;
-  }
-
   function recordKnownCoord(coord: SharedLogoutCoord): void {
     if (
       machine.knownCoord === null ||
@@ -1261,30 +1254,8 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       postReconcileNudge();
       return { written: true, superseded: false };
     } catch {
-      // If completed or signed_in hits quota-full while an older coord sits in
-      // localStorage, remove the stale coord so tabs never observe stale state.
-      if (next.state === 'completed' || next.state === 'signed_in') {
-        const existingLocal = readSharedCoord(storage);
-        if (
-          existingLocal !== null &&
-          compareSharedCoord(next, existingLocal) > 0
-        ) {
-          try {
-            storage.removeItem(coordKey());
-            resetKnownCoord();
-          } catch {
-            // Ignore storage removal errors.
-          }
-          try {
-            storage.setItem(coordKey(), JSON.stringify(next));
-            recordKnownCoord(next);
-            postReconcileNudge();
-            return { written: true, superseded: false };
-          } catch {
-            // Quota-full: keep stale localStorage coord removed; continue in memory.
-          }
-        }
-      }
+      // DELTA 15 Rule A: Never remove coordKey on quota failure so attemptIds
+      // stay monotonic across all tabs (fresh and open) and never restart at 1.
       postReconcileNudge();
       return { written: false, superseded: false };
     }
@@ -1352,15 +1323,6 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
 
     const retry = writeSharedCoord(storage, next);
     if (!retry.written && !retry.superseded) {
-      const existingLocal = readSharedCoord(storage);
-      if (existingLocal?.state === 'signed_in') {
-        try {
-          storage.removeItem(coordKey());
-          resetKnownCoord();
-        } catch {
-          // Ignore storage removal errors.
-        }
-      }
       postReconcileNudge();
     }
     return {
@@ -1385,18 +1347,22 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       existing.ownerTabId === tabId &&
       existing.state === 'pending'
     ) {
+      // DELTA 15 Rule A: Overwrite our dangling pending with signed_in at the
+      // same attemptId (rank 5 > rank 1) instead of deleting coordKey.
+      const persistedKey = sessionKeyOf(readPersistedSupabaseSession(storage));
+      const replacement: SharedLogoutCoord = {
+        attemptId,
+        ownerTabId: tabId,
+        state: 'signed_in',
+        sessionKey: persistedKey,
+      };
       try {
-        storage.removeItem(coordKey());
-        if (
-          machine.knownCoord !== null &&
-          machine.knownCoord.attemptId === attemptId &&
-          machine.knownCoord.ownerTabId === tabId &&
-          machine.knownCoord.state === 'pending'
-        ) {
-          resetKnownCoord();
-        }
+        storage.setItem(coordKey(), JSON.stringify(replacement));
+        recordKnownCoord(replacement);
+        postReconcileNudge();
       } catch {
-        // Ignore storage cleanup errors.
+        // Under quota, leave pending in place; Rule B ensures a pending for an
+        // older sessionKey never blocks or signs out the newer persisted session.
       }
     }
   }
@@ -1976,6 +1942,34 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     const shared = readSharedCoord(storage);
 
     if (shared !== null) {
+      // DELTA 15 Rule B: Saved credentials decide. A logout coord whose
+      // sessionKey differs from the currently persisted session never signs
+      // that persisted session out or blocks it.
+      const persistedKeyNow = sessionKeyOf(
+        readPersistedSupabaseSession(storage),
+      );
+      if (
+        shared.state !== 'signed_in' &&
+        shared.sessionKey !== null &&
+        persistedKeyNow !== null &&
+        shared.sessionKey !== persistedKeyNow
+      ) {
+        recordKnownCoord(shared);
+        clearPendingAbandonmentWatch();
+        if (
+          machine.activeAttemptId === null &&
+          (isBlockingLogoutPhase(machine.logoutPhase) ||
+            machine.logoutPhase === 'revocation_failed')
+        ) {
+          machine.logoutPhase = 'idle';
+          machine.backedByStorage = false;
+          machine.retainedRevocationSession = null;
+          machine.revokedSessionKey = null;
+          emit();
+        }
+        return;
+      }
+
       const rank = coordStateRank(shared.state);
       const isSameKnownState =
         machine.knownCoord !== null &&
@@ -1988,26 +1982,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
           ? compareSharedCoord(shared, machine.knownCoord)
           : 1;
 
-      const persistedKeyForSignedIn =
-        shared.state === 'signed_in' && shared.sessionKey !== null
-          ? sessionKeyOf(readPersistedSupabaseSession(storage))
-          : null;
-      const isFreshSignedInAfterQuotaReset =
-        !isSameKnownState &&
-        cmpToKnown < 0 &&
-        machine.activeAttemptId === null &&
-        shared.state === 'signed_in' &&
-        shared.sessionKey !== null &&
-        persistedKeyForSignedIn === shared.sessionKey &&
-        machine.knownCoord !== null &&
-        machine.knownCoord.sessionKey !== null &&
-        machine.knownCoord.sessionKey !== shared.sessionKey;
-
-      if (
-        !isSameKnownState &&
-        cmpToKnown < 0 &&
-        !isFreshSignedInAfterQuotaReset
-      ) {
+      if (!isSameKnownState && cmpToKnown < 0) {
         reconcileMissingDirectCredentials(storage, options?.sdkKeyRemoved);
         return;
       }
@@ -2031,30 +2006,6 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
           shared.ownerTabId === tabId
         ) {
           return;
-        }
-        if (
-          (shared.state === 'pending' &&
-            machine.activeAttemptId !== shared.attemptId) ||
-          shared.state === 'local_failed'
-        ) {
-          const persistedKeyNow = sessionKeyOf(
-            readPersistedSupabaseSession(storage),
-          );
-          if (
-            shared.sessionKey !== null &&
-            persistedKeyNow !== null &&
-            persistedKeyNow !== shared.sessionKey
-          ) {
-            clearPendingAbandonmentWatch(shared);
-            if (isBlockingLogoutPhase(machine.logoutPhase)) {
-              machine.logoutPhase = 'idle';
-              machine.backedByStorage = false;
-              machine.retainedRevocationSession = null;
-              machine.revokedSessionKey = null;
-              emit();
-            }
-            return;
-          }
         }
         if (!needsBlockingPhaseRepair) {
           if (shared.state === 'pending' && shared.ownerTabId !== tabId) {
@@ -2211,13 +2162,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       }
     }
 
-    // shared === null: either never written, cleared externally, or deleted
-    // under quota cleanup. Whenever no local attempt is active, drop any stale
-    // knownCoord so it can never outrank a future record allocated from 1 by a
-    // fresh/reloaded tab (I1, I2, I3).
-    if (machine.activeAttemptId === null && machine.knownCoord !== null) {
-      resetKnownCoord();
-    }
+    // shared === null: either never written or cleared externally.
     const client = deps.getClient();
     const isDirect = client !== null && hasDirectRevocationTransport(client);
     const hasDirectCreds = isDirect && hasPersistedSupabaseCredentials(storage);
@@ -2591,17 +2536,6 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
   ): void {
     clearPendingAbandonmentWatch();
     abortInFlightRevocations();
-    const sharedNow = readSharedCoord(deps.getStorage());
-    if (sharedNow === null) {
-      resetKnownCoord();
-    } else if (
-      sharedNow.state === 'signed_in' &&
-      machine.knownCoord !== null &&
-      compareSharedCoord(sharedNow, machine.knownCoord) < 0
-    ) {
-      resetKnownCoord();
-      recordKnownCoord(sharedNow);
-    }
     machine.logoutPhase = 'idle';
     machine.activeAttemptId = null;
     machine.backedByStorage = false;
@@ -2717,25 +2651,24 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     const initialCoord = readSharedCoord(storage);
     if (initialCoord) {
       recordKnownCoord(initialCoord);
-      if (
+      const persistedKey = sessionKeyOf(readPersistedSupabaseSession(storage));
+      const isStaleLogoutForOlderSession =
+        initialCoord.state !== 'signed_in' &&
+        initialCoord.sessionKey !== null &&
+        persistedKey !== null &&
+        initialCoord.sessionKey !== persistedKey;
+      if (isStaleLogoutForOlderSession) {
+        // DELTA 15 Rule B: Storage holds a newer persisted session than this
+        // stale logout coord; let INITIAL_SESSION restore it cleanly.
+      } else if (
         initialCoord.state === 'pending' ||
         initialCoord.state === 'local_failed'
       ) {
-        const persistedKey = sessionKeyOf(
-          readPersistedSupabaseSession(storage),
-        );
-        const hasNewerPersistedSession =
-          persistedKey !== null &&
-          initialCoord.sessionKey !== null &&
-          persistedKey !== initialCoord.sessionKey;
         const directTransportWithNoCreds =
           hasDirectRevocationTransport(client) &&
           !hasPersistedSupabaseCredentials(storage);
 
-        if (hasNewerPersistedSession) {
-          // Storage already holds a newer session than this stale coord; let
-          // INITIAL_SESSION restore the newer session cleanly.
-        } else if (directTransportWithNoCreds) {
+        if (directTransportWithNoCreds) {
           if (initialCoord.state === 'pending') {
             machine.status = 'signed-out';
             machine.email = null;
@@ -2888,6 +2821,25 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
               if (retained) {
                 machine.retainedRevocationSession = retained;
               }
+              if (!fallback.stillPresentForTarget) {
+                // DELTA 15 P2-1: Local creds were removed without global
+                // revocation; move to revocation_failed (retry available) so
+                // this tab never silently flips to clean idle (I2).
+                machine.logoutPhase = 'revocation_failed';
+                if (fallback.written) {
+                  const promoted = writeSharedCoord(currentStorage, {
+                    attemptId,
+                    ownerTabId: tabId,
+                    state: 'revocation_failed',
+                    sessionKey: targetKey,
+                  });
+                  if (promoted.superseded) {
+                    reconcileFromShared();
+                  } else {
+                    machine.backedByStorage = promoted.written;
+                  }
+                }
+              }
             }
           }
         }
@@ -3005,18 +2957,30 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         currentStorage !== null &&
         hasDirectRevocationTransport(client) &&
         !hasPersistedSupabaseCredentials(currentStorage);
+      const sharedMatchesIncoming =
+        shared !== null &&
+        shared.state !== 'signed_in' &&
+        (shared.sessionKey === null ||
+          incomingKey === null ||
+          shared.sessionKey === incomingKey);
       const isStaleRefreshWhileSignedOut =
         event === 'TOKEN_REFRESHED' &&
         !isDistinctNewerSid &&
         machine.session === null &&
         shared?.state !== 'signed_in' &&
-        (machine.revokedSessionKey !== null || shared !== null);
+        (machine.revokedSessionKey !== null || sharedMatchesIncoming);
+      const isBlockedBySharedForIncoming =
+        shared !== null &&
+        (shared.state === 'pending' || shared.state === 'local_failed') &&
+        incomingKey !== null &&
+        shared.sessionKey === incomingKey;
 
       if (
         !isOwnFreshSignIn &&
         (isRevokedSessionReplay ||
           isGhostEventWithoutCreds ||
-          isStaleRefreshWhileSignedOut)
+          isStaleRefreshWhileSignedOut ||
+          isBlockedBySharedForIncoming)
       ) {
         if (
           currentStorage &&
@@ -3577,12 +3541,16 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     }
     const storage = deps.getStorage();
     const sharedBefore = readSharedCoord(storage);
-    if (sharedBefore?.state === 'signed_in') {
+    if (
+      sharedBefore?.state === 'signed_in' &&
+      hasPersistedSupabaseCredentials(storage)
+    ) {
       reconcileFromShared();
       return;
     }
-    const expectedSessionKey =
-      sharedBefore?.sessionKey ?? machine.revokedSessionKey;
+    const expectedSessionKey = machine.backedByStorage
+      ? (sharedBefore?.sessionKey ?? machine.revokedSessionKey)
+      : (machine.revokedSessionKey ?? sharedBefore?.sessionKey ?? null);
 
     // P3-1: If a late cross-tab refresh re-persisted sdkKey, refuse if it is a
     // newer session, or evict same-session credentials (retaining rotated
@@ -3734,19 +3702,29 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
   async function signOut(): Promise<void> {
     const client = deps.getClient();
     if (!client) return;
+    const hadActiveSession = machine.session !== null;
+    const initialActiveKey = sessionKeyOf(machine.session);
     const initialRevokedKey =
       machine.session === null ? machine.revokedSessionKey : null;
     reconcileFromShared();
 
     const storage = deps.getStorage();
     const hasStoredSdkCreds = hasPersistedSupabaseCredentials(storage);
+    const isAlreadyConfirmedCompleted =
+      machine.knownCoord?.state === 'completed' &&
+      (machine.knownCoord.sessionKey === null ||
+        initialActiveKey === null ||
+        machine.knownCoord.sessionKey === initialActiveKey);
+    const isCleanlySignedOutOnSignedIn =
+      !hadActiveSession &&
+      machine.retainedRevocationSession === null &&
+      hasDirectRevocationTransport(client) &&
+      machine.knownCoord?.state === 'signed_in';
     if (
       machine.session === null &&
       !hasStoredSdkCreds &&
       machine.logoutPhase === 'idle' &&
-      (machine.knownCoord?.state === 'completed' ||
-        (hasDirectRevocationTransport(client) &&
-          machine.knownCoord?.state === 'signed_in'))
+      (isAlreadyConfirmedCompleted || isCleanlySignedOutOnSignedIn)
     ) {
       return;
     }

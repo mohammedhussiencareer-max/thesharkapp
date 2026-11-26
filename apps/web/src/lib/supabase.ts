@@ -20,9 +20,19 @@ function noStoreFetch(
   return globalThis.fetch(input, { ...init, cache: 'no-store' });
 }
 
+function resolveLocalStorage(): Storage | undefined {
+  try {
+    if (typeof window === 'undefined') return undefined;
+    return window.localStorage;
+  } catch {
+    return undefined;
+  }
+}
+
 export const supabase: SupabaseClient<Database> | null = env
   ? createClient<Database>(env.url, env.anonKey, {
       auth: {
+        storage: resolveLocalStorage(),
         persistSession: true,
         autoRefreshToken: true,
         detectSessionInUrl: false,
