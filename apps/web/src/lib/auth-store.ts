@@ -1075,11 +1075,11 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     ownerTabId: string;
     sessionKey: string | null;
   } | null = null;
-  let watchedPendingAttemptId: number | null = null;
+  let watchedPendingKey: string | null = null;
   let pendingWatchedCoord: SharedLogoutCoord | null = null;
   let pendingWatchedDurable = false;
   let watchedLeaseObservedAt: number | null = null;
-  let pendingLockProbeAttemptId: number | null = null;
+  let pendingLockProbeKey: string | null = null;
   let pendingFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   let knownSeqIsTabLocalOnly = false;
   let lastAllocatedAttemptId = 0;
@@ -1510,7 +1510,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         if (
           existingLocal !== null &&
           compareLocatedCoords(
-            { coord: stamped, durable: false },
+            { coord: stamped, durable: !knownSeqIsTabLocalOnly },
             { coord: existingLocal, durable: true },
           ) > 0
         ) {
@@ -1713,10 +1713,20 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     return true;
   }
 
-  function clearPendingAbandonmentWatch(expectedAttemptId?: number): void {
+  function pendingWatchKeyOf(coord: {
+    attemptId: number;
+    ownerTabId: string;
+  }): string {
+    return `${coord.attemptId}:${coord.ownerTabId}`;
+  }
+
+  function clearPendingAbandonmentWatch(expected?: {
+    attemptId: number;
+    ownerTabId: string;
+  }): void {
     if (
-      expectedAttemptId !== undefined &&
-      watchedPendingAttemptId !== expectedAttemptId
+      expected !== undefined &&
+      watchedPendingKey !== pendingWatchKeyOf(expected)
     ) {
       return;
     }
@@ -1724,11 +1734,11 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       clearTimeout(pendingFallbackTimer);
       pendingFallbackTimer = null;
     }
-    watchedPendingAttemptId = null;
+    watchedPendingKey = null;
     pendingWatchedCoord = null;
     pendingWatchedDurable = false;
     watchedLeaseObservedAt = null;
-    pendingLockProbeAttemptId = null;
+    pendingLockProbeKey = null;
   }
 
   function clearPersistedCoord(storage: Storage | null): void {
@@ -1859,6 +1869,15 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       candidate.coord.ownerTabId === watched.coord.ownerTabId &&
       candidate.coord.sessionKey === watched.coord.sessionKey;
     if (samePending) return false;
+    if (
+      candidate.coord.state === 'pending' &&
+      candidate.coord.attemptId === watched.coord.attemptId &&
+      candidate.coord.ownerTabId !== watched.coord.ownerTabId &&
+      candidate.durable &&
+      !watched.durable
+    ) {
+      return true;
+    }
     return compareLocatedCoords(candidate, watched) > 0;
   }
 
@@ -1877,7 +1896,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       machine.session !== null ||
       hasAdvancedPastWatchedCoord(knownLocated, watchedLocated)
     ) {
-      clearPendingAbandonmentWatch(coord.attemptId);
+      clearPendingAbandonmentWatch(coord);
       reconcileFromShared();
       return;
     }
@@ -1888,12 +1907,12 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       machine.backedByStorage &&
       !hasPersistedSupabaseCredentials(latestStorage)
     ) {
-      clearPendingAbandonmentWatch(coord.attemptId);
+      clearPendingAbandonmentWatch(coord);
       reconcileFromShared();
       return;
     }
     if (hasAdvancedPastWatchedCoord(latestLocated, watchedLocated)) {
-      clearPendingAbandonmentWatch(coord.attemptId);
+      clearPendingAbandonmentWatch(coord);
       reconcileFromShared();
       return;
     }
@@ -1906,7 +1925,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       persistedKey !== coord.sessionKey
     ) {
       // P1-3: A newer session already replaced the pending logout's session.
-      clearPendingAbandonmentWatch(coord.attemptId);
+      clearPendingAbandonmentWatch(coord);
       if (
         readCoordFromStorage(deps.getSessionStorage())?.attemptId ===
         coord.attemptId
@@ -1928,7 +1947,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       // P1-2 / P2-1: Promote IN PLACE at coord.attemptId to local_failed so a
       // reloaded or sibling tab is never deadlocked if creds remain/return, and
       // a delayed completed(coord.attemptId) still outranks and heals.
-      clearPendingAbandonmentWatch(coord.attemptId);
+      clearPendingAbandonmentWatch(coord);
       const written = writeSharedCoord(latestStorage, {
         attemptId: coord.attemptId,
         ownerTabId: tabId,
@@ -1955,7 +1974,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     }
 
     // P1-2: Promote IN PLACE at coord.attemptId (rank 3 < completed rank 4).
-    clearPendingAbandonmentWatch(coord.attemptId);
+    clearPendingAbandonmentWatch(coord);
     const written = writeSharedCoord(latestStorage, {
       attemptId: coord.attemptId,
       ownerTabId: tabId,
@@ -2027,10 +2046,11 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       clearTimeout(pendingFallbackTimer);
       pendingFallbackTimer = null;
     }
+    const watchKey = pendingWatchKeyOf(coord);
     const clampedDelay = Math.min(PENDING_LEASE_TTL_MS, Math.max(0, delayMs));
     pendingFallbackTimer = setTimeout(() => {
       pendingFallbackTimer = null;
-      if (epoch !== storeEpoch || watchedPendingAttemptId !== coord.attemptId) {
+      if (epoch !== storeEpoch || watchedPendingKey !== watchKey) {
         return;
       }
       probePendingAbandonment(coord, epoch);
@@ -2041,10 +2061,11 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     coord: SharedLogoutCoord,
     epoch: number,
   ): void {
+    const watchKey = pendingWatchKeyOf(coord);
     if (
       epoch !== storeEpoch ||
       coord.ownerTabId === tabId ||
-      watchedPendingAttemptId !== coord.attemptId
+      watchedPendingKey !== watchKey
     ) {
       return;
     }
@@ -2060,7 +2081,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       machine.session !== null ||
       hasAdvancedPastWatchedCoord(knownLocated, watchedLocated)
     ) {
-      clearPendingAbandonmentWatch(coord.attemptId);
+      clearPendingAbandonmentWatch(coord);
       reconcileFromShared();
       return;
     }
@@ -2072,12 +2093,12 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       machine.backedByStorage &&
       !hasPersistedSupabaseCredentials(latestStorage)
     ) {
-      clearPendingAbandonmentWatch(coord.attemptId);
+      clearPendingAbandonmentWatch(coord);
       reconcileFromShared();
       return;
     }
     if (hasAdvancedPastWatchedCoord(latestLocated, watchedLocated)) {
-      clearPendingAbandonmentWatch(coord.attemptId);
+      clearPendingAbandonmentWatch(coord);
       reconcileFromShared();
       return;
     }
@@ -2111,22 +2132,23 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       return;
     }
 
-    // P3-2: Dedupe concurrent lock probes for the same watched attempt so
-    // repeated visibilitychange/isAuthResolved calls never stack waiters.
-    if (pendingLockProbeAttemptId === coord.attemptId) {
+    // P3-2 / DELTA11-P2-1: Dedupe concurrent lock probes per (attemptId, ownerTabId)
+    // so repeated visibilitychange/isAuthResolved calls never stack waiters while
+    // switching to a new owner at the same attemptId starts a fresh lock probe.
+    if (pendingLockProbeKey === watchKey) {
       return;
     }
-    pendingLockProbeAttemptId = coord.attemptId;
+    pendingLockProbeKey = watchKey;
 
     const attemptLockName = logoutAttemptLockKey(
       coord.attemptId,
       coord.ownerTabId,
     );
     const tryPromoteAfterLock = () => {
-      if (pendingLockProbeAttemptId === coord.attemptId) {
-        pendingLockProbeAttemptId = null;
+      if (pendingLockProbeKey === watchKey) {
+        pendingLockProbeKey = null;
       }
-      if (epoch !== storeEpoch || watchedPendingAttemptId !== coord.attemptId) {
+      if (epoch !== storeEpoch || watchedPendingKey !== watchKey) {
         return;
       }
       const freshStorage = deps.getStorage();
@@ -2141,7 +2163,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         machine.backedByStorage &&
         !hasPersistedSupabaseCredentials(freshStorage)
       ) {
-        clearPendingAbandonmentWatch(coord.attemptId);
+        clearPendingAbandonmentWatch(coord);
         reconcileFromShared();
         return;
       }
@@ -2156,7 +2178,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         hasAdvancedPastWatchedCoord(freshKnownLocated, watchedLocated) ||
         hasAdvancedPastWatchedCoord(freshLatestLocated, watchedLocated)
       ) {
-        clearPendingAbandonmentWatch(coord.attemptId);
+        clearPendingAbandonmentWatch(coord);
         reconcileFromShared();
         return;
       }
@@ -2179,12 +2201,9 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
           attemptLockName,
           { mode: 'exclusive', ifAvailable: true },
           (lock) => {
-            if (
-              epoch !== storeEpoch ||
-              watchedPendingAttemptId !== coord.attemptId
-            ) {
-              if (pendingLockProbeAttemptId === coord.attemptId) {
-                pendingLockProbeAttemptId = null;
+            if (epoch !== storeEpoch || watchedPendingKey !== watchKey) {
+              if (pendingLockProbeKey === watchKey) {
+                pendingLockProbeKey = null;
               }
               return;
             }
@@ -2218,15 +2237,20 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     epoch: number,
     durable: boolean,
   ): void {
-    if (watchedPendingAttemptId === coord.attemptId) {
+    if (epoch !== storeEpoch || coord.ownerTabId === tabId) return;
+    const watchKey = pendingWatchKeyOf(coord);
+    if (
+      watchedPendingKey === watchKey &&
+      pendingWatchedCoord !== null &&
+      pendingWatchedCoord.attemptId === coord.attemptId &&
+      pendingWatchedCoord.ownerTabId === coord.ownerTabId
+    ) {
       if (durable) {
         pendingWatchedDurable = true;
       }
       // Refresh tracked heartbeat and monotonic observation timestamp if a
       // strictly newer heartbeat arrived for the watched attempt.
       if (
-        pendingWatchedCoord !== null &&
-        pendingWatchedCoord.ownerTabId === coord.ownerTabId &&
         typeof coord.heartbeatAt === 'number' &&
         (pendingWatchedCoord.heartbeatAt === undefined ||
           coord.heartbeatAt > pendingWatchedCoord.heartbeatAt)
@@ -2240,7 +2264,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       return;
     }
     clearPendingAbandonmentWatch();
-    watchedPendingAttemptId = coord.attemptId;
+    watchedPendingKey = watchKey;
     pendingWatchedCoord = coord;
     pendingWatchedDurable = durable;
     watchedLeaseObservedAt = monotonicNow();
@@ -2369,7 +2393,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
             // P1-3 / DELTA9-P2-2: Newer session replaced the pending or
             // local_failed logout's session; clear tab-local fallback and
             // unblock login without touching the newer session (I3, I4).
-            clearPendingAbandonmentWatch(shared.attemptId);
+            clearPendingAbandonmentWatch(shared);
             if (
               readCoordFromStorage(deps.getSessionStorage())?.attemptId ===
               shared.attemptId
