@@ -96,6 +96,7 @@ vi.mock('@/purchases/api', () => ({
 }));
 
 vi.mock('@/sorting/api', () => ({
+  hasSortHistoryEntry: vi.fn(() => Promise.resolve(true)),
   listMixedFish: vi.fn(),
   listSorts: vi.fn(),
   recordSort: vi.fn(),

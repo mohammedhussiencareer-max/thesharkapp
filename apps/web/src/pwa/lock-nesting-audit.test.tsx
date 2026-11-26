@@ -163,6 +163,7 @@ vi.mock('@/recipes/api', () => ({
 }));
 
 vi.mock('@/waste/api', () => ({
+  hasWasteHistoryEntry: vi.fn(() => Promise.resolve(true)),
   historyPageSize: 2,
   loadHistoryPage: vi.fn(),
   recordWaste: vi.fn(),

@@ -15,6 +15,7 @@ import {
 } from '@/items/request-id';
 import {
   captureWriteSession,
+  isCurrentWriteSession,
   storageWriteFailedMessage,
   type WriteSession,
 } from '@/lib/held-writes';
@@ -92,7 +93,7 @@ export function useWasteAction(
       try {
         saved = await recordWaste(action);
         persisted = true;
-        markActionPostedReload(subject, action.requestId, subject);
+        markActionPostedReload(subject, action.requestId, saved.documentId);
       } catch (failure) {
         if (!persisted) {
           settleAction(subject, action.requestId, failure);
@@ -118,8 +119,12 @@ export function useWasteAction(
         releaseLock();
       }
       const warning = await reload();
-      if (warning === null) {
-        await clearActionPostedReload(subject, subject, action.requestId);
+      if (warning === null && isCurrentWriteSession(session)) {
+        await clearActionPostedReload(
+          subject,
+          saved.documentId,
+          action.requestId,
+        );
       }
       options.onSaved?.(saved);
       setNotice({ kind: 'saved', result: saved, warning });

@@ -1467,6 +1467,8 @@ describe('held-writes store', () => {
       expect(blockedDuringLogout).toEqual({ ok: false, reason: 'signed_out' });
       expect(applyPwaUpdate(reload, { authResolved: true })).toBe(false);
 
+      // The transport sign-out starts only after the logout Web Lock is granted.
+      await vi.waitFor(() => expect(signOutSpy).toHaveBeenCalled());
       resolveSignOut();
       await pendingLogout;
 
@@ -2110,24 +2112,398 @@ describe('held-writes store', () => {
     },
   );
 
+  it.each(['inflight', 'unknown'] as const)(
+    'blocks a sibling expense when quota left the posted write %s on disk',
+    async (phase) => {
+      const { client } = makeAuditedLocks();
+      const writer = createHeldWriteStore({ getLocks: () => client('writer') });
+      const stale = createHeldWriteStore({ getLocks: () => client('stale') });
+      try {
+        writer.setHeldWriteUser('user-a');
+        stale.setHeldWriteUser('user-a');
+        const month = '2030-04-01';
+        const original = await writer.claimFreshHeldWrite(
+          'expense:new',
+          () => ({
+            periodMonth: month,
+          }),
+          { readTarget: month },
+        );
+        expect(original.ok).toBe(true);
+        if (!original.ok) return;
+        const { requestId } = original.record;
+        const quota = vi
+          .spyOn(Storage.prototype, 'setItem')
+          .mockImplementation(() => {
+            throw new DOMException('storage full', 'QuotaExceededError');
+          });
+        try {
+          expect(() =>
+            writer.setHeldWritePhase(
+              'expense:new',
+              requestId,
+              'posted_reload',
+              {
+                readTarget: month,
+              },
+            ),
+          ).toThrow();
+        } finally {
+          quota.mockRestore();
+          original.release();
+          await Promise.resolve();
+        }
+        expect(stale.hasPostedReload('expense:new')).toBe(false);
+        if (phase === 'unknown') await stale.rehydrateHeldWritesAsync();
+        const key = `${userStoragePrefix('user-a')}${encodeURIComponent('expense:new')}`;
+        expect(JSON.parse(localStorage.getItem(key) ?? '{}')).toMatchObject({
+          phase,
+          requestId,
+        });
+
+        const create = (id: string) => ({ requestId: id, targetMonth: month });
+        const opts = { readTarget: month };
+        const claimed = await stale.claimFreshHeldWrite(
+          'expense:void:entry-1',
+          create,
+          opts,
+        );
+        if (claimed.ok) claimed.release();
+        expect(claimed).toMatchObject({
+          ok: false,
+          reason: 'conflict',
+          existing: { subject: 'expense:new', phase, requestId },
+        });
+        await writer.clearPostedReloadSnapshot(
+          writer.snapshotPostedReloads({ subject: 'expense:new' }),
+          month,
+        );
+        expect(localStorage.getItem(key)).toBeNull();
+        const afterVerification = await stale.claimFreshHeldWrite(
+          'expense:void:entry-1',
+          create,
+          opts,
+        );
+        expect(afterVerification.ok).toBe(true);
+        if (afterVerification.ok) afterVerification.release();
+      } finally {
+        writer.dispose();
+        stale.dispose();
+      }
+    },
+  );
+
+  it.each(['normal', 'quota'] as const)(
+    'settles two legacy unknown expense pins with one exact replay at a time (%s)',
+    async (scenario) => {
+      const { client } = makeAuditedLocks();
+      const tab1 = createHeldWriteStore({ getLocks: () => client('tab-1') });
+      const tab2 = createHeldWriteStore({ getLocks: () => client('tab-2') });
+      const addSubject = 'expense:new';
+      const voidSubject = 'expense:void:entry-1';
+      const april = '2030-04-01';
+      const voidMonth = scenario === 'quota' ? april : '2030-05-01';
+      const addPayload = { requestId: 'legacy-add', periodMonth: april };
+      const voidPayload = {
+        requestId: 'legacy-void',
+        id: 'entry-1',
+        targetMonth: voidMonth,
+      };
+      const verifyExpenseSibling = vi
+        .fn<(requestId: string) => Promise<'absent' | 'verified'>>()
+        .mockResolvedValue('absent');
+      const addOpts = {
+        readTarget: (payload: typeof addPayload) => payload.periodMonth,
+        verifyExpenseSibling,
+      };
+      const voidOpts = {
+        readTarget: (payload: typeof voidPayload) => payload.targetMonth,
+        verifyExpenseSibling,
+      };
+      try {
+        tab1.setHeldWriteUser('user-a');
+        tab1.putHeldWrite(addSubject, {
+          requestId: addPayload.requestId,
+          payload: addPayload,
+          phase: 'unknown',
+          kind: 'expense',
+        });
+        tab1.putHeldWrite(voidSubject, {
+          requestId: voidPayload.requestId,
+          payload: voidPayload,
+          phase: 'unknown',
+          kind: 'expense_void',
+        });
+        tab2.setHeldWriteUser('user-a');
+        await tab1.rehydrateHeldWritesAsync();
+        await tab2.rehydrateHeldWritesAsync();
+        expect(tab1.getHeldWrite(addSubject)).toMatchObject({
+          requestId: addPayload.requestId,
+          phase: 'unknown',
+        });
+        expect(tab2.getHeldWrite(voidSubject)).toMatchObject({
+          requestId: voidPayload.requestId,
+          phase: 'unknown',
+        });
+
+        expect(
+          await tab2.claimFreshHeldWrite('expense:void:entry-2', () => ({}), {
+            readTarget: '2030-06-01',
+          }),
+        ).toMatchObject({
+          ok: false,
+          reason: 'conflict',
+          existing: { phase: 'unknown' },
+        });
+        expect(
+          await tab2.claimReplayHeldWrite(voidSubject, 'other-id', voidOpts),
+        ).toMatchObject({
+          ok: false,
+          reason: 'missing',
+        });
+
+        const add = await tab1.claimReplayHeldWrite(
+          addSubject,
+          addPayload.requestId,
+          addOpts,
+        );
+        expect(add).toMatchObject({
+          ok: true,
+          record: { requestId: addPayload.requestId, payload: addPayload },
+        });
+        if (!add.ok) return;
+        expect(
+          await tab2.claimReplayHeldWrite(
+            voidSubject,
+            voidPayload.requestId,
+            voidOpts,
+          ),
+        ).toMatchObject({
+          ok: false,
+          reason: 'locked',
+        });
+        const postAdd = () =>
+          tab1.setHeldWritePhase(
+            addSubject,
+            addPayload.requestId,
+            'posted_reload',
+            { readTarget: april },
+          );
+        if (scenario === 'quota') {
+          const quota = vi
+            .spyOn(Storage.prototype, 'setItem')
+            .mockImplementation(() => {
+              throw new DOMException('storage full', 'QuotaExceededError');
+            });
+          try {
+            expect(postAdd).toThrow('مش قادر أحفظ العملية');
+          } finally {
+            quota.mockRestore();
+          }
+        } else {
+          postAdd();
+        }
+        add.release();
+        await Promise.resolve();
+
+        if (scenario === 'quota') {
+          await tab2.rehydrateHeldWritesAsync();
+          expect(tab2.getHeldWrite(addSubject)).toMatchObject({
+            requestId: addPayload.requestId,
+            phase: 'unknown',
+          });
+          verifyExpenseSibling.mockRejectedValueOnce(
+            new Error('month readback failed'),
+          );
+          expect(
+            await tab2.claimReplayHeldWrite(
+              voidSubject,
+              voidPayload.requestId,
+              voidOpts,
+            ),
+          ).toMatchObject({
+            ok: false,
+            reason: 'conflict',
+            existing: { subject: addSubject, requestId: addPayload.requestId },
+          });
+          expect(verifyExpenseSibling).toHaveBeenLastCalledWith(
+            addPayload.requestId,
+          );
+          expect(tab2.getHeldWrite(addSubject)).toMatchObject({
+            phase: 'unknown',
+          });
+          expect(tab2.getHeldWrite(voidSubject)).toMatchObject({
+            phase: 'unknown',
+          });
+          verifyExpenseSibling.mockImplementationOnce(async () => {
+            expect(
+              await tab1.claimReplayHeldWrite(
+                addSubject,
+                addPayload.requestId,
+                addOpts,
+              ),
+            ).toMatchObject({ ok: false, reason: 'locked' });
+            return 'verified';
+          });
+          const fullStorage = vi
+            .spyOn(Storage.prototype, 'setItem')
+            .mockImplementation(() => {
+              throw new DOMException('storage full', 'QuotaExceededError');
+            });
+          try {
+            expect(
+              await tab2.claimReplayHeldWrite(
+                voidSubject,
+                voidPayload.requestId,
+                voidOpts,
+              ),
+            ).toMatchObject({ ok: false, reason: 'storage' });
+            expect(fullStorage).toHaveBeenCalledExactlyOnceWith(
+              `${userStoragePrefix('user-a')}${encodeURIComponent(voidSubject)}`,
+              expect.stringContaining('"phase":"inflight"'),
+            );
+            expect(tab2.getHeldWrite(addSubject)).toBeNull();
+            expect(tab2.getHeldWrite(voidSubject)).toMatchObject({
+              phase: 'unknown',
+            });
+          } finally {
+            fullStorage.mockRestore();
+          }
+        }
+        const voidClaim = await tab2.claimReplayHeldWrite(
+          voidSubject,
+          voidPayload.requestId,
+          voidOpts,
+        );
+        expect(voidClaim).toMatchObject({
+          ok: true,
+          record: { requestId: voidPayload.requestId, payload: voidPayload },
+        });
+        if (!voidClaim.ok) return;
+        if (scenario === 'quota') {
+          expect(verifyExpenseSibling).toHaveBeenLastCalledWith(
+            addPayload.requestId,
+          );
+          expect(tab2.getHeldWrite(addSubject)).toBeNull();
+        }
+        tab2.setHeldWritePhase(
+          voidSubject,
+          voidPayload.requestId,
+          'posted_reload',
+          { readTarget: voidMonth },
+        );
+        voidClaim.release();
+        await Promise.resolve();
+        await tab1.clearPostedReload(addSubject, april, addPayload.requestId);
+        await tab2.clearPostedReload(
+          voidSubject,
+          voidMonth,
+          voidPayload.requestId,
+        );
+        await tab1.rehydrateHeldWritesAsync();
+        expect(tab1.getHeldWrite(addSubject)).toBeNull();
+        expect(tab1.getHeldWrite(voidSubject)).toBeNull();
+      } finally {
+        tab1.dispose();
+        tab2.dispose();
+      }
+    },
+  );
+
+  it('clears the in-memory unknown copy after verifying the same durable inflight expense claim', async () => {
+    const addSubject = 'expense:new';
+    const voidSubject = 'expense:void:legacy';
+    const addId = 'legacy-add';
+    const voidId = 'legacy-void';
+    const month = '2030-04-01';
+    setHeldWriteUser('user-a');
+    putHeldWrite(addSubject, {
+      requestId: addId,
+      phase: 'unknown',
+      payload: { periodMonth: month },
+    });
+    putHeldWrite(voidSubject, {
+      requestId: voidId,
+      phase: 'unknown',
+      payload: { targetMonth: month },
+    });
+
+    const add = await claimReplayHeldWrite(addSubject, addId, {
+      verifyExpenseSibling: () => Promise.resolve('absent'),
+    });
+    expect(add.ok).toBe(true);
+    if (!add.ok) return;
+    const quota = vi
+      .spyOn(Storage.prototype, 'setItem')
+      .mockImplementation(() => {
+        throw new DOMException('storage full', 'QuotaExceededError');
+      });
+    try {
+      setHeldWritePhase(addSubject, addId, 'unknown');
+    } finally {
+      quota.mockRestore();
+      add.release();
+      await Promise.resolve();
+    }
+    const key = `${userStoragePrefix('user-a')}${encodeURIComponent(addSubject)}`;
+    expect(getHeldWrite(addSubject)).toMatchObject({
+      phase: 'unknown',
+      requestId: addId,
+      claimId: add.record.claimId,
+    });
+    expect(JSON.parse(localStorage.getItem(key) ?? '{}')).toMatchObject({
+      phase: 'inflight',
+      requestId: addId,
+      claimId: add.record.claimId,
+    });
+
+    const verifyExpenseSibling = vi
+      .fn<(requestId: string) => Promise<'verified'>>()
+      .mockResolvedValue('verified');
+    const voidClaim = await claimReplayHeldWrite(voidSubject, voidId, {
+      verifyExpenseSibling,
+    });
+    expect(voidClaim.ok).toBe(true);
+    if (!voidClaim.ok) return;
+    expect(verifyExpenseSibling).toHaveBeenCalledExactlyOnceWith(addId);
+    try {
+      setHeldWritePhase(voidSubject, voidId, 'posted_reload', {
+        readTarget: month,
+      });
+    } finally {
+      voidClaim.release();
+      await Promise.resolve();
+    }
+    await clearPostedReload(voidSubject, month, voidId);
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(getHeldWrite(voidSubject)).toBeNull();
+
+    const postMessage = vi.fn();
+    try {
+      setTestWaitingWorker({ postMessage } as unknown as ServiceWorker);
+      expect(applyPwaUpdate(vi.fn(), { authResolved: true })).toBe(true);
+      expect(postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
+      expect(getHeldWrite(addSubject)).toBeNull();
+    } finally {
+      resetPwaState();
+    }
+  });
+
   it('rechecks other expense pins using the durable replay payload month', async () => {
     const { client } = makeAuditedLocks();
     const tab1 = createHeldWriteStore({ getLocks: () => client('tab-1') });
     const tab2 = createHeldWriteStore({ getLocks: () => client('tab-2') });
     try {
       const subject = 'expense:void:entry-1';
-      const held = await tab2.claimFreshHeldWrite(subject, () => ({
-        targetMonth: '2030-04-01',
-      }));
-      expect(held.ok).toBe(true);
-      if (!held.ok) return;
-      tab2.setHeldWritePhase(subject, held.record.requestId, 'unknown');
-      held.release();
-      await Promise.resolve();
-
       const add = await tab1.claimFreshHeldWrite('expense:new', () => ({}));
       expect(add.ok).toBe(true);
       if (!add.ok) return;
+      // An earlier build could leave an unknown void alongside an active add.
+      const held = tab2.putHeldWrite(subject, {
+        requestId: 'legacy-void',
+        phase: 'unknown',
+        payload: { targetMonth: '2030-04-01' },
+      });
       tab1.setHeldWritePhase(
         'expense:new',
         add.record.requestId,
@@ -2143,7 +2519,7 @@ describe('held-writes store', () => {
         readTarget: (payload: { targetMonth: string }) => payload.targetMonth,
       };
       expect(
-        await tab2.claimReplayHeldWrite(subject, held.record.requestId, opts),
+        await tab2.claimReplayHeldWrite(subject, held.requestId, opts),
       ).toMatchObject({
         ok: false,
         reason: 'conflict',
@@ -2151,7 +2527,7 @@ describe('held-writes store', () => {
       });
       expect(tab2.getHeldWrite(subject)).toMatchObject({
         phase: 'unknown',
-        requestId: held.record.requestId,
+        requestId: held.requestId,
       });
       await tab1.clearPostedReload(
         'expense:new',
@@ -2160,7 +2536,7 @@ describe('held-writes store', () => {
       );
       const replay = await tab2.claimReplayHeldWrite(
         subject,
-        held.record.requestId,
+        held.requestId,
         opts,
       );
       expect(replay.ok).toBe(true);

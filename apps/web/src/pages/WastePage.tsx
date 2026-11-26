@@ -1,16 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
-import {
-  clearActionPostedReloadSnapshot,
-  snapshotActionPostedReloads,
-} from '@/items/request-id';
+import { snapshotActionPostedReloads } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import {
+  captureWriteSession,
+  clearPostedReloadSnapshot,
+  type PostedReloadSnapshot,
+} from '@/lib/held-writes';
 import { offlineMoneyMessage, useReconnectReload } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { listStockChoices } from '@/purchases/api';
 import type { StockChoice } from '@/purchases/types';
-import { historyPageSize, loadHistoryPage } from '@/waste/api';
+import {
+  hasWasteHistoryEntry,
+  historyPageSize,
+  loadHistoryPage,
+} from '@/waste/api';
 import { freshStart, newWasteSubject } from '@/waste/format';
 import { reloadHistory } from '@/waste/history';
 import type { HistoryEntry } from '@/waste/types';
@@ -18,6 +24,19 @@ import { useWasteAction } from '@/waste/useWasteAction';
 import { WasteForm } from '@/waste/WasteForm';
 import { WasteHistory } from '@/waste/WasteHistory';
 import { WasteNoticeView } from '@/waste/WasteNotice';
+
+async function verifyPostedWaste(pins: PostedReloadSnapshot): Promise<void> {
+  await Promise.all(
+    pins.map(async ({ subject, readTarget, requestId }) => {
+      // Older pins used the action subject as the read target.
+      const id =
+        readTarget === subject || readTarget === '*' ? undefined : readTarget;
+      if (!(await hasWasteHistoryEntry({ id, requestId }))) {
+        throw new Error(genericCatalogError);
+      }
+    }),
+  );
+}
 
 export function WastePage() {
   const [choices, setChoices] = useState<StockChoice[] | null>(null);
@@ -46,12 +65,14 @@ export function WastePage() {
     const seq = ++loadSeqRef.current;
     const historySeq = ++historySeqRef.current;
     let cancelled = false;
+    const session = captureWriteSession();
     const pendingReloads = snapshotActionPostedReloads({ prefix: 'waste:' });
     void (async () => {
       try {
         const [items, page] = await Promise.all([
           listStockChoices(),
           loadHistoryPage(null),
+          verifyPostedWaste(pendingReloads),
         ]);
         if (cancelled || seq !== loadSeqRef.current) return;
         setChoices(items);
@@ -61,7 +82,7 @@ export function WastePage() {
           setNext(page.next);
           loadedRef.current = page.entries.length;
           setMoreError(null);
-          await clearActionPostedReloadSnapshot(pendingReloads);
+          await clearPostedReloadSnapshot(pendingReloads, undefined, session);
         }
       } catch (error) {
         if (cancelled || seq !== loadSeqRef.current) return;
@@ -109,18 +130,20 @@ export function WastePage() {
   // Re-reads everything already on screen plus the new document, so a corrected row refreshes too.
   const reload = useCallback(async (): Promise<void> => {
     const seq = ++historySeqRef.current;
+    const session = captureWriteSession();
     const pendingReloads = snapshotActionPostedReloads({ prefix: 'waste:' });
     setReloading((count) => count + 1);
     try {
-      const page = await reloadHistory(
-        Math.max(historyPageSize, loadedRef.current + 1),
-      );
+      const [page] = await Promise.all([
+        reloadHistory(Math.max(historyPageSize, loadedRef.current + 1)),
+        verifyPostedWaste(pendingReloads),
+      ]);
       if (seq !== historySeqRef.current) return;
       setEntries(page.entries);
       setNext(page.next);
       loadedRef.current = page.entries.length;
       setMoreError(null);
-      await clearActionPostedReloadSnapshot(pendingReloads);
+      await clearPostedReloadSnapshot(pendingReloads, undefined, session);
     } finally {
       setReloading((count) => count - 1);
     }

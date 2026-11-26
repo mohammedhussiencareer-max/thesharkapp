@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   addExpenseCategory,
   addExpenseEntry,
+  hasExpenseVoidRequest,
   instantKey,
   loadExpenseMonth,
   loadExpenseRequestMonth,
@@ -141,6 +142,49 @@ describe('expense api', () => {
   beforeEach(() => {
     mocks.schema.mockReset();
     rpcCalls.length = 0;
+  });
+
+  it('requires a matching void request ID and original expense ID', async () => {
+    const eq = vi.fn().mockReturnThis();
+    const select = vi.fn().mockReturnThis();
+    const maybeSingle = vi
+      .fn()
+      .mockResolvedValueOnce({ data: null, error: null })
+      .mockResolvedValueOnce({ data: { id: 'void-marker' }, error: null });
+    const from = vi.fn(() => ({ select, eq, maybeSingle }));
+    mocks.schema.mockReturnValue({ from });
+
+    await expect(
+      hasExpenseVoidRequest('unknown-request', 'original'),
+    ).resolves.toBe(false);
+    await expect(
+      hasExpenseVoidRequest('confirmed-request', 'original'),
+    ).resolves.toBe(true);
+    expect(from).toHaveBeenCalledWith('expense_entries');
+    expect(eq.mock.calls).toEqual([
+      ['request_id', 'unknown-request'],
+      ['voids_id', 'original'],
+      ['request_id', 'confirmed-request'],
+      ['voids_id', 'original'],
+    ]);
+  });
+
+  it('distinguishes an absent expense request from a stored void with an unreadable month', async () => {
+    const missing = query({ data: null, error: null });
+    const voided = query({
+      data: { period_month: null, expense_date: null, voids_id: 'original' },
+      error: null,
+    });
+    const original = query({ data: null, error: { message: 'unavailable' } });
+    const from = vi
+      .fn()
+      .mockReturnValueOnce(missing.chain)
+      .mockReturnValueOnce(voided.chain)
+      .mockReturnValueOnce(original.chain);
+    mocks.schema.mockReturnValue({ from });
+
+    await expect(loadExpenseRequestMonth('missing')).resolves.toBeNull();
+    await expect(loadExpenseRequestMonth('stored-void')).rejects.toThrow();
   });
 
   it('resolves a stored expense request month from its entry or the original entry of a void', async () => {

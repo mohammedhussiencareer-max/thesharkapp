@@ -26,6 +26,7 @@ import {
   waitingForSyncMessage,
 } from '@/counts/errors';
 import type { CountItem, CountRecord, CountWriteResult } from '@/counts/types';
+import { setHeldWriteUser, userStoragePrefix } from '@/lib/held-writes';
 import { CountsPage } from '@/pages/CountsPage';
 import { formatCairoDateTime } from '@/purchases/time';
 
@@ -105,6 +106,42 @@ describe('CountsPage', () => {
     vi.mocked(listPendingCounts).mockResolvedValue([]);
     vi.mocked(recordCount).mockResolvedValue(posted);
     vi.mocked(recordStoredCount).mockResolvedValue(posted);
+  });
+
+  it('blocks a stale daily count until a different stored card is verified', async () => {
+    setHeldWriteUser('counter');
+    await renderPage();
+    fillShortage();
+    const subject = 'count:stored:recent-card';
+    const key = `${userStoragePrefix('counter')}posted:${encodeURIComponent(subject)}:recent-card`;
+    // A second tab posted after this page rendered. No storage event has arrived.
+    localStorage.setItem(
+      key,
+      JSON.stringify({
+        v: 1,
+        subject,
+        requestId: 'recent-card',
+        kind: 'count_stored',
+        phase: 'posted_reload',
+        payload: null,
+      }),
+    );
+    vi.mocked(listCounts).mockRejectedValueOnce(
+      new Error('count readback failed'),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      await Promise.resolve();
+    });
+    expect(recordCount).not.toHaveBeenCalled();
+    expect(localStorage.getItem(key)).not.toBeNull();
+    expect(
+      await screen.findByText('count readback failed'),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => expect(localStorage.getItem(key)).toBeNull());
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
   });
 
   it('locks the page through the save and the reload', async () => {

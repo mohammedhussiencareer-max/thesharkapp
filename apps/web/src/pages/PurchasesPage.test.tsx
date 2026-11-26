@@ -20,7 +20,11 @@ import {
   listUnitsAt,
   recordPurchase,
 } from '@/purchases/api';
-import { hasPostedReload } from '@/lib/held-writes';
+import {
+  claimReplayHeldWrite,
+  hasPostedReload,
+  putHeldWrite,
+} from '@/lib/held-writes';
 import { PurchasesPage } from '@/pages/PurchasesPage';
 import type { Purchase, StockChoice, UnitOption } from '@/purchases/types';
 
@@ -87,6 +91,51 @@ describe('PurchasesPage', () => {
     vi.mocked(recordPurchase).mockResolvedValue(undefined);
     vi.mocked(listUnitsAt).mockReset();
     vi.mocked(listUnitsAt).mockResolvedValue({});
+  });
+
+  it('blocks a legacy purchase retry at the page and under the lock until the older post is verified', async () => {
+    await renderPage();
+    const subject = 'purchase:new';
+    act(() => {
+      putHeldWrite(subject, {
+        requestId: 'older-purchase',
+        payload: null,
+        phase: 'posted_reload',
+        readTarget: 'saved-purchase',
+      });
+      putHeldWrite(subject, {
+        requestId: 'legacy-retry',
+        phase: 'unknown',
+        payload: {
+          requestId: 'legacy-retry',
+          purchasedAt: '2026-07-15T09:00:00.000Z',
+          supplier: 'مورد',
+          invoiceNo: null,
+          note: null,
+          lines: [
+            {
+              itemId: 'oil',
+              quantity: '1',
+              unit: 'kg',
+              amountPaid: '10',
+              baseUnit: 'kg',
+              expectedFactor: '1',
+            },
+          ],
+        },
+      });
+    });
+    const claimed = await claimReplayHeldWrite(subject, 'legacy-retry');
+    if (claimed.ok) claimed.release();
+    expect(claimed).toMatchObject({
+      ok: false,
+      reason: 'conflict',
+      existing: { requestId: 'older-purchase' },
+    });
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'تحقق تاني' }));
+    await waitFor(() => expect(hasPostedReload(subject)).toBe(false));
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
   });
 
   it('filters by a Cairo date range and ignores a stale read', async () => {

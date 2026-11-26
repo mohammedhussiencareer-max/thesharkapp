@@ -27,6 +27,7 @@ import type {
 import { listCounts, listDailyItems, listPendingCounts } from '@/counts/api';
 import {
   addExpenseEntry,
+  hasExpenseVoidRequest,
   loadExpenseMonth,
   voidExpenseEntry,
 } from '@/expenses/api';
@@ -160,6 +161,7 @@ vi.mock('@/packaging/api', () => ({
 }));
 
 vi.mock('@/waste/api', () => ({
+  hasWasteHistoryEntry: vi.fn(() => Promise.resolve(true)),
   historyPageSize: 20,
   loadHistoryPage: vi.fn(),
   recordWaste: vi.fn(),
@@ -192,6 +194,7 @@ vi.mock('@/items/api', () => ({
 vi.mock('@/expenses/api', () => ({
   loadExpenseMonth: vi.fn(),
   addExpenseEntry: vi.fn(),
+  hasExpenseVoidRequest: vi.fn(),
   voidExpenseEntry: vi.fn(),
   addExpenseCategory: vi.fn(),
   renameExpenseCategory: vi.fn(),
@@ -216,6 +219,7 @@ vi.mock('@/counts/api', () => ({
 }));
 
 vi.mock('@/sorting/api', () => ({
+  hasSortHistoryEntry: vi.fn(() => Promise.resolve(true)),
   listMixedFish: vi.fn(),
   listSorts: vi.fn(),
   recordSort: vi.fn(),
@@ -712,7 +716,7 @@ describe('P7-3 round-3 review fixes', () => {
     fireEvent.click(screen.getByRole('button', { name: 'send-waste' }));
 
     await screen.findByText(/تحديث السجل فشل/);
-    expect(hasPostedReload(newWasteSubject, newWasteSubject)).toBe(true);
+    expect(hasPostedReload(newWasteSubject, 'w-1')).toBe(true);
   });
 
   it('R3-2f: DecisionForm moves to posted_reload after setOrderDisposition succeeds and clears only after onChanged succeeds', async () => {
@@ -1278,7 +1282,7 @@ describe('P7-3 round-3 review fixes', () => {
     }
   });
 
-  it('R3-7a: ExpensesPage reconciles an unknown void pin when reloaded month proves the entry is already voided', async () => {
+  it('R3-7a: ExpensesPage reconciles an unknown void pin when the exact void request is verified', async () => {
     const currentMonthStart = `${cairoMonthInput()}-01`;
     const voidedMonth: ExpenseMonth = {
       monthStart: currentMonthStart,
@@ -1315,6 +1319,7 @@ describe('P7-3 round-3 review fixes', () => {
       kind: 'expense_void',
     });
     vi.mocked(loadExpenseMonth).mockResolvedValue(voidedMonth);
+    vi.mocked(hasExpenseVoidRequest).mockResolvedValueOnce(true);
 
     render(
       <MemoryRouter>
@@ -1323,6 +1328,10 @@ describe('P7-3 round-3 review fixes', () => {
     );
 
     await screen.findByText('كهرباء');
+    expect(hasExpenseVoidRequest).toHaveBeenCalledWith(
+      'req-void-1',
+      'exp-voided',
+    );
     await waitFor(() => {
       expect(getHeldWrite('expense:void:exp-voided')).toBeNull();
     });

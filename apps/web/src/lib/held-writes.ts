@@ -322,8 +322,15 @@ function sameAcknowledgedClaim(
 
 export const COUNT_DAILY_SUBJECT = 'count:daily';
 export const COUNT_STORED_PREFIX = 'count:stored:';
+export const PURCHASE_SUBJECT = 'purchase:new';
 export const EXPENSE_NEW_SUBJECT = 'expense:new';
 export const EXPENSE_VOID_PREFIX = 'expense:void:';
+
+function isCountSubject(subject: string): boolean {
+  return (
+    subject === COUNT_DAILY_SUBJECT || subject.startsWith(COUNT_STORED_PREFIX)
+  );
+}
 
 function isExpenseSubject(subject: string): boolean {
   return (
@@ -1545,40 +1552,72 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     return stored as HeldWriteRecord<T>;
   }
 
-  function readBlockingPostedCopy(
+  function readBlockingWrite(
     subject: string,
     userId: string,
-    readTarget: string | undefined,
-    ownerId: string | undefined,
+    options: { readTarget?: string; ownerId?: string } & (
+      | { mode: 'fresh' }
+      | { mode: 'replay'; unresolvedSiblings: HeldWriteRecord[] }
+    ),
   ): HeldWriteRecord | null {
+    const { readTarget, ownerId } = options;
     const expense = isExpenseSubject(subject);
+    const count = isCountSubject(subject);
     const scope = userStoragePrefix(userId, getProjectUrl());
-    const add = encodeURIComponent(EXPENSE_NEW_SUBJECT);
-    const voidPrefix = encodeURIComponent(EXPENSE_VOID_PREFIX);
-    const keys = expense
-      ? safeListKeys(scope, true).filter((key) => {
-          const suffix = key.slice(scope.length);
-          return (
-            suffix === add ||
-            suffix.startsWith(voidPrefix) ||
-            suffix.startsWith(`${POSTED_SEGMENT}${add}:`) ||
-            suffix.startsWith(`${POSTED_SEGMENT}${voidPrefix}`)
-          );
-        })
-      : safeListKeys(postedSubjectPrefix(subject, userId), true);
+    const keys =
+      expense || count
+        ? safeListKeys(scope, true).filter((key) => {
+            const suffix = key.slice(scope.length);
+            const exact = encodeURIComponent(
+              expense ? EXPENSE_NEW_SUBJECT : COUNT_DAILY_SUBJECT,
+            );
+            const prefix = encodeURIComponent(
+              expense ? EXPENSE_VOID_PREFIX : COUNT_STORED_PREFIX,
+            );
+            return (
+              suffix === exact ||
+              suffix.startsWith(prefix) ||
+              suffix.startsWith(`${POSTED_SEGMENT}${exact}:`) ||
+              suffix.startsWith(`${POSTED_SEGMENT}${prefix}`)
+            );
+          })
+        : safeListKeys(postedSubjectPrefix(subject, userId), true);
     for (const key of keys) {
       const record = readDurableRecord(key);
       if (
         !record ||
         (expense
           ? !isExpenseSubject(record.subject)
-          : record.subject !== subject) ||
-        record.phase !== 'posted_reload' ||
-        (!expense && ownerId !== undefined && record.postedBy === ownerId)
+          : count
+            ? !isCountSubject(record.subject)
+            : record.subject !== subject) ||
+        (!expense &&
+          !count &&
+          subject !== PURCHASE_SUBJECT &&
+          ownerId !== undefined &&
+          record.postedBy === ownerId)
       ) {
         continue;
       }
+      if (record.phase !== 'posted_reload') {
+        // A quota failure can leave a confirmed expense indistinguishable
+        // from an interrupted one, even after hydration promotes it. Its
+        // submitted month may differ from the month stored for that ID.
+        // An exact replay verifies these siblings before it can dispatch.
+        if (
+          expense &&
+          record.subject !== subject &&
+          isUnresolvedPhase(record.phase) &&
+          !readPostedCopy(record, userId)
+        ) {
+          if (options.mode === 'fresh') return record;
+          options.unresolvedSiblings.push(record);
+        }
+        continue;
+      }
       if (
+        count ||
+        subject === PURCHASE_SUBJECT ||
         readTarget === undefined ||
         readTarget === '*' ||
         matchesPostedTarget(record, readTarget)
@@ -1587,6 +1626,26 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       }
     }
     return null;
+  }
+
+  function observeBlockingWrite(record: HeldWriteRecord, userId: string): void {
+    if (record.phase === 'posted_reload') {
+      observePostedCopy(record);
+    } else {
+      const { subject } = record;
+      records.set(subject, preservePayloadIdentity(subject, record));
+      if (record.phase === 'inflight') {
+        const projectUrl = getProjectUrl();
+        const lock = subjectLockKey(subject, userId, projectUrl);
+        queueExactInflightRechecks(
+          userId,
+          projectUrl,
+          new Map([[lock, [record]]]),
+          hydrationRunId,
+        );
+      }
+    }
+    emit();
   }
 
   /**
@@ -1659,18 +1718,21 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
           postedOwner?.generation === session.generation
             ? postedOwner.id
             : undefined;
-        const posted =
+        const blocking =
           requestedPosted ??
           (stored?.phase === 'posted_reload'
             ? stored
             : stored && stored.requestId !== opts?.requestId
               ? readPostedCopy(stored, userId)
               : null) ??
-          readBlockingPostedCopy(subject, userId, opts?.readTarget, ownerId);
-        if (posted) {
-          observePostedCopy(posted);
-          emit();
-          return { ok: false, reason: 'conflict', existing: posted };
+          readBlockingWrite(subject, userId, {
+            mode: 'fresh',
+            readTarget: opts?.readTarget,
+            ownerId,
+          });
+        if (blocking) {
+          observeBlockingWrite(blocking, userId);
+          return { ok: false, reason: 'conflict', existing: blocking };
         }
       } catch {
         return { ok: false, reason: 'storage' };
@@ -1754,6 +1816,10 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       payload?: T;
       /** Expense month derived under lock from the payload that will be sent. */
       readTarget?: (payload: T) => string | undefined;
+      /** Read-only proof for the exact sibling ID, including its month if posted. */
+      verifyExpenseSibling?: (
+        requestId: string,
+      ) => Promise<'absent' | 'verified'>;
       awaitingReviewReload?: boolean;
       session?: WriteSession | null;
       checkConflict?: () => HeldWriteRecord | null;
@@ -1769,10 +1835,13 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       return { ok: false, reason: 'session_invalid' };
     }
     const userId = session.userId;
-    const key = entryStorageKey(subject, userId);
+    const projectUrl = getProjectUrl();
+    const key = entryStorageKey(subject, userId, projectUrl);
     const expected = records.get(subject);
     const initialAckWait = acknowledgedWait.get(subject);
-    const lock = await acquireSubjectLock(subjectLockKey(subject, userId));
+    const lock = await acquireSubjectLock(
+      subjectLockKey(subject, userId, projectUrl),
+    );
     if (!lock.acquired) {
       return {
         ok: false,
@@ -1781,7 +1850,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
     let handedOff = false;
     try {
-      if (!canDispatchWriteFor(session)) {
+      if (!canDispatchWriteFor(session) || getProjectUrl() !== projectUrl) {
         return { ok: false, reason: 'session_invalid' };
       }
       try {
@@ -1850,21 +1919,24 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
           },
         };
       }
+      const unresolvedSiblings: HeldWriteRecord[] = [];
       try {
-        const posted =
+        const blocking =
           readPostedCopy(stored, userId) ??
-          (isExpenseSubject(subject)
-            ? readBlockingPostedCopy(
-                subject,
-                userId,
-                opts?.readTarget?.(opts.payload ?? (stored.payload as T)),
-                undefined,
-              )
+          (isExpenseSubject(subject) ||
+          isCountSubject(subject) ||
+          subject === PURCHASE_SUBJECT
+            ? readBlockingWrite(subject, userId, {
+                mode: 'replay',
+                readTarget: opts?.readTarget?.(
+                  opts.payload ?? (stored.payload as T),
+                ),
+                unresolvedSiblings,
+              })
             : null);
-        if (posted) {
-          observePostedCopy(posted);
-          emit();
-          return { ok: false, reason: 'conflict', existing: posted };
+        if (blocking) {
+          observeBlockingWrite(blocking, userId);
+          return { ok: false, reason: 'conflict', existing: blocking };
         }
       } catch {
         return { ok: false, reason: 'storage' };
@@ -1892,6 +1964,46 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         records.set(subject, preserved);
         emit();
         return { ok: false, reason: 'conflict', existing: preserved };
+      }
+      if (unresolvedSiblings.length > 0) {
+        for (const sibling of unresolvedSiblings) {
+          let proof: 'absent' | 'verified' | undefined;
+          try {
+            proof = await opts?.verifyExpenseSibling?.(sibling.requestId);
+          } catch {
+            // A failed read gives no proof that the sibling is safe to pass.
+          }
+          if (!canDispatchWriteFor(session) || getProjectUrl() !== projectUrl) {
+            return { ok: false, reason: 'session_invalid' };
+          }
+          if (proof !== 'absent' && proof !== 'verified') {
+            observeBlockingWrite(sibling, userId);
+            return { ok: false, reason: 'conflict', existing: sibling };
+          }
+          if (proof === 'verified') {
+            try {
+              clearHeldWrite(
+                sibling.subject,
+                sibling.requestId,
+                sibling,
+                session,
+              );
+            } catch {
+              return { ok: false, reason: 'storage' };
+            }
+          }
+        }
+        if (!canDispatchWriteFor(session) || getProjectUrl() !== projectUrl) {
+          return { ok: false, reason: 'session_invalid' };
+        }
+        try {
+          const current = readDurableRecord(key);
+          if (!current || !sameClaim(current, stored)) {
+            return { ok: false, reason: 'missing' };
+          }
+        } catch {
+          return { ok: false, reason: 'storage' };
+        }
       }
       const claimId = crypto.randomUUID();
       const next: HeldWriteRecord<T> = {
@@ -2511,7 +2623,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     const waitAck = acknowledgedWait.get(subject);
     if (
       current &&
-      (sameClaim(current, captured) ||
+      (sameAcknowledgedClaim(current, captured) ||
         (waitAck &&
           sameAcknowledgedClaim(captured, waitAck) &&
           current.requestId === captured.requestId))
@@ -2522,7 +2634,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       acknowledgedWait.delete(subject);
     }
     const ack = acknowledgedInflight.get(subject);
-    if (ack && sameClaim(ack.record, captured))
+    if (ack && sameAcknowledgedClaim(captured, ack.record))
       acknowledgedInflight.delete(subject);
     emit();
   }

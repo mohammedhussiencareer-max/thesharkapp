@@ -338,6 +338,7 @@ export async function addExpenseEntry(draft: ExpenseDraft): Promise<void> {
   await writeEntry(() => appDb().rpc('add_expense_entry', args));
 }
 
+/** Null means that the exact request has no stored entry. */
 export async function loadExpenseRequestMonth(
   requestId: string,
 ): Promise<string | null> {
@@ -348,8 +349,11 @@ export async function loadExpenseRequestMonth(
     .maybeSingle();
   throwIfError(error);
   if (!data) return null;
-  if (data.voids_id) return loadExpenseEntryMonth(data.voids_id);
-  return expenseEntryMonth(data);
+  const month = data.voids_id
+    ? await loadExpenseEntryMonth(data.voids_id)
+    : expenseEntryMonth(data);
+  if (month === null) throw new Error(genericCatalogError);
+  return month;
 }
 
 export async function voidExpenseEntry(
@@ -364,6 +368,20 @@ export async function voidExpenseEntry(
       p_request_id: requestId,
     }),
   );
+}
+
+export async function hasExpenseVoidRequest(
+  requestId: string,
+  originalId: string,
+): Promise<boolean> {
+  const { data, error } = await appDb()
+    .from('expense_entries')
+    .select('id')
+    .eq('request_id', requestId)
+    .eq('voids_id', originalId)
+    .maybeSingle();
+  throwIfError(error);
+  return data !== null;
 }
 
 export async function setMonthExpenseComplete(

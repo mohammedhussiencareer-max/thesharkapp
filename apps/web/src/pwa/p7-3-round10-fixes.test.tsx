@@ -39,6 +39,7 @@ import {
 } from '@/items/api';
 import {
   addExpenseEntry,
+  hasExpenseVoidRequest,
   loadExpenseMonth,
   renameExpenseCategory,
 } from '@/expenses/api';
@@ -179,6 +180,7 @@ vi.mock('@/counts/api', () => ({
 vi.mock('@/expenses/api', () => ({
   loadExpenseMonth: vi.fn(),
   addExpenseEntry: vi.fn(),
+  hasExpenseVoidRequest: vi.fn(),
   voidExpenseEntry: vi.fn(),
   addExpenseCategory: vi.fn(),
   renameExpenseCategory: vi.fn(),
@@ -1021,6 +1023,9 @@ describe('P7-3 round-10 review fixes', () => {
         await Promise.resolve();
       });
       await waitFor(() => expect(settleRead).toBeDefined());
+      expect(
+        screen.getByRole('button', { name: 'حفظ المصروف' }),
+      ).toBeDisabled();
       const cleanupLock = await other.acquireHeldWriteLock(otherSubject);
       if (!cleanupLock.acquired)
         throw new Error('expected the second tab to hold the expense lock');
@@ -1032,7 +1037,10 @@ describe('P7-3 round-10 review fixes', () => {
       ];
       expect(bothPins).toHaveLength(2);
       partnerCleanup = other
-        .clearPostedReloadSnapshot(bothPins, month)
+        .clearPostedReloadSnapshot(
+          bothPins.filter((pin) => pin.subject === otherSubject),
+          month,
+        )
         .finally(releaseOther);
       await act(async () => {
         settleRead?.();
@@ -1050,6 +1058,10 @@ describe('P7-3 round-10 review fixes', () => {
             ],
             'concurrent month cleanup must finish without a lock cycle',
           ).toEqual([true, true]);
+          expect(
+            screen.getByRole('button', { name: 'حفظ المصروف' }),
+          ).toBeEnabled();
+          expect(screen.getByLabelText('مصاريف الشهر كاملة')).toBeEnabled();
         },
         { timeout: 800 },
       );
@@ -1298,6 +1310,7 @@ describe('P7-3 round-10 review fixes', () => {
         },
       ]);
       vi.mocked(loadExpenseMonth).mockResolvedValueOnce(older);
+      vi.mocked(hasExpenseVoidRequest).mockResolvedValueOnce(true);
       fireEvent.click(retry);
       await screen.findByText('إلغاء قديم');
       fireEvent.change(picker, { target: { value: '2030-05' } });
@@ -1453,6 +1466,7 @@ describe('P7-3 round-10 review fixes', () => {
           payload: { id: 'synthetic-void' },
         });
       });
+      vi.mocked(hasExpenseVoidRequest).mockResolvedValueOnce(true);
       vi.mocked(loadExpenseMonth).mockResolvedValueOnce(
         r13ExpenseMonth('2030-05-01', [
           {
@@ -2461,6 +2475,7 @@ describe('P7-3 round-10 review fixes', () => {
         });
       });
 
+      vi.mocked(hasExpenseVoidRequest).mockResolvedValueOnce(true);
       vi.mocked(loadExpenseMonth).mockResolvedValueOnce(
         r13ExpenseMonth('2030-05-01', [
           {

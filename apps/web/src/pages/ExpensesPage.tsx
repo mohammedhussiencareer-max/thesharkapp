@@ -4,6 +4,7 @@ import { AllocationTable } from '@/expenses/AllocationTable';
 import {
   addExpenseCategory,
   addExpenseEntry,
+  hasExpenseVoidRequest,
   loadExpenseEntryMonth,
   loadExpenseMonth,
   loadExpenseRequestMonth,
@@ -45,6 +46,7 @@ import {
   EXPENSE_VOID_PREFIX,
   getHeldWrite,
   hasDurableHeldWrite,
+  isCurrentWriteSession,
   listHeldWritesByPrefix,
   setHeldWritePhase,
   snapshotPostedReloads,
@@ -260,7 +262,9 @@ export function ExpensesPage() {
 
   async function reconcileCommittedVoids(
     entries: readonly ExpenseLine[],
+    readSession: WriteSession | null,
   ): Promise<void> {
+    if (!isCurrentWriteSession(readSession)) return;
     const voidedIds = new Set(
       entries.filter((line) => line.voided).map((line) => line.id),
     );
@@ -269,17 +273,21 @@ export function ExpensesPage() {
     for (const record of listHeldWritesByPrefix<StoredVoidPayload>(
       EXPENSE_VOID_PREFIX,
     )) {
-      if (
-        record.phase !== 'unknown' ||
-        !record.payload ||
-        record.payload.awaitingRequestMonth
-      )
+      const id = record.payload?.id;
+      if (record.phase !== 'unknown' || !id || !voidedIds.has(id)) continue;
+      // A voided row can belong to a different request. Only the exact void
+      // marker can settle this pin, including after quota and a reload.
+      try {
+        if (!(await hasExpenseVoidRequest(record.requestId, id))) continue;
+      } catch {
         continue;
-      if (voidedIds.has(record.payload.id)) {
-        await clearVerifiedHeldWrite(record);
-        voidRequestIdsRef.current.delete(record.payload.id);
-        clearedIds.push(record.payload.id);
       }
+      if (!isCurrentWriteSession(readSession)) return;
+      await clearVerifiedHeldWrite(record);
+      if (!isCurrentWriteSession(readSession)) return;
+      if (getHeldWrite(record.subject)) continue;
+      voidRequestIdsRef.current.delete(id);
+      clearedIds.push(id);
     }
     if (clearedIds.length > 0) {
       setVoidSnapshots((current) => {
@@ -424,7 +432,7 @@ export function ExpensesPage() {
 
   const isLatestMonthSeq = useCallback(
     (targetMonth: string, seq: number): boolean =>
-      monthSeqRef.current.get(targetMonth) === seq,
+      (monthSeqRef.current.get(targetMonth) ?? 0) === seq,
     [],
   );
 
@@ -443,10 +451,18 @@ export function ExpensesPage() {
   const readExpenseMonthTarget = useCallback(
     async (
       targetMonth: string,
-      mode: 'month' | 'global' = 'month',
+      mode: 'month' | 'global' | 'sibling' = 'month',
     ): Promise<MonthReadResult | null> => {
-      const monthSeq = nextMonthSeq(targetMonth);
-      const globalSeq = ++globalReadSeqRef.current;
+      // Sibling verification may fail without a UI error. Let an existing
+      // navigation read finish unless verification produces a replacement.
+      const monthSeq =
+        mode === 'sibling'
+          ? (monthSeqRef.current.get(targetMonth) ?? 0)
+          : nextMonthSeq(targetMonth);
+      const globalSeq =
+        mode === 'sibling'
+          ? globalReadSeqRef.current
+          : ++globalReadSeqRef.current;
       const readSession = captureWriteSession();
       const isStale = () =>
         !isLatestMonthSeq(targetMonth, monthSeq) ||
@@ -476,6 +492,35 @@ export function ExpensesPage() {
       return next;
     });
   }, []);
+
+  function applyDisplayedMonthRead(result: MonthReadResult): boolean {
+    if (result.data.monthStart !== `${monthRef.current}-01`) return false;
+    dataSessionRef.current = result.readSession;
+    setData(result.data);
+    setLoadError(null);
+    return true;
+  }
+
+  async function verifyExpenseReplaySibling(
+    requestId: string,
+  ): Promise<'absent' | 'verified'> {
+    const session = captureWriteSession();
+    const targetMonth = await loadExpenseRequestMonth(requestId);
+    if (targetMonth === null) return 'absent';
+    if (!isCurrentWriteSession(session)) throw new Error(retrySafeMessage);
+    const result = await readExpenseMonthTarget(targetMonth, 'sibling');
+    if (
+      !result ||
+      result.data.monthStart !== targetMonth ||
+      !isCurrentWriteSession(result.readSession) ||
+      !isLatestMonthSeq(targetMonth, result.monthSeq)
+    ) {
+      throw new Error(retrySafeMessage);
+    }
+    if (applyDisplayedMonthRead(result)) nextMonthSeq(targetMonth);
+    clearPostedVerifyError(targetMonth);
+    return 'verified';
+  }
 
   const setPostedVerifyError = useCallback(
     (targetMonth: string, message: string) => {
@@ -515,7 +560,7 @@ export function ExpensesPage() {
           completeAttempt,
           categoryAttempt,
         );
-        await reconcileCommittedVoids(result.data.entries);
+        await reconcileCommittedVoids(result.data.entries, result.readSession);
         await clearPostedReloadSnapshot(
           pendingReloads,
           result.data.monthStart,
@@ -553,12 +598,8 @@ export function ExpensesPage() {
     try {
       const result = await readExpenseMonthTarget(targetMonth);
       if (!result) return;
-      if (result.data.monthStart === `${monthRef.current}-01`) {
-        dataSessionRef.current = result.readSession;
-        setData(result.data);
-        setLoadError(null);
-      }
-      await reconcileCommittedVoids(result.data.entries);
+      applyDisplayedMonthRead(result);
+      await reconcileCommittedVoids(result.data.entries, result.readSession);
       await clearPostedReloadSnapshot(
         pendingReloads,
         result.data.monthStart,
@@ -635,7 +676,7 @@ export function ExpensesPage() {
         dataSessionRef.current = result.readSession;
         setData(fresh);
         setLoadError(null);
-        await reconcileCommittedVoids(fresh.entries);
+        await reconcileCommittedVoids(fresh.entries, result.readSession);
       }
       await clearPostedReloadSnapshot(
         pendingReloads,
@@ -706,7 +747,10 @@ export function ExpensesPage() {
             dataSessionRef.current = result.readSession;
             setData(result.data);
             setLoadError(null);
-            await reconcileCommittedVoids(result.data.entries);
+            await reconcileCommittedVoids(
+              result.data.entries,
+              result.readSession,
+            );
           }
           await clearPostedReloadSnapshot(
             pendingReloads,
@@ -795,7 +839,10 @@ export function ExpensesPage() {
               setData(result.data);
               setLoadError(null);
             }
-            await reconcileCommittedVoids(result.data.entries);
+            await reconcileCommittedVoids(
+              result.data.entries,
+              result.readSession,
+            );
             await clearPostedReloadSnapshot(
               pendingReloads,
               result.data.monthStart,
@@ -853,7 +900,11 @@ export function ExpensesPage() {
       ? await claimReplayHeldWrite<ExpenseDraft>(
           EXPENSE_NEW_SUBJECT,
           draft.requestId,
-          { session, readTarget: expenseDraftMonth },
+          {
+            session,
+            readTarget: expenseDraftMonth,
+            verifyExpenseSibling: verifyExpenseReplaySibling,
+          },
         )
       : await claimFreshHeldWrite<ExpenseDraft>(
           EXPENSE_NEW_SUBJECT,
@@ -988,6 +1039,7 @@ export function ExpensesPage() {
           session,
           readTarget: (payload) =>
             payload.awaitingRequestMonth ? undefined : payload.targetMonth,
+          verifyExpenseSibling: verifyExpenseReplaySibling,
         })
       : await claimFreshHeldWrite<StoredVoidPayload>(
           subject,

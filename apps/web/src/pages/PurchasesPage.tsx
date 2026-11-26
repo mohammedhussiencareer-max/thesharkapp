@@ -12,6 +12,7 @@ import {
   clearPostedReloadSnapshot,
   getHeldWrite,
   hasDurableHeldWrite,
+  PURCHASE_SUBJECT,
   setHeldWritePhase,
   snapshotPostedReloads,
   storageWriteFailedMessage,
@@ -56,8 +57,6 @@ import {
   cairoNextDateStartIso,
   dateRangeError,
 } from '@/purchases/time';
-
-const PURCHASE_SUBJECT = 'purchase:new';
 
 const shell =
   'mx-auto flex min-h-dvh w-full max-w-3xl flex-col gap-4 px-4 py-6 text-start';
@@ -205,7 +204,9 @@ export function PurchasesPage() {
     knownNames,
   );
   const inflight = stored?.phase === 'inflight';
-  const postedReload = stored?.phase === 'posted_reload';
+  const postedReload =
+    heldEpoch >= 0 &&
+    snapshotPostedReloads({ subject: PURCHASE_SUBJECT }).length > 0;
   const needsReload = localNeedsReload || postedReload;
   const editingLocked = saving || inflight || needsReload;
   const filterLocked =

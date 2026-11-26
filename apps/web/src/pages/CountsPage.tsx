@@ -317,13 +317,7 @@ export function CountsPage() {
   const storedCountPins =
     heldEpoch < 0 ? [] : listHeldWritesByPrefix<Json>(COUNT_STORED_PREFIX);
   const postedReload =
-    heldEpoch >= 0 &&
-    (storedDaily?.phase === 'posted_reload' ||
-      hasPostedReload(COUNT_DAILY_SUBJECT) ||
-      storedCountPins.some(
-        (record) =>
-          record.phase === 'posted_reload' || hasPostedReload(record.subject),
-      ));
+    heldEpoch >= 0 && snapshotCountPostedReloads().length > 0;
 
   const needsReload = localNeedsReload || postedReload;
   const editingLocked = saving || inflightDaily || needsReload;

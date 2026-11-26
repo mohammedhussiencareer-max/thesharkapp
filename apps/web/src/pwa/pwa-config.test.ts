@@ -92,6 +92,23 @@ describe('PWA Vite configuration', () => {
     );
   });
 
+  it('uses one guarded client with redirects disabled for both mobile count helpers', () => {
+    const mobileSpec = readFileSync(
+      resolve(import.meta.dirname, '../../e2e/mobile-pwa.spec.ts'),
+      'utf8',
+    );
+    expect(mobileSpec.match(/createClient<Database>\(/g)).toHaveLength(1);
+    expect(mobileSpec).toMatch(
+      /fetch\(input,\s*\{\s*\.\.\.init,\s*redirect:\s*'error'/,
+    );
+    expect(mobileSpec).toContain(
+      'const client = createLocalCountClient(apiUrl)',
+    );
+    expect(mobileSpec).toContain(
+      'const verifyClient = createLocalCountClient(supabaseUrl)',
+    );
+  });
+
   it('builds the desktop Tauri frontend with VITE_PWA=0 and keeps detectSessionInUrl false', () => {
     const tauriConf = JSON.parse(
       readFileSync(

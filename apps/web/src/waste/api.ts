@@ -204,6 +204,21 @@ export async function loadHistoryPage(
   return { entries, next: entries.length === limit && last ? last.id : null };
 }
 
+export async function hasWasteHistoryEntry(lookup: {
+  id?: string;
+  requestId: string;
+}): Promise<boolean> {
+  let query = appDb()
+    .from('waste_history')
+    .select('id')
+    .eq('request_id', lookup.requestId);
+  // Pass bigint IDs as text so the exact lookup does not round them.
+  if (lookup.id) query = query.filter('id', 'eq', lookup.id);
+  const { data, error } = await query.maybeSingle();
+  if (error) throw new Error(genericCatalogError);
+  return data !== null;
+}
+
 export function resultOf(value: unknown): WasteResult {
   const row = record(value);
   if (row.status !== 'ok') return bad();

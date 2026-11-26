@@ -26,15 +26,22 @@ async function expectNoHorizontalOverflow(page: {
   expect(scrollWidth).toBeLessThanOrEqual(innerWidth + 1);
 }
 
-async function coverCountTime(apiUrl: string): Promise<void> {
+function createLocalCountClient(apiUrl: string) {
   assertLocalSupabaseUrl(apiUrl);
-  const client = createClient<Database>(apiUrl, localServiceRoleKey, {
+  return createClient<Database>(apiUrl, localServiceRoleKey, {
     auth: {
       persistSession: false,
       autoRefreshToken: false,
       detectSessionInUrl: false,
     },
+    global: {
+      fetch: (input, init) => fetch(input, { ...init, redirect: 'error' }),
+    },
   });
+}
+
+async function coverCountTime(apiUrl: string): Promise<void> {
+  const client = createLocalCountClient(apiUrl);
   const app = client.schema('app');
 
   for (let attempt = 0; attempt < 6; attempt += 1) {
@@ -299,18 +306,7 @@ test('daily count retries the exact request id and payload across a reload at 39
   await expect(saved).toBeVisible(visible);
   await expect(saved.getByText('عجز 150.00 ج.م')).toBeVisible();
 
-  assertLocalSupabaseUrl(supabaseUrl);
-  const verifyClient = createClient<Database>(
-    supabaseUrl,
-    localServiceRoleKey,
-    {
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-        detectSessionInUrl: false,
-      },
-    },
-  );
+  const verifyClient = createLocalCountClient(supabaseUrl);
   const { data: storedCounts, error: verifyError } = await verifyClient
     .schema('app')
     .from('stock_counts')

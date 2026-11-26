@@ -8,7 +8,6 @@ import {
   claimFreshHeldWrite,
   claimReplayHeldWrite,
   clearHeldWrite,
-  clearPostedReload,
   clearPostedReloadSnapshot,
   getHeldWrite,
   hasDurableHeldWrite,
@@ -16,6 +15,7 @@ import {
   snapshotPostedReloads,
   storageWriteFailedMessage,
   subscribeHeldWritesStore,
+  type PostedReloadSnapshot,
 } from '@/lib/held-writes';
 import {
   isOnline,
@@ -24,7 +24,12 @@ import {
   useReconnectReload,
 } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
-import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
+import {
+  hasSortHistoryEntry,
+  listMixedFish,
+  listSorts,
+  recordSort,
+} from '@/sorting/api';
 import {
   genericSortError,
   isPayloadRefusal,
@@ -46,6 +51,17 @@ const SORT_SUBJECT = 'sort:new';
 const fieldClass = 'w-full rounded border border-neutral-300 px-3 py-2';
 
 type Snapshot = { items: MixedFish[]; sorts: SortRecord[] };
+
+async function verifyPostedSorts(pins: PostedReloadSnapshot): Promise<void> {
+  await Promise.all(
+    pins.map(async ({ readTarget, requestId }) => {
+      const id = readTarget === '*' ? undefined : readTarget;
+      if (!(await hasSortHistoryEntry({ id, requestId }))) {
+        throw new Error(genericSortError);
+      }
+    }),
+  );
+}
 
 type ReadResult =
   | { status: 'ready'; snapshot: Snapshot }
@@ -99,7 +115,9 @@ export function SortingPage() {
   const stored = heldEpoch < 0 ? null : getHeldWrite<SortDraft>(SORT_SUBJECT);
   const pending = stored?.phase === 'unknown' ? stored.payload : null;
   const inflight = stored?.phase === 'inflight';
-  const postedReload = stored?.phase === 'posted_reload';
+  const postedReload =
+    heldEpoch >= 0 &&
+    snapshotPostedReloads({ subject: SORT_SUBJECT }).length > 0;
   const needsReload = localNeedsReload || postedReload;
   const editingLocked = saving || inflight || needsReload;
   const busy = editingLocked || loads > 0;
@@ -146,19 +164,22 @@ export function SortingPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const session = captureWriteSession();
     const pendingReloads = snapshotPostedReloads({ subject: SORT_SUBJECT });
     void (async () => {
       try {
-        const next = await readSnapshot();
+        const [next] = await Promise.all([
+          readSnapshot(),
+          verifyPostedSorts(pendingReloads),
+        ]);
         if (cancelled || next.status === 'stale') return;
         if (next.status === 'blocked') {
           setLoadError(next.message);
-          setLocalNeedsReload(false);
-          return;
+        } else {
+          setSnapshot(next.snapshot);
+          setLoadError(null);
         }
-        setSnapshot(next.snapshot);
-        setLoadError(null);
-        await clearPostedReloadSnapshot(pendingReloads);
+        await clearPostedReloadSnapshot(pendingReloads, undefined, session);
         setLocalNeedsReload(false);
       } catch (error) {
         if (cancelled) return;
@@ -252,24 +273,29 @@ export function SortingPage() {
     setSuccess(null);
     let saved = false;
     try {
-      await recordSort(claim.record.payload);
+      const sortId = await recordSort(claim.record.payload);
       saved = true;
-      setHeldWritePhase(SORT_SUBJECT, draft.requestId, 'posted_reload');
+      setHeldWritePhase(SORT_SUBJECT, draft.requestId, 'posted_reload', {
+        readTarget: sortId,
+      });
       setLocalNeedsReload(true);
       setFormEpoch((value) => value + 1);
       setSuccess('اتسجل الفرز');
-      const next = await readSnapshot();
+      const pendingReloads = snapshotPostedReloads({ subject: SORT_SUBJECT });
+      const [next] = await Promise.all([
+        readSnapshot(),
+        verifyPostedSorts(pendingReloads),
+      ]);
       if (next.status === 'ready') {
         setSnapshot(next.snapshot);
         setLoadError(null);
-        await clearPostedReload(SORT_SUBJECT, undefined, draft.requestId);
-        setLocalNeedsReload(false);
       } else if (next.status === 'blocked') {
         setLoadError(next.message);
-        setLocalNeedsReload(false);
-      } else {
-        setLocalNeedsReload(false);
       }
+      if (next.status !== 'stale') {
+        await clearPostedReloadSnapshot(pendingReloads, undefined, session);
+      }
+      setLocalNeedsReload(false);
     } catch (error) {
       if (!saved) {
         setServerError(reportedSortError(error));
