@@ -11963,4 +11963,322 @@ describe('auth-store PR 65 verified findings (P1-1..P3-4)', () => {
       tabA.resetAuthStore({ clearStorage: false });
     }
   });
+
+  it('DELTA12-P2-1: confirmed completed for the same sessionKey beats a later-writtenAt tab-local revocation_failed across storages and on same-attempt promotion', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { createAuthStore, getLogoutCoordStorageKey } =
+      await import('@/lib/auth-store');
+    const url = 'https://delta12-p2-1-same-session-completed-wins.test';
+    const sdkKey = 'sb-delta12-p2-1-same-session-completed-wins-auth-token';
+    const coordKey = getLogoutCoordStorageKey(url);
+    const values = new Map<string, string>();
+    let zeroByteQuota = false;
+    const storage: Storage = {
+      get length() {
+        return values.size;
+      },
+      clear() {
+        values.clear();
+      },
+      getItem(k: string) {
+        return values.get(k) ?? null;
+      },
+      key(i: number) {
+        return [...values.keys()][i] ?? null;
+      },
+      removeItem(k: string) {
+        values.delete(k);
+      },
+      setItem(k: string, v: string) {
+        if (zeroByteQuota) {
+          throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+        }
+        values.set(k, String(v));
+      },
+    };
+    const sessionStorageB = makeMemoryStorage();
+    const server = createStatefulAuthServer();
+    const sid1 = server.issueSession();
+    storage.setItem(sdkKey, JSON.stringify(sid1));
+
+    let logoutSeq = 0;
+    let resolveTabALogout: ((res: Response) => void) | null = null;
+    const fetchFn: typeof fetch = (input, init) => {
+      const href = requestUrlOf(input);
+      const headers = new Headers(init?.headers);
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/token?grant_type=refresh_token')) {
+        return Promise.resolve(
+          server.handleRefresh(
+            typeof init?.body === 'string' ? init.body : null,
+          ),
+        );
+      }
+      if (href.includes('/auth/v1/logout')) {
+        logoutSeq += 1;
+        if (logoutSeq === 1) {
+          // Server revokes sid-1 immediately, but Tab A's 204 response is delayed in transit.
+          const realRes = server.handleLogout(headers.get('authorization'));
+          return new Promise<Response>((resolve) => {
+            resolveTabALogout = () => resolve(realRes);
+          });
+        }
+        // Tab B's concurrent /logout hits the already-revoked sid-1 -> 403 session_not_found.
+        return Promise.resolve(
+          server.handleLogout(headers.get('authorization')),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    const makeClient = () =>
+      createClient(url, TEST_ANON_KEY, {
+        auth: {
+          storage,
+          storageKey: sdkKey,
+          persistSession: true,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+        },
+        global: { fetch: fetchFn },
+      });
+
+    const clientA = makeClient();
+    const tabA = createAuthStore({
+      getClient: () => clientA as never,
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      getSessionStorage: () => makeMemoryStorage(),
+      addStorageListener: () => () => {},
+      createBroadcastChannel: () => null,
+      tabId: 'tabA',
+      syncGlobalStores: false,
+    });
+    const clientB = makeClient();
+    const tabB = createAuthStore({
+      getClient: () => clientB as never,
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      getSessionStorage: () => sessionStorageB,
+      addStorageListener: () => () => {},
+      createBroadcastChannel: () => null,
+      tabId: 'tabB',
+      syncGlobalStores: false,
+    });
+    const clientReloadB = makeClient();
+    const tabReloadB = createAuthStore({
+      getClient: () => clientReloadB as never,
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      getSessionStorage: () => sessionStorageB,
+      addStorageListener: () => () => {},
+      createBroadcastChannel: () => null,
+      tabId: 'tabB-reload',
+      syncGlobalStores: false,
+    });
+
+    try {
+      tabA.startAuth();
+      tabB.startAuth();
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('owner');
+        expect(tabB.getAuthSnapshot().status).toBe('owner');
+      });
+
+      // T1: Tab A calls signOut -> durable pending(1, tabA, sid:1, writtenAt: T1),
+      // removes sdkKey, server revokes sid-1 (204 delayed).
+      const signOutA = tabA.signOut();
+      await vi.waitFor(() => {
+        expect(resolveTabALogout).not.toBeNull();
+      });
+      expect(storage.getItem(sdkKey)).toBeNull();
+
+      // T2 > T1: 0-byte quota hits; Tab B calls signOut -> attemptId=2, writtenAt=T2 > T1,
+      // gets 403/400 because sid-1 is already revoked -> tab-local revocation_failed(2, sid:1, T2).
+      await vi.advanceTimersByTimeAsync(100);
+      zeroByteQuota = true;
+      await tabB.signOut();
+      expect(tabB.getAuthSnapshot().logoutPhase).toBe('revocation_failed');
+      const tabLocalRevFail = JSON.parse(
+        sessionStorageB.getItem(coordKey) ?? 'null',
+      ) as { attemptId: number; state: string; writtenAt: number };
+      expect(tabLocalRevFail).toMatchObject({
+        attemptId: 2,
+        state: 'revocation_failed',
+      });
+
+      // Quota recovers; Tab A's delayed 204 resolves -> durable completed(1, tabA, sid:1, writtenAt: T1 < T2).
+      await vi.advanceTimersByTimeAsync(200);
+      zeroByteQuota = false;
+      resolveTabALogout!(new Response(null, { status: 204 }));
+      await signOutA;
+      const durableCompleted = JSON.parse(
+        storage.getItem(coordKey) ?? 'null',
+      ) as { attemptId: number; state: string; writtenAt: number };
+      expect(durableCompleted).toMatchObject({
+        attemptId: 1,
+        state: 'completed',
+      });
+      expect(durableCompleted.writtenAt).toBeLessThan(
+        tabLocalRevFail.writtenAt,
+      );
+
+      // Tab B reconciles -> confirmed completed(1, sid:1) MUST beat later-writtenAt
+      // tab-local revocation_failed(2, sid:1) and clear sessionStorageB!
+      expect(tabB.isAuthResolved()).toBe(true);
+      expect(tabB.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'idle',
+        logoutRevocationFailed: false,
+      });
+      expect(sessionStorageB.getItem(coordKey)).toBeNull();
+
+      // Sequence B check: same-attempt tab-local revocation_failed(1, T2) vs durable
+      // completed(1, T1 < T2) on reload also resolves to idle cleanly.
+      sessionStorageB.setItem(
+        coordKey,
+        JSON.stringify({
+          attemptId: 1,
+          ownerTabId: 'tabB',
+          state: 'revocation_failed',
+          sessionKey: 'sid:sid-1',
+          writtenAt: tabLocalRevFail.writtenAt,
+        }),
+      );
+      tabReloadB.startAuth();
+      await vi.advanceTimersByTimeAsync(20);
+      expect(tabReloadB.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'idle',
+        logoutRevocationFailed: false,
+      });
+      expect(sessionStorageB.getItem(coordKey)).toBeNull();
+    } finally {
+      await clientA.auth.stopAutoRefresh();
+      await clientB.auth.stopAutoRefresh();
+      await clientReloadB.auth.stopAutoRefresh();
+      tabA.resetAuthStore({ clearStorage: false });
+      tabB.resetAuthStore({ clearStorage: false });
+      tabReloadB.resetAuthStore({ clearStorage: false });
+    }
+  });
+
+  it('DELTA12-P2-2: retryLogoutRevocation is a no-op while signIn is in flight so it cannot revoke the brand-new session', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { createAuthStore, getLogoutCoordStorageKey } =
+      await import('@/lib/auth-store');
+    const url = 'https://delta12-p2-2-retry-during-signin.test';
+    const sdkKey = 'sb-delta12-p2-2-retry-during-signin-auth-token';
+    const coordKey = getLogoutCoordStorageKey(url);
+    const storage = makeMemoryStorage();
+    const server = createStatefulAuthServer();
+    storage.setItem(sdkKey, JSON.stringify(server.issueSession()));
+
+    let logoutCalls = 0;
+    let resolveSignIn: ((res: Response) => void) | null = null;
+    const fetchFn: typeof fetch = (input, init) => {
+      const href = requestUrlOf(input);
+      const headers = new Headers(init?.headers);
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/logout')) {
+        logoutCalls += 1;
+        if (logoutCalls === 1) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ message: 'unavailable' }), {
+              status: 503,
+              headers: { 'content-type': 'application/json' },
+            }),
+          );
+        }
+        return Promise.resolve(
+          server.handleLogout(headers.get('authorization')),
+        );
+      }
+      if (href.includes('/auth/v1/token?grant_type=password')) {
+        return new Promise<Response>((resolve) => {
+          resolveSignIn = resolve;
+        });
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    const clientA = createClient(url, TEST_ANON_KEY, {
+      auth: {
+        storage,
+        storageKey: sdkKey,
+        persistSession: true,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+      global: { fetch: fetchFn },
+    });
+    const tabA = createAuthStore({
+      getClient: () => clientA as never,
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      getSessionStorage: () => makeMemoryStorage(),
+      addStorageListener: () => () => {},
+      createBroadcastChannel: () => null,
+      tabId: 'tabA',
+      syncGlobalStores: false,
+    });
+
+    try {
+      tabA.startAuth();
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('owner');
+      });
+
+      // Sign out gets 503 -> lands in revocation_failed with retry offered.
+      await tabA.signOut();
+      expect(tabA.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'revocation_failed',
+        logoutRevocationFailed: true,
+        canRetryLogoutRevocation: true,
+      });
+      expect(logoutCalls).toBe(1);
+
+      // Start signIn (signInWithPassword held in flight).
+      const signInPromise = tabA.signIn('owner@test.local', 'ValidPassword123');
+      await vi.waitFor(() => {
+        expect(resolveSignIn).not.toBeNull();
+      });
+
+      // Calling retryLogoutRevocation() while signIn is in flight MUST be a no-op!
+      await tabA.retryLogoutRevocation();
+      expect(logoutCalls).toBe(1);
+      expect(tabA.getAuthSnapshot().logoutPhase).toBe('revocation_failed');
+      expect(JSON.parse(storage.getItem(coordKey) ?? 'null')).toMatchObject({
+        attemptId: 1,
+        state: 'revocation_failed',
+      });
+
+      // signIn resolves cleanly with a brand-new session that was NEVER revoked.
+      resolveSignIn!(server.handlePasswordSignIn());
+      expect(await signInPromise).toBe('ok');
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('owner');
+      });
+      expect(tabA.getAuthSnapshot().logoutPhase).toBe('idle');
+      expect(server.getConfirmedGlobalLogouts()).toBe(0);
+    } finally {
+      await clientA.auth.stopAutoRefresh();
+      tabA.resetAuthStore({ clearStorage: false });
+    }
+  });
 });

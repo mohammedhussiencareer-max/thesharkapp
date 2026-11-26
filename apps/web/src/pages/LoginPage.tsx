@@ -49,6 +49,13 @@ export function LoginPage() {
     })();
   }
 
+  function onRetryRevocation() {
+    if (submittingRef.current || submitting || logoutPending) {
+      return;
+    }
+    void (retryLogoutRevocation ?? signOut)();
+  }
+
   return (
     <main className={shell}>
       <p className="text-sm">The Shark</p>
@@ -83,8 +90,8 @@ export function LoginPage() {
               <button
                 className="w-fit rounded bg-neutral-900 px-3 py-2 text-white disabled:opacity-60"
                 type="button"
-                disabled={logoutPending}
-                onClick={() => void (retryLogoutRevocation ?? signOut)()}
+                disabled={logoutPending || submitting}
+                onClick={onRetryRevocation}
               >
                 {logoutPending
                   ? 'جاري إنهاء الجلسات…'

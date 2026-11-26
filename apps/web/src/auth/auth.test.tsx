@@ -1192,4 +1192,79 @@ describe('production GoTrueClient UI integration (hasDirectRevocationTransport =
       view.unmount();
     }
   });
+
+  it('DELTA12-P2-2: LoginPage disables and synchronously guards the revocation retry button while signIn is submitting', async () => {
+    let resolveSignIn!: (result: 'ok' | 'invalid' | 'failed') => void;
+    const signInMock = vi.fn(
+      () =>
+        new Promise<'ok' | 'invalid' | 'failed'>((resolve) => {
+          resolveSignIn = resolve;
+        }),
+    );
+    const retryRevocationMock = vi.fn(async () => {});
+    const { AuthContext } = await import('@/lib/auth-context');
+    const { LoginPage } = await import('@/pages/LoginPage');
+
+    const view = render(
+      <MemoryRouter initialEntries={['/login']}>
+        <AuthContext.Provider
+          value={{
+            status: 'signed-out',
+            email: null,
+            logoutPending: false,
+            logoutFailed: false,
+            logoutRevocationFailed: true,
+            canRetryLogoutRevocation: true,
+            signIn: signInMock,
+            signOut: vi.fn(async () => {}),
+            retryLogoutRevocation: retryRevocationMock,
+            retry: vi.fn(),
+          }}
+        >
+          <LoginPage />
+        </AuthContext.Provider>
+      </MemoryRouter>,
+    );
+
+    try {
+      fireEvent.change(screen.getByLabelText('البريد'), {
+        target: { value: 'owner@theshark.test' },
+      });
+      fireEvent.change(screen.getByLabelText('كلمة السر'), {
+        target: { value: 'ValidPassword123' },
+      });
+      const form = screen
+        .getByRole('button', { name: 'تسجيل الدخول' })
+        .closest('form')!;
+      const retryButton = screen.getByRole('button', {
+        name: 'إعادة محاولة إنهاء الجلسات الأخرى',
+      });
+      expect(retryButton).toBeEnabled();
+
+      // Synchronously submit sign-in AND click the retry button in the same tick:
+      // submittingRef MUST block retryLogoutRevocation immediately.
+      act(() => {
+        fireEvent.submit(form);
+        fireEvent.click(retryButton);
+      });
+      expect(signInMock).toHaveBeenCalledTimes(1);
+      expect(retryRevocationMock).not.toHaveBeenCalled();
+
+      // While signIn is in flight, the retry button MUST also be disabled.
+      expect(retryButton).toBeDisabled();
+      fireEvent.click(retryButton);
+      expect(retryRevocationMock).not.toHaveBeenCalled();
+
+      // Once signIn resolves with 'invalid', the retry button re-enables and works.
+      await act(async () => {
+        resolveSignIn('invalid');
+        await Promise.resolve();
+      });
+      expect(retryButton).toBeEnabled();
+      fireEvent.click(retryButton);
+      expect(retryRevocationMock).toHaveBeenCalledTimes(1);
+    } finally {
+      view.unmount();
+    }
+  });
 });

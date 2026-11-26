@@ -420,21 +420,55 @@ function compareCrossStorageTie(
   return cmp !== 0 ? cmp : 1;
 }
 
+function sameSessionCompletedVsUnconfirmed(
+  a: SharedLogoutCoord,
+  b: SharedLogoutCoord,
+): number | null {
+  if (
+    a.sessionKey === null ||
+    b.sessionKey === null ||
+    a.sessionKey !== b.sessionKey
+  ) {
+    return null;
+  }
+  const aIsCompleted = a.state === 'completed';
+  const bIsCompleted = b.state === 'completed';
+  if (aIsCompleted === bIsCompleted) return null;
+  const otherState = aIsCompleted ? b.state : a.state;
+  // Keep 'local_failed' outside this fast path so DELTA9-P1-1 cannot drop an
+  // active local_failed while sdkKey is still persisted (I1).
+  if (otherState === 'pending' || otherState === 'revocation_failed') {
+    return aIsCompleted ? 1 : -1;
+  }
+  return null;
+}
+
 /**
  * Single unified coord ordering rule used across readSharedCoord,
  * reconcileFromShared, startAuth, isAttemptSuperseded, writeSharedCoord,
  * refreshPendingLease, and the abandonment watcher:
+ * - Same non-null sessionKey: confirmed `completed` always beats `pending` and
+ *   `revocation_failed` regardless of storage, attemptId, or writtenAt
+ *   (`local_failed` stays outside this fast path to preserve I1).
  * - Within durable localStorage (or same-tab tab-local): attemptId / rank.
  * - Across storages (durable vs tab-local) or across different tabs'
- *   non-durable records: later trusted `writtenAt` wins (timestamps >5 s in
- *   the future are treated as untrusted); ties / legacy records fall back to
- *   the I1/I2/I4-safe cross-storage tie-breaker.
+ *   non-durable records: same-attempt non-`signed_in` rank first, then later
+ *   trusted `writtenAt` (timestamps >5 s in the future are treated as
+ *   untrusted); ties / legacy records fall back to the I1/I2/I4-safe
+ *   cross-storage tie-breaker.
  */
 function compareLocatedCoords(
   a: LocatedCoord,
   b: LocatedCoord,
   now = Date.now(),
 ): number {
+  const sameSessionCompletedCmp = sameSessionCompletedVsUnconfirmed(
+    a.coord,
+    b.coord,
+  );
+  if (sameSessionCompletedCmp !== null) {
+    return sameSessionCompletedCmp;
+  }
   if (a.durable && b.durable) {
     return compareSharedCoord(a.coord, b.coord);
   }
@@ -481,6 +515,20 @@ function compareLocatedCoords(
   const durable = a.durable ? a.coord : b.coord;
   const tabLocal = a.durable ? b.coord : a.coord;
   const sign = a.durable ? 1 : -1;
+  const differentSession =
+    durable.sessionKey !== null &&
+    tabLocal.sessionKey !== null &&
+    durable.sessionKey !== tabLocal.sessionKey;
+  if (
+    durable.attemptId === tabLocal.attemptId &&
+    !differentSession &&
+    durable.state !== 'signed_in' &&
+    tabLocal.state !== 'signed_in'
+  ) {
+    const rankDiff =
+      coordStateRank(durable.state) - coordStateRank(tabLocal.state);
+    if (rankDiff !== 0) return sign * rankDiff;
+  }
   const tDurable = effectiveWrittenAt(durable, now);
   const tTabLocal = effectiveWrittenAt(tabLocal, now);
   if (tDurable !== null && tTabLocal !== null && tDurable !== tTabLocal) {
@@ -1953,6 +2001,9 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         ownerTabId: tabId,
         state: 'local_failed',
         sessionKey: coord.sessionKey,
+        ...(coord.writtenAt !== undefined
+          ? { writtenAt: coord.writtenAt }
+          : {}),
       });
       if (written.superseded) {
         reconcileFromShared();
@@ -1980,6 +2031,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       ownerTabId: tabId,
       state: 'revocation_failed',
       sessionKey: coord.sessionKey,
+      ...(coord.writtenAt !== undefined ? { writtenAt: coord.writtenAt } : {}),
     });
     if (written.superseded) {
       reconcileFromShared();
@@ -3996,6 +4048,9 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
   async function retryLogoutRevocation(): Promise<void> {
     const client = deps.getClient();
     if (!client) return;
+    // DELTA12-P2-2: Never dispatch global logout retry while a fresh signIn is
+    // in flight in this tab so it cannot revoke the brand-new session (I3).
+    if (signInInProgressCount > 0) return;
     if (pendingSignOutPromise) {
       await pendingSignOutPromise.catch(() => {});
       return;
