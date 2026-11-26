@@ -1929,4 +1929,100 @@ describe('I6 real createClient path and takeover during auth operations', () => 
       managed.deactivate();
     }
   });
+
+  it('DELTA-OT4 P3: signIn() during cold local_failed boot returns failed without instantiating GoTrueClient or firing a refresh fetch', async () => {
+    const url = 'https://delta-ot4-p3.example.test';
+    const anonKey = 'anon-key-delta-ot4-p3';
+    const sdkKey = 'sb-delta-ot4-p3-auth-token';
+    const recordKey = getLogoutCoordStorageKey(url);
+
+    const expiredSession = {
+      ...makeSession('sid-ot4-p3-expired'),
+      expires_at: Math.floor(Date.now() / 1000) - 60,
+    };
+
+    const backing = new Map<string, string>();
+    const storage: Storage = {
+      get length() {
+        return backing.size;
+      },
+      clear: () => backing.clear(),
+      getItem: (k) => backing.get(k) ?? null,
+      key: (i) => [...backing.keys()][i] ?? null,
+      removeItem: (k) => {
+        if (k === sdkKey) {
+          throw new DOMException('Blocked remove', 'QuotaExceededError');
+        }
+        backing.delete(k);
+      },
+      setItem: (k, v) => {
+        if (k === sdkKey) {
+          throw new DOMException('Blocked tombstone', 'QuotaExceededError');
+        }
+        backing.set(k, String(v));
+      },
+    };
+
+    const fetchCalls: string[] = [];
+    const rawFetch: typeof fetch = (input) => {
+      fetchCalls.push(requestUrlOf(input));
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    backing.set(sdkKey, JSON.stringify(expiredSession));
+    backing.set(
+      recordKey,
+      JSON.stringify({
+        attemptId: 1,
+        state: 'local_failed',
+        sessionKey: 'sid:sid-ot4-p3-expired',
+      }),
+    );
+
+    const managed = createManagedSupabaseClient({
+      url,
+      anonKey,
+      storageKey: sdkKey,
+      getStorage: () => storage,
+      getFetch: () => rawFetch,
+    });
+    const store = createAuthStore({
+      getClient: () => managed.getClient(),
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      storageKey: sdkKey,
+      syncGlobalStores: false,
+    });
+
+    try {
+      store.startAuth();
+      expect(store.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'local_failed',
+        logoutFailed: true,
+      });
+      expect(managed.hasInstantiatedClient()).toBe(false);
+      expect(fetchCalls).toEqual([]);
+
+      // Direct signIn() while cold-booted in local_failed MUST return 'failed'
+      // WITHOUT instantiating GoTrueClient or firing /token?grant_type=refresh_token
+      // (fails on 39b2003!).
+      expect(await store.signIn('owner@example.test', 'ValidPassword123')).toBe(
+        'failed',
+      );
+      await new Promise((r) => setTimeout(r, 25));
+
+      expect(managed.hasInstantiatedClient()).toBe(false);
+      expect(fetchCalls).toEqual([]);
+      expect(store.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'local_failed',
+        logoutFailed: true,
+      });
+      expect(store.isAuthResolved()).toBe(false);
+    } finally {
+      store.resetAuthStore({ clearStorage: false });
+      managed.deactivate();
+    }
+  });
 });

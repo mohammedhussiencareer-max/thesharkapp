@@ -5398,4 +5398,305 @@ describe('auth-store single-active-tab edge cases and regression coverage', () =
       tab.resetAuthStore({ clearStorage: false });
     }
   });
+
+  it('DELTA-OT4 P2 #1 & #2: global removeItem failure tombstones coordKey on confirmed sign-out/retry (I2) and on sign-in over null-sessionKey legacy marker (I3), and unclearable null-sessionKey revocation_failed never evicts a newer session', async () => {
+    const { createAuthStore, getLogoutCoordStorageKey } =
+      await import('@/lib/auth-store');
+    const url = 'https://delta-ot4-p2-tombstone.test';
+    const sdkKey = 'sb-delta-ot4-p2-tombstone-auth-token';
+    const coordKey = getLogoutCoordStorageKey(url);
+    const values = new Map<string, string>();
+    let failRemoveMode: 'none' | 'all' | 'coord_only' = 'all';
+    let failCoordSet = false;
+
+    const storage: Storage = {
+      get length() {
+        return values.size;
+      },
+      clear: () => values.clear(),
+      getItem: (k) => values.get(k) ?? null,
+      key: (i) => [...values.keys()][i] ?? null,
+      removeItem: (k) => {
+        if (
+          failRemoveMode === 'all' ||
+          (failRemoveMode === 'coord_only' && k === coordKey)
+        ) {
+          throw new DOMException(
+            `removeItem blocked (${failRemoveMode}) for ${k}`,
+            'InvalidStateError',
+          );
+        }
+        values.delete(k);
+      },
+      setItem: (k, v) => {
+        if (failCoordSet && k === coordKey) {
+          throw new DOMException(
+            'coordKey setItem blocked',
+            'QuotaExceededError',
+          );
+        }
+        values.set(k, String(v));
+      },
+    };
+
+    let logoutStatus = 204;
+    let sidSeq = 1;
+    const makeSidSession = (sid: string) => ({
+      access_token: makeJwt({
+        sub: 'owner-1',
+        email: 'owner@test.local',
+        session_id: sid,
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      }),
+      refresh_token: `rt-${sid}`,
+      token_type: 'bearer',
+      expires_in: 3600,
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      user: {
+        id: 'owner-1',
+        email: 'owner@test.local',
+        aud: 'authenticated',
+        app_metadata: {},
+        user_metadata: {},
+        created_at: '2026-01-01T00:00:00Z',
+      },
+    });
+
+    const fetchFn: typeof fetch = (input) => {
+      const href = requestUrlOf(input);
+      if (href.includes('/auth/v1/logout')) {
+        return Promise.resolve(
+          logoutStatus === 204
+            ? new Response(null, { status: 204 })
+            : new Response(JSON.stringify({ message: 'unavailable' }), {
+                status: logoutStatus,
+                headers: { 'content-type': 'application/json' },
+              }),
+        );
+      }
+      if (href.includes('/auth/v1/token?grant_type=password')) {
+        const s = makeSidSession(`ot4-sid-${sidSeq++}`);
+        return Promise.resolve(
+          new Response(JSON.stringify(s), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    const makeTab = () => {
+      const client = createClient(url, TEST_ANON_KEY, {
+        auth: {
+          storage,
+          storageKey: sdkKey,
+          persistSession: true,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+        },
+        global: { fetch: fetchFn },
+      });
+      const store = createAuthStore({
+        getClient: () => client as never,
+        getProjectUrl: () => url,
+        getStorage: () => storage,
+        storageKey: sdkKey,
+        syncGlobalStores: false,
+      });
+      return { client, store };
+    };
+
+    const cleanups: Array<() => Promise<void>> = [];
+    const openTab = () => {
+      const t = makeTab();
+      cleanups.push(async () => {
+        t.store.resetAuthStore({ clearStorage: false });
+        await t.client.auth.stopAutoRefresh();
+      });
+      return t;
+    };
+
+    try {
+      // === Part A (P2 #1 / I2): Confirmed 204 sign-out under global removeItem failure ===
+      values.set(sdkKey, JSON.stringify(makeSidSession('ot4-initial-1')));
+      const t1 = openTab();
+      t1.store.startAuth();
+      await vi.waitFor(() => {
+        expect(t1.store.getAuthSnapshot().status).toBe('owner');
+      });
+
+      logoutStatus = 204;
+      await t1.store.signOut();
+      expect(values.get(sdkKey)).toBe('');
+      expect(values.get(coordKey)).toBe('');
+      expect(t1.store.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'idle',
+        logoutRevocationFailed: false,
+      });
+
+      // Reload MUST boot into clean idle, NOT false revocation_failed (fails on 39b2003!).
+      t1.store.deactivate();
+      const t1Reload = openTab();
+      t1Reload.store.startAuth();
+      await vi.waitFor(() => {
+        expect(t1Reload.store.getAuthSnapshot().status).toBe('signed-out');
+      });
+      expect(t1Reload.store.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'idle',
+        logoutRevocationFailed: false,
+      });
+
+      // === Part B (P2 #1 / I2): Successful retryLogoutRevocation under global removeItem failure ===
+      expect(
+        await t1Reload.store.signIn('owner@test.local', 'ValidPass123'),
+      ).toBe('ok');
+      await vi.waitFor(() => {
+        expect(t1Reload.store.getAuthSnapshot().status).toBe('owner');
+      });
+      logoutStatus = 503;
+      await t1Reload.store.signOut();
+      expect(t1Reload.store.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'revocation_failed',
+        canRetryLogoutRevocation: true,
+      });
+      logoutStatus = 204;
+      await t1Reload.store.retryLogoutRevocation();
+      expect(values.get(coordKey)).toBe('');
+      expect(t1Reload.store.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'idle',
+        logoutRevocationFailed: false,
+      });
+
+      t1Reload.store.deactivate();
+      const t2Reload = openTab();
+      t2Reload.store.startAuth();
+      await vi.waitFor(() => {
+        expect(t2Reload.store.getAuthSnapshot().status).toBe('signed-out');
+      });
+      expect(t2Reload.store.getAuthSnapshot().logoutPhase).toBe('idle');
+      t2Reload.store.deactivate();
+
+      // === Part C (P2 #2 / I3): Migrated legacy '1' marker (sessionKey: null) + global removeItem failure ===
+      values.clear();
+      values.set(coordKey, '1');
+      const t3 = openTab();
+      t3.store.startAuth();
+      expect(t3.store.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'revocation_failed',
+        logoutRevocationFailed: true,
+      });
+      expect(JSON.parse(values.get(coordKey) ?? 'null')).toMatchObject({
+        state: 'revocation_failed',
+        sessionKey: null,
+      });
+
+      // Sign in cleanly -> clearDurableLogoutRecord tombstones coordKey to ''!
+      expect(await t3.store.signIn('owner@test.local', 'ValidPass123')).toBe(
+        'ok',
+      );
+      await vi.waitFor(() => {
+        expect(t3.store.getAuthSnapshot().status).toBe('owner');
+      });
+      expect(values.get(coordKey)).toBe('');
+      const signedInRaw = values.get(sdkKey);
+      expect(signedInRaw).toBeTruthy();
+
+      // Reload MUST stay owner and MUST NOT evict the new session (fails on 39b2003!).
+      t3.store.deactivate();
+      const t3Reload = openTab();
+      t3Reload.store.startAuth();
+      await vi.waitFor(() => {
+        expect(t3Reload.store.getAuthSnapshot().status).toBe('owner');
+      });
+      expect(values.get(sdkKey)).toBe(signedInRaw);
+      t3Reload.store.deactivate();
+
+      // === Part D (P2 #2 / I3): Unclearable revocation_failed(sessionKey: null) (BOTH removeItem & coordKey setItem throw) ===
+      values.clear();
+      values.set(
+        coordKey,
+        JSON.stringify({
+          attemptId: 1,
+          state: 'revocation_failed',
+          sessionKey: null,
+        }),
+      );
+      failRemoveMode = 'all';
+      failCoordSet = true;
+
+      const t4 = openTab();
+      t4.store.startAuth();
+      expect(t4.store.getAuthSnapshot().logoutPhase).toBe('revocation_failed');
+      expect(await t4.store.signIn('owner@test.local', 'ValidPass123')).toBe(
+        'ok',
+      );
+      await vi.waitFor(() => {
+        expect(t4.store.getAuthSnapshot().status).toBe('owner');
+      });
+      const signedInRaw2 = values.get(sdkKey);
+      expect(signedInRaw2).toBeTruthy();
+      // coordKey could neither be removed nor tombstoned, so it still holds revocation_failed(sessionKey: null).
+      expect(JSON.parse(values.get(coordKey) ?? 'null')).toMatchObject({
+        state: 'revocation_failed',
+        sessionKey: null,
+      });
+
+      // Reload MUST keep the newly signed-in owner session and MUST NOT evict sdkKey!
+      t4.store.deactivate();
+      const t4Reload = openTab();
+      t4Reload.store.startAuth();
+      await vi.waitFor(() => {
+        expect(t4Reload.store.getAuthSnapshot().status).toBe('owner');
+      });
+      expect(values.get(sdkKey)).toBe(signedInRaw2);
+      t4Reload.store.deactivate();
+
+      // === Part E (P2 #1 / I2): coordKey-only removeItem failure (sdkKey deletes normally, coordKey tombstoned) ===
+      values.clear();
+      failRemoveMode = 'coord_only';
+      failCoordSet = false;
+      values.set(sdkKey, JSON.stringify(makeSidSession('ot4-coord-only-1')));
+      const t5 = openTab();
+      t5.store.startAuth();
+      await vi.waitFor(() => {
+        expect(t5.store.getAuthSnapshot().status).toBe('owner');
+      });
+      logoutStatus = 204;
+      await t5.store.signOut();
+      expect(values.has(sdkKey)).toBe(false);
+      expect(values.get(coordKey)).toBe('');
+      t5.store.deactivate();
+
+      const t5Reload = openTab();
+      t5Reload.store.startAuth();
+      await vi.waitFor(() => {
+        expect(t5Reload.store.getAuthSnapshot().status).toBe('signed-out');
+      });
+      expect(t5Reload.store.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'idle',
+        logoutRevocationFailed: false,
+      });
+    } finally {
+      failRemoveMode = 'none';
+      failCoordSet = false;
+      for (const cleanup of cleanups) {
+        await cleanup();
+      }
+    }
+  });
 });

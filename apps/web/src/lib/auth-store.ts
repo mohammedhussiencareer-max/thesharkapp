@@ -817,12 +817,27 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     }
   }
 
-  function clearDurableLogoutRecord(storage: Storage | null): void {
-    if (!storage || !active) return;
+  function clearDurableLogoutRecord(storage: Storage | null): boolean {
+    if (!storage || !active) return false;
+    const key = recordKey();
     try {
-      storage.removeItem(recordKey());
+      storage.removeItem(key);
+      return true;
     } catch {
-      // Ignore storage cleanup errors.
+      // DELTA OT-4 P2: Mirror sdkKey's tombstone fallback when removeItem
+      // throws globally while setItem still works. `parseDurableLogoutRecord`
+      // treats '' as an absent record.
+      try {
+        const existing = storage.getItem(key);
+        if (existing === null || existing === '') {
+          return true;
+        }
+        storage.setItem(key, '');
+        return true;
+      } catch {
+        // Ignore storage cleanup errors when both removeItem and setItem fail.
+        return false;
+      }
     }
   }
 
@@ -1790,10 +1805,16 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       }
       lastAttemptId = Math.max(lastAttemptId, initialRecord.attemptId);
       const persistedKey = sessionKeyOf(readPersistedSupabaseSession(storage));
+      // A durable logout record is stale if storage already holds a newer
+      // distinct session, OR if an unclearable `revocation_failed` record has
+      // `sessionKey: null` (e.g., migrated legacy '1' marker where sdkKey was
+      // already absent) while storage now holds a valid signed-in session (I3).
       const isStaleForOlderSession =
-        initialRecord.sessionKey !== null &&
         persistedKey !== null &&
-        initialRecord.sessionKey !== persistedKey;
+        ((initialRecord.sessionKey !== null &&
+          initialRecord.sessionKey !== persistedKey) ||
+          (initialRecord.state === 'revocation_failed' &&
+            initialRecord.sessionKey === null));
 
       if (isStaleForOlderSession) {
         // Storage already holds a newer distinct session; discard stale logout record.
@@ -2269,29 +2290,43 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     password: string,
   ): Promise<'ok' | 'invalid' | 'failed'> {
     if (!active) return 'failed';
-    const client = activeClient ?? deps.getClient();
-    if (!client) return 'failed';
-    ensureAuthSubscribed(client);
     const epoch = storeEpoch;
     if (pendingSignOutPromise) {
       await pendingSignOutPromise.catch(() => {});
       if (epoch !== storeEpoch || !active) return 'failed';
     }
+    // DELTA OT-4 P3: Check logout blocking phases and durable blocking records
+    // BEFORE instantiating/subscribing GoTrueClient so a cold `local_failed`
+    // boot cannot trigger a spurious refresh for an expired blocked session.
     if (isPwaBlockedByLogout(machine.logoutPhase)) {
       return 'failed';
     }
     const storage = deps.getStorage();
     const durableBefore = readDurableLogoutRecord(storage);
+    const hasStoredCredsBefore = hasPersistedSupabaseCredentials(storage);
     const persistedKeyBefore = sessionKeyOf(
       readPersistedSupabaseSession(storage),
     );
     const isStaleRecordForOlderSession =
-      durableBefore?.sessionKey != null &&
+      durableBefore !== null &&
       persistedKeyBefore !== null &&
-      durableBefore.sessionKey !== persistedKeyBefore;
+      ((durableBefore.sessionKey !== null &&
+        durableBefore.sessionKey !== persistedKeyBefore) ||
+        (durableBefore.state === 'revocation_failed' &&
+          durableBefore.sessionKey === null));
+    if (
+      !isStaleRecordForOlderSession &&
+      hasStoredCredsBefore &&
+      (durableBefore?.state === 'pending' ||
+        durableBefore?.state === 'local_failed')
+    ) {
+      return 'failed';
+    }
+
+    const client = activeClient ?? deps.getClient();
+    if (!client) return 'failed';
     const directTransportWithNoCreds =
-      hasDirectRevocationTransport(client) &&
-      !hasPersistedSupabaseCredentials(storage);
+      hasDirectRevocationTransport(client) && !hasStoredCredsBefore;
     if (
       !isStaleRecordForOlderSession &&
       !directTransportWithNoCreds &&
@@ -2300,6 +2335,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     ) {
       return 'failed';
     }
+    ensureAuthSubscribed(client);
 
     const preSignInMachineSession = machine.session;
     const capturedSignOutEpoch = signOutEpoch;

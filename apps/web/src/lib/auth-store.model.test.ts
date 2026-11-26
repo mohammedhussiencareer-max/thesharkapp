@@ -422,6 +422,7 @@ class ModelAuthServer {
 }
 
 type QuotaMode = 'normal' | 'coord_blocked' | 'zero_byte';
+type RemoveFailMode = 'none' | 'sdk_only' | 'coord_only' | 'all_keys';
 type LogoutMode = '204' | '503' | 'slow_204' | 'slow_503' | '401_once';
 type RefreshMode = 'ok' | 'slow_ok' | 'slow_400';
 
@@ -477,6 +478,8 @@ type ModelCoverageStats = {
   revocationRetriesConverged: number;
   localFailedRecoveries: number;
   tombstoneFallbacks: number;
+  coordTombstoneFallbacks: number;
+  legacyMarkerSignInSupersedes: number;
   lateRevokedRefreshEvents: number;
   globalMultiSessionRevokes: number;
   inactiveTabsVerifiedSilent: number;
@@ -516,8 +519,13 @@ function readPersistedUserEmail(raw: string | undefined): string | null {
 
 function readDurableRecord(raw: string | undefined): DurableRecord | null {
   if (!raw) return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed === '1') {
+    return { attemptId: 0, state: 'revocation_failed', sessionKey: null };
+  }
   try {
-    const parsed = JSON.parse(raw) as Partial<DurableRecord>;
+    const parsed = JSON.parse(trimmed) as Partial<DurableRecord>;
     if (
       typeof parsed.attemptId === 'number' &&
       (parsed.state === 'pending' ||
@@ -638,7 +646,7 @@ async function runModelSeed(
   let logoutMode: LogoutMode = '204';
   let refreshMode: RefreshMode = 'ok';
   let slowSignIn = false;
-  let failSdkRemove = false;
+  let removeFailMode: RemoveFailMode = 'none';
   let failSdkTombstone = false;
 
   const trace: string[] = [];
@@ -673,6 +681,9 @@ async function runModelSeed(
     trace.push(
       `init: seeded ${initialSession.sessionKey} (${initialUser.id}, ttl=${ttl}s)`,
     );
+  } else if (chance(0.5)) {
+    values.set(coordKey, '1');
+    trace.push('init: signed-out with legacy revocation marker "1"');
   } else {
     trace.push('init: signed-out');
   }
@@ -726,9 +737,21 @@ async function runModelSeed(
           tab.inactiveStorageWriteCount += 1;
           return;
         }
-        if (k === sdkKey && failSdkRemove) {
+        if (removeFailMode === 'all_keys') {
+          throw new DOMException(
+            'Simulated global removeItem failure',
+            'QuotaExceededError',
+          );
+        }
+        if (removeFailMode === 'sdk_only' && k === sdkKey) {
           throw new DOMException(
             'Simulated sdkKey removeItem failure',
+            'QuotaExceededError',
+          );
+        }
+        if (removeFailMode === 'coord_only' && k === coordKey) {
+          throw new DOMException(
+            'Simulated coordKey removeItem failure',
             'QuotaExceededError',
           );
         }
@@ -758,8 +781,15 @@ async function runModelSeed(
             'QuotaExceededError',
           );
         }
-        if (k === sdkKey && str === '' && failSdkRemove) {
+        const sdkRemoveBlocked =
+          removeFailMode === 'sdk_only' || removeFailMode === 'all_keys';
+        const coordRemoveBlocked =
+          removeFailMode === 'coord_only' || removeFailMode === 'all_keys';
+        if (k === sdkKey && str === '' && sdkRemoveBlocked) {
           stats.tombstoneFallbacks += 1;
+        }
+        if (k === coordKey && str === '' && coordRemoveBlocked) {
+          stats.coordTombstoneFallbacks += 1;
         }
         values.set(k, str);
       },
@@ -1358,13 +1388,22 @@ async function runModelSeed(
         // Sign in on the active tab
         const user = chance(0.55) ? USER_A : USER_B;
         trace.push(`step ${step}: signIn(${activeTab.tabId}, ${user.id})`);
+        const durableBeforeSignIn = readDurableRecord(values.get(coordKey));
+        const hadNullSessionKeyRecord =
+          durableBeforeSignIn !== null &&
+          durableBeforeSignIn.sessionKey === null;
         const canAwaitSync =
           !slowSignIn && deferredNets.length === 0 && !hasAnyInFlight();
+        let signInOutcome: 'ok' | 'invalid' | 'failed' | null = null;
         activeTab.inFlightSignIns += 1;
         const p = activeTab.store
           .signIn(user.email, 'ValidPassword123')
           .then((res) => {
+            signInOutcome = res;
             if (res === 'ok') {
+              if (hadNullSessionKeyRecord) {
+                stats.legacyMarkerSignInSupersedes += 1;
+              }
               const sid = readPersistedSid(values.get(sdkKey));
               if (sid) {
                 latestCleanSignedInSid = sid;
@@ -1381,6 +1420,18 @@ async function runModelSeed(
           });
         if (canAwaitSync) {
           await p;
+          if (
+            signInOutcome === 'ok' &&
+            quotaMode === 'normal' &&
+            !activeTab.destroyed &&
+            activeTab.activeCtrl.isActive() &&
+            readDurableRecord(values.get(coordKey)) !== null
+          ) {
+            throw formatFailure(
+              'I3-coord-not-cleared-after-signin',
+              `At step ${step}: coordKey remained non-empty after signIn succeeded under removeFailMode=${removeFailMode}`,
+            );
+          }
         }
         await vi.advanceTimersByTimeAsync(20);
         await flushMicrotasks();
@@ -1394,8 +1445,10 @@ async function runModelSeed(
             signOutOriginUsers.set(targetSid, targetSession.user.id);
           }
           latestSignOutSessionKey = targetSid;
+          const sdkRemoveBlocked =
+            removeFailMode === 'sdk_only' || removeFailMode === 'all_keys';
           const sdkEraseBlocked =
-            failSdkRemove && (failSdkTombstone || quotaMode === 'zero_byte');
+            sdkRemoveBlocked && (failSdkTombstone || quotaMode === 'zero_byte');
           const coordWriteBlocked =
             quotaMode === 'coord_blocked' || quotaMode === 'zero_byte';
           latestSignOutUnpersistedAndUnerased =
@@ -1406,7 +1459,7 @@ async function runModelSeed(
         const signOutOriginEmail = activeTab.store.getAuthSnapshot().email;
         const signOutOriginStatus = activeTab.store.getAuthSnapshot().status;
         trace.push(
-          `step ${step}: signOut(${activeTab.tabId}) target=${targetSid ?? 'none'} mode=${logoutMode} quota=${quotaMode} rmFail=${failSdkRemove} tombFail=${failSdkTombstone}`,
+          `step ${step}: signOut(${activeTab.tabId}) target=${targetSid ?? 'none'} mode=${logoutMode} quota=${quotaMode} rmFail=${removeFailMode} tombFail=${failSdkTombstone}`,
         );
         const canAwaitSync =
           logoutMode !== 'slow_204' &&
@@ -1420,12 +1473,32 @@ async function runModelSeed(
         });
         if (canAwaitSync) {
           await p;
+          if (
+            targetSid !== null &&
+            quotaMode === 'normal' &&
+            !activeTab.destroyed &&
+            activeTab.activeCtrl.isActive()
+          ) {
+            const snap = activeTab.store.getAuthSnapshot();
+            if (
+              snap.logoutPhase === 'idle' &&
+              snap.status === 'signed-out' &&
+              readPersistedSid(values.get(sdkKey)) === null &&
+              readDurableRecord(values.get(coordKey)) !== null
+            ) {
+              throw formatFailure(
+                'I2-coord-not-cleared-after-clean-logout',
+                `At step ${step}: coordKey remained active after clean idle signOut under removeFailMode=${removeFailMode}`,
+              );
+            }
+          }
         }
         await vi.advanceTimersByTimeAsync(20);
         await flushMicrotasks();
         if (
           signOutOriginStatus === 'owner' &&
           signOutOriginEmail === USER_A.email &&
+          removeFailMode !== 'all_keys' &&
           !activeTab.destroyed &&
           activeTab.activeCtrl.isActive()
         ) {
@@ -1450,6 +1523,25 @@ async function runModelSeed(
         });
         if (canAwaitSync) {
           await p;
+          if (
+            canRetry &&
+            quotaMode === 'normal' &&
+            !activeTab.destroyed &&
+            activeTab.activeCtrl.isActive()
+          ) {
+            const snap = activeTab.store.getAuthSnapshot();
+            if (
+              snap.logoutPhase === 'idle' &&
+              snap.status === 'signed-out' &&
+              readPersistedSid(values.get(sdkKey)) === null &&
+              readDurableRecord(values.get(coordKey)) !== null
+            ) {
+              throw formatFailure(
+                'I2-coord-not-cleared-after-retry',
+                `At step ${step}: coordKey remained active after clean retryLogoutRevocation under removeFailMode=${removeFailMode}`,
+              );
+            }
+          }
         }
         await vi.advanceTimersByTimeAsync(20);
         await flushMicrotasks();
@@ -1556,10 +1648,15 @@ async function runModelSeed(
           quotaMode = pick(['normal', 'coord_blocked', 'zero_byte'] as const);
           trace.push(`step ${step}: env quotaMode=${quotaMode}`);
         } else if (knob === 1) {
-          failSdkRemove = chance(0.45);
+          removeFailMode = pick([
+            'none',
+            'sdk_only',
+            'coord_only',
+            'all_keys',
+          ] as const);
           failSdkTombstone = chance(0.35);
           trace.push(
-            `step ${step}: env rmFail=${failSdkRemove} tombFail=${failSdkTombstone}`,
+            `step ${step}: env rmFail=${removeFailMode} tombFail=${failSdkTombstone}`,
           );
         } else if (knob === 2) {
           logoutMode = pick([
@@ -1588,7 +1685,7 @@ async function runModelSeed(
     logoutMode = '204';
     refreshMode = 'ok';
     slowSignIn = false;
-    failSdkRemove = false;
+    removeFailMode = 'none';
     failSdkTombstone = false;
 
     let guard = 0;
@@ -1967,6 +2064,8 @@ describe('auth-store one-active-tab model-based suite (I1-I6)', () => {
     revocationRetriesConverged: 0,
     localFailedRecoveries: 0,
     tombstoneFallbacks: 0,
+    coordTombstoneFallbacks: 0,
+    legacyMarkerSignInSupersedes: 0,
     lateRevokedRefreshEvents: 0,
     globalMultiSessionRevokes: 0,
     inactiveTabsVerifiedSilent: 0,
@@ -1999,6 +2098,8 @@ describe('auth-store one-active-tab model-based suite (I1-I6)', () => {
     expect(suiteStats.revocationRetriesConverged).toBeGreaterThan(0);
     expect(suiteStats.localFailedRecoveries).toBeGreaterThan(0);
     expect(suiteStats.tombstoneFallbacks).toBeGreaterThan(0);
+    expect(suiteStats.coordTombstoneFallbacks).toBeGreaterThan(0);
+    expect(suiteStats.legacyMarkerSignInSupersedes).toBeGreaterThan(0);
     expect(suiteStats.lateRevokedRefreshEvents).toBeGreaterThan(0);
     expect(suiteStats.globalMultiSessionRevokes).toBeGreaterThan(0);
     expect(suiteStats.inactiveTabsVerifiedSilent).toBeGreaterThan(0);
