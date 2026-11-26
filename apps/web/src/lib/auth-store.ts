@@ -909,6 +909,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
   let watchedLeaseObservedAt: number | null = null;
   let pendingLockProbeAttemptId: number | null = null;
   let pendingFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  let knownSeqIsTabLocalOnly = false;
   let activeAttemptRotatedSession: {
     attemptId: number;
     session: RetainedRevocationSession;
@@ -1016,6 +1017,18 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     const durable = readCoordFromStorage(storage);
     const sessionFallback = readCoordFromStorage(deps.getSessionStorage());
     if (durable && sessionFallback) {
+      // P2-1: If localStorage holds a cross-tab signed_in/completed for a
+      // different session (e.g. after 0-byte quota recovery while this tab's
+      // sessionStorage accumulated higher tab-local attemptIds), durable wins.
+      if (
+        durable.sessionKey !== null &&
+        sessionFallback.sessionKey !== null &&
+        durable.sessionKey !== sessionFallback.sessionKey &&
+        (durable.state === 'signed_in' || durable.state === 'completed')
+      ) {
+        clearSessionStorageCoord();
+        return durable;
+      }
       return compareSharedCoord(sessionFallback, durable) > 0
         ? sessionFallback
         : durable;
@@ -1178,8 +1191,13 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
   }
 
   function nextAttemptId(storage: Storage | null): number {
-    const persisted = readSharedCoord(storage);
-    const base = Math.max(machine.knownSeq, persisted?.attemptId ?? 0);
+    const durableLocal = readCoordFromStorage(storage);
+    const sessionLocal = readCoordFromStorage(deps.getSessionStorage());
+    const base = Math.max(
+      machine.knownSeq,
+      durableLocal?.attemptId ?? 0,
+      sessionLocal?.attemptId ?? 0,
+    );
     const next = base + 1;
     machine.knownSeq = next;
     machine.knownStateRank = 0;
@@ -1240,6 +1258,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       }
     }
     if (!storage) {
+      knownSeqIsTabLocalOnly = true;
       mirrorCoordToSessionStorage(next);
       recordKnownCoord(next);
       postSharedCoord(next);
@@ -1248,10 +1267,38 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     try {
       storage.setItem(coordKey(), JSON.stringify(next));
       clearSessionStorageCoord();
+      knownSeqIsTabLocalOnly = false;
       recordKnownCoord(next);
       postSharedCoord(next);
       return { written: true, superseded: false };
     } catch {
+      // P3-2: If completed or signed_in hits quota-full while an older coord
+      // (e.g. revocation_failed) sits in localStorage, remove the stale coord
+      // so new or background tabs never observe stale failure UI.
+      if (next.state === 'completed' || next.state === 'signed_in') {
+        const existingLocal = readCoordFromStorage(storage);
+        if (
+          existingLocal !== null &&
+          compareSharedCoord(next, existingLocal) > 0
+        ) {
+          try {
+            storage.removeItem(coordKey());
+          } catch {
+            // Ignore storage removal errors.
+          }
+          try {
+            storage.setItem(coordKey(), JSON.stringify(next));
+            clearSessionStorageCoord();
+            knownSeqIsTabLocalOnly = false;
+            recordKnownCoord(next);
+            postSharedCoord(next);
+            return { written: true, superseded: false };
+          } catch {
+            // 0-byte quota: keep stale localStorage coord removed.
+          }
+        }
+      }
+      knownSeqIsTabLocalOnly = true;
       mirrorCoordToSessionStorage(next);
       recordKnownCoord(next);
       postSharedCoord(next);
@@ -1924,9 +1971,17 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     let shared: SharedLogoutCoord | null = durableShared;
     let selectedIncoming = false;
     if (incoming !== null) {
+      const incomingOverridesTabLocalSession =
+        knownSeqIsTabLocalOnly &&
+        incoming.ownerTabId !== tabId &&
+        (incoming.state === 'signed_in' || incoming.state === 'completed') &&
+        incoming.sessionKey !== null &&
+        machine.revokedSessionKey !== null &&
+        incoming.sessionKey !== machine.revokedSessionKey;
       if (
         durableShared === null ||
-        compareSharedCoord(incoming, durableShared) > 0
+        compareSharedCoord(incoming, durableShared) > 0 ||
+        incomingOverridesTabLocalSession
       ) {
         shared = incoming;
         selectedIncoming = true;
@@ -1935,6 +1990,24 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
 
     if (shared !== null) {
       const rank = coordStateRank(shared.state);
+      // P2-1: If this tab's higher knownSeq came only from tab-local
+      // sessionStorage under 0-byte quota, allow a cross-tab signed_in or
+      // completed for a different session to supersede the desynced sequence.
+      if (
+        shared.attemptId < machine.knownSeq &&
+        knownSeqIsTabLocalOnly &&
+        shared.ownerTabId !== tabId &&
+        (shared.state === 'signed_in' || shared.state === 'completed') &&
+        shared.sessionKey !== null &&
+        machine.revokedSessionKey !== null &&
+        shared.sessionKey !== machine.revokedSessionKey
+      ) {
+        clearSessionStorageCoord();
+        knownSeqIsTabLocalOnly = false;
+        machine.knownSeq = 0;
+        machine.knownStateRank = 0;
+        machine.knownOwnerTabId = null;
+      }
       if (shared.attemptId < machine.knownSeq) {
         reconcileMissingDirectCredentials(storage, options?.sdkKeyRemoved);
         return;
@@ -2049,6 +2122,14 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       machine.knownSeq = shared.attemptId;
       machine.knownStateRank = rank;
       machine.knownOwnerTabId = shared.ownerTabId;
+      const durableLocalNow = readCoordFromStorage(storage);
+      if (
+        durableLocalNow !== null &&
+        durableLocalNow.attemptId === shared.attemptId &&
+        durableLocalNow.state === shared.state
+      ) {
+        knownSeqIsTabLocalOnly = false;
+      }
       if (
         machine.activeAttemptId !== null &&
         (shared.attemptId > machine.activeAttemptId ||
@@ -2512,7 +2593,9 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     previousSession: Session | null,
   ): void {
     clearPendingAbandonmentWatch();
+    clearSessionStorageCoord();
     abortInFlightRevocations();
+    knownSeqIsTabLocalOnly = false;
     machine.logoutPhase = 'idle';
     machine.activeAttemptId = null;
     machine.backedByStorage = false;
@@ -2625,16 +2708,37 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     const storage = deps.getStorage();
     const initialCoord = readSharedCoord(storage);
     if (initialCoord) {
+      knownSeqIsTabLocalOnly =
+        readCoordFromStorage(storage) === null &&
+        readCoordFromStorage(deps.getSessionStorage()) !== null;
       recordKnownCoord(initialCoord);
       if (
         initialCoord.state === 'pending' ||
         initialCoord.state === 'local_failed'
       ) {
+        const persistedKey = sessionKeyOf(
+          readPersistedSupabaseSession(storage),
+        );
+        const hasNewerPersistedSession =
+          persistedKey !== null &&
+          initialCoord.sessionKey !== null &&
+          persistedKey !== initialCoord.sessionKey;
         const directTransportWithNoCreds =
           hasDirectRevocationTransport(client) &&
           !hasPersistedSupabaseCredentials(storage);
 
-        if (directTransportWithNoCreds) {
+        if (hasNewerPersistedSession) {
+          // P2-1: Storage already holds a newer session than this stale
+          // pending/local_failed coord; clear matching sessionStorage fallback
+          // and let INITIAL_SESSION restore the newer session cleanly.
+          if (
+            readCoordFromStorage(deps.getSessionStorage())?.attemptId ===
+            initialCoord.attemptId
+          ) {
+            clearSessionStorageCoord();
+            knownSeqIsTabLocalOnly = false;
+          }
+        } else if (directTransportWithNoCreds) {
           if (initialCoord.state === 'pending') {
             machine.status = 'signed-out';
             machine.email = null;
@@ -3435,20 +3539,74 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       return;
     }
     const storage = deps.getStorage();
-    if (
-      hasDirectRevocationTransport(client) &&
-      hasPersistedSupabaseCredentials(storage)
-    ) {
+    const sharedBefore = readSharedCoord(storage);
+    if (sharedBefore?.state === 'signed_in') {
+      reconcileFromShared();
       return;
     }
+    const expectedSessionKey =
+      sharedBefore?.sessionKey ?? machine.revokedSessionKey;
+
+    // P3-1: If a late cross-tab refresh re-persisted sdkKey, refuse if it is a
+    // newer session, or evict same-session credentials (retaining rotated
+    // tokens, or downgrading to local_failed if eviction fails).
+    if (
+      hasDirectRevocationTransport(client) &&
+      storage &&
+      hasPersistedSupabaseCredentials(storage)
+    ) {
+      const persisted = readPersistedSupabaseSession(storage);
+      const persistedKey = sessionKeyOf(persisted);
+      if (
+        persistedKey !== null &&
+        expectedSessionKey !== null &&
+        persistedKey !== expectedSessionKey
+      ) {
+        if (
+          readCoordFromStorage(deps.getSessionStorage())?.sessionKey ===
+          expectedSessionKey
+        ) {
+          clearSessionStorageCoord();
+          knownSeqIsTabLocalOnly = false;
+        }
+        machine.logoutPhase = 'idle';
+        machine.backedByStorage = false;
+        machine.retainedRevocationSession = null;
+        machine.revokedSessionKey = null;
+        reconcileFromShared();
+        emit();
+        return;
+      }
+      const removal = removePersistedSupabaseCredentials(
+        storage,
+        expectedSessionKey,
+      );
+      if (removal.skippedNewerSession) {
+        reconcileFromShared();
+        return;
+      }
+      if (removal.stillPresentForTarget) {
+        const failAttemptId = nextAttemptId(storage);
+        machine.activeAttemptId = failAttemptId;
+        commitLogoutResult(failAttemptId, {
+          localOk: false,
+          revocationOk: false,
+          retainedSession: persisted ?? machine.retainedRevocationSession,
+          targetSessionKey: expectedSessionKey,
+        });
+        return;
+      }
+      if (persisted !== null) {
+        machine.retainedRevocationSession = persisted;
+      }
+    }
+
     const sessionToRevoke = machine.retainedRevocationSession;
     if (!sessionToRevoke) {
       // I2: Never clear logoutRevocationFailed or report success without
       // actually performing global revocation.
       return;
     }
-    const shared = readSharedCoord(storage);
-    const expectedSessionKey = shared?.sessionKey ?? machine.revokedSessionKey;
     const retainedKey = sessionKeyOf(sessionToRevoke);
     if (
       expectedSessionKey !== null &&
@@ -3460,30 +3618,83 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       return;
     }
 
+    // P1-1: Coordinate global revocation retry across tabs via pending + lease
+    // + per-attempt lock so no sibling tab can sign in concurrently and get its
+    // fresh session globally revoked by our in-flight POST /logout?scope=global (I3).
     const attemptId = nextAttemptId(storage);
     const epoch = storeEpoch;
     const targetSessionKey = retainedKey ?? machine.revokedSessionKey;
+    const pendingCoord: SharedLogoutCoord = {
+      attemptId,
+      ownerTabId: tabId,
+      state: 'pending',
+      sessionKey: targetSessionKey,
+      heartbeatAt: Date.now(),
+    };
+    const pendingWrite = writeSharedCoord(storage, pendingCoord);
+    if (pendingWrite.superseded) {
+      reconcileFromShared();
+      return;
+    }
+
     machine.activeAttemptId = attemptId;
     machine.logoutPhase = 'retrying_revocation';
+    machine.backedByStorage = readSharedCoord(storage) !== null;
     machine.status = 'signed-out';
     machine.email = null;
     emit();
 
+    const attemptLock = startAttemptLock(attemptId, tabId, epoch);
+    let heartbeatStopped = false;
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    const stopHeartbeat = () => {
+      if (heartbeatStopped) return;
+      heartbeatStopped = true;
+      activeHeartbeatStops.delete(stopHeartbeat);
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
+    activeHeartbeatStops.add(stopHeartbeat);
+    heartbeatTimer = setInterval(() => {
+      if (
+        heartbeatStopped ||
+        epoch !== storeEpoch ||
+        machine.activeAttemptId !== attemptId
+      ) {
+        stopHeartbeat();
+        return;
+      }
+      if (!refreshPendingLease(storage, pendingCoord)) {
+        stopHeartbeat();
+      }
+    }, PENDING_HEARTBEAT_INTERVAL_MS);
+
     let task: Promise<void> | null = null;
     task = (async () => {
+      let revocationOk = false;
+      let retainedSession: RetainedRevocationSession | null = sessionToRevoke;
       try {
         const revocation = await runBoundedRevocation(client, sessionToRevoke);
-        if (epoch !== storeEpoch) return;
-        commitLogoutResult(attemptId, {
-          localOk: true,
-          revocationOk: revocation.ok,
-          retainedSession: revocation.session,
-          targetSessionKey,
-        });
+        revocationOk = revocation.ok;
+        retainedSession = revocation.session;
+      } catch {
+        revocationOk = false;
       } finally {
-        if (epoch === storeEpoch && pendingRevocationPromise === task) {
-          pendingRevocationPromise = null;
+        stopHeartbeat();
+        if (epoch === storeEpoch) {
+          commitLogoutResult(attemptId, {
+            localOk: true,
+            revocationOk,
+            retainedSession,
+            targetSessionKey,
+          });
+          if (pendingRevocationPromise === task) {
+            pendingRevocationPromise = null;
+          }
         }
+        attemptLock.release();
       }
     })();
     pendingRevocationPromise = task;
@@ -3497,12 +3708,23 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
 
     const storage = deps.getStorage();
     const hasStoredSdkCreds = hasPersistedSupabaseCredentials(storage);
+    const persistedSession = readPersistedSupabaseSession(storage);
+    // P2-1: When signed out with a known revokedSessionKey, never adopt a
+    // different (newer) persisted session from storage as our logout target.
+    const matchingPersistedSession =
+      machine.session === null && machine.revokedSessionKey !== null
+        ? sessionKeyOf(persistedSession) === machine.revokedSessionKey
+          ? persistedSession
+          : null
+        : persistedSession;
     const capturedSession =
       extractRevocationSession(machine.session) ??
-      readPersistedSupabaseSession(storage) ??
+      matchingPersistedSession ??
       machine.retainedRevocationSession;
     const targetSessionKey =
-      sessionKeyOf(capturedSession) ?? machine.revokedSessionKey;
+      machine.session === null && machine.revokedSessionKey !== null
+        ? machine.revokedSessionKey
+        : (sessionKeyOf(capturedSession) ?? machine.revokedSessionKey);
 
     // P2-1: Coalesce duplicate in-tab signOut() calls for the same session on
     // direct transport so double-clicks never fire a second /logout request.
@@ -3559,6 +3781,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     signInInProgress = false;
     signInRejectedOwnSession = null;
     lastRemoteSignedIn = null;
+    knownSeqIsTabLocalOnly = false;
     activeAttemptRotatedSession = null;
     clearPendingAbandonmentWatch();
     abortInFlightRevocations();
