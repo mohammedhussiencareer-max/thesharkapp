@@ -1957,6 +1957,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         machine.logoutPhase !== 'revocation_failed' &&
         machine.logoutPhase !== 'signing_out'
       ) {
+        clearPendingAbandonmentWatch();
         machine.logoutPhase = 'idle';
       }
       emit();
@@ -1987,7 +1988,26 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
           ? compareSharedCoord(shared, machine.knownCoord)
           : 1;
 
-      if (!isSameKnownState && cmpToKnown < 0) {
+      const persistedKeyForSignedIn =
+        shared.state === 'signed_in' && shared.sessionKey !== null
+          ? sessionKeyOf(readPersistedSupabaseSession(storage))
+          : null;
+      const isFreshSignedInAfterQuotaReset =
+        !isSameKnownState &&
+        cmpToKnown < 0 &&
+        machine.activeAttemptId === null &&
+        shared.state === 'signed_in' &&
+        shared.sessionKey !== null &&
+        persistedKeyForSignedIn === shared.sessionKey &&
+        machine.knownCoord !== null &&
+        machine.knownCoord.sessionKey !== null &&
+        machine.knownCoord.sessionKey !== shared.sessionKey;
+
+      if (
+        !isSameKnownState &&
+        cmpToKnown < 0 &&
+        !isFreshSignedInAfterQuotaReset
+      ) {
         reconcileMissingDirectCredentials(storage, options?.sdkKeyRemoved);
         return;
       }
@@ -1996,6 +2016,15 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         cmpToKnown === 0 &&
         shared.state === 'pending' &&
         shared.ownerTabId !== machine.knownCoord?.ownerTabId;
+      const isTentativeInFlightPhase =
+        machine.logoutPhase === 'signing_out' ||
+        machine.logoutPhase === 'retrying_local';
+      const needsBlockingPhaseRepair =
+        machine.activeAttemptId === null &&
+        isTentativeInFlightPhase &&
+        (shared.state !== 'pending' ||
+          machine.logoutPhase === 'retrying_local' ||
+          (shared.ownerTabId !== tabId && pendingWatchedCoord === null));
       if ((isSameKnownState || cmpToKnown === 0) && !isPendingOwnerSwitch) {
         if (
           machine.activeAttemptId === shared.attemptId &&
@@ -2027,34 +2056,36 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
             return;
           }
         }
-        if (shared.state === 'pending' && shared.ownerTabId !== tabId) {
-          if (
-            pendingWatchedCoord !== null &&
-            pendingWatchedCoord.attemptId === shared.attemptId &&
-            pendingWatchedCoord.ownerTabId === shared.ownerTabId
-          ) {
+        if (!needsBlockingPhaseRepair) {
+          if (shared.state === 'pending' && shared.ownerTabId !== tabId) {
             if (
-              shared.heartbeatAt !== undefined &&
-              (pendingWatchedCoord.heartbeatAt === undefined ||
-                shared.heartbeatAt > pendingWatchedCoord.heartbeatAt)
+              pendingWatchedCoord !== null &&
+              pendingWatchedCoord.attemptId === shared.attemptId &&
+              pendingWatchedCoord.ownerTabId === shared.ownerTabId
             ) {
-              pendingWatchedCoord = {
-                ...pendingWatchedCoord,
-                heartbeatAt: shared.heartbeatAt,
-              };
-              watchedLeaseObservedAt = monotonicNow();
-            }
-            if (
-              machine.logoutPhase === 'signing_out' &&
-              effectiveLeaseRemainingMs(pendingWatchedCoord) === 0
-            ) {
-              probePendingAbandonment(pendingWatchedCoord, storeEpoch);
-              return;
+              if (
+                shared.heartbeatAt !== undefined &&
+                (pendingWatchedCoord.heartbeatAt === undefined ||
+                  shared.heartbeatAt > pendingWatchedCoord.heartbeatAt)
+              ) {
+                pendingWatchedCoord = {
+                  ...pendingWatchedCoord,
+                  heartbeatAt: shared.heartbeatAt,
+                };
+                watchedLeaseObservedAt = monotonicNow();
+              }
+              if (
+                machine.logoutPhase === 'signing_out' &&
+                effectiveLeaseRemainingMs(pendingWatchedCoord) === 0
+              ) {
+                probePendingAbandonment(pendingWatchedCoord, storeEpoch);
+                return;
+              }
             }
           }
+          reconcileMissingDirectCredentials(storage, options?.sdkKeyRemoved);
+          return;
         }
-        reconcileMissingDirectCredentials(storage, options?.sdkKeyRemoved);
-        return;
       }
 
       machine.knownCoord = shared;
@@ -2180,12 +2211,16 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       }
     }
 
-    // shared === null: either never written, cleared externally, or quota-full.
+    // shared === null: either never written, cleared externally, or deleted
+    // under quota cleanup. Whenever no local attempt is active, drop any stale
+    // knownCoord so it can never outrank a future record allocated from 1 by a
+    // fresh/reloaded tab (I1, I2, I3).
+    if (machine.activeAttemptId === null && machine.knownCoord !== null) {
+      resetKnownCoord();
+    }
     const client = deps.getClient();
-    const hasDirectCreds =
-      client !== null &&
-      hasDirectRevocationTransport(client) &&
-      hasPersistedSupabaseCredentials(storage);
+    const isDirect = client !== null && hasDirectRevocationTransport(client);
+    const hasDirectCreds = isDirect && hasPersistedSupabaseCredentials(storage);
     const persistedKeyNow = sessionKeyOf(readPersistedSupabaseSession(storage));
     const hasNewerDirectSession =
       machine.revokedSessionKey !== null &&
@@ -2194,9 +2229,16 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     if (hasNewerDirectSession && machine.logoutPhase === 'idle') {
       machine.revokedSessionKey = null;
     }
+    const unbackedLocalFailedClearedBySibling =
+      machine.logoutPhase === 'local_failed' &&
+      storage !== null &&
+      isDirect &&
+      !hasDirectCreds;
     if (
       machine.activeAttemptId === null &&
-      (machine.backedByStorage || hasNewerDirectSession) &&
+      (machine.backedByStorage ||
+        hasNewerDirectSession ||
+        unbackedLocalFailedClearedBySibling) &&
       (isBlockingLogoutPhase(machine.logoutPhase) ||
         machine.logoutPhase === 'revocation_failed') &&
       (!hasDirectCreds || hasNewerDirectSession)
@@ -2326,6 +2368,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
               sessionKey: outcome.targetSessionKey,
             });
             if (!written.superseded) {
+              clearPendingAbandonmentWatch();
               machine.logoutPhase = 'idle';
               machine.backedByStorage = false;
               machine.retainedRevocationSession = null;
@@ -2377,6 +2420,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       ) {
         cleanupDanglingPendingCoord(storage, attemptId);
         if (isPwaBlockedByLogout(machine.logoutPhase)) {
+          clearPendingAbandonmentWatch();
           machine.logoutPhase = 'idle';
           machine.backedByStorage = false;
           machine.retainedRevocationSession = null;
@@ -2482,6 +2526,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         reconcileFromShared();
         return;
       }
+      clearPendingAbandonmentWatch();
       machine.logoutPhase = 'idle';
       machine.backedByStorage = false;
       machine.retainedRevocationSession = null;
@@ -2546,6 +2591,17 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
   ): void {
     clearPendingAbandonmentWatch();
     abortInFlightRevocations();
+    const sharedNow = readSharedCoord(deps.getStorage());
+    if (sharedNow === null) {
+      resetKnownCoord();
+    } else if (
+      sharedNow.state === 'signed_in' &&
+      machine.knownCoord !== null &&
+      compareSharedCoord(sharedNow, machine.knownCoord) < 0
+    ) {
+      resetKnownCoord();
+      recordKnownCoord(sharedNow);
+    }
     machine.logoutPhase = 'idle';
     machine.activeAttemptId = null;
     machine.backedByStorage = false;
@@ -2781,6 +2837,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
             shared.state === 'completed' ||
             shared.state === 'signed_in'
           ) {
+            clearPendingAbandonmentWatch();
             machine.logoutPhase = 'idle';
             machine.backedByStorage = false;
             // DELTA10-P2-3: Preserve revokedSessionKey unless a signed_in coord
@@ -3130,6 +3187,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         machine.logoutPhase === 'signing_out' ||
         machine.logoutPhase === 'retrying_local'
       ) {
+        clearPendingAbandonmentWatch();
         machine.logoutPhase = 'idle';
         machine.backedByStorage = false;
         machine.retainedRevocationSession = null;
@@ -3205,6 +3263,16 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         activeSignOutTargetKey = null;
       }
       safeReconcile();
+      if (
+        machine.activeAttemptId === null &&
+        isBlockingLogoutPhase(machine.logoutPhase) &&
+        readSharedCoord(storage)?.state !== 'pending'
+      ) {
+        clearPendingAbandonmentWatch();
+        machine.logoutPhase = 'idle';
+        machine.backedByStorage = false;
+        safeEmit();
+      }
       resolveTask();
       return;
     }
@@ -3672,6 +3740,16 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
 
     const storage = deps.getStorage();
     const hasStoredSdkCreds = hasPersistedSupabaseCredentials(storage);
+    if (
+      machine.session === null &&
+      !hasStoredSdkCreds &&
+      machine.logoutPhase === 'idle' &&
+      (machine.knownCoord?.state === 'completed' ||
+        (hasDirectRevocationTransport(client) &&
+          machine.knownCoord?.state === 'signed_in'))
+    ) {
+      return;
+    }
     const persistedSession = readPersistedSupabaseSession(storage);
     const persistedKeyNow = sessionKeyOf(persistedSession);
     const clearStaleBlockForNewerSession = (): void => {

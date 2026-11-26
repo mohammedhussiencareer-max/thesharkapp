@@ -1267,4 +1267,49 @@ describe('production GoTrueClient UI integration (hasDirectRevocationTransport =
       view.unmount();
     }
   });
+
+  it('DELTA14-P2-4: LoginPage local_failed banner instructs the owner to retry or close all tabs while keeping login disabled (I1)', async () => {
+    const { AuthContext } = await import('@/lib/auth-context');
+    const { LoginPage } = await import('@/pages/LoginPage');
+    const signOutMock = vi.fn(async () => {});
+
+    const view = render(
+      <MemoryRouter initialEntries={['/login']}>
+        <AuthContext.Provider
+          value={{
+            status: 'signed-out',
+            email: null,
+            logoutPending: false,
+            logoutFailed: true,
+            logoutRevocationFailed: false,
+            canRetryLogoutRevocation: false,
+            signIn: vi.fn(() => Promise.resolve('failed' as const)),
+            signOut: signOutMock,
+            retryLogoutRevocation: vi.fn(() => Promise.resolve()),
+            retry: vi.fn(),
+          }}
+        >
+          <LoginPage />
+        </AuthContext.Provider>
+      </MemoryRouter>,
+    );
+
+    try {
+      const alert = screen.getByRole('alert');
+      expect(alert).toHaveTextContent(
+        'تعذر إنهاء تسجيل الخروج على هذا الجهاز — أعد المحاولة أو أغلق كل التبويبات',
+      );
+      expect(
+        screen.getByRole('button', { name: 'تسجيل الدخول' }),
+      ).toBeDisabled();
+      const retryLogoutBtn = screen.getByRole('button', {
+        name: 'إعادة محاولة تسجيل الخروج',
+      });
+      expect(retryLogoutBtn).toBeEnabled();
+      fireEvent.click(retryLogoutBtn);
+      expect(signOutMock).toHaveBeenCalledTimes(1);
+    } finally {
+      view.unmount();
+    }
+  });
 });

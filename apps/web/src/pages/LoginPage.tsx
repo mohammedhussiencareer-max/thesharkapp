@@ -65,7 +65,10 @@ export function LoginPage() {
           role="alert"
           className="flex flex-col gap-2 rounded border border-red-300 bg-red-50 p-3 text-sm"
         >
-          <p>تعذر إنهاء تسجيل الخروج على هذا الجهاز — أعد المحاولة</p>
+          <p>
+            تعذر إنهاء تسجيل الخروج على هذا الجهاز — أعد المحاولة أو أغلق كل
+            التبويبات
+          </p>
           <button
             className="w-fit rounded bg-neutral-900 px-3 py-2 text-white disabled:opacity-60"
             type="button"
