@@ -10,6 +10,7 @@ import { expect, test } from './fixtures';
 import { assertLocalSupabaseUrl } from './local-guard';
 
 test.use({
+  loopbackGuardMode: 'proxy',
   viewport: { width: 390, height: 844 },
   serviceWorkers: 'block',
 });

@@ -109,6 +109,16 @@ describe('PWA Vite configuration', () => {
     );
   });
 
+  it('runs the mobile browser smoke spec behind the loopback-only proxy', () => {
+    const mobileSpec = readFileSync(
+      resolve(import.meta.dirname, '../../e2e/mobile-pwa.spec.ts'),
+      'utf8',
+    );
+    expect(mobileSpec).toMatch(
+      /test\.use\(\{(?:[^{}]|\{[^{}]*\})*?\bloopbackGuardMode:\s*'proxy'/,
+    );
+  });
+
   it('builds the desktop Tauri frontend with VITE_PWA=0 and keeps detectSessionInUrl false', () => {
     const tauriConf = JSON.parse(
       readFileSync(

@@ -127,6 +127,13 @@ export type ClaimHeldWriteResult<T> =
       existing?: HeldWriteRecord;
     };
 
+type VerifySibling = (requestId: string) => Promise<'absent' | 'verified'>;
+type NotifyVerifiedCountSibling = (
+  record: HeldWriteRecord,
+  lockReleased: Promise<void>,
+) => void;
+type ClaimFailure = Extract<ClaimHeldWriteResult<unknown>, { ok: false }>;
+
 export type PostedReloadSnapshotItem = {
   subject: string;
   requestId: string;
@@ -562,13 +569,17 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     lockName: string,
     wait = false,
   ): Promise<
-    | { acquired: true; release: () => void }
+    | { acquired: true; release: () => void; released: Promise<void> }
     | { acquired: false; reason: 'locked' | 'unavailable'; release: () => void }
   > {
     const locks = getLocks();
     if (!locks) {
       if (allowTestUnlocked) {
-        return { acquired: true, release: () => {} };
+        return {
+          acquired: true,
+          release: () => {},
+          released: Promise.resolve(),
+        };
       }
       // Fail closed for durable claims when Web Locks are unavailable so two
       // tabs cannot race on non-atomic localStorage reads and writes.
@@ -578,6 +589,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       return { acquired: false, reason: 'locked', release: () => {} };
     }
     let releaseFn: () => void = () => {};
+    let released = Promise.resolve();
     let acquired: boolean;
     try {
       acquired = await new Promise<boolean>((resolve) => {
@@ -588,7 +600,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
             resolve(value);
           }
         };
-        void Promise.resolve(
+        released = Promise.resolve(
           locks.request(
             lockName,
             { mode: 'exclusive', ...(wait ? {} : { ifAvailable: true }) },
@@ -627,15 +639,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
               });
             },
           ),
-        ).catch(() => {
-          finish(false);
-        });
+        ).then(
+          () => {},
+          () => finish(false),
+        );
       });
     } catch {
       acquired = false;
     }
     return acquired
-      ? { acquired: true, release: releaseFn }
+      ? { acquired: true, release: releaseFn, released }
       : { acquired: false, reason: 'locked', release: () => {} };
   }
 
@@ -1555,10 +1568,13 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
   function readBlockingWrite(
     subject: string,
     userId: string,
-    options: { readTarget?: string; ownerId?: string } & (
-      | { mode: 'fresh' }
-      | { mode: 'replay'; unresolvedSiblings: HeldWriteRecord[] }
-    ),
+    options: {
+      mode: 'fresh' | 'replay';
+      readTarget?: string;
+      ownerId?: string;
+      requestId?: string;
+      unresolvedSiblings: HeldWriteRecord[];
+    },
   ): HeldWriteRecord | null {
     const { readTarget, ownerId } = options;
     const expense = isExpenseSubject(subject);
@@ -1600,6 +1616,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         continue;
       }
       if (record.phase !== 'posted_reload') {
+        // An interrupted count can already be posted if quota blocked its
+        // marker. Leave waiting_for_sync alone and allow exact-ID alias recovery.
+        if (
+          count &&
+          record.subject !== subject &&
+          record.requestId !== options.requestId &&
+          (record.phase === 'inflight' || record.phase === 'unknown')
+        ) {
+          options.unresolvedSiblings.push(record);
+        }
         // A quota failure can leave a confirmed expense indistinguishable
         // from an interrupted one, even after hydration promotes it. Its
         // submitted month may differ from the month stored for that ID.
@@ -1648,6 +1674,61 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     emit();
   }
 
+  async function verifyHeldSiblings(
+    siblings: HeldWriteRecord[],
+    verify: VerifySibling | undefined,
+    session: WriteSession,
+    projectUrl: string,
+    countResolution: {
+      notify?: NotifyVerifiedCountSibling;
+      lockReleased: Promise<void>;
+    },
+  ): Promise<ClaimFailure | null> {
+    const clearVerified = (record: HeldWriteRecord) => {
+      if (clearHeldWrite(record.subject, record.requestId, record, session)) {
+        countResolution.notify?.(record, countResolution.lockReleased);
+      }
+    };
+    const verified = new Set<string>();
+    for (const sibling of siblings) {
+      if (verified.has(sibling.requestId)) continue;
+      let proof: 'absent' | 'verified' | undefined;
+      try {
+        proof = await verify?.(sibling.requestId);
+      } catch {
+        // A failed read gives no proof that the sibling is safe to pass.
+      }
+      if (!canDispatchWriteFor(session) || getProjectUrl() !== projectUrl) {
+        return { ok: false, reason: 'session_invalid' };
+      }
+      if (proof !== 'absent' && proof !== 'verified') {
+        observeBlockingWrite(sibling, session.userId);
+        return { ok: false, reason: 'conflict', existing: sibling };
+      }
+      if (proof === 'verified') {
+        try {
+          clearVerified(sibling);
+          const alias = countAliasSubject(sibling.subject, sibling.requestId);
+          if (alias) {
+            const record = readLockedHeldWrite(alias);
+            if (
+              record?.requestId === sibling.requestId &&
+              isUnresolvedPhase(record.phase)
+            ) {
+              clearVerified(record);
+            }
+            verified.add(sibling.requestId);
+          }
+        } catch {
+          return { ok: false, reason: 'storage' };
+        }
+      }
+    }
+    return canDispatchWriteFor(session) && getProjectUrl() === projectUrl
+      ? null
+      : { ok: false, reason: 'session_invalid' };
+  }
+
   /**
    * Atomically claim a fresh write on `subject` under its Web Lock. Rechecks
    * the write session, connectivity and applicable pins before persisting
@@ -1662,6 +1743,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       readTarget?: string;
       /** A new operation may proceed while this tab verifies its own earlier posts. */
       allowOwnPostedReloads?: boolean;
+      verifyCountSibling?: VerifySibling;
+      onCountSiblingVerified?: NotifyVerifiedCountSibling;
       session?: WriteSession | null;
       checkConflict?: () => HeldWriteRecord | null;
     },
@@ -1676,8 +1759,11 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       return { ok: false, reason: 'session_invalid' };
     }
     const userId = session.userId;
-    const key = entryStorageKey(subject, userId);
-    const lock = await acquireSubjectLock(subjectLockKey(subject, userId));
+    const projectUrl = getProjectUrl();
+    const key = entryStorageKey(subject, userId, projectUrl);
+    const lock = await acquireSubjectLock(
+      subjectLockKey(subject, userId, projectUrl),
+    );
     if (!lock.acquired) {
       return {
         ok: false,
@@ -1686,7 +1772,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     }
     let handedOff = false;
     try {
-      if (!canDispatchWriteFor(session)) {
+      if (!canDispatchWriteFor(session) || getProjectUrl() !== projectUrl) {
         return { ok: false, reason: 'session_invalid' };
       }
       try {
@@ -1708,6 +1794,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       if (read.value !== null && (!stored || stored.subject !== subject)) {
         return { ok: false, reason: 'storage' };
       }
+      const unresolvedSiblings: HeldWriteRecord[] = [];
       try {
         const requestedPosted =
           opts?.requestId === undefined
@@ -1729,6 +1816,8 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
             mode: 'fresh',
             readTarget: opts?.readTarget,
             ownerId,
+            requestId: opts?.requestId,
+            unresolvedSiblings,
           });
         if (blocking) {
           observeBlockingWrite(blocking, userId);
@@ -1772,6 +1861,23 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         if (isUnresolvedPhase(stored.phase)) records.set(subject, preserved);
         emit();
         return { ok: false, reason: 'conflict', existing: preserved };
+      }
+      if (unresolvedSiblings.length > 0) {
+        const failure = await verifyHeldSiblings(
+          unresolvedSiblings,
+          opts?.verifyCountSibling,
+          session,
+          projectUrl,
+          { notify: opts?.onCountSiblingVerified, lockReleased: lock.released },
+        );
+        if (failure) return failure;
+        try {
+          const current = readDurableRecord(key);
+          if (current)
+            return { ok: false, reason: 'conflict', existing: current };
+        } catch {
+          return { ok: false, reason: 'storage' };
+        }
       }
       const requestId = opts?.requestId ?? crypto.randomUUID();
       const claimId = crypto.randomUUID();
@@ -1817,9 +1923,9 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
       /** Expense month derived under lock from the payload that will be sent. */
       readTarget?: (payload: T) => string | undefined;
       /** Read-only proof for the exact sibling ID, including its month if posted. */
-      verifyExpenseSibling?: (
-        requestId: string,
-      ) => Promise<'absent' | 'verified'>;
+      verifyExpenseSibling?: VerifySibling;
+      verifyCountSibling?: VerifySibling;
+      onCountSiblingVerified?: NotifyVerifiedCountSibling;
       awaitingReviewReload?: boolean;
       session?: WriteSession | null;
       checkConflict?: () => HeldWriteRecord | null;
@@ -1931,6 +2037,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
                 readTarget: opts?.readTarget?.(
                   opts.payload ?? (stored.payload as T),
                 ),
+                requestId,
                 unresolvedSiblings,
               })
             : null);
@@ -1966,36 +2073,16 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
         return { ok: false, reason: 'conflict', existing: preserved };
       }
       if (unresolvedSiblings.length > 0) {
-        for (const sibling of unresolvedSiblings) {
-          let proof: 'absent' | 'verified' | undefined;
-          try {
-            proof = await opts?.verifyExpenseSibling?.(sibling.requestId);
-          } catch {
-            // A failed read gives no proof that the sibling is safe to pass.
-          }
-          if (!canDispatchWriteFor(session) || getProjectUrl() !== projectUrl) {
-            return { ok: false, reason: 'session_invalid' };
-          }
-          if (proof !== 'absent' && proof !== 'verified') {
-            observeBlockingWrite(sibling, userId);
-            return { ok: false, reason: 'conflict', existing: sibling };
-          }
-          if (proof === 'verified') {
-            try {
-              clearHeldWrite(
-                sibling.subject,
-                sibling.requestId,
-                sibling,
-                session,
-              );
-            } catch {
-              return { ok: false, reason: 'storage' };
-            }
-          }
-        }
-        if (!canDispatchWriteFor(session) || getProjectUrl() !== projectUrl) {
-          return { ok: false, reason: 'session_invalid' };
-        }
+        const failure = await verifyHeldSiblings(
+          unresolvedSiblings,
+          isCountSubject(subject)
+            ? opts?.verifyCountSibling
+            : opts?.verifyExpenseSibling,
+          session,
+          projectUrl,
+          { notify: opts?.onCountSiblingVerified, lockReleased: lock.released },
+        );
+        if (failure) return failure;
         try {
           const current = readDurableRecord(key);
           if (!current || !sameClaim(current, stored)) {
@@ -2604,20 +2691,20 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     requestId?: string,
     expected?: HeldWriteRecord,
     session?: WriteSession | null,
-  ): void {
+  ): boolean {
     ensureHydrated();
     const userId = activeUserId();
-    if (userId === null) return;
-    if (session !== undefined && !isCurrentWriteSession(session)) return;
+    if (userId === null) return false;
+    if (session !== undefined && !isCurrentWriteSession(session)) return false;
     const captured = expected ?? records.get(subject);
     if (
       !captured ||
       (requestId !== undefined && captured.requestId !== requestId) ||
       isClaimSessionStale(captured)
     )
-      return;
+      return false;
     const stored = readLockedHeldWrite(subject);
-    if (stored && !sameClaim(stored, captured)) return;
+    if (stored && !sameClaim(stored, captured)) return false;
     if (stored) removeDurableRecord(entryStorageKey(subject, userId));
     const current = records.get(subject);
     const waitAck = acknowledgedWait.get(subject);
@@ -2637,6 +2724,7 @@ export function createHeldWriteStore(options: HeldWriteStoreOptions = {}) {
     if (ack && sameAcknowledgedClaim(captured, ack.record))
       acknowledgedInflight.delete(subject);
     emit();
+    return true;
   }
 
   async function clearVerifiedHeldWrite(

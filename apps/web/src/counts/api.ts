@@ -223,6 +223,28 @@ export async function listCounts(): Promise<CountRecord[]> {
   });
 }
 
+/** An exact request can be absent or confirmed in history. Failed reads throw. */
+export async function verifyCountSibling(
+  requestId: string,
+): Promise<'absent' | 'verified'> {
+  const db = appDb();
+  const { data: count, error: lookupError } = await db
+    .from('stock_counts')
+    .select('id')
+    .eq('request_id', requestId)
+    .maybeSingle();
+  throwIfError(lookupError);
+  if (!count) return 'absent';
+  const { data: history, error: historyError } = await db
+    .from('stock_count_history')
+    .select('id')
+    .eq('id', count.id)
+    .maybeSingle();
+  throwIfError(historyError);
+  if (!history) throw new Error(genericCountError);
+  return 'verified';
+}
+
 function countPayload(draft: CountDraft): Json {
   return {
     request_id: draft.requestId,

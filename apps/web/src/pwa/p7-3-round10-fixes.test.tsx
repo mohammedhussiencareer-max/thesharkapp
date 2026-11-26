@@ -2572,7 +2572,13 @@ describe('P7-3 round-10 review fixes', () => {
       const dailyClaim = await tab1.claimFreshHeldWrite(
         COUNT_DAILY_SUBJECT,
         (requestId) => ({ requestId }),
-        { kind: 'count' },
+        {
+          kind: 'count',
+          verifyCountSibling: (requestId) => {
+            expect(requestId).toBe('req-abandoned-r15');
+            return Promise.resolve('absent' as const);
+          },
+        },
       );
       if (!dailyClaim.ok) throw new Error('expected daily claim');
       releaseDaily = dailyClaim.release;

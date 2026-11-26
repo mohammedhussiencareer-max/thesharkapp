@@ -9,6 +9,7 @@ import {
   listPendingCounts,
   recordCount,
   recordStoredCount,
+  verifyCountSibling,
 } from '@/counts/api';
 import {
   genericCountError,
@@ -397,6 +398,42 @@ export function CountsPage() {
     return mapCountError(error);
   }
 
+  function trackSiblingVerification(session: WriteSession | null) {
+    let lockReleased: Promise<void> | undefined;
+    function takeVerifiedSiblingRelease() {
+      const release = lockReleased;
+      lockReleased = undefined;
+      return release;
+    }
+    return {
+      claimOptions: {
+        verifyCountSibling: (requestId: string) =>
+          verifyCountSibling(requestId),
+        onCountSiblingVerified(
+          record: HeldWriteRecord,
+          released: Promise<void>,
+        ) {
+          lockReleased = released;
+          if (!mountedRef.current || !isCurrentWriteSession(session)) return;
+          if (record.subject === COUNT_DAILY_SUBJECT) {
+            setRequestKey((key) => key + 1);
+            setServerError(null);
+          }
+          setWaitNotice((current) =>
+            current === record.requestId ? null : current,
+          );
+        },
+      },
+      takeVerifiedSiblingRelease,
+      async reloadIfNeeded() {
+        const release = takeVerifiedSiblingRelease();
+        if (!release) return;
+        await release;
+        await handleRef.current?.reloadPosted(session);
+      },
+    };
+  }
+
   async function refreshAfterWait(
     session: WriteSession | null,
     noticeRequestId: string | null = null,
@@ -546,6 +583,7 @@ export function CountsPage() {
     release: () => void,
     session: WriteSession | null,
     postedSeq: number | null,
+    takeVerifiedSiblingRelease: () => Promise<void> | undefined,
   ): Promise<boolean> {
     if (!isCurrentWriteSession(session)) {
       release();
@@ -588,6 +626,7 @@ export function CountsPage() {
         setSuccess(null);
       }
       release();
+      await takeVerifiedSiblingRelease();
       await refreshAfterWait(session, noticeRequestId);
       return false;
     }
@@ -601,6 +640,7 @@ export function CountsPage() {
     );
     // The readback may cover pins owned by other count writers.
     release();
+    await takeVerifiedSiblingRelease();
     await reloadPostedCounts(session, {
       fromPosted: true,
       requestId,
@@ -696,6 +736,7 @@ export function CountsPage() {
   async function handleSubmit(draft: CountDraft) {
     if (busy || loadsRef.current > 0 || !isOnline()) return;
     const session = captureWriteSession();
+    const siblingVerification = trackSiblingVerification(session);
     const prior = getHeldWrite<CountDraft>(COUNT_DAILY_SUBJECT);
     const priorPhase =
       prior !== null &&
@@ -742,7 +783,11 @@ export function CountsPage() {
         ? await claimReplayHeldWrite<CountDraft>(
             COUNT_DAILY_SUBJECT,
             draft.requestId,
-            { session, checkConflict },
+            {
+              session,
+              checkConflict,
+              ...siblingVerification.claimOptions,
+            },
           )
         : await claimFreshHeldWrite<CountDraft>(
             COUNT_DAILY_SUBJECT,
@@ -752,6 +797,7 @@ export function CountsPage() {
               kind: 'count',
               session,
               checkConflict,
+              ...siblingVerification.claimOptions,
             },
           );
     if (!claim.ok) {
@@ -761,6 +807,7 @@ export function CountsPage() {
       ) {
         setLocalNeedsReload(true);
         try {
+          await siblingVerification.takeVerifiedSiblingRelease();
           await reloadPostedCounts(session, {
             requestId: claim.existing.requestId,
           });
@@ -769,9 +816,16 @@ export function CountsPage() {
         }
       } else if (claim.reason === 'storage' || claim.reason === 'missing') {
         setServerError(storageWriteFailedMessage);
+      } else if (
+        claim.reason === 'conflict' &&
+        claim.existing &&
+        claim.existing.requestId !== draft.requestId
+      ) {
+        setServerError(genericCountError);
       } else if (claim.reason === 'session_invalid' && !isOnline()) {
         setServerError(offlineWriteMessage);
       }
+      await siblingVerification.reloadIfNeeded();
       return;
     }
     if (!canDispatchHeldWrite(COUNT_DAILY_SUBJECT, draft.requestId, session)) {
@@ -784,6 +838,7 @@ export function CountsPage() {
       );
       if (!durable) setServerError(storageWriteFailedMessage);
       else if (!isOnline()) setServerError(offlineWriteMessage);
+      await siblingVerification.reloadIfNeeded();
       return;
     }
     setSaving(true);
@@ -809,6 +864,7 @@ export function CountsPage() {
         claim.release,
         session,
         postedSeq,
+        siblingVerification.takeVerifiedSiblingRelease,
       );
     } catch (error) {
       if (!isCurrentWriteSession(session)) return;
@@ -833,6 +889,7 @@ export function CountsPage() {
       }
     } finally {
       claim.release();
+      await siblingVerification.reloadIfNeeded();
       if (mountedRef.current) setSaving(false);
     }
   }
@@ -841,6 +898,7 @@ export function CountsPage() {
     if (busy || loadsRef.current > 0 || !isOnline()) return;
     const requestId = requestIdOf(payload);
     const session = captureWriteSession();
+    const siblingVerification = trackSiblingVerification(session);
     const storedSubject =
       requestId !== null ? `${COUNT_STORED_PREFIX}${requestId}` : null;
     let releaseLock = () => {};
@@ -888,12 +946,14 @@ export function CountsPage() {
           ? await claimReplayHeldWrite<Json>(storedSubject, requestId, {
               session,
               checkConflict,
+              ...siblingVerification.claimOptions,
             })
           : await claimFreshHeldWrite<Json>(storedSubject, () => payload, {
               requestId,
               kind: 'count_stored',
               session,
               checkConflict,
+              ...siblingVerification.claimOptions,
             });
       if (!claim.ok) {
         if (
@@ -902,6 +962,7 @@ export function CountsPage() {
         ) {
           setLocalNeedsReload(true);
           try {
+            await siblingVerification.takeVerifiedSiblingRelease();
             await reloadPostedCounts(session, {
               requestId: claim.existing.requestId,
             });
@@ -910,9 +971,16 @@ export function CountsPage() {
           }
         } else if (claim.reason === 'storage' || claim.reason === 'missing') {
           setCardError(storageWriteFailedMessage);
+        } else if (
+          claim.reason === 'conflict' &&
+          claim.existing &&
+          claim.existing.requestId !== requestId
+        ) {
+          setCardError(genericCountError);
         } else if (claim.reason === 'session_invalid' && !isOnline()) {
           setCardError(offlineWriteMessage);
         }
+        await siblingVerification.reloadIfNeeded();
         return;
       }
       releaseLock = claim.release;
@@ -939,6 +1007,7 @@ export function CountsPage() {
       }
       if (!durable) setCardError(storageWriteFailedMessage);
       else if (!isOnline()) setCardError(offlineWriteMessage);
+      await siblingVerification.reloadIfNeeded();
       return;
     }
     const daily = matchingDaily.record;
@@ -966,6 +1035,7 @@ export function CountsPage() {
         releaseLock,
         session,
         postedSeq,
+        siblingVerification.takeVerifiedSiblingRelease,
       );
     } catch (error) {
       if (!isCurrentWriteSession(session)) return;
@@ -1013,6 +1083,7 @@ export function CountsPage() {
       }
     } finally {
       releaseLock();
+      await siblingVerification.reloadIfNeeded();
       if (mountedRef.current) setSaving(false);
     }
   }
