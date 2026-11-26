@@ -1337,7 +1337,13 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       activeAttemptRotatedSession = null;
     }
 
-    const currentClient = activeClient ?? deps.getClient();
+    // Do not lazily instantiate GoTrueClient while committing `local_failed`:
+    // if storage still holds a blocked expired session, constructing the client
+    // would schedule `_emitInitialSession` -> `__loadSession` -> token refresh
+    // (DELTA OT-3 P3).
+    const currentClient = effectiveLocalOk
+      ? (activeClient ?? deps.getClient())
+      : activeClient;
     if (
       effectiveLocalOk &&
       storage !== null &&
@@ -1966,7 +1972,8 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
   }
 
   async function executeSignOutAttempt(params: {
-    client: NonNullable<typeof supabase>;
+    client: NonNullable<typeof supabase> | null;
+    getClient?: () => typeof supabase;
     storage: Storage | null;
     capturedSession: RetainedRevocationSession | null;
     targetSessionKey: string | null;
@@ -1976,7 +1983,8 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
   }): Promise<void> {
     if (!active) return;
     const {
-      client,
+      client: initialClient,
+      getClient = () => activeClient ?? deps.getClient(),
       storage,
       capturedSession,
       targetSessionKey,
@@ -2025,7 +2033,9 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       machine.retainedRevocationSession = capturedSession;
     }
     lockSessionForSignOut({ clearResolvedPins });
-    stopClientAutoRefresh(client);
+    if (initialClient) {
+      stopClientAutoRefresh(initialClient);
+    }
     machine.status = 'signed-out';
     machine.email = null;
     safeEmit();
@@ -2108,8 +2118,12 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       machine.retainedRevocationSession = sessionForRevocation;
     }
 
-    // 3. Synchronously remove (or tombstone) sdkKey on direct-transport clients.
-    const isDirect = hasDirectRevocationTransport(client);
+    // 3. Synchronously remove (or tombstone) sdkKey BEFORE instantiating a
+    //    deferred GoTrueClient (DELTA OT-3 P3) or running direct-transport
+    //    global revocation.
+    const deferredClientMode = initialClient === null;
+    const isDirect =
+      deferredClientMode || hasDirectRevocationTransport(initialClient);
     let localOk = false;
     if (isDirect) {
       if (storage) {
@@ -2159,13 +2173,35 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       }
     }
 
+    // Now that local credentials have been removed/tombstoned, resolve the
+    // lazy client if it was deferred so Step 4 can dispatch global /logout.
+    const client = initialClient ?? getClient();
+    if (!client) {
+      if (epoch === storeEpoch && active) {
+        commitSafe({
+          localOk,
+          revocationOk: false,
+          retainedSession: sessionForRevocation,
+          targetSessionKey,
+        });
+        if (pendingSignOutPromise === task) {
+          pendingSignOutPromise = null;
+          activeSignOutTargetKey = null;
+        }
+      }
+      resolveTask();
+      return;
+    }
+    const clientIsDirect = hasDirectRevocationTransport(client);
+    stopClientAutoRefresh(client);
+
     // 4. Run bounded 10 s global revocation (or mock client signOut).
     void (async () => {
       let revocationOk = false;
       let retainedSession: RetainedRevocationSession | null =
         sessionForRevocation;
       try {
-        if (isDirect) {
+        if (clientIsDirect) {
           if (sessionForRevocation) {
             const revocation = await runBoundedRevocation(
               client,
@@ -2177,7 +2213,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         } else {
           const auth = client.auth as unknown as AuthClientInternals;
           const canUseAdminRevocation =
-            persistResult.removedLocalCredentials &&
+            (persistResult.removedLocalCredentials || deferredClientMode) &&
             typeof auth.admin?.signOut === 'function' &&
             sessionForRevocation !== null;
 
@@ -2486,12 +2522,28 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
 
   async function signOut(): Promise<void> {
     if (!active) return;
-    const client = activeClient ?? deps.getClient();
-    if (!client) return;
 
     const storage = deps.getStorage();
-    const isDirect = hasDirectRevocationTransport(client);
     const hasStoredSdkCreds = hasPersistedSupabaseCredentials(storage);
+    // DELTA OT-3 P3: After a cold boot/takeover into `local_failed` (where
+    // startAuth deliberately left GoTrueClient uninstantiated), do not touch
+    // `deps.getClient()` / `client.auth` before removing/tombstoning `sdkKey`,
+    // or the lazy proxy will construct GoTrueClient and fire a refresh for the
+    // blocked expired session when storage still refuses erase.
+    const deferClientInstantiation =
+      activeClient === null &&
+      (machine.logoutPhase === 'local_failed' ||
+        machine.logoutPhase === 'retrying_local') &&
+      hasStoredSdkCreds;
+
+    let client: NonNullable<typeof supabase> | null = null;
+    if (!deferClientInstantiation) {
+      client = activeClient ?? deps.getClient();
+      if (!client) return;
+    }
+
+    const isDirect =
+      deferClientInstantiation || hasDirectRevocationTransport(client!);
     const persistedSession = readPersistedSupabaseSession(storage);
     const persistedKeyNow = sessionKeyOf(persistedSession);
 
@@ -2580,6 +2632,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       machine.logoutPhase === 'revocation_failed';
     await executeSignOutAttempt({
       client,
+      getClient: () => activeClient ?? deps.getClient(),
       storage,
       capturedSession,
       targetSessionKey,

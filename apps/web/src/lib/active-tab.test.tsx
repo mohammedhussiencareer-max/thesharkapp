@@ -1743,4 +1743,190 @@ describe('I6 real createClient path and takeover during auth operations', () => 
       vi.useRealTimers();
     }
   });
+
+  it('DELTA-OT3 P3: signOut retry from cold local_failed boot does not instantiate GoTrueClient or fetch while storage still blocks erase, then instantiates client and runs global /logout once storage recovers', async () => {
+    const url = 'https://delta-ot3-p3.example.test';
+    const anonKey = 'anon-key-delta-ot3-p3';
+    const sdkKey = 'sb-delta-ot3-p3-auth-token';
+    const recordKey = getLogoutCoordStorageKey(url);
+
+    const expiredSession = {
+      ...makeSession('sid-ot3-p3-expired'),
+      expires_at: Math.floor(Date.now() / 1000) - 60,
+    };
+    const refreshedSession = makeSession('sid-ot3-p3-expired');
+    const freshSignInSession = makeSession('sid-ot3-p3-fresh');
+
+    const backing = new Map<string, string>();
+    const events: string[] = [];
+    let blockSdkErase = true;
+    const storage: Storage = {
+      get length() {
+        return backing.size;
+      },
+      clear: () => backing.clear(),
+      getItem: (k) => backing.get(k) ?? null,
+      key: (i) => [...backing.keys()][i] ?? null,
+      removeItem: (k) => {
+        if (blockSdkErase && k === sdkKey) {
+          throw new DOMException('Blocked remove', 'QuotaExceededError');
+        }
+        if (k === sdkKey) events.push('remove:sdkKey');
+        backing.delete(k);
+      },
+      setItem: (k, v) => {
+        const str = String(v);
+        if (blockSdkErase && k === sdkKey) {
+          throw new DOMException('Blocked tombstone', 'QuotaExceededError');
+        }
+        if (k === recordKey) {
+          const parsed = JSON.parse(str) as { state?: string };
+          events.push(`record:${parsed.state ?? 'unknown'}`);
+        }
+        backing.set(k, str);
+      },
+    };
+
+    const fetchCalls: string[] = [];
+    let logoutBearer: string | null = null;
+    const rawFetch: typeof fetch = (input, init) => {
+      const href = requestUrlOf(input);
+      fetchCalls.push(href);
+      if (href.includes('/auth/v1/token?grant_type=refresh_token')) {
+        events.push('fetch:refresh');
+        return Promise.resolve(
+          new Response(JSON.stringify(refreshedSession), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/logout?scope=global')) {
+        events.push('fetch:logout');
+        const headers = new Headers(
+          init?.headers ??
+            (input instanceof Request ? input.headers : undefined),
+        );
+        logoutBearer = headers.get('Authorization');
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      if (href.includes('/auth/v1/token?grant_type=password')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(freshSignInSession), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    backing.set(sdkKey, JSON.stringify(expiredSession));
+    backing.set(
+      recordKey,
+      JSON.stringify({
+        attemptId: 1,
+        state: 'local_failed',
+        sessionKey: 'sid:sid-ot3-p3-expired',
+      }),
+    );
+
+    const managed = createManagedSupabaseClient({
+      url,
+      anonKey,
+      storageKey: sdkKey,
+      getStorage: () => storage,
+      getFetch: () => rawFetch,
+    });
+    const store = createAuthStore({
+      getClient: () => {
+        events.push('client:get');
+        return managed.getClient();
+      },
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      storageKey: sdkKey,
+      syncGlobalStores: false,
+    });
+
+    try {
+      // 1. Cold boot into local_failed -> client stays uninstantiated, zero fetches.
+      store.startAuth();
+      expect(store.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'local_failed',
+        logoutFailed: true,
+      });
+      expect(store.isAuthResolved()).toBe(false);
+      expect(managed.hasInstantiatedClient()).toBe(false);
+      expect(fetchCalls).toEqual([]);
+
+      // 2. Owner clicks retry while storage STILL refuses removeItem and '' tombstone.
+      //    Must NOT instantiate GoTrueClient or fire any fetch (fails on f86ecd1!).
+      await store.signOut();
+      await new Promise((r) => setTimeout(r, 25));
+
+      expect(managed.hasInstantiatedClient()).toBe(false);
+      expect(fetchCalls).toEqual([]);
+      expect(store.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'local_failed',
+        logoutFailed: true,
+        logoutPending: false,
+      });
+      expect(store.isAuthResolved()).toBe(false);
+      expect(backing.has(sdkKey)).toBe(true);
+      expect(JSON.parse(backing.get(recordKey) ?? 'null')).toMatchObject({
+        state: 'local_failed',
+      });
+
+      // 3. Storage recovers -> owner clicks retry again.
+      //    Order invariant: durable pending -> remove sdkKey -> instantiate client ->
+      //    in-memory refresh of captured expired token -> global /logout?scope=global!
+      events.length = 0;
+      blockSdkErase = false;
+      await store.signOut();
+
+      expect(managed.hasInstantiatedClient()).toBe(true);
+      expect(backing.get(sdkKey)).toBeUndefined();
+      expect(backing.get(recordKey)).toBeUndefined();
+      expect(logoutBearer).toBe(`Bearer ${refreshedSession.access_token}`);
+      expect(events.indexOf('record:pending')).toBeGreaterThanOrEqual(0);
+      expect(events.indexOf('remove:sdkKey')).toBeGreaterThan(
+        events.indexOf('record:pending'),
+      );
+      expect(events.indexOf('client:get')).toBeGreaterThan(
+        events.indexOf('remove:sdkKey'),
+      );
+      expect(events.indexOf('fetch:logout')).toBeGreaterThan(
+        events.indexOf('client:get'),
+      );
+      expect(store.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'idle',
+        logoutFailed: false,
+        logoutRevocationFailed: false,
+      });
+      expect(store.isAuthResolved()).toBe(true);
+
+      // 4. Subsequent sign-in works cleanly after deferred client subscription.
+      expect(await store.signIn('owner@example.test', 'ValidPassword123')).toBe(
+        'ok',
+      );
+      await vi.waitFor(() => {
+        expect(store.getAuthSnapshot().status).toBe('owner');
+      });
+    } finally {
+      store.resetAuthStore({ clearStorage: false });
+      managed.deactivate();
+    }
+  });
 });
