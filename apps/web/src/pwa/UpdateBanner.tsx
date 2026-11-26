@@ -7,6 +7,7 @@ import {
   applyPwaUpdate,
   getPwaUpdateSnapshot,
   isPwaLogoutPending,
+  isPwaTabActive,
   subscribePwaUpdate,
 } from '@/lib/pwa';
 
@@ -38,13 +39,18 @@ export function UpdateBanner({
     isPwaLogoutPending,
     () => false,
   );
+  const tabActive = useSyncExternalStore(
+    subscribePwaUpdate,
+    isPwaTabActive,
+    () => true,
+  );
   const pinned = useSyncExternalStore(
     subscribeHeldWritesStore,
     hasAnyHeldWrite,
     () => false,
   );
 
-  if (!update.waiting) return null;
+  if (!tabActive || !update.waiting) return null;
 
   const disabled = !authResolved || logoutPending || pinned;
 

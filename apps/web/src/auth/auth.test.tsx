@@ -7,7 +7,6 @@ import {
   getAuthSnapshot,
   isAuthResolved,
   resetAuthStore,
-  signIn,
 } from '@/lib/auth-store';
 
 type Session = {
@@ -446,124 +445,6 @@ describe('owner access', () => {
     cleanAuthStore.resetAuthStore();
   });
 
-  it('reconciles a failed logout in another tab when SIGNED_OUT arrives before marker removal', async () => {
-    const markerKey = `theshark:auth:logout-pending:v1:${encodeURIComponent('http://127.0.0.1:55421')}`;
-    const session = {
-      user: { id: 'owner', email: 'owner@theshark.test' },
-      access_token: 'tok-owner-crosstab-a',
-      refresh_token: 'rt-owner-crosstab-a',
-    };
-
-    authState.session = session;
-    authState.isOwner = true;
-    authState.signOutError = { message: 'offline refresh failed' };
-
-    renderApp('/');
-    expect(await screen.findByText('owner@theshark.test')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'تسجيل الخروج' }));
-    expect(
-      await screen.findByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
-    ).toBeInTheDocument();
-    const markerValue = localStorage.getItem(markerKey);
-    expect(markerValue).not.toBeNull();
-    expect(JSON.parse(markerValue!)).toMatchObject({
-      attemptId: 1,
-      state: 'local_failed',
-    });
-    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
-
-    // Another tab's SDK signOut emits SIGNED_OUT while the marker is still present.
-    authState.session = null;
-    act(() => {
-      for (const listener of [...authState.listeners]) {
-        listener('SIGNED_OUT', null);
-      }
-    });
-    expect(getAuthSnapshot().logoutFailed).toBe(true);
-    expect(isAuthResolved()).toBe(false);
-    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
-
-    // Then the other tab finishes signOut and clears the persisted logout marker.
-    localStorage.removeItem(markerKey);
-    act(() => {
-      window.dispatchEvent(
-        new StorageEvent('storage', {
-          key: markerKey,
-          oldValue: markerValue,
-          newValue: null,
-        }),
-      );
-    });
-
-    await vi.waitFor(() => {
-      expect(screen.queryByRole('alert')).toBeNull();
-    });
-    expect(
-      screen.queryByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
-    ).toBeNull();
-    expect(getAuthSnapshot()).toMatchObject({
-      status: 'signed-out',
-      logoutPending: false,
-      logoutFailed: false,
-    });
-    expect(isAuthResolved()).toBe(true);
-    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeEnabled();
-    expect(await signIn('owner@theshark.test', 'ValidPassword123')).toBe('ok');
-  });
-
-  it('reconciles a failed logout in another tab when SIGNED_OUT arrives after marker removal', async () => {
-    const markerKey = `theshark:auth:logout-pending:v1:${encodeURIComponent('http://127.0.0.1:55421')}`;
-    const session = {
-      user: { id: 'owner', email: 'owner@theshark.test' },
-      access_token: 'tok-owner-crosstab-b',
-      refresh_token: 'rt-owner-crosstab-b',
-    };
-
-    authState.session = session;
-    authState.isOwner = true;
-    authState.signOutError = { message: 'offline refresh failed' };
-
-    renderApp('/');
-    expect(await screen.findByText('owner@theshark.test')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'تسجيل الخروج' }));
-    expect(
-      await screen.findByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
-    ).toBeInTheDocument();
-    const markerValue = localStorage.getItem(markerKey);
-    expect(markerValue).not.toBeNull();
-    expect(JSON.parse(markerValue!)).toMatchObject({
-      attemptId: 1,
-      state: 'local_failed',
-    });
-    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeDisabled();
-
-    // Marker is removed first without delivering a storage event, then SIGNED_OUT arrives.
-    localStorage.removeItem(markerKey);
-    authState.session = null;
-    act(() => {
-      for (const listener of [...authState.listeners]) {
-        listener('SIGNED_OUT', null);
-      }
-    });
-
-    await vi.waitFor(() => {
-      expect(screen.queryByRole('alert')).toBeNull();
-    });
-    expect(
-      screen.queryByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
-    ).toBeNull();
-    expect(getAuthSnapshot()).toMatchObject({
-      status: 'signed-out',
-      logoutPending: false,
-      logoutFailed: false,
-    });
-    expect(isAuthResolved()).toBe(true);
-    expect(screen.getByRole('button', { name: 'تسجيل الدخول' })).toBeEnabled();
-    expect(await signIn('owner@theshark.test', 'ValidPassword123')).toBe('ok');
-  });
-
   it('surfaces global revocation failure separately on /login after quota fallback removes local credentials and clears it on retry', async () => {
     const sdkStorageKey = 'sb-127-auth-token';
     const session = {
@@ -850,7 +731,6 @@ describe('login', () => {
     const store = createAuthStore({
       getClient: () => fakeClient as unknown as StoreClient,
       getStorage: () => window.localStorage,
-      getSessionStorage: () => window.sessionStorage,
       getProjectUrl: () => 'https://post-throw.example.test',
       syncGlobalStores: false,
     });
@@ -880,7 +760,7 @@ describe('login', () => {
 });
 
 describe('production GoTrueClient UI integration (hasDirectRevocationTransport === true)', () => {
-  it('P1-1 + P2-1 + P3-1: exercises LoginPage + AuthProvider against real GoTrueClient for reload-while-pending recovery, disabled sign-out button, and sibling pending banner', async () => {
+  it('P1-1 + P2-1: exercises LoginPage + AuthProvider against real GoTrueClient for reload-while-pending recovery and coalesced sign-out', async () => {
     const { createClient } = await import('@supabase/supabase-js');
     const url = 'https://prod-ui-test.example.test';
     const anonKey = 'anon-key-prod-ui';
@@ -1012,18 +892,9 @@ describe('production GoTrueClient UI integration (hasDirectRevocationTransport =
       view1.unmount();
       storeMod1.resetAuthStore({ clearStorage: false });
 
-      // Simulate the abandoned owner's lease expiring (>10s since last heartbeat)
-      // before reload (under P3-2, a fresh no-locks pending stays in signing_out
-      // while the owner's lease is active so a second tab cannot interrupt a live logout).
-      const pendingRaw = JSON.parse(
-        window.localStorage.getItem(coordKey) ?? 'null',
-      ) as Record<string, unknown> | null;
-      if (pendingRaw && typeof pendingRaw.heartbeatAt === 'number') {
-        pendingRaw.heartbeatAt = Date.now() - 15_000;
-        window.localStorage.setItem(coordKey, JSON.stringify(pendingRaw));
-      }
-
-      // Simulate reload while coordKey is still state:'pending' (P1-1)!
+      // Simulate reload while durable logout record is still state:'pending' (P1-1).
+      // Under the one-active-tab model, pending from a gone tab immediately resolves
+      // conservatively on boot (creds gone -> revocation_failed with login enabled).
       vi.resetModules();
       const clientReloaded = createClient(url, anonKey, {
         auth: {
@@ -1076,36 +947,6 @@ describe('production GoTrueClient UI integration (hasDirectRevocationTransport =
       expect(
         await screen.findByText('owner-ui@theshark.test'),
       ).toBeInTheDocument();
-
-      // P3-1: when another tab writes pending, sibling tab does NOT show red failure banner!
-      const pendingCoord = JSON.stringify({
-        attemptId: 99,
-        ownerTabId: 'other-tab',
-        state: 'pending',
-        sessionKey: 'sid:sid-ui-2',
-        heartbeatAt: Date.now(),
-      });
-      window.localStorage.setItem(coordKey, pendingCoord);
-      act(() => {
-        window.dispatchEvent(
-          new StorageEvent('storage', {
-            key: coordKey,
-            oldValue: null,
-            newValue: pendingCoord,
-          }),
-        );
-      });
-      await vi.waitFor(() => {
-        expect(storeMod2.getAuthSnapshot().status).toBe('signed-out');
-      });
-      expect(storeMod2.getAuthSnapshot().logoutPending).toBe(true);
-      expect(storeMod2.getAuthSnapshot().logoutFailed).toBe(false);
-      expect(
-        screen.queryByRole('button', { name: 'إعادة محاولة تسجيل الخروج' }),
-      ).toBeNull();
-      expect(
-        screen.getByRole('button', { name: 'تسجيل الدخول' }),
-      ).toBeDisabled();
 
       view2.unmount();
       await clientReloaded.auth.stopAutoRefresh();

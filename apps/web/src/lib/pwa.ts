@@ -20,6 +20,7 @@ let reloadDeferred = false;
 let authResolvedState = false;
 let approvedAuthResolved: boolean | null = null;
 let logoutPending = false;
+let tabActive = true;
 let lastHadLiveClaims = false;
 let initReload: (() => void) | null = null;
 let pendingReload: (() => void) | null = null;
@@ -57,6 +58,22 @@ export function isPwaLogoutPending(): boolean {
   return logoutPending;
 }
 
+export function setPwaTabActive(active: boolean): void {
+  if (tabActive === active) return;
+  tabActive = active;
+  if (!active) {
+    reloadRequested = false;
+    approvedWorker = null;
+    pendingReload = null;
+    approvedAuthResolved = null;
+  }
+  emit();
+}
+
+export function isPwaTabActive(): boolean {
+  return tabActive;
+}
+
 function emit(): void {
   for (const listener of listeners) listener();
 }
@@ -83,6 +100,7 @@ function isActivatedWorker(worker: ServiceWorker | null): boolean {
 function canCompleteApprovedReload(): boolean {
   const resolved = approvedAuthResolved ?? authResolvedState;
   return (
+    tabActive &&
     resolved &&
     !logoutPending &&
     !hasAnyHeldWrite() &&
@@ -210,6 +228,7 @@ export function applyPwaUpdate(
   reload?: () => void,
   options?: { authResolved?: boolean },
 ): boolean {
+  if (!tabActive) return false;
   const resolved = options?.authResolved ?? authResolvedState;
   if (!resolved || logoutPending) return false;
   if (hasAnyHeldWrite() || hasLiveHeldWriteClaims()) return false;
@@ -270,6 +289,7 @@ export function initPwa(
   const container = navigator.serviceWorker;
   let hadController = Boolean(container.controller);
   container.addEventListener('controllerchange', () => {
+    if (!tabActive) return;
     const activatedUpdate =
       reloadRequested || waitingWorker !== null || hadController;
     hadController = true;
@@ -362,6 +382,7 @@ export function resetPwaState(): void {
   authResolvedState = false;
   approvedAuthResolved = null;
   logoutPending = false;
+  tabActive = true;
   lastHadLiveClaims = false;
   initReload = null;
   pendingReload = null;

@@ -1,8 +1,18 @@
+import { useSyncExternalStore, type ReactNode } from 'react';
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { AuthProvider } from '@/auth/AuthProvider';
+import { InactiveTabNotice } from '@/auth/InactiveTabNotice';
 import { RequireOwner } from '@/auth/RequireOwner';
+import {
+  getActiveTabSnapshot,
+  registerActiveTabLifecycle,
+  subscribeActiveTab,
+  takeOverActiveTab,
+} from '@/lib/active-tab';
 import { useAuth } from '@/lib/auth-context';
-import { supabase } from '@/lib/supabase';
+import { activateAuthStore, deactivateAuthStore } from '@/lib/auth-store';
+import { initPwa, setPwaTabActive } from '@/lib/pwa';
+import * as supabaseMod from '@/lib/supabase';
 import { ExpensesPage } from '@/pages/ExpensesPage';
 import { ActivationPage } from '@/pages/ActivationPage';
 import { CountsPage } from '@/pages/CountsPage';
@@ -190,17 +200,71 @@ export function AppRoutes() {
   );
 }
 
+function handleTabBecomeActive(): void {
+  supabaseMod.activateSupabaseClient?.();
+  setPwaTabActive(true);
+  initPwa();
+  activateAuthStore();
+}
+
+function handleTabBecomeInactive(): void {
+  deactivateAuthStore();
+  supabaseMod.deactivateSupabaseClient?.();
+  setPwaTabActive(false);
+}
+
+function subscribeAppActiveTab(listener: () => void): () => void {
+  const unregisterLifecycle = registerActiveTabLifecycle({
+    onBecomeActive: handleTabBecomeActive,
+    onBecomeInactive: handleTabBecomeInactive,
+  });
+  const unsubscribe = subscribeActiveTab(listener);
+  return () => {
+    unsubscribe();
+    unregisterLifecycle();
+  };
+}
+
+function ActiveTabGate({ children }: { children: ReactNode }) {
+  const tab = useSyncExternalStore(
+    subscribeAppActiveTab,
+    getActiveTabSnapshot,
+    getActiveTabSnapshot,
+  );
+
+  if (tab.status === 'checking') {
+    return (
+      <main className="mx-auto flex min-h-dvh max-w-lg flex-col gap-4 ps-4 pe-4 pt-8 text-start">
+        <p>جاري التحقق…</p>
+      </main>
+    );
+  }
+
+  if (tab.status === 'inactive') {
+    return (
+      <InactiveTabNotice
+        takingOver={tab.takingOver}
+        onTakeOver={() => void takeOverActiveTab()}
+      />
+    );
+  }
+
+  return children;
+}
+
 export function App() {
-  if (!supabase) {
+  if (!supabaseMod.supabase) {
     return <MissingEnvScreen />;
   }
 
   return (
-    <BrowserRouter>
-      <AuthProvider>
-        <UpdateBanner />
-        <AppRoutes />
-      </AuthProvider>
-    </BrowserRouter>
+    <ActiveTabGate>
+      <BrowserRouter>
+        <AuthProvider>
+          <UpdateBanner />
+          <AppRoutes />
+        </AuthProvider>
+      </BrowserRouter>
+    </ActiveTabGate>
   );
 }
