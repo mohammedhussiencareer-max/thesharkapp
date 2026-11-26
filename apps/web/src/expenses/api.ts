@@ -34,8 +34,20 @@ function appDb() {
   return supabase.schema('app');
 }
 
-function throwIfError(error: { message?: string } | null): void {
-  if (error) throw new Error(mapExpenseError(error));
+function throwIfError(
+  error: {
+    code?: string;
+    message?: string;
+    details?: string | null;
+    hint?: string | null;
+  } | null,
+): void {
+  if (!error) return;
+  const mapped = new Error(mapExpenseError(error), { cause: error });
+  if (typeof error.code === 'string' && error.code.trim() !== '') {
+    Object.assign(mapped, { code: error.code.trim() });
+  }
+  throw mapped;
 }
 
 async function readPages<T extends object>(
@@ -283,6 +295,28 @@ export async function loadExpenseMonth(
   };
 }
 
+function expenseEntryMonth(row: {
+  period_month: string | null;
+  expense_date: string | null;
+}): string | null {
+  const periodMonth = optionalDate(row.period_month);
+  if (periodMonth) return periodMonth;
+  const expenseDate = optionalDate(row.expense_date);
+  return expenseDate ? `${expenseDate.slice(0, 7)}-01` : null;
+}
+
+export async function loadExpenseEntryMonth(
+  id: string,
+): Promise<string | null> {
+  const { data, error } = await appDb()
+    .from('expense_lines')
+    .select('period_month, expense_date')
+    .eq('id', id)
+    .maybeSingle();
+  if (error || !data) return null;
+  return expenseEntryMonth(data);
+}
+
 export async function addExpenseEntry(draft: ExpenseDraft): Promise<void> {
   const args: EntryArgs = {
     p_category_id: draft.categoryId,
@@ -304,6 +338,24 @@ export async function addExpenseEntry(draft: ExpenseDraft): Promise<void> {
   await writeEntry(() => appDb().rpc('add_expense_entry', args));
 }
 
+/** Null means that the exact request has no stored entry. */
+export async function loadExpenseRequestMonth(
+  requestId: string,
+): Promise<string | null> {
+  const { data, error } = await appDb()
+    .from('expense_entries')
+    .select('period_month, expense_date, voids_id')
+    .eq('request_id', requestId)
+    .maybeSingle();
+  throwIfError(error);
+  if (!data) return null;
+  const month = data.voids_id
+    ? await loadExpenseEntryMonth(data.voids_id)
+    : expenseEntryMonth(data);
+  if (month === null) throw new Error(genericCatalogError);
+  return month;
+}
+
 export async function voidExpenseEntry(
   id: string,
   reason: string,
@@ -316,6 +368,20 @@ export async function voidExpenseEntry(
       p_request_id: requestId,
     }),
   );
+}
+
+export async function hasExpenseVoidRequest(
+  requestId: string,
+  originalId: string,
+): Promise<boolean> {
+  const { data, error } = await appDb()
+    .from('expense_entries')
+    .select('id')
+    .eq('request_id', requestId)
+    .eq('voids_id', originalId)
+    .maybeSingle();
+  throwIfError(error);
+  return data !== null;
 }
 
 export async function setMonthExpenseComplete(

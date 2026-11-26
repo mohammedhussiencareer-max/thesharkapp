@@ -10,6 +10,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { costingImpact } from '@/items/api';
 import { impactLine } from '@/items/effective';
 import { resetHeldWrites, unknownSaveMessage } from '@/items/request-id';
+import {
+  hasPostedReload,
+  putHeldWrite,
+  userStoragePrefix,
+} from '@/lib/held-writes';
+import { recipeImportSubject } from '@/recipes/subjects';
+import { makeAuditedLocks } from '@/test/held-write-locks';
 import { RecipeImportPage } from '@/pages/RecipeImportPage';
 import {
   commitRecipeImport,
@@ -651,5 +658,71 @@ describe('RecipeImportPage', () => {
       expect(commitRecipeImport).toHaveBeenCalledTimes(2);
       expect(sent(1).requestId).not.toBe(sent(0).requestId);
     });
+  });
+
+  it('P2: unlocks workspace when posted_reload cleanup finishes after mount', async () => {
+    const shared = makeAuditedLocks();
+    const pageLocks = shared.client('recipe-import-page');
+    const otherTabLocks = shared.client('other-tab');
+    const origLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: pageLocks,
+    });
+
+    putHeldWrite(recipeImportSubject, {
+      requestId: 'req-import-delayed-clear',
+      payload: null,
+      phase: 'posted_reload',
+      readTarget: recipeImportSubject,
+    });
+    expect(hasPostedReload(recipeImportSubject)).toBe(true);
+
+    // Hold the subject Web Lock from another tab so parent mount cleanup waits until after Workspace mounts.
+    const lockKey = `${userStoragePrefix('__local__')}${encodeURIComponent(recipeImportSubject)}`;
+    let releaseExternalLock!: () => void;
+    let lockAcquired!: () => void;
+    const lockReady = new Promise<void>((resolve) => {
+      lockAcquired = resolve;
+    });
+    const externalHolder = otherTabLocks.request(
+      lockKey,
+      { mode: 'exclusive' },
+      () =>
+        new Promise<void>((resolve) => {
+          releaseExternalLock = resolve;
+          lockAcquired();
+        }),
+    );
+    await lockReady;
+
+    try {
+      vi.mocked(loadImportContext).mockResolvedValueOnce(importContext());
+      renderPage();
+
+      // Workspace mounts while posted_reload cleanup is still waiting for the other tab's lock.
+      const fileInput = await screen.findByLabelText('ملف الوصفات (xlsx)');
+      expect(fileInput).toBeDisabled();
+
+      // Release the other tab's lock so cleanup completes AFTER mount.
+      releaseExternalLock();
+      await externalHolder;
+
+      await waitFor(() => {
+        expect(hasPostedReload(recipeImportSubject)).toBe(false);
+      });
+      await waitFor(() => {
+        expect(screen.getByLabelText('ملف الوصفات (xlsx)')).toBeEnabled();
+      });
+      expect(shared.nested).toEqual([]);
+    } finally {
+      releaseExternalLock?.();
+      await externalHolder;
+      if (origLocks) {
+        Object.defineProperty(navigator, 'locks', origLocks);
+      } else {
+        Reflect.deleteProperty(navigator, 'locks');
+      }
+    }
   });
 });

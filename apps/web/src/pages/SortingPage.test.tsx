@@ -8,7 +8,13 @@ import {
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SortingPage } from '@/pages/SortingPage';
-import { listMixedFish, listSorts, recordSort } from '@/sorting/api';
+import { hasPostedReload } from '@/lib/held-writes';
+import {
+  hasSortHistoryEntry,
+  listMixedFish,
+  listSorts,
+  recordSort,
+} from '@/sorting/api';
 import {
   backDatedSortMessage,
   notEnoughStockMessage,
@@ -18,6 +24,7 @@ import {
 import type { MixedFish, SortRecord } from '@/sorting/types';
 
 vi.mock('@/sorting/api', () => ({
+  hasSortHistoryEntry: vi.fn(),
   listMixedFish: vi.fn(),
   listSorts: vi.fn(),
   recordSort: vi.fn(),
@@ -85,9 +92,47 @@ describe('SortingPage', () => {
     vi.mocked(listMixedFish).mockReset();
     vi.mocked(listSorts).mockReset();
     vi.mocked(recordSort).mockReset();
+    vi.mocked(hasSortHistoryEntry).mockReset();
+    vi.mocked(hasSortHistoryEntry).mockResolvedValue(true);
     vi.mocked(listMixedFish).mockResolvedValue([mixed]);
     vi.mocked(listSorts).mockResolvedValue([]);
     vi.mocked(recordSort).mockResolvedValue(undefined);
+  });
+
+  it('keeps a posted sort until its ID is readable outside the selected history range', async () => {
+    await renderPage();
+    fireEvent.change(screen.getByLabelText('إلى'), {
+      target: { value: '2025-01-01' },
+    });
+    await waitFor(() => {
+      expect(listSorts).toHaveBeenLastCalledWith({
+        from: undefined,
+        toExclusive: expect.stringMatching(/^2025-01-/) as string,
+      });
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    vi.mocked(recordSort).mockResolvedValueOnce('saved-sort');
+    vi.mocked(hasSortHistoryEntry).mockResolvedValueOnce(false);
+    fillSort();
+    fireEvent.change(screen.getByLabelText('وقت الفرز'), {
+      target: { value: '2026-10-22T12:00' },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      await Promise.resolve();
+    });
+    const requestId = vi.mocked(recordSort).mock.lastCall?.[0].requestId;
+    expect(requestId).toBeDefined();
+    expect(hasPostedReload('sort:new')).toBe(true);
+    expect(hasSortHistoryEntry).toHaveBeenCalledExactlyOnceWith({
+      id: 'saved-sort',
+      requestId,
+    });
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => expect(hasPostedReload('sort:new')).toBe(false));
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
   });
 
   it('locks the page through the save and the reload', async () => {
@@ -95,7 +140,7 @@ describe('SortingPage', () => {
     let releaseSave: () => void = () => undefined;
     vi.mocked(recordSort).mockReturnValueOnce(
       new Promise((resolve) => {
-        releaseSave = () => resolve();
+        releaseSave = () => resolve(undefined);
       }),
     );
     fillSort();

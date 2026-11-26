@@ -13,9 +13,11 @@ import {
   listPendingCounts,
   recordCount,
   recordStoredCount,
+  verifyCountSibling,
 } from '@/counts/api';
 import {
   backDatedCountMessage,
+  genericCountError,
   inactiveItemMessage,
   insideShiftMessage,
   openShiftMessage,
@@ -26,6 +28,11 @@ import {
   waitingForSyncMessage,
 } from '@/counts/errors';
 import type { CountItem, CountRecord, CountWriteResult } from '@/counts/types';
+import {
+  createHeldWriteStore,
+  setHeldWriteUser,
+  userStoragePrefix,
+} from '@/lib/held-writes';
 import { CountsPage } from '@/pages/CountsPage';
 import { formatCairoDateTime } from '@/purchases/time';
 
@@ -35,6 +42,7 @@ vi.mock('@/counts/api', () => ({
   listPendingCounts: vi.fn(),
   recordCount: vi.fn(),
   recordStoredCount: vi.fn(),
+  verifyCountSibling: vi.fn(),
 }));
 
 const posted: CountWriteResult = { status: 'posted', countId: 'saved-count' };
@@ -93,6 +101,35 @@ function fillShortage() {
   });
 }
 
+async function loseDailyReplyWithAnotherStoredCount() {
+  const other = {
+    request_id: 'd1900000-0000-4000-8000-000000000062',
+    frequency: 'daily',
+    counted_at: '2026-10-22T08:00:00.000Z',
+    note: null,
+    lines: [{ item_id: 'shrimp', counted_qty: '3', expected_base_unit: 'kg' }],
+  };
+  vi.mocked(listPendingCounts).mockResolvedValue([
+    {
+      requestId: other.request_id,
+      preparedAt: '2026-10-22T08:05:00.000Z',
+      countedAt: other.counted_at,
+      itemCount: 1,
+      payload: other,
+    },
+  ]);
+  await renderPage();
+  fillShortage();
+  vi.mocked(recordCount).mockRejectedValueOnce(
+    new TypeError('Failed to fetch'),
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+  expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+  const [daily] = vi.mocked(recordCount).mock.calls[0]!;
+  vi.mocked(verifyCountSibling).mockResolvedValueOnce('verified');
+  return { daily, other };
+}
+
 describe('CountsPage', () => {
   beforeEach(() => {
     vi.mocked(listDailyItems).mockReset();
@@ -100,11 +137,122 @@ describe('CountsPage', () => {
     vi.mocked(listPendingCounts).mockReset();
     vi.mocked(recordCount).mockReset();
     vi.mocked(recordStoredCount).mockReset();
+    vi.mocked(verifyCountSibling).mockReset();
+    vi.mocked(verifyCountSibling).mockResolvedValue('absent');
     vi.mocked(listDailyItems).mockResolvedValue([tilapia, shrimp]);
     vi.mocked(listCounts).mockResolvedValue([]);
     vi.mocked(listPendingCounts).mockResolvedValue([]);
     vi.mocked(recordCount).mockResolvedValue(posted);
     vi.mocked(recordStoredCount).mockResolvedValue(posted);
+  });
+
+  it('blocks a stale daily count until a different stored card is verified', async () => {
+    setHeldWriteUser('counter');
+    await renderPage();
+    fillShortage();
+    const subject = 'count:stored:recent-card';
+    const key = `${userStoragePrefix('counter')}posted:${encodeURIComponent(subject)}:recent-card`;
+    // A second tab posted after this page rendered. No storage event has arrived.
+    localStorage.setItem(
+      key,
+      JSON.stringify({
+        v: 1,
+        subject,
+        requestId: 'recent-card',
+        kind: 'count_stored',
+        phase: 'posted_reload',
+        payload: null,
+      }),
+    );
+    vi.mocked(listCounts).mockRejectedValueOnce(
+      new Error('count readback failed'),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      await Promise.resolve();
+    });
+    expect(recordCount).not.toHaveBeenCalled();
+    expect(localStorage.getItem(key)).not.toBeNull();
+    expect(
+      await screen.findByText('count readback failed'),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => expect(localStorage.getItem(key)).toBeNull());
+    expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+  });
+
+  it('verifies the exact stored count under the shared lock after quota loses its posted marker', async () => {
+    setHeldWriteUser('counter');
+    const writer = createHeldWriteStore({ getLocks: () => navigator.locks });
+    writer.setHeldWriteUser('counter');
+    try {
+      await renderPage();
+      fillShortage();
+      const requestId = 'quota-card';
+      const subject = `count:stored:${requestId}`;
+      const key = `${userStoragePrefix('counter')}${encodeURIComponent(subject)}`;
+      const first = await writer.claimFreshHeldWrite(
+        subject,
+        () => ({
+          request_id: requestId,
+          counted_at: '2026-10-22T09:00:00.000Z',
+          frequency: 'daily',
+          lines: [
+            { item_id: 'tilapia', counted_qty: '7', expected_base_unit: 'kg' },
+          ],
+        }),
+        { requestId, kind: 'count_stored' },
+      );
+      expect(first.ok).toBe(true);
+      if (!first.ok) return;
+      const quota = vi
+        .spyOn(Storage.prototype, 'setItem')
+        .mockImplementation(() => {
+          throw new DOMException('storage full', 'QuotaExceededError');
+        });
+      try {
+        expect(() =>
+          writer.setHeldWritePhase(subject, requestId, 'posted_reload'),
+        ).toThrow();
+      } finally {
+        quota.mockRestore();
+        first.release();
+        await Promise.resolve();
+      }
+      expect(JSON.parse(localStorage.getItem(key) ?? '{}')).toMatchObject({
+        phase: 'inflight',
+        requestId,
+      });
+
+      vi.mocked(verifyCountSibling).mockRejectedValueOnce(
+        new Error('readback failed'),
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+        await Promise.resolve();
+      });
+      expect(recordCount).not.toHaveBeenCalled();
+      expect(verifyCountSibling).toHaveBeenCalledExactlyOnceWith(requestId);
+      expect(localStorage.getItem(key)).not.toBeNull();
+      expect(screen.getByText(genericCountError)).toBeVisible();
+
+      vi.mocked(verifyCountSibling).mockImplementationOnce(async () => {
+        expect(
+          await writer.claimReplayHeldWrite(subject, requestId),
+        ).toMatchObject({
+          ok: false,
+          reason: 'locked',
+        });
+        return 'verified';
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+      await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(1));
+      expect(verifyCountSibling).toHaveBeenLastCalledWith(requestId);
+      expect(localStorage.getItem(key)).toBeNull();
+    } finally {
+      writer.dispose();
+    }
   });
 
   it('locks the page through the save and the reload', async () => {
@@ -904,6 +1052,53 @@ describe('CountsPage', () => {
       expect(recordCount).toHaveBeenCalledTimes(2);
     });
     expect(vi.mocked(recordCount).mock.calls[1]?.[0]).toEqual(pinned);
+  });
+
+  it('renews the daily request id when another count verifies it and is refused', async () => {
+    const { daily, other } = await loseDailyReplyWithAnotherStoredCount();
+    vi.mocked(recordStoredCount).mockRejectedValueOnce({
+      code: '22023',
+      message: 'item is inactive',
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    await screen.findByText(inactiveItemMessage);
+    expect(verifyCountSibling).toHaveBeenCalledExactlyOnceWith(daily.requestId);
+    expect(recordStoredCount).toHaveBeenCalledExactlyOnceWith(other);
+    expect(screen.queryByText(pendingResendMessage)).not.toBeInTheDocument();
+    const quantity = screen.getByLabelText('الكمية المعدودة بلطي');
+    expect(quantity).toHaveValue('7');
+    fireEvent.change(quantity, { target: { value: '8' } });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'حفظ' })).toBeEnabled();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ' }));
+    await waitFor(() => expect(recordCount).toHaveBeenCalledTimes(2));
+    const [edited] = vi.mocked(recordCount).mock.calls[1]!;
+    expect(edited.lines[0]?.countedQty).toBe('8');
+    expect(edited.requestId).not.toBe(daily.requestId);
+  });
+
+  it('refreshes history outside the shared lock after a verified sibling and a refused send', async () => {
+    const { daily, other } = await loseDailyReplyWithAnotherStoredCount();
+    const note = 'جرد اتأكد بعد ما الرد ضاع';
+    const locksDuringRead = vi.fn();
+    vi.mocked(listCounts).mockImplementationOnce(async () => {
+      locksDuringRead((await navigator.locks.query()).held);
+      return [countRow('verified-daily', note)];
+    });
+    vi.mocked(recordStoredCount).mockImplementationOnce(() => {
+      expect(listCounts).toHaveBeenCalledTimes(1);
+      // Supabase rejects with a plain PostgrestError-shaped object.
+      // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+      return Promise.reject({ code: '22023', message: 'item is inactive' });
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'سجّل الجرد' }));
+    await screen.findByText(inactiveItemMessage);
+    expect(verifyCountSibling).toHaveBeenCalledExactlyOnceWith(daily.requestId);
+    expect(recordStoredCount).toHaveBeenCalledExactlyOnceWith(other);
+    expect(await screen.findByRole('article', { name: note })).toBeVisible();
+    expect(locksDuringRead).toHaveBeenCalledExactlyOnceWith([]);
+    expect(screen.getByText(inactiveItemMessage)).toBeVisible();
   });
 
   it('shows a pending-card refusal when the count form is hidden', async () => {

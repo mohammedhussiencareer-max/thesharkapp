@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  loadOrderWorkState,
   loadProcessingSummary,
   recordRunFailure,
   retryParkedOrder,
   runDeductions,
+  type OrderWorkState,
+  type RetryOrderStatus,
 } from '@/accounting/api';
 import {
   formatCountPair,
@@ -27,19 +30,36 @@ import {
 import type { ParkedOrder, ProcessingSummary } from '@/accounting/types';
 import { ConfirmedRefusalError, messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  abortActionBeforeDispatch,
+  canDispatchAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearActionPostedReloadSnapshot,
   hasAction,
+  hasDurableAction,
+  markActionPostedReload,
   settleAction,
+  snapshotActionPostedReloads,
   subscribeHeldWrites,
   unknownAction,
+  updateActionPayload,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
-import { isDefiniteRefusal } from '@/lib/write-outcome';
+import {
+  captureWriteSession,
+  setHeldWritePhase,
+  storageWriteFailedMessage,
+  type HeldWriteRecord,
+  type WriteSession,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
+import { isDefiniteRefusal, isPayloadRefusal } from '@/lib/write-outcome';
 import { primaryButton, secondaryButton } from '@/lib/page-style';
 
 const recordedNotice = 'اتسجل إن المكالمة اتقطعت';
 const busyNotice = 'الحساب مشغول، حاول تاني';
 const notFailedNotice = 'الطلب مش متوقف';
+const staleRetryNotice = 'حالة الطلب اتغيرت — راجع الطلبات المتوقفة';
 const retriedNotice = 'الطلب رجع للشغل';
 const dormantNotice = 'الخصم لسه ما اتفعّلش. التشغيل بيرجع من غير ما يكتب.';
 
@@ -88,6 +108,7 @@ export function ProcessingPanel({
   refreshKey?: number;
   onShiftDataStale?: () => void;
 }) {
+  const online = useOnline();
   const [summary, setSummary] = useState<ProcessingSummary | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -113,12 +134,17 @@ export function ProcessingPanel({
   useEffect(() => {
     const seq = ++seqRef.current;
     let cancelled = false;
+    const pendingReloads = [
+      ...snapshotActionPostedReloads({ subject: accountingRunSubject }),
+      ...snapshotActionPostedReloads({ prefix: 'accounting:retry:' }),
+    ];
     void (async () => {
       try {
         const next = await loadProcessingSummary();
         if (cancelled || seq !== seqRef.current) return;
         setSummary(next);
         setLoadError(null);
+        await clearActionPostedReloadSnapshot(pendingReloads);
       } catch (error) {
         if (cancelled || seq !== seqRef.current) return;
         setLoadError(messageFrom(error));
@@ -143,18 +169,47 @@ export function ProcessingPanel({
     requestReload();
   }
 
-  async function finishFresh(action: RunHeld): Promise<void> {
-    if (flight.current) return;
+  async function finishFresh(
+    action: RunHeld,
+    session: WriteSession | null,
+    release: () => void,
+  ): Promise<void> {
+    if (
+      flight.current ||
+      !canDispatchAction(accountingRunSubject, action.requestId, session)
+    ) {
+      const missingPin = !hasDurableAction(
+        accountingRunSubject,
+        action.requestId,
+      );
+      abortActionBeforeDispatch(
+        accountingRunSubject,
+        action.requestId,
+        false,
+        release,
+      );
+      if (!isOnline()) setNotice(offlineWriteMessage);
+      else if (missingPin) setNotice(storageWriteFailedMessage);
+      return;
+    }
     flight.current = true;
     setRunning(true);
     setNotice(null);
+    let saved = false;
     try {
       let outcome: RunOutcome;
       try {
-        outcome = await runDeductions((report: AttemptReport) => {
-          action.report = report;
-        });
+        const persistAttempt = (report: AttemptReport) => {
+          action.report = { ...report };
+          updateActionPayload(accountingRunSubject, action.requestId, {
+            ...action,
+          });
+        };
+        outcome = await runDeductions(persistAttempt, persistAttempt, () =>
+          canDispatchAction(accountingRunSubject, action.requestId, session),
+        );
       } catch (error) {
+        updateActionPayload(accountingRunSubject, action.requestId, action);
         settleAction(accountingRunSubject, action.requestId, error);
         setNotice(messageFrom(error));
         return;
@@ -170,23 +225,69 @@ export function ProcessingPanel({
       }
       if (
         outcome.stop === 'call_failed' &&
+        outcome.report === 'not_needed' &&
+        !hasDurableAction(accountingRunSubject, action.requestId)
+      ) {
+        setNotice(storageWriteFailedMessage);
+        return;
+      }
+      if (
+        outcome.stop === 'call_failed' &&
         (outcome.report === 'unreported' || outcome.report === 'busy')
       ) {
+        updateActionPayload(accountingRunSubject, action.requestId, action);
         settleAction(accountingRunSubject, action.requestId, outcome.cause);
         setNotice(runStopLabel('call_failed'));
         return;
       }
-      settleAction(accountingRunSubject, action.requestId);
+      saved = true;
+      try {
+        markActionPostedReload(
+          accountingRunSubject,
+          action.requestId,
+          accountingRunSubject,
+        );
+      } catch (error) {
+        setNotice(messageFrom(error));
+        return;
+      }
       setNotice(runStopLabel(outcome.stop));
       publishAcknowledged();
+    } catch (error) {
+      if (!saved) {
+        settleAction(accountingRunSubject, action.requestId, error);
+      }
+      setNotice(messageFrom(error));
     } finally {
+      release();
       flight.current = false;
       setRunning(false);
     }
   }
 
-  async function finishUnknown(action: RunHeld): Promise<void> {
-    if (flight.current) return;
+  async function finishUnknown(
+    action: RunHeld,
+    session: WriteSession | null,
+    release: () => void,
+  ): Promise<void> {
+    if (
+      flight.current ||
+      !canDispatchAction(accountingRunSubject, action.requestId, session)
+    ) {
+      const missingPin = !hasDurableAction(
+        accountingRunSubject,
+        action.requestId,
+      );
+      abortActionBeforeDispatch(
+        accountingRunSubject,
+        action.requestId,
+        true,
+        release,
+      );
+      if (!isOnline()) setNotice(offlineWriteMessage);
+      else if (missingPin) setNotice(storageWriteFailedMessage);
+      return;
+    }
     flight.current = true;
     setRunning(true);
     setNotice(null);
@@ -196,80 +297,236 @@ export function ProcessingPanel({
         setNotice(runStopLabel('call_failed'));
         return;
       }
+      let persisted = false;
       try {
         const status = await recordRunFailure(action.report);
         if (!acknowledgedReport(status)) {
+          setHeldWritePhase(accountingRunSubject, action.requestId, 'unknown');
           setNotice(busyNotice);
           return;
         }
-        settleAction(accountingRunSubject, action.requestId);
+        persisted = true;
+        markActionPostedReload(
+          accountingRunSubject,
+          action.requestId,
+          accountingRunSubject,
+        );
         setNotice(recordedNotice);
         publishAcknowledged();
       } catch (error) {
         // The attempt stays until recording acknowledges a terminal status.
+        if (!persisted) {
+          setHeldWritePhase(accountingRunSubject, action.requestId, 'unknown');
+        }
         setNotice(messageFrom(error));
       }
     } finally {
+      release();
       flight.current = false;
       setRunning(false);
     }
   }
 
-  async function finishRetry(action: RetryHeld): Promise<void> {
-    if (flight.current) return;
+  async function finishRetry(
+    action: RetryHeld,
+    session: WriteSession | null,
+    isReplay: boolean,
+    release: () => void,
+  ): Promise<void> {
+    const subject = accountingRetrySubject(action.orderId);
+    if (
+      flight.current ||
+      !canDispatchAction(subject, action.requestId, session)
+    ) {
+      const missingPin = !hasDurableAction(subject, action.requestId);
+      abortActionBeforeDispatch(subject, action.requestId, isReplay, release);
+      if (!isOnline()) setNotice(offlineWriteMessage);
+      else if (missingPin) setNotice(storageWriteFailedMessage);
+      return;
+    }
     flight.current = true;
     setRunning(true);
     setNotice(null);
-    const subject = accountingRetrySubject(action.orderId);
     try {
-      let status: 'retried' | 'not_failed' | 'busy';
+      // Client-side guard before calling retry_accounting_work(p_order_id) for
+      // both fresh clicks and replays; the atomic server-side compare lands in
+      // the follow-up migration after PR 63.
+      let currentState: OrderWorkState | null;
       try {
-        status = await retryParkedOrder(action.orderId);
+        currentState = await loadOrderWorkState(action.orderId);
       } catch (error) {
-        if (isDefiniteRefusal(error)) {
-          retireRefusal(subject, action.requestId, error);
+        if (isReplay) {
+          setHeldWritePhase(subject, action.requestId, 'unknown');
         } else {
-          settleAction(subject, action.requestId, error);
+          settleAction(subject, action.requestId);
         }
         setNotice(messageFrom(error));
         return;
       }
-      settleAction(subject, action.requestId);
-      if (status === 'busy') {
-        setNotice(busyNotice);
+      const matchesStoredGeneration =
+        action.workGeneration !== undefined &&
+        currentState !== null &&
+        currentState.workGeneration === action.workGeneration;
+      if (!matchesStoredGeneration) {
+        settleAction(subject, action.requestId);
+        setNotice(
+          currentState !== null && currentState.failedAt !== null
+            ? staleRetryNotice
+            : notFailedNotice,
+        );
+        publishAcknowledged();
+        return;
+      }
+      if (!canDispatchAction(subject, action.requestId, session)) {
+        const missingPin = !hasDurableAction(subject, action.requestId);
+        if (!missingPin) {
+          if (isReplay) {
+            setHeldWritePhase(subject, action.requestId, 'unknown');
+          } else {
+            settleAction(subject, action.requestId);
+          }
+        }
+        if (!isOnline()) setNotice(offlineWriteMessage);
+        else if (missingPin) setNotice(storageWriteFailedMessage);
+        return;
+      }
+      let status: RetryOrderStatus;
+      let persisted = false;
+      try {
+        status = await retryParkedOrder(action.orderId);
+        if (status === 'busy') {
+          if (isReplay) {
+            setHeldWritePhase(subject, action.requestId, 'unknown');
+          } else {
+            settleAction(subject, action.requestId);
+          }
+          setNotice(busyNotice);
+          return;
+        }
+        persisted = true;
+        markActionPostedReload(subject, action.requestId, subject);
+      } catch (error) {
+        if (!persisted) {
+          if (isReplay ? isPayloadRefusal(error) : isDefiniteRefusal(error)) {
+            retireRefusal(subject, action.requestId, error);
+          } else {
+            settleAction(subject, action.requestId, error);
+          }
+        }
+        setNotice(messageFrom(error));
         return;
       }
       setNotice(status === 'not_failed' ? notFailedNotice : retriedNotice);
       publishAcknowledged();
     } finally {
+      release();
       flight.current = false;
       setRunning(false);
     }
   }
 
-  function run(): void {
-    if (flight.current || running || hasAction(accountingRunSubject)) return;
-    const action = beginAction<RunHeld>(accountingRunSubject, (requestId) => ({
+  async function replayUnknownRun(
+    requestId: string,
+    initiatingSession?: WriteSession | null,
+  ): Promise<void> {
+    if (flight.current || running || !isOnline()) return;
+    const session = initiatingSession ?? captureWriteSession();
+    const claim = await claimReplayAction<RunHeld>(
+      accountingRunSubject,
       requestId,
-      report: null,
-    }));
-    void finishFresh(action);
+      { session },
+    );
+    if (!claim.ok) {
+      if (claim.reason === 'locked') {
+        setNotice(busyNotice);
+      } else if (claim.reason === 'missing' || claim.reason === 'storage') {
+        setNotice(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setNotice(offlineWriteMessage);
+      }
+      return;
+    }
+    await finishUnknown(claim.record.payload, session, claim.release);
+  }
+
+  async function run(): Promise<void> {
+    if (
+      flight.current ||
+      running ||
+      !isOnline() ||
+      hasAction(accountingRunSubject)
+    )
+      return;
+    const session = captureWriteSession();
+    const claim = await claimFreshAction<RunHeld>(
+      accountingRunSubject,
+      (requestId) => ({
+        requestId,
+        report: null,
+      }),
+      { session, allowOwnPostedReloads: true },
+    );
+    if (!claim.ok) {
+      if (claim.reason === 'storage') {
+        setNotice(storageWriteFailedMessage);
+        return;
+      }
+      if (claim.reason === 'locked') {
+        setNotice(busyNotice);
+        return;
+      }
+      if (claim.reason === 'session_invalid') {
+        if (!isOnline()) setNotice(offlineWriteMessage);
+        return;
+      }
+      if (claim.reason === 'conflict' && claim.existing) {
+        const existing = claim.existing as HeldWriteRecord<RunHeld>;
+        if (existing.phase === 'unknown') {
+          await replayUnknownRun(existing.requestId, session);
+        } else {
+          setNotice(busyNotice);
+        }
+      }
+      return;
+    }
+    await finishFresh(claim.record.payload, session, claim.release);
   }
 
   function retryRun(): void {
-    if (!heldRun || flight.current || running) return;
-    void finishUnknown(heldRun);
+    if (!heldRun || flight.current || running || !isOnline()) return;
+    void replayUnknownRun(heldRun.requestId);
   }
 
-  function retryOrder(order: ParkedOrder): void {
+  async function retryOrder(order: ParkedOrder): Promise<void> {
     const subject = accountingRetrySubject(order.orderId);
-    if (flight.current || running || hasAction(subject)) return;
-    const action = beginAction<RetryHeld>(subject, (requestId) => ({
-      requestId,
-      orderId: order.orderId,
-    }));
+    if (flight.current || running || !isOnline() || hasAction(subject)) return;
+    const parsedGeneration = Number(order.workGeneration);
+    const workGeneration =
+      Number.isSafeInteger(parsedGeneration) && parsedGeneration >= 1
+        ? parsedGeneration
+        : undefined;
+    const session = captureWriteSession();
+    const claim = await claimFreshAction<RetryHeld>(
+      subject,
+      (requestId) => ({
+        requestId,
+        orderId: order.orderId,
+        ...(workGeneration !== undefined ? { workGeneration } : {}),
+      }),
+      { session, allowOwnPostedReloads: true },
+    );
+    if (!claim.ok) {
+      if (claim.reason === 'storage') {
+        setNotice(storageWriteFailedMessage);
+      } else if (claim.reason === 'locked') {
+        setNotice(busyNotice);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setNotice(offlineWriteMessage);
+      }
+      return;
+    }
     noteRetryOrder(order.orderId);
-    void finishRetry(action);
+    await finishRetry(claim.record.payload, session, false, claim.release);
   }
 
   const unresolvedRetries =
@@ -280,10 +537,25 @@ export function ProcessingPanel({
             !summary.parked.some((order) => order.orderId === held.orderId),
         );
 
-  function retryHeldOrder(orderId: string): void {
-    const held = unknownAction<RetryHeld>(accountingRetrySubject(orderId));
-    if (!held || flight.current || running) return;
-    void finishRetry(held);
+  async function retryHeldOrder(orderId: string): Promise<void> {
+    const subject = accountingRetrySubject(orderId);
+    const held = unknownAction<RetryHeld>(subject);
+    if (!held || flight.current || running || !isOnline()) return;
+    const session = captureWriteSession();
+    const claim = await claimReplayAction<RetryHeld>(subject, held.requestId, {
+      session,
+    });
+    if (!claim.ok) {
+      if (claim.reason === 'locked') {
+        setNotice(busyNotice);
+      } else if (claim.reason === 'missing' || claim.reason === 'storage') {
+        setNotice(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setNotice(offlineWriteMessage);
+      }
+      return;
+    }
+    await finishRetry(claim.record.payload, session, true, claim.release);
   }
 
   return (
@@ -327,13 +599,13 @@ export function ProcessingPanel({
           <p>{formatCoverage(summary.coverage)}</p>
           {notice ? <p>{notice}</p> : null}
           {heldRun ? (
-            <UnknownSave disabled={running} onRetry={retryRun} />
+            <UnknownSave disabled={running || !online} onRetry={retryRun} />
           ) : (
             <button
               className={primaryButton}
               type="button"
-              disabled={running}
-              onClick={run}
+              disabled={running || !online}
+              onClick={() => void run()}
             >
               {running ? 'جاري الحساب…' : 'شغّل الخصم'}
             </button>
@@ -353,15 +625,15 @@ export function ProcessingPanel({
                     <p>{formatFailureReason(order.reason, order.sqlstate)}</p>
                     {held ? (
                       <UnknownSave
-                        disabled={running}
-                        onRetry={() => retryHeldOrder(order.orderId)}
+                        disabled={running || !online}
+                        onRetry={() => void retryHeldOrder(order.orderId)}
                       />
                     ) : (
                       <button
                         className={secondaryButton}
                         type="button"
-                        disabled={running}
-                        onClick={() => retryOrder(order)}
+                        disabled={running || !online}
+                        onClick={() => void retryOrder(order)}
                       >
                         رجّع الطلب
                       </button>
@@ -377,8 +649,8 @@ export function ProcessingPanel({
                 <li key={held.orderId} className="flex flex-col gap-1">
                   <p dir="ltr">{held.orderId}</p>
                   <UnknownSave
-                    disabled={running}
-                    onRetry={() => retryHeldOrder(held.orderId)}
+                    disabled={running || !online}
+                    onRetry={() => void retryHeldOrder(held.orderId)}
                   />
                 </li>
               ))}

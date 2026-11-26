@@ -1,13 +1,25 @@
 import { useEffect, useRef, useState } from 'react';
 import { messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  abortActionBeforeDispatch,
+  canDispatchAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearActionPostedReload,
   hasAction,
+  hasDurableAction,
+  markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import {
+  captureWriteSession,
+  storageWriteFailedMessage,
+  type WriteSession,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import { setOrderDisposition } from '@/order-decisions/api';
 import { noteDecisionOrder } from '@/order-decisions/held-decisions';
@@ -39,22 +51,52 @@ export const returnedReviewMessage = 'راجع الكميات المرتجعة';
 
 const field = 'rounded border border-neutral-300 px-3 py-2';
 
+export type OrderDecisionDraft = {
+  choice: Decision;
+  reason: string;
+  draft: Record<string, string>;
+  clearReturned: boolean;
+  rowVersion: string;
+};
+
+function draftsEqual(
+  left: Readonly<Record<string, string>>,
+  right: Readonly<Record<string, string>>,
+): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every((key) => left[key] === right[key]);
+}
+
 export function DecisionForm({
   row,
+  savedDraft,
+  onDraftChange,
   onNotice,
   onChanged,
 }: {
   row: QueueRow;
+  savedDraft?: OrderDecisionDraft;
+  onDraftChange?: (orderId: string, next: OrderDecisionDraft | null) => void;
   onNotice: (notice: DecisionNotice | null) => void;
   onChanged: (orderId: string) => Promise<void>;
 }) {
+  const online = useOnline();
   const subject = decisionSubject(row.orderId);
-  const [choice, setChoice] = useState<Decision>(row.decision);
-  const [reason, setReason] = useState('');
-  const [draft, setDraft] = useState<Record<string, string>>(() =>
-    draftFromReturned(row.returned),
+  const rowVersion = `${row.token}:${row.eventId}`;
+  const restored =
+    savedDraft && savedDraft.rowVersion === rowVersion ? savedDraft : null;
+  const [choice, setChoice] = useState<Decision>(
+    () => restored?.choice ?? row.decision,
   );
-  const [clearReturned, setClearReturned] = useState(false);
+  const [reason, setReason] = useState(() => restored?.reason ?? '');
+  const [draft, setDraft] = useState<Record<string, string>>(() =>
+    restored ? { ...restored.draft } : draftFromReturned(row.returned),
+  );
+  const [clearReturned, setClearReturned] = useState(
+    () => restored?.clearReturned ?? false,
+  );
   const [saving, setSaving] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [heldEpoch, setHeldEpoch] = useState(0);
@@ -65,6 +107,38 @@ export function DecisionForm({
     () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
     [],
   );
+
+  useEffect(() => {
+    if (!onDraftChange) return;
+    const baseDraft = draftFromReturned(row.returned);
+    const dirty =
+      choice !== row.decision ||
+      reason !== '' ||
+      clearReturned ||
+      !draftsEqual(draft, baseDraft);
+    onDraftChange(
+      row.orderId,
+      dirty
+        ? {
+            choice,
+            reason,
+            draft: { ...draft },
+            clearReturned,
+            rowVersion,
+          }
+        : null,
+    );
+  }, [
+    choice,
+    clearReturned,
+    draft,
+    onDraftChange,
+    reason,
+    row.decision,
+    row.orderId,
+    row.returned,
+    rowVersion,
+  ]);
 
   const unresolved = row.currentClass === 'unresolved_refund';
   const onlyMade = row.currentClass === null;
@@ -92,34 +166,68 @@ export function DecisionForm({
         ? reasonTooLongMessage
         : null
     : null;
-  const blocked = saving || held !== null || unresolved;
+  const blocked = saving || held !== null || unresolved || !online;
 
-  async function finish(action: DecisionWrite): Promise<void> {
-    if (flight.current) return;
+  async function finish(
+    action: DecisionWrite,
+    session: WriteSession | null,
+    isReplay: boolean,
+    releaseLock: () => void,
+  ): Promise<void> {
+    if (
+      flight.current ||
+      !canDispatchAction(subject, action.requestId, session)
+    ) {
+      const missingPin = !hasDurableAction(subject, action.requestId);
+      abortActionBeforeDispatch(
+        subject,
+        action.requestId,
+        isReplay,
+        releaseLock,
+      );
+      if (!isOnline()) setProblem(offlineWriteMessage);
+      else if (missingPin) setProblem(storageWriteFailedMessage);
+      return;
+    }
     flight.current = true;
     setSaving(true);
     setProblem(null);
     onNotice(null);
     try {
       let saved: Awaited<ReturnType<typeof setOrderDisposition>>;
+      let persisted = false;
       try {
         saved = await setOrderDisposition(action);
-        settleAction(subject, action.requestId);
+        persisted = true;
+        if (saved.status === 'ok') {
+          onDraftChange?.(row.orderId, null);
+          markActionPostedReload(subject, action.requestId, subject);
+        } else {
+          settleAction(subject, action.requestId);
+        }
       } catch (failure) {
-        settleAction(subject, action.requestId, failure);
+        if (!persisted) {
+          settleAction(subject, action.requestId, failure);
+        }
         const message = messageFrom(failure);
-        if (hasAction(subject)) {
+        if (persisted || hasAction(subject)) {
           onNotice({ kind: 'failed', message });
           return;
         }
+        releaseLock();
         const warning = await reload();
         onNotice({
           kind: 'failed',
           message: warning ? `${message} — ${warning}` : message,
         });
         return;
+      } finally {
+        releaseLock();
       }
       const warning = saved.status === 'ok' ? await reload() : null;
+      if (saved.status === 'ok' && warning === null) {
+        await clearActionPostedReload(subject, subject, action.requestId);
+      }
       onNotice({ kind: 'saved', result: saved, warning });
     } finally {
       flight.current = false;
@@ -147,16 +255,54 @@ export function DecisionForm({
       setProblem(returnedReviewMessage);
       return;
     }
-    noteDecisionOrder(row.orderId);
-    const action = beginAction<DecisionWrite>(subject, (requestId) => ({
-      requestId,
+    const payloadDraft = {
       orderId: row.orderId,
       decision: choice,
       token: row.token,
       reason: flipping ? reasonText : null,
       returned: clearing ? [] : parsed?.ok === true ? parsed.lines : null,
-    }));
-    void finish(action);
+    };
+    const session = captureWriteSession();
+    void (async () => {
+      const claim = await claimFreshAction<DecisionWrite>(
+        subject,
+        (requestId) => ({
+          requestId,
+          ...payloadDraft,
+        }),
+        { session },
+      );
+      if (!claim.ok) {
+        if (claim.reason === 'storage') {
+          setProblem(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setProblem(offlineWriteMessage);
+        }
+        return;
+      }
+      noteDecisionOrder(row.orderId);
+      await finish(claim.record.payload, session, false, claim.release);
+    })();
+  }
+
+  function retry() {
+    if (!held || flight.current || saving || !isOnline()) return;
+    const targetId = held.requestId;
+    const session = captureWriteSession();
+    void (async () => {
+      const claim = await claimReplayAction<DecisionWrite>(subject, targetId, {
+        session,
+      });
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setProblem(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setProblem(offlineWriteMessage);
+        }
+        return;
+      }
+      await finish(claim.record.payload, session, true, claim.release);
+    })();
   }
 
   return (
@@ -173,9 +319,7 @@ export function DecisionForm({
           فيه مرتجع بمبلغ سالب — لازم يتصلح في الكاشير الأول قبل ما تقرر
         </p>
       ) : null}
-      {held ? (
-        <UnknownSave disabled={saving} onRetry={() => void finish(held)} />
-      ) : null}
+      {held ? <UnknownSave disabled={saving} onRetry={retry} /> : null}
       <fieldset className="flex flex-col gap-1" disabled={blocked}>
         <legend className="font-semibold">الطلب اتعمل ولا لأ؟</legend>
         {(['made', 'not_made'] as const).map((value) => (

@@ -1,4 +1,5 @@
 import {
+  ConfirmedRefusalError,
   CostingChangedError,
   genericCatalogError,
   mapCatalogError,
@@ -6,13 +7,22 @@ import {
 } from '@/items/errors';
 import type { ItemExpectation } from '@/items/expectation';
 import {
-  beginAction,
+  abortActionBeforeDispatch,
+  canDispatchAction,
+  claimFreshAction,
+  claimReplayAction,
   createSubject,
+  hasDurableAction,
+  ITEMS_RELOAD_SUBJECT,
+  markActionPostedReload,
   settleAction,
   unitSubject,
+  unknownAction,
 } from '@/items/request-id';
 import type { Database } from '@/lib/database.types';
 import { exactDecimal } from '@/lib/decimal';
+import { captureWriteSession, HeldWriteStorageError } from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage } from '@/lib/online';
 import { readAllPages } from '@/lib/paged';
 import { isDefiniteRefusal } from '@/lib/write-outcome';
 import { supabase } from '@/lib/supabase';
@@ -137,70 +147,132 @@ function coversNow(row: Record<string, unknown>, nowMs: number): boolean {
   return !Number.isNaN(to) && nowMs < to;
 }
 
+const stockItemSelect =
+  'id, name, kind, base_unit, count_frequency, parent_item_id, active, item_balances(on_hand_qty, avg_cost, on_hand_value), item_loss_versions(loss_pct, loss_text:loss_pct::text, effective_from, effective_to, superseded_change_id), item_conversion_versions(id, superseded_change_id), item_opening_prices(id, price_text:unit_cost::text, superseded_change_id)';
+
+type RawStockItemRow = {
+  id: string;
+  name: string;
+  kind: string;
+  base_unit: string;
+  count_frequency: string;
+  parent_item_id: string | null;
+  active: boolean;
+  item_balances: unknown;
+  item_loss_versions: unknown;
+  item_conversion_versions: unknown;
+  item_opening_prices: unknown;
+};
+
+function mapCatalogItemRow(row: RawStockItemRow, nowMs: number): CatalogItem {
+  if (
+    !isStockKind(row.kind) ||
+    !isBaseUnit(row.base_unit) ||
+    !isCountFrequency(row.count_frequency)
+  ) {
+    throw new Error(genericCatalogError);
+  }
+  const balance = itemBalance(row.item_balances);
+  const loss = rowsOf(row.item_loss_versions).find((version) =>
+    coversNow(version, nowMs),
+  );
+  const lossFractionText = loss
+    ? exactDecimal(loss.loss_text, genericCatalogError)
+    : null;
+  const opening = rowsOf(row.item_opening_prices).find(
+    (price) => price.superseded_change_id == null,
+  );
+  const configured =
+    rowsOf(row.item_loss_versions).some(
+      (version) => version.superseded_change_id == null,
+    ) ||
+    rowsOf(row.item_conversion_versions).some(
+      (version) => version.superseded_change_id == null,
+    ) ||
+    opening !== undefined ||
+    balance !== null;
+  return {
+    id: row.id,
+    name: row.name,
+    kind: row.kind,
+    baseUnit: row.base_unit,
+    countFrequency: row.count_frequency,
+    lossPct: lossFractionText === null ? null : toNumber(loss?.loss_pct),
+    lossFractionText,
+    identityLocked: configured,
+    openingPriceId:
+      opening && typeof opening.id === 'string' ? opening.id : null,
+    openingPriceText: opening
+      ? exactDecimal(opening.price_text, genericCatalogError)
+      : null,
+    parentItemId: row.parent_item_id,
+    active: row.active,
+    onHandQty: balance ? toNumber(balance.on_hand_qty) : 0,
+    avgCost: balance ? toNumber(balance.avg_cost) : 0,
+    onHandValue: balance ? toNumber(balance.on_hand_value) : 0,
+  };
+}
+
 export async function listItems(): Promise<CatalogItem[]> {
   const { data, error } = await appDb()
     .from('stock_items')
-    .select(
-      'id, name, kind, base_unit, count_frequency, parent_item_id, active, item_balances(on_hand_qty, avg_cost, on_hand_value), item_loss_versions(loss_pct, loss_text:loss_pct::text, effective_from, effective_to, superseded_change_id), item_conversion_versions(id, superseded_change_id), item_opening_prices(id, price_text:unit_cost::text, superseded_change_id)',
-    )
+    .select(stockItemSelect)
     .order('name');
   throwIfError(error);
   const nowMs = Date.now();
 
-  return (data ?? []).map((row) => {
-    if (
-      !isStockKind(row.kind) ||
-      !isBaseUnit(row.base_unit) ||
-      !isCountFrequency(row.count_frequency)
-    ) {
-      throw new Error(genericCatalogError);
-    }
-    const balance = itemBalance(row.item_balances);
-    const loss = rowsOf(row.item_loss_versions).find((version) =>
-      coversNow(version, nowMs),
-    );
-    const lossFractionText = loss
-      ? exactDecimal(loss.loss_text, genericCatalogError)
-      : null;
-    const opening = rowsOf(row.item_opening_prices).find(
-      (price) => price.superseded_change_id == null,
-    );
-    const configured =
-      rowsOf(row.item_loss_versions).some(
-        (version) => version.superseded_change_id == null,
-      ) ||
-      rowsOf(row.item_conversion_versions).some(
-        (version) => version.superseded_change_id == null,
-      ) ||
-      opening !== undefined ||
-      balance !== null;
-    return {
-      id: row.id,
-      name: row.name,
-      kind: row.kind,
-      baseUnit: row.base_unit,
-      countFrequency: row.count_frequency,
-      lossPct: lossFractionText === null ? null : toNumber(loss?.loss_pct),
-      lossFractionText,
-      identityLocked: configured,
-      openingPriceId:
-        opening && typeof opening.id === 'string' ? opening.id : null,
-      openingPriceText: opening
-        ? exactDecimal(opening.price_text, genericCatalogError)
-        : null,
-      parentItemId: row.parent_item_id,
-      active: row.active,
-      onHandQty: balance ? toNumber(balance.on_hand_qty) : 0,
-      avgCost: balance ? toNumber(balance.avg_cost) : 0,
-      onHandValue: balance ? toNumber(balance.on_hand_value) : 0,
-    };
-  });
+  return (data ?? []).map((row) => mapCatalogItemRow(row, nowMs));
 }
+
+export async function getItemById(id: string): Promise<CatalogItem | null> {
+  const { data, error } = await appDb()
+    .from('stock_items')
+    .select(stockItemSelect)
+    .eq('id', id)
+    .maybeSingle();
+  throwIfError(error);
+  if (!data) return null;
+  return mapCatalogItemRow(data, Date.now());
+}
+
+export { ITEMS_RELOAD_SUBJECT };
 
 export async function createItem(draft: ItemDraft): Promise<void> {
   const subject = createSubject(draft);
-  const requestId = beginAction(subject, (id) => id);
+  const session = captureWriteSession();
+  const existing = unknownAction<string>(subject);
+  const isReplay = existing !== null;
+  const claim = isReplay
+    ? await claimReplayAction<string>(subject, existing, { session })
+    : await claimFreshAction<string>(subject, (id) => id, { session });
+  if (!claim.ok) {
+    if (claim.reason === 'storage' || claim.reason === 'missing') {
+      throw new HeldWriteStorageError();
+    }
+    if (claim.reason === 'session_invalid') {
+      throw new Error(offlineWriteMessage);
+    }
+    throw new Error(genericCatalogError);
+  }
+  const requestId = claim.record.requestId;
+  let released = false;
+  const releaseOnce = () => {
+    if (!released) {
+      released = true;
+      claim.release();
+    }
+  };
+  let dispatched = false;
+  let saved = false;
   try {
+    if (!canDispatchAction(subject, requestId, session)) {
+      const missingPin = !hasDurableAction(subject, requestId);
+      abortActionBeforeDispatch(subject, requestId, isReplay, releaseOnce);
+      if (!isOnline()) throw new Error(offlineWriteMessage);
+      if (missingPin) throw new HeldWriteStorageError();
+      throw new Error(offlineWriteMessage);
+    }
+    dispatched = true;
     const { data, error } = await appDb().rpc('create_stock_item', {
       p_request_id: requestId,
       p_name: draft.name.trim(),
@@ -215,10 +287,15 @@ export async function createItem(draft: ItemDraft): Promise<void> {
     if (typeof data !== 'string' || data.length === 0) {
       throw new Error(genericCatalogError);
     }
-    settleAction(subject, requestId);
+    saved = true;
+    markActionPostedReload(subject, requestId, ITEMS_RELOAD_SUBJECT);
   } catch (error) {
-    settleAction(subject, requestId, error);
+    if (dispatched && !saved) {
+      settleAction(subject, requestId, error);
+    }
     throw error;
+  } finally {
+    releaseOnce();
   }
 }
 
@@ -241,6 +318,12 @@ export async function updateItem(
       ? matched.is('parent_item_id', null)
       : matched.eq('parent_item_id', expected.parentItemId);
   const { data, error } = await filtered.select('id');
+  if (error?.code === '23505') {
+    throw new ConfirmedRefusalError(mapCatalogError(error), {
+      code: '23505',
+      cause: error,
+    });
+  }
   throwIfError(error);
   if (!data || data.length === 0) throw new StaleWriteError();
 }
@@ -482,8 +565,46 @@ export async function addCustomUnit(
   requestId?: string,
 ): Promise<string> {
   const subject = unitSubject(code, labelAr);
-  const id = requestId ?? beginAction(subject, (next) => next);
+  let id = requestId;
+  let releaseLock = () => {};
+  let isReplay = false;
+  const session = requestId ? null : captureWriteSession();
+  if (!id) {
+    const existing = unknownAction<string>(subject);
+    isReplay = existing !== null;
+    const claim =
+      existing !== null
+        ? await claimReplayAction<string>(subject, existing, { session })
+        : await claimFreshAction<string>(subject, (next) => next, { session });
+    if (!claim.ok) {
+      if (claim.reason === 'storage' || claim.reason === 'missing') {
+        throw new HeldWriteStorageError();
+      }
+      if (claim.reason === 'session_invalid') {
+        throw new Error(offlineWriteMessage);
+      }
+      throw new Error(genericCatalogError);
+    }
+    id = claim.record.requestId;
+    releaseLock = claim.release;
+  }
+  let released = false;
+  const releaseOnce = () => {
+    if (!released) {
+      released = true;
+      releaseLock();
+    }
+  };
+  let dispatched = false;
   try {
+    if (!requestId && !canDispatchAction(subject, id, session)) {
+      const missingPin = !hasDurableAction(subject, id);
+      abortActionBeforeDispatch(subject, id, isReplay, releaseOnce);
+      if (!isOnline()) throw new Error(offlineWriteMessage);
+      if (missingPin) throw new HeldWriteStorageError();
+      throw new Error(offlineWriteMessage);
+    }
+    dispatched = true;
     const { data, error } = await appDb().rpc('add_custom_unit', {
       p_request_id: id,
       p_code: code.trim(),
@@ -496,8 +617,10 @@ export async function addCustomUnit(
     if (!requestId) settleAction(subject, id);
     return data;
   } catch (error) {
-    if (!requestId) settleAction(subject, id, error);
+    if (!requestId && dispatched) settleAction(subject, id, error);
     throw error;
+  } finally {
+    releaseOnce();
   }
 }
 

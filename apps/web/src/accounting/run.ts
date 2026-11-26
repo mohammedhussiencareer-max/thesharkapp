@@ -1,3 +1,4 @@
+import { isOnline, offlineWriteMessage } from '@/lib/online';
 import { isUnknownOutcome } from '@/lib/write-outcome';
 import type { RunStop } from '@/accounting/format';
 
@@ -105,6 +106,10 @@ export type RunOptions = {
   newAttemptId: () => string;
   sleep: (ms: number) => Promise<void>;
   onBoundAttempt?: (report: AttemptReport) => void;
+  /** Called right after classifying an unknown bound-call failure, BEFORE sending the recorder RPC. */
+  onFailureClassified?: (report: AttemptReport) => void;
+  /** Rechecked right before each mutation RPC (worker call or recorder call). */
+  canContinue?: () => boolean;
 };
 
 const DEFAULTS: RunOptions = {
@@ -112,6 +117,7 @@ const DEFAULTS: RunOptions = {
   clock: () => Date.now(),
   newAttemptId: () => crypto.randomUUID(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  canContinue: () => isOnline(),
 };
 
 export function zeroAccountingCounts(): AccountingCounts {
@@ -142,10 +148,19 @@ export async function runAccountingWork(
   db: AccountingDb,
   options: Partial<RunOptions> = {},
 ): Promise<RunOutcome> {
-  const { budgetMs, clock, newAttemptId, sleep, onBoundAttempt } = {
+  const {
+    budgetMs,
+    clock,
+    newAttemptId,
+    sleep,
+    onBoundAttempt,
+    onFailureClassified,
+    canContinue,
+  } = {
     ...DEFAULTS,
     ...options,
   };
+  const checkAllowed = canContinue ?? DEFAULTS.canContinue!;
   const started = clock();
   const counts = zeroAccountingCounts();
   let calls = 0;
@@ -178,6 +193,9 @@ export async function runAccountingWork(
     if (clock() - started >= budgetMs || calls >= MAX_CALLS) {
       return done('budget');
     }
+    if (!checkAllowed()) {
+      return done('call_failed', 'not_needed', new Error(offlineWriteMessage));
+    }
     const attemptId = newAttemptId();
     calls += 1;
     const held: AttemptReport | null =
@@ -190,6 +208,9 @@ export async function runAccountingWork(
             failureKind: null,
           };
     if (held) onBoundAttempt?.(held);
+    if (!checkAllowed()) {
+      return done('call_failed', 'not_needed', new Error(offlineWriteMessage));
+    }
     let run: AccountingRun;
     try {
       run = await db.runAccountingWork(attemptId, RUN_BATCH_LIMIT, binding);
@@ -197,13 +218,14 @@ export async function runAccountingWork(
       if (held && isUnknownOutcome(error)) {
         held.failureKind =
           failureCode(error) === '57014' ? 'recompute_timeout' : 'escaped';
+        onFailureClassified?.(held);
       }
       return failedCall(
         db,
         held,
         binding,
         error,
-        { budgetMs, clock, sleep, started },
+        { budgetMs, clock, sleep, started, canContinue: checkAllowed },
         done,
       );
     }
@@ -249,6 +271,7 @@ async function failedCall(
     clock: () => number;
     sleep: (ms: number) => Promise<void>;
     started: number;
+    canContinue: () => boolean;
   },
   done: (
     stop: RunStop,
@@ -283,8 +306,11 @@ async function failedCall(
           held.workGeneration,
         );
   try {
+    if (!pacing.canContinue()) {
+      return done('call_failed', 'unreported', error);
+    }
     let report = await record();
-    const { clock, started, budgetMs, sleep } = pacing;
+    const { clock, started, budgetMs, sleep, canContinue } = pacing;
     let waited = 0;
     for (let repeat = 0; report === 'busy'; repeat += 1) {
       const pause = RECORDER_BACKOFF_MS[
@@ -293,6 +319,9 @@ async function failedCall(
       if (Math.max(clock() - started, waited) + pause > budgetMs) break;
       await sleep(pause);
       waited += pause;
+      if (!canContinue()) {
+        return done('call_failed', 'unreported', error);
+      }
       report = await record();
     }
     return done('call_failed', report, error);

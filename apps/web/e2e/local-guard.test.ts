@@ -1,13 +1,16 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   assertLocalSupabaseUrl,
+  createLoopbackOnlyProxy,
   developmentSupabaseUrl,
   installLoopbackGuard,
   isBlockedRemoteUrl,
+  LOOPBACK_PROXY_BYPASS,
 } from './local-guard';
 
 describe('assertLocalSupabaseUrl', () => {
@@ -130,6 +133,118 @@ describe('loopback route guard', () => {
       'close wss://abc.supabase.co/realtime/v1/websocket',
       'connect ws://127.0.0.1:5173/',
     ]);
+  });
+
+  it('createLoopbackOnlyProxy refuses remote HTTP and CONNECT requests and bypasses only loopback', async () => {
+    const proxy = await createLoopbackOnlyProxy();
+    try {
+      const serverUrl = new URL(proxy.proxyConfig.server);
+      expect(serverUrl.hostname).toBe('127.0.0.1');
+      expect(proxy.proxyConfig.bypass).toBe(
+        '<-loopback>,127.0.0.1,localhost,[::1]',
+      );
+
+      const httpStatus = await new Promise<number>((resolveStatus, reject) => {
+        const req = httpRequest(
+          {
+            host: serverUrl.hostname,
+            port: Number(serverUrl.port),
+            method: 'GET',
+            path: 'http://example.invalid/rest/v1/probe',
+            headers: { host: 'example.invalid' },
+          },
+          (res) => {
+            res.resume();
+            resolveStatus(res.statusCode ?? 0);
+          },
+        );
+        req.on('error', reject);
+        req.end();
+      });
+      expect(httpStatus).toBe(403);
+
+      const connectStatus = await new Promise<number>(
+        (resolveStatus, reject) => {
+          const req = httpRequest({
+            host: serverUrl.hostname,
+            port: Number(serverUrl.port),
+            method: 'CONNECT',
+            path: 'example.invalid:443',
+          });
+          req.on('connect', (res, socket) => {
+            socket.destroy();
+            resolveStatus(res.statusCode ?? 0);
+          });
+          req.on('error', reject);
+          req.end();
+        },
+      );
+      expect(connectStatus).toBe(403);
+      expect(proxy.blockedRequests).toEqual([
+        'http://example.invalid/rest/v1/probe',
+        'CONNECT example.invalid:443',
+      ]);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('pwa-shell cache probe uses unrouted loopback proxy guard so Chromium HTTP cache stays active', () => {
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const fixturesSrc = readFileSync(resolve(dir, 'fixtures.ts'), 'utf8');
+    const pwaSpecSrc = readFileSync(resolve(dir, 'pwa-shell.spec.ts'), 'utf8');
+    expect(fixturesSrc).toContain('createLoopbackOnlyProxy');
+    expect(fixturesSrc).toContain("loopbackGuardMode: ['route'");
+    expect(pwaSpecSrc).toContain("loopbackGuardMode: 'proxy'");
+    expect(pwaSpecSrc).toContain('cache-control-check');
+  });
+
+  it('disables Chromium implicit non-loopback bypasses with <-loopback> before allowing only intended loopback hosts', async () => {
+    expect(LOOPBACK_PROXY_BYPASS.split(',')).toEqual([
+      '<-loopback>',
+      '127.0.0.1',
+      'localhost',
+      '[::1]',
+    ]);
+
+    const proxy = await createLoopbackOnlyProxy();
+    try {
+      expect(proxy.proxyConfig.bypass).toBe(
+        '<-loopback>,127.0.0.1,localhost,[::1]',
+      );
+      const serverUrl = new URL(proxy.proxyConfig.server);
+      const linkLocalStatus = await new Promise<number>(
+        (resolveStatus, reject) => {
+          const req = httpRequest({
+            host: serverUrl.hostname,
+            port: Number(serverUrl.port),
+            method: 'CONNECT',
+            path: '169.254.0.1:443',
+          });
+          req.on('connect', (res, socket) => {
+            socket.destroy();
+            resolveStatus(res.statusCode ?? 0);
+          });
+          req.on('error', reject);
+          req.end();
+        },
+      );
+      expect(linkLocalStatus).toBe(403);
+      expect(proxy.blockedRequests).toContain('CONNECT 169.254.0.1:443');
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('pwa-shell proxy guard exposes blockedRequests and asserts the proxy receives blocked probes', () => {
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const fixturesSrc = readFileSync(resolve(dir, 'fixtures.ts'), 'utf8');
+    const pwaSpecSrc = readFileSync(resolve(dir, 'pwa-shell.spec.ts'), 'utf8');
+    expect(fixturesSrc).toContain('loopbackGuardProxy');
+    expect(pwaSpecSrc).toContain('loopbackGuardProxy');
+    expect(pwaSpecSrc).toContain('blockedRequests');
+    expect(pwaSpecSrc).toContain('CONNECT example.invalid:443');
+    expect(pwaSpecSrc).toContain('CONNECT 169.254.0.1:443');
   });
 });
 

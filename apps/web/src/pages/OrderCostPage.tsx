@@ -4,6 +4,11 @@ import { loadOrderCost } from '@/accounting/api';
 import { OrderCostDetail } from '@/accounting/OrderCostDetail';
 import type { OrderCostDetail as OrderCostDetailData } from '@/accounting/types';
 import { messageFrom } from '@/items/errors';
+import {
+  isOnline,
+  offlineMoneyMessage,
+  useReconnectReload,
+} from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 
 export function OrderCostPage() {
@@ -22,7 +27,14 @@ export function OrderCostPage() {
   }
   const seqRef = useRef(0);
 
+  const online = useReconnectReload(() => {
+    setLoading(true);
+    setLoadError(null);
+    setLoadId((value) => value + 1);
+  });
+
   useEffect(() => {
+    if (!isOnline()) return;
     const seq = ++seqRef.current;
     let cancelled = false;
     void (async () => {
@@ -51,8 +63,9 @@ export function OrderCostPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">تكلفة الطلب</h1>
-      {loading && detail === null ? <p>جاري تحميل التكلفة…</p> : null}
-      {loadError ? (
+      {!online ? <p role="status">{offlineMoneyMessage}</p> : null}
+      {online && loading && detail === null ? <p>جاري تحميل التكلفة…</p> : null}
+      {online && loadError ? (
         <>
           <p>{loadError}</p>
           <button
@@ -64,7 +77,7 @@ export function OrderCostPage() {
           </button>
         </>
       ) : null}
-      {detail ? <OrderCostDetail detail={detail} /> : null}
+      {online && detail ? <OrderCostDetail detail={detail} /> : null}
     </main>
   );
 }

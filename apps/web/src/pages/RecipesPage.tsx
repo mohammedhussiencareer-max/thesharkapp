@@ -1,8 +1,19 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
-import { subscribeHeldWrites, unknownAction } from '@/items/request-id';
+import {
+  clearActionPostedReloadSnapshot,
+  hasDurableAction,
+  snapshotActionPostedReloads,
+  subscribeHeldWrites,
+  unknownAction,
+} from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import {
+  listHeldWritesByPrefix,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
 import { createRecipe, listRecipes } from '@/recipes/api';
 import {
@@ -21,13 +32,38 @@ import { validateRecipeName } from '@/recipes/validation';
 
 const fieldClass = 'w-full rounded border border-neutral-300 px-3 py-2';
 
+const recipeCreatePrefix = 'recipe-create:';
+
 type Draft = { name: string; kind: RecipeKind };
+
+function firstUnknownRecipeCreate(): Draft | null {
+  for (const record of listHeldWritesByPrefix(recipeCreatePrefix)) {
+    if (record.phase !== 'unknown') continue;
+    try {
+      const parsed: unknown = JSON.parse(
+        record.subject.slice(recipeCreatePrefix.length),
+      );
+      if (
+        Array.isArray(parsed) &&
+        typeof parsed[0] === 'string' &&
+        typeof parsed[1] === 'string' &&
+        isRecipeKind(parsed[1])
+      ) {
+        return { name: parsed[0], kind: parsed[1] };
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
 
 function isKindFilter(value: string): value is 'all' | RecipeKind {
   return value === 'all' || isRecipeKind(value);
 }
 
 export function RecipesPage() {
+  const online = useOnline();
   const navigate = useNavigate();
   const [recipes, setRecipes] = useState<RecipeSummary[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -42,13 +78,15 @@ export function RecipesPage() {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const flight = useRef(false);
+  const restored = heldEpoch < 0 ? null : firstUnknownRecipeCreate();
+  const activeDraft = submitted ?? restored;
   const held =
-    submitted === null || heldEpoch < 0
+    activeDraft === null || heldEpoch < 0
       ? null
       : unknownAction<string>(
-          recipeCreateSubject(submitted.name, submitted.kind),
+          recipeCreateSubject(activeDraft.name, activeDraft.kind),
         );
-  const formDisabled = creating || held !== null;
+  const formDisabled = creating || held !== null || !online;
 
   useEffect(
     () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
@@ -57,12 +95,16 @@ export function RecipesPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const pendingReloads = snapshotActionPostedReloads({
+      prefix: recipeCreatePrefix,
+    });
     void (async () => {
       try {
         const next = await listRecipes();
         if (cancelled) return;
         setRecipes(next);
         setLoadError(null);
+        await clearActionPostedReloadSnapshot(pendingReloads);
       } catch (error) {
         if (!cancelled) setLoadError(messageFrom(error));
       } finally {
@@ -80,8 +122,18 @@ export function RecipesPage() {
     setLoadId((value) => value + 1);
   }
 
-  async function send(draft: Draft) {
-    if (flight.current) return;
+  async function send(draft: Draft, replayRequestId?: string) {
+    if (flight.current || !isOnline()) return;
+    if (
+      replayRequestId !== undefined &&
+      !hasDurableAction(
+        recipeCreateSubject(draft.name, draft.kind),
+        replayRequestId,
+      )
+    ) {
+      setCreateError(storageWriteFailedMessage);
+      return;
+    }
     flight.current = true;
     setCreating(true);
     setCreateError(null);
@@ -125,6 +177,7 @@ export function RecipesPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الوصفات</h1>
+      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
       <p>
         <Link className="underline" to="/recipes/import">
           استيراد الوصفات
@@ -187,10 +240,10 @@ export function RecipesPage() {
                 ))}
               </select>
             </label>
-            {held && submitted ? (
+            {held && activeDraft ? (
               <UnknownSave
                 disabled={creating}
-                onRetry={() => void send(submitted)}
+                onRetry={() => void send(activeDraft, held)}
               />
             ) : null}
             {createError ? <p role="alert">{createError}</p> : null}

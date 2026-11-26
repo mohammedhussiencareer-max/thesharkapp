@@ -2,14 +2,25 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { currentMinuteMs } from '@/items/effective';
 import { messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  abortActionBeforeDispatch,
+  canDispatchAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearActionPostedReload,
   hasAction,
+  hasDurableAction,
+  markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
+import {
+  captureWriteSession,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { setRecipeVersion } from '@/recipes/api';
 import { sourceChangedMessage } from '@/recipes/labels';
 import { LinesTable } from '@/recipes/LinesTable';
@@ -52,16 +63,17 @@ export function VersionEditor({
   /** Another section of the page is saving. */
   locked: boolean;
   onBusyChange: (busy: boolean) => void;
-  /** Re-reads the schedule. Never rejects; the page shows its own load error. */
-  onReload: () => Promise<void>;
+  /** Re-reads the schedule. Returning false or rejecting keeps `posted_reload` held. */
+  onReload: () => Promise<boolean | void>;
 }) {
+  const online = useOnline();
   const subject = recipeVersionSubject(recipe.id);
   const [mountNow] = useState(() => currentMinuteMs(Date.now()));
   const [heldEpoch, setHeldEpoch] = useState(0);
   const [saving, setSaving] = useState(false);
   const flight = useRef(false);
   const held = heldEpoch < 0 ? null : unknownAction<VersionAction>(subject);
-  const disabled = locked || saving || held !== null;
+  const disabled = locked || saving || held !== null || !online;
   const timing = useDatedTiming(
     undefined,
     catalog.shiftStart,
@@ -98,16 +110,61 @@ export function VersionEditor({
     [],
   );
 
-  async function finish(action: VersionAction) {
-    if (flight.current) return;
+  async function finish(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => VersionAction }
+      | { kind: 'replay'; action: VersionAction },
+  ) {
+    if (flight.current || !isOnline()) return;
+    const session = captureWriteSession();
     flight.current = true;
     setSaving(true);
     onBusyChange(true);
     setError(null);
     setNotice(null);
+    let releaseLock = () => {};
+    let saved = false;
+    let requestId: string | null = null;
     try {
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<VersionAction>(subject, mode.create, {
+              session,
+            })
+          : await claimReplayAction<VersionAction>(
+              subject,
+              mode.action.write.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setError(offlineWriteMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+      const action = claim.record.payload;
+      requestId = claim.record.requestId;
+      if (!canDispatchAction(subject, requestId, session)) {
+        const durable = hasDurableAction(subject, requestId);
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        if (!durable) setError(storageWriteFailedMessage);
+        else if (!isOnline()) setError(offlineWriteMessage);
+        return;
+      }
       await setRecipeVersion(action.recipeId, action.write);
-      settleAction(subject, action.write.requestId);
+      saved = true;
+      markActionPostedReload(subject, requestId, subject);
+      releaseLock();
+      releaseLock = () => {};
       setDirty(false);
       setConfirmStop(false);
       timing.refreshClock();
@@ -116,12 +173,20 @@ export function VersionEditor({
           ? 'الوصفة اتوقفت من الوقت ده'
           : 'نسخة الوصفة اتحفظت',
       );
-      await onReload();
+      const reloaded = await onReload();
+      if (reloaded !== false) {
+        await clearActionPostedReload(subject, subject, requestId);
+      }
     } catch (failure) {
-      settleAction(subject, action.write.requestId, failure);
+      if (!saved && requestId !== null) {
+        settleAction(subject, requestId, failure);
+      }
       setError(messageFrom(failure));
-      if (!hasAction(subject)) await onReload();
+      releaseLock();
+      releaseLock = () => {};
+      if (!saved && requestId !== null && !hasAction(subject)) await onReload();
     } finally {
+      releaseLock();
       flight.current = false;
       setSaving(false);
       onBusyChange(false);
@@ -155,20 +220,22 @@ export function VersionEditor({
       return;
     }
     setError(null);
-    const action = beginAction<VersionAction>(subject, (requestId) => ({
-      recipeId: recipe.id,
-      write: {
-        requestId,
-        effectiveFrom: built.write.effectiveFrom,
-        effectiveTo: built.write.effectiveTo,
-        batchQty: batch?.batchQty ?? null,
-        batchUnit: batch?.batchUnit ?? null,
-        lines,
-        reason: built.write.reason,
-        token: built.write.token,
-      },
-    }));
-    void finish(action);
+    void finish({
+      kind: 'fresh',
+      create: (requestId) => ({
+        recipeId: recipe.id,
+        write: {
+          requestId,
+          effectiveFrom: built.write.effectiveFrom,
+          effectiveTo: built.write.effectiveTo,
+          batchQty: batch?.batchQty ?? null,
+          batchUnit: batch?.batchUnit ?? null,
+          lines,
+          reason: built.write.reason,
+          token: built.write.token,
+        },
+      }),
+    });
   }
 
   function onSubmit(event: FormEvent<HTMLFormElement>) {
@@ -193,7 +260,7 @@ export function VersionEditor({
 
   function retry() {
     if (!held || locked || flight.current) return;
-    void finish(held);
+    void finish({ kind: 'replay', action: held });
   }
 
   const batchUnits =

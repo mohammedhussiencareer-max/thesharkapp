@@ -1,14 +1,20 @@
-import type { Json } from '@/lib/database.types';
+import { pendingResendMessage } from '@/counts/errors';
 import type { PendingCount } from '@/counts/types';
-import { formatCairoDateTime } from '@/purchases/time';
+import type { Json } from '@/lib/database.types';
 import { primaryButton } from '@/lib/page-style';
+import { formatCairoDateTime } from '@/purchases/time';
+
+export type PendingCountEntry = PendingCount & {
+  /** Local unknown retry pin whose server reply was lost. */
+  unknown?: boolean;
+};
 
 export function PendingCounts({
   counts,
   disabled,
   onResend,
 }: {
-  counts: readonly PendingCount[];
+  counts: readonly PendingCountEntry[];
   disabled: boolean;
   onResend: (payload: Json) => void;
 }) {
@@ -17,7 +23,9 @@ export function PendingCounts({
     <section className="flex flex-col gap-3">
       <h2 className="text-lg font-semibold">جرد مستني المزامنة</h2>
       {counts.map((count) => {
-        const when = formatCairoDateTime(count.countedAt);
+        const when = count.countedAt
+          ? formatCairoDateTime(count.countedAt)
+          : count.requestId;
         return (
           <article
             key={count.requestId}
@@ -26,6 +34,7 @@ export function PendingCounts({
           >
             <p>{when}</p>
             <p>{`الأصناف ${count.itemCount}`}</p>
+            {count.unknown ? <p>{pendingResendMessage}</p> : null}
             <button
               className={primaryButton}
               type="button"

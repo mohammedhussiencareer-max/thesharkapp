@@ -11,7 +11,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   addExpenseCategory,
   addExpenseEntry,
+  hasExpenseVoidRequest,
   loadExpenseMonth,
+  loadExpenseRequestMonth,
   renameExpenseCategory,
   setExpenseCategoryActive,
   setMonthExpenseComplete,
@@ -20,6 +22,7 @@ import {
 import type {
   AllocationDay,
   ExpenseCategory,
+  ExpenseDraft,
   ExpenseLine,
   ExpenseMonth,
 } from '@/expenses/types';
@@ -29,13 +32,22 @@ import {
   retrySafeMessage,
 } from '@/expenses/errors';
 import { genericCatalogError } from '@/items/errors';
-import { formatMonth } from '@/lib/cairo';
+import { cairoMonthInput, formatMonth } from '@/lib/cairo';
+import {
+  getHeldWrite,
+  hasPostedReload,
+  putHeldWrite,
+  rehydrateHeldWritesAsync,
+  resetHeldWritesStore,
+} from '@/lib/held-writes';
 import { formatEgpText } from '@/lib/money';
 import { ExpensesPage } from '@/pages/ExpensesPage';
 
 vi.mock('@/expenses/api', () => ({
   loadExpenseMonth: vi.fn(),
   addExpenseEntry: vi.fn(),
+  hasExpenseVoidRequest: vi.fn(),
+  loadExpenseRequestMonth: vi.fn(),
   voidExpenseEntry: vi.fn(),
   addExpenseCategory: vi.fn(),
   renameExpenseCategory: vi.fn(),
@@ -127,6 +139,10 @@ describe('ExpensesPage', () => {
       Promise.resolve(monthData(monthStart)),
     );
     vi.mocked(addExpenseEntry).mockResolvedValue(undefined);
+    vi.mocked(hasExpenseVoidRequest).mockReset();
+    vi.mocked(hasExpenseVoidRequest).mockResolvedValue(false);
+    vi.mocked(loadExpenseRequestMonth).mockReset();
+    vi.mocked(loadExpenseRequestMonth).mockResolvedValue(null);
     vi.mocked(voidExpenseEntry).mockResolvedValue(undefined);
     vi.mocked(setMonthExpenseComplete).mockResolvedValue(undefined);
     vi.mocked(addExpenseCategory).mockResolvedValue(undefined);
@@ -377,7 +393,7 @@ describe('ExpensesPage', () => {
     const [first, second, third] = vi.mocked(addExpenseEntry).mock.calls;
     expect(second?.[0]).toEqual(first?.[0]);
     expect(third?.[0]).toMatchObject({ amount: '2000.00' });
-    expect(third?.[0]?.requestId).toBe(first?.[0]?.requestId);
+    expect(third?.[0]?.requestId).not.toBe(first?.[0]?.requestId);
   });
 
   it('clears a pinned expense after that payload succeeds', async () => {
@@ -948,7 +964,7 @@ describe('ExpensesPage', () => {
     const [first, second, third] = vi.mocked(voidExpenseEntry).mock.calls;
     expect(second).toEqual(first);
     expect(third?.[1]).toBe('سبب صحيح');
-    expect(third?.[2]).toBe(first?.[2]);
+    expect(third?.[2]).not.toBe(first?.[2]);
   });
 
   it('clears a pinned void after the same payload succeeds', async () => {
@@ -1134,5 +1150,616 @@ describe('ExpensesPage', () => {
     await waitFor(() =>
       expect(addExpenseCategory).toHaveBeenCalledWith('كهربا', 'daily'),
     );
+  });
+
+  it('P2: void replay from another month verifies the original target month without overwriting displayed month and keeps verification available when that read fails', async () => {
+    const aprilEntry = entry({
+      id: 'exp-april',
+      periodMonth: '2030-04-01',
+      note: 'مصروف أبريل',
+    });
+    const mayEntry = entry({
+      id: 'exp-may',
+      periodMonth: '2030-05-01',
+      note: 'مصروف مايو',
+    });
+    vi.mocked(loadExpenseMonth).mockImplementation((targetMonth) => {
+      if (targetMonth === '2030-04-01') {
+        return Promise.resolve(
+          monthData('2030-04-01', { entries: [aprilEntry] }),
+        );
+      }
+      if (targetMonth === '2030-05-01') {
+        return Promise.resolve(
+          monthData('2030-05-01', { entries: [mayEntry] }),
+        );
+      }
+      return Promise.resolve(monthData(targetMonth, { entries: [] }));
+    });
+    renderPage();
+
+    const picker = await screen.findByLabelText('الشهر');
+    fireEvent.change(picker, { target: { value: '2030-04' } });
+    expect(await screen.findByText('مصروف أبريل')).toBeInTheDocument();
+
+    // Start void on April entry and drop reply so it stays pinned unknown.
+    vi.mocked(voidExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'إلغاء المصروف' }));
+    fireEvent.change(screen.getByLabelText('سبب الإلغاء'), {
+      target: { value: 'تكرار أبريل' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'تأكيد الإلغاء' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      retrySafeMessage,
+    );
+
+    // Switch displayed month to May; pinned April card stays visible for replay.
+    fireEvent.change(screen.getByLabelText('الشهر'), {
+      target: { value: '2030-05' },
+    });
+    expect(await screen.findByText('مصروف مايو')).toBeInTheDocument();
+    const aprilCard = screen.getByRole('article', {
+      name: 'إيجار 1000.00 ج.م أبريل 2030',
+    });
+
+    // Replay void from May: void succeeds, first verification read for April fails, second succeeds.
+    vi.mocked(voidExpenseEntry).mockResolvedValueOnce(undefined);
+    let aprilVerifyCalls = 0;
+    vi.mocked(loadExpenseMonth).mockImplementation((targetMonth) => {
+      if (targetMonth === '2030-04-01') {
+        aprilVerifyCalls += 1;
+        if (aprilVerifyCalls === 1) {
+          return Promise.reject(new Error('تعذر تحميل أبريل'));
+        }
+        return Promise.resolve(
+          monthData('2030-04-01', {
+            entries: [
+              { ...aprilEntry, voided: true, voidReason: 'تكرار أبريل' },
+            ],
+          }),
+        );
+      }
+      if (targetMonth === '2030-05-01') {
+        return Promise.resolve(
+          monthData('2030-05-01', { entries: [mayEntry] }),
+        );
+      }
+      return Promise.resolve(monthData(targetMonth, { entries: [] }));
+    });
+
+    fireEvent.click(
+      within(aprilCard).getByRole('button', { name: 'إلغاء المصروف' }),
+    );
+    fireEvent.click(
+      within(aprilCard).getByRole('button', { name: 'تأكيد الإلغاء' }),
+    );
+
+    await waitFor(() => {
+      expect(aprilVerifyCalls).toBe(1);
+    });
+    // April posted_reload pin stays held because April read failed, and verification button is visible.
+    expect(hasPostedReload('expense:void:exp-april', '2030-04-01')).toBe(true);
+    const verifyBtn = await screen.findByRole('button', { name: 'تحقق تاني' });
+    expect(verifyBtn).toBeEnabled();
+    // Displayed month is still May and shows May's entry.
+    expect(screen.getByText('مصروف مايو')).toBeInTheDocument();
+
+    fireEvent.click(verifyBtn);
+    await waitFor(() => {
+      expect(hasPostedReload('expense:void:exp-april', '2030-04-01')).toBe(
+        false,
+      );
+    });
+    expect(aprilVerifyCalls).toBe(2);
+    // Visible data still shows May, NOT overwritten with April's entries.
+    expect(screen.getByText('مصروف مايو')).toBeInTheDocument();
+    expect(screen.queryByText('مصروف أبريل')).toBeNull();
+  });
+
+  it('P2 item 1a: stale expense retry sends claim.record.payload instead of stale render draft', async () => {
+    vi.mocked(addExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    renderPage();
+    await saveRent('1000');
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    // Update the durable expense:new record in localStorage without firing a
+    // storage event so this tab's React state still holds the stale draft.
+    let updatedKey: string | null = null;
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const k = localStorage.key(i);
+      if (!k || !k.includes(encodeURIComponent('expense:new'))) continue;
+      const raw = localStorage.getItem(k);
+      if (!raw) continue;
+      const parsed = JSON.parse(raw) as {
+        payload: Record<string, unknown>;
+      };
+      parsed.payload = { ...parsed.payload, note: 'من التاب الأول' };
+      localStorage.setItem(k, JSON.stringify(parsed));
+      updatedKey = k;
+    }
+    expect(updatedKey).not.toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(addExpenseEntry).mock.calls[1]?.[0]).toMatchObject({
+      note: 'من التاب الأول',
+    });
+  });
+
+  it('P2 item 1b: request_id mismatch refusal does not blindly clear the recovery pin', async () => {
+    vi.mocked(addExpenseEntry)
+      .mockRejectedValueOnce(new Error(retrySafeMessage))
+      .mockRejectedValueOnce(
+        new Error(
+          'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع مصاريف الشهر قبل ما تسجّل تاني',
+          {
+            cause: {
+              code: '22023',
+              message: 'request_id already used for a different expense',
+            },
+          },
+        ),
+      );
+    renderPage();
+    await saveRent('1000');
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع مصاريف الشهر قبل ما تسجّل تاني',
+    );
+    // Recovery pin must NOT be blindly erased on a request_id mismatch.
+    expect(
+      getHeldWrite('expense:new') !== null || hasPostedReload('expense:new'),
+    ).toBe(true);
+  });
+
+  it('reads the stored month of the exact sibling expense before dispatching a void replay', async () => {
+    const sibling = 'legacy-add';
+    const target = '2030-04-01';
+    putHeldWrite('expense:new', {
+      requestId: sibling,
+      phase: 'unknown',
+      kind: 'expense',
+      payload: {
+        requestId: sibling,
+        categoryId: 'rent',
+        amount: '1000',
+        periodMonth: '2030-05-01',
+        expenseDate: null,
+        paidOn: null,
+        isEstimate: false,
+        note: null,
+        hours: null,
+        hourlyRate: null,
+        driverLabel: null,
+      } satisfies ExpenseDraft,
+    });
+    const subject = 'expense:void:detached-1';
+    putHeldWrite(subject, {
+      requestId: 'legacy-void',
+      phase: 'unknown',
+      kind: 'expense_void',
+      payload: {
+        id: 'detached-1',
+        requestId: 'legacy-void',
+        reason: 'تكرار',
+        targetMonth: target,
+      },
+    });
+    renderPage();
+    const retry = await screen.findByRole('button', {
+      name: 'إعادة محاولة الإلغاء',
+    });
+    await waitFor(() => expect(retry).toBeEnabled());
+    vi.mocked(loadExpenseRequestMonth).mockResolvedValue(target);
+    vi.mocked(loadExpenseMonth).mockRejectedValueOnce(
+      new Error('month readback failed'),
+    );
+    await act(async () => {
+      fireEvent.click(retry);
+      await Promise.resolve();
+    });
+    expect(voidExpenseEntry).not.toHaveBeenCalled();
+    expect(loadExpenseRequestMonth).toHaveBeenCalledExactlyOnceWith(sibling);
+    expect(loadExpenseMonth).toHaveBeenLastCalledWith(target);
+    expect(getHeldWrite('expense:new')).toMatchObject({
+      phase: 'unknown',
+      requestId: sibling,
+    });
+    expect(getHeldWrite(subject)).toMatchObject({
+      phase: 'unknown',
+      requestId: 'legacy-void',
+    });
+
+    fireEvent.click(retry);
+    await waitFor(() => {
+      expect(voidExpenseEntry).toHaveBeenCalledExactlyOnceWith(
+        'detached-1',
+        'تكرار',
+        'legacy-void',
+      );
+      expect(getHeldWrite('expense:new')).toBeNull();
+      expect(getHeldWrite(subject)).toBeNull();
+    });
+  });
+
+  it('refreshes the displayed expense month from sibling verification when the replay fails', async () => {
+    const displayedMonth = `${cairoMonthInput()}-01`;
+    const sibling = 'legacy-add';
+    putHeldWrite('expense:new', {
+      requestId: sibling,
+      phase: 'unknown',
+      kind: 'expense',
+      payload: {
+        requestId: sibling,
+        categoryId: 'rent',
+        amount: '1000',
+        periodMonth: displayedMonth,
+        expenseDate: null,
+        paidOn: null,
+        isEstimate: false,
+        note: null,
+        hours: null,
+        hourlyRate: null,
+        driverLabel: null,
+      } satisfies ExpenseDraft,
+    });
+    const subject = 'expense:void:detached-1';
+    putHeldWrite(subject, {
+      requestId: 'legacy-void',
+      phase: 'unknown',
+      kind: 'expense_void',
+      payload: {
+        id: 'detached-1',
+        requestId: 'legacy-void',
+        reason: 'تكرار',
+        targetMonth: '2030-05-01',
+      },
+    });
+    renderPage();
+    const retry = await screen.findByRole('button', {
+      name: 'إعادة محاولة الإلغاء',
+    });
+    await waitFor(() => expect(retry).toBeEnabled());
+    expect(screen.queryByText('مصروف اتأكد بعد القراءة')).toBeNull();
+
+    vi.mocked(loadExpenseRequestMonth).mockResolvedValueOnce(displayedMonth);
+    vi.mocked(loadExpenseMonth).mockClear();
+    vi.mocked(loadExpenseMonth).mockResolvedValueOnce(
+      monthData(displayedMonth, {
+        entries: [
+          entry({
+            periodMonth: displayedMonth,
+            note: 'مصروف اتأكد بعد القراءة',
+          }),
+        ],
+      }),
+    );
+    vi.mocked(voidExpenseEntry).mockRejectedValueOnce(
+      new Error(retrySafeMessage),
+    );
+    await act(async () => {
+      fireEvent.click(retry);
+      await Promise.resolve();
+    });
+    expect(loadExpenseRequestMonth).toHaveBeenCalledExactlyOnceWith(sibling);
+    expect(loadExpenseMonth).toHaveBeenCalledExactlyOnceWith(displayedMonth);
+    expect(voidExpenseEntry).toHaveBeenCalledExactlyOnceWith(
+      'detached-1',
+      'تكرار',
+      'legacy-void',
+    );
+    expect(getHeldWrite('expense:new')).toBeNull();
+    expect(getHeldWrite(subject)).toMatchObject({
+      phase: 'unknown',
+      requestId: 'legacy-void',
+    });
+    expect(screen.queryByText('مصروف اتأكد بعد القراءة')).toBeInTheDocument();
+  });
+
+  it('shows the selected month when sibling verification fails after navigation starts', async () => {
+    const selected = cairoMonthInput() === '2030-04' ? '2030-05' : '2030-04';
+    const target = `${selected}-01`;
+    const sibling = 'legacy-add';
+    putHeldWrite('expense:new', {
+      requestId: sibling,
+      phase: 'unknown',
+      kind: 'expense',
+      payload: {
+        requestId: sibling,
+        categoryId: 'rent',
+        amount: '1000',
+        periodMonth: target,
+        expenseDate: null,
+        paidOn: null,
+        isEstimate: false,
+        note: null,
+        hours: null,
+        hourlyRate: null,
+        driverLabel: null,
+      } satisfies ExpenseDraft,
+    });
+    const subject = 'expense:void:detached-1';
+    putHeldWrite(subject, {
+      requestId: 'legacy-void',
+      phase: 'unknown',
+      kind: 'expense_void',
+      payload: {
+        id: 'detached-1',
+        requestId: 'legacy-void',
+        reason: 'تكرار',
+        targetMonth: target,
+      },
+    });
+
+    let finishLookup!: (month: string) => void;
+    vi.mocked(loadExpenseRequestMonth).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishLookup = resolve;
+        }),
+    );
+    renderPage();
+    const retry = await screen.findByRole('button', {
+      name: 'إعادة محاولة الإلغاء',
+    });
+    await waitFor(() => expect(retry).toBeEnabled());
+    fireEvent.click(retry);
+    await waitFor(() =>
+      expect(loadExpenseRequestMonth).toHaveBeenCalledExactlyOnceWith(sibling),
+    );
+
+    let finishNavigation!: (month: ExpenseMonth) => void;
+    let failVerification!: (error: Error) => void;
+    vi.mocked(loadExpenseMonth)
+      .mockClear()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishNavigation = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            failVerification = reject;
+          }),
+      );
+    fireEvent.change(screen.getByLabelText('الشهر'), {
+      target: { value: selected },
+    });
+    await waitFor(() =>
+      expect(loadExpenseMonth).toHaveBeenCalledExactlyOnceWith(target),
+    );
+    await act(async () => {
+      finishLookup(target);
+      await Promise.resolve();
+    });
+    expect(vi.mocked(loadExpenseMonth).mock.calls).toEqual([
+      [target],
+      [target],
+    ]);
+
+    await act(async () => {
+      failVerification(new Error('month verification failed'));
+      finishNavigation(
+        monthData(target, {
+          entries: [
+            entry({ periodMonth: target, note: 'مصروف الشهر المختار' }),
+          ],
+        }),
+      );
+      await Promise.resolve();
+    });
+    expect(screen.queryByText('مصروف الشهر المختار')).toBeInTheDocument();
+    expect(screen.queryByText('جاري تحميل المصاريف…')).not.toBeInTheDocument();
+    expect(voidExpenseEntry).not.toHaveBeenCalled();
+    expect(getHeldWrite('expense:new')).toMatchObject({
+      phase: 'unknown',
+      requestId: sibling,
+    });
+    expect(getHeldWrite(subject)).toMatchObject({
+      phase: 'unknown',
+      requestId: 'legacy-void',
+    });
+  });
+
+  it('keeps an unknown void after quota and reload until its exact request is independently verified', async () => {
+    const subject = 'expense:void:entry-1';
+    const quota = vi.spyOn(Storage.prototype, 'setItem');
+    const view = renderPage();
+    try {
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'إلغاء المصروف' }),
+      );
+      fireEvent.change(screen.getByLabelText('سبب الإلغاء'), {
+        target: { value: 'تكرار' },
+      });
+      vi.mocked(voidExpenseEntry).mockImplementationOnce(() => {
+        quota.mockImplementation(() => {
+          throw new DOMException('storage full', 'QuotaExceededError');
+        });
+        return Promise.reject(
+          new Error('request_id mismatch', {
+            cause: {
+              code: '22023',
+              message: 'request_id already used for a different expense',
+            },
+          }),
+        );
+      });
+      vi.mocked(loadExpenseRequestMonth).mockRejectedValueOnce(
+        new Error('lookup failed'),
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'تأكيد الإلغاء' }));
+        await Promise.resolve();
+      });
+    } finally {
+      quota.mockRestore();
+    }
+    const requestId = vi.mocked(voidExpenseEntry).mock.lastCall?.[2];
+    expect(requestId).toBeDefined();
+    expect(loadExpenseRequestMonth).toHaveBeenCalledWith(requestId);
+
+    view.unmount();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
+    expect(getHeldWrite(subject)).toMatchObject({
+      phase: 'unknown',
+      requestId,
+    });
+    expect(
+      getHeldWrite<{ awaitingRequestMonth?: true }>(subject)?.payload
+        .awaitingRequestMonth,
+    ).toBeUndefined();
+
+    vi.mocked(loadExpenseMonth).mockImplementation((month) =>
+      Promise.resolve(monthData(month, { entries: [entry({ voided: true })] })),
+    );
+    const reloaded = renderPage();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(await screen.findByText('ملغي')).toBeInTheDocument();
+    expect(getHeldWrite(subject)).toMatchObject({
+      phase: 'unknown',
+      requestId,
+    });
+    expect(hasExpenseVoidRequest).toHaveBeenCalledWith(requestId, 'entry-1');
+
+    reloaded.unmount();
+    vi.mocked(hasExpenseVoidRequest).mockResolvedValueOnce(true);
+    renderPage();
+    await waitFor(() => expect(getHeldWrite(subject)).toBeNull());
+    expect(voidExpenseEntry).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['add', '2030-05-01'],
+    ['void', '2030-05-01'],
+    ['add', null],
+    ['void', null],
+  ])(
+    'verifies a mismatched expense %s in its stored month (%s)',
+    async (operation, storedMonth) => {
+      const subject =
+        operation === 'add' ? 'expense:new' : 'expense:void:entry-1';
+      const mismatch = new Error('request_id mismatch', {
+        cause: {
+          code: '22023',
+          message: 'request_id already used for a different expense',
+        },
+      });
+      if (storedMonth) {
+        vi.mocked(loadExpenseRequestMonth).mockResolvedValueOnce(storedMonth);
+      } else {
+        vi.mocked(loadExpenseRequestMonth).mockRejectedValueOnce(
+          new Error('lookup failed'),
+        );
+      }
+      renderPage();
+      await screen.findByText('إيجار الاختبار');
+      fireEvent.change(screen.getByLabelText('الشهر'), {
+        target: { value: '2030-04' },
+      });
+      await waitFor(() =>
+        expect(loadExpenseMonth).toHaveBeenCalledWith('2030-04-01'),
+      );
+      await waitFor(() =>
+        expect(
+          screen.getByRole('button', { name: 'إلغاء المصروف' }),
+        ).toBeEnabled(),
+      );
+      vi.mocked(loadExpenseMonth).mockClear();
+
+      let requestId: string | undefined;
+      if (operation === 'add') {
+        vi.mocked(addExpenseEntry).mockRejectedValueOnce(mismatch);
+        await act(async () => saveRent());
+        requestId = vi.mocked(addExpenseEntry).mock.lastCall?.[0].requestId;
+      } else {
+        vi.mocked(voidExpenseEntry).mockRejectedValueOnce(mismatch);
+        fireEvent.click(screen.getByRole('button', { name: 'إلغاء المصروف' }));
+        fireEvent.change(screen.getByLabelText('سبب الإلغاء'), {
+          target: { value: 'تكرار' },
+        });
+        await act(async () => {
+          fireEvent.click(
+            screen.getByRole('button', { name: 'تأكيد الإلغاء' }),
+          );
+          await Promise.resolve();
+        });
+        requestId = vi.mocked(voidExpenseEntry).mock.lastCall?.[2];
+      }
+      expect(requestId).toBeDefined();
+      expect(hasPostedReload(subject, '2030-04-01', requestId)).toBe(false);
+      expect(loadExpenseRequestMonth).toHaveBeenCalledWith(requestId);
+      if (!storedMonth) {
+        expect(getHeldWrite(subject)).toMatchObject({
+          phase: 'unknown',
+          requestId,
+        });
+        expect(loadExpenseMonth).not.toHaveBeenCalled();
+        if (operation === 'void') {
+          vi.mocked(loadExpenseMonth).mockImplementation((month) =>
+            Promise.resolve(
+              monthData(month, {
+                entries: [entry({ voided: month === '2030-04-01' })],
+              }),
+            ),
+          );
+          const picker = screen.getByLabelText('الشهر');
+          await act(async () => {
+            fireEvent.change(picker, { target: { value: '2030-05' } });
+            await Promise.resolve();
+          });
+          await act(async () => {
+            fireEvent.change(picker, { target: { value: '2030-04' } });
+            await Promise.resolve();
+          });
+          expect(loadExpenseMonth).toHaveBeenLastCalledWith('2030-04-01');
+          expect(getHeldWrite(subject)).toMatchObject({
+            phase: 'unknown',
+            requestId,
+          });
+        }
+        return;
+      }
+      expect(hasPostedReload(subject, storedMonth, requestId)).toBe(true);
+      expect(loadExpenseMonth).not.toHaveBeenCalled();
+      fireEvent.click(await screen.findByRole('button', { name: 'تحقق تاني' }));
+      await waitFor(() => {
+        expect(hasPostedReload(subject, storedMonth, requestId)).toBe(false);
+      });
+      expect(loadExpenseMonth).toHaveBeenCalledExactlyOnceWith(storedMonth);
+    },
+  );
+
+  it('P2 item 1c: definitive refusal of an unknown expense mints a new request id for the next submit', async () => {
+    vi.mocked(addExpenseEntry)
+      .mockRejectedValueOnce(new Error(retrySafeMessage))
+      .mockRejectedValueOnce(phoneRefusal());
+    renderPage();
+    await saveRent('1000');
+    expect(await screen.findByText(pendingResendMessage)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(phoneMessage);
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(2));
+
+    fireEvent.change(screen.getByLabelText('المبلغ'), {
+      target: { value: '2000' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'حفظ المصروف' }));
+    await waitFor(() => expect(addExpenseEntry).toHaveBeenCalledTimes(3));
+    const [first, , third] = vi.mocked(addExpenseEntry).mock.calls;
+    expect(third?.[0]?.requestId).not.toBe(first?.[0]?.requestId);
   });
 });

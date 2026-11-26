@@ -3,9 +3,11 @@ import { Link } from 'react-router-dom';
 export function HomePage({
   email,
   onSignOut,
+  logoutPending = false,
 }: {
   email: string;
   onSignOut: () => void;
+  logoutPending?: boolean;
 }) {
   return (
     <main className="mx-auto flex min-h-dvh max-w-lg flex-col gap-2 ps-4 pe-4 pt-8 text-start">
@@ -90,7 +92,7 @@ export function HomePage({
       >
         الهالك
       </Link>
-      <button type="button" onClick={onSignOut}>
+      <button type="button" disabled={logoutPending} onClick={onSignOut}>
         تسجيل الخروج
       </button>
     </main>

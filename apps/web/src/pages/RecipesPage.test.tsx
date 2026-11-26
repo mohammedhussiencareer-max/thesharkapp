@@ -8,7 +8,7 @@ import {
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  beginAction,
+  claimFreshAction,
   hasAction,
   resetHeldWrites,
   settleAction,
@@ -242,12 +242,18 @@ describe('RecipesPage', () => {
 
   it('locks the form after an unknown outcome and retries the same create only', async () => {
     vi.mocked(createRecipe)
-      .mockImplementationOnce((name, kind) => {
+      .mockImplementationOnce(async (name, kind) => {
         const subject = recipeCreateSubject(name, kind);
-        const requestId = beginAction(subject, (id) => id);
+        const claim = await claimFreshAction(subject, (id) => id);
+        if (!claim.ok) throw new Error('claim failed');
+        const requestId = claim.record.requestId;
         const failure = new Error('تعذر الاتصال');
-        settleAction(subject, requestId, failure);
-        return Promise.reject(failure);
+        try {
+          settleAction(subject, requestId, failure);
+          throw failure;
+        } finally {
+          claim.release();
+        }
       })
       .mockResolvedValueOnce('new-id');
     await renderList();

@@ -11,16 +11,37 @@ import type {
 } from '@/accounting/types';
 import { messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  canDispatchAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearActionPostedReloadSnapshot,
+  snapshotActionPostedReloads,
   hasAction,
+  hasDurableAction,
   activationReviewReloadPending,
   heldAction,
+  heldRequestId,
+  markActionPostedReload,
   pinActivationReviewReload,
   replaceActivationPayload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
+  unknownSaveMessage,
 } from '@/items/request-id';
+import {
+  abortClaimBeforeDispatch,
+  acquireHeldWriteLock,
+  captureWriteSession,
+  clearHeldWrite,
+  hasPostedReload,
+  readLockedHeldWrite,
+  setHeldWritePhase,
+  type HeldWriteRecord,
+  HeldWriteStorageError,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { reloadFailedMessage } from '@/waste/useWasteAction';
 
 export const ACTIVATION_SUBJECT = 'activation';
@@ -41,6 +62,7 @@ export function useActivationAction(
   review: OpeningReview | null,
   onReview: (review: OpeningReview) => void,
 ) {
+  const online = useOnline();
   const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [reloadBlocked, setReloadBlocked] = useState(false);
@@ -60,8 +82,16 @@ export function useActivationAction(
 
   const unknown =
     heldEpoch < 0 ? null : unknownAction<ActivationWrite>(ACTIVATION_SUBJECT);
+  const held =
+    heldEpoch < 0 ? null : heldAction<ActivationWrite>(ACTIVATION_SUBJECT);
+  const posted =
+    heldEpoch >= 0 && hasPostedReload(ACTIVATION_SUBJECT, ACTIVATION_SUBJECT);
+  const activatedWithHeld =
+    review?.activated === true && (unknown !== null || held !== null);
   const reloadPending =
+    posted ||
     reloadBlocked ||
+    activatedWithHeld ||
     (heldEpoch >= 0 && activationReviewReloadPending(ACTIVATION_SUBJECT));
 
   function toggleZero(itemId: string) {
@@ -88,7 +118,7 @@ export function useActivationAction(
       ? 'إعادة المحاولة'
       : 'تفعيل الخصم';
   const activateDisabled =
-    saving || (!reloadPending && unknown === null && !allChecked);
+    !online || saving || (!reloadPending && unknown === null && !allChecked);
 
   async function reloadReview(): Promise<OpeningReview | null> {
     try {
@@ -100,9 +130,13 @@ export function useActivationAction(
     }
   }
 
-  function acceptReloaded(requestId: string, next: OpeningReview): void {
+  function acceptReloaded(
+    expected: HeldWriteRecord<ActivationWrite>,
+    next: OpeningReview,
+  ): void {
+    const { requestId } = expected;
     if (next.activated) {
-      settleAction(ACTIVATION_SUBJECT, requestId);
+      clearHeldWrite(ACTIVATION_SUBJECT, requestId, expected);
       onReview(next);
       setReloadBlocked(false);
       setNotice(null);
@@ -114,50 +148,216 @@ export function useActivationAction(
       onReview(next);
       return;
     }
-    replaceActivationPayload(ACTIVATION_SUBJECT, requestId, {
+    const replaced = replaceActivationPayload(
+      ACTIVATION_SUBJECT,
       requestId,
-      manifestHash: next.openingManifestHash,
-      explicitZeroItemIds: [],
-    });
+      {
+        requestId,
+        manifestHash: next.openingManifestHash,
+        explicitZeroItemIds: [],
+      },
+      expected,
+    );
+    if (!replaced) {
+      setReloadBlocked(true);
+      setNotice(reloadFailedMessage);
+      onReview(next);
+      return;
+    }
     setChecks({ hash: next.openingManifestHash, ids: new Set() });
     setReloadBlocked(false);
     onReview(next);
     setNotice(manifestChangedMessage);
   }
 
+  async function verifyPostedActivation(): Promise<void> {
+    const pins = snapshotActionPostedReloads({ subject: ACTIVATION_SUBJECT });
+    const next = await reloadReview();
+    if (!next) return;
+    if (!next.activated) {
+      setReloadBlocked(true);
+      setNotice(reloadFailedMessage);
+      return;
+    }
+    onReview(next);
+    await clearActionPostedReloadSnapshot(pins, ACTIVATION_SUBJECT);
+    setReloadBlocked(false);
+    setNotice(null);
+  }
+
   async function activate(): Promise<void> {
-    if (!review || flight.current) return;
+    if (!review || flight.current || !isOnline()) return;
     const current = heldAction<ActivationWrite>(ACTIVATION_SUBJECT);
     const unknownHeld = unknownAction<ActivationWrite>(ACTIVATION_SUBJECT);
-    if (reloadPending) {
-      const requestId = (unknownHeld ?? current)?.requestId;
-      if (!requestId) return;
+    const isPosted =
+      posted || hasPostedReload(ACTIVATION_SUBJECT, ACTIVATION_SUBJECT);
+    if (reloadPending || isPosted || review.activated) {
+      const reviewWasPending =
+        activationReviewReloadPending(ACTIVATION_SUBJECT);
+      const requestId =
+        heldRequestId(ACTIVATION_SUBJECT) ??
+        (unknownHeld ?? current)?.requestId;
       flight.current = true;
       setSaving(true);
+      let releaseReloadLock = () => {};
       try {
+        if (isPosted) {
+          await verifyPostedActivation();
+          return;
+        }
+        const lock = await acquireHeldWriteLock(ACTIVATION_SUBJECT);
+        if (!lock.acquired) {
+          if (lock.reason === 'storage') {
+            setNotice(storageWriteFailedMessage);
+          }
+          return;
+        }
+        releaseReloadLock = lock.release;
+        const durable = readLockedHeldWrite<ActivationWrite>(
+          ACTIVATION_SUBJECT,
+          { refresh: true },
+        );
+        if (
+          durable &&
+          durable.requestId === requestId &&
+          durable.awaitingReviewReload
+        ) {
+          const next = await reloadReview();
+          if (next) acceptReloaded(durable, next);
+          return;
+        }
+        if (reviewWasPending) {
+          // The durable request changed after this button was rendered.
+          setReloadBlocked(true);
+          setNotice(unknownSaveMessage);
+          return;
+        }
         const next = await reloadReview();
-        if (next) acceptReloaded(requestId, next);
+        if (!next) return;
+        if (durable && durable.phase !== 'posted_reload') {
+          if (next.activated) {
+            clearHeldWrite(ACTIVATION_SUBJECT, durable.requestId, durable);
+          } else if (durable.phase === 'inflight') {
+            setHeldWritePhase(
+              ACTIVATION_SUBJECT,
+              durable.requestId,
+              'unknown',
+              { expected: durable },
+            );
+          }
+        }
+        onReview(next);
+        setReloadBlocked(false);
+        setNotice(durable && !next.activated ? unknownSaveMessage : null);
+      } catch (error) {
+        setReloadBlocked(true);
+        setNotice(messageFrom(error));
       } finally {
+        releaseReloadLock();
         flight.current = false;
         setSaving(false);
       }
       return;
     }
 
+    const session = captureWriteSession();
     let action: ActivationWrite;
+    let releaseLock: () => void;
+    let priorPhase: 'unknown' | 'awaiting_reconfirm' | null = null;
     if (unknownHeld) {
-      action = unknownHeld;
+      priorPhase = 'unknown';
+      const claim = await claimReplayAction<ActivationWrite>(
+        ACTIVATION_SUBJECT,
+        unknownHeld.requestId,
+        { session },
+      );
+      if (!claim.ok) {
+        if (claim.reason === 'conflict') {
+          setReloadBlocked(true);
+          setNotice(
+            claim.existing?.phase === 'posted_reload'
+              ? reloadFailedMessage
+              : unknownSaveMessage,
+          );
+        } else if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setNotice(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setNotice(offlineWriteMessage);
+        }
+        return;
+      }
+      action = claim.record.payload;
+      releaseLock = claim.release;
     } else if (current && !activationReviewReloadPending(ACTIVATION_SUBJECT)) {
-      action = { ...current, explicitZeroItemIds: zerosOf(checked) };
-      replaceActivationPayload(ACTIVATION_SUBJECT, action.requestId, action);
+      priorPhase = 'awaiting_reconfirm';
+      const nextPayload: ActivationWrite = {
+        ...current,
+        manifestHash: review.openingManifestHash ?? current.manifestHash,
+        explicitZeroItemIds: zerosOf(checked),
+      };
+      const claim = await claimReplayAction<ActivationWrite>(
+        ACTIVATION_SUBJECT,
+        current.requestId,
+        { payload: nextPayload, awaitingReviewReload: false, session },
+      );
+      if (!claim.ok) {
+        if (claim.reason === 'conflict') {
+          setReloadBlocked(true);
+          setNotice(
+            claim.existing?.phase === 'posted_reload'
+              ? reloadFailedMessage
+              : unknownSaveMessage,
+          );
+        } else if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setNotice(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setNotice(offlineWriteMessage);
+        }
+        return;
+      }
+      action = claim.record.payload;
+      releaseLock = claim.release;
     } else {
       if (hasAction(ACTIVATION_SUBJECT) || !review.openingManifestHash) return;
       const manifestHash = review.openingManifestHash;
-      action = beginAction(ACTIVATION_SUBJECT, (requestId) => ({
-        requestId,
-        manifestHash,
-        explicitZeroItemIds: zerosOf(checked),
-      }));
+      const claim = await claimFreshAction<ActivationWrite>(
+        ACTIVATION_SUBJECT,
+        (requestId) => ({
+          requestId,
+          manifestHash,
+          explicitZeroItemIds: zerosOf(checked),
+        }),
+        { session },
+      );
+      if (!claim.ok) {
+        if (
+          claim.reason === 'conflict' &&
+          claim.existing?.phase === 'posted_reload'
+        ) {
+          setReloadBlocked(true);
+          setNotice(reloadFailedMessage);
+        } else if (claim.reason === 'storage') {
+          setNotice(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setNotice(offlineWriteMessage);
+        }
+        return;
+      }
+      action = claim.record.payload;
+      releaseLock = claim.release;
+    }
+
+    if (!canDispatchAction(ACTIVATION_SUBJECT, action.requestId, session)) {
+      const durable = hasDurableAction(ACTIVATION_SUBJECT, action.requestId);
+      abortClaimBeforeDispatch(
+        ACTIVATION_SUBJECT,
+        action.requestId,
+        priorPhase,
+        releaseLock,
+      );
+      if (!durable) setNotice(storageWriteFailedMessage);
+      else if (!isOnline()) setNotice(offlineWriteMessage);
+      return;
     }
 
     flight.current = true;
@@ -165,9 +365,15 @@ export function useActivationAction(
     setNotice(null);
     try {
       let saved: ActivationResult;
+      let persisted = false;
       try {
         saved = await activateInventory(action);
-        settleAction(ACTIVATION_SUBJECT, action.requestId);
+        persisted = true;
+        markActionPostedReload(
+          ACTIVATION_SUBJECT,
+          action.requestId,
+          ACTIVATION_SUBJECT,
+        );
         onReview({
           ...review,
           activated: true,
@@ -177,20 +383,43 @@ export function useActivationAction(
           canActivate: false,
         });
       } catch (failure) {
-        if (isOpeningManifestChange(failure)) {
-          pinActivationReviewReload(ACTIVATION_SUBJECT, action.requestId);
-          setReloadBlocked(true);
-          const next = await reloadReview();
-          if (next) acceptReloaded(action.requestId, next);
+        if (!persisted && isOpeningManifestChange(failure)) {
+          try {
+            pinActivationReviewReload(ACTIVATION_SUBJECT, action.requestId);
+            const durable =
+              readLockedHeldWrite<ActivationWrite>(ACTIVATION_SUBJECT);
+            setReloadBlocked(true);
+            const next = await reloadReview();
+            if (
+              next &&
+              durable?.requestId === action.requestId &&
+              durable.awaitingReviewReload
+            ) {
+              acceptReloaded(durable, next);
+            }
+          } catch (storageError) {
+            setReloadBlocked(true);
+            setNotice(
+              storageError instanceof HeldWriteStorageError
+                ? storageWriteFailedMessage
+                : messageFrom(storageError),
+            );
+            return;
+          }
           return;
         }
-        settleAction(ACTIVATION_SUBJECT, action.requestId, failure);
+        if (!persisted) {
+          settleAction(ACTIVATION_SUBJECT, action.requestId, failure);
+        } else {
+          setReloadBlocked(true);
+        }
         setNotice(messageFrom(failure));
         return;
+      } finally {
+        releaseLock();
       }
       try {
-        onReview(await loadOpeningReview());
-        setNotice(null);
+        await verifyPostedActivation();
       } catch {
         setNotice(reloadFailedMessage);
       }

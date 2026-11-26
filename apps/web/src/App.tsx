@@ -1,8 +1,23 @@
+import { useSyncExternalStore, type ReactNode } from 'react';
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { AuthProvider } from '@/auth/AuthProvider';
+import { InactiveTabNotice } from '@/auth/InactiveTabNotice';
 import { RequireOwner } from '@/auth/RequireOwner';
+import {
+  getActiveTabSnapshot,
+  registerActiveTabLifecycle,
+  subscribeActiveTab,
+  takeOverActiveTab,
+} from '@/lib/active-tab';
 import { useAuth } from '@/lib/auth-context';
-import { supabase } from '@/lib/supabase';
+import {
+  activateAuthStore,
+  deactivateAuthStore,
+  startAuth,
+} from '@/lib/auth-store';
+import { setHeldWritesTabActive } from '@/lib/held-writes';
+import { initPwa, setPwaTabActive } from '@/lib/pwa';
+import * as supabaseMod from '@/lib/supabase';
 import { ExpensesPage } from '@/pages/ExpensesPage';
 import { ActivationPage } from '@/pages/ActivationPage';
 import { CountsPage } from '@/pages/CountsPage';
@@ -24,10 +39,17 @@ import { SalesShiftPage } from '@/pages/SalesShiftPage';
 import { WastePage } from '@/pages/WastePage';
 import { MissingEnvScreen } from '@/pages/MissingEnvScreen';
 import { NotFoundPage } from '@/pages/NotFoundPage';
+import { UpdateBanner } from '@/pwa/UpdateBanner';
 
 function HomeRoute() {
-  const { email, signOut } = useAuth();
-  return <HomePage email={email ?? ''} onSignOut={() => void signOut()} />;
+  const { email, signOut, logoutPending = false } = useAuth();
+  return (
+    <HomePage
+      email={email ?? ''}
+      logoutPending={logoutPending}
+      onSignOut={() => void signOut()}
+    />
+  );
 }
 
 export function AppRoutes() {
@@ -183,16 +205,81 @@ export function AppRoutes() {
   );
 }
 
+function handleTabBecomeActive(): void {
+  setHeldWritesTabActive(true);
+  // Enable Supabase lazily without eagerly constructing GoTrueClient;
+  // startAuth() reconciles durable logout records first so auto-refresh
+  // cannot race before boot reconciliation (P2-2).
+  if (typeof supabaseMod.enableSupabaseClient === 'function') {
+    supabaseMod.enableSupabaseClient();
+  } else {
+    supabaseMod.activateSupabaseClient?.();
+  }
+  setPwaTabActive(true);
+  initPwa();
+  activateAuthStore();
+  startAuth();
+}
+
+function handleTabBecomeInactive(): void {
+  deactivateAuthStore();
+  supabaseMod.deactivateSupabaseClient?.();
+  setHeldWritesTabActive(false);
+  setPwaTabActive(false);
+}
+
+function subscribeAppActiveTab(listener: () => void): () => void {
+  const unregisterLifecycle = registerActiveTabLifecycle({
+    onBecomeActive: handleTabBecomeActive,
+    onBecomeInactive: handleTabBecomeInactive,
+  });
+  const unsubscribe = subscribeActiveTab(listener);
+  return () => {
+    unsubscribe();
+    unregisterLifecycle();
+  };
+}
+
+function ActiveTabGate({ children }: { children: ReactNode }) {
+  const tab = useSyncExternalStore(
+    subscribeAppActiveTab,
+    getActiveTabSnapshot,
+    getActiveTabSnapshot,
+  );
+
+  if (tab.status === 'checking') {
+    return (
+      <main className="mx-auto flex min-h-dvh max-w-lg flex-col gap-4 ps-4 pe-4 pt-8 text-start">
+        <p>جاري التحقق…</p>
+      </main>
+    );
+  }
+
+  if (tab.status === 'inactive') {
+    return (
+      <InactiveTabNotice
+        takingOver={tab.takingOver}
+        onTakeOver={() => void takeOverActiveTab()}
+      />
+    );
+  }
+
+  return children;
+}
+
 export function App() {
-  if (!supabase) {
+  if (!supabaseMod.supabase) {
     return <MissingEnvScreen />;
   }
 
   return (
-    <BrowserRouter>
-      <AuthProvider>
-        <AppRoutes />
-      </AuthProvider>
-    </BrowserRouter>
+    <ActiveTabGate>
+      <BrowserRouter>
+        <AuthProvider>
+          <UpdateBanner />
+          <AppRoutes />
+        </AuthProvider>
+      </BrowserRouter>
+    </ActiveTabGate>
   );
 }

@@ -7,6 +7,7 @@ import {
 } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  loadOrderWorkState,
   loadProcessingSummary,
   recordRunFailure,
   retryParkedOrder,
@@ -26,8 +27,13 @@ import {
   resetHeldWrites,
   unknownSaveMessage,
 } from '@/items/request-id';
+import {
+  rehydrateHeldWritesAsync,
+  resetHeldWritesStore,
+} from '@/lib/held-writes';
 
 vi.mock('@/accounting/api', () => ({
+  loadOrderWorkState: vi.fn(),
   loadProcessingSummary: vi.fn(),
   runDeductions: vi.fn(),
   recordRunFailure: vi.fn(),
@@ -72,11 +78,17 @@ const summary: ProcessingSummary = {
 describe('ProcessingPanel', () => {
   beforeEach(() => {
     resetHeldWrites();
+    vi.mocked(loadOrderWorkState).mockReset();
     vi.mocked(loadProcessingSummary).mockReset();
     vi.mocked(runDeductions).mockReset();
     vi.mocked(recordRunFailure).mockReset();
     vi.mocked(retryParkedOrder).mockReset();
     vi.mocked(loadProcessingSummary).mockResolvedValue(summary);
+    vi.mocked(loadOrderWorkState).mockResolvedValue({
+      orderId: 'order-parked',
+      workGeneration: 2,
+      failedAt: '2026-02-01T00:00:00.000Z',
+    });
   });
 
   it('shows the counts, coverage, progress, and dormant banner', async () => {
@@ -414,5 +426,143 @@ describe('ProcessingPanel', () => {
     expect(onShiftDataStale).toHaveBeenCalledTimes(4);
     expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
     expect(loadProcessingSummary).toHaveBeenCalledTimes(1);
+  });
+
+  it('replays a held retry when current work_generation matches and keeps the pin on busy', async () => {
+    vi.mocked(retryParkedOrder).mockRejectedValueOnce(new Error('socket'));
+    const view = render(<ProcessingPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'رجّع الطلب' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(1, 'order-parked');
+
+    view.unmount();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
+
+    render(<ProcessingPanel />);
+    const retryBtn = await screen.findByRole('button', {
+      name: 'إعادة المحاولة',
+    });
+
+    // Busy on replay of an unresolved pin MUST keep the pin held.
+    vi.mocked(loadOrderWorkState).mockResolvedValueOnce({
+      orderId: 'order-parked',
+      workGeneration: 2,
+      failedAt: '2026-02-01T00:00:00.000Z',
+    });
+    vi.mocked(retryParkedOrder).mockResolvedValueOnce('busy');
+    fireEvent.click(retryBtn);
+    expect(
+      await screen.findByText('الحساب مشغول، حاول تاني'),
+    ).toBeInTheDocument();
+    expect(loadOrderWorkState).toHaveBeenCalledWith('order-parked');
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(2, 'order-parked');
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(true);
+    expect(screen.getByText(unknownSaveMessage)).toBeInTheDocument();
+
+    // Matching generation still replays and settles on retried.
+    vi.mocked(loadOrderWorkState).mockResolvedValueOnce({
+      orderId: 'order-parked',
+      workGeneration: 2,
+      failedAt: '2026-02-01T00:00:00.000Z',
+    });
+    vi.mocked(retryParkedOrder).mockResolvedValueOnce('retried');
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(await screen.findByText('الطلب رجع للشغل')).toBeInTheDocument();
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
+    expect(retryParkedOrder).toHaveBeenNthCalledWith(3, 'order-parked');
+  });
+
+  it('does not call retry_accounting_work when stored work_generation is older than current work_generation and settles read-only', async () => {
+    vi.mocked(retryParkedOrder).mockRejectedValueOnce(new Error('socket'));
+    const view = render(<ProcessingPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'رجّع الطلب' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+    expect(retryParkedOrder).toHaveBeenCalledTimes(1);
+
+    // Reload after the order has parked again on a newer workGeneration (3).
+    view.unmount();
+    resetHeldWritesStore({ clearStorage: false });
+    await rehydrateHeldWritesAsync();
+    vi.mocked(loadProcessingSummary).mockResolvedValue({
+      ...summary,
+      parked: [
+        {
+          ...summary.parked[0]!,
+          workGeneration: '3',
+        },
+      ],
+    });
+    vi.mocked(loadOrderWorkState).mockResolvedValueOnce({
+      orderId: 'order-parked',
+      workGeneration: 3,
+      failedAt: '2026-02-02T00:00:00.000Z',
+    });
+
+    render(<ProcessingPanel />);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'إعادة المحاولة' }),
+    );
+    expect(
+      await screen.findByText('حالة الطلب اتغيرت — راجع الطلبات المتوقفة'),
+    ).toBeInTheDocument();
+    expect(loadOrderWorkState).toHaveBeenCalledWith('order-parked');
+    // Must NOT call retryParkedOrder again (only the initial attempt before reload).
+    expect(retryParkedOrder).toHaveBeenCalledTimes(1);
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
+    expect(screen.queryByText(unknownSaveMessage)).toBeNull();
+    expect(
+      screen.getByRole('button', { name: 'رجّع الطلب' }),
+    ).toBeInTheDocument();
+  });
+
+  it('keeps the held retry pin if re-reading order work state fails before replay', async () => {
+    vi.mocked(retryParkedOrder).mockRejectedValueOnce(new Error('socket'));
+    render(<ProcessingPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'رجّع الطلب' }));
+    expect(await screen.findByText(unknownSaveMessage)).toBeInTheDocument();
+
+    vi.mocked(loadOrderWorkState).mockRejectedValueOnce(
+      new Error('read timeout'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    expect(await screen.findByText('read timeout')).toBeInTheDocument();
+    expect(retryParkedOrder).toHaveBeenCalledTimes(1);
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(true);
+    expect(screen.getByText(unknownSaveMessage)).toBeInTheDocument();
+  });
+
+  it('does not call retry_accounting_work on a fresh click when current work_generation is newer than the rendered parked order', async () => {
+    vi.mocked(loadOrderWorkState).mockResolvedValueOnce({
+      orderId: 'order-parked',
+      workGeneration: 3,
+      failedAt: '2026-02-02T00:00:00.000Z',
+    });
+
+    render(<ProcessingPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'رجّع الطلب' }));
+
+    expect(
+      await screen.findByText('حالة الطلب اتغيرت — راجع الطلبات المتوقفة'),
+    ).toBeInTheDocument();
+    expect(loadOrderWorkState).toHaveBeenCalledWith('order-parked');
+    expect(retryParkedOrder).not.toHaveBeenCalled();
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
+    expect(loadProcessingSummary).toHaveBeenCalledTimes(2);
+  });
+
+  it('clears the fresh retry pin if preflight order work state read fails before a fresh retry', async () => {
+    vi.mocked(loadOrderWorkState).mockRejectedValueOnce(
+      new Error('read timeout'),
+    );
+
+    render(<ProcessingPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'رجّع الطلب' }));
+
+    expect(await screen.findByText('read timeout')).toBeInTheDocument();
+    expect(loadOrderWorkState).toHaveBeenCalledWith('order-parked');
+    expect(retryParkedOrder).not.toHaveBeenCalled();
+    expect(hasAction(accountingRetrySubject('order-parked'))).toBe(false);
+    expect(screen.queryByText(unknownSaveMessage)).toBeNull();
   });
 });

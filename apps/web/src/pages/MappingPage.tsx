@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
+import {
+  clearActionPostedReloadSnapshot,
+  snapshotActionPostedReloads,
+} from '@/items/request-id';
 import { cairoDateIso, formatCairo } from '@/lib/cairo';
+import type { PostedReloadSnapshot } from '@/lib/held-writes';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import {
   loadBases,
@@ -17,7 +22,9 @@ import {
   subjectTitle,
 } from '@/mapping/format';
 import { statusLabel } from '@/mapping/labels';
+import { baseSubject, optionSubject } from '@/mapping/subjects';
 import { SubjectPanel } from '@/mapping/SubjectPanel';
+import { basePackagingSubject } from '@/packaging/subjects';
 import type {
   Coverage,
   MappingCatalog,
@@ -29,6 +36,43 @@ import {
   cairoNextDateStartIso,
   dateRangeError,
 } from '@/purchases/time';
+
+function snapshotMappingReloads(base: ObservedBase): PostedReloadSnapshot {
+  const baseSubj = baseSubject(base.posItemId, base.sizeKeyText);
+  const packSubj = basePackagingSubject(base.posItemId, base.sizeKeyText);
+  return [
+    ...snapshotActionPostedReloads({ subject: baseSubj }),
+    ...snapshotActionPostedReloads({ subject: packSubj }),
+    ...snapshotActionPostedReloads({ prefix: 'pos-option:' }),
+  ];
+}
+
+async function clearMappingReloads(
+  snapshot: PostedReloadSnapshot,
+  base: ObservedBase,
+  detail: SubjectDetail,
+): Promise<void> {
+  const allowed = new Set<string>([
+    baseSubject(base.posItemId, base.sizeKeyText),
+    basePackagingSubject(base.posItemId, base.sizeKeyText),
+  ]);
+  for (const binding of detail.optionBindings) {
+    allowed.add(
+      optionSubject(
+        binding.scope,
+        binding.scope === 'item' ? base.posItemId : '',
+        binding.scope === 'item' ? base.sizeKeyText : '',
+        binding.optionValue,
+      ),
+    );
+  }
+  await clearActionPostedReloadSnapshot(
+    snapshot.filter(
+      (entry) =>
+        allowed.has(entry.subject) && entry.readTarget === entry.subject,
+    ),
+  );
+}
 
 function baseKey(base: ObservedBase): string {
   return `${base.posItemId}\n${base.sizeKeyText}`;
@@ -112,6 +156,7 @@ export function MappingPage() {
     const key = baseKey(selected);
     let cancelled = false;
     const current = selected;
+    const pendingReloads = snapshotMappingReloads(current);
     void (async () => {
       try {
         const next = await loadSubjectDetail(current);
@@ -124,6 +169,7 @@ export function MappingPage() {
         }
         setDetail({ key, value: next });
         setDetailError(null);
+        await clearMappingReloads(pendingReloads, current, next);
       } catch (error) {
         if (
           cancelled ||
@@ -141,14 +187,20 @@ export function MappingPage() {
     };
   }, [selected]);
 
-  async function reload() {
-    const keyAtStart = selectedKeyRef.current;
+  async function reload(expectedBaseKey?: string): Promise<boolean> {
+    const keyAtStart = expectedBaseKey ?? selectedKeyRef.current;
+    if (keyAtStart === null || selectedKeyRef.current !== keyAtStart) {
+      return false;
+    }
     const gen = ++listSeq.current;
     const nextBases = await loadHome(gen);
-    if (!nextBases || gen !== listSeq.current) return;
-    if (keyAtStart === null || selectedKeyRef.current !== keyAtStart) return;
+    if (!nextBases || gen !== listSeq.current) return false;
+    if (selectedKeyRef.current !== keyAtStart) {
+      return false;
+    }
     const current = nextBases.find((base) => baseKey(base) === keyAtStart);
-    if (!current) return;
+    if (!current) return false;
+    const pendingReloads = snapshotMappingReloads(current);
     const detailRequest = ++detailSeq.current;
     const next = await loadSubjectDetail(current);
     if (
@@ -156,10 +208,12 @@ export function MappingPage() {
       detailRequest !== detailSeq.current ||
       selectedKeyRef.current !== keyAtStart
     ) {
-      return;
+      return false;
     }
     setDetail({ key: keyAtStart, value: next });
     setDetailError(null);
+    await clearMappingReloads(pendingReloads, current, next);
+    return true;
   }
 
   const shown = sortBases(bases ?? []).filter((base) =>

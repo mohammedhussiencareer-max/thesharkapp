@@ -5,12 +5,14 @@ import { ProcessingPanel } from '@/accounting/ProcessingPanel';
 import type { ShiftAccountingStatus } from '@/accounting/types';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import { formatCairo } from '@/lib/cairo';
+import { isOnline, useOnline } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { loadSalesHome } from '@/sales/api';
 import { ShiftList } from '@/sales/ShiftList';
 import type { ShiftSummary } from '@/sales/types';
 
 export function SalesPage() {
+  const online = useOnline();
   const [shifts, setShifts] = useState<ShiftSummary[] | null>(null);
   const [lastSyncAt, setLastSyncAt] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -23,8 +25,23 @@ export function SalesPage() {
   const [statusCapped, setStatusCapped] = useState(false);
   const [statusError, setStatusError] = useState<string | null>(null);
   const seqRef = useRef(0);
+  const wasOfflineRef = useRef(!online);
 
   useEffect(() => {
+    if (!online) {
+      wasOfflineRef.current = true;
+      return;
+    }
+    if (wasOfflineRef.current) {
+      wasOfflineRef.current = false;
+      setLoading(true);
+      setLoadError(null);
+      setLoadId((value) => value + 1);
+    }
+  }, [online]);
+
+  useEffect(() => {
+    if (!isOnline()) return;
     const seq = ++seqRef.current;
     let cancelled = false;
     void (async () => {
@@ -47,7 +64,7 @@ export function SalesPage() {
   }, [loadId]);
 
   useEffect(() => {
-    if (!shifts) return;
+    if (!shifts || !online) return;
     let cancelled = false;
     const ids = shifts.map((shift) => shift.shiftId);
     void (async () => {
@@ -66,9 +83,10 @@ export function SalesPage() {
     return () => {
       cancelled = true;
     };
-  }, [shifts]);
+  }, [shifts, online]);
 
   function reload() {
+    if (!online) return;
     setLoading(true);
     setLoadError(null);
     setLoadId((value) => value + 1);
@@ -82,24 +100,43 @@ export function SalesPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">المبيعات</h1>
-      {lastSyncAt ? <p>آخر مزامنة {formatCairo(lastSyncAt)}</p> : null}
+      {!online ? (
+        <p role="status">
+          مفيش اتصال بالإنترنت — الأرقام المالية مش متاحة بدون اتصال وهتتحدث لما
+          النت يرجع
+        </p>
+      ) : null}
+      {online && lastSyncAt ? (
+        <p>آخر مزامنة {formatCairo(lastSyncAt)}</p>
+      ) : null}
       <ProcessingPanel refreshKey={loadId} onShiftDataStale={reload} />
-      {statusError ? <p>{statusError}</p> : null}
-      <button className={secondaryButton} type="button" onClick={reload}>
+      {online && statusError ? <p>{statusError}</p> : null}
+      <button
+        className={secondaryButton}
+        type="button"
+        disabled={!online}
+        onClick={reload}
+      >
         {loadError ? 'إعادة المحاولة' : 'تحديث'}
       </button>
-      {loading && shifts === null ? <p>جاري تحميل المبيعات…</p> : null}
-      {loadError ? <p role="alert">{loadError}</p> : null}
-      {shifts && shifts.length === 0 ? <p>لسه مفيش مبيعات متزامنة</p> : null}
-      {shifts && shifts.length > 0 ? (
-        <ShiftList
-          shifts={shifts}
-          statuses={statuses ?? undefined}
-          statusCapped={statusCapped}
-        />
-      ) : null}
-      {shifts === null && !loading && !loadError ? (
-        <p role="alert">{genericCatalogError}</p>
+      {online ? (
+        <>
+          {loading && shifts === null ? <p>جاري تحميل المبيعات…</p> : null}
+          {loadError ? <p role="alert">{loadError}</p> : null}
+          {shifts && shifts.length === 0 ? (
+            <p>لسه مفيش مبيعات متزامنة</p>
+          ) : null}
+          {shifts && shifts.length > 0 ? (
+            <ShiftList
+              shifts={shifts}
+              statuses={statuses ?? undefined}
+              statusCapped={statusCapped}
+            />
+          ) : null}
+          {shifts === null && !loading && !loadError ? (
+            <p role="alert">{genericCatalogError}</p>
+          ) : null}
+        </>
       ) : null}
     </main>
   );

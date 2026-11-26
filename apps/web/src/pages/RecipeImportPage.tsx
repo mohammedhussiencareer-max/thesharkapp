@@ -2,14 +2,29 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  abortActionBeforeDispatch,
+  canDispatchAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearActionPostedReloadSnapshot,
   hasAction,
+  hasDurableAction,
+  markActionPostedReload,
   settleAction,
+  snapshotActionPostedReloads,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
+import {
+  canDispatchWriteFor,
+  captureWriteSession,
+  hasPostedReload,
+  storageWriteFailedMessage,
+  type WriteSession,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { pageShell, primaryButton, secondaryButton } from '@/lib/page-style';
 import {
   commitRecipeImport,
@@ -106,6 +121,7 @@ function Workspace({
   ctx: ImportContext;
   reload: () => Promise<void>;
 }) {
+  const online = useOnline();
   const subject = recipeImportSubject;
   const [heldEpoch, setHeldEpoch] = useState(0);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
@@ -113,14 +129,17 @@ function Workspace({
   const [fileError, setFileError] = useState<string | null>(null);
   const [showIssues, setShowIssues] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [stale, setStale] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [reloadError, setReloadError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ImportResult | null>(null);
   const [pickerKey, setPickerKey] = useState(0);
   const flight = useRef(false);
   const held = heldEpoch < 0 ? null : unknownAction<ImportAction>(subject);
-  const disabled = saving || reading || stale || held !== null;
+  const postedReload =
+    heldEpoch < 0 ? false : hasPostedReload(recipeImportSubject);
+  const stale = postedReload || refreshing;
+  const disabled = saving || reading || stale || held !== null || !online;
   const timing = useDatedTiming(
     undefined,
     ctx.shiftStart,
@@ -179,35 +198,65 @@ function Workspace({
   }
 
   async function refresh() {
+    setRefreshing(true);
     setReloadError(null);
+    const pendingReloads = snapshotActionPostedReloads({
+      subject: recipeImportSubject,
+    });
     try {
       await reload();
-      setStale(false);
+      await clearActionPostedReloadSnapshot(
+        pendingReloads,
+        recipeImportSubject,
+      );
     } catch (failure) {
       setReloadError(messageFrom(failure) || genericCatalogError);
+    } finally {
+      setRefreshing(false);
     }
   }
 
-  async function run(action: ImportAction) {
+  async function run(
+    action: ImportAction,
+    session: WriteSession | null,
+    isReplay: boolean,
+    releaseLock: () => void,
+  ) {
     setSaving(true);
     setError(null);
     let outcome: ImportResult;
+    let saved = false;
+    let release = releaseLock;
     try {
+      if (!canDispatchAction(subject, action.requestId, session)) {
+        const durable = hasDurableAction(subject, action.requestId);
+        abortActionBeforeDispatch(subject, action.requestId, isReplay, release);
+        release = () => {};
+        if (!durable) setError(storageWriteFailedMessage);
+        else if (!isOnline()) setError(offlineWriteMessage);
+        flight.current = false;
+        setSaving(false);
+        return;
+      }
       outcome = await commitRecipeImport(action);
-      settleAction(subject, action.requestId);
+      saved = true;
+      markActionPostedReload(subject, action.requestId, recipeImportSubject);
     } catch (failure) {
-      settleAction(subject, action.requestId, failure);
+      if (!saved) {
+        settleAction(subject, action.requestId, failure);
+      }
       setError(messageFrom(failure));
       flight.current = false;
       setSaving(false);
       return;
+    } finally {
+      release();
     }
     timing.refreshClock();
     setResult(outcome);
     setLoaded(null);
     setShowIssues(false);
     setPickerKey((value) => value + 1);
-    setStale(true);
     flight.current = false;
     setSaving(false);
     await refresh();
@@ -234,14 +283,21 @@ function Workspace({
       return;
     }
     setError(null);
+    const initiatingUser = captureWriteSession();
     flight.current = true;
     setSaving(true);
-    let action: ImportAction;
+    let payload: ImportAction['payload'];
     try {
       const tokens = await fetchImportTokens(
         requiredTokens(loaded.review, loaded.parsed),
       );
-      const payload = buildImportPayload({
+      if (!canDispatchWriteFor(initiatingUser)) {
+        flight.current = false;
+        setSaving(false);
+        setError(offlineWriteMessage);
+        return;
+      }
+      payload = buildImportPayload({
         review: loaded.review,
         parsed: loaded.parsed,
         hash: loaded.hash,
@@ -249,23 +305,53 @@ function Workspace({
         reason: built.write.reason,
         tokens,
       });
-      action = beginAction<ImportAction>(subject, (requestId) => ({
-        requestId,
-        payload,
-      }));
     } catch (failure) {
       flight.current = false;
       setSaving(false);
       setError(messageFrom(failure) || genericCatalogError);
       return;
     }
-    await run(action);
+    const claim = await claimFreshAction<ImportAction>(
+      subject,
+      (requestId) => ({
+        requestId,
+        payload,
+      }),
+      { session: initiatingUser },
+    );
+    if (!claim.ok) {
+      flight.current = false;
+      setSaving(false);
+      if (claim.reason === 'storage' || claim.reason === 'missing') {
+        setError(storageWriteFailedMessage);
+      } else if (claim.reason === 'session_invalid' && !isOnline()) {
+        setError(offlineWriteMessage);
+      }
+      return;
+    }
+    await run(claim.record.payload, initiatingUser, false, claim.release);
   }
 
   function retry() {
-    if (!held || flight.current) return;
+    if (!held || flight.current || !isOnline()) return;
+    const targetId = held.requestId;
+    const session = captureWriteSession();
     flight.current = true;
-    void run(held);
+    void (async () => {
+      const claim = await claimReplayAction<ImportAction>(subject, targetId, {
+        session,
+      });
+      if (!claim.ok) {
+        flight.current = false;
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setError(offlineWriteMessage);
+        }
+        return;
+      }
+      await run(claim.record.payload, session, true, claim.release);
+    })();
   }
 
   const knownStructure = loaded ? isKnownStructure(loaded.hash, ctx) : false;
@@ -282,6 +368,7 @@ function Workspace({
 
   return (
     <>
+      {!online ? <p role="status">{offlineWriteMessage}</p> : null}
       {result ? (
         <section className="flex flex-col gap-2" aria-label="نتيجة الاستيراد">
           <p role="status">الاستيراد اتحفظ</p>
@@ -298,7 +385,19 @@ function Workspace({
         </section>
       ) : null}
       {stale && reloadError === null ? (
-        <p role="status">جاري تحديث بيانات الوصفات قبل استيراد جديد…</p>
+        <div className="flex flex-col gap-2">
+          <p role="status">جاري تحديث بيانات الوصفات قبل استيراد جديد…</p>
+          {postedReload && !refreshing ? (
+            <button
+              className={secondaryButton}
+              type="button"
+              disabled={saving || !online}
+              onClick={() => void refresh()}
+            >
+              حدّث البيانات
+            </button>
+          ) : null}
+        </div>
       ) : null}
       {stale && reloadError !== null ? (
         <div className="flex flex-col gap-2">
@@ -306,6 +405,7 @@ function Workspace({
           <button
             className={secondaryButton}
             type="button"
+            disabled={saving || refreshing || !online}
             onClick={() => void refresh()}
           >
             حدّث البيانات
@@ -444,12 +544,19 @@ export function RecipeImportPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const pendingReloads = snapshotActionPostedReloads({
+      subject: recipeImportSubject,
+    });
     void (async () => {
       try {
         const next = await loadImportContext();
         if (cancelled) return;
         setCtx(next);
         setLoadError(null);
+        await clearActionPostedReloadSnapshot(
+          pendingReloads,
+          recipeImportSubject,
+        );
       } catch (failure) {
         if (!cancelled) setLoadError(messageFrom(failure));
       } finally {

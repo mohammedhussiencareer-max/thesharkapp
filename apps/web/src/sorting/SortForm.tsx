@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react';
-import { nowCairoDateTimeLocal } from '@/purchases/time';
+import { useOnline } from '@/lib/online';
+import { formatCairoDateTime, nowCairoDateTimeLocal } from '@/purchases/time';
 import { pendingResendMessage } from '@/sorting/errors';
 import { formatCostPerKg, formatKg, formatLossMoney } from '@/sorting/format';
 import { assessSort } from '@/sorting/validation';
@@ -17,6 +18,12 @@ function emptyValues(): SortValues {
     note: '',
     quantities: {},
   };
+}
+
+function pinnedSortTime(iso: string): string {
+  const formatted = formatCairoDateTime(iso);
+  const match = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})$/.exec(formatted);
+  return match ? `${match[1]}T${match[2]}` : iso;
 }
 
 export function SortForm({
@@ -37,14 +44,19 @@ export function SortForm({
   onClearServerError: () => void;
   onSubmit: (draft: SortDraft) => void;
 }) {
+  const online = useOnline();
   // Reused after a definite refusal, because that attempt was not stored.
   // An unknown outcome resends `pending` with this same id. A confirmed
   // save remounts the form and mints a new id.
   const [requestId] = useState(() => crypto.randomUUID());
   const [values, setValues] = useState<SortValues>(emptyValues);
   const [showErrors, setShowErrors] = useState(false);
-  const disabled = locked || submitting;
-  const selected = items.find((item) => item.id === values.mixedItemId) ?? null;
+  const disabled = locked || submitting || !online;
+  const shownMixedId = pending ? pending.mixedItemId : values.mixedItemId;
+  const selected = items.find((item) => item.id === shownMixedId) ?? null;
+  const pendingLineQty = new Map(
+    pending?.lines.map((line) => [line.itemId, line.quantity]) ?? [],
+  );
   const assessment = pending ? null : assessSort(values, items);
   const preview = assessment?.preview ?? null;
   const submitted = showErrors && assessment ? assessment.errors : null;
@@ -106,7 +118,9 @@ export function SortForm({
             type="datetime-local"
             disabled={disabled}
             readOnly={pending !== null}
-            value={values.occurredAt}
+            value={
+              pending ? pinnedSortTime(pending.occurredAt) : values.occurredAt
+            }
             onChange={(event) => edit({ occurredAt: event.target.value })}
           />
         </label>
@@ -115,7 +129,7 @@ export function SortForm({
           <select
             className={fieldClass}
             disabled={disabled || pending !== null}
-            value={values.mixedItemId}
+            value={shownMixedId}
             onChange={(event) => edit({ mixedItemId: event.target.value })}
           >
             <option value="">اختار</option>
@@ -124,12 +138,17 @@ export function SortForm({
                 {item.name}
               </option>
             ))}
+            {pending && !selected ? (
+              <option value={pending.mixedItemId}>{pending.mixedItemId}</option>
+            ) : null}
           </select>
         </label>
       </div>
       {selected ? (
         <p>
-          {`الرصيد ${formatKg(selected.onHandQty)} — متوسط التكلفة ${formatCostPerKg(selected.avgCost)}`}
+          {online
+            ? `الرصيد ${formatKg(selected.onHandQty)} — متوسط التكلفة ${formatCostPerKg(selected.avgCost)}`
+            : `الرصيد ${formatKg(selected.onHandQty)}`}
         </p>
       ) : null}
       <label className="flex flex-col gap-1">
@@ -139,7 +158,7 @@ export function SortForm({
           inputMode="decimal"
           disabled={disabled}
           readOnly={pending !== null}
-          value={values.qtyTaken}
+          value={pending ? pending.qtyTaken : values.qtyTaken}
           onChange={(event) => edit({ qtyTaken: event.target.value })}
         />
       </label>
@@ -157,8 +176,27 @@ export function SortForm({
                 className={fieldClass}
                 inputMode="decimal"
                 readOnly={pending !== null}
-                value={values.quantities[size.id] ?? ''}
+                value={
+                  pending
+                    ? (pendingLineQty.get(size.id) ?? '')
+                    : (values.quantities[size.id] ?? '')
+                }
                 onChange={(event) => editQuantity(size.id, event.target.value)}
+              />
+            </label>
+          ))}
+        </fieldset>
+      ) : pending && pending.lines.length > 0 ? (
+        <fieldset className="flex flex-col gap-3" disabled={disabled}>
+          <legend className="font-semibold">أحجام السمك</legend>
+          {pending.lines.map((line) => (
+            <label key={line.itemId} className="flex flex-col gap-1">
+              {`كمية ${line.itemId}`}
+              <input
+                className={fieldClass}
+                inputMode="decimal"
+                readOnly
+                value={line.quantity}
               />
             </label>
           ))}
@@ -170,7 +208,7 @@ export function SortForm({
           className={fieldClass}
           disabled={disabled}
           readOnly={pending !== null}
-          value={values.note}
+          value={pending ? (pending.note ?? '') : values.note}
           onChange={(event) => edit({ note: event.target.value })}
         />
       </label>
@@ -178,11 +216,15 @@ export function SortForm({
         <section aria-label="معاينة الفرز" className="flex flex-col gap-1">
           <h2 className="text-lg font-semibold">معاينة الفرز</h2>
           <p>{`مجموع الأحجام ${formatKg(preview.sizesQty)}`}</p>
-          <p>{`تكلفة الكيلو ${formatCostPerKg(preview.costPerKg)}`}</p>
+          {online ? (
+            <p>{`تكلفة الكيلو ${formatCostPerKg(preview.costPerKg)}`}</p>
+          ) : null}
           {preview.lossQty !== null && preview.lossValue !== null ? (
             <>
               <p>{`الفاقد ${formatKg(preview.lossQty)}`}</p>
-              <p>{`قيمة الفاقد ${formatLossMoney(preview.lossValue)}`}</p>
+              {online ? (
+                <p>{`قيمة الفاقد ${formatLossMoney(preview.lossValue)}`}</p>
+              ) : null}
             </>
           ) : null}
           <ul className="flex flex-col gap-1">
@@ -192,7 +234,9 @@ export function SortForm({
               );
               return (
                 <li key={line.itemId}>
-                  {`${size?.name ?? line.itemId}: ${formatKg(line.quantity)} — ${formatLossMoney(line.value)}`}
+                  {online
+                    ? `${size?.name ?? line.itemId}: ${formatKg(line.quantity)} — ${formatLossMoney(line.value)}`
+                    : `${size?.name ?? line.itemId}: ${formatKg(line.quantity)}`}
                 </li>
               );
             })}

@@ -127,4 +127,54 @@ describe('SalesPage', () => {
       screen.queryByText('صافي المبيعات 999.00 ج.م'),
     ).not.toBeInTheDocument();
   });
+
+  it('P2-5: hides monetary totals while offline and reloads them on reconnect', async () => {
+    const originalOnLine = Object.getOwnPropertyDescriptor(navigator, 'onLine');
+    const setOnline = (value: boolean) => {
+      Object.defineProperty(navigator, 'onLine', {
+        configurable: true,
+        get: () => value,
+      });
+      window.dispatchEvent(new Event(value ? 'online' : 'offline'));
+    };
+    setOnline(true);
+    try {
+      vi.mocked(loadSalesHome)
+        .mockResolvedValueOnce(home('210.00'))
+        .mockResolvedValueOnce(home('350.00'));
+      render(
+        <MemoryRouter>
+          <SalesPage />
+        </MemoryRouter>,
+      );
+      expect(
+        await screen.findByText('صافي المبيعات 210.00 ج.م'),
+      ).toBeInTheDocument();
+
+      act(() => {
+        setOnline(false);
+      });
+      expect(
+        screen.queryByText('صافي المبيعات 210.00 ج.م'),
+      ).not.toBeInTheDocument();
+
+      act(() => {
+        setOnline(true);
+      });
+      expect(
+        await screen.findByText('صافي المبيعات 350.00 ج.م'),
+      ).toBeInTheDocument();
+      expect(loadSalesHome).toHaveBeenCalledTimes(2);
+    } finally {
+      if (originalOnLine) {
+        Object.defineProperty(navigator, 'onLine', originalOnLine);
+      } else {
+        Object.defineProperty(navigator, 'onLine', {
+          configurable: true,
+          get: () => true,
+        });
+      }
+      window.dispatchEvent(new Event('online'));
+    }
+  });
 });

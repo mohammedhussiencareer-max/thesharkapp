@@ -1,8 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  addExpenseCategory,
   addExpenseEntry,
+  hasExpenseVoidRequest,
   instantKey,
   loadExpenseMonth,
+  loadExpenseRequestMonth,
+  renameExpenseCategory,
+  setExpenseCategoryActive,
+  setMonthExpenseComplete,
   voidExpenseEntry,
 } from '@/expenses/api';
 import {
@@ -12,6 +18,7 @@ import {
 } from '@/expenses/errors';
 import type { ExpenseDraft } from '@/expenses/types';
 import { genericCatalogError } from '@/items/errors';
+import { isRequestlessDefiniteRefusal } from '@/lib/write-outcome';
 
 const mocks = vi.hoisted(() => ({
   schema: vi.fn(),
@@ -135,6 +142,91 @@ describe('expense api', () => {
   beforeEach(() => {
     mocks.schema.mockReset();
     rpcCalls.length = 0;
+  });
+
+  it('requires a matching void request ID and original expense ID', async () => {
+    const eq = vi.fn().mockReturnThis();
+    const select = vi.fn().mockReturnThis();
+    const maybeSingle = vi
+      .fn()
+      .mockResolvedValueOnce({ data: null, error: null })
+      .mockResolvedValueOnce({ data: { id: 'void-marker' }, error: null });
+    const from = vi.fn(() => ({ select, eq, maybeSingle }));
+    mocks.schema.mockReturnValue({ from });
+
+    await expect(
+      hasExpenseVoidRequest('unknown-request', 'original'),
+    ).resolves.toBe(false);
+    await expect(
+      hasExpenseVoidRequest('confirmed-request', 'original'),
+    ).resolves.toBe(true);
+    expect(from).toHaveBeenCalledWith('expense_entries');
+    expect(eq.mock.calls).toEqual([
+      ['request_id', 'unknown-request'],
+      ['voids_id', 'original'],
+      ['request_id', 'confirmed-request'],
+      ['voids_id', 'original'],
+    ]);
+  });
+
+  it('distinguishes an absent expense request from a stored void with an unreadable month', async () => {
+    const missing = query({ data: null, error: null });
+    const voided = query({
+      data: { period_month: null, expense_date: null, voids_id: 'original' },
+      error: null,
+    });
+    const original = query({ data: null, error: { message: 'unavailable' } });
+    const from = vi
+      .fn()
+      .mockReturnValueOnce(missing.chain)
+      .mockReturnValueOnce(voided.chain)
+      .mockReturnValueOnce(original.chain);
+    mocks.schema.mockReturnValue({ from });
+
+    await expect(loadExpenseRequestMonth('missing')).resolves.toBeNull();
+    await expect(loadExpenseRequestMonth('stored-void')).rejects.toThrow();
+  });
+
+  it('resolves a stored expense request month from its entry or the original entry of a void', async () => {
+    const added = query({
+      data: { period_month: '2030-05-01', expense_date: null, voids_id: null },
+      error: null,
+    });
+    const voided = query({
+      data: { period_month: null, expense_date: null, voids_id: 'original' },
+      error: null,
+    });
+    const original = query({
+      data: { period_month: null, expense_date: '2030-06-18' },
+      error: null,
+    });
+    const from = vi
+      .fn()
+      .mockReturnValueOnce(added.chain)
+      .mockReturnValueOnce(voided.chain)
+      .mockReturnValueOnce(original.chain);
+    mocks.schema.mockReturnValue({ from });
+
+    await expect(loadExpenseRequestMonth('add-request')).resolves.toBe(
+      '2030-05-01',
+    );
+    await expect(loadExpenseRequestMonth('void-request')).resolves.toBe(
+      '2030-06-01',
+    );
+    expect(added.captured.eq).toEqual({
+      column: 'request_id',
+      value: 'add-request',
+    });
+    expect(voided.captured.eq).toEqual({
+      column: 'request_id',
+      value: 'void-request',
+    });
+    expect(original.captured.eq).toEqual({ column: 'id', value: 'original' });
+    expect(from.mock.calls).toEqual([
+      ['expense_entries'],
+      ['expense_entries'],
+      ['expense_lines'],
+    ]);
   });
 
   it('reads exact decimal text for the month, newest first', async () => {
@@ -535,5 +627,49 @@ describe('expense api', () => {
     expect(month.categories.filter((row) => row.id === 'c0000')).toEqual([
       expect.objectContaining({ name: 'zzzz-renamed' }),
     ]);
+  });
+
+  it('preserves SQLSTATE codes on request-less expense writes so definite refusals stay actionable', async () => {
+    const cases: Array<{
+      code: string;
+      message: string;
+      run: () => Promise<void>;
+    }> = [
+      {
+        code: '23505',
+        message: 'duplicate key value',
+        run: () => addExpenseCategory('غاز', 'daily'),
+      },
+      {
+        code: '22023',
+        message: 'invalid name',
+        run: () => renameExpenseCategory('cat-gas', 'غاز'),
+      },
+      {
+        code: '42501',
+        message: 'insufficient_privilege',
+        run: () => setExpenseCategoryActive('cat-gas', false),
+      },
+      {
+        code: '42501',
+        message: 'insufficient_privilege',
+        run: () => setMonthExpenseComplete('2030-04-01', true),
+      },
+    ];
+    for (const item of cases) {
+      install({
+        categories: query({ data: [], error: null }),
+        lines: query({ data: [], error: null }),
+        days: query({ data: [], error: null }),
+        status: query({ data: null, error: null }),
+        writeError: { code: item.code, message: item.message },
+      });
+      await expect(item.run()).rejects.toSatisfy(
+        (error: unknown) =>
+          error instanceof Error &&
+          (error as { code?: string }).code === item.code &&
+          isRequestlessDefiniteRefusal(error),
+      );
+    }
   });
 });

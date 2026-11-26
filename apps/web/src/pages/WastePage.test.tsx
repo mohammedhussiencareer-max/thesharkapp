@@ -14,9 +14,15 @@ import {
   resetHeldWrites,
   unknownSaveMessage,
 } from '@/items/request-id';
+import { hasPostedReload, putHeldWrite } from '@/lib/held-writes';
+import { makeAuditedLocks } from '@/test/held-write-locks';
 import { WastePage } from '@/pages/WastePage';
 import { listStockChoices } from '@/purchases/api';
-import { loadHistoryPage, recordWaste } from '@/waste/api';
+import {
+  hasWasteHistoryEntry,
+  loadHistoryPage,
+  recordWaste,
+} from '@/waste/api';
 import {
   alreadyCorrectedMessage,
   AlreadyCorrectedError,
@@ -46,6 +52,7 @@ const pageSize = vi.hoisted(() => 2);
 vi.mock('@/waste/api', () => ({
   historyPageSize: pageSize,
   loadHistoryPage: vi.fn(),
+  hasWasteHistoryEntry: vi.fn(),
   recordWaste: vi.fn(),
 }));
 
@@ -143,8 +150,60 @@ describe('WastePage', () => {
     vi.mocked(listStockChoices).mockReset();
     vi.mocked(loadHistoryPage).mockReset();
     vi.mocked(recordWaste).mockReset();
+    vi.mocked(hasWasteHistoryEntry).mockReset();
+    vi.mocked(hasWasteHistoryEntry).mockResolvedValue(true);
     vi.mocked(listStockChoices).mockResolvedValue([stockChoice()]);
     vi.mocked(loadHistoryPage).mockResolvedValue({ entries: [], next: null });
+  });
+
+  it('keeps an older correction pin when the first history page succeeds but exact readback fails', async () => {
+    const subject = documentSubject('6');
+    putHeldWrite(subject, {
+      requestId: 'old-correction',
+      payload: null,
+      phase: 'posted_reload',
+      readTarget: '7',
+    });
+    vi.mocked(loadHistoryPage).mockResolvedValue(slice(40, 39, '39'));
+    vi.mocked(hasWasteHistoryEntry).mockResolvedValueOnce(false);
+    await act(async () => {
+      renderPage();
+      await Promise.resolve();
+    });
+    expect(loadHistoryPage).toHaveBeenCalledExactlyOnceWith(null);
+    expect(hasPostedReload(subject, '7')).toBe(true);
+    expect(hasWasteHistoryEntry).toHaveBeenCalledExactlyOnceWith({
+      id: '7',
+      requestId: 'old-correction',
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
+    await waitFor(() => expect(hasPostedReload(subject, '7')).toBe(false));
+    await screen.findByRole('article', { name: 'سجل رقم 40' });
+  });
+
+  it('R14-2: definitive waste rejection releases its lock before another waste pin is cleaned', async () => {
+    const { locks, nested } = makeAuditedLocks();
+    vi.stubGlobal('navigator', { onLine: true, locks });
+    try {
+      vi.mocked(recordWaste).mockImplementationOnce(() => {
+        const other = documentSubject('synthetic-waste');
+        putHeldWrite(other, {
+          requestId: 'other-waste',
+          payload: null,
+          phase: 'posted_reload',
+          readTarget: other,
+        });
+        return Promise.reject(new MissingCostBasisError([itemA]));
+      });
+      renderPage();
+      const { submit } = await fillNew();
+      fireEvent.click(submit);
+      expect(await screen.findByRole('alert')).toHaveTextContent('مفيش تكلفة');
+      expect(loadHistoryPage).toHaveBeenCalledTimes(2);
+      expect(nested).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('shows the form, the empty history and the way back home', async () => {

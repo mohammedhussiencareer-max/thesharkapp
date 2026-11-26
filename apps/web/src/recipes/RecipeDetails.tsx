@@ -5,13 +5,24 @@ import {
   staleWriteMessage,
 } from '@/items/errors';
 import {
-  beginAction,
+  abortActionBeforeDispatch,
+  canDispatchAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearActionPostedReload,
   hasAction,
+  hasDurableAction,
+  markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import {
+  captureWriteSession,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { updateRecipe, type RecipeUpdate } from '@/recipes/api';
 import { recipeKindLabels } from '@/recipes/labels';
 import { recipeUpdateSubject } from '@/recipes/subjects';
@@ -38,6 +49,7 @@ export function RecipeDetails({
   /** Re-reads the recipe. Resolves to null when the read failed. */
   onReload: () => Promise<RecipeRecord | null>;
 }) {
+  const online = useOnline();
   const subject = recipeUpdateSubject(recipe.id);
   const [expected, setExpected] = useState(recipe);
   const [name, setName] = useState(recipe.name);
@@ -48,7 +60,7 @@ export function RecipeDetails({
   const [notice, setNotice] = useState<string | null>(null);
   const flight = useRef(false);
   const held = heldEpoch < 0 ? null : unknownAction<DetailsAction>(subject);
-  const disabled = locked || saving || held !== null;
+  const disabled = locked || saving || held !== null || !online;
 
   useEffect(
     () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
@@ -61,17 +73,65 @@ export function RecipeDetails({
     setActive(next.active);
   }
 
-  async function finish(action: DetailsAction) {
-    if (flight.current) return;
+  async function finish(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => DetailsAction }
+      | { kind: 'replay'; action: DetailsAction },
+  ) {
+    if (flight.current || !isOnline()) return;
+    const session = captureWriteSession();
     flight.current = true;
     setSaving(true);
     onBusyChange(true);
     setError(null);
     setNotice(null);
+    let releaseLock = () => {};
+    let saved = false;
+    let requestId: string | null = null;
     try {
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<DetailsAction>(subject, mode.create, {
+              session,
+            })
+          : await claimReplayAction<DetailsAction>(
+              subject,
+              mode.action.update.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setError(offlineWriteMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+      const action = claim.record.payload;
+      requestId = claim.record.requestId;
+      if (!canDispatchAction(subject, requestId, session)) {
+        const durable = hasDurableAction(subject, requestId);
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        if (!durable) setError(storageWriteFailedMessage);
+        else if (!isOnline()) setError(offlineWriteMessage);
+        return;
+      }
       await updateRecipe(action.recipeId, action.update);
-      settleAction(subject, action.update.requestId);
+      saved = true;
+      markActionPostedReload(subject, requestId, subject);
+      releaseLock();
+      releaseLock = () => {};
       const fresh = await onReload();
+      if (fresh !== null) {
+        await clearActionPostedReload(subject, subject, requestId);
+      }
       adopt(
         fresh ?? {
           ...expected,
@@ -81,8 +141,12 @@ export function RecipeDetails({
       );
       setNotice('الوصفة اتحفظت');
     } catch (failure) {
-      settleAction(subject, action.update.requestId, failure);
-      if (failure instanceof StaleWriteError) {
+      if (!saved && requestId !== null) {
+        settleAction(subject, requestId, failure);
+      }
+      if (!saved && failure instanceof StaleWriteError) {
+        releaseLock();
+        releaseLock = () => {};
         const fresh = await onReload();
         if (fresh) adopt(fresh);
         setError(staleWriteMessage);
@@ -90,6 +154,7 @@ export function RecipeDetails({
         setError(messageFrom(failure));
       }
     } finally {
+      releaseLock();
       flight.current = false;
       setSaving(false);
       onBusyChange(false);
@@ -109,22 +174,24 @@ export function RecipeDetails({
       setNotice('مفيش تغيير للحفظ');
       return;
     }
-    const action = beginAction<DetailsAction>(subject, (requestId) => ({
-      recipeId: recipe.id,
-      update: {
-        requestId,
-        name,
-        active,
-        expectedName: expected.name,
-        expectedActive: expected.active,
-      },
-    }));
-    void finish(action);
+    void finish({
+      kind: 'fresh',
+      create: (requestId) => ({
+        recipeId: recipe.id,
+        update: {
+          requestId,
+          name,
+          active,
+          expectedName: expected.name,
+          expectedActive: expected.active,
+        },
+      }),
+    });
   }
 
   function retry() {
     if (!held || locked || flight.current) return;
-    void finish(held);
+    void finish({ kind: 'replay', action: held });
   }
 
   return (

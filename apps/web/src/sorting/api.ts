@@ -47,16 +47,20 @@ async function readPages<T>(
 
 async function writeRpc(
   call: () => PromiseLike<{
+    data: string | null;
     error: Parameters<typeof throwIfError>[0];
   }>,
-): Promise<void> {
-  let result: { error: Parameters<typeof throwIfError>[0] };
+): Promise<string | undefined> {
+  let result: {
+    data: string | null;
+    error: Parameters<typeof throwIfError>[0];
+  };
   try {
     result = await call();
   } catch (error) {
     throw new Error(retrySafeMessage, { cause: error });
   }
-  if (!result.error) return;
+  if (!result.error) return result.data ?? undefined;
   const mapped = mapSortError(result.error);
   // A definite refusal already rolled back, so its mapped text stands.
   // An unknown outcome (anything off the allow-list, including 23505 and
@@ -328,8 +332,35 @@ function sortPayload(draft: SortDraft): Json {
   };
 }
 
-export async function recordSort(draft: SortDraft): Promise<void> {
-  await writeRpc(() =>
+export async function hasSortHistoryEntry(lookup: {
+  id?: string;
+  requestId: string;
+}): Promise<boolean> {
+  const db = appDb();
+  let id = lookup.id;
+  if (!id) {
+    const { data, error } = await db
+      .from('sort_batches')
+      .select('id')
+      .eq('request_id', lookup.requestId)
+      .maybeSingle();
+    throwIfError(error);
+    if (!data) return false;
+    id = data.id;
+  }
+  const { data, error } = await db
+    .from('sort_history')
+    .select('id')
+    .eq('id', id)
+    .maybeSingle();
+  throwIfError(error);
+  return data !== null;
+}
+
+export async function recordSort(
+  draft: SortDraft,
+): Promise<string | undefined> {
+  return writeRpc(() =>
     appDb().rpc('record_sort', { p_sort: sortPayload(draft) }),
   );
 }

@@ -14,6 +14,7 @@ import {
   createItem,
   currentShiftStart,
   deleteConversion,
+  getItemById,
   listConversions,
   listCostingSchedule,
   listItems,
@@ -46,6 +47,7 @@ import { ItemsPage } from '@/pages/ItemsPage';
 
 vi.mock('@/items/api', () => ({
   listItems: vi.fn(),
+  getItemById: vi.fn(),
   createItem: vi.fn(),
   updateItem: vi.fn(),
   setItemLoss: vi.fn(),
@@ -186,6 +188,10 @@ describe('ItemsPage', () => {
     resetHeldWrites();
     vi.mocked(listItems).mockReset();
     vi.mocked(listItems).mockResolvedValue([]);
+    vi.mocked(getItemById).mockReset();
+    vi.mocked(getItemById).mockImplementation((id: string) =>
+      Promise.resolve(served.find((row) => row.id === id) ?? null),
+    );
     vi.mocked(createItem).mockReset();
     vi.mocked(createItem).mockResolvedValue(undefined);
     vi.mocked(updateItem).mockReset();
@@ -510,7 +516,7 @@ describe('ItemsPage', () => {
   });
 
   async function saveFirstBoxConversion(
-    refresh: () => Promise<CatalogItem[]>,
+    refresh: () => Promise<CatalogItem | null>,
   ): Promise<{ loads: () => number }> {
     const box = item({
       id: 'box',
@@ -520,10 +526,11 @@ describe('ItemsPage', () => {
       countFrequency: 'weekly',
     });
     served = [box];
+    vi.mocked(listItems).mockResolvedValue([box]);
     let loads = 0;
-    vi.mocked(listItems).mockImplementation(() => {
+    vi.mocked(getItemById).mockImplementation(() => {
       loads += 1;
-      return loads === 1 ? Promise.resolve([box]) : refresh();
+      return refresh();
     });
     const rows: UnitConversion[] = [];
     vi.mocked(listConversions).mockImplementation(() =>
@@ -563,14 +570,11 @@ describe('ItemsPage', () => {
       target: { value: '12' },
     });
     fireEvent.click(within(card).getByRole('button', { name: 'ضيف التحويل' }));
-    expect(
-      await within(card).findByText('1 كرتونة = 12 قطعة'),
-    ).toBeInTheDocument();
     return { loads: () => loads };
   }
 
   it('refreshes the identity lock after the first conversion saves', async () => {
-    let resolveRefresh: (value: CatalogItem[]) => void = () => undefined;
+    let resolveRefresh: (value: CatalogItem | null) => void = () => undefined;
     const { loads } = await saveFirstBoxConversion(
       () =>
         new Promise((resolve) => {
@@ -579,13 +583,13 @@ describe('ItemsPage', () => {
     );
 
     await waitFor(() => {
-      expect(loads()).toBe(2);
+      expect(loads()).toBe(1);
     });
     expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
     expect(screen.getByLabelText('النوع')).toBeDisabled();
     expect(screen.queryByText(/متقفلين/)).not.toBeInTheDocument();
 
-    resolveRefresh([
+    resolveRefresh(
       item({
         id: 'box',
         name: 'علبة',
@@ -594,7 +598,8 @@ describe('ItemsPage', () => {
         countFrequency: 'weekly',
         identityLocked: true,
       }),
-    ]);
+    );
+    expect(await screen.findByText('1 كرتونة = 12 قطعة')).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
     });
@@ -609,16 +614,14 @@ describe('ItemsPage', () => {
     );
 
     await waitFor(() => {
-      expect(loads()).toBe(2);
+      expect(loads()).toBe(1);
     });
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'حصل خطأ. حاول تاني.',
     );
     expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
     expect(screen.getByLabelText('النوع')).toBeDisabled();
-    expect(
-      screen.getByRole('button', { name: 'إعادة المحاولة' }),
-    ).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'تحقق تاني' })).toBeEnabled();
   });
 
   it('locks the inactive filter while an inactive item conversion saves', async () => {
@@ -779,6 +782,10 @@ describe('ItemsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'ضيف صنف' }));
     expect(screen.getByLabelText('الاسم')).toHaveValue('بوري جديد');
 
+    const mixedId = catalog.find((row) => row.name === 'بوري مخلوط')?.id;
+    served = catalog.map((row) =>
+      row.id === mixedId ? { ...row, name: 'بوري جديد' } : row,
+    );
     resolveSave();
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeEnabled();
@@ -788,8 +795,8 @@ describe('ItemsPage', () => {
 
   it('keeps the editor closed until the saved name reloads', async () => {
     await renderCatalog();
-    let resolveReload: (value: CatalogItem[]) => void = () => undefined;
-    vi.mocked(listItems).mockReturnValue(
+    let resolveReload: (value: CatalogItem | null) => void = () => undefined;
+    vi.mocked(getItemById).mockReturnValue(
       new Promise((resolve) => {
         resolveReload = resolve;
       }),
@@ -814,11 +821,8 @@ describe('ItemsPage', () => {
     fireEvent.click(edit);
     expect(screen.getByLabelText('الاسم')).toHaveValue('بوري جديد');
 
-    resolveReload(
-      catalog.map((row) =>
-        row.id === 'mixed' ? { ...row, name: 'بوري جديد' } : row,
-      ),
-    );
+    const mixedRow = catalog.find((row) => row.id === 'mixed');
+    resolveReload(mixedRow ? { ...mixedRow, name: 'بوري جديد' } : null);
 
     expect(
       await screen.findByRole('heading', { name: 'بوري جديد' }),
@@ -844,13 +848,15 @@ describe('ItemsPage', () => {
       }
       throw new StaleWriteError();
     });
-    const landed = catalog.map((row) =>
-      row.id === 'mixed' ? { ...row, name: 'بوري جديد' } : row,
-    );
-    let loads = 0;
-    vi.mocked(listItems).mockImplementation(() => {
-      loads += 1;
-      return Promise.resolve(loads >= 4 ? landed : catalog);
+    const baseMixed = catalog.find((row) => row.id === 'mixed');
+    const landedRow: CatalogItem | null = baseMixed
+      ? { ...baseMixed, name: 'بوري جديد' }
+      : null;
+    vi.mocked(listItems).mockResolvedValue(catalog);
+    let byIdLoads = 0;
+    vi.mocked(getItemById).mockImplementation(() => {
+      byIdLoads += 1;
+      return Promise.resolve(landedRow);
     });
 
     const first = render(
@@ -891,7 +897,7 @@ describe('ItemsPage', () => {
     expect(screen.getByLabelText('الاسم')).toHaveValue('بوري مخلوط');
 
     releaseFirst();
-    await waitFor(() => expect(loads).toBe(3));
+    await waitFor(() => expect(byIdLoads).toBe(1));
     expect(screen.getByLabelText('الاسم')).toHaveValue('بوري مخلوط');
 
     fireEvent.change(screen.getByLabelText('الاسم'), {
@@ -1105,7 +1111,7 @@ describe('ItemsPage', () => {
 
   it('keeps the page locked until a reload after a landed save succeeds', async () => {
     await renderCatalog();
-    vi.mocked(listItems).mockRejectedValueOnce(
+    vi.mocked(getItemById).mockRejectedValueOnce(
       new Error('حصل خطأ. حاول تاني.'),
     );
 
@@ -1121,8 +1127,8 @@ describe('ItemsPage', () => {
     );
     expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
 
-    let resolveRetry: (value: CatalogItem[]) => void = () => undefined;
-    vi.mocked(listItems).mockReturnValueOnce(
+    let resolveRetry: (value: CatalogItem | null) => void = () => undefined;
+    vi.mocked(getItemById).mockReturnValueOnce(
       new Promise((resolve) => {
         resolveRetry = resolve;
       }),
@@ -1130,11 +1136,8 @@ describe('ItemsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'إعادة المحاولة' }));
     expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
 
-    resolveRetry(
-      catalog.map((row) =>
-        row.id === 'mixed' ? { ...row, name: 'بوري جديد' } : row,
-      ),
-    );
+    const mixedRow = catalog.find((row) => row.id === 'mixed');
+    resolveRetry(mixedRow ? { ...mixedRow, name: 'بوري جديد' } : null);
     expect(
       await screen.findByRole('heading', { name: 'بوري جديد' }),
     ).toBeInTheDocument();
@@ -1249,20 +1252,29 @@ describe('ItemsPage', () => {
       baseUnit: 'kg',
       active: true,
     });
-    served = [oil];
-    let resolveSaveRead: (value: CatalogItem[]) => void = () => undefined;
+    const box = item({
+      id: 'box',
+      name: 'علبة',
+      kind: 'packaging',
+      baseUnit: 'piece',
+      active: true,
+    });
+    served = [oil, box];
+    let resolveSaveRead: (value: CatalogItem | null) => void = () => undefined;
     let loads = 0;
     vi.mocked(listItems).mockImplementation(() => {
       loads += 1;
-      if (loads === 1) return Promise.resolve([oil]);
-      if (loads === 2) {
-        return new Promise((resolve) => {
-          resolveSaveRead = resolve;
-        });
-      }
+      if (loads === 1) return Promise.resolve([oil, box]);
       return Promise.reject(new Error('حصل خطأ. حاول تاني.'));
     });
-    // The panel's snapshot read started before the save and lands after it.
+    let byIdLoads = 0;
+    vi.mocked(getItemById).mockImplementation(() => {
+      byIdLoads += 1;
+      return new Promise((resolve) => {
+        resolveSaveRead = resolve;
+      });
+    });
+    // The independently ordered box panel can start a newer catalog read.
     let resolveSnapshot: (value: ReturnType<typeof listed>) => void = () =>
       undefined;
     vi.mocked(listConversions).mockReturnValueOnce(
@@ -1277,23 +1289,24 @@ describe('ItemsPage', () => {
       </MemoryRouter>,
     );
     const card = await screen.findByRole('article', { name: 'زيت' });
-    fireEvent.click(within(card).getByRole('button', { name: 'التحويلات' }));
+    const boxCard = screen.getByRole('article', { name: 'علبة' });
+    fireEvent.click(within(boxCard).getByRole('button', { name: 'التحويلات' }));
     fireEvent.click(within(card).getByRole('button', { name: 'تعديل' }));
     fireEvent.change(screen.getByLabelText('الاسم'), {
       target: { value: 'زيت جديد' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'حفظ البيانات' }));
     await waitFor(() => {
-      expect(loads).toBe(2);
+      expect(byIdLoads).toBe(1);
     });
 
     resolveSnapshot(listed([], 'liter'));
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'حصل خطأ. حاول تاني.',
     );
-    resolveSaveRead([{ ...oil, name: 'زيت جديد' }]);
+    resolveSaveRead({ ...oil, name: 'زيت جديد' });
     await waitFor(() => {
-      expect(loads).toBe(3);
+      expect(loads).toBe(2);
     });
     expect(screen.getByRole('button', { name: 'ضيف صنف' })).toBeDisabled();
     expect(
@@ -1946,11 +1959,11 @@ describe('ItemsPage', () => {
     );
     vi.mocked(updateItem).mockImplementation(() => {
       identity = 'liter|seafood||';
-      vi.mocked(listItems).mockResolvedValue(
-        catalog.map((row) =>
-          row.id === 'shrimp' ? { ...row, baseUnit: 'liter' } : row,
-        ),
+      const updated = catalog.map((row) =>
+        row.id === 'shrimp' ? { ...row, baseUnit: 'liter' as const } : row,
       );
+      served = updated;
+      vi.mocked(listItems).mockResolvedValue(updated);
       return Promise.resolve();
     });
     await renderCatalog();

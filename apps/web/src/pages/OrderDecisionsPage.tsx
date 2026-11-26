@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
+import {
+  clearActionPostedReloadSnapshot,
+  snapshotActionPostedReloads,
+} from '@/items/request-id';
 import { formatCairo } from '@/lib/cairo';
+import { offlineMoneyMessage, useReconnectReload } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import {
   loadQueuePage,
@@ -9,8 +14,12 @@ import {
   loadUnlinkedRefunds,
 } from '@/order-decisions/api';
 import { DecisionCard, NoticeView } from '@/order-decisions/DecisionCard';
-import { reloadFailedMessage } from '@/order-decisions/DecisionForm';
-import { moneyText } from '@/order-decisions/format';
+import {
+  reloadFailedMessage,
+  type OrderDecisionDraft,
+} from '@/order-decisions/DecisionForm';
+import { decisionSubject, moneyText } from '@/order-decisions/format';
+import { orderIdFromDecisionSubject } from '@/order-decisions/held-decisions';
 import { PendingSaves } from '@/order-decisions/PendingSaves';
 import type {
   DecisionNotice,
@@ -42,18 +51,132 @@ export function OrderDecisionsPage() {
   const [unlinkedId, setUnlinkedId] = useState(0);
   const [rescued, setRescued] = useState<Rescued[]>([]);
   const seqRef = useRef(0);
+  const loadedPagesRef = useRef(1);
+  const preservePagesRef = useRef(false);
+  // In-memory unsent drafts keyed by orderId (never written to localStorage).
+  const [drafts, setDrafts] = useState<ReadonlyMap<string, OrderDecisionDraft>>(
+    () => new Map(),
+  );
+  const draftsRef = useRef<Map<string, OrderDecisionDraft>>(new Map());
+  const entriesRef = useRef<Entry[] | null>(null);
+
+  const handleDraftChange = useCallback(
+    (orderId: string, nextDraft: OrderDecisionDraft | null) => {
+      const prev = draftsRef.current.get(orderId) ?? null;
+      if (nextDraft === null) {
+        if (prev === null) return;
+        draftsRef.current.delete(orderId);
+        setDrafts((current) => {
+          if (!current.has(orderId)) return current;
+          const next = new Map(current);
+          next.delete(orderId);
+          return next;
+        });
+        return;
+      }
+      draftsRef.current.set(orderId, nextDraft);
+      setDrafts((current) => {
+        const next = new Map(current);
+        next.set(orderId, nextDraft);
+        return next;
+      });
+    },
+    [],
+  );
+
+  const online = useReconnectReload(() => {
+    preservePagesRef.current = true;
+    setLoading(true);
+    setLoadError(null);
+    setLoadId((value) => value + 1);
+  });
 
   useEffect(() => {
     const seq = ++seqRef.current;
     let cancelled = false;
+    const isReconnect = preservePagesRef.current;
+    const pagesToLoad = isReconnect ? Math.max(1, loadedPagesRef.current) : 1;
+    preservePagesRef.current = false;
+    const pendingReloads = snapshotActionPostedReloads({
+      prefix: 'order-decision:',
+    });
     void (async () => {
       try {
-        const page = await loadQueuePage(filter, null);
-        if (cancelled || seq !== seqRef.current) return;
-        setEntries(page.rows.map((row) => ({ row, closed: false })));
-        setNext(page.next);
+        const merged: QueueRow[] = [];
+        const seen = new Set<string>();
+        let cursor: string | null = null;
+        let nextCursor: string | null = null;
+        let loadedCount = 0;
+        for (let index = 0; index < pagesToLoad; index += 1) {
+          const page = await loadQueuePage(filter, cursor);
+          if (cancelled || seq !== seqRef.current) return;
+          loadedCount += 1;
+          for (const row of page.rows) {
+            if (!seen.has(row.orderId)) {
+              seen.add(row.orderId);
+              merged.push(row);
+            }
+          }
+          nextCursor = page.next;
+          if (nextCursor === null) break;
+          cursor = nextCursor;
+        }
+        loadedPagesRef.current = Math.max(1, loadedCount);
+        const nextEntries: Entry[] = merged.map((row) => ({
+          row,
+          closed: false,
+        }));
+        // If earlier orders entered the queue while offline and pushed a
+        // drafted card past the loaded pages, keep the drafted card rendered
+        // (and draftsRef also restores it by orderId if it later remounts).
+        if (isReconnect && entriesRef.current) {
+          for (const previous of entriesRef.current) {
+            if (
+              !seen.has(previous.row.orderId) &&
+              draftsRef.current.has(previous.row.orderId)
+            ) {
+              seen.add(previous.row.orderId);
+              nextEntries.push(previous);
+            }
+          }
+        }
+        entriesRef.current = nextEntries;
+        setEntries(nextEntries);
+        setNext(nextCursor);
         setLoadError(null);
         setMoreError(null);
+        // Clear posted_reload pins directly covered by loaded rows, AND verify
+        // any remaining posted_reload pins (e.g., closed decisions or later
+        // pages) directly by order id via loadQueueRow(orderId).
+        const loadedSubjects = new Set(
+          merged.map((row) => decisionSubject(row.orderId)),
+        );
+        const directlyCovered = pendingReloads.filter(
+          (entry) =>
+            loadedSubjects.has(entry.subject) &&
+            entry.readTarget === entry.subject,
+        );
+        await clearActionPostedReloadSnapshot(directlyCovered);
+        const unverified = pendingReloads.filter(
+          (entry) =>
+            !loadedSubjects.has(entry.subject) &&
+            entry.readTarget === entry.subject,
+        );
+        if (unverified.length > 0) {
+          await Promise.all(
+            unverified.map(async (pin) => {
+              const orderId = orderIdFromDecisionSubject(pin.subject);
+              if (!orderId) return;
+              try {
+                await loadQueueRow(orderId);
+                if (cancelled || seq !== seqRef.current) return;
+                await clearActionPostedReloadSnapshot([pin], pin.subject);
+              } catch {
+                // Keep posted_reload held until a direct read for this order succeeds.
+              }
+            }),
+          );
+        }
       } catch (error) {
         if (cancelled || seq !== seqRef.current) return;
         setLoadError(messageFrom(error));
@@ -85,6 +208,8 @@ export function OrderDecisionsPage() {
   }, [loadId, unlinkedId]);
 
   function reload() {
+    loadedPagesRef.current = 1;
+    preservePagesRef.current = false;
     setLoading(true);
     setLoadError(null);
     setEntries(null);
@@ -117,6 +242,8 @@ export function OrderDecisionsPage() {
 
   function chooseFilter(value: QueueFilter) {
     if (value === filter) return;
+    loadedPagesRef.current = 1;
+    preservePagesRef.current = false;
     setEntries(null);
     setNext(null);
     setLoadError(null);
@@ -127,23 +254,42 @@ export function OrderDecisionsPage() {
   async function loadMore() {
     if (next === null || loadingMore) return;
     const seq = seqRef.current;
+    const pendingReloads = snapshotActionPostedReloads({
+      prefix: 'order-decision:',
+    });
     setLoadingMore(true);
     setMoreError(null);
     try {
       const page = await loadQueuePage(filter, next);
       if (seq !== seqRef.current) return;
+      loadedPagesRef.current += 1;
       setEntries((current) => {
-        const known = new Set(
-          (current ?? []).map((entry) => entry.row.orderId),
-        );
-        return [
-          ...(current ?? []),
+        const byId = new Map(page.rows.map((row) => [row.orderId, row]));
+        const updated = (current ?? []).map((entry) => {
+          const refreshed = byId.get(entry.row.orderId);
+          return refreshed ? { row: refreshed, closed: false } : entry;
+        });
+        const known = new Set(updated.map((entry) => entry.row.orderId));
+        const combined = [
+          ...updated,
           ...page.rows
             .filter((row) => !known.has(row.orderId))
             .map((row) => ({ row, closed: false })),
         ];
+        entriesRef.current = combined;
+        return combined;
       });
       setNext(page.next);
+      const loadedSubjects = new Set(
+        page.rows.map((row) => decisionSubject(row.orderId)),
+      );
+      await clearActionPostedReloadSnapshot(
+        pendingReloads.filter(
+          (entry) =>
+            loadedSubjects.has(entry.subject) &&
+            entry.readTarget === entry.subject,
+        ),
+      );
     } catch (error) {
       if (seq === seqRef.current) setMoreError(messageFrom(error));
     } finally {
@@ -152,18 +298,24 @@ export function OrderDecisionsPage() {
   }
 
   const reloadRow = useCallback(async (orderId: string): Promise<void> => {
+    const subj = decisionSubject(orderId);
+    const pendingReloads = snapshotActionPostedReloads({ subject: subj });
     const row = await loadQueueRow(orderId);
-    setEntries((current) =>
-      current === null
-        ? current
-        : current.map((entry) =>
-            entry.row.orderId !== orderId
-              ? entry
-              : row === null
-                ? { row: entry.row, closed: true }
-                : { row, closed: false },
-          ),
-    );
+    await clearActionPostedReloadSnapshot(pendingReloads, subj);
+    setEntries((current) => {
+      const updated =
+        current === null
+          ? current
+          : current.map((entry) =>
+              entry.row.orderId !== orderId
+                ? entry
+                : row === null
+                  ? { row: entry.row, closed: true }
+                  : { row, closed: false },
+            );
+      entriesRef.current = updated;
+      return updated;
+    });
   }, []);
 
   return (
@@ -174,6 +326,7 @@ export function OrderDecisionsPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">قرارات الطلبات</h1>
+      {!online ? <p role="status">{offlineMoneyMessage}</p> : null}
       <p>الطلبات الملغية والمرتجعة: اتعملت ولا ماتعملتش؟</p>
       <div className="flex flex-wrap gap-2" role="group" aria-label="التصفية">
         {filters.map(([value, label]) => (
@@ -200,6 +353,7 @@ export function OrderDecisionsPage() {
           )
         }
         onSettled={settled}
+        onVerifyPosted={reloadRow}
       />
       {rescued.map((item) => (
         <section
@@ -207,7 +361,7 @@ export function OrderDecisionsPage() {
           className="flex flex-col gap-1"
           aria-label={`نتيجة إعادة المحاولة لطلب ${item.orderId}`}
         >
-          <NoticeView notice={item.notice} />
+          <NoticeView notice={item.notice} hideMoney={!online} />
         </section>
       ))}
       {loading && entries === null ? <p>جاري تحميل الطلبات…</p> : null}
@@ -226,13 +380,16 @@ export function OrderDecisionsPage() {
               key={entry.row.orderId}
               row={entry.row}
               closed={entry.closed}
+              hideMoney={!online}
+              savedDraft={drafts.get(entry.row.orderId)}
+              onDraftChange={handleDraftChange}
               onChanged={reloadRow}
             />
           ))}
         </div>
       ) : null}
-      {moreError ? <p role="alert">{moreError}</p> : null}
-      {next !== null ? (
+      {online && moreError ? <p role="alert">{moreError}</p> : null}
+      {online && next !== null ? (
         <button
           className={secondaryButton}
           type="button"
@@ -242,26 +399,31 @@ export function OrderDecisionsPage() {
           عرض المزيد
         </button>
       ) : null}
-      {entries === null && !loading && !loadError ? (
+      {online && entries === null && !loading && !loadError ? (
         <p role="alert">{genericCatalogError}</p>
       ) : null}
-      <section className="flex flex-col gap-2" aria-label="مرتجعات من غير طلب">
-        <h2 className="text-lg font-semibold">مرتجعات من غير طلب</h2>
-        {unlinkedError ? <p role="alert">{unlinkedError}</p> : null}
-        {unlinked && unlinked.length === 0 ? (
-          <p>مفيش مرتجعات من غير طلب</p>
-        ) : null}
-        {unlinked && unlinked.length > 0 ? (
-          <ul>
-            {unlinked.map((refund) => (
-              <li key={`${refund.shiftId}/${refund.txId}`}>
-                {formatCairo(refund.occurredAt)} —{' '}
-                <span dir="ltr">{moneyText(refund.amount)}</span>
-              </li>
-            ))}
-          </ul>
-        ) : null}
-      </section>
+      {online ? (
+        <section
+          className="flex flex-col gap-2"
+          aria-label="مرتجعات من غير طلب"
+        >
+          <h2 className="text-lg font-semibold">مرتجعات من غير طلب</h2>
+          {unlinkedError ? <p role="alert">{unlinkedError}</p> : null}
+          {unlinked && unlinked.length === 0 ? (
+            <p>مفيش مرتجعات من غير طلب</p>
+          ) : null}
+          {unlinked && unlinked.length > 0 ? (
+            <ul>
+              {unlinked.map((refund) => (
+                <li key={`${refund.shiftId}/${refund.txId}`}>
+                  {formatCairo(refund.occurredAt)} —{' '}
+                  <span dir="ltr">{moneyText(refund.amount)}</span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </section>
+      ) : null}
     </main>
   );
 }

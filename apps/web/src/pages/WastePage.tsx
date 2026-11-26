@@ -1,11 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
+import { snapshotActionPostedReloads } from '@/items/request-id';
 import { UnknownSave } from '@/items/UnknownSave';
+import {
+  captureWriteSession,
+  clearPostedReloadSnapshot,
+  type PostedReloadSnapshot,
+} from '@/lib/held-writes';
+import { offlineMoneyMessage, useReconnectReload } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { listStockChoices } from '@/purchases/api';
 import type { StockChoice } from '@/purchases/types';
-import { historyPageSize, loadHistoryPage } from '@/waste/api';
+import {
+  hasWasteHistoryEntry,
+  historyPageSize,
+  loadHistoryPage,
+} from '@/waste/api';
 import { freshStart, newWasteSubject } from '@/waste/format';
 import { reloadHistory } from '@/waste/history';
 import type { HistoryEntry } from '@/waste/types';
@@ -13,6 +24,19 @@ import { useWasteAction } from '@/waste/useWasteAction';
 import { WasteForm } from '@/waste/WasteForm';
 import { WasteHistory } from '@/waste/WasteHistory';
 import { WasteNoticeView } from '@/waste/WasteNotice';
+
+async function verifyPostedWaste(pins: PostedReloadSnapshot): Promise<void> {
+  await Promise.all(
+    pins.map(async ({ subject, readTarget, requestId }) => {
+      // Older pins used the action subject as the read target.
+      const id =
+        readTarget === subject || readTarget === '*' ? undefined : readTarget;
+      if (!(await hasWasteHistoryEntry({ id, requestId }))) {
+        throw new Error(genericCatalogError);
+      }
+    }),
+  );
+}
 
 export function WastePage() {
   const [choices, setChoices] = useState<StockChoice[] | null>(null);
@@ -31,15 +55,24 @@ export function WastePage() {
   // The cursor only belongs to the list on screen while no refresh or reload is replacing that list.
   const pagingBlocked = loading || reloading > 0;
 
+  const online = useReconnectReload(() => {
+    setLoading(true);
+    setLoadError(null);
+    setLoadId((value) => value + 1);
+  });
+
   useEffect(() => {
     const seq = ++loadSeqRef.current;
     const historySeq = ++historySeqRef.current;
     let cancelled = false;
+    const session = captureWriteSession();
+    const pendingReloads = snapshotActionPostedReloads({ prefix: 'waste:' });
     void (async () => {
       try {
         const [items, page] = await Promise.all([
           listStockChoices(),
           loadHistoryPage(null),
+          verifyPostedWaste(pendingReloads),
         ]);
         if (cancelled || seq !== loadSeqRef.current) return;
         setChoices(items);
@@ -49,6 +82,7 @@ export function WastePage() {
           setNext(page.next);
           loadedRef.current = page.entries.length;
           setMoreError(null);
+          await clearPostedReloadSnapshot(pendingReloads, undefined, session);
         }
       } catch (error) {
         if (cancelled || seq !== loadSeqRef.current) return;
@@ -96,16 +130,20 @@ export function WastePage() {
   // Re-reads everything already on screen plus the new document, so a corrected row refreshes too.
   const reload = useCallback(async (): Promise<void> => {
     const seq = ++historySeqRef.current;
+    const session = captureWriteSession();
+    const pendingReloads = snapshotActionPostedReloads({ prefix: 'waste:' });
     setReloading((count) => count + 1);
     try {
-      const page = await reloadHistory(
-        Math.max(historyPageSize, loadedRef.current + 1),
-      );
+      const [page] = await Promise.all([
+        reloadHistory(Math.max(historyPageSize, loadedRef.current + 1)),
+        verifyPostedWaste(pendingReloads),
+      ]);
       if (seq !== historySeqRef.current) return;
       setEntries(page.entries);
       setNext(page.next);
       loadedRef.current = page.entries.length;
       setMoreError(null);
+      await clearPostedReloadSnapshot(pendingReloads, undefined, session);
     } finally {
       setReloading((count) => count - 1);
     }
@@ -134,6 +172,7 @@ export function WastePage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">الهالك</h1>
+      {!online ? <p role="status">{offlineMoneyMessage}</p> : null}
       <p>سجّل الأصناف اللي اتشالت من المخزون من غير بيع، مع السبب.</p>
       <div className="flex flex-wrap gap-2">
         <button
@@ -173,8 +212,10 @@ export function WastePage() {
       </section>
       <section className="flex flex-col gap-3" aria-label="سجل الهالك">
         <h2 className="text-lg font-semibold">سجل الهالك</h2>
-        {entries && entries.length === 0 ? <p>مفيش هالك متسجل</p> : null}
-        {entries && entries.length > 0 ? (
+        {online && entries && entries.length === 0 ? (
+          <p>مفيش هالك متسجل</p>
+        ) : null}
+        {online && entries && entries.length > 0 ? (
           <WasteHistory
             entries={entries}
             choices={choices ?? []}
@@ -182,8 +223,8 @@ export function WastePage() {
             reload={reload}
           />
         ) : null}
-        {moreError ? <p role="alert">{moreError}</p> : null}
-        {next !== null ? (
+        {online && moreError ? <p role="alert">{moreError}</p> : null}
+        {online && next !== null ? (
           <button
             className={secondaryButton}
             type="button"

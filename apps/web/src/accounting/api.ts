@@ -1,9 +1,4 @@
-import {
-  callFailedMessage,
-  mapActivationError,
-  readError,
-  writeError,
-} from '@/accounting/errors';
+import { mapActivationError, readError, writeError } from '@/accounting/errors';
 import {
   runAccountingWork,
   RUN_BUDGET_MS,
@@ -54,6 +49,7 @@ import {
 } from '@/accounting/types';
 import { genericCatalogError } from '@/items/errors';
 import { exactDecimal } from '@/lib/decimal';
+import { canDispatchWriteFor, captureWriteSession } from '@/lib/held-writes';
 import { supabase } from '@/lib/supabase';
 
 const openingPageSize = 100;
@@ -655,9 +651,9 @@ export function failureReportOf(value: unknown): FailureReport {
   return row.status as FailureReport;
 }
 
-export function retryResultOf(
-  value: unknown,
-): 'retried' | 'not_failed' | 'busy' {
+export type RetryOrderStatus = 'retried' | 'not_failed' | 'busy';
+
+export function retryResultOf(value: unknown): RetryOrderStatus {
   const row = record(value);
   if (
     row.status !== 'retried' &&
@@ -667,6 +663,40 @@ export function retryResultOf(
     bad();
   }
   return row.status;
+}
+
+export type OrderWorkState = {
+  orderId: string;
+  workGeneration: number;
+  failedAt: string | null;
+};
+
+export async function loadOrderWorkState(
+  orderId: string,
+): Promise<OrderWorkState | null> {
+  const { data, error } = await appDb()
+    .from('accounting_work_state')
+    .select('order_id, work_generation, failed_at')
+    .eq('order_id', orderId)
+    .maybeSingle();
+  if (error) throw readError(error);
+  if (data === null) return null;
+  const row = record(data);
+  const generation = row.work_generation;
+  if (
+    typeof row.order_id !== 'string' ||
+    row.order_id.length === 0 ||
+    typeof generation !== 'number' ||
+    !Number.isInteger(generation) ||
+    generation < 0
+  ) {
+    bad();
+  }
+  return {
+    orderId: row.order_id,
+    workGeneration: generation,
+    failedAt: looseText(row.failed_at),
+  };
 }
 
 export async function loadProcessingSummary(): Promise<ProcessingSummary> {
@@ -838,22 +868,29 @@ export function webAccountingDb(): AccountingDb {
 
 export async function runDeductions(
   onBoundAttempt?: (report: AttemptReport) => void,
+  onFailureClassified?: (report: AttemptReport) => void,
+  canContinue?: () => boolean,
 ): Promise<RunOutcome> {
+  const initiatingUser = captureWriteSession();
   return runAccountingWork(webAccountingDb(), {
     budgetMs: RUN_BUDGET_MS,
     clock: () => Date.now(),
     newAttemptId: () => crypto.randomUUID(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     onBoundAttempt,
+    onFailureClassified,
+    canContinue: () =>
+      canDispatchWriteFor(initiatingUser) &&
+      (canContinue ? canContinue() : true),
   });
 }
 
 export async function recordRunFailure(
   report: AttemptReport,
 ): Promise<FailureReport> {
-  if (report.failureKind === null) {
-    throw new Error(callFailedMessage);
-  }
+  // When a page reloads mid-bound-call, failureKind is null; reconcile the
+  // interrupted attempt via record_accounting_call_failure (the existing
+  // recovery path) using the persisted attemptId + order binding.
   return failureReportOf(
     await writeRpc(
       report.failureKind === 'recompute_timeout'
@@ -892,7 +929,7 @@ export async function activateInventory(
 
 export async function retryParkedOrder(
   orderId: string,
-): Promise<'retried' | 'not_failed' | 'busy'> {
+): Promise<RetryOrderStatus> {
   return retryResultOf(
     await writeRpc('retry_accounting_work', { p_order_id: orderId }),
   );

@@ -22,6 +22,35 @@ export {
 const differentRequestMessage =
   'الحفظ اللي فات ممكن يكون اتسجل قبل التعديل. راجع مصاريف الشهر قبل ما تسجّل تاني';
 
+export function isRequestIdMismatchError(error: unknown): boolean {
+  let current: unknown = error;
+  for (
+    let depth = 0;
+    depth < 6 && current !== null && current !== undefined;
+    depth += 1
+  ) {
+    if (typeof current === 'string') {
+      if (
+        current.includes('request_id already used for a different expense') ||
+        current.includes(differentRequestMessage)
+      ) {
+        return true;
+      }
+      break;
+    }
+    if (typeof current !== 'object') break;
+    const { text } = errorText(current);
+    if (
+      text.includes('request_id already used for a different expense') ||
+      text.includes(differentRequestMessage)
+    ) {
+      return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 const reasons: Array<[string, string]> = [
   [
     'driver amount must be greater than zero',

@@ -6,6 +6,21 @@ import { ItemList } from '@/items/ItemList';
 import type { CatalogItem, UnitConversion } from '@/items/types';
 
 vi.mock('@/items/api', () => ({
+  getItemById: vi.fn((id: string) =>
+    Promise.resolve({
+      id,
+      name: 'زيت',
+      kind: 'ingredient',
+      baseUnit: 'kg',
+      countFrequency: 'weekly',
+      lossPct: 0,
+      parentItemId: null,
+      active: true,
+      onHandQty: 0,
+      avgCost: 0,
+      onHandValue: 0,
+    }),
+  ),
   listConversions: vi.fn(),
   addConversion: vi.fn(),
   updateConversion: vi.fn(),

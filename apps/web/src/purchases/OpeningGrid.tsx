@@ -3,8 +3,9 @@ import { formatStoredFactor } from '@/items/format';
 import { groupCatalog } from '@/items/group';
 import { kindLabels, unitLabels } from '@/items/labels';
 import type { CatalogItem } from '@/items/types';
+import { useOnline } from '@/lib/online';
 import type { OpeningDraft, StockChoice, UnitOption } from '@/purchases/types';
-import { nowCairoDateTimeLocal } from '@/purchases/time';
+import { formatCairoDateTime, nowCairoDateTimeLocal } from '@/purchases/time';
 import { useResolvedUnits } from '@/purchases/units-at';
 import {
   choiceLabel,
@@ -121,20 +122,31 @@ function OpeningRow({
   );
 }
 
+function pinnedOpeningTime(iso: string): string {
+  const formatted = formatCairoDateTime(iso);
+  const match = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})$/.exec(formatted);
+  return match ? `${match[1]}T${match[2]}` : iso;
+}
+
 export function OpeningGrid({
   items,
+  allItems,
   locked,
   submitting,
   serverError,
+  pending = null,
   onClearServerError,
   onSubmit,
   resolveUnits,
   reloadKey = 0,
 }: {
   items: readonly StockChoice[];
+  allItems?: readonly StockChoice[];
   locked: boolean;
   submitting: boolean;
   serverError: string | null;
+  /** Set only after an unknown outcome or reload recovery. */
+  pending?: OpeningDraft | null;
   onClearServerError: () => void;
   onSubmit: (draft: OpeningDraft) => void;
   resolveUnits?: (
@@ -144,6 +156,7 @@ export function OpeningGrid({
   /** Bumped after a rejected factor so the same instant is fetched again. */
   reloadKey?: number;
 }) {
+  const online = useOnline();
   // One id for this draft. A failed save retries it; a new form gets a new one.
   const [requestId] = useState(() => crypto.randomUUID());
   // The current Cairo minute, captured when this form mounts, including after
@@ -158,7 +171,7 @@ export function OpeningGrid({
     ready: unitsReady,
     retry: retryUnits,
   } = useResolvedUnits(items, occurredAt, resolveUnits, reloadKey);
-  const disabled = locked || submitting;
+  const disabled = locked || submitting || !online;
   const byId = new Map(resolvedItems.map((item) => [item.id, item]));
   const groups = groupCatalog(items.map(asCatalog), false);
 
@@ -206,7 +219,12 @@ export function OpeningGrid({
 
   function onSubmitForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (disabled || !unitsReady || unitBlocked) return;
+    if (disabled) return;
+    if (pending) {
+      onSubmit(pending);
+      return;
+    }
+    if (!unitsReady || unitBlocked) return;
     const result = validateOpening(settledValues(), resolvedItems, occurredAt);
     if (!result.ok) {
       setFormError(result.formError);
@@ -251,63 +269,95 @@ export function OpeningGrid({
         </div>
       ) : null}
       {formError ? <p role="alert">{formError}</p> : null}
+      {pending ? (
+        <p>الحفظ اللي فات ممكن يكون اتسجل — هيتبعت تاني من غير تغيير</p>
+      ) : null}
       <label className="flex max-w-xs flex-col gap-1">
         وقت الرصيد
         <input
           className={fieldClass}
           type="datetime-local"
           disabled={disabled}
-          value={occurredAt}
+          readOnly={pending !== null}
+          value={pending ? pinnedOpeningTime(pending.occurredAt) : occurredAt}
           onChange={(event) => {
+            if (pending) return;
             onClearServerError();
             setFormError(null);
             setOccurredAt(event.target.value);
           }}
         />
       </label>
-      {groups.fish.length > 0 ? (
-        <section className="flex flex-col gap-3">
-          <h2 className="text-lg font-semibold">{kindLabels.fish_mixed}</h2>
-          {groups.fish.map((block) => (
-            <div key={block.parent.id} className="flex flex-col gap-3">
-              {block.showParent ? renderItem(block.parent) : null}
-              {block.children.length > 0 ? (
-                <div className="flex flex-col gap-3 border-s border-neutral-200 ps-3">
-                  <h3 className="text-base font-semibold">
-                    {kindLabels.fish_size}
-                  </h3>
-                  {block.children.map(renderItem)}
+      {pending ? (
+        <div className="flex flex-col gap-3">
+          {pending.lines.map((line) => {
+            const known = (allItems ?? items).find(
+              (candidate) => candidate.id === line.itemId,
+            );
+            const name = known?.name ?? line.itemId;
+            return (
+              <article
+                key={line.itemId}
+                aria-label={name}
+                className="flex flex-col gap-2 rounded border border-neutral-300 p-3"
+              >
+                <h3 className="text-base font-semibold">{name}</h3>
+                <p>{`${line.quantity} ${line.unit} — تكلفة ${line.unitCost}`}</p>
+              </article>
+            );
+          })}
+        </div>
+      ) : (
+        <>
+          {groups.fish.length > 0 ? (
+            <section className="flex flex-col gap-3">
+              <h2 className="text-lg font-semibold">{kindLabels.fish_mixed}</h2>
+              {groups.fish.map((block) => (
+                <div key={block.parent.id} className="flex flex-col gap-3">
+                  {block.showParent ? renderItem(block.parent) : null}
+                  {block.children.length > 0 ? (
+                    <div className="flex flex-col gap-3 border-s border-neutral-200 ps-3">
+                      <h3 className="text-base font-semibold">
+                        {kindLabels.fish_size}
+                      </h3>
+                      {block.children.map(renderItem)}
+                    </div>
+                  ) : null}
                 </div>
-              ) : null}
-            </div>
-          ))}
-        </section>
-      ) : null}
-      {groups.orphans.length > 0 ? (
-        <section className="flex flex-col gap-3">
-          <h2 className="text-lg font-semibold">{kindLabels.fish_size}</h2>
-          {groups.orphans.map(renderItem)}
-        </section>
-      ) : null}
-      {groups.seafood.length > 0 ? (
-        <section className="flex flex-col gap-3">
-          <h2 className="text-lg font-semibold">{kindLabels.seafood}</h2>
-          {groups.seafood.map(renderItem)}
-        </section>
-      ) : null}
-      {groups.ingredients.length > 0 ? (
-        <section className="flex flex-col gap-3">
-          <h2 className="text-lg font-semibold">{kindLabels.ingredient}</h2>
-          {groups.ingredients.map(renderItem)}
-        </section>
-      ) : null}
-      {groups.packaging.length > 0 ? (
-        <section className="flex flex-col gap-3">
-          <h2 className="text-lg font-semibold">{kindLabels.packaging}</h2>
-          {groups.packaging.map(renderItem)}
-        </section>
-      ) : null}
-      <button className={primaryButton} type="submit" disabled={blocked}>
+              ))}
+            </section>
+          ) : null}
+          {groups.orphans.length > 0 ? (
+            <section className="flex flex-col gap-3">
+              <h2 className="text-lg font-semibold">{kindLabels.fish_size}</h2>
+              {groups.orphans.map(renderItem)}
+            </section>
+          ) : null}
+          {groups.seafood.length > 0 ? (
+            <section className="flex flex-col gap-3">
+              <h2 className="text-lg font-semibold">{kindLabels.seafood}</h2>
+              {groups.seafood.map(renderItem)}
+            </section>
+          ) : null}
+          {groups.ingredients.length > 0 ? (
+            <section className="flex flex-col gap-3">
+              <h2 className="text-lg font-semibold">{kindLabels.ingredient}</h2>
+              {groups.ingredients.map(renderItem)}
+            </section>
+          ) : null}
+          {groups.packaging.length > 0 ? (
+            <section className="flex flex-col gap-3">
+              <h2 className="text-lg font-semibold">{kindLabels.packaging}</h2>
+              {groups.packaging.map(renderItem)}
+            </section>
+          ) : null}
+        </>
+      )}
+      <button
+        className={primaryButton}
+        type="submit"
+        disabled={pending ? disabled : blocked}
+      >
         حفظ
       </button>
     </form>

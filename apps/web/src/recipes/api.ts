@@ -3,8 +3,19 @@ import {
   CostingChangedError,
   genericCatalogError,
 } from '@/items/errors';
-import { beginAction, settleAction } from '@/items/request-id';
+import {
+  abortActionBeforeDispatch,
+  canDispatchAction,
+  claimFreshAction,
+  claimReplayAction,
+  hasDurableAction,
+  markActionPostedReload,
+  settleAction,
+  unknownAction,
+} from '@/items/request-id';
 import { isStockKind } from '@/items/types';
+import { captureWriteSession, HeldWriteStorageError } from '@/lib/held-writes';
+import { offlineWriteMessage } from '@/lib/online';
 import {
   keysAfterFilter,
   readAllByKey,
@@ -193,8 +204,35 @@ export async function createRecipe(
   kind: RecipeKind,
 ): Promise<string> {
   const subject = recipeCreateSubject(name, kind);
-  const requestId = beginAction(subject, (id) => id);
+  const session = captureWriteSession();
+  const existing = unknownAction<string>(subject);
+  const claim =
+    existing !== null
+      ? await claimReplayAction<string>(subject, existing, { session })
+      : await claimFreshAction<string>(subject, (id) => id, { session });
+  if (!claim.ok) {
+    if (claim.reason === 'storage' || claim.reason === 'missing') {
+      throw new HeldWriteStorageError();
+    }
+    if (claim.reason === 'session_invalid') {
+      throw new Error(offlineWriteMessage);
+    }
+    throw new Error(genericCatalogError);
+  }
+  const requestId = claim.record.requestId;
+  const isReplay = existing !== null;
+  let releaseLock = claim.release;
+  let dispatched = false;
+  let saved = false;
   try {
+    if (!canDispatchAction(subject, requestId, session)) {
+      const durable = hasDurableAction(subject, requestId);
+      abortActionBeforeDispatch(subject, requestId, isReplay, releaseLock);
+      releaseLock = () => {};
+      if (!durable) throw new HeldWriteStorageError();
+      throw new Error(offlineWriteMessage);
+    }
+    dispatched = true;
     const { data, error } = await appDb().rpc('create_recipe', {
       p_request_id: requestId,
       p_name: name.trim(),
@@ -205,11 +243,16 @@ export async function createRecipe(
     if (typeof recipeId !== 'string' || recipeId.length === 0) {
       throw new Error(genericCatalogError);
     }
-    settleAction(subject, requestId);
+    saved = true;
+    markActionPostedReload(subject, requestId, recipeId);
     return recipeId;
   } catch (failure) {
-    settleAction(subject, requestId, failure);
+    if (dispatched && !saved) {
+      settleAction(subject, requestId, failure);
+    }
     throw failure;
+  } finally {
+    releaseLock();
   }
 }
 

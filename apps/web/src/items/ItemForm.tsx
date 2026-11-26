@@ -1,3 +1,4 @@
+import { flushSync } from 'react-dom';
 import {
   useEffect,
   useId,
@@ -30,16 +31,25 @@ import {
   saveDetailsFirstMessage,
 } from '@/items/errors';
 import {
-  beginAction,
+  abortActionBeforeDispatch,
+  canDispatchAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearCostingPinsForItem,
   createSubject,
+  firstUnknownItemCreate,
   hasAction,
+  hasDurableAction,
   hasItemConfigurationAction,
   lossSubject,
+  markActionPostedReload,
   priceSubject,
   settleAction,
+  snapshotActionPostedReloads,
   subscribeHeldWrites,
   unknownAction,
 } from '@/items/request-id';
+import { verifyLossItem, type RunItemRead } from '@/items/verify';
 import { UnknownSave } from '@/items/UnknownSave';
 import {
   frequencyOptions,
@@ -59,6 +69,12 @@ import {
   type ItemSave,
 } from '@/items/types';
 
+import {
+  captureWriteSession,
+  HeldWriteStorageError,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { cairoDateTimeLocalToIso } from '@/purchases/time';
 import {
   decimalsEqual,
@@ -85,6 +101,20 @@ type PriceAction = {
   requestId: string;
 };
 
+function areDetailsDirty(
+  current: ItemFormValues,
+  baseline: ItemFormValues,
+): boolean {
+  return (
+    current.name !== baseline.name ||
+    current.kind !== baseline.kind ||
+    current.baseUnit !== baseline.baseUnit ||
+    current.countFrequency !== baseline.countFrequency ||
+    current.parentItemId !== baseline.parentItemId ||
+    current.active !== baseline.active
+  );
+}
+
 export function ItemForm({
   items,
   editingId,
@@ -96,8 +126,13 @@ export function ItemForm({
   onSubmit,
   onCancel,
   detailsKey = 0,
+  syncedSchedule,
+  freshDataAvailable = false,
+  onAdoptFreshData,
   onIdentityDirtyChange,
+  onDetailsDirtyChange,
   onItemStale,
+  onRunItemRead,
 }: {
   items: readonly CatalogItem[];
   editingId?: string;
@@ -107,32 +142,54 @@ export function ItemForm({
   locked?: boolean;
   serverError: string | null;
   onClearServerError: () => void;
-  onSubmit: (action: ItemSave) => Promise<boolean>;
+  onSubmit: (
+    action: ItemSave,
+    releaseAfterSettlement?: () => void,
+  ) => Promise<boolean>;
   onCancel: () => void;
-  /** Bumped after a stale details reload. Resets details only. */
+  /** Bumped after a stale details reload or clean sync. Resets details only. */
   detailsKey?: number;
+  /** Shared per-item schedule pushed by ItemsPage's unified read pipeline. */
+  syncedSchedule?: CostingSchedule | null;
+  /** True when a newer server row arrived while the form holds unsaved detail edits. */
+  freshDataAvailable?: boolean;
+  /** Explicitly adopt the latest server row into the form and its CAS baseline. */
+  onAdoptFreshData?: () => void;
   /** True while kind, base unit or parent differs from the saved item. */
   onIdentityDirtyChange?: (dirty: boolean) => void;
+  /** True while any editable detail field differs from the form's baseline. */
+  onDetailsDirtyChange?: (dirty: boolean) => void;
   /** The costing schedule is for a different identity than the shown item. */
   onItemStale?: (itemId: string) => void | Promise<void>;
+  /** Unified per-item read pipeline provided by ItemsPage. */
+  onRunItemRead?: RunItemRead;
 }) {
+  const online = useOnline();
   const titleId = useId();
+  const [baselineValues, setBaselineValues] = useState(
+    initial ?? emptyItemForm,
+  );
   const [values, setValues] = useState(initial ?? emptyItemForm);
   const [seenDetails, setSeenDetails] = useState(detailsKey);
   if (seenDetails !== detailsKey) {
     setSeenDetails(detailsKey);
-    // A stale details reload refreshes name, kind, and the other detail
-    // fields. Loss and price stay, including a value whose write outcome
-    // is still unknown.
+    const nextBaseline = initial ?? emptyItemForm();
+    setBaselineValues(nextBaseline);
+    // A stale details reload or explicit refresh updates name, kind, and the
+    // other detail fields. Loss and price stay, including a value whose write
+    // outcome is still unknown.
     setValues((current) => ({
-      ...(initial ?? emptyItemForm()),
+      ...nextBaseline,
       lossPercent: current.lossPercent,
     }));
   }
   const [errors, setErrors] = useState<ItemFormErrors>({});
   const [extraError, setExtraError] = useState<string | null>(null);
   const [shiftStart, setShiftStart] = useState<string | null>(null);
-  const [schedule, setSchedule] = useState<CostingSchedule | null>(null);
+  const [localSchedule, setLocalSchedule] = useState<CostingSchedule | null>(
+    null,
+  );
+  const schedule = syncedSchedule ?? localSchedule;
   const [mode, setMode] = useState<EffectiveMode>('now');
   const [customLocal, setCustomLocal] = useState('');
   const [lossReason, setLossReason] = useState('');
@@ -151,6 +208,10 @@ export function ItemForm({
   const timingTouched = useRef(false);
   const scheduleLoad = useRef(0);
   const onItemStaleRef = useRef(onItemStale);
+  const onRunItemReadRef = useRef(onRunItemRead);
+  const onDetailsDirtyChangeRef = useRef(onDetailsDirtyChange);
+  const detailsDirty =
+    editingId !== undefined && areDetailsDirty(values, baselineValues);
   const lossFlight = useRef(false);
   const priceFlight = useRef(false);
   const createFlight = useRef(false);
@@ -198,16 +259,20 @@ export function ItemForm({
     editingId === undefined || heldNow < 0
       ? null
       : unknownAction<PriceAction>(priceSubject(editingId));
+  const restoredCreateDraft =
+    editingId !== undefined || heldNow < 0 ? null : firstUnknownItemCreate();
+  const activeCreateDraft = submittedDraft ?? restoredCreateDraft;
   const createHeld =
-    submittedDraft === null || heldNow < 0
+    activeCreateDraft === null || heldNow < 0
       ? null
-      : unknownAction<string>(createSubject(submittedDraft));
+      : unknownAction<string>(createSubject(activeCreateDraft));
   const lossBlocked = lossHeld !== null;
   const priceBlocked = priceHeld !== null;
   const createBlocked = createHeld !== null;
-  const detailsDisabled = submitting || locked || createBlocked;
-  const lossDisabled = submitting || locked || lossBlocked || createBlocked;
-  const priceDisabled = submitting || locked || priceBlocked;
+  const detailsDisabled = submitting || locked || createBlocked || !online;
+  const lossDisabled =
+    submitting || locked || lossBlocked || createBlocked || !online;
+  const priceDisabled = submitting || locked || priceBlocked || !online;
   const parsedPrice = parseUnitCost(priceText);
   const zeroPrice =
     parsedPrice.ok && !('empty' in parsedPrice) && parsedPrice.text === '0';
@@ -227,8 +292,18 @@ export function ItemForm({
   }, [identityDirty, onIdentityDirtyChange]);
 
   useEffect(() => {
+    onDetailsDirtyChangeRef.current = onDetailsDirtyChange;
+  }, [onDetailsDirtyChange]);
+
+  useEffect(() => {
+    onDetailsDirtyChange?.(detailsDirty);
+    return () => onDetailsDirtyChange?.(false);
+  }, [detailsDirty, onDetailsDirtyChange]);
+
+  useEffect(() => {
     onItemStaleRef.current = onItemStale;
-  }, [onItemStale]);
+    onRunItemReadRef.current = onRunItemRead;
+  }, [onItemStale, onRunItemRead]);
 
   // A new displayed identity re-reads the schedule. A schedule for another
   // identity than the one this read was issued for means the shown item is
@@ -237,16 +312,64 @@ export function ItemForm({
     if (!editingId) return;
     const request = ++scheduleLoad.current;
     let cancelled = false;
+    const subject = lossSubject(editingId);
+    const pendingReloads = snapshotActionPostedReloads({ subject });
+    const runItemRead = onRunItemReadRef.current;
+    const readSession = captureWriteSession();
     void (async () => {
       try {
-        const [shift, nextSchedule] = await Promise.all([
-          currentShiftStart(),
+        const shiftRead = currentShiftStart().then((shift) => {
+          if (cancelled) return;
+          setShiftStart(shift);
+          if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
+        });
+        if (runItemRead) {
+          const [, outcome] = await Promise.all([
+            shiftRead,
+            runItemRead(
+              editingId,
+              pendingReloads.length > 0
+                ? { kind: 'loss', snapshots: pendingReloads }
+                : { kind: 'schedule' },
+            ),
+          ]);
+          if (
+            cancelled ||
+            request !== scheduleLoad.current ||
+            outcome.status === 'superseded' ||
+            !outcome.schedule
+          ) {
+            return;
+          }
+          setLocalSchedule(outcome.schedule);
+          const appliedIdentity = outcome.item
+            ? itemIdentity(outcome.item)
+            : editingIdentity;
+          if (outcome.schedule.identity !== appliedIdentity) {
+            void onItemStaleRef.current?.(editingId);
+          }
+          return;
+        }
+        if (pendingReloads.length > 0) {
+          const [, verified] = await Promise.all([
+            shiftRead,
+            verifyLossItem(editingId),
+          ]);
+          if (cancelled || request !== scheduleLoad.current) return;
+          flushSync(() => setLocalSchedule(verified.schedule));
+          await clearCostingPinsForItem(pendingReloads, editingId, readSession);
+          if (cancelled || request !== scheduleLoad.current) return;
+          if (verified.schedule.identity !== editingIdentity) {
+            void onItemStaleRef.current?.(editingId);
+          }
+          return;
+        }
+        const [, nextSchedule] = await Promise.all([
+          shiftRead,
           listCostingSchedule(editingId),
         ]);
         if (cancelled || request !== scheduleLoad.current) return;
-        setShiftStart(shift);
-        setSchedule(nextSchedule);
-        if (!timingTouched.current) setMode(defaultEffectiveMode(shift));
+        setLocalSchedule(nextSchedule);
         if (nextSchedule.identity !== editingIdentity) {
           void onItemStaleRef.current?.(editingId);
         }
@@ -261,21 +384,66 @@ export function ItemForm({
     };
   }, [editingId, editingIdentity]);
 
-  async function reloadLossSchedule(expectedIdentity?: string): Promise<void> {
-    if (!editingId) return;
+  async function reloadLossSchedule(
+    expectedIdentity?: string,
+    options?: { includeItem?: boolean },
+  ): Promise<boolean> {
+    if (!editingId) return false;
     const request = ++scheduleLoad.current;
+    const subject = lossSubject(editingId);
+    const pendingReloads = snapshotActionPostedReloads({ subject });
+    const includeItem = options?.includeItem ?? true;
+    const runItemRead = onRunItemReadRef.current;
+    const readSession = captureWriteSession();
     try {
-      const next = await listCostingSchedule(editingId);
-      if (request !== scheduleLoad.current) return;
-      setSchedule(next);
+      if (runItemRead) {
+        const outcome = await runItemRead(
+          editingId,
+          includeItem || pendingReloads.length > 0
+            ? { kind: 'loss', snapshots: pendingReloads }
+            : { kind: 'schedule' },
+        );
+        if (outcome.status === 'superseded') return false;
+        if (request !== scheduleLoad.current || !outcome.schedule) return true;
+        setLocalSchedule(outcome.schedule);
+        const appliedIdentity = outcome.item
+          ? itemIdentity(outcome.item)
+          : expectedIdentity;
+        if (
+          appliedIdentity !== undefined &&
+          outcome.schedule.identity !== appliedIdentity
+        ) {
+          void onItemStaleRef.current?.(editingId);
+        }
+        return true;
+      }
+      let nextSchedule: CostingSchedule;
+      if (includeItem || pendingReloads.length > 0) {
+        const verified = await verifyLossItem(editingId);
+        if (request !== scheduleLoad.current) return false;
+        nextSchedule = verified.schedule;
+        if (pendingReloads.length > 0) {
+          flushSync(() => setLocalSchedule(verified.schedule));
+          await clearCostingPinsForItem(pendingReloads, editingId, readSession);
+          if (request !== scheduleLoad.current) return false;
+        } else {
+          setLocalSchedule(nextSchedule);
+        }
+      } else {
+        nextSchedule = await listCostingSchedule(editingId);
+        if (request !== scheduleLoad.current) return false;
+        setLocalSchedule(nextSchedule);
+      }
       if (
         expectedIdentity !== undefined &&
-        next.identity !== expectedIdentity
+        nextSchedule.identity !== expectedIdentity
       ) {
         void onItemStaleRef.current?.(editingId);
       }
+      return true;
     } catch (error) {
       if (request === scheduleLoad.current) setExtraError(messageFrom(error));
+      return false;
     }
   }
 
@@ -325,7 +493,15 @@ export function ItemForm({
   function change(patch: Partial<ItemFormValues>) {
     onClearServerError();
     setExtraError(null);
-    setValues((current) => ({ ...current, ...patch }));
+    setValues((current) => {
+      const next = { ...current, ...patch };
+      if (editingId !== undefined) {
+        onDetailsDirtyChangeRef.current?.(
+          areDetailsDirty(next, baselineValues),
+        );
+      }
+      return next;
+    });
     setErrors({});
   }
 
@@ -342,64 +518,211 @@ export function ItemForm({
     });
   }
 
-  async function finishLoss(action: LossAction) {
-    if (!editingId || lossFlight.current) return;
+  async function finishLoss(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => LossAction }
+      | { kind: 'replay'; action: LossAction },
+  ) {
+    if (!editingId || lossFlight.current || !isOnline()) return;
+    const session = captureWriteSession();
     lossFlight.current = true;
     const subject = lossSubject(editingId);
     setRefreshingSchedule(true);
+    onClearServerError();
+    setExtraError(null);
+    let releaseLock = () => {};
+    let settledByPage = false;
+    const releaseAfterSettlement = () => {
+      settledByPage = true;
+      releaseLock();
+      releaseLock = () => {};
+    };
+    let saved = false;
+    let requestId: string | null = null;
     try {
-      const accepted = await onSubmit({
-        kind: 'loss',
-        lossPct: action.lossPct,
-        write: action.write,
-      });
-      // A refused send never reached the database. A retry whose page is
-      // busy still has an unknown outcome and must keep its payload.
-      if (accepted !== true) {
-        if (unknownAction<LossAction>(subject) === null) {
-          settleAction(subject, action.write.requestId);
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<LossAction>(subject, mode.create, {
+              session,
+            })
+          : await claimReplayAction<LossAction>(
+              subject,
+              mode.action.write.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setExtraError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setExtraError(offlineWriteMessage);
         }
         return;
       }
-      settleAction(subject, action.write.requestId);
+      releaseLock = claim.release;
+      const action = claim.record.payload;
+      requestId = claim.record.requestId;
+      if (!canDispatchAction(subject, requestId, session)) {
+        const missingPin = !hasDurableAction(subject, requestId);
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        if (!isOnline()) setExtraError(offlineWriteMessage);
+        else if (missingPin) setExtraError(storageWriteFailedMessage);
+        return;
+      }
+      const accepted = await onSubmit(
+        {
+          kind: 'loss',
+          lossPct: action.lossPct,
+          write: action.write,
+        },
+        releaseAfterSettlement,
+      );
+      // A refused send never reached the database. A retry whose page is
+      // busy still has an unknown outcome and must keep its payload.
+      if (accepted !== true) {
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        return;
+      }
+      saved = true;
+      try {
+        markActionPostedReload(subject, requestId, editingId);
+      } catch (storageError) {
+        if (!(storageError instanceof HeldWriteStorageError)) {
+          throw storageError;
+        }
+        setExtraError(messageFrom(storageError));
+      }
+      releaseLock();
+      releaseLock = () => {};
       setDatedLoss(false);
       await reloadLossSchedule();
     } catch (error) {
-      settleAction(subject, action.write.requestId, error);
-      if (isConfirmedConfigurationChange(error)) await reloadLossSchedule();
+      if (!settledByPage && !saved && requestId !== null) {
+        settleAction(subject, requestId, error);
+      }
+      if (saved) {
+        setExtraError(messageFrom(error));
+      } else if (isConfirmedConfigurationChange(error)) {
+        releaseLock();
+        releaseLock = () => {};
+        await reloadLossSchedule(undefined, { includeItem: false });
+      }
     } finally {
+      releaseLock();
       lossFlight.current = false;
       setRefreshingSchedule(false);
       setActionEpoch((value) => value + 1);
     }
   }
 
-  async function finishPrice(action: PriceAction) {
-    if (!editingId || priceFlight.current) return;
+  async function finishPrice(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => PriceAction }
+      | { kind: 'replay'; action: PriceAction },
+  ) {
+    if (!editingId || priceFlight.current || !isOnline()) return;
+    const session = captureWriteSession();
     priceFlight.current = true;
     const subject = priceSubject(editingId);
+    onClearServerError();
+    setPriceError(null);
+    let releaseLock = () => {};
+    let settledByPage = false;
+    const releaseAfterSettlement = () => {
+      settledByPage = true;
+      releaseLock();
+      releaseLock = () => {};
+    };
+    let saved = false;
+    let requestId: string | null = null;
     try {
-      const accepted = await onSubmit({
-        kind: 'price',
-        price: action.price,
-        reason: action.reason,
-        expectedId: action.expectedId,
-        identity: action.identity,
-        requestId: action.requestId,
-      });
-      if (accepted !== true) {
-        if (unknownAction<PriceAction>(subject) === null) {
-          settleAction(subject, action.requestId);
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<PriceAction>(subject, mode.create, {
+              session,
+            })
+          : await claimReplayAction<PriceAction>(
+              subject,
+              mode.action.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setPriceError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setPriceError(offlineWriteMessage);
         }
         return;
       }
-      settleAction(subject, action.requestId);
+      releaseLock = claim.release;
+      const action = claim.record.payload;
+      requestId = claim.record.requestId;
+      if (!canDispatchAction(subject, requestId, session)) {
+        const missingPin = !hasDurableAction(subject, requestId);
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        if (!isOnline()) setPriceError(offlineWriteMessage);
+        else if (missingPin) setPriceError(storageWriteFailedMessage);
+        return;
+      }
+      const accepted = await onSubmit(
+        {
+          kind: 'price',
+          price: action.price,
+          reason: action.reason,
+          expectedId: action.expectedId,
+          identity: action.identity,
+          requestId: action.requestId,
+        },
+        releaseAfterSettlement,
+      );
+      if (accepted !== true) {
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        return;
+      }
+      saved = true;
+      // ItemsPage transitions `price:<id>` to `posted_reload` until its catalog
+      // readback succeeds; only settle here if the caller did not manage it.
+      if (!settledByPage && hasDurableAction(subject, requestId)) {
+        settleAction(subject, requestId);
+      }
     } catch (error) {
-      settleAction(subject, action.requestId, error);
-      // The held price keeps the identity it was submitted with. A confirmed
-      // conflict retires that hold; the next fresh action reads this reload.
-      if (isConfirmedConfigurationChange(error)) await reloadLossSchedule();
+      if (!settledByPage && !saved && requestId !== null) {
+        settleAction(subject, requestId, error);
+      }
+      if (saved) {
+        setPriceError(messageFrom(error));
+      } else if (isConfirmedConfigurationChange(error)) {
+        releaseLock();
+        releaseLock = () => {};
+        // The held price keeps the identity it was submitted with. A confirmed
+        // conflict retires that hold; the next fresh action reads this reload.
+        await reloadLossSchedule(undefined, { includeItem: false });
+      }
     } finally {
+      releaseLock();
       priceFlight.current = false;
       setActionEpoch((value) => value + 1);
     }
@@ -425,10 +748,24 @@ export function ItemForm({
   }
 
   function retryCreate() {
-    if (!submittedDraft || submitting || locked || createFlight.current) return;
-    if (unknownAction<string>(createSubject(submittedDraft)) === null) return;
+    if (
+      !activeCreateDraft ||
+      submitting ||
+      locked ||
+      !isOnline() ||
+      createFlight.current
+    )
+      return;
+    const subject = createSubject(activeCreateDraft);
+    const heldId = unknownAction<string>(subject);
+    if (heldId === null) return;
+    if (!hasDurableAction(subject, heldId)) {
+      setExtraError(storageWriteFailedMessage);
+      return;
+    }
     createFlight.current = true;
-    void onSubmit({ kind: 'create', draft: submittedDraft })
+    setSubmittedDraft(activeCreateDraft);
+    void onSubmit({ kind: 'create', draft: activeCreateDraft })
       .catch(() => undefined)
       .finally(() => {
         createFlight.current = false;
@@ -467,6 +804,7 @@ export function ItemForm({
       !editingId ||
       submitting ||
       locked ||
+      !isOnline() ||
       refreshingSchedule ||
       lossFlight.current
     ) {
@@ -474,7 +812,7 @@ export function ItemForm({
     }
     const action = unknownAction<LossAction>(lossSubject(editingId));
     if (!action) return;
-    void finishLoss(action);
+    void finishLoss({ kind: 'replay', action });
   }
 
   function saveLoss() {
@@ -556,18 +894,27 @@ export function ItemForm({
         return;
       }
     }
-    const action = beginAction(lossSubject(editingId), (requestId) => ({
-      lossPct,
-      write: { ...built.write, requestId },
-    }));
-    void finishLoss(action);
+    void finishLoss({
+      kind: 'fresh',
+      create: (requestId) => ({
+        lossPct,
+        write: { ...built.write, requestId },
+      }),
+    });
   }
 
   function retryPrice() {
-    if (!editingId || submitting || locked || priceFlight.current) return;
+    if (
+      !editingId ||
+      submitting ||
+      locked ||
+      !isOnline() ||
+      priceFlight.current
+    )
+      return;
     const action = unknownAction<PriceAction>(priceSubject(editingId));
     if (!action) return;
-    void finishPrice(action);
+    void finishPrice({ kind: 'replay', action });
   }
 
   function savePrice() {
@@ -605,14 +952,16 @@ export function ItemForm({
       return;
     }
     const reason = price === '0' ? priceReason.trim() : null;
-    const action = beginAction(priceSubject(editingId), (requestId) => ({
-      price,
-      reason,
-      expectedId: editing?.openingPriceId ?? null,
-      identity,
-      requestId,
-    }));
-    void finishPrice(action);
+    void finishPrice({
+      kind: 'fresh',
+      create: (requestId) => ({
+        price,
+        reason,
+        expectedId: editing?.openingPriceId ?? null,
+        identity,
+        requestId,
+      }),
+    });
   }
 
   return (
@@ -629,6 +978,24 @@ export function ItemForm({
         <h2 id={titleId} className="text-lg font-semibold">
           {title}
         </h2>
+        {freshDataAvailable ? (
+          <div
+            role="status"
+            className="flex flex-wrap items-center justify-between gap-2 rounded border border-neutral-300 p-2 text-sm"
+          >
+            <span>البيانات اتحدّثت على السيرفر — في نسخة أحدث متاحة</span>
+            {onAdoptFreshData ? (
+              <button
+                className={secondaryButton}
+                type="button"
+                disabled={submitting || locked}
+                onClick={onAdoptFreshData}
+              >
+                تحميل أحدث بيانات
+              </button>
+            ) : null}
+          </div>
+        ) : null}
         {serverError ? <p role="alert">{serverError}</p> : null}
         {extraError ? <p role="alert">{extraError}</p> : null}
         <div className="flex flex-col gap-1">
@@ -861,7 +1228,7 @@ export function ItemForm({
                 dir="ltr"
                 inputMode="decimal"
                 disabled={priceDisabled}
-                value={priceText}
+                value={online ? priceText : ''}
                 onChange={(event) => {
                   if (priceDisabled) return;
                   onClearServerError();
@@ -870,7 +1237,7 @@ export function ItemForm({
                 }}
               />
             </label>
-            {zeroPrice ? (
+            {online && zeroPrice ? (
               <label className="flex flex-col gap-1">
                 سبب إن السعر صفر
                 <input

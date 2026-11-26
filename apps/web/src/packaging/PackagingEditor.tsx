@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { genericCatalogError, messageFrom } from '@/items/errors';
 import {
-  beginAction,
+  abortActionBeforeDispatch,
+  canDispatchAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearActionPostedReload,
   hasAction,
+  hasDurableAction,
+  markActionPostedReload,
   settleAction,
   subscribeHeldWrites,
   unknownAction,
@@ -11,6 +17,11 @@ import { UnknownSave } from '@/items/UnknownSave';
 import { currentMinuteMs } from '@/items/effective';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatCairo } from '@/lib/cairo';
+import {
+  captureWriteSession,
+  storageWriteFailedMessage,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 import { primaryButton } from '@/lib/page-style';
 import { coverAt, quantityError } from '@/mapping/format';
 import { sourceChangedMessage } from '@/mapping/labels';
@@ -407,6 +418,7 @@ function HistoryList({
 
 export function PackagingEditor({
   subjectKey,
+  expectedKey,
   kind,
   orderType,
   posItemId,
@@ -420,6 +432,7 @@ export function PackagingEditor({
   onReload,
 }: {
   subjectKey: string;
+  expectedKey?: string;
   kind: 'order_type' | 'base';
   orderType?: string | null;
   posItemId?: string;
@@ -430,29 +443,81 @@ export function PackagingEditor({
   units: readonly EditorUnit[];
   shiftStart: string | null;
   allowCapacity: boolean;
-  onReload: () => Promise<void>;
+  onReload: (expectedKey?: string) => Promise<boolean | void>;
 }) {
+  const online = useOnline();
   const [heldEpoch, setHeldEpoch] = useState(0);
   const [saving, setSaving] = useState(false);
   const flight = useRef(false);
   const held = heldEpoch < 0 ? null : unknownAction<PackagingWrite>(subjectKey);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const disabled = saving || held !== null;
+  const disabled = saving || held !== null || !online;
 
   useEffect(
     () => subscribeHeldWrites(() => setHeldEpoch((value) => value + 1)),
     [],
   );
 
-  async function finish(write: PackagingWrite) {
-    if (flight.current) return;
+  async function finish(
+    mode:
+      | { kind: 'fresh'; create: (requestId: string) => PackagingWrite }
+      | { kind: 'replay'; write: PackagingWrite },
+  ) {
+    if (flight.current || !isOnline()) return;
+    const session = captureWriteSession();
     flight.current = true;
     setSaving(true);
     setError(null);
     setNotice(null);
-    const requestId = write.requestId;
+    let releaseLock = () => {};
     try {
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<PackagingWrite>(subjectKey, mode.create, {
+              session,
+            })
+          : await claimReplayAction<PackagingWrite>(
+              subjectKey,
+              mode.write.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setError(offlineWriteMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+      const write = claim.record.payload;
+      const requestId = claim.record.requestId;
+      if (!canDispatchAction(subjectKey, requestId, session)) {
+        const durable = hasDurableAction(subjectKey, requestId);
+        abortActionBeforeDispatch(
+          subjectKey,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        if (!durable) setError(storageWriteFailedMessage);
+        else if (!isOnline()) setError(offlineWriteMessage);
+        return;
+      }
+      if (kind !== 'order_type' && (!posItemId || !sizeKey)) {
+        abortActionBeforeDispatch(
+          subjectKey,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        setError(genericCatalogError);
+        return;
+      }
+      let saved = false;
       try {
         if (kind === 'order_type') {
           const orderWrite: OrderTypePackagingWrite = {
@@ -469,18 +534,30 @@ export function PackagingEditor({
           };
           await setBasePackaging(baseWrite);
         }
-        settleAction(subjectKey, requestId);
+        saved = true;
+        markActionPostedReload(subjectKey, requestId, subjectKey);
       } catch (failure) {
-        settleAction(subjectKey, requestId, failure);
+        if (!saved) {
+          settleAction(subjectKey, requestId, failure);
+        }
         setError(messageFrom(failure));
-        if (!hasAction(subjectKey)) await onReload();
+        releaseLock();
+        releaseLock = () => {};
+        if (!saved && !hasAction(subjectKey)) await onReload(expectedKey);
         return;
+      } finally {
+        releaseLock();
+        releaseLock = () => {};
       }
-      await onReload();
+      const reloaded = await onReload(expectedKey);
+      if (reloaded !== false) {
+        await clearActionPostedReload(subjectKey, subjectKey, requestId);
+      }
       setNotice('التغليف اتحفظ');
     } catch (failure) {
       setError(messageFrom(failure));
     } finally {
+      releaseLock();
       flight.current = false;
       setSaving(false);
     }
@@ -492,22 +569,27 @@ export function PackagingEditor({
     reason: string | null;
     policy: PackagingPolicy | null;
   }) {
-    const write = beginAction(subjectKey, (requestId) => ({
-      requestId,
-      effectiveFrom: timing.effectiveFrom,
-      effectiveTo: timing.effectiveTo,
-      token: schedule.token,
-      reason: timing.reason,
-      policy: timing.policy,
-    }));
-    void finish(write);
+    void finish({
+      kind: 'fresh',
+      create: (requestId) => ({
+        requestId,
+        effectiveFrom: timing.effectiveFrom,
+        effectiveTo: timing.effectiveTo,
+        token: schedule.token,
+        reason: timing.reason,
+        policy: timing.policy,
+      }),
+    });
   }
 
   return (
     <section className="flex flex-col gap-3" aria-label="التغليف">
       <h3 className="text-lg font-semibold">التغليف</h3>
       {held ? (
-        <UnknownSave disabled={saving} onRetry={() => void finish(held)} />
+        <UnknownSave
+          disabled={saving}
+          onRetry={() => void finish({ kind: 'replay', write: held })}
+        />
       ) : null}
       {notice ? <p role="status">{notice}</p> : null}
       {error ? <p role="alert">{error}</p> : null}

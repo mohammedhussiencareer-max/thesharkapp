@@ -62,6 +62,17 @@ export function isDefiniteRefusal(error: unknown): boolean {
   return DEFINITE_SQLSTATES.has(code);
 }
 
+/**
+ * Whether a request-less write is known to have been refused by the server.
+ * Unlike idempotent writers (where 23505 can be a request_id replay collision),
+ * request-less writers have no request_id unique guard, so 23505 (e.g. duplicate
+ * item or category name) is always a definite refusal the owner can correct.
+ */
+export function isRequestlessDefiniteRefusal(error: unknown): boolean {
+  if (isDefiniteRefusal(error)) return true;
+  return serverCode(error) === '23505';
+}
+
 export function isUnknownOutcome(error: unknown): boolean {
   return !isDefiniteRefusal(error);
 }

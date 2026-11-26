@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { UnknownSave } from '@/items/UnknownSave';
 import { isBaseUnit } from '@/items/types';
 import { formatCairo } from '@/lib/cairo';
+import { useOnline } from '@/lib/online';
 import { primaryButton, secondaryButton } from '@/lib/page-style';
 import { formatCairoDateTime } from '@/purchases/time';
 import type { StockChoice } from '@/purchases/types';
@@ -79,6 +80,7 @@ function EntryActions({
   names: Readonly<Record<string, string>>;
   reload: () => Promise<void>;
 }) {
+  const online = useOnline();
   const [mode, setMode] = useState<Mode>('idle');
   const action = useWasteAction(documentSubject(entry.id), {
     reload,
@@ -86,7 +88,7 @@ function EntryActions({
   });
   const canChange = entry.isCurrent && !entry.isVoid;
   if (!canChange && !action.held && !action.notice) return null;
-  const locked = action.saving || action.held !== null;
+  const locked = action.saving || action.held !== null || !online;
 
   return (
     <div className="flex flex-col gap-2">

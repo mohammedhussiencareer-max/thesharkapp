@@ -1,3 +1,4 @@
+import { flushSync } from 'react-dom';
 import {
   useCallback,
   useEffect,
@@ -19,17 +20,34 @@ import {
 import { emptyScheduleToken } from '@/items/effective';
 import {
   identityOutOfDateMessage,
+  genericCatalogError,
   messageFrom,
   saveDetailsFirstMessage,
   StaleWriteError,
 } from '@/items/errors';
 import {
-  beginAction,
+  abortActionBeforeDispatch,
+  canDispatchAction,
+  claimFreshAction,
+  claimReplayAction,
+  clearCostingPinsForItem,
   conversionSubject,
   hasAction,
+  hasDurableAction,
+  listUnknownConversionsForItem,
+  markActionPostedReload,
   settleAction,
+  snapshotActionPostedReloads,
+  subscribeHeldWrites,
   unknownAction,
+  unknownSaveMessage,
+  updateActionPayload,
 } from '@/items/request-id';
+import {
+  verifyConversionItem,
+  type ItemSyncedData,
+  type RunItemRead,
+} from '@/items/verify';
 import { UnknownSave } from '@/items/UnknownSave';
 import { useDatedTiming } from '@/items/useDatedTiming';
 import { formatStoredFactor } from '@/items/format';
@@ -46,6 +64,14 @@ import {
 } from '@/items/types';
 import { validateConversion } from '@/items/validation';
 import { formatCairo } from '@/lib/cairo';
+import {
+  canDispatchWriteFor,
+  captureWriteSession,
+  HeldWriteStorageError,
+  storageWriteFailedMessage,
+  type WriteSession,
+} from '@/lib/held-writes';
+import { isOnline, offlineWriteMessage, useOnline } from '@/lib/online';
 
 const noVersions: readonly CostingVersion[] = [];
 
@@ -103,6 +129,14 @@ function actionSubject(action: ConversionAction): string {
   return conversionSubject(action.itemId, unit);
 }
 
+type ConversionSubmit =
+  | {
+      kind: 'fresh';
+      subject: string;
+      create: (requestId: string) => ConversionAction;
+    }
+  | { kind: 'replay'; action: ConversionAction };
+
 function ConversionRow({
   conversion,
   baseLabel,
@@ -123,7 +157,7 @@ function ConversionRow({
   shiftStart: string | null;
   versions: readonly CostingVersion[];
   token: string;
-  onReplay: (action: ConversionAction) => Promise<void>;
+  onReplay: (mode: ConversionSubmit) => Promise<void>;
 }) {
   const subject = conversionSubject(conversion.itemId, conversion.unit);
   const [factor, setFactor] = useState(() =>
@@ -150,11 +184,11 @@ function ConversionRow({
   const automatic = conversion.source === 'implicit' ? ' تلقائي' : '';
   const readOnly = conversion.source === 'implicit';
 
-  async function finish(action: ConversionAction) {
+  async function finish(mode: ConversionSubmit) {
     if (flight.current) return;
     flight.current = true;
     try {
-      await onReplay(action);
+      await onReplay(mode);
     } finally {
       flight.current = false;
       setActionEpoch((value) => value + 1);
@@ -177,10 +211,11 @@ function ConversionRow({
       return;
     }
     setError(null);
-    const action = beginAction(subject, (requestId) =>
-      create({ ...built.write, requestId }),
-    );
-    void finish(action);
+    void finish({
+      kind: 'fresh',
+      subject,
+      create: (requestId) => create({ ...built.write, requestId }),
+    });
   }
 
   function onSubmit(event: FormEvent<HTMLFormElement>) {
@@ -215,7 +250,7 @@ function ConversionRow({
   function retry() {
     if (!held || disabled || flight.current) return;
     setError(null);
-    void finish(held);
+    void finish({ kind: 'replay', action: held });
   }
 
   return (
@@ -284,24 +319,29 @@ export function ConversionsPanel({
   item,
   locked = false,
   identityDirty = false,
+  syncedData,
   onBusyChange,
   onItemStale,
-  onConversionSaved,
+  onRunItemRead,
 }: {
   item: CatalogItem;
   /** Set by the page while an item save is in flight. */
   locked?: boolean;
   /** The open editor holds a kind, base unit or parent that is not saved. */
   identityDirty?: boolean;
+  /** Shared per-item schedule/conversions snapshot driven by ItemsPage's read pipeline. */
+  syncedData?: ItemSyncedData;
   onBusyChange?: (busy: boolean) => void;
   /** The snapshot base unit no longer matches the item the page rendered. */
   onItemStale?: (itemId: string) => void | Promise<void>;
-  /** A write landed, so the item's configuration status may have changed. */
-  onConversionSaved?: (itemId: string) => void | Promise<void>;
+  /** Unified per-item read pipeline provided by ItemsPage. */
+  onRunItemRead?: RunItemRead;
 }) {
   const requestRef = useRef(0);
   const aliveRef = useRef(false);
   const onItemStaleRef = useRef(onItemStale);
+  const onRunItemReadRef = useRef(onRunItemRead);
+  const syncedConversionsRef = useRef(syncedData?.conversions);
   const itemBaseUnitRef = useRef(item.baseUnit);
   const identityKey = itemIdentity(item);
   const itemIdentityRef = useRef(identityKey);
@@ -309,12 +349,29 @@ export function ConversionsPanel({
   const replayFlight = useRef(new Set<string>());
   useEffect(() => {
     onItemStaleRef.current = onItemStale;
+    onRunItemReadRef.current = onRunItemRead;
+    syncedConversionsRef.current = syncedData?.conversions;
     itemBaseUnitRef.current = item.baseUnit;
     itemIdentityRef.current = identityKey;
-  }, [identityKey, item.baseUnit, onItemStale]);
-  const [rows, setRows] = useState<UnitConversion[] | null>(null);
-  const [baseUnit, setBaseUnit] = useState<BaseUnit | null>(null);
-  const [schedule, setSchedule] = useState<CostingSchedule | null>(null);
+  }, [
+    identityKey,
+    item.baseUnit,
+    onItemStale,
+    onRunItemRead,
+    syncedData?.conversions,
+  ]);
+  const [localRows, setLocalRows] = useState<UnitConversion[] | null>(null);
+  const [localBaseUnit, setLocalBaseUnit] = useState<BaseUnit | null>(null);
+  const [localSchedule, setLocalSchedule] = useState<CostingSchedule | null>(
+    null,
+  );
+  const rows = syncedData?.conversions
+    ? syncedData.conversions.rows
+    : localRows;
+  const baseUnit = syncedData?.conversions
+    ? syncedData.conversions.baseUnit
+    : localBaseUnit;
+  const schedule = syncedData?.schedule ?? localSchedule;
   const [meta, setMeta] = useState<{
     itemId: string;
     shiftStart: string | null;
@@ -342,7 +399,9 @@ export function ConversionsPanel({
   const metaReady = meta?.itemId === item.id;
   const shiftStart = metaReady ? (meta?.shiftStart ?? null) : null;
   const unitOptions = metaReady ? (meta?.unitOptions ?? []) : [];
-  const controlsDisabled = busy || locked || !metaReady || schedule === null;
+  const online = useOnline();
+  const controlsDisabled =
+    busy || locked || !online || !metaReady || schedule === null;
   // Fresh saves wait until the cached rows, the schedule and the item shown
   // agree on the identity. A held retry still replays unchanged.
   const snapshotMismatch =
@@ -355,7 +414,30 @@ export function ConversionsPanel({
     addSubject.length === 0 || actionEpoch < 0
       ? null
       : unknownAction<ConversionAction>(addSubject);
+  const detachedUnknown =
+    actionEpoch < 0
+      ? []
+      : listUnknownConversionsForItem<ConversionAction>(item.id).filter(
+          (candidate) => {
+            const candidateSubject = actionSubject(candidate);
+            if (addHeld !== null && candidateSubject === addSubject) {
+              return false;
+            }
+            if (
+              candidate.kind !== 'create_unit_then_conversion' &&
+              (rows ?? []).some((row) => row.unit === candidate.unit)
+            ) {
+              return false;
+            }
+            return true;
+          },
+        );
   const addBlocked = addHeld !== null;
+
+  useEffect(
+    () => subscribeHeldWrites(() => setActionEpoch((value) => value + 1)),
+    [],
+  );
   const addDisabled = controlsDisabled || addBlocked;
   const addTiming = useDatedTiming(
     item.id,
@@ -365,98 +447,118 @@ export function ConversionsPanel({
     addDisabled,
   );
 
-  const applySnapshot = useCallback(
-    async (
-      itemId: string,
-      next: ConversionList,
-      scheduleIdentity: string,
-      requestId: number,
-      cancelled: () => boolean,
-    ) => {
-      if (!aliveRef.current || cancelled() || requestId !== requestRef.current)
-        return;
-      setRows(next.rows);
-      setBaseUnit(next.baseUnit);
-      setLoadError(null);
-      if (
-        next.baseUnit !== itemBaseUnitRef.current ||
-        scheduleIdentity !== itemIdentityRef.current
-      ) {
-        await onItemStaleRef.current?.(itemId);
-      }
-    },
-    [],
-  );
+  const load = useCallback(
+    async (verify = true): Promise<boolean> => {
+      const requestId = ++requestRef.current;
+      const isCurrent = () =>
+        aliveRef.current && requestId === requestRef.current;
+      const pendingReloads = snapshotActionPostedReloads({
+        prefix: `conversion:[${JSON.stringify(item.id)},`,
+      });
+      const needsVerification = verify || pendingReloads.length > 0;
+      const readSession = captureWriteSession();
+      const runItemRead = onRunItemReadRef.current;
+      const initialConversions = syncedConversionsRef.current;
 
-  const failLoad = useCallback(
-    async (
-      itemId: string,
-      error: unknown,
-      requestId: number,
-      cancelled: () => boolean,
-    ) => {
-      if (!aliveRef.current || cancelled() || requestId !== requestRef.current)
-        return;
-      setLoadError(messageFrom(error));
-      if (error instanceof StaleWriteError) {
-        await onItemStaleRef.current?.(itemId);
-      }
-    },
-    [],
-  );
+      const applySnapshot = async (
+        conversions: ConversionList,
+        nextSchedule: CostingSchedule,
+        freshItem?: CatalogItem,
+      ) => {
+        if (!isCurrent()) return false;
+        const publish = () => {
+          setLocalSchedule(nextSchedule);
+          setLocalRows(conversions.rows);
+          setLocalBaseUnit(conversions.baseUnit);
+          setLoadError(null);
+        };
+        if (!runItemRead && pendingReloads.length > 0) {
+          flushSync(publish);
+          await clearCostingPinsForItem(pendingReloads, item.id, readSession);
+        } else {
+          publish();
+        }
+        if (
+          isCurrent() &&
+          (conversions.baseUnit !==
+            (freshItem?.baseUnit ?? itemBaseUnitRef.current) ||
+            nextSchedule.identity !==
+              (freshItem ? itemIdentity(freshItem) : itemIdentityRef.current))
+        ) {
+          await onItemStaleRef.current?.(item.id);
+        }
+        return true;
+      };
 
-  const load = useCallback(async () => {
-    const requestId = ++requestRef.current;
-    try {
-      const [next, nextSchedule] = await Promise.all([
-        listConversions(item.id),
-        listCostingSchedule(item.id),
-      ]);
-      if (!aliveRef.current || requestId !== requestRef.current) return;
-      setSchedule(nextSchedule);
-      await applySnapshot(
-        item.id,
-        next,
-        nextSchedule.identity,
-        requestId,
-        () => false,
-      );
-    } catch (error) {
-      await failLoad(item.id, error, requestId, () => false);
-    }
-  }, [applySnapshot, failLoad, item.id]);
-
-  useEffect(() => {
-    const requestId = ++requestRef.current;
-    let cancelled = false;
-    aliveRef.current = true;
-
-    void (async () => {
       try {
-        const [next, nextSchedule] = await Promise.all([
+        if (runItemRead) {
+          // The first verification can settle a write that finished after unmount.
+          do {
+            const outcome = await runItemRead(
+              item.id,
+              needsVerification
+                ? { kind: 'conversion', snapshots: pendingReloads }
+                : { kind: 'conversions_open' },
+            );
+            if (!isCurrent()) return false;
+            if (outcome.status === 'applied') {
+              if (!outcome.conversions || !outcome.schedule)
+                throw new Error(genericCatalogError);
+              return await applySnapshot(
+                outcome.conversions,
+                outcome.schedule,
+                outcome.item,
+              );
+            }
+            // A newer read may only cover the schedule. Give it time to publish,
+            // then replace this request if the mounted panel still needs rows.
+            await outcome.waitForLatest();
+            const synced = syncedConversionsRef.current;
+            if (
+              isCurrent() &&
+              !needsVerification &&
+              synced &&
+              synced !== initialConversions
+            ) {
+              setLoadError(null);
+              return true;
+            }
+          } while (isCurrent());
+          return false;
+        }
+        if (needsVerification) {
+          const verified = await verifyConversionItem(item.id);
+          return await applySnapshot(verified.conversions, verified.schedule);
+        }
+        const [conversions, nextSchedule] = await Promise.all([
           listConversions(item.id),
           listCostingSchedule(item.id),
         ]);
-        if (!aliveRef.current || cancelled || requestId !== requestRef.current)
-          return;
-        setSchedule(nextSchedule);
-        await applySnapshot(
-          item.id,
-          next,
-          nextSchedule.identity,
-          requestId,
-          () => cancelled,
-        );
+        return await applySnapshot(conversions, nextSchedule);
       } catch (error) {
-        await failLoad(item.id, error, requestId, () => cancelled);
+        if (!isCurrent()) return false;
+        setLoadError(messageFrom(error));
+        if (error instanceof StaleWriteError)
+          await onItemStaleRef.current?.(item.id);
+        return false;
       }
-    })();
+    },
+    [item.id],
+  );
 
+  useEffect(() => {
+    let cancelled = false;
+    aliveRef.current = true;
+    void Promise.resolve().then(() => {
+      if (!cancelled) return load(false);
+      return false;
+    });
     return () => {
       cancelled = true;
       aliveRef.current = false;
+      requestRef.current += 1;
     };
-  }, [applySnapshot, failLoad, identityKey, item.id]);
+  }, [identityKey, load]);
 
   useEffect(() => {
     let cancelled = false;
@@ -484,14 +586,13 @@ export function ConversionsPanel({
   }
 
   async function run(work: () => Promise<void>): Promise<boolean> {
-    if (busy || locked) return false;
+    if (busy || locked || !isOnline()) return false;
     setBusy(true);
     onBusyChange?.(true);
     setActionError(null);
     try {
       await work();
       await load();
-      await onConversionSaved?.(item.id);
       return true;
     } catch (error) {
       setActionError(messageFrom(error));
@@ -503,7 +604,21 @@ export function ConversionsPanel({
     }
   }
 
-  async function perform(action: ConversionAction): Promise<void> {
+  async function perform(
+    action: ConversionAction,
+    initiatingUser: WriteSession | null,
+  ): Promise<void> {
+    const subject = actionSubject(action);
+    const requestId = action.write.requestId;
+    const ensureCanDispatch = () => {
+      if (!canDispatchWriteFor(initiatingUser)) {
+        throw new Error(offlineWriteMessage);
+      }
+      if (!hasDurableAction(subject, requestId)) {
+        throw new HeldWriteStorageError();
+      }
+    };
+    ensureCanDispatch();
     switch (action.kind) {
       case 'remove_conversion':
         await deleteConversion(
@@ -537,17 +652,33 @@ export function ConversionsPanel({
       case 'create_unit_then_conversion': {
         let unitCode = action.createdCode;
         if (unitCode === null) {
+          ensureCanDispatch();
           unitCode = await addCustomUnit(
             action.inputCode,
             action.label,
             action.unitRequestId,
           );
-          action.createdCode = unitCode;
+          try {
+            updateActionPayload(subject, requestId, {
+              ...action,
+              createdCode: unitCode,
+            });
+          } catch (checkpointError) {
+            // The initial pin already persists `unitRequestId`, so replay of
+            // `addCustomUnit` is idempotent if this optional checkpoint cannot
+            // be written (e.g. storage quota full).
+            if (!(checkpointError instanceof HeldWriteStorageError)) {
+              throw checkpointError;
+            }
+          }
           setCreatedUnit({
             code: unitCode,
             inputCode: action.inputCode,
             label: action.label,
           });
+          if (!canDispatchWriteFor(initiatingUser)) {
+            throw new Error(offlineWriteMessage);
+          }
           const options = await listUnitOptions();
           setMeta((current) =>
             current && current.itemId === action.itemId
@@ -555,6 +686,7 @@ export function ConversionsPanel({
               : current,
           );
         }
+        ensureCanDispatch();
         await addConversion(
           action.itemId,
           unitCode,
@@ -583,41 +715,102 @@ export function ConversionsPanel({
     setFactor('');
   }
 
-  async function replay(action: ConversionAction): Promise<void> {
-    const subject = actionSubject(action);
-    if (replayFlight.current.has(subject)) return;
+  async function replay(mode: ConversionSubmit): Promise<void> {
+    const subject =
+      mode.kind === 'fresh' ? mode.subject : actionSubject(mode.action);
+    if (replayFlight.current.has(subject) || busy || locked || !isOnline()) {
+      return;
+    }
+    const session = captureWriteSession();
     replayFlight.current.add(subject);
+    setActionError(null);
+    let releaseLock = () => {};
     try {
+      const claim =
+        mode.kind === 'fresh'
+          ? await claimFreshAction<ConversionAction>(subject, mode.create, {
+              session,
+            })
+          : await claimReplayAction<ConversionAction>(
+              subject,
+              mode.action.write.requestId,
+              { session },
+            );
+      if (!claim.ok) {
+        if (claim.reason === 'missing' || claim.reason === 'storage') {
+          setActionError(storageWriteFailedMessage);
+        } else if (claim.reason === 'session_invalid' && !isOnline()) {
+          setActionError(offlineWriteMessage);
+        }
+        return;
+      }
+      releaseLock = claim.release;
+      const action = claim.record.payload;
+      const requestId = claim.record.requestId;
+      if (!canDispatchAction(subject, requestId, session)) {
+        const missingPin = !hasDurableAction(subject, requestId);
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
+        if (!isOnline()) setActionError(offlineWriteMessage);
+        else if (missingPin) setActionError(storageWriteFailedMessage);
+        return;
+      }
+      let saved = false;
       const accepted = await run(async () => {
         try {
-          await perform(action);
-          settleAction(subject, action.write.requestId);
+          await perform(action, session);
+          saved = true;
+          try {
+            markActionPostedReload(subject, requestId, item.id);
+          } catch (storageError) {
+            if (!(storageError instanceof HeldWriteStorageError)) {
+              throw storageError;
+            }
+            setActionError(messageFrom(storageError));
+          }
           clearSubmittedAdd(action);
         } catch (error) {
-          if (hasAction(subject)) {
-            settleAction(subject, action.write.requestId, error);
+          if (
+            !saved &&
+            (!(error instanceof HeldWriteStorageError) ||
+              hasDurableAction(subject, requestId)) &&
+            hasAction(subject)
+          ) {
+            settleAction(subject, requestId, error);
           }
           throw error;
+        } finally {
+          releaseLock();
+          releaseLock = () => {};
         }
       });
-      if (
-        accepted === false &&
-        unknownAction<ConversionAction>(subject) === null
-      ) {
-        settleAction(subject, action.write.requestId);
+      if (accepted === false) {
+        abortActionBeforeDispatch(
+          subject,
+          requestId,
+          mode.kind === 'replay',
+          releaseLock,
+        );
+        releaseLock = () => {};
       }
     } catch {
       // run already settled this action and showed the error.
     } finally {
+      releaseLock();
       replayFlight.current.delete(subject);
       setActionEpoch((value) => value + 1);
     }
   }
 
-  function send(action: ConversionAction) {
+  function send(mode: ConversionSubmit) {
     if (addFlight.current) return;
     addFlight.current = true;
-    void replay(action).finally(() => {
+    void replay(mode).finally(() => {
       addFlight.current = false;
     });
   }
@@ -653,39 +846,42 @@ export function ConversionsPanel({
       return;
     }
     const snapshotBaseUnit = baseUnit;
-    const action = beginAction(subject, (requestId) => {
-      const write = { ...built.write, requestId };
-      if (freshUnit) {
-        const createdCode =
-          createdUnit &&
-          createdUnit.inputCode === code &&
-          createdUnit.label === label
-            ? createdUnit.code
-            : null;
+    send({
+      kind: 'fresh',
+      subject,
+      create: (requestId) => {
+        const write = { ...built.write, requestId };
+        if (freshUnit) {
+          const createdCode =
+            createdUnit &&
+            createdUnit.inputCode === code &&
+            createdUnit.label === label
+              ? createdUnit.code
+              : null;
+          return {
+            kind: 'create_unit_then_conversion' as const,
+            itemId: item.id,
+            inputCode: code,
+            label,
+            createdCode,
+            unitRequestId: crypto.randomUUID(),
+            factor: parsed.factor,
+            baseUnit: snapshotBaseUnit,
+            write,
+          };
+        }
         return {
-          kind: 'create_unit_then_conversion' as const,
+          kind: 'set_conversion' as const,
+          via: 'add' as const,
           itemId: item.id,
-          inputCode: code,
-          label,
-          createdCode,
-          unitRequestId: crypto.randomUUID(),
+          unit: code,
           factor: parsed.factor,
+          expectedFactor: parsed.factor,
           baseUnit: snapshotBaseUnit,
           write,
         };
-      }
-      return {
-        kind: 'set_conversion' as const,
-        via: 'add' as const,
-        itemId: item.id,
-        unit: code,
-        factor: parsed.factor,
-        expectedFactor: parsed.factor,
-        baseUnit: snapshotBaseUnit,
-        write,
-      };
+      },
     });
-    send(action);
   }
 
   function retryAdd() {
@@ -695,7 +891,7 @@ export function ConversionsPanel({
       conversionSubject(item.id, code),
     );
     if (!action) return;
-    send(action);
+    send({ kind: 'replay', action });
   }
 
   const shownError = loadError ?? metaError;
@@ -778,6 +974,37 @@ export function ConversionsPanel({
               </div>
             ),
           )}
+        </div>
+      ) : null}
+      {detachedUnknown.length > 0 ? (
+        <div
+          className="flex flex-col gap-2"
+          aria-label="تحويلات مش متأكد إنها اتسجلت"
+        >
+          {detachedUnknown.map((pendingAction) => {
+            const label =
+              pendingAction.kind === 'create_unit_then_conversion'
+                ? pendingAction.label
+                : pendingAction.unit;
+            return (
+              <div
+                key={actionSubject(pendingAction)}
+                className="flex flex-col gap-2 rounded border border-neutral-300 p-2"
+              >
+                <p role="alert">{`تحويل ${label} — ${unknownSaveMessage}`}</p>
+                <button
+                  className={secondaryButton}
+                  type="button"
+                  disabled={busy || locked || !online}
+                  onClick={() =>
+                    send({ kind: 'replay', action: pendingAction })
+                  }
+                >
+                  إعادة المحاولة
+                </button>
+              </div>
+            );
+          })}
         </div>
       ) : null}
       <form

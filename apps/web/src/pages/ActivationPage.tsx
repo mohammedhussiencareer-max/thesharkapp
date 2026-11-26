@@ -1,10 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useActivationAction } from '@/accounting/activation-action';
+import {
+  ACTIVATION_SUBJECT,
+  useActivationAction,
+} from '@/accounting/activation-action';
 import { loadOpeningReview } from '@/accounting/api';
 import { ActivationReview } from '@/accounting/ActivationReview';
-import type { OpeningReview } from '@/accounting/types';
+import type { ActivationWrite, OpeningReview } from '@/accounting/types';
 import { messageFrom } from '@/items/errors';
+import {
+  clearActionPostedReloadSnapshot,
+  snapshotActionPostedReloads,
+} from '@/items/request-id';
+import { clearVerifiedHeldWrite, getHeldWrite } from '@/lib/held-writes';
+import { offlineMoneyMessage, useReconnectReload } from '@/lib/online';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 
 export function ActivationPage() {
@@ -14,15 +23,34 @@ export function ActivationPage() {
   const [loadId, setLoadId] = useState(0);
   const seqRef = useRef(0);
 
+  const online = useReconnectReload(() => {
+    setLoading(true);
+    setLoadError(null);
+    setLoadId((value) => value + 1);
+  });
+
   useEffect(() => {
     const seq = ++seqRef.current;
     let cancelled = false;
+    const pendingReloads = snapshotActionPostedReloads({
+      subject: ACTIVATION_SUBJECT,
+    });
+    const capturedHeld = getHeldWrite<ActivationWrite>(ACTIVATION_SUBJECT);
     void (async () => {
       try {
         const next = await loadOpeningReview();
         if (cancelled || seq !== seqRef.current) return;
         setReview(next);
         setLoadError(null);
+        if (next.activated) {
+          if (capturedHeld && capturedHeld.phase !== 'posted_reload') {
+            await clearVerifiedHeldWrite(capturedHeld);
+          }
+          await clearActionPostedReloadSnapshot(
+            pendingReloads,
+            ACTIVATION_SUBJECT,
+          );
+        }
       } catch (error) {
         if (cancelled || seq !== seqRef.current) return;
         setLoadError(messageFrom(error));
@@ -45,13 +73,17 @@ export function ActivationPage() {
         </Link>
       </p>
       <h1 className="text-2xl font-semibold">مراجعة التفعيل</h1>
-      {loading && review === null ? <p>جاري تحميل المراجعة…</p> : null}
+      {!online ? <p role="status">{offlineMoneyMessage}</p> : null}
+      {online && loading && review === null ? (
+        <p>جاري تحميل المراجعة…</p>
+      ) : null}
       {loadError ? (
         <>
           <p>{loadError}</p>
           <button
             className={secondaryButton}
             type="button"
+            disabled={!online}
             onClick={() => setLoadId((value) => value + 1)}
           >
             إعادة تحميل المراجعة
@@ -63,6 +95,7 @@ export function ActivationPage() {
           review={review}
           checkedZeroIds={activation.checkedZeroIds}
           checksLocked={activation.checksLocked}
+          hideMoney={!online}
           onToggleZero={activation.toggleZero}
           notice={activation.notice}
           showActivate={activation.showActivate}

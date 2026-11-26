@@ -61,24 +61,25 @@ function isConversionChanged(error: {
   return error.code === '40001' || text.includes('conversion changed');
 }
 
-async function writeRpc(
+async function writeRpc<T = unknown>(
   call: () => PromiseLike<{
+    data?: T | null;
     error: Parameters<typeof throwIfError>[0];
   }>,
-): Promise<void> {
-  let result: { error: Parameters<typeof throwIfError>[0] };
+): Promise<T | undefined> {
+  let result: { data?: T | null; error: Parameters<typeof throwIfError>[0] };
   try {
     result = await call();
   } catch (error) {
     throw new Error(retrySafeMessage, { cause: error });
   }
-  if (!result.error) return;
+  if (!result.error) return result.data ?? undefined;
   if (isConversionChanged(result.error)) throw new ConversionChangedError();
   const mapped = mapPurchaseError(result.error);
   if (mapped === genericPurchaseError) {
     throw new Error(retrySafeMessage, { cause: result.error });
   }
-  throw new Error(mapped);
+  throw new Error(mapped, { cause: result.error });
 }
 
 function throwIfError(
@@ -311,6 +312,36 @@ export async function listPurchases(
   }));
 }
 
+export async function getPurchaseById(lookup: {
+  id?: string;
+  requestId?: string;
+}): Promise<Purchase | null> {
+  if (!lookup.id && !lookup.requestId) return null;
+  let query = appDb()
+    .from('purchases')
+    .select(
+      'id, purchased_at, supplier, invoice_no, note, total_paid_text:total_paid::text, created_at',
+    );
+  if (lookup.id) {
+    query = query.eq('id', lookup.id);
+  } else if (lookup.requestId) {
+    query = query.eq('request_id', lookup.requestId);
+  }
+  const { data, error } = await query.maybeSingle();
+  throwIfError(error);
+  if (!data) return null;
+  const lines = await linesByPurchase([data.id]);
+  return {
+    id: data.id,
+    purchasedAt: data.purchased_at,
+    supplier: data.supplier,
+    invoiceNo: data.invoice_no,
+    note: data.note,
+    totalPaid: exactDecimal(data.total_paid_text),
+    lines: lines.get(data.id) ?? [],
+  };
+}
+
 function purchasePayload(draft: PurchaseDraft): Json {
   return {
     request_id: draft.requestId,
@@ -329,12 +360,15 @@ function purchasePayload(draft: PurchaseDraft): Json {
   };
 }
 
-export async function recordPurchase(draft: PurchaseDraft): Promise<void> {
-  await writeRpc(() =>
+export async function recordPurchase(
+  draft: PurchaseDraft,
+): Promise<string | undefined> {
+  const data = await writeRpc<string>(() =>
     appDb().rpc('record_purchase', {
       p_purchase: purchasePayload(draft),
     }),
   );
+  return typeof data === 'string' && data.length > 0 ? data : undefined;
 }
 
 export async function recordOpeningStock(draft: OpeningDraft): Promise<void> {

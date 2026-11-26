@@ -4,6 +4,7 @@ import { formatEgp, formatLossPercent, formatQty } from '@/items/format';
 import { groupCatalog } from '@/items/group';
 import { frequencyLabels, kindLabels, unitLabels } from '@/items/labels';
 import type { CatalogItem } from '@/items/types';
+import type { ItemSyncedData, RunItemRead } from '@/items/verify';
 
 const secondaryButton =
   'rounded border border-neutral-300 px-3 py-2 disabled:opacity-60';
@@ -14,22 +15,26 @@ function ItemCard({
   editsDisabled,
   conversionsLocked,
   identityDirty,
+  hideMoney = false,
+  syncedData,
   onEdit,
   onToggleConversions,
   onConversionsBusy,
   onItemStale,
-  onConversionSaved,
+  onRunItemRead,
 }: {
   item: CatalogItem;
   conversionsOpen: boolean;
   editsDisabled: boolean;
   conversionsLocked: boolean;
   identityDirty: boolean;
+  hideMoney?: boolean;
+  syncedData?: ItemSyncedData;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusy: (busy: boolean) => void;
   onItemStale?: (itemId: string) => void | Promise<void>;
-  onConversionSaved?: (itemId: string) => void | Promise<void>;
+  onRunItemRead?: RunItemRead;
 }) {
   return (
     <article
@@ -58,14 +63,18 @@ function ItemCard({
             {formatQty(item.onHandQty)} {unitLabels[item.baseUnit]}
           </dd>
         </div>
-        <div>
-          <dt className="text-neutral-600">متوسط التكلفة</dt>
-          <dd>{formatEgp(item.avgCost)}</dd>
-        </div>
-        <div>
-          <dt className="text-neutral-600">القيمة</dt>
-          <dd>{formatEgp(item.onHandValue)}</dd>
-        </div>
+        {hideMoney ? null : (
+          <>
+            <div>
+              <dt className="text-neutral-600">متوسط التكلفة</dt>
+              <dd>{formatEgp(item.avgCost)}</dd>
+            </div>
+            <div>
+              <dt className="text-neutral-600">القيمة</dt>
+              <dd>{formatEgp(item.onHandValue)}</dd>
+            </div>
+          </>
+        )}
       </dl>
       <div className="flex flex-wrap gap-2">
         <button
@@ -94,9 +103,10 @@ function ItemCard({
           item={item}
           locked={editsDisabled}
           identityDirty={identityDirty}
+          syncedData={syncedData}
           onBusyChange={onConversionsBusy}
           onItemStale={onItemStale}
-          onConversionSaved={onConversionSaved}
+          onRunItemRead={onRunItemRead}
         />
       ) : null}
     </article>
@@ -118,11 +128,13 @@ export function ItemList({
   openConversionsId,
   editsDisabled,
   identityDirtyId = null,
+  hideMoney = false,
+  syncedDataById,
   onEdit,
   onToggleConversions,
   onConversionsBusyChange,
   onItemStale,
-  onConversionSaved,
+  onRunItemRead,
 }: {
   items: readonly CatalogItem[];
   showInactive: boolean;
@@ -130,11 +142,13 @@ export function ItemList({
   editsDisabled: boolean;
   /** The item whose open editor holds an unsaved kind, base unit or parent. */
   identityDirtyId?: string | null;
+  hideMoney?: boolean;
+  syncedDataById?: Readonly<Record<string, ItemSyncedData>>;
   onEdit: (item: CatalogItem) => void;
   onToggleConversions: (itemId: string) => void;
   onConversionsBusyChange?: (busy: boolean) => void;
   onItemStale?: (itemId: string) => void | Promise<void>;
-  onConversionSaved?: (itemId: string) => void | Promise<void>;
+  onRunItemRead?: RunItemRead;
 }) {
   const [conversionsBusy, setConversionsBusyState] = useState(false);
   // The page also locks controls that would unmount an open panel (the inactive filter).
@@ -151,11 +165,13 @@ export function ItemList({
       editsDisabled={editsDisabled}
       conversionsLocked={conversionsBusy || editsDisabled}
       identityDirty={identityDirtyId === item.id}
+      hideMoney={hideMoney}
+      syncedData={syncedDataById?.[item.id]}
       onEdit={onEdit}
       onToggleConversions={onToggleConversions}
       onConversionsBusy={setConversionsBusy}
       onItemStale={onItemStale}
-      onConversionSaved={onConversionSaved}
+      onRunItemRead={onRunItemRead}
     />
   );
 
@@ -180,11 +196,13 @@ export function ItemList({
                   editsDisabled={editsDisabled}
                   conversionsLocked={conversionsBusy || editsDisabled}
                   identityDirty={identityDirtyId === block.parent.id}
+                  hideMoney={hideMoney}
+                  syncedData={syncedDataById?.[block.parent.id]}
                   onEdit={onEdit}
                   onToggleConversions={onToggleConversions}
                   onConversionsBusy={setConversionsBusy}
                   onItemStale={onItemStale}
-                  onConversionSaved={onConversionSaved}
+                  onRunItemRead={onRunItemRead}
                 />
               ) : (
                 <p>تحت {block.parent.name} (موقوف)</p>

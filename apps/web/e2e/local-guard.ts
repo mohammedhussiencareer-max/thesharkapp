@@ -1,7 +1,13 @@
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { loadEnv } from 'vite';
 
 const localHosts = new Set(['127.0.0.1', 'localhost', '::1']);
+// Disable Chromium's implicit bypass rules (which include link-local IPs like
+// 169.254.0.0/16 and [fe80::]/10) first with `<-loopback>`, then explicitly
+// allow only the intended loopback hosts.
+export const LOOPBACK_PROXY_BYPASS = '<-loopback>,127.0.0.1,localhost,[::1]';
 
 const webRoot = join(import.meta.dirname, '..');
 
@@ -60,7 +66,7 @@ export function isBlockedRemoteUrl(url: string): boolean {
   return !isLoopbackHost(parsed.hostname);
 }
 
-type GuardedPage = {
+type GuardedTarget = {
   route(
     url: string,
     handler: (route: {
@@ -69,7 +75,7 @@ type GuardedPage = {
       continue(): Promise<unknown>;
     }) => Promise<unknown> | void,
   ): Promise<unknown>;
-  // page.route does not see WebSockets; Playwright routes them separately.
+  // route does not see WebSockets; Playwright routes them separately.
   routeWebSocket(
     url: string,
     handler: (ws: {
@@ -80,16 +86,18 @@ type GuardedPage = {
   ): Promise<unknown>;
 };
 
-/** Abort every non-loopback request and WebSocket for the life of the page. */
-export async function installLoopbackGuard(page: GuardedPage): Promise<void> {
-  await page.route('**/*', async (route) => {
+/** Abort every non-loopback request and WebSocket for the life of the context or page. */
+export async function installLoopbackGuard(
+  target: GuardedTarget,
+): Promise<void> {
+  await target.route('**/*', async (route) => {
     if (isBlockedRemoteUrl(route.request().url())) {
       await route.abort('blockedbyclient');
       return;
     }
     await route.continue();
   });
-  await page.routeWebSocket('**/*', async (ws) => {
+  await target.routeWebSocket('**/*', async (ws) => {
     if (isBlockedRemoteUrl(ws.url())) {
       // Never connected to the remote server; the page sees a closed socket.
       await ws.close({
@@ -100,4 +108,59 @@ export async function installLoopbackGuard(page: GuardedPage): Promise<void> {
     }
     ws.connectToServer();
   });
+}
+
+export type LoopbackOnlyProxy = {
+  proxyConfig: {
+    server: string;
+    bypass: string;
+  };
+  blockedRequests: string[];
+  close: () => Promise<void>;
+};
+
+/**
+ * Starts a loopback-bound proxy that refuses every proxied request without
+ * opening any outbound connection. Paired with `bypass: LOOPBACK_PROXY_BYPASS`,
+ * loopback traffic goes directly to localhost with Chromium's real HTTP cache
+ * enabled (no `context.route()` interception), while every non-loopback HTTP,
+ * HTTPS, or WebSocket request is rejected.
+ */
+export async function createLoopbackOnlyProxy(): Promise<LoopbackOnlyProxy> {
+  const blockedRequests: string[] = [];
+  const server = createServer((req, res) => {
+    blockedRequests.push(req.url ?? req.headers.host ?? 'unknown');
+    res.writeHead(403, {
+      'content-type': 'text/plain',
+      connection: 'close',
+    });
+    res.end('blocked by e2e loopback-only proxy');
+  });
+  server.on('connect', (req, socket) => {
+    blockedRequests.push(`CONNECT ${req.url ?? 'unknown'}`);
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+
+  const address = server.address() as AddressInfo;
+  return {
+    proxyConfig: {
+      server: `http://127.0.0.1:${String(address.port)}`,
+      bypass: LOOPBACK_PROXY_BYPASS,
+    },
+    blockedRequests,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      }),
+  };
 }

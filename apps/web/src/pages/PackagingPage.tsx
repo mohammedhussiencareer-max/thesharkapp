@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { genericCatalogError, messageFrom } from '@/items/errors';
+import {
+  clearActionPostedReloadSnapshot,
+  snapshotActionPostedReloads,
+} from '@/items/request-id';
 import { cairoDateIso, formatCairo } from '@/lib/cairo';
 import { pageShell, secondaryButton } from '@/lib/page-style';
 import { orderCoverageText } from '@/mapping/format';
@@ -109,6 +113,8 @@ export function PackagingPage() {
     const key = selected.key;
     let cancelled = false;
     const current = selected;
+    const packSubj = orderTypePackagingSubject(current.key);
+    const pendingReloads = snapshotActionPostedReloads({ subject: packSubj });
     void (async () => {
       try {
         const next = await loadOrderTypePackaging(current.label);
@@ -121,6 +127,7 @@ export function PackagingPage() {
         }
         setDetail({ key, value: next });
         setDetailError(null);
+        await clearActionPostedReloadSnapshot(pendingReloads, packSubj);
       } catch (error) {
         if (
           cancelled ||
@@ -138,14 +145,21 @@ export function PackagingPage() {
     };
   }, [selected]);
 
-  async function reload() {
-    const keyAtStart = selectedKeyRef.current;
+  async function reload(expectedKey?: string): Promise<boolean> {
+    const keyAtStart = expectedKey ?? selectedKeyRef.current;
+    if (keyAtStart === null || selectedKeyRef.current !== keyAtStart) {
+      return false;
+    }
     const gen = ++listSeq.current;
     const nextTypes = await loadHome(gen);
-    if (!nextTypes || gen !== listSeq.current) return;
-    if (keyAtStart === null || selectedKeyRef.current !== keyAtStart) return;
+    if (!nextTypes || gen !== listSeq.current) return false;
+    if (selectedKeyRef.current !== keyAtStart) {
+      return false;
+    }
     const current = nextTypes.find((row) => row.key === keyAtStart);
-    if (!current) return;
+    if (!current) return false;
+    const packSubj = orderTypePackagingSubject(current.key);
+    const pendingReloads = snapshotActionPostedReloads({ subject: packSubj });
     const detailRequest = ++detailSeq.current;
     const next = await loadOrderTypePackaging(current.label);
     if (
@@ -153,10 +167,12 @@ export function PackagingPage() {
       detailRequest !== detailSeq.current ||
       selectedKeyRef.current !== keyAtStart
     ) {
-      return;
+      return false;
     }
     setDetail({ key: keyAtStart, value: next });
     setDetailError(null);
+    await clearActionPostedReloadSnapshot(pendingReloads, packSubj);
+    return true;
   }
 
   return (
@@ -264,6 +280,7 @@ export function PackagingPage() {
       {selected && detail && detail.key === selected.key && catalog ? (
         <PackagingEditor
           subjectKey={orderTypePackagingSubject(selected.key)}
+          expectedKey={selected.key}
           kind="order_type"
           orderType={selected.label}
           schedule={detail.value.schedule}

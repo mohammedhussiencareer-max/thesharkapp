@@ -521,6 +521,9 @@ describe('RecipePage', () => {
       });
       fireEvent.click(screen.getByRole('button', { name: 'احفظ البيانات' }));
       expect(save()).toBeDisabled();
+      await waitFor(() => {
+        expect(updateRecipe).toHaveBeenCalledTimes(1);
+      });
       await act(async () => {
         release();
         await Promise.resolve();
@@ -1224,9 +1227,11 @@ describe('RecipePage', () => {
       fireEvent.click(save());
       fireEvent.submit(form);
       fireEvent.click(save());
-      expect(setRecipeVersion).toHaveBeenCalledTimes(1);
       expect(save()).toBeDisabled();
       expect(screen.getByLabelText('اسم الوصفة')).toBeDisabled();
+      await waitFor(() => {
+        expect(setRecipeVersion).toHaveBeenCalledTimes(1);
+      });
 
       await act(async () => {
         release();
