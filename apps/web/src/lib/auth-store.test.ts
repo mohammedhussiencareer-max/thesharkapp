@@ -3479,7 +3479,39 @@ describe('auth-store PR 65 verified findings (P1-1..P3-4)', () => {
     const sdkKey = 'sb-p1-1-skip-newer-auth-token';
     const coordKey = getLogoutCoordStorageKey(url);
     const lockKey = `theshark:auth:logout-lock:v1:${encodeURIComponent(url)}`;
-    const storage = makeMemoryStorage();
+    const values = new Map<string, string>();
+    let injectSession2AfterCapture = false;
+    let coordReadsDuringSignOut = 0;
+    const storage: Storage = {
+      get length() {
+        return values.size;
+      },
+      clear() {
+        values.clear();
+      },
+      getItem(k: string) {
+        if (injectSession2AfterCapture && k === coordKey) {
+          coordReadsDuringSignOut += 1;
+          // Let signOut() reconcile and capture session1, then race session2
+          // into sdkKey right as executeSignOutAttempt allocates attemptId
+          // (before writing pending).
+          if (coordReadsDuringSignOut === 2) {
+            injectSession2AfterCapture = false;
+            values.set(sdkKey, JSON.stringify(session2));
+          }
+        }
+        return values.get(k) ?? null;
+      },
+      key(i: number) {
+        return [...values.keys()][i] ?? null;
+      },
+      removeItem(k: string) {
+        values.delete(k);
+      },
+      setItem(k: string, v: string) {
+        values.set(k, String(v));
+      },
+    };
     const fakeLocks = createFakeLockManager();
 
     const server = createStatefulAuthServer();
@@ -3527,8 +3559,9 @@ describe('auth-store PR 65 verified findings (P1-1..P3-4)', () => {
         expect(store.getAuthSnapshot().status).toBe('owner');
       });
 
-      // Another tab replaced sdkKey with session2 (before writing signed_in coord).
-      storage.setItem(sdkKey, JSON.stringify(session2));
+      // Another tab races and replaces sdkKey with session2 right after signOut
+      // captures session1 (before writing pending coord).
+      injectSession2AfterCapture = true;
 
       await store.signOut();
       await Promise.resolve();
@@ -13486,6 +13519,348 @@ describe('auth-store PR 65 verified findings (P1-1..P3-4)', () => {
     } finally {
       await clientA.auth.stopAutoRefresh();
       tabA.resetAuthStore({ clearStorage: false });
+    }
+  });
+
+  it('DELTA17-P2-1: explicit signOut on an active signed-in tab with a stale in-memory session signs out the authoritative newer persisted session instead of silently no-oping (I1, I4)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { createAuthStore, getLogoutCoordStorageKey } =
+      await import('@/lib/auth-store');
+    const url = 'https://delta17-p2-1-stale-active-signout.test';
+    const sdkKey = 'sb-delta17-p2-1-stale-active-signout-auth-token';
+    const coordKey = getLogoutCoordStorageKey(url);
+    const storage = makeMemoryStorage();
+    const server = createStatefulAuthServer();
+    const sid1 = server.issueSession();
+    storage.setItem(sdkKey, JSON.stringify(sid1));
+
+    let lastLogoutAuth: string | null = null;
+    const fetchFn: typeof fetch = (input, init) => {
+      const href = requestUrlOf(input);
+      const headers = new Headers(init?.headers);
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/token?grant_type=password')) {
+        return Promise.resolve(server.handlePasswordSignIn());
+      }
+      if (href.includes('/auth/v1/logout')) {
+        lastLogoutAuth = headers.get('authorization');
+        return Promise.resolve(
+          server.handleLogout(headers.get('authorization')),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    const makeClient = () =>
+      createClient(url, TEST_ANON_KEY, {
+        auth: {
+          storage,
+          storageKey: sdkKey,
+          persistSession: true,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+        },
+        global: { fetch: fetchFn },
+      });
+
+    const clientA = makeClient();
+    const clientB = makeClient();
+    const visibilityB = new Set<() => void>();
+    const tabA = createAuthStore({
+      getClient: () => clientA as never,
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      addStorageListener: () => () => {},
+      createBroadcastChannel: () => null,
+      tabId: 'tabA',
+      syncGlobalStores: false,
+    });
+    const tabB = createAuthStore({
+      getClient: () => clientB as never,
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      addStorageListener: () => () => {},
+      addVisibilityListener: (fn) => {
+        visibilityB.add(fn);
+        return () => visibilityB.delete(fn);
+      },
+      createBroadcastChannel: () => null,
+      tabId: 'tabB',
+      syncGlobalStores: false,
+    });
+
+    try {
+      tabA.startAuth();
+      tabB.startAuth();
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('owner');
+        expect(tabB.getAuthSnapshot().status).toBe('owner');
+      });
+
+      // Tab B is backgrounded while Tab A signs out sid-1 and signs back in as sid-2.
+      await tabA.signOut();
+      expect(await tabA.signIn('owner@test.local', 'ValidPassword123')).toBe(
+        'ok',
+      );
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('owner');
+      });
+      const sid2 = JSON.parse(storage.getItem(sdkKey) ?? 'null') as {
+        access_token: string;
+      };
+      expect(sid2.access_token).not.toBe(sid1.access_token);
+
+      // Tab B regains focus (reconciles signed_in(2, sid:sid-2)) while its
+      // in-memory machine.session still holds stale sid-1, and user clicks Sign Out.
+      for (const fn of visibilityB) fn();
+      expect(tabB.getAuthSnapshot().status).toBe('owner');
+
+      await tabB.signOut();
+
+      // Tab B MUST have signed out the authoritative persisted session sid-2!
+      expect(storage.getItem(sdkKey)).toBeNull();
+      expect(lastLogoutAuth).toBe(`Bearer ${sid2.access_token}`);
+      expect(server.getConfirmedGlobalLogouts()).toBe(2);
+      expect(JSON.parse(storage.getItem(coordKey) ?? 'null')).toMatchObject({
+        state: 'completed',
+        sessionKey: 'sid:sid-2',
+      });
+      expect(tabB.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'idle',
+        logoutFailed: false,
+        logoutRevocationFailed: false,
+      });
+      expect(tabB.isAuthResolved()).toBe(true);
+    } finally {
+      await clientA.auth.stopAutoRefresh();
+      await clientB.auth.stopAutoRefresh();
+      tabA.resetAuthStore({ clearStorage: false });
+      tabB.resetAuthStore({ clearStorage: false });
+    }
+  });
+
+  it('DELTA17-P2-2: probePendingAbandonment and tryPromoteAfterLock advance watchedLeaseObservedAt when reading fresher heartbeats from localStorage so a live owner is not prematurely promoted after 10s (I3)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { createAuthStore, getLogoutCoordStorageKey } =
+      await import('@/lib/auth-store');
+
+    // Part A: No navigator.locks and no cross-tab events (StorageEvent/BC missed):
+    // Tab B's probePendingAbandonment timer fires at t=10s while Tab A has kept
+    // writing fresher heartbeats to localStorage.
+    const urlA = 'https://delta17-p2-2-nolocks-probe.test';
+    const sdkKeyA = 'sb-delta17-p2-2-nolocks-probe-auth-token';
+    const coordKeyA = getLogoutCoordStorageKey(urlA);
+    const storageA = makeMemoryStorage();
+    const serverA = createStatefulAuthServer();
+    storageA.setItem(sdkKeyA, JSON.stringify(serverA.issueSession()));
+
+    const fetchA: typeof fetch = (input) => {
+      const href = requestUrlOf(input);
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    const clientB1 = createClient(urlA, TEST_ANON_KEY, {
+      auth: {
+        storage: storageA,
+        storageKey: sdkKeyA,
+        persistSession: true,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+      global: { fetch: fetchA },
+    });
+    const tabB1 = createAuthStore({
+      getClient: () => clientB1 as never,
+      getProjectUrl: () => urlA,
+      getStorage: () => storageA,
+      addStorageListener: () => () => {},
+      createBroadcastChannel: () => null,
+      getLocks: () => null,
+      tabId: 'tabB1',
+      syncGlobalStores: false,
+    });
+
+    // Part B: locks.request rejects (falling into tryPromoteAfterLock) after 10s
+    // while owner tab wrote a fresher heartbeat into localStorage.
+    const urlB = 'https://delta17-p2-2-lock-reject-probe.test';
+    const sdkKeyB = 'sb-delta17-p2-2-lock-reject-probe-auth-token';
+    const coordKeyB = getLogoutCoordStorageKey(urlB);
+    const storageB = makeMemoryStorage();
+    const serverB = createStatefulAuthServer();
+    storageB.setItem(sdkKeyB, JSON.stringify(serverB.issueSession()));
+    const rejectingLocks = {
+      request<T>(): Promise<T> {
+        return Promise.reject(new Error('LockManager unavailable'));
+      },
+    };
+    const clientB2 = createClient(urlB, TEST_ANON_KEY, {
+      auth: {
+        storage: storageB,
+        storageKey: sdkKeyB,
+        persistSession: true,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+      global: { fetch: fetchA },
+    });
+    const tabB2 = createAuthStore({
+      getClient: () => clientB2 as never,
+      getProjectUrl: () => urlB,
+      getStorage: () => storageB,
+      addStorageListener: () => () => {},
+      createBroadcastChannel: () => null,
+      getLocks: () => rejectingLocks,
+      tabId: 'tabB2',
+      syncGlobalStores: false,
+    });
+
+    try {
+      // --- Part A: probePendingAbandonment ---
+      storageA.removeItem(sdkKeyA);
+      const t0 = Date.now();
+      storageA.setItem(
+        coordKeyA,
+        JSON.stringify({
+          attemptId: 1,
+          ownerTabId: 'tabA',
+          state: 'pending',
+          sessionKey: 'sid:sid-1',
+          heartbeatAt: t0,
+        }),
+      );
+      tabB1.startAuth();
+      expect(tabB1.getAuthSnapshot().logoutPhase).toBe('signing_out');
+
+      // Live owner refreshes heartbeatAt in localStorage at t=4s and t=8s (no events delivered).
+      await vi.advanceTimersByTimeAsync(4_000);
+      storageA.setItem(
+        coordKeyA,
+        JSON.stringify({
+          attemptId: 1,
+          ownerTabId: 'tabA',
+          state: 'pending',
+          sessionKey: 'sid:sid-1',
+          heartbeatAt: Date.now(),
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(4_000);
+      const lastLiveHeartbeatA = Date.now();
+      storageA.setItem(
+        coordKeyA,
+        JSON.stringify({
+          attemptId: 1,
+          ownerTabId: 'tabA',
+          state: 'pending',
+          sessionKey: 'sid:sid-1',
+          heartbeatAt: lastLiveHeartbeatA,
+        }),
+      );
+
+      // Advance past t=10s (to t=12s): owner's heartbeat at t=8s is only 4s old!
+      // probePendingAbandonment MUST advance watchedLeaseObservedAt and stay in signing_out!
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(tabB1.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'signing_out',
+        logoutPending: true,
+        logoutRevocationFailed: false,
+      });
+      expect(JSON.parse(storageA.getItem(coordKeyA) ?? 'null')).toMatchObject({
+        attemptId: 1,
+        ownerTabId: 'tabA',
+        state: 'pending',
+      });
+
+      // Now owner stops heartbeating: 10s after lastLiveHeartbeatA (at t=18.5s),
+      // Tab B1 MUST promote to revocation_failed.
+      await vi.advanceTimersByTimeAsync(6_500);
+      expect(tabB1.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'revocation_failed',
+        logoutRevocationFailed: true,
+      });
+
+      // --- Part B: tryPromoteAfterLock (stale probe -> lock rejects -> fresh heartbeat written) ---
+      storageB.removeItem(sdkKeyB);
+      const t1 = Date.now();
+      storageB.setItem(
+        coordKeyB,
+        JSON.stringify({
+          attemptId: 1,
+          ownerTabId: 'tabA2',
+          state: 'pending',
+          sessionKey: 'sid:sid-1',
+          heartbeatAt: t1,
+        }),
+      );
+      tabB2.startAuth();
+      expect(tabB2.getAuthSnapshot().logoutPhase).toBe('signing_out');
+
+      // Advance to t1 + 10s (lease expires at first probe, triggering rejectingLocks ->
+      // tryPromoteAfterLock microtask); right before microtask resolves, owner writes a
+      // fresh heartbeat into localStorage!
+      await vi.advanceTimersByTimeAsync(9_900);
+      const freshHbB = Date.now();
+      // Let probe fire at t1 + 10s while heartbeat is still stale, then immediately
+      // write freshHbB before the rejected lock promise runs tryPromoteAfterLock.
+      const origGetItem = storageB.getItem.bind(storageB);
+      let injectedFreshHb = false;
+      vi.spyOn(storageB, 'getItem').mockImplementation((k: string) => {
+        const val = origGetItem(k);
+        if (k === coordKeyB && !injectedFreshHb && Date.now() >= t1 + 10_000) {
+          injectedFreshHb = true;
+          // Return stale on probePendingAbandonment's first read, and persist fresh
+          // heartbeat for tryPromoteAfterLock's read!
+          storageB.setItem(
+            coordKeyB,
+            JSON.stringify({
+              attemptId: 1,
+              ownerTabId: 'tabA2',
+              state: 'pending',
+              sessionKey: 'sid:sid-1',
+              heartbeatAt: freshHbB + 100,
+            }),
+          );
+          return val;
+        }
+        return val;
+      });
+
+      await vi.advanceTimersByTimeAsync(200);
+      // tryPromoteAfterLock MUST have seen the fresher heartbeat, updated
+      // watchedLeaseObservedAt, and kept Tab B2 in signing_out!
+      expect(tabB2.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'signing_out',
+        logoutPending: true,
+        logoutRevocationFailed: false,
+      });
+      expect(JSON.parse(storageB.getItem(coordKeyB) ?? 'null')).toMatchObject({
+        attemptId: 1,
+        ownerTabId: 'tabA2',
+        state: 'pending',
+      });
+    } finally {
+      await clientB1.auth.stopAutoRefresh();
+      await clientB2.auth.stopAutoRefresh();
+      tabB1.resetAuthStore({ clearStorage: false });
+      tabB2.resetAuthStore({ clearStorage: false });
     }
   });
 });

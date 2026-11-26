@@ -1684,6 +1684,28 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     return best;
   }
 
+  function recordObservedPendingHeartbeat(
+    heartbeatAt: number | undefined,
+  ): void {
+    if (
+      typeof heartbeatAt !== 'number' ||
+      !Number.isFinite(heartbeatAt) ||
+      pendingWatchedCoord === null
+    ) {
+      return;
+    }
+    if (
+      pendingWatchedCoord.heartbeatAt === undefined ||
+      heartbeatAt > pendingWatchedCoord.heartbeatAt
+    ) {
+      pendingWatchedCoord = {
+        ...pendingWatchedCoord,
+        heartbeatAt,
+      };
+      watchedLeaseObservedAt = monotonicNow();
+    }
+  }
+
   function effectiveLeaseRemainingMs(coord: SharedLogoutCoord): number {
     const wallRemaining = leaseRemainingMs(coord);
     if (wallRemaining <= 0) return 0;
@@ -1769,6 +1791,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
     }
 
     const heartbeatAt = latestPendingHeartbeatAt(coord, latest);
+    recordObservedPendingHeartbeat(heartbeatAt);
     const remaining = effectiveLeaseRemainingMs({ ...coord, heartbeatAt });
     if (remaining > 0) {
       schedulePendingLeaseProbe(coord, epoch, remaining);
@@ -1821,6 +1844,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
         return;
       }
       const freshHeartbeat = latestPendingHeartbeatAt(coord, freshLatest);
+      recordObservedPendingHeartbeat(freshHeartbeat);
       const freshRemaining = effectiveLeaseRemainingMs({
         ...coord,
         heartbeatAt: freshHeartbeat,
@@ -1881,17 +1905,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       pendingWatchedCoord.attemptId === coord.attemptId &&
       pendingWatchedCoord.ownerTabId === coord.ownerTabId
     ) {
-      if (
-        typeof coord.heartbeatAt === 'number' &&
-        (pendingWatchedCoord.heartbeatAt === undefined ||
-          coord.heartbeatAt > pendingWatchedCoord.heartbeatAt)
-      ) {
-        pendingWatchedCoord = {
-          ...pendingWatchedCoord,
-          heartbeatAt: coord.heartbeatAt,
-        };
-        watchedLeaseObservedAt = monotonicNow();
-      }
+      recordObservedPendingHeartbeat(coord.heartbeatAt);
       return;
     }
     clearPendingAbandonmentWatch();
@@ -2090,17 +2104,7 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
               pendingWatchedCoord.attemptId === shared.attemptId &&
               pendingWatchedCoord.ownerTabId === shared.ownerTabId
             ) {
-              if (
-                shared.heartbeatAt !== undefined &&
-                (pendingWatchedCoord.heartbeatAt === undefined ||
-                  shared.heartbeatAt > pendingWatchedCoord.heartbeatAt)
-              ) {
-                pendingWatchedCoord = {
-                  ...pendingWatchedCoord,
-                  heartbeatAt: shared.heartbeatAt,
-                };
-                watchedLeaseObservedAt = monotonicNow();
-              }
+              recordObservedPendingHeartbeat(shared.heartbeatAt);
               if (
                 machine.logoutPhase === 'signing_out' &&
                 effectiveLeaseRemainingMs(pendingWatchedCoord) === 0
@@ -3892,20 +3896,26 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       clearStaleBlockForNewerSession();
       return;
     }
-    // P2-1 / DELTA10-P3-4: When signed out with a known revokedSessionKey,
-    // never adopt a different (newer) persisted session from storage as our
-    // logout target. When signed in and storage holds a freshly rotated token
-    // copy for the SAME sessionKey (not older by expiresAt), prefer the
-    // persisted copy over stale in-memory machine.session so global revocation
-    // and its retry use live rotated tokens instead of a consumed refresh token.
+    // P2-1 / DELTA10-P3-4 / DELTA17-P2-1: When signed out with a known
+    // revokedSessionKey, never adopt a different (newer) persisted session from
+    // storage as our logout target. When actively signed in (`machine.session
+    // !== null`), an explicit Sign Out must sign out the authoritative
+    // persisted session in storage (whether it is a distinct newer session or a
+    // freshly rotated token copy for the same sessionKey).
     const inMemorySession = extractRevocationSession(machine.session);
     const inMemoryKey = sessionKeyOf(inMemorySession);
+    const isSignedInTab = machine.session !== null;
     const matchingPersistedSession =
-      machine.session === null && machine.revokedSessionKey !== null
+      !isSignedInTab && machine.revokedSessionKey !== null
         ? persistedKeyNow === machine.revokedSessionKey
           ? persistedSession
           : null
         : persistedSession;
+    const persistedIsDifferentOnSignedInTab =
+      isSignedInTab &&
+      matchingPersistedSession !== null &&
+      persistedKeyNow !== null &&
+      persistedKeyNow !== inMemoryKey;
     const persistedIsOlderByExpiry =
       inMemorySession !== null &&
       matchingPersistedSession !== null &&
@@ -3923,13 +3933,14 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
           matchingPersistedSession.expiresAt > inMemorySession.expiresAt)) ||
         matchingPersistedSession.accessToken !== inMemorySession.accessToken ||
         matchingPersistedSession.refreshToken !== inMemorySession.refreshToken);
-    const capturedSession = preferPersistedForSameSession
-      ? matchingPersistedSession
-      : (inMemorySession ??
-        matchingPersistedSession ??
-        machine.retainedRevocationSession);
+    const capturedSession =
+      persistedIsDifferentOnSignedInTab || preferPersistedForSameSession
+        ? matchingPersistedSession
+        : (inMemorySession ??
+          matchingPersistedSession ??
+          machine.retainedRevocationSession);
     const targetSessionKey =
-      machine.session === null && machine.revokedSessionKey !== null
+      !isSignedInTab && machine.revokedSessionKey !== null
         ? machine.revokedSessionKey
         : (sessionKeyOf(capturedSession) ?? machine.revokedSessionKey);
 
@@ -3954,10 +3965,10 @@ export function createAuthStore(customDeps?: Partial<AuthStoreDeps>) {
       return;
     }
 
-    // NEW-4 / DELTA9-P2-2: Check for a newer persisted session BEFORE writing
-    // 'pending' so a stale signOut never leaves a dangling pending coord or
-    // leaves a local_failed tab permanently stuck with login disabled (I3, I4).
-    if (storage && targetSessionKey !== null) {
+    // NEW-4 / DELTA9-P2-2 / DELTA17-P2-1: Keep the newer-session abort guard
+    // only for retrying an already signed-out logout; an explicit Sign Out on a
+    // signed-in tab already adopted the authoritative persisted session above.
+    if (!isSignedInTab && storage && targetSessionKey !== null) {
       const persistedKey = sessionKeyOf(readPersistedSupabaseSession(storage));
       if (persistedKey !== null && persistedKey !== targetSessionKey) {
         clearStaleBlockForNewerSession();
