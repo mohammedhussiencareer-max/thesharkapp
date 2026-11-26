@@ -14737,4 +14737,1126 @@ describe('auth-store PR 65 verified findings (P1-1..P3-4)', () => {
       tabB.resetAuthStore({ clearStorage: false });
     }
   });
+
+  it('DELTA20-P1: late in-flight TOKEN_REFRESHED for a revoked session after a newer sign-in never reopens owner, evicts the revoked session, and preserves held-writes isolation (I1, I3, I5)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { createAuthStore, getLogoutCoordStorageKey } =
+      await import('@/lib/auth-store');
+    const {
+      resetHeldWritesStore,
+      setHeldWriteUser,
+      beginHeldWrite,
+      getHeldWrite,
+      clearHeldWrite,
+      isWritesLocked,
+    } = await import('@/lib/held-writes');
+    const makeFakeJwt = (payload: Record<string, unknown>): string => {
+      const encode = (obj: Record<string, unknown>) =>
+        btoa(JSON.stringify(obj))
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/g, '');
+      return `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode(payload)}.test-sig`;
+    };
+    const url = 'https://delta20-p1-late-refresh-after-signin.test';
+    const sdkKey = 'sb-delta20-p1-late-refresh-after-signin-auth-token';
+    const coordKey = getLogoutCoordStorageKey(url);
+    const values = new Map<string, string>();
+    const storageListenersByTab = new Map<
+      string,
+      Set<(ev: StorageEvent) => void>
+    >();
+
+    let sawRevokedRefreshWrite = false;
+    const makeTabStorage = (who: string): Storage => ({
+      get length() {
+        return values.size;
+      },
+      clear() {
+        values.clear();
+      },
+      getItem(k: string) {
+        return values.get(k) ?? null;
+      },
+      key(i: number) {
+        return [...values.keys()][i] ?? null;
+      },
+      removeItem(k: string) {
+        const oldValue = values.get(k) ?? null;
+        if (!values.delete(k)) return;
+        for (const [peer, listeners] of storageListenersByTab) {
+          if (peer === who) continue;
+          const ev = new StorageEvent('storage', {
+            key: k,
+            oldValue,
+            newValue: null,
+          });
+          for (const fn of [...listeners]) fn(ev);
+        }
+      },
+      setItem(k: string, v: string) {
+        const oldValue = values.get(k) ?? null;
+        const next = String(v);
+        if (k === sdkKey && next.includes('rt-1-rotated')) {
+          sawRevokedRefreshWrite = true;
+        }
+        values.set(k, next);
+        for (const [peer, listeners] of storageListenersByTab) {
+          if (peer === who) continue;
+          const ev = new StorageEvent('storage', {
+            key: k,
+            oldValue,
+            newValue: next,
+          });
+          for (const fn of [...listeners]) fn(ev);
+        }
+      },
+    });
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const makeUserSession = (
+      userId: string,
+      email: string,
+      sid: string,
+      refreshToken: string,
+      expiresInSec = 3600,
+    ) => ({
+      access_token: makeFakeJwt({
+        sub: userId,
+        email,
+        session_id: sid,
+        exp: nowSec + expiresInSec,
+      }),
+      refresh_token: refreshToken,
+      token_type: 'bearer' as const,
+      expires_in: expiresInSec,
+      expires_at: nowSec + expiresInSec,
+      user: {
+        id: userId,
+        email,
+        aud: 'authenticated',
+        role: 'authenticated',
+        app_metadata: {},
+        user_metadata: {},
+        created_at: '2026-01-01T00:00:00Z',
+      },
+    });
+
+    const sid1Initial = makeUserSession(
+      'user-a',
+      'a@test.local',
+      'sid-1',
+      'rt-1',
+    );
+    const sid1Rotated = makeUserSession(
+      'user-a',
+      'a@test.local',
+      'sid-1',
+      'rt-1-rotated',
+    );
+    const sid2UserB = makeUserSession(
+      'user-b',
+      'b@test.local',
+      'sid-2',
+      'rt-2',
+    );
+    values.set(sdkKey, JSON.stringify(sid1Initial));
+
+    let resolveTabBRefresh!: () => void;
+    let tabBRefreshStarted!: () => void;
+    const tabBRefreshStartedPromise = new Promise<void>((r) => {
+      tabBRefreshStarted = r;
+    });
+    const revokedSids = new Set<string>();
+
+    const makeFetch = (who: string): typeof fetch => {
+      return (input, init) => {
+        const href = requestUrlOf(input);
+        const headers = new Headers(init?.headers);
+        if (href.includes('/rest/v1/rpc/is_owner')) {
+          return Promise.resolve(
+            new Response(JSON.stringify(true), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            }),
+          );
+        }
+        if (href.includes('/auth/v1/token?grant_type=refresh_token')) {
+          if (who === 'tabB') {
+            tabBRefreshStarted();
+            return new Promise<Response>((resolve) => {
+              resolveTabBRefresh = () => {
+                resolve(
+                  new Response(JSON.stringify(sid1Rotated), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                  }),
+                );
+              };
+            });
+          }
+          return Promise.resolve(
+            new Response(JSON.stringify({ error: 'invalid_grant' }), {
+              status: 400,
+              headers: { 'content-type': 'application/json' },
+            }),
+          );
+        }
+        if (href.includes('/auth/v1/token?grant_type=password')) {
+          return Promise.resolve(
+            new Response(JSON.stringify(sid2UserB), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            }),
+          );
+        }
+        if (href.includes('/auth/v1/logout')) {
+          const auth = headers.get('authorization') ?? '';
+          if (auth.includes(sid1Initial.access_token)) {
+            revokedSids.add('sid-1');
+          }
+          return Promise.resolve(new Response(null, { status: 204 }));
+        }
+        return Promise.resolve(new Response(null, { status: 404 }));
+      };
+    };
+
+    const storageA = makeTabStorage('tabA');
+    const storageB = makeTabStorage('tabB');
+    const storageC = makeTabStorage('tabC');
+
+    // Disable GoTrueClient's internal BroadcastChannel so Tab B stays signed-out
+    // after Tab A signs in as User B, reproducing the exact stale refresh race
+    // where Tab B's in-flight _callRefreshToken overwrites sdkKey with rotated
+    // revoked sid-1 and emits TOKEN_REFRESHED while Tab B is signed-out.
+    const originalBC = globalThis.BroadcastChannel;
+    Object.defineProperty(globalThis, 'BroadcastChannel', {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+
+    const clientA = createClient(url, TEST_ANON_KEY, {
+      auth: {
+        storage: storageA,
+        storageKey: sdkKey,
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: false,
+      },
+      global: { fetch: makeFetch('tabA') },
+    });
+    const clientB = createClient(url, TEST_ANON_KEY, {
+      auth: {
+        storage: storageB,
+        storageKey: sdkKey,
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: false,
+      },
+      global: { fetch: makeFetch('tabB') },
+    });
+
+    const addListenerFor =
+      (who: string) => (fn: (ev: StorageEvent) => void) => {
+        let set = storageListenersByTab.get(who);
+        if (!set) {
+          set = new Set();
+          storageListenersByTab.set(who, set);
+        }
+        set.add(fn);
+        return () => set.delete(fn);
+      };
+
+    const tabA = createAuthStore({
+      getClient: () => clientA as never,
+      getProjectUrl: () => url,
+      getStorage: () => storageA,
+      addStorageListener: addListenerFor('tabA'),
+      createBroadcastChannel: () => null,
+      tabId: 'tabA',
+      syncGlobalStores: false,
+    });
+    const tabB = createAuthStore({
+      getClient: () => clientB as never,
+      getProjectUrl: () => url,
+      getStorage: () => storageB,
+      addStorageListener: addListenerFor('tabB'),
+      createBroadcastChannel: () => null,
+      tabId: 'tabB',
+      syncGlobalStores: true,
+    });
+    let clientC: typeof clientA | null = null;
+    let tabC: ReturnType<typeof createAuthStore> | null = null;
+
+    try {
+      // Seed per-user held writes for User A and User B.
+      resetHeldWritesStore({ clearStorage: true, resetUser: true });
+      setHeldWriteUser('user-a');
+      beginHeldWrite('op-a', () => ({ qty: 1 }), { requestId: 'req-a' });
+      setHeldWriteUser('user-b');
+      beginHeldWrite('op-b', () => ({ qty: 2 }), { requestId: 'req-b' });
+      setHeldWriteUser(null);
+
+      tabA.startAuth();
+      tabB.startAuth();
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('owner');
+        expect(tabB.getAuthSnapshot().status).toBe('owner');
+      });
+
+      // Tab A signs out sid-1 (204 -> completed(1, tabA, sid:sid-1), removing
+      // sdkKey). Tab B reconciles to signed-out.
+      await tabA.signOut();
+      expect(revokedSids.has('sid-1')).toBe(true);
+      await vi.waitFor(() => {
+        expect(tabB.getAuthSnapshot().status).toBe('signed-out');
+      });
+
+      // Start Tab B's real GoTrueClient refreshSession({ refresh_token: 'rt-1' })
+      // while sdkKey is empty, then Tab A signs in as User B (sid:sid-2 ->
+      // signed_in(2, tabA, sid:sid-2)) before the refresh response arrives.
+      // Because storedAtStart was null, real GoTrueClient writes sid1Rotated to
+      // sdkKey (_saveSession) and emits TOKEN_REFRESHED.
+      const inFlightRefresh = clientB.auth.refreshSession({
+        refresh_token: sid1Initial.refresh_token,
+      });
+      await tabBRefreshStartedPromise;
+      const signInOutcome = await tabA.signIn(
+        'b@test.local',
+        'ValidPassword123',
+      );
+      expect(signInOutcome).toBe('ok');
+      expect(JSON.parse(values.get(coordKey) ?? 'null')).toMatchObject({
+        state: 'signed_in',
+        sessionKey: 'sid:sid-2',
+      });
+
+      // Now Tab B's stale refreshSession() for rotated revoked sid-1 returns:
+      // GoTrueClient writes rotated sid-1 to sdkKey and emits TOKEN_REFRESHED.
+      resolveTabBRefresh();
+      await inFlightRefresh;
+      await vi.advanceTimersByTimeAsync(50);
+
+      // Verify GoTrueClient really wrote rotated sid-1 to sdkKey, AND our
+      // production code rejected + evicted it!
+      expect(sawRevokedRefreshWrite).toBe(true);
+      expect(tabB.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        email: null,
+      });
+      expect(isWritesLocked()).toBe(true);
+      expect(getHeldWrite('op-a')).toBeNull();
+      const persistedAfter = values.get(sdkKey);
+      expect(persistedAfter ?? '').not.toContain('rt-1-rotated');
+
+      // Reloading a fresh Tab C AFTER the race MUST NOT boot into revoked sid-1.
+      const reloadedClientC = createClient(url, TEST_ANON_KEY, {
+        auth: {
+          storage: storageC,
+          storageKey: sdkKey,
+          persistSession: true,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+        },
+        global: { fetch: makeFetch('tabC') },
+      });
+      clientC = reloadedClientC;
+      tabC = createAuthStore({
+        getClient: () => reloadedClientC as never,
+        getProjectUrl: () => url,
+        getStorage: () => storageC,
+        addStorageListener: addListenerFor('tabC'),
+        createBroadcastChannel: () => null,
+        tabId: 'tabC',
+        syncGlobalStores: false,
+      });
+      tabC.startAuth();
+      const reloadedTabC = tabC;
+      await vi.waitFor(() => {
+        expect(reloadedTabC.getAuthSnapshot().status).toBe('signed-out');
+      });
+    } finally {
+      Object.defineProperty(globalThis, 'BroadcastChannel', {
+        configurable: true,
+        writable: true,
+        value: originalBC,
+      });
+      clearHeldWrite('op-a');
+      clearHeldWrite('op-b');
+      resetHeldWritesStore({ clearStorage: true, resetUser: true });
+      await clientA.auth.stopAutoRefresh();
+      await clientB.auth.stopAutoRefresh();
+      await clientC?.auth.stopAutoRefresh();
+      tabA.resetAuthStore({ clearStorage: false });
+      tabB.resetAuthStore({ clearStorage: false });
+      tabC?.resetAuthStore({ clearStorage: false });
+    }
+  });
+
+  it('DELTA20-P2-1: signOut() on a signed-in tab never early-returns clean idle when knownCoord is completed(sessionKey: null) and sdkKey was removed without global revocation (I2)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { createAuthStore, getLogoutCoordStorageKey } =
+      await import('@/lib/auth-store');
+    const url = 'https://delta20-p2-1-null-completed-signout.test';
+    const sdkKey = 'sb-delta20-p2-1-null-completed-signout-auth-token';
+    const coordKey = getLogoutCoordStorageKey(url);
+    const values = new Map<string, string>();
+    let blockCoordWrites = false;
+    let logoutStatus = 204;
+    let logoutCalls = 0;
+
+    const storage: Storage = {
+      get length() {
+        return values.size;
+      },
+      clear() {
+        values.clear();
+      },
+      getItem(k: string) {
+        return values.get(k) ?? null;
+      },
+      key(i: number) {
+        return [...values.keys()][i] ?? null;
+      },
+      removeItem(k: string) {
+        values.delete(k);
+      },
+      setItem(k: string, v: string) {
+        if (blockCoordWrites && k === coordKey) {
+          throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+        }
+        values.set(k, String(v));
+      },
+    };
+
+    const server = createStatefulAuthServer();
+    const fetchFn: typeof fetch = (input, init) => {
+      const href = requestUrlOf(input);
+      const headers = new Headers(init?.headers);
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/token?grant_type=password')) {
+        return Promise.resolve(server.handlePasswordSignIn());
+      }
+      if (href.includes('/auth/v1/logout')) {
+        logoutCalls += 1;
+        if (logoutStatus !== 204) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ message: 'offline' }), {
+              status: logoutStatus,
+              headers: { 'content-type': 'application/json' },
+            }),
+          );
+        }
+        return Promise.resolve(
+          server.handleLogout(headers.get('authorization')),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    const makeClient = () =>
+      createClient(url, TEST_ANON_KEY, {
+        auth: {
+          storage,
+          storageKey: sdkKey,
+          persistSession: true,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+        },
+        global: { fetch: fetchFn },
+      });
+
+    const clientA = makeClient();
+    const clientB = makeClient();
+    const tabA = createAuthStore({
+      getClient: () => clientA as never,
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      addStorageListener: () => () => {},
+      createBroadcastChannel: () => null,
+      tabId: 'tabA',
+      syncGlobalStores: false,
+    });
+    const tabB = createAuthStore({
+      getClient: () => clientB as never,
+      getProjectUrl: () => url,
+      getStorage: () => storage,
+      addStorageListener: () => () => {},
+      createBroadcastChannel: () => null,
+      tabId: 'tabB',
+      syncGlobalStores: false,
+    });
+
+    try {
+      // Step 1: Empty-storage signOut leaves completed(1, sessionKey: null).
+      tabA.startAuth();
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('signed-out');
+      });
+      await tabA.signOut();
+      expect(JSON.parse(values.get(coordKey) ?? 'null')).toMatchObject({
+        state: 'completed',
+        sessionKey: null,
+      });
+
+      // Step 2: Under coord_blocked quota, Tab A signs in (sid:sid-1), and
+      // Tab B also boots as owner while knownCoord stays completed(null).
+      blockCoordWrites = true;
+      expect(await tabA.signIn('owner@test.local', 'ValidPassword123')).toBe(
+        'ok',
+      );
+      tabB.startAuth();
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('owner');
+        expect(tabB.getAuthSnapshot().status).toBe('owner');
+      });
+
+      // Step 3: Offline (503) under coord_blocked quota: Tab B signs out ->
+      // removes sdkKey, /logout fails (503), coordKey stays completed(null).
+      logoutStatus = 503;
+      await tabB.signOut();
+      expect(values.get(sdkKey)).toBeUndefined();
+      expect(tabB.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'revocation_failed',
+        logoutRevocationFailed: true,
+      });
+      expect(logoutCalls).toBe(1);
+
+      // Step 4: Tab A (still showing owner because storage event was dropped)
+      // calls signOut(): MUST NOT early-return clean idle! Must attempt
+      // global revocation and land in revocation_failed with retry available.
+      await tabA.signOut();
+      expect(logoutCalls).toBe(2);
+      expect(tabA.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'revocation_failed',
+        logoutRevocationFailed: true,
+        canRetryLogoutRevocation: true,
+      });
+    } finally {
+      blockCoordWrites = false;
+      await clientA.auth.stopAutoRefresh();
+      await clientB.auth.stopAutoRefresh();
+      tabA.resetAuthStore({ clearStorage: false });
+      tabB.resetAuthStore({ clearStorage: false });
+    }
+  });
+
+  it('DELTA20-P2-2: cross-tab retryLogoutRevocation() coordinates with in-flight signIn() via shared/exclusive Web Lock and never revokes the newly issued session (I3)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { createAuthStore, getLogoutCoordStorageKey } =
+      await import('@/lib/auth-store');
+    const url = 'https://delta20-p2-2-retry-vs-signin-lock.test';
+    const sdkKey = 'sb-delta20-p2-2-retry-vs-signin-lock-auth-token';
+    const coordKey = getLogoutCoordStorageKey(url);
+    const values = new Map<string, string>();
+    const storageListenersByTab = new Map<
+      string,
+      Set<(ev: StorageEvent) => void>
+    >();
+
+    // FIFO reader-writer Web Lock manager (shared + exclusive).
+    type LockState = {
+      mode: 'exclusive' | 'shared';
+      holders: number;
+      waiters: Array<{ mode: 'exclusive' | 'shared'; grant: () => void }>;
+    };
+    const lockStates = new Map<string, LockState>();
+    const pumpLock = (name: string) => {
+      const st = lockStates.get(name);
+      if (!st || st.holders > 0) return;
+      if (st.waiters.length === 0) {
+        lockStates.delete(name);
+        return;
+      }
+      const head = st.waiters.shift()!;
+      st.mode = head.mode;
+      st.holders = 1;
+      head.grant();
+      if (st.mode === 'shared') {
+        while (st.waiters.length > 0 && st.waiters[0]!.mode === 'shared') {
+          const next = st.waiters.shift()!;
+          st.holders += 1;
+          next.grant();
+        }
+      }
+    };
+    const lockManager = {
+      request<T>(
+        name: string,
+        options: { mode?: 'exclusive' | 'shared'; ifAvailable?: boolean },
+        callback: (
+          lock: { name: string; mode: string } | null,
+        ) => Promise<T> | T,
+      ): Promise<T> {
+        const reqMode: 'exclusive' | 'shared' = options.mode ?? 'exclusive';
+        const run = async (): Promise<T> => {
+          try {
+            return await callback({ name, mode: reqMode });
+          } finally {
+            const st = lockStates.get(name);
+            if (st) {
+              st.holders -= 1;
+              pumpLock(name);
+            }
+          }
+        };
+        const existing = lockStates.get(name);
+        const grantNow =
+          !existing ||
+          (reqMode === 'shared' &&
+            existing.mode === 'shared' &&
+            existing.waiters.length === 0);
+        if (grantNow) {
+          if (!existing) {
+            lockStates.set(name, { mode: reqMode, holders: 1, waiters: [] });
+          } else {
+            existing.holders += 1;
+          }
+          return run();
+        }
+        if (options.ifAvailable) {
+          return Promise.resolve().then(() => callback(null));
+        }
+        return new Promise<T>((resolve, reject) => {
+          existing.waiters.push({
+            mode: reqMode,
+            grant: () => {
+              run().then(resolve, reject);
+            },
+          });
+        });
+      },
+    };
+
+    const makeTabStorage = (who: string): Storage => ({
+      get length() {
+        return values.size;
+      },
+      clear() {
+        values.clear();
+      },
+      getItem(k: string) {
+        return values.get(k) ?? null;
+      },
+      key(i: number) {
+        return [...values.keys()][i] ?? null;
+      },
+      removeItem(k: string) {
+        const oldValue = values.get(k) ?? null;
+        if (!values.delete(k)) return;
+        for (const [peer, listeners] of storageListenersByTab) {
+          if (peer === who) continue;
+          const ev = new StorageEvent('storage', {
+            key: k,
+            oldValue,
+            newValue: null,
+          });
+          for (const fn of [...listeners]) fn(ev);
+        }
+      },
+      setItem(k: string, v: string) {
+        const oldValue = values.get(k) ?? null;
+        const next = String(v);
+        values.set(k, next);
+        for (const [peer, listeners] of storageListenersByTab) {
+          if (peer === who) continue;
+          const ev = new StorageEvent('storage', {
+            key: k,
+            oldValue,
+            newValue: next,
+          });
+          for (const fn of [...listeners]) fn(ev);
+        }
+      },
+    });
+
+    // Stateful GoTrue scope=global server: POST /logout revokes ALL sessions of
+    // the same user.
+    const makeFakeJwt = (payload: Record<string, unknown>): string => {
+      const encode = (obj: Record<string, unknown>) =>
+        btoa(JSON.stringify(obj))
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/g, '');
+      return `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode(payload)}.test-sig`;
+    };
+    const nowSec = Math.floor(Date.now() / 1000);
+    let sidSeq = 0;
+    const activeSessions = new Map<string, { sid: string; revoked: boolean }>();
+    const issueSession = () => {
+      sidSeq += 1;
+      const sid = `sid-${sidSeq}`;
+      const accessToken = makeFakeJwt({
+        sub: 'user-owner',
+        email: 'owner@test.local',
+        session_id: sid,
+        exp: nowSec + 3600,
+      });
+      activeSessions.set(sid, { sid, revoked: false });
+      return {
+        access_token: accessToken,
+        refresh_token: `rt-${sidSeq}`,
+        token_type: 'bearer' as const,
+        expires_in: 3600,
+        expires_at: nowSec + 3600,
+        user: {
+          id: 'user-owner',
+          email: 'owner@test.local',
+          aud: 'authenticated',
+          role: 'authenticated',
+          app_metadata: {},
+          user_metadata: {},
+          created_at: '2026-01-01T00:00:00Z',
+        },
+      };
+    };
+
+    let logoutStatus = 503;
+    let logoutRequestsAfterFirst = 0;
+    let pauseNextSignIn = false;
+    let signInInFlightStarted!: () => void;
+    const signInInFlightPromise = new Promise<void>((r) => {
+      signInInFlightStarted = r;
+    });
+    let releasePausedSignIn!: () => void;
+
+    const fetchFn: typeof fetch = (input) => {
+      const href = requestUrlOf(input);
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/token?grant_type=password')) {
+        if (pauseNextSignIn) {
+          pauseNextSignIn = false;
+          signInInFlightStarted();
+          return new Promise<Response>((resolve) => {
+            releasePausedSignIn = () => {
+              resolve(
+                new Response(JSON.stringify(issueSession()), {
+                  status: 200,
+                  headers: { 'content-type': 'application/json' },
+                }),
+              );
+            };
+          });
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify(issueSession()), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/logout')) {
+        if (logoutStatus !== 204) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ message: 'offline' }), {
+              status: logoutStatus,
+              headers: { 'content-type': 'application/json' },
+            }),
+          );
+        }
+        logoutRequestsAfterFirst += 1;
+        // Real GoTrue scope=global: revokes ALL sessions of the user!
+        for (const rec of activeSessions.values()) {
+          rec.revoked = true;
+        }
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    const addListenerFor =
+      (who: string) => (fn: (ev: StorageEvent) => void) => {
+        let set = storageListenersByTab.get(who);
+        if (!set) {
+          set = new Set();
+          storageListenersByTab.set(who, set);
+        }
+        set.add(fn);
+        return () => set.delete(fn);
+      };
+
+    const storageA = makeTabStorage('tabA');
+    const storageB = makeTabStorage('tabB');
+    const clientA = createClient(url, TEST_ANON_KEY, {
+      auth: {
+        storage: storageA,
+        storageKey: sdkKey,
+        persistSession: true,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+      global: { fetch: fetchFn },
+    });
+    const clientB = createClient(url, TEST_ANON_KEY, {
+      auth: {
+        storage: storageB,
+        storageKey: sdkKey,
+        persistSession: true,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+      global: { fetch: fetchFn },
+    });
+
+    const tabA = createAuthStore({
+      getClient: () => clientA as never,
+      getProjectUrl: () => url,
+      getStorage: () => storageA,
+      addStorageListener: addListenerFor('tabA'),
+      createBroadcastChannel: () => null,
+      getLocks: () => lockManager,
+      tabId: 'tabA',
+      syncGlobalStores: false,
+    });
+    const tabB = createAuthStore({
+      getClient: () => clientB as never,
+      getProjectUrl: () => url,
+      getStorage: () => storageB,
+      addStorageListener: addListenerFor('tabB'),
+      createBroadcastChannel: () => null,
+      getLocks: () => lockManager,
+      tabId: 'tabB',
+      syncGlobalStores: false,
+    });
+
+    try {
+      tabA.startAuth();
+      tabB.startAuth();
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('signed-out');
+        expect(tabB.getAuthSnapshot().status).toBe('signed-out');
+      });
+
+      // Tab A signs in (sid-1), then signs out under 503 -> revocation_failed.
+      expect(await tabA.signIn('owner@test.local', 'ValidPassword123')).toBe(
+        'ok',
+      );
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('owner');
+      });
+      await tabA.signOut();
+      expect(tabA.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        logoutPhase: 'revocation_failed',
+        canRetryLogoutRevocation: true,
+      });
+
+      // Server recovers to 204; Tab B starts an in-flight signIn (same user).
+      logoutStatus = 204;
+      pauseNextSignIn = true;
+      const tabBSignInPromise = tabB.signIn(
+        'owner@test.local',
+        'ValidPassword123',
+      );
+      await signInInFlightPromise;
+
+      // While Tab B's signIn is in flight, Tab A clicks Retry!
+      const tabARetryPromise = tabA.retryLogoutRevocation();
+      await vi.advanceTimersByTimeAsync(20);
+
+      // Tab A MUST wait on the exclusive lock and NOT dispatch POST /logout.
+      expect(logoutRequestsAfterFirst).toBe(0);
+
+      // Now Tab B's signIn completes (issuing sid-2 and publishing signed_in).
+      releasePausedSignIn();
+      expect(await tabBSignInPromise).toBe('ok');
+      await tabARetryPromise;
+      await vi.advanceTimersByTimeAsync(50);
+
+      // Tab A exited retry cleanly WITHOUT sending POST /logout?scope=global,
+      // cleared revocation_failed to idle (and accepted Tab B's sid-2 via
+      // GoTrue BroadcastChannel), and Tab B's sid-2 remains UNREVOKED!
+      expect(logoutRequestsAfterFirst).toBe(0);
+      expect(activeSessions.get('sid-2')?.revoked).toBe(false);
+      expect(tabB.getAuthSnapshot().status).toBe('owner');
+      expect(tabA.getAuthSnapshot()).toMatchObject({
+        logoutPhase: 'idle',
+        logoutRevocationFailed: false,
+      });
+      expect(JSON.parse(values.get(coordKey) ?? 'null')).toMatchObject({
+        state: 'signed_in',
+        sessionKey: 'sid:sid-2',
+      });
+    } finally {
+      await clientA.auth.stopAutoRefresh();
+      await clientB.auth.stopAutoRefresh();
+      tabA.resetAuthStore({ clearStorage: false });
+      tabB.resetAuthStore({ clearStorage: false });
+    }
+  });
+
+  it('DELTA20-P3: direct cross-user signIn without removal event or BroadcastChannel immediately invalidates sibling tab session and held-writes user scope (I5)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { createAuthStore, getLogoutCoordStorageKey } =
+      await import('@/lib/auth-store');
+    const {
+      resetHeldWritesStore,
+      getHeldWrite,
+      isWritesLocked,
+      userStoragePrefix,
+    } = await import('@/lib/held-writes');
+    const makeFakeJwt = (payload: Record<string, unknown>): string => {
+      const encode = (obj: Record<string, unknown>) =>
+        btoa(JSON.stringify(obj))
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/g, '');
+      return `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode(payload)}.test-sig`;
+    };
+    const url = 'https://delta20-p3-direct-user-switch-nobc.test';
+    const sdkKey = 'sb-delta20-p3-direct-user-switch-nobc-auth-token';
+    const coordKey = getLogoutCoordStorageKey(url);
+    const values = new Map<string, string>();
+    const storageListenersByTab = new Map<
+      string,
+      Set<(ev: StorageEvent) => void>
+    >();
+
+    const makeTabStorage = (who: string): Storage => ({
+      get length() {
+        return values.size;
+      },
+      clear() {
+        values.clear();
+      },
+      getItem(k: string) {
+        return values.get(k) ?? null;
+      },
+      key(i: number) {
+        return [...values.keys()][i] ?? null;
+      },
+      removeItem(k: string) {
+        const oldValue = values.get(k) ?? null;
+        if (!values.delete(k)) return;
+        for (const [peer, listeners] of storageListenersByTab) {
+          if (peer === who) continue;
+          const ev = new StorageEvent('storage', {
+            key: k,
+            oldValue,
+            newValue: null,
+          });
+          for (const fn of [...listeners]) fn(ev);
+        }
+      },
+      setItem(k: string, v: string) {
+        const oldValue = values.get(k) ?? null;
+        const next = String(v);
+        values.set(k, next);
+        for (const [peer, listeners] of storageListenersByTab) {
+          if (peer === who) continue;
+          const ev = new StorageEvent('storage', {
+            key: k,
+            oldValue,
+            newValue: next,
+          });
+          for (const fn of [...listeners]) fn(ev);
+        }
+      },
+    });
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const makeUserSession = (userId: string, email: string, sid: string) => ({
+      access_token: makeFakeJwt({
+        sub: userId,
+        email,
+        session_id: sid,
+        exp: nowSec + 3600,
+      }),
+      refresh_token: `rt-${sid}`,
+      token_type: 'bearer' as const,
+      expires_in: 3600,
+      expires_at: nowSec + 3600,
+      user: {
+        id: userId,
+        email,
+        aud: 'authenticated',
+        role: 'authenticated',
+        app_metadata: {},
+        user_metadata: {},
+        created_at: '2026-01-01T00:00:00Z',
+      },
+    });
+
+    const sessionA = makeUserSession('user-a', 'a@test.local', 'sid-a');
+    const sessionB = makeUserSession('user-b', 'b@test.local', 'sid-b');
+    values.set(sdkKey, JSON.stringify(sessionA));
+
+    const fetchFn: typeof fetch = (input) => {
+      const href = requestUrlOf(input);
+      if (href.includes('/rest/v1/rpc/is_owner')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(true), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (href.includes('/auth/v1/token?grant_type=password')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(sessionB), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+
+    // Disable global BroadcastChannel so GoTrueClient cannot broadcast either.
+    const originalBC = globalThis.BroadcastChannel;
+    Object.defineProperty(globalThis, 'BroadcastChannel', {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+
+    const addListenerFor =
+      (who: string) => (fn: (ev: StorageEvent) => void) => {
+        let set = storageListenersByTab.get(who);
+        if (!set) {
+          set = new Set();
+          storageListenersByTab.set(who, set);
+        }
+        set.add(fn);
+        return () => set.delete(fn);
+      };
+
+    const storageA = makeTabStorage('tabA');
+    const storageB = makeTabStorage('tabB');
+    const clientA = createClient(url, TEST_ANON_KEY, {
+      auth: {
+        storage: storageA,
+        storageKey: sdkKey,
+        persistSession: true,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+      global: { fetch: fetchFn },
+    });
+    const clientB = createClient(url, TEST_ANON_KEY, {
+      auth: {
+        storage: storageB,
+        storageKey: sdkKey,
+        persistSession: true,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+      global: { fetch: fetchFn },
+    });
+
+    const tabA = createAuthStore({
+      getClient: () => clientA as never,
+      getProjectUrl: () => url,
+      getStorage: () => storageA,
+      addStorageListener: addListenerFor('tabA'),
+      createBroadcastChannel: () => null,
+      tabId: 'tabA',
+      syncGlobalStores: false,
+    });
+    const tabB = createAuthStore({
+      getClient: () => clientB as never,
+      getProjectUrl: () => url,
+      getStorage: () => storageB,
+      addStorageListener: addListenerFor('tabB'),
+      createBroadcastChannel: () => null,
+      tabId: 'tabB',
+      syncGlobalStores: true,
+    });
+
+    try {
+      // Seed unresolved held writes for User A & User B, plus a resolved pin for User A.
+      resetHeldWritesStore({ clearStorage: true, resetUser: true });
+      const opAKey = `${userStoragePrefix('user-a')}${encodeURIComponent('op-a')}`;
+      const opBKey = `${userStoragePrefix('user-b')}${encodeURIComponent('op-b')}`;
+      const postedAKey = `${userStoragePrefix('user-a')}posted:${encodeURIComponent('posted-a')}:req-posted-a`;
+      window.localStorage.setItem(
+        opAKey,
+        JSON.stringify({
+          v: 1,
+          subject: 'op-a',
+          requestId: 'req-a',
+          payload: { user: 'a' },
+          phase: 'unknown',
+        }),
+      );
+      window.localStorage.setItem(
+        opBKey,
+        JSON.stringify({
+          v: 1,
+          subject: 'op-b',
+          requestId: 'req-b',
+          payload: { user: 'b' },
+          phase: 'unknown',
+        }),
+      );
+      window.localStorage.setItem(
+        postedAKey,
+        JSON.stringify({
+          v: 1,
+          subject: 'posted-a',
+          requestId: 'req-posted-a',
+          payload: {},
+          phase: 'posted_reload',
+        }),
+      );
+
+      tabA.startAuth();
+      tabB.startAuth();
+      await vi.waitFor(() => {
+        expect(tabA.getAuthSnapshot().status).toBe('owner');
+        expect(tabB.getAuthSnapshot().status).toBe('owner');
+      });
+      expect(getHeldWrite('op-a')?.requestId).toBe('req-a');
+      expect(isWritesLocked()).toBe(false);
+
+      // Tab A directly signs in as User B (no signOut, no sdkKey removal, no BC).
+      expect(await tabA.signIn('b@test.local', 'ValidPassword123')).toBe('ok');
+      expect(JSON.parse(values.get(coordKey) ?? 'null')).toMatchObject({
+        state: 'signed_in',
+        sessionKey: 'sid:sid-b',
+      });
+
+      // Tab B received only StorageEvents (no sdkKey removal, no BC) and MUST
+      // immediately lock & clear User A's session and held-writes scope!
+      expect(tabB.getAuthSnapshot()).toMatchObject({
+        status: 'signed-out',
+        email: null,
+      });
+      expect(isWritesLocked()).toBe(true);
+      expect(getHeldWrite('op-a')).toBeNull();
+      expect(getHeldWrite('op-b')).toBeNull();
+      // Unresolved per-user pins remain persisted; User A's resolved pin is cleared.
+      expect(window.localStorage.getItem(opAKey)).not.toBeNull();
+      expect(window.localStorage.getItem(opBKey)).not.toBeNull();
+      expect(window.localStorage.getItem(postedAKey)).toBeNull();
+    } finally {
+      Object.defineProperty(globalThis, 'BroadcastChannel', {
+        configurable: true,
+        writable: true,
+        value: originalBC,
+      });
+      resetHeldWritesStore({ clearStorage: true, resetUser: true });
+      await clientA.auth.stopAutoRefresh();
+      await clientB.auth.stopAutoRefresh();
+      tabA.resetAuthStore({ clearStorage: false });
+      tabB.resetAuthStore({ clearStorage: false });
+    }
+  });
 });

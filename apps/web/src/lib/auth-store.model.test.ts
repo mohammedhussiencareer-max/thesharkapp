@@ -117,6 +117,7 @@ function createFakeBroadcastHub(isDropped: () => boolean) {
   }
 
   return {
+    BroadcastChannel: FakeChannel,
     createChannel: (name: string) => new FakeChannel(name),
     closeAll() {
       for (const group of channelsByName.values()) {
@@ -130,7 +131,34 @@ function createFakeBroadcastHub(isDropped: () => boolean) {
 function createFakeLockManager(
   getMode: () => 'enabled' | 'unavailable' | 'rejecting',
 ) {
-  const held = new Map<string, Array<() => void>>();
+  type LockState = {
+    mode: 'exclusive' | 'shared';
+    holders: number;
+    waiters: Array<{ mode: 'exclusive' | 'shared'; grant: () => void }>;
+  };
+  const states = new Map<string, LockState>();
+
+  function pump(name: string): void {
+    const st = states.get(name);
+    if (!st) return;
+    if (st.holders === 0) {
+      if (st.waiters.length === 0) {
+        states.delete(name);
+        return;
+      }
+      const head = st.waiters.shift()!;
+      st.mode = head.mode;
+      st.holders = 1;
+      head.grant();
+      if (st.mode === 'shared') {
+        while (st.waiters.length > 0 && st.waiters[0]!.mode === 'shared') {
+          const next = st.waiters.shift()!;
+          st.holders += 1;
+          next.grant();
+        }
+      }
+    }
+  }
 
   return {
     getLocks() {
@@ -147,33 +175,46 @@ function createFakeLockManager(
           if (getMode() === 'rejecting') {
             return Promise.reject(new Error('LockManager unavailable'));
           }
+          const reqMode: 'exclusive' | 'shared' = options.mode ?? 'exclusive';
           const runWithLock = async (): Promise<T> => {
             try {
               return await callback({
                 name,
-                mode: options.mode ?? 'exclusive',
+                mode: reqMode,
               });
             } finally {
-              const waiters = held.get(name);
-              if (waiters && waiters.length > 0) {
-                const next = waiters.shift()!;
-                next();
-              } else {
-                held.delete(name);
+              const st = states.get(name);
+              if (st) {
+                st.holders -= 1;
+                pump(name);
               }
             }
           };
 
-          if (!held.has(name)) {
-            held.set(name, []);
+          const existing = states.get(name);
+          const canGrantImmediately =
+            !existing ||
+            (reqMode === 'shared' &&
+              existing.mode === 'shared' &&
+              existing.waiters.length === 0);
+
+          if (canGrantImmediately) {
+            if (!existing) {
+              states.set(name, { mode: reqMode, holders: 1, waiters: [] });
+            } else {
+              existing.holders += 1;
+            }
             return runWithLock();
           }
           if (options.ifAvailable) {
             return Promise.resolve().then(() => callback(null));
           }
           return new Promise<T>((resolve, reject) => {
-            held.get(name)!.push(() => {
-              runWithLock().then(resolve, reject);
+            existing.waiters.push({
+              mode: reqMode,
+              grant: () => {
+                runWithLock().then(resolve, reject);
+              },
             });
           });
         },
@@ -192,6 +233,8 @@ type IssuedSession = {
   generation: number;
   revoked: boolean;
   revokedBySessionKey: string | null;
+  revokedByRetry: boolean;
+  revokedUnderNormalLocks: boolean;
   revokedAtOrderIndex: number | null;
   issuedOrderIndex: number;
   expiredOnce: boolean;
@@ -265,6 +308,8 @@ function createModelAuthServer() {
       generation: 0,
       revoked: false,
       revokedBySessionKey: null,
+      revokedByRetry: false,
+      revokedUnderNormalLocks: false,
       revokedAtOrderIndex: null,
       issuedOrderIndex,
       expiredOnce: false,
@@ -328,6 +373,7 @@ function createModelAuthServer() {
   function handleLogout(
     authHeader: string | null,
     mode: '204' | '503' | '401_once',
+    meta?: { fromRetry?: boolean; normalLocks?: boolean },
   ): Response {
     if (mode === '503') {
       return new Response('unavailable', { status: 503 });
@@ -360,6 +406,8 @@ function createModelAuthServer() {
       if (s.user.id === rec.user.id && !s.revoked) {
         s.revoked = true;
         s.revokedBySessionKey = rec.sessionKey;
+        s.revokedByRetry = Boolean(meta?.fromRetry);
+        s.revokedUnderNormalLocks = Boolean(meta?.normalLocks);
         s.revokedAtOrderIndex = revokeOrderIndex;
         confirmedRevokedKeys.add(s.sessionKey);
         confirmedRevokedAtOrder.set(s.sessionKey, revokeOrderIndex);
@@ -449,6 +497,7 @@ type TabHandle = {
   inFlightPromises: Set<Promise<unknown>>;
   // Model-tracking fields for I2/I3 verification:
   lastHeldSid: string | null;
+  everHeldSids: Set<string>;
   attemptedSignOutSids: Set<string>;
   revocationOriginSids: Set<string>;
   differentSessionAppearedAfterSignOut: boolean;
@@ -461,6 +510,16 @@ function readPersistedSid(raw: string | undefined): string | null {
   try {
     const parsed = JSON.parse(raw) as { access_token?: string };
     return decodeJwtSid(parsed?.access_token);
+  } catch {
+    return null;
+  }
+}
+
+function readPersistedUserEmail(raw: string | undefined): string | null {
+  if (!raw || raw.trim() === '' || raw.trim() === 'null') return null;
+  try {
+    const parsed = JSON.parse(raw) as { user?: { email?: unknown } };
+    return typeof parsed?.user?.email === 'string' ? parsed.user.email : null;
   } catch {
     return null;
   }
@@ -499,6 +558,9 @@ type ModelCoverageStats = {
   revocationRetriesConverged: number;
   localFailedRecoveries: number;
   globalMultiSessionRevokes: number;
+  lateRevokedRefreshEvents: number;
+  raceSignInVsRetryCount: number;
+  directUserSwitchNoBcCount: number;
 };
 
 async function runModelSeed(
@@ -537,6 +599,12 @@ async function runModelSeed(
   let deferredNetId = 0;
 
   const hub = createFakeBroadcastHub(() => bcDropped);
+  const originalBroadcastChannel = globalThis.BroadcastChannel;
+  Object.defineProperty(globalThis, 'BroadcastChannel', {
+    configurable: true,
+    writable: true,
+    value: hub.BroadcastChannel,
+  });
   const fakeLocks = createFakeLockManager(() => locksMode);
   const server = createModelAuthServer();
 
@@ -547,6 +615,7 @@ async function runModelSeed(
   // or by inheriting persisted sdkKey on signOut), every Bearer sessionKey sent
   // directly to POST /logout, and every session erased from sdkKey.
   const everSignOutTargetedSids = new Set<string>();
+  const supersededSids = new Set<string>();
   const directLogoutDispatchedSids = new Set<string>();
   const erasedUntargetedSdkViolations: string[] = [];
   const staleDispatchWhileNewerPersistedViolations: string[] = [];
@@ -634,7 +703,12 @@ async function runModelSeed(
         if (!values.delete(k)) return;
         if (k === sdkKey) {
           const erasedSid = readPersistedSid(oldValue ?? undefined);
-          if (erasedSid !== null && !everSignOutTargetedSids.has(erasedSid)) {
+          if (
+            erasedSid !== null &&
+            !everSignOutTargetedSids.has(erasedSid) &&
+            !supersededSids.has(erasedSid) &&
+            !server.isConfirmedRevoked(erasedSid)
+          ) {
             erasedUntargetedSdkViolations.push(
               `tab${slot} removed untargeted sdkKey=${erasedSid}`,
             );
@@ -656,9 +730,25 @@ async function runModelSeed(
           throw new DOMException('QuotaExceededError', 'QuotaExceededError');
         }
         const oldValue = values.get(k) ?? null;
+        if (k === sdkKey) {
+          const nextSid = readPersistedSid(str);
+          if (nextSid !== null) {
+            const nextIdx = server.getIssuedIndex(nextSid);
+            for (const s of server.latestActiveSessions()) {
+              if (s.sessionKey !== nextSid && s.issuedOrderIndex < nextIdx) {
+                supersededSids.add(s.sessionKey);
+              }
+            }
+          }
+        }
         if (isTombstone) {
           const erasedSid = readPersistedSid(oldValue ?? undefined);
-          if (erasedSid !== null && !everSignOutTargetedSids.has(erasedSid)) {
+          if (
+            erasedSid !== null &&
+            !everSignOutTargetedSids.has(erasedSid) &&
+            !supersededSids.has(erasedSid) &&
+            !server.isConfirmedRevoked(erasedSid)
+          ) {
             erasedUntargetedSdkViolations.push(
               `tab${slot} tombstoned untargeted sdkKey=${erasedSid}`,
             );
@@ -758,10 +848,19 @@ async function runModelSeed(
         }
         const immediateMode =
           mode === 'slow_204' ? '204' : mode === 'slow_503' ? '503' : mode;
+        const fromRetry =
+          tabs[slot]?.store.getAuthSnapshot().logoutPhase ===
+          'retrying_revocation';
+        const normalLocks = locksMode === 'enabled' && quotaMode === 'normal';
         trace.push(
-          `  [net tab${slot}] POST /logout (${logoutSid ?? 'unknown'}, mode=${immediateMode})`,
+          `  [net tab${slot}] POST /logout (${logoutSid ?? 'unknown'}, mode=${immediateMode}, retry=${fromRetry})`,
         );
-        return Promise.resolve(server.handleLogout(authHeader, immediateMode));
+        return Promise.resolve(
+          server.handleLogout(authHeader, immediateMode, {
+            fromRetry,
+            normalLocks,
+          }),
+        );
       }
       return Promise.resolve(new Response(null, { status: 404 }));
     };
@@ -807,6 +906,10 @@ async function runModelSeed(
           }
         }
         const resolvedMode = logoutMode === 'slow_204' ? '204' : '503';
+        const fromRetry =
+          tabs[slot]?.store.getAuthSnapshot().logoutPhase ===
+          'retrying_revocation';
+        const normalLocks = locksMode === 'enabled' && quotaMode === 'normal';
         const signal = init?.signal;
         return new Promise<Response>((resolve, reject) => {
           const id = ++deferredNetId;
@@ -830,7 +933,12 @@ async function runModelSeed(
             label: `logout(${resolvedMode})#${id}`,
             resolve: () => {
               cleanup();
-              resolve(server.handleLogout(authHeader, resolvedMode));
+              resolve(
+                server.handleLogout(authHeader, resolvedMode, {
+                  fromRetry,
+                  normalLocks,
+                }),
+              );
             },
           });
         });
@@ -894,23 +1002,30 @@ async function runModelSeed(
       unsubscribeTrace: () => {},
       inFlightPromises: new Set(),
       lastHeldSid: null,
+      everHeldSids: new Set(),
       attemptedSignOutSids: new Set(),
       revocationOriginSids: new Set(),
       differentSessionAppearedAfterSignOut: false,
       sawUnbackedLocalFailedWithNullCoord: false,
       destroyed: false,
     };
+    store.startAuth();
     const {
       data: { subscription: traceSub },
     } = client.auth.onAuthStateChange((ev, sess) => {
       const sid = decodeJwtSid(sess?.access_token);
       trace.push(`  [sdk ${tabId}] ${ev} ${sid ?? 'null'}`);
-      if (sid !== null && readPersistedSid(values.get(sdkKey)) === sid) {
+      const snap = store.getAuthSnapshot();
+      if (
+        sid !== null &&
+        readPersistedSid(values.get(sdkKey)) === sid &&
+        (snap.status === 'owner' || snap.status === 'checking')
+      ) {
         handle.lastHeldSid = sid;
+        handle.everHeldSids.add(sid);
       }
     });
     handle.unsubscribeTrace = () => traceSub.unsubscribe();
-    store.startAuth();
     return handle;
   }
 
@@ -1004,8 +1119,10 @@ async function runModelSeed(
     //     targeted by a signOut/retryLogoutRevocation call.
     //  2. No untargeted persisted sdkKey may ever be erased/tombstoned.
     //  3. A global logout of user A never revokes any session of user B.
-    //  4. A session issued AFTER its revoker's target session was already
-    //     confirmed revoked is never revoked by that stale target.
+    //  4. When Web Locks and normal storage are active, a stale
+    //     retryLogoutRevocation() for an older session never revokes a newer
+    //     untargeted session of the same user (replaces the earlier vacuous
+    //     issuedOrderIndex >= revokerConfirmedAt check).
     //  5. Under normal coordinated storage/events/BC, a stale logout for an
     //     older session is never dispatched while a newer untargeted session
     //     of the same user is already persisted in sdkKey.
@@ -1039,16 +1156,16 @@ async function runModelSeed(
             `Session ${s.sessionKey} (${s.user.id}) was revoked by ${s.revokedBySessionKey} (${revoker.user.id}) at ${stepLabel}`,
           );
         }
-        const revokerConfirmedAt = server.getConfirmedRevokedAtOrder(
-          s.revokedBySessionKey,
-        );
         if (
-          revokerConfirmedAt !== null &&
-          s.issuedOrderIndex >= revokerConfirmedAt
+          s.revokedByRetry &&
+          s.revokedUnderNormalLocks &&
+          revoker &&
+          s.issuedOrderIndex > revoker.issuedOrderIndex &&
+          !everSignOutTargetedSids.has(s.sessionKey)
         ) {
           throw formatFailure(
-            'I3-revoked-session-issued-after-confirmed-logout',
-            `Session ${s.sessionKey} (order=${s.issuedOrderIndex}) was revoked by already-confirmed ${s.revokedBySessionKey} (confirmedAt=${revokerConfirmedAt}) at ${stepLabel}`,
+            'I3-retry-revoked-newer-session',
+            `retryLogoutRevocation for older ${s.revokedBySessionKey} revoked newer untargeted session ${s.sessionKey} under normal locks/storage at ${stepLabel}`,
           );
         }
       }
@@ -1221,6 +1338,10 @@ async function runModelSeed(
     ) {
       everSignOutTargetedSids.add(tab.lastHeldSid);
       if (isSignedInTab) {
+        if (persistedSid === null) {
+          tab.attemptedSignOutSids.add(tab.lastHeldSid);
+          tab.differentSessionAppearedAfterSignOut = false;
+        }
         tab.revocationOriginSids.add(tab.lastHeldSid);
         tab.sawUnbackedLocalFailedWithNullCoord = false;
       }
@@ -1342,10 +1463,18 @@ async function runModelSeed(
         await vi.advanceTimersByTimeAsync(10);
         await flushMicrotasks();
       } else if (r < 0.72) {
-        // Late TOKEN_REFRESHED from an earlier (possibly already revoked) session
-        const all = server.latestActiveSessions();
-        if (all.length > 0) {
-          const chosen = pick(all);
+        // Late TOKEN_REFRESHED from an earlier (frequently already-revoked) session
+        // that THIS tab instance actually held (a reloaded tab cannot receive an
+        // in-flight _callRefreshToken response from before it was loaded).
+        const eligible = server
+          .latestActiveSessions()
+          .filter((s) => tab.everHeldSids.has(s.sessionKey));
+        if (eligible.length > 0) {
+          const revokedSessions = eligible.filter((s) => s.revoked);
+          const chosen =
+            revokedSessions.length > 0 && chance(0.55)
+              ? pick(revokedSessions)
+              : pick(eligible);
           const rotated = server.rotateSession(chosen.refreshToken);
           const payload = rotated.ok
             ? rotated.payload
@@ -1365,8 +1494,11 @@ async function runModelSeed(
                   created_at: '2026-01-01T00:00:00Z',
                 },
               };
+          if (chosen.revoked) {
+            stats.lateRevokedRefreshEvents += 1;
+          }
           trace.push(
-            `lateTokenRefreshed(tab${slot}, ${chosen.sessionKey}, rotated=${rotated.ok})`,
+            `lateTokenRefreshed(tab${slot}, ${chosen.sessionKey}, revoked=${chosen.revoked}, rotated=${rotated.ok})`,
           );
           // Write to sdkKey if storage permits (simulating GoTrueClient _callRefreshToken)
           try {
@@ -1379,6 +1511,89 @@ async function runModelSeed(
           await flushMicrotasks();
         } else {
           trace.push('lateTokenRefreshed(skip: no sessions)');
+        }
+      } else if (r < 0.76) {
+        // Targeted multi-tab races:
+        //  (a) retryLogoutRevocation in one tab while signIn is in flight in another;
+        //  (b) direct cross-user sign-in with BroadcastChannel dropped (no removal event).
+        const retryCandidate = tabs.find(
+          (t) =>
+            !t.destroyed && t.store.getAuthSnapshot().canRetryLogoutRevocation,
+        );
+        if (retryCandidate && tabCount >= 2) {
+          const otherTab = tabs.find(
+            (t) => !t.destroyed && t.slot !== retryCandidate.slot,
+          )!;
+          const prevSlowSignIn: boolean = slowSignIn;
+          const prevLogoutMode: LogoutServerMode = logoutMode;
+          const prevQuota: QuotaMode = quotaMode;
+          const prevLocks: LocksMode = locksMode;
+          quotaMode = 'normal';
+          locksMode = 'enabled';
+          slowSignIn = true;
+          logoutMode = 'slow_204';
+          const coordNow = readCoordRecord(values.get(coordKey));
+          const revokerRec = coordNow?.sessionKey
+            ? server.getSessionByKey(coordNow.sessionKey)
+            : null;
+          const signInUser = revokerRec?.user ?? USER_A;
+          stats.raceSignInVsRetryCount += 1;
+          trace.push(
+            `raceSignInVsRetry(signInTab=tab${otherTab.slot}, retryTab=tab${retryCandidate.slot}, user=${signInUser.id})`,
+          );
+          const signInP = otherTab.store.signIn(
+            signInUser.email,
+            'ValidPassword123',
+          );
+          trackPromise(otherTab, signInP);
+          await flushMicrotasks(4);
+          const retryP = retryCandidate.store.retryLogoutRevocation();
+          trackPromise(retryCandidate, retryP);
+          await flushMicrotasks(4);
+          // Resolve signIn first, then any dispatched logout.
+          const signInNet = deferredNets.find((d) => d.kind === 'signin');
+          if (signInNet) {
+            const idx = deferredNets.indexOf(signInNet);
+            if (idx >= 0) deferredNets.splice(idx, 1);
+            signInNet.resolve();
+          }
+          await vi.advanceTimersByTimeAsync(10);
+          await flushMicrotasks();
+          const logoutNet = deferredNets.find((d) => d.kind === 'logout');
+          if (logoutNet) {
+            logoutNet.resolve();
+          }
+          await vi.advanceTimersByTimeAsync(10);
+          await flushMicrotasks();
+          slowSignIn = prevSlowSignIn;
+          logoutMode = prevLogoutMode;
+          quotaMode = prevQuota;
+          locksMode = prevLocks;
+        } else if (tabCount >= 2) {
+          // Direct cross-user signIn on another tab while BroadcastChannel is
+          // dropped (sdkKey switches user without any removal event or BC).
+          const tab0Snap = tabs[0]?.store.getAuthSnapshot();
+          const otherTab = tabs[1]!;
+          const targetUser = tab0Snap?.email === USER_A.email ? USER_B : USER_A;
+          const prevBcDropped: boolean = bcDropped;
+          const prevEventMode: StorageEventMode = storageEventMode;
+          bcDropped = true;
+          storageEventMode = 'immediate';
+          stats.directUserSwitchNoBcCount += 1;
+          trace.push(
+            `directUserSwitchNoBC(tab${otherTab.slot}, user=${targetUser.id})`,
+          );
+          const p = otherTab.store.signIn(targetUser.email, 'ValidPassword123');
+          trackPromise(otherTab, p);
+          await vi.advanceTimersByTimeAsync(10);
+          await flushMicrotasks();
+          if (deferredNets.length === 0) {
+            await p;
+          }
+          bcDropped = prevBcDropped;
+          storageEventMode = prevEventMode;
+        } else {
+          trace.push('raceAction(skip)');
         }
       } else if (r < 0.8) {
         // Resolve a deferred network request or flush delayed StorageEvents
@@ -1504,7 +1719,26 @@ async function runModelSeed(
     // Assert I4 & I1: no tab remains stuck in an in-flight logout phase, and
     // verify fresh-tab reload + recovery semantics after settle.
     const persistedAfterSettle = readPersistedSid(values.get(sdkKey));
+    const persistedEmailAfterSettle = readPersistedUserEmail(
+      values.get(sdkKey),
+    );
     const coordAfterSettle = readCoordRecord(values.get(coordKey));
+    const isLocalFailedAfterSettle =
+      coordAfterSettle?.state === 'local_failed' &&
+      (coordAfterSettle.sessionKey === null ||
+        coordAfterSettle.sessionKey === persistedAfterSettle);
+    // I1 post-settle: a confirmed-revoked session must NEVER remain persisted
+    // in sdkKey outside an explicit local_failed state.
+    if (
+      persistedAfterSettle !== null &&
+      !isLocalFailedAfterSettle &&
+      server.isConfirmedRevoked(persistedAfterSettle)
+    ) {
+      throw formatFailure(
+        'I1-revoked-session-persisted-after-settle',
+        `Confirmed-revoked session ${persistedAfterSettle} remained persisted in sdkKey after settle`,
+      );
+    }
     for (const t of tabs) {
       if (t.destroyed) continue;
       const snap = t.store.getAuthSnapshot();
@@ -1561,15 +1795,24 @@ async function runModelSeed(
             );
           }
         }
-      } else if (
-        coordAfterSettle?.state === 'local_failed' &&
-        (coordAfterSettle.sessionKey === null ||
-          coordAfterSettle.sessionKey === persistedAfterSettle)
-      ) {
+      } else if (isLocalFailedAfterSettle) {
         if (snap.status === 'owner') {
           throw formatFailure(
             'I1-owner-with-local-failed-after-settle',
             `${t.tabId} remained owner after settle while coordKey is local_failed for ${persistedAfterSettle}`,
+          );
+        }
+      } else {
+        // I5 post-settle: when sdkKey switched to another user without a removal
+        // event or BroadcastChannel, no open tab may remain owner as the old user.
+        if (
+          snap.status === 'owner' &&
+          persistedEmailAfterSettle !== null &&
+          snap.email !== persistedEmailAfterSettle
+        ) {
+          throw formatFailure(
+            'I5-stale-user-owner-after-user-switch',
+            `${t.tabId} stayed status=owner as ${snap.email} while sdkKey holds ${persistedEmailAfterSettle} (${persistedAfterSettle})`,
           );
         }
       }
@@ -1602,11 +1845,7 @@ async function runModelSeed(
             `Fresh reloaded tab booted into phase=${probeSnap.logoutPhase} (logoutRevocationFailed=false) while coordKey is revocation_failed`,
           );
         }
-      } else if (
-        coordAfterSettle?.state === 'local_failed' &&
-        (coordAfterSettle.sessionKey === null ||
-          coordAfterSettle.sessionKey === persistedAfterSettle)
-      ) {
+      } else if (isLocalFailedAfterSettle) {
         if (
           probeSnap.status !== 'signed-out' ||
           probeSnap.logoutPhase !== 'local_failed' ||
@@ -1617,6 +1856,14 @@ async function runModelSeed(
             `Fresh reloaded tab booted into status=${probeSnap.status} phase=${probeSnap.logoutPhase} while local_failed holds ${persistedAfterSettle}`,
           );
         }
+      } else if (
+        server.isConfirmedRevoked(persistedAfterSettle) &&
+        probeSnap.status === 'owner'
+      ) {
+        throw formatFailure(
+          'I1-probe-reopened-revoked-session',
+          `Fresh reloaded tab booted into status=owner on confirmed-revoked ${persistedAfterSettle}`,
+        );
       }
     } finally {
       await destroyTab(probeTab);
@@ -1756,6 +2003,11 @@ async function runModelSeed(
       }
     }
     hub.closeAll();
+    Object.defineProperty(globalThis, 'BroadcastChannel', {
+      configurable: true,
+      writable: true,
+      value: originalBroadcastChannel,
+    });
     resetHeldWritesStore({ clearStorage: true, resetUser: true });
   }
 }
@@ -1790,6 +2042,9 @@ describe('auth-store deterministic model-based interleaving suite (I1-I5)', () =
     revocationRetriesConverged: 0,
     localFailedRecoveries: 0,
     globalMultiSessionRevokes: 0,
+    lateRevokedRefreshEvents: 0,
+    raceSignInVsRetryCount: 0,
+    directUserSwitchNoBcCount: 0,
   };
 
   for (let batch = 0; batch < BATCH_COUNT; batch += 1) {
@@ -1807,5 +2062,8 @@ describe('auth-store deterministic model-based interleaving suite (I1-I5)', () =
     expect(suiteStats.revocationRetriesConverged).toBeGreaterThan(0);
     expect(suiteStats.localFailedRecoveries).toBeGreaterThan(0);
     expect(suiteStats.globalMultiSessionRevokes).toBeGreaterThan(0);
+    expect(suiteStats.lateRevokedRefreshEvents).toBeGreaterThan(0);
+    expect(suiteStats.raceSignInVsRetryCount).toBeGreaterThan(0);
+    expect(suiteStats.directUserSwitchNoBcCount).toBeGreaterThan(0);
   });
 });
