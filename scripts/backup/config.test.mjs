@@ -335,7 +335,10 @@ test('sanitizeStderr keeps only error lines and masks hosts and values', () => {
 });
 
 test('settlement-identity durable and scratch tables are registered for backup without owner remap columns', () => {
-  assert.equal(SETTLEMENT_DURABLE_TABLES.length, 16);
+  assert.equal(SETTLEMENT_DURABLE_TABLES.length, 17);
+  assert.ok(
+    SETTLEMENT_DURABLE_TABLES.includes('app.dependent_operation_class_amounts'),
+  );
   assert.equal(SETTLEMENT_SCRATCH_TABLES.length, 3);
 
   for (const table of SETTLEMENT_DURABLE_TABLES) {

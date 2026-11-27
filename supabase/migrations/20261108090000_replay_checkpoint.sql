@@ -664,11 +664,14 @@ create trigger trg_accounting_runs_no_truncate
 before truncate on app.accounting_runs for each statement
 execute function app.prevent_append_only_mutation ();
 
+alter table app.stock_count_lines
+add unique (count_id, line_no, item_id);
+
 create table app.accounting_piece_keys (
   id bigint generated always as identity primary key,
   item_id uuid not null references app.stock_items (id) on delete restrict,
   origin_kind text not null check (origin_kind in ('movement', 'count_anchor')),
-  movement_id bigint null unique references app.stock_movements (id) on delete restrict,
+  movement_id bigint null unique,
   count_id uuid null,
   count_line_no integer null check (
     count_line_no is null
@@ -721,11 +724,39 @@ create table app.accounting_piece_keys (
       and count_line_no is not null
     )
   ),
-  constraint accounting_piece_keys_count_line_fk foreign key (count_id, count_line_no) references app.stock_count_lines (count_id, line_no) on delete restrict
+  constraint accounting_piece_keys_movement_fk foreign key (movement_id) references app.stock_movements (id) on delete restrict,
+  constraint accounting_piece_keys_count_line_fk foreign key (count_id, count_line_no, item_id) references app.stock_count_lines (count_id, line_no, item_id) on delete restrict
   deferrable initially deferred
 );
 
 comment on table app.accounting_piece_keys is 'Append-only canonical piece identity for movements and stock-count anchors. The count-line FK is deferrable initially deferred so count posting may reserve the anchor key before inserting the line in the same transaction.';
+
+-- The movement and its item are immutable. Validate the item when a piece
+-- is registered, reusing the stock_movements primary key for the lookup.
+create function app.trg_accounting_piece_keys_item_chk () returns trigger language plpgsql security definer
+set
+  search_path = '' as $$
+begin
+  if not exists (
+    select
+      1
+    from
+      app.stock_movements movement
+    where
+      movement.id = new.movement_id
+      and movement.item_id = new.item_id
+  ) then
+    raise exception 'accounting piece must reference a movement for the same item'
+      using errcode = '23503', constraint = 'accounting_piece_keys_movement_fk';
+  end if;
+
+  return new;
+end;
+$$;
+
+create trigger trg_accounting_piece_keys_item_ins
+after insert on app.accounting_piece_keys for each row when (new.movement_id is not null)
+execute function app.trg_accounting_piece_keys_item_chk ();
 
 create trigger trg_accounting_piece_keys_no_update
 before update or delete on app.accounting_piece_keys for each row
@@ -741,7 +772,7 @@ create table app.deficit_settlements (
   deficit_piece_id bigint not null,
   inflow_piece_id bigint not null,
   settlement_kind text not null check (
-    settlement_kind in ('fifo', 'count_drop', 'inactive')
+    settlement_kind in ('fifo', 'own_source', 'count_drop', 'inactive')
   ),
   settled_qty numeric(20, 6) not null check (
     settled_qty >= 0
@@ -787,7 +818,7 @@ create table app.deficit_settlements (
       and required_report_class is null
     )
     or (
-      settlement_kind in ('fifo', 'count_drop')
+      settlement_kind in ('fifo', 'own_source', 'count_drop')
       and settled_qty > 0
       and required_bucket is not null
     )
@@ -945,7 +976,9 @@ create table app.deficit_settlement_events (
       'seal'
     )
   ),
-  old_kind text not null check (old_kind in ('fifo', 'count_drop', 'inactive')),
+  old_kind text not null check (
+    old_kind in ('fifo', 'own_source', 'count_drop', 'inactive')
+  ),
   old_qty numeric(20, 6) not null check (
     old_qty >= 0
     and old_qty <> 'NaN'::numeric
@@ -958,7 +991,20 @@ create table app.deficit_settlement_events (
     old_inflow_value >= 0
     and old_inflow_value <> 'NaN'::numeric
   ),
-  new_kind text not null check (new_kind in ('fifo', 'count_drop', 'inactive')),
+  old_bucket text null check (
+    old_bucket in (
+      'inventory',
+      'cogs',
+      'waste',
+      'count',
+      'sort_transfer'
+    )
+  ),
+  old_waste_reason text null,
+  old_report_class text null,
+  new_kind text not null check (
+    new_kind in ('fifo', 'own_source', 'count_drop', 'inactive')
+  ),
   new_qty numeric(20, 6) not null check (
     new_qty >= 0
     and new_qty <> 'NaN'::numeric
@@ -971,14 +1017,41 @@ create table app.deficit_settlement_events (
     new_inflow_value >= 0
     and new_inflow_value <> 'NaN'::numeric
   ),
+  new_bucket text null check (
+    new_bucket in (
+      'inventory',
+      'cogs',
+      'waste',
+      'count',
+      'sort_transfer'
+    )
+  ),
+  new_waste_reason text null,
+  new_report_class text null,
   delta_b_total numeric(14, 2) not null default 0 check (delta_b_total <> 'NaN'::numeric),
   delta_c_total numeric(14, 2) not null default 0 check (delta_c_total <> 'NaN'::numeric),
   created_at timestamptz not null default pg_catalog.clock_timestamp (),
+  constraint deficit_settlement_events_old_class_chk check (
+    case
+      when old_kind = 'inactive' then old_bucket is null
+      and old_waste_reason is null
+      and old_report_class is null
+      else old_bucket is not null
+    end
+  ),
+  constraint deficit_settlement_events_new_class_chk check (
+    case
+      when new_kind = 'inactive' then new_bucket is null
+      and new_waste_reason is null
+      and new_report_class is null
+      else new_bucket is not null
+    end
+  ),
   unique (settlement_id, event_no),
   unique (settlement_id, run_id)
 );
 
-comment on table app.deficit_settlement_events is 'Append-only settlement lifecycle history. Records economic changes even when delta_b_total and delta_c_total are both zero.';
+comment on table app.deficit_settlement_events is 'Append-only settlement lifecycle history. Records old and new economic and report-class state, including changes with no monetary deltas.';
 
 create trigger trg_deficit_settlement_events_no_update
 before update or delete on app.deficit_settlement_events for each row
@@ -1028,8 +1101,20 @@ execute function app.prevent_append_only_mutation ();
 create table app.movement_value_heads (
   piece_id bigint primary key,
   item_id uuid not null references app.stock_items (id) on delete restrict,
+  base_qty numeric(20, 6) not null check (base_qty <> 'NaN'::numeric),
   base_total numeric(14, 2) not null default 0 check (base_total <> 'NaN'::numeric),
-  base_unit_cost numeric(20, 6) not null default 0 check (base_unit_cost <> 'NaN'::numeric),
+  base_unit_cost numeric(20, 6) not null default 0 check (
+    base_unit_cost >= 0
+    and base_unit_cost <> 'NaN'::numeric
+  ),
+  opened_deficit_qty numeric(20, 6) not null default 0 check (
+    opened_deficit_qty >= 0
+    and opened_deficit_qty <> 'NaN'::numeric
+  ),
+  opened_deficit_value numeric(14, 2) not null default 0 check (
+    opened_deficit_value >= 0
+    and opened_deficit_value <> 'NaN'::numeric
+  ),
   base_adjustment_total numeric(14, 2) not null default 0 check (base_adjustment_total <> 'NaN'::numeric),
   settlement_adjustment_total numeric(14, 2) not null default 0 check (settlement_adjustment_total <> 'NaN'::numeric),
   last_run_id bigint null references app.accounting_runs (id) on delete restrict,
@@ -1057,6 +1142,10 @@ create table app.dependent_operation_heads (
   quantity_intent numeric(20, 6) not null check (
     quantity_intent > 0
     and quantity_intent <> 'NaN'::numeric
+  ),
+  basis_qty numeric(20, 6) not null default 0 check (
+    basis_qty >= 0
+    and basis_qty <> 'NaN'::numeric
   ),
   retained_qty numeric(20, 6) null check (
     retained_qty is null
@@ -1116,10 +1205,7 @@ create table app.dependent_operation_heads (
   new_report_class text null,
   reclass_value numeric(14, 2) null check (
     reclass_value is null
-    or (
-      reclass_value >= 0
-      and reclass_value <> 'NaN'::numeric
-    )
+    or reclass_value <> 'NaN'::numeric
   ),
   last_run_id bigint null references app.accounting_runs (id) on delete restrict,
   created_at timestamptz not null default pg_catalog.clock_timestamp (),
@@ -1230,6 +1316,38 @@ execute function app.trg_dependent_operation_heads_guard ();
 create trigger trg_dependent_operation_heads_guard_truncate
 before truncate on app.dependent_operation_heads for each statement
 execute function app.trg_dependent_operation_heads_guard ();
+
+create table app.dependent_operation_class_amounts (
+  operation_id bigint not null references app.dependent_operation_heads (id) on delete restrict,
+  bucket text not null check (
+    bucket in (
+      'inventory',
+      'cogs',
+      'waste',
+      'count',
+      'sort_transfer'
+    )
+  ),
+  waste_reason text null,
+  report_class text null,
+  booked_amount numeric(14, 2) not null default 0 check (booked_amount <> 'NaN'::numeric),
+  basis_amount numeric(14, 2) not null default 0 check (basis_amount <> 'NaN'::numeric),
+  required_amount numeric(14, 2) not null default 0 check (required_amount <> 'NaN'::numeric),
+  posted_receipt_amount numeric(14, 2) not null default 0 check (posted_receipt_amount <> 'NaN'::numeric),
+  posted_original_source_amount numeric(14, 2) not null default 0 check (posted_original_source_amount <> 'NaN'::numeric),
+  posted_current_date_source_amount numeric(14, 2) not null default 0 check (
+    posted_current_date_source_amount <> 'NaN'::numeric
+  ),
+  posted_original_reclass_amount numeric(14, 2) not null default 0 check (posted_original_reclass_amount <> 'NaN'::numeric),
+  posted_current_date_reclass_amount numeric(14, 2) not null default 0 check (
+    posted_current_date_reclass_amount <> 'NaN'::numeric
+  ),
+  posted_cap_amount numeric(14, 2) not null default 0 check (posted_cap_amount <> 'NaN'::numeric),
+  posted_current_date_cap_amount numeric(14, 2) not null default 0 check (posted_current_date_cap_amount <> 'NaN'::numeric),
+  unique nulls not distinct (operation_id, bucket, waste_reason, report_class)
+);
+
+comment on table app.dependent_operation_class_amounts is 'Booked amounts, certified pre-operation basis, required results, and posted totals by class and posting method.';
 
 create table app.source_classification_intervals (
   id bigint generated always as identity primary key,
@@ -1350,6 +1468,7 @@ create table app.reversal_settlement_splits (
     or (
       split_kind = 'settlement_b'
       and settlement_id is not null
+      and settlement_event_id is not null
       and quantity = 0
     )
   )
@@ -1369,7 +1488,8 @@ declare
 begin
   select
     sm.movement_type,
-    sm.reverses_movement_id
+    sm.reverses_movement_id,
+    sm.accounting_run_id
   into v_rev
   from
     app.stock_movements sm
@@ -1383,6 +1503,30 @@ begin
     'waste_reversal'::app.movement_type
   ) then
     raise exception 'reversal_settlement_splits requires a sale_reversal or waste_reversal movement'
+      using errcode = '23514';
+  end if;
+
+  if new.split_kind = 'settlement_b'
+  and new.settlement_event_id is not null
+  and not exists (
+    select
+      1
+    from
+      app.deficit_settlement_events event
+      join app.deficit_settlements pair on pair.id = event.settlement_id
+      join app.accounting_piece_keys deficit on deficit.id = pair.deficit_piece_id
+    where
+      event.id = new.settlement_event_id
+      and event.settlement_id = new.settlement_id
+      and deficit.movement_id = v_rev.reverses_movement_id
+      and event.run_id = v_rev.accounting_run_id
+      and event.operation = 'remove'
+      and event.new_kind = 'inactive'
+      and event.new_qty = 0
+      and event.new_provisional_value = 0
+      and event.new_inflow_value = 0
+  ) then
+    raise exception 'reversal_settlement_splits requires the reversed deficit settlement removal in the reversal run'
       using errcode = '23514';
   end if;
 
@@ -1484,6 +1628,7 @@ execute function app.prevent_append_only_mutation ();
 create table app.legacy_certification_splits (
   group_id bigint not null references app.legacy_certification_groups (id) on delete restrict,
   line_no integer not null check (line_no > 0),
+  locus text not null check (locus in ('base', 'deficit', 'inflow')),
   bucket text not null check (
     bucket in (
       'inventory',
@@ -1500,7 +1645,13 @@ create table app.legacy_certification_splits (
     and amount <> 'NaN'::numeric
   ),
   primary key (group_id, line_no),
-  constraint legacy_certification_splits_class_uidx unique nulls not distinct (group_id, bucket, waste_reason, report_class)
+  constraint legacy_certification_splits_class_uidx unique nulls not distinct (
+    group_id,
+    bucket,
+    waste_reason,
+    report_class,
+    locus
+  )
 );
 
 comment on table app.legacy_certification_splits is 'Append-only per-class amount splits for certified legacy groups.';
@@ -1553,7 +1704,16 @@ create index open_deficit_queue_fifo_idx on app.open_deficit_queue (
   tie_breaker
 );
 
-create index open_deficit_queue_source_idx on app.open_deficit_queue (source_kind, source_id, item_id);
+create index open_deficit_queue_source_idx on app.open_deficit_queue (
+  item_id,
+  source_kind,
+  source_id,
+  occurred_at,
+  ord_class,
+  event_position,
+  piece_position,
+  tie_breaker
+);
 
 create table app.sort_group_items (
   item_id uuid not null references app.stock_items (id) on delete restrict,
@@ -1590,6 +1750,7 @@ add column dependent_role text null check (
   dependent_role is null
   or dependent_role in (
     'effective_receipt',
+    'signed_source',
     'cap_allocation',
     'reclass_out',
     'reclass_in'
@@ -1597,7 +1758,13 @@ add column dependent_role text null check (
 ),
 add column dependent_mode text null check (
   dependent_mode is null
-  or dependent_mode in ('normal', 'cap_offset')
+  or dependent_mode in (
+    'original_key',
+    'current_date_source',
+    'current_date_reclass',
+    'cap_offset',
+    'current_date_cap_offset'
+  )
 ),
 add column posting_bucket text null check (
   posting_bucket is null
@@ -1640,8 +1807,18 @@ add constraint stock_movements_posting_links_chk check (
     and settlement_locus is null
   )
 ),
+add constraint stock_movements_dependent_method_chk check (
+  dependent_role is null
+  or case dependent_role
+    when 'effective_receipt' then dependent_mode = 'original_key'
+    when 'signed_source' then dependent_mode in ('original_key', 'current_date_source')
+    when 'cap_allocation' then dependent_mode in ('cap_offset', 'current_date_cap_offset')
+    else dependent_mode in ('original_key', 'current_date_reclass')
+  end
+),
 add constraint stock_movements_cap_offset_no_pair_chk check (
-  dependent_mode is distinct from 'cap_offset'
+  dependent_mode is null
+  or dependent_mode not in ('cap_offset', 'current_date_cap_offset')
   or (
     cover_inflow_movement_id is null
     and cover_deficit_movement_id is null
@@ -1668,7 +1845,7 @@ create unique index stock_movements_dependent_run_delta_uidx on app.stock_moveme
 where
   dependent_operation_id is not null;
 
--- RLS (enabled, zero API policies) and explicit revokes on all 19 new tables,
+-- RLS (enabled, zero API policies) and explicit revokes on the new tables,
 -- their identity sequences, and trigger functions.
 alter table ledger_scratch.accounting_run_context enable row level security;
 
@@ -1691,6 +1868,8 @@ alter table app.deficit_settlement_event_deltas enable row level security;
 alter table app.movement_value_heads enable row level security;
 
 alter table app.dependent_operation_heads enable row level security;
+
+alter table app.dependent_operation_class_amounts enable row level security;
 
 alter table app.source_classification_intervals enable row level security;
 
@@ -1719,6 +1898,7 @@ app.deficit_settlement_events,
 app.deficit_settlement_event_deltas,
 app.movement_value_heads,
 app.dependent_operation_heads,
+app.dependent_operation_class_amounts,
 app.source_classification_intervals,
 app.recognized_class_amounts,
 app.reversal_settlement_splits,
@@ -1765,7 +1945,8 @@ begin
 end;
 $$;
 
-revoke all on function app.trg_deficit_settlements_guard (),
+revoke all on function app.trg_accounting_piece_keys_item_chk (),
+app.trg_deficit_settlements_guard (),
 app.trg_dependent_operation_heads_guard (),
 app.trg_reversal_settlement_splits_shape (),
 app.trg_legacy_certification_members_item_chk ()
@@ -2020,31 +2201,32 @@ $$;
 
 comment on function app.is_trusted_fixture_caller () is 'True only when the session user is a superuser or database owner and no SET ROLE is active. Rejects API roles and switched roles inside SECURITY DEFINER chains.';
 
-create function app.accounting_run_enter (
-  p_entry_point text,
-  p_t_change timestamptz default null,
-  p_require_sync_lock boolean default true,
-  p_require_shifts_lock boolean default true
-) returns uuid language plpgsql security definer
+create function app.accounting_run_assert_locks () returns void language plpgsql security definer
 set
   search_path = '' as $$
 declare
   v_pid integer := pg_catalog.pg_backend_pid();
-  v_xid xid8 := pg_catalog.pg_current_xact_id();
-  v_token uuid;
-  v_t_change timestamptz;
-  v_window_start timestamptz;
+  v_ledger_key constant bigint := 7342750000000000001;
 begin
-  if p_entry_point is null
-  or pg_catalog.length(pg_catalog.btrim(p_entry_point)) = 0 then
-    raise exception 'entry_point is required'
-      using errcode = '22023';
+  if not exists (
+    select
+      1
+    from
+      pg_catalog.pg_locks l
+    where
+      l.pid = v_pid
+      and l.locktype = 'advisory'
+      and l.mode = 'ExclusiveLock'
+      and l.granted
+      and l.objsubid = 1
+      and l.classid = (v_ledger_key >> 32)::oid
+      and l.objid = (v_ledger_key & 4294967295::bigint)::oid
+  ) then
+    raise exception 'exclusive ledger lock is required for an accounting run'
+      using errcode = '55000';
   end if;
 
-  perform app.assert_ledger_lock_held ();
-
-  if coalesce(p_require_sync_lock, true)
-  and not exists (
+  if not exists (
     select
       1
     from
@@ -2061,12 +2243,11 @@ begin
         'AccessExclusiveLock'
       )
   ) then
-    raise exception 'pos_sync_runs share lock is required before accounting_run_enter'
+    raise exception 'pos_sync_runs share lock is required for an accounting run'
       using errcode = '55000';
   end if;
 
-  if coalesce(p_require_shifts_lock, true)
-  and not exists (
+  if not exists (
     select
       1
     from
@@ -2083,9 +2264,30 @@ begin
         'AccessExclusiveLock'
       )
   ) then
-    raise exception 'pos_shifts share lock is required before accounting_run_enter'
+    raise exception 'pos_shifts share lock is required for an accounting run'
       using errcode = '55000';
   end if;
+
+end;
+$$;
+
+create function app.accounting_run_enter (p_entry_point text) returns uuid language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_pid integer := pg_catalog.pg_backend_pid();
+  v_xid xid8 := pg_catalog.pg_current_xact_id();
+  v_token uuid;
+  v_t_change timestamptz;
+  v_window_start timestamptz;
+begin
+  if p_entry_point is null
+  or pg_catalog.length(pg_catalog.btrim(p_entry_point)) = 0 then
+    raise exception 'entry_point is required'
+      using errcode = '22023';
+  end if;
+
+  perform app.accounting_run_assert_locks ();
 
   delete from ledger_scratch.accounting_run_context ctx
   where
@@ -2105,7 +2307,11 @@ begin
       using errcode = '55000';
   end if;
 
-  v_t_change := coalesce(p_t_change, app.note_change_instant ());
+  if app.is_trusted_fixture_caller () then
+    v_t_change := app.test_clock_pin ();
+  end if;
+
+  v_t_change := coalesce(v_t_change, pg_catalog.clock_timestamp());
   v_window_start := app.restatement_window_start (v_t_change);
   v_token := pg_catalog.gen_random_uuid();
 
@@ -2136,7 +2342,7 @@ begin
 end;
 $$;
 
-comment on function app.accounting_run_enter (text, timestamptz, boolean, boolean) is 'Private §3 run entry check. Requires ledger advisory lock and requested sync/shift share locks, opens transient transaction-local run state in phase authorize without writing durable app.accounting_runs, and never accepts GUC authority.';
+comment on function app.accounting_run_enter (text) is 'Private §3 run entry. Requires the exclusive ledger lock and both sync/shift share locks before reading the server clock or authorized fixture pin.';
 
 create function app.accounting_run_set_phase (p_run_token uuid, p_next_phase text) returns void language plpgsql security definer
 set
@@ -2164,7 +2370,7 @@ begin
       using errcode = '42501';
   end if;
 
-  perform app.assert_ledger_lock_held ();
+  perform app.accounting_run_assert_locks ();
 
   v_expected := case v_ctx.phase
     when 'authorize' then 'stage'
@@ -2218,7 +2424,7 @@ begin
       using errcode = '42501';
   end if;
 
-  perform app.assert_ledger_lock_held ();
+  perform app.accounting_run_assert_locks ();
 
   if coalesce(p_require_historical, false)
   and not v_ctx.historical_authorized then
@@ -2226,8 +2432,7 @@ begin
       using errcode = '42501';
   end if;
 
-  if p_allowed_phases is not null
-  and not (v_ctx.phase = any (p_allowed_phases)) then
+  if (v_ctx.phase = any (p_allowed_phases)) is not true then
     raise exception 'accounting run phase % is not allowed here', v_ctx.phase
       using errcode = '55000';
   end if;
@@ -2238,21 +2443,17 @@ $$;
 
 comment on function app.accounting_run_assert (text[], boolean) is 'Private §3 guard verifying active backend/transaction run authority, lock ownership, allowed phase, and optional historical authority. Ignores GUCs and stale transactions.';
 
-create function app.accounting_run_exit (
-  p_run_token uuid,
-  p_require_publish boolean default true
-) returns void language plpgsql security definer
+create function app.accounting_run_close (p_run_token uuid, p_allowed_phases text[]) returns void language plpgsql security definer
 set
   search_path = '' as $$
 declare
   v_pid integer := pg_catalog.pg_backend_pid();
   v_xid xid8 := pg_catalog.pg_current_xact_id();
-  v_ctx record;
+  v_token uuid;
 begin
   select
-    ctx.run_token,
-    ctx.phase
-  into v_ctx
+    ctx.run_token
+  into v_token
   from
     ledger_scratch.accounting_run_context ctx
   where
@@ -2261,16 +2462,12 @@ begin
 
   if not found
   or p_run_token is null
-  or v_ctx.run_token is distinct from p_run_token then
+  or v_token is distinct from p_run_token then
     raise exception 'invalid or missing accounting run authority'
       using errcode = '42501';
   end if;
 
-  if coalesce(p_require_publish, true)
-  and v_ctx.phase <> 'publish' then
-    raise exception 'accounting_run_exit requires publish phase (current: %)', v_ctx.phase
-      using errcode = '55000';
-  end if;
+  perform app.accounting_run_assert (p_allowed_phases);
 
   delete from ledger_scratch.accounting_run_context ctx
   where
@@ -2279,7 +2476,21 @@ begin
 end;
 $$;
 
-comment on function app.accounting_run_exit (uuid, boolean) is 'Private §3 run exit check. Verifies token and final phase before clearing transient transaction-local run state.';
+create function app.accounting_run_exit (p_run_token uuid) returns void language sql security definer
+set
+  search_path = '' as $$
+  select app.accounting_run_close (p_run_token, array['publish']);
+$$;
+
+comment on function app.accounting_run_exit (uuid) is 'Close a successfully published accounting run.';
+
+create function app.accounting_run_cancel (p_run_token uuid) returns void language sql security definer
+set
+  search_path = '' as $$
+  select app.accounting_run_close (p_run_token, array['authorize', 'stage', 'materialize', 'confirm']);
+$$;
+
+comment on function app.accounting_run_cancel (uuid) is 'Clear transient run authority before publication. The caller must roll back any staged writes.';
 
 create function app.replay_probe_arm (
   p_probe_enabled boolean default true,
@@ -2293,6 +2504,8 @@ declare
   v_xid xid8 := pg_catalog.pg_current_xact_id();
   v_mode text := coalesce(p_override_mode, 'none');
   v_cuts jsonb := coalesce(p_forced_cuts, '{}'::jsonb);
+  v_normalized_cuts jsonb := '{}'::jsonb;
+  v_item_key text;
   v_entry record;
 begin
   if not app.is_trusted_fixture_caller () then
@@ -2329,12 +2542,17 @@ begin
         pg_catalog.jsonb_each(v_cuts) as e (key, value)
     loop
       begin
-        perform v_entry.key::uuid;
+        v_item_key := v_entry.key::uuid::text;
       exception
         when invalid_text_representation then
           raise exception 'invalid item_id in forced_cuts'
             using errcode = '22023';
       end;
+
+      if v_normalized_cuts ? v_item_key then
+        raise exception 'duplicate item_id in forced_cuts'
+          using errcode = '22023';
+      end if;
 
       if pg_catalog.jsonb_typeof(v_entry.value) <> 'null' then
         if pg_catalog.jsonb_typeof(v_entry.value) <> 'number'
@@ -2343,6 +2561,8 @@ begin
             using errcode = '22023';
         end if;
       end if;
+
+      v_normalized_cuts := v_normalized_cuts || pg_catalog.jsonb_build_object(v_item_key, v_entry.value);
     end loop;
   end if;
 
@@ -2366,10 +2586,7 @@ begin
       v_xid,
       coalesce(p_probe_enabled, true),
       v_mode,
-      case
-        when v_mode = 'forced_cut' then v_cuts
-        else '{}'::jsonb
-      end,
+      v_normalized_cuts,
       pg_catalog.clock_timestamp()
     )
   on conflict (backend_pid, xact_id) do update
@@ -2464,10 +2681,13 @@ $$;
 comment on function app.replay_probe_active_override () is 'Return the active transaction-local cut override for trusted fixture callers. Never reads GUCs and never leaks across transactions.';
 
 revoke all on function app.is_trusted_fixture_caller (),
-app.accounting_run_enter (text, timestamptz, boolean, boolean),
+app.accounting_run_assert_locks (),
+app.accounting_run_enter (text),
 app.accounting_run_set_phase (uuid, text),
 app.accounting_run_assert (text[], boolean),
-app.accounting_run_exit (uuid, boolean),
+app.accounting_run_close (uuid, text[]),
+app.accounting_run_exit (uuid),
+app.accounting_run_cancel (uuid),
 app.replay_probe_arm (boolean, text, jsonb),
 app.replay_probe_clear (),
 app.replay_probe_is_enabled (),
@@ -2489,14 +2709,18 @@ begin
       rolname = 'backup_reader'
   ) then
     revoke execute on function app.is_trusted_fixture_caller (),
-    app.accounting_run_enter (text, timestamptz, boolean, boolean),
+    app.accounting_run_assert_locks (),
+    app.accounting_run_enter (text),
     app.accounting_run_set_phase (uuid, text),
     app.accounting_run_assert (text[], boolean),
-    app.accounting_run_exit (uuid, boolean),
+    app.accounting_run_close (uuid, text[]),
+    app.accounting_run_exit (uuid),
+    app.accounting_run_cancel (uuid),
     app.replay_probe_arm (boolean, text, jsonb),
     app.replay_probe_clear (),
     app.replay_probe_is_enabled (),
     app.replay_probe_active_override (),
+    app.trg_accounting_piece_keys_item_chk (),
     app.trg_deficit_settlements_guard (),
     app.trg_dependent_operation_heads_guard (),
     app.trg_reversal_settlement_splits_shape (),
@@ -3102,20 +3326,23 @@ from
 create function app.sort_family_ids (p_item_id uuid) returns uuid[] language sql stable security definer
 set
   search_path = '' as $$
-  select
-    coalesce(
-      pg_catalog.array_agg(distinct family.id),
-      '{}'::uuid[]
-    )
-  from
-    (
+  -- Resolve the seed first. Sort only the bounded results, so the UUID
+  -- order cannot make the planner walk the stock_items primary index.
+  with
+    seed as materialized (
+      select
+        item.parent_item_id
+      from
+        app.stock_items item
+      where
+        item.id = p_item_id
+        and item.parent_item_id is not null
+    ),
+    family as materialized (
       select
         seed.parent_item_id as id
       from
-        app.stock_items seed
-      where
-        seed.id = p_item_id
-        and seed.parent_item_id is not null
+        seed
       union
       select
         child.id
@@ -3127,13 +3354,22 @@ set
       select
         sibling.id
       from
-        app.stock_items seed
-        join app.stock_items sibling on sibling.parent_item_id = seed.parent_item_id
-      where
-        seed.id = p_item_id
-        and seed.parent_item_id is not null
-        and sibling.id <> seed.id
-    ) family;
+        seed
+        cross join lateral (
+          select
+            item.id
+          from
+            app.stock_items item
+          where
+            item.parent_item_id = seed.parent_item_id
+            and item.id <> p_item_id
+          offset 0
+        ) sibling
+    )
+  select
+    coalesce(pg_catalog.array_agg(family.id order by family.id), '{}'::uuid[])
+  from
+    family;
 $$;
 
 comment on function app.sort_family_ids (uuid) is 'Mixed parent and size siblings of one fish item. Posted sorts stay inside this family.';
@@ -3530,41 +3766,52 @@ begin
         using errcode = '22023';
     end if;
 
-    select
-      coalesce(
-        pg_catalog.array_agg(
-          distinct found.item_id
-          order by
-            found.item_id
-        ),
-        '{}'::uuid[]
-      )
-    into v_next
-    from
-      (
+    -- Materialize the catalog lookups before ordering the deduplicated
+    -- result. Each child lookup stays bound to one parent.
+    with
+      seeds as materialized (
         select
-          si.parent_item_id as item_id
+          item.id,
+          item.parent_item_id,
+          item.kind
         from
-          pg_catalog.unnest(v_set) as seed (item_id)
-          join app.stock_items si on si.id = seed.item_id
+          app.stock_items item
         where
-          si.parent_item_id is not null
+          item.id = any (v_set)
+      ),
+      found as materialized (
+        select
+          seed.parent_item_id as item_id
+        from
+          seeds seed
+        where
+          seed.parent_item_id is not null
         union
         select
           child.id
         from
-          pg_catalog.unnest(v_set) as seed (item_id)
-          join app.stock_items si on si.id = seed.item_id
-          join app.stock_items child on child.parent_item_id = coalesce(
-            si.parent_item_id,
-            case
-              when si.kind = 'fish_mixed' then si.id
-              else null
-            end
-          )
-      ) as found
-    where
-      found.item_id is not null;
+          seeds seed
+          cross join lateral (
+            select
+              item.id
+            from
+              app.stock_items item
+            where
+              item.parent_item_id = coalesce(
+                seed.parent_item_id,
+                case
+                  when seed.kind = 'fish_mixed' then seed.id
+                  else null
+                end
+              )
+            offset 0
+          ) child
+      )
+    select
+      coalesce(pg_catalog.array_agg(found.item_id order by found.item_id), '{}'::uuid[])
+    into v_next
+    from
+      found;
 
     -- Sort partners after each seed's certified cut. The cut is a literal
     -- inside replay_bounded_sort_edges, so frozen edges are not scanned.
@@ -3749,7 +3996,11 @@ from
   authenticated,
   service_role;
 
-create function app.replay_bind_resume (p_item_ids uuid[], p_pending jsonb) returns void language plpgsql security definer
+create function app.replay_bind_resume (
+  p_item_ids uuid[],
+  p_pending jsonb,
+  p_apply_probe_override boolean default true
+) returns void language plpgsql security definer
 set
   search_path = '' as $$
 declare
@@ -3789,14 +4040,16 @@ begin
     ''
   )::timestamptz;
 
-  select
-    ov.mode,
-    ov.forced_cuts
-  into
-    v_override_mode,
-    v_forced_cuts
-  from
-    app.replay_probe_active_override () ov;
+  if p_apply_probe_override then
+    select
+      ov.mode,
+      ov.forced_cuts
+    into
+      v_override_mode,
+      v_forced_cuts
+    from
+      app.replay_probe_active_override () ov;
+  end if;
 
   if p_pending is null
   or pg_catalog.jsonb_typeof(p_pending) <> 'array'
@@ -4536,9 +4789,9 @@ begin
 end;
 $$;
 
-comment on function app.replay_bind_resume (uuid[], jsonb) is 'Choose one usable checkpoint per item whose cut is strictly before that item''s own effect. The effect is the earliest pending row in the item''s sort component. Empty pending skips historical sort edges. Posted sort edges join only pending items after each member''s certified cut, bound by item_id. A checkpoint that fails the anchor count or the suffix test is skipped. Demotion repeats until no sort straddles a cut in the component, reading only edges after the earliest partner cut. Each newly exposed sort adds its items to the candidates. Each fallback cut passes the same suffix watermark as the bind loop.';
+comment on function app.replay_bind_resume (uuid[], jsonb, boolean) is 'Choose one usable checkpoint per item whose cut is strictly before that item''s own effect. The effect is the earliest pending row in the item''s sort component. Empty pending skips historical sort edges. Posted sort edges join only pending items after each member''s certified cut, bound by item_id. A checkpoint that fails the anchor count or the suffix test is skipped. Demotion repeats until no sort straddles a cut in the component, reading only edges after the earliest partner cut. Each newly exposed sort adds its items to the candidates. Each fallback cut passes the same suffix watermark as the bind loop.';
 
-revoke all on function app.replay_bind_resume (uuid[], jsonb)
+revoke all on function app.replay_bind_resume (uuid[], jsonb, boolean)
 from
   public,
   anon,
@@ -7987,7 +8240,8 @@ set
 begin
   -- Truncate recompute_row when a user BEFORE TRUNCATE trigger is attached or
   -- its heap grew past 32 KB; otherwise DELETE avoids relfilenode churn and
-  -- relcache invalidation on short resumed walks.
+  -- relcache invalidation on short resumed walks. The DELETE branches use
+  -- non-null scratch keys so they also run in PostgREST's safeupdate sessions.
   if pg_catalog.pg_relation_size('ledger_scratch.recompute_row'::regclass) > 32768
   or exists (
     select
@@ -8000,7 +8254,7 @@ begin
   ) then
     truncate ledger_scratch.recompute_row;
   elsif pg_catalog.pg_relation_size('ledger_scratch.recompute_row'::regclass) > 0 then
-    delete from ledger_scratch.recompute_row;
+    delete from ledger_scratch.recompute_row where movement_id is not null;
   end if;
 
   if pg_catalog.pg_relation_size('ledger_scratch.recompute_def'::regclass) > 65536
@@ -8020,39 +8274,316 @@ begin
     ledger_scratch.replay_probe_pieces;
   else
     if pg_catalog.pg_relation_size('ledger_scratch.recompute_bal'::regclass) > 0 then
-      delete from ledger_scratch.recompute_bal;
+      delete from ledger_scratch.recompute_bal where item_id is not null;
     end if;
     if pg_catalog.pg_relation_size('ledger_scratch.recompute_def'::regclass) > 0 then
-      delete from ledger_scratch.recompute_def;
+      delete from ledger_scratch.recompute_def where movement_id is not null;
     end if;
     if pg_catalog.pg_relation_size('ledger_scratch.recompute_effect'::regclass) > 0 then
-      delete from ledger_scratch.recompute_effect;
+      delete from ledger_scratch.recompute_effect where movement_id is not null;
     end if;
     if pg_catalog.pg_relation_size('ledger_scratch.recompute_piece'::regclass) > 0 then
-      delete from ledger_scratch.recompute_piece;
+      delete from ledger_scratch.recompute_piece where line_key is not null;
     end if;
     if pg_catalog.pg_relation_size('ledger_scratch.recompute_override'::regclass) > 0 then
-      delete from ledger_scratch.recompute_override;
+      delete from ledger_scratch.recompute_override where movement_id is not null;
     end if;
     if pg_catalog.pg_relation_size('ledger_scratch.recompute_seq'::regclass) > 0 then
-      delete from ledger_scratch.recompute_seq;
+      delete from ledger_scratch.recompute_seq where next_id is not null;
     end if;
     if pg_catalog.pg_relation_size('ledger_scratch.recompute_anchor'::regclass) > 0 then
-      delete from ledger_scratch.recompute_anchor;
+      delete from ledger_scratch.recompute_anchor where anchor_ord is not null;
     end if;
     if pg_catalog.pg_relation_size('ledger_scratch.replay_resume'::regclass) > 0 then
-      delete from ledger_scratch.replay_resume;
+      delete from ledger_scratch.replay_resume where item_id is not null;
     end if;
     if pg_catalog.pg_relation_size('ledger_scratch.recompute_cover_pair'::regclass) > 0 then
-      delete from ledger_scratch.recompute_cover_pair;
+      delete from ledger_scratch.recompute_cover_pair where inflow_movement_id is not null;
     end if;
     if pg_catalog.pg_relation_size('ledger_scratch.replay_restore_plan'::regclass) > 0 then
-      delete from ledger_scratch.replay_restore_plan;
+      delete from ledger_scratch.replay_restore_plan where checkpoint_id is not null;
     end if;
     if pg_catalog.pg_relation_size('ledger_scratch.replay_probe_pieces'::regclass) > 0 then
-      delete from ledger_scratch.replay_probe_pieces;
+      delete from ledger_scratch.replay_probe_pieces where piece_seq is not null;
     end if;
   end if;
+end;
+$$;
+
+-- Preserve the outflow walk from order_dispositions with a guarded scratch sequence update.
+create or replace function app.replay_outflow (
+  p_movement_id bigint,
+  p_item_id uuid,
+  p_type app.movement_type,
+  p_occurred_at timestamptz,
+  p_out_qty numeric,
+  p_forced_total numeric,
+  p_is_pending boolean,
+  p_line_key integer,
+  p_shift_id text,
+  p_source_type text,
+  p_source_id text,
+  p_note text
+) returns void language plpgsql security definer
+set
+  search_path = '' as $$
+declare
+  v_qty numeric(20, 6);
+  v_value numeric(14, 2);
+  v_avg numeric(20, 6);
+  v_known boolean;
+  v_engine boolean;
+  v_prov_unit numeric(20, 6);
+  v_unit numeric(20, 6);
+  v_normal_qty numeric(20, 6);
+  v_prov_qty numeric(20, 6);
+  v_normal_cost numeric(14, 2);
+  v_prov_cost numeric(14, 2);
+  v_base numeric(14, 2);
+  v_piece integer := 0;
+  v_syn bigint;
+  v_ord integer;
+  v_event bigint;
+  v_row_piece integer;
+begin
+  select
+    b.on_hand_qty,
+    b.on_hand_value,
+    b.avg_cost,
+    b.cost_known
+  into
+    v_qty,
+    v_value,
+    v_avg,
+    v_known
+  from
+    ledger_scratch.recompute_bal b
+  where
+    b.item_id = p_item_id;
+
+  select
+    coalesce(q.engine_valued, false),
+    coalesce(q.ord_class, 0),
+    q.event_position,
+    coalesce(q.piece_position, 0)
+  into
+    v_engine,
+    v_ord,
+    v_event,
+    v_row_piece
+  from
+    ledger_scratch.recompute_row q
+  where
+    q.movement_id = p_movement_id;
+
+  v_known := coalesce(v_known, false);
+  v_engine := coalesce(v_engine, false);
+  v_ord := coalesce(v_ord, 0);
+  v_event := coalesce(v_event, p_movement_id);
+  v_row_piece := coalesce(v_row_piece, 0);
+  v_unit := app.assert_recompute_range (v_avg, 6, false);
+  v_prov_unit := v_unit;
+
+  if p_forced_total is not null then
+    v_normal_qty := p_out_qty;
+    v_prov_qty := 0;
+    v_normal_cost := app.assert_recompute_range (p_forced_total, 2, true);
+    v_prov_cost := 0;
+  else
+    v_normal_qty := least(p_out_qty, greatest(v_qty, 0::numeric));
+    v_prov_qty := p_out_qty - v_normal_qty;
+
+    if v_normal_qty > 0 then
+      if v_normal_qty = v_qty then
+        v_normal_cost := -v_value;
+      else
+        v_normal_cost := -pg_catalog.round(v_value * v_normal_qty / v_qty, 2);
+      end if;
+    else
+      v_normal_cost := 0;
+    end if;
+
+    if v_prov_qty > 0
+    and v_engine
+    and not v_known then
+      v_prov_unit := app.ensure_provisional_seed (p_item_id);
+    end if;
+
+    if v_prov_qty > 0 then
+      v_prov_cost := -pg_catalog.round(v_prov_qty * v_prov_unit, 2);
+    else
+      v_prov_cost := 0;
+    end if;
+
+    v_normal_cost := app.assert_recompute_range (v_normal_cost, 2, true);
+    v_prov_cost := app.assert_recompute_range (v_prov_cost, 2, true);
+  end if;
+
+  v_base := app.assert_recompute_range (v_normal_cost + v_prov_cost, 2, true);
+
+  if p_is_pending then
+    if v_normal_qty > 0 then
+      v_piece := v_piece + 1;
+
+      insert into
+        ledger_scratch.recompute_piece (
+          line_key,
+          piece_no,
+          item_id,
+          movement_type,
+          occurred_at,
+          quantity,
+          unit_cost,
+          total_cost,
+          is_provisional,
+          shift_id,
+          source_type,
+          source_id,
+          note
+        )
+      values
+        (
+          p_line_key,
+          v_piece,
+          p_item_id,
+          p_type,
+          p_occurred_at,
+          -v_normal_qty,
+          v_unit,
+          v_normal_cost,
+          false,
+          p_shift_id,
+          p_source_type,
+          p_source_id,
+          p_note
+        );
+    end if;
+
+    if v_prov_qty > 0 then
+      v_piece := v_piece + 1;
+
+      insert into
+        ledger_scratch.recompute_piece (
+          line_key,
+          piece_no,
+          item_id,
+          movement_type,
+          occurred_at,
+          quantity,
+          unit_cost,
+          total_cost,
+          is_provisional,
+          shift_id,
+          source_type,
+          source_id,
+          note
+        )
+      values
+        (
+          p_line_key,
+          v_piece,
+          p_item_id,
+          p_type,
+          p_occurred_at,
+          -v_prov_qty,
+          v_prov_unit,
+          v_prov_cost,
+          true,
+          p_shift_id,
+          p_source_type,
+          p_source_id,
+          p_note
+        );
+
+      update ledger_scratch.recompute_seq
+      set
+        next_id = next_id + 1
+      where
+        next_id is not null
+      returning
+        next_id into v_syn;
+
+      insert into
+        ledger_scratch.recompute_def (
+          movement_id,
+          item_id,
+          qty_uncovered,
+          provisional_unit_cost,
+          value_uncovered,
+          occurred_at,
+          ord_class,
+          event_position,
+          piece_position
+        )
+      values
+        (
+          v_syn,
+          p_item_id,
+          v_prov_qty,
+          v_prov_unit,
+          abs(v_prov_cost),
+          p_occurred_at,
+          v_ord,
+          v_event,
+          v_row_piece + v_piece
+        );
+    end if;
+  else
+    insert into
+      ledger_scratch.recompute_effect (
+        movement_id,
+        item_id,
+        movement_type,
+        base_total,
+        unit_cost,
+        cover_total
+      )
+    values
+      (
+        p_movement_id,
+        p_item_id,
+        p_type,
+        v_base,
+        v_unit,
+        0
+      );
+
+    if v_prov_qty > 0 then
+      insert into
+        ledger_scratch.recompute_def (
+          movement_id,
+          item_id,
+          qty_uncovered,
+          provisional_unit_cost,
+          value_uncovered,
+          occurred_at,
+          ord_class,
+          event_position,
+          piece_position
+        )
+      values
+        (
+          p_movement_id,
+          p_item_id,
+          v_prov_qty,
+          v_prov_unit,
+          abs(v_prov_cost),
+          p_occurred_at,
+          v_ord,
+          v_event,
+          v_row_piece
+        );
+    end if;
+  end if;
+
+  update ledger_scratch.recompute_bal
+  set
+    on_hand_qty = on_hand_qty - p_out_qty,
+    on_hand_value = app.assert_recompute_range (on_hand_value + v_base, 2, true)
+  where
+    item_id = p_item_id;
+
+  perform app.replay_touch_deficit_flag (p_item_id);
 end;
 $$;
 
@@ -8689,6 +9220,7 @@ declare
   v_walked_ids bigint[];
   v_uncut_ids uuid[];
   v_before_sort_at timestamptz;
+  v_cap_waived boolean;
   v_probe_enabled boolean := app.replay_probe_is_enabled ();
 begin
   if p_pending is null then
@@ -8707,6 +9239,23 @@ begin
   perform app.replay_prepare_tables ();
 
   perform app.replay_note_window ();
+
+  -- Only a frozen replay can qualify for a waiver. Measure eligibility
+  -- against the normal coordinated selection, even when the fixture walks
+  -- a different suffix.
+  if pg_catalog.current_setting('app.replay_frozen', true) = '1'
+  and exists (
+    select
+      1
+    from
+      app.replay_probe_active_override () probe
+    where
+      probe.mode <> 'none'
+  ) then
+    perform app.replay_bind_resume (p_item_ids, p_pending, false);
+    v_cap_waived := app.replay_cap_waived (p_item_ids);
+    perform app.replay_prepare_tables ();
+  end if;
 
   perform app.replay_bind_resume (p_item_ids, p_pending);
 
@@ -9027,7 +9576,7 @@ begin
         or anchor.counted_at > resume.cut_occurred_at
       )
   ) > 100000
-  and not app.replay_cap_waived (p_item_ids) then
+  and not coalesce(v_cap_waived, app.replay_cap_waived (p_item_ids)) then
     perform app.raise_recompute_failure ('recompute_limit');
   end if;
 

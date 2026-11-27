@@ -32,6 +32,7 @@ export const SETTLEMENT_DURABLE_TABLES = [
   'app.deficit_settlement_event_deltas',
   'app.movement_value_heads',
   'app.dependent_operation_heads',
+  'app.dependent_operation_class_amounts',
   'app.source_classification_intervals',
   'app.recognized_class_amounts',
   'app.reversal_settlement_splits',

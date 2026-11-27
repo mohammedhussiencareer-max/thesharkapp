@@ -47,16 +47,16 @@ export type Database = {
                   Relationships: [
                     {
       foreignKeyName: "accounting_piece_keys_count_line_fk"
-      columns: ["count_id","count_line_no"]
-isOneToOne: true
+      columns: ["count_id","count_line_no","item_id"]
+isOneToOne: false
       referencedRelation: "stock_count_line_current"
-      referencedColumns: ["count_id","line_no"]
+      referencedColumns: ["count_id","line_no","item_id"]
     },{
       foreignKeyName: "accounting_piece_keys_count_line_fk"
-      columns: ["count_id","count_line_no"]
-isOneToOne: true
+      columns: ["count_id","count_line_no","item_id"]
+isOneToOne: false
       referencedRelation: "stock_count_lines"
-      referencedColumns: ["count_id","line_no"]
+      referencedColumns: ["count_id","line_no","item_id"]
     },{
       foreignKeyName: "accounting_piece_keys_item_id_fkey"
       columns: ["item_id"]
@@ -64,7 +64,7 @@ isOneToOne: false
       referencedRelation: "stock_items"
       referencedColumns: ["id"]
     },{
-      foreignKeyName: "accounting_piece_keys_movement_id_fkey"
+      foreignKeyName: "accounting_piece_keys_movement_fk"
       columns: ["movement_id"]
 isOneToOne: true
       referencedRelation: "stock_movements"
@@ -365,14 +365,14 @@ isOneToOne: false
                   ]
                 },"deficit_settlement_events": {
                   Row: {
-                    "cause_id": string,"created_at": string,"delta_b_total": number,"delta_c_total": number,"economic_at": string,"event_no": number,"id": number,"new_inflow_value": number,"new_kind": string,"new_provisional_value": number,"new_qty": number,"old_inflow_value": number,"old_kind": string,"old_provisional_value": number,"old_qty": number,"operation": string,"posting_at": string,"run_id": number,"settlement_id": number
+                    "cause_id": string,"created_at": string,"delta_b_total": number,"delta_c_total": number,"economic_at": string,"event_no": number,"id": number,"new_bucket": string | null,"new_inflow_value": number,"new_kind": string,"new_provisional_value": number,"new_qty": number,"new_report_class": string | null,"new_waste_reason": string | null,"old_bucket": string | null,"old_inflow_value": number,"old_kind": string,"old_provisional_value": number,"old_qty": number,"old_report_class": string | null,"old_waste_reason": string | null,"operation": string,"posting_at": string,"run_id": number,"settlement_id": number
                   }
                   ComputedFields: never
                   Insert: {
-                    "cause_id": string,"created_at"?: string,"delta_b_total"?: number,"delta_c_total"?: number,"economic_at": string,"event_no": number,"id"?: never,"new_inflow_value": number,"new_kind": string,"new_provisional_value": number,"new_qty": number,"old_inflow_value": number,"old_kind": string,"old_provisional_value": number,"old_qty": number,"operation": string,"posting_at": string,"run_id": number,"settlement_id": number
+                    "cause_id": string,"created_at"?: string,"delta_b_total"?: number,"delta_c_total"?: number,"economic_at": string,"event_no": number,"id"?: never,"new_bucket"?: string | null,"new_inflow_value": number,"new_kind": string,"new_provisional_value": number,"new_qty": number,"new_report_class"?: string | null,"new_waste_reason"?: string | null,"old_bucket"?: string | null,"old_inflow_value": number,"old_kind": string,"old_provisional_value": number,"old_qty": number,"old_report_class"?: string | null,"old_waste_reason"?: string | null,"operation": string,"posting_at": string,"run_id": number,"settlement_id": number
                   }
                   Update: {
-                    "cause_id"?: string,"created_at"?: string,"delta_b_total"?: number,"delta_c_total"?: number,"economic_at"?: string,"event_no"?: number,"id"?: never,"new_inflow_value"?: number,"new_kind"?: string,"new_provisional_value"?: number,"new_qty"?: number,"old_inflow_value"?: number,"old_kind"?: string,"old_provisional_value"?: number,"old_qty"?: number,"operation"?: string,"posting_at"?: string,"run_id"?: number,"settlement_id"?: number
+                    "cause_id"?: string,"created_at"?: string,"delta_b_total"?: number,"delta_c_total"?: number,"economic_at"?: string,"event_no"?: number,"id"?: never,"new_bucket"?: string | null,"new_inflow_value"?: number,"new_kind"?: string,"new_provisional_value"?: number,"new_qty"?: number,"new_report_class"?: string | null,"new_waste_reason"?: string | null,"old_bucket"?: string | null,"old_inflow_value"?: number,"old_kind"?: string,"old_provisional_value"?: number,"old_qty"?: number,"old_report_class"?: string | null,"old_waste_reason"?: string | null,"operation"?: string,"posting_at"?: string,"run_id"?: number,"settlement_id"?: number
                   }
                   Relationships: [
                     {
@@ -427,16 +427,36 @@ isOneToOne: false
       referencedColumns: ["id"]
     }
                   ]
-                },"dependent_operation_heads": {
+                },"dependent_operation_class_amounts": {
                   Row: {
-                    "cap_allocation": number | null,"certified_held_effect": number | null,"created_at": string,"economic_at": string,"effective_receipt_credit": number | null,"event_position": number,"id": number,"item_id": string,"last_run_id": number | null,"new_bucket": string | null,"new_report_class": string | null,"new_waste_reason": string | null,"old_bucket": string | null,"old_report_class": string | null,"old_waste_reason": string | null,"operation_kind": string,"original_signed_source_credit": number | null,"piece_position": number,"pinned_shift_id": string | null,"pinned_shift_resolved": boolean,"quantity_intent": number,"reclass_value": number | null,"retained_qty": number | null,"source_id": string,"source_kind": string,"updated_at": string
+                    "basis_amount": number,"booked_amount": number,"bucket": string,"operation_id": number,"posted_cap_amount": number,"posted_current_date_cap_amount": number,"posted_current_date_reclass_amount": number,"posted_current_date_source_amount": number,"posted_original_reclass_amount": number,"posted_original_source_amount": number,"posted_receipt_amount": number,"report_class": string | null,"required_amount": number,"waste_reason": string | null
                   }
                   ComputedFields: never
                   Insert: {
-                    "cap_allocation"?: number | null,"certified_held_effect"?: number | null,"created_at"?: string,"economic_at": string,"effective_receipt_credit"?: number | null,"event_position": number,"id"?: never,"item_id": string,"last_run_id"?: number | null,"new_bucket"?: string | null,"new_report_class"?: string | null,"new_waste_reason"?: string | null,"old_bucket"?: string | null,"old_report_class"?: string | null,"old_waste_reason"?: string | null,"operation_kind": string,"original_signed_source_credit"?: number | null,"piece_position"?: number,"pinned_shift_id"?: string | null,"pinned_shift_resolved"?: boolean,"quantity_intent": number,"reclass_value"?: number | null,"retained_qty"?: number | null,"source_id": string,"source_kind": string,"updated_at"?: string
+                    "basis_amount"?: number,"booked_amount"?: number,"bucket": string,"operation_id": number,"posted_cap_amount"?: number,"posted_current_date_cap_amount"?: number,"posted_current_date_reclass_amount"?: number,"posted_current_date_source_amount"?: number,"posted_original_reclass_amount"?: number,"posted_original_source_amount"?: number,"posted_receipt_amount"?: number,"report_class"?: string | null,"required_amount"?: number,"waste_reason"?: string | null
                   }
                   Update: {
-                    "cap_allocation"?: number | null,"certified_held_effect"?: number | null,"created_at"?: string,"economic_at"?: string,"effective_receipt_credit"?: number | null,"event_position"?: number,"id"?: never,"item_id"?: string,"last_run_id"?: number | null,"new_bucket"?: string | null,"new_report_class"?: string | null,"new_waste_reason"?: string | null,"old_bucket"?: string | null,"old_report_class"?: string | null,"old_waste_reason"?: string | null,"operation_kind"?: string,"original_signed_source_credit"?: number | null,"piece_position"?: number,"pinned_shift_id"?: string | null,"pinned_shift_resolved"?: boolean,"quantity_intent"?: number,"reclass_value"?: number | null,"retained_qty"?: number | null,"source_id"?: string,"source_kind"?: string,"updated_at"?: string
+                    "basis_amount"?: number,"booked_amount"?: number,"bucket"?: string,"operation_id"?: number,"posted_cap_amount"?: number,"posted_current_date_cap_amount"?: number,"posted_current_date_reclass_amount"?: number,"posted_current_date_source_amount"?: number,"posted_original_reclass_amount"?: number,"posted_original_source_amount"?: number,"posted_receipt_amount"?: number,"report_class"?: string | null,"required_amount"?: number,"waste_reason"?: string | null
+                  }
+                  Relationships: [
+                    {
+      foreignKeyName: "dependent_operation_class_amounts_operation_id_fkey"
+      columns: ["operation_id"]
+isOneToOne: false
+      referencedRelation: "dependent_operation_heads"
+      referencedColumns: ["id"]
+    }
+                  ]
+                },"dependent_operation_heads": {
+                  Row: {
+                    "basis_qty": number,"cap_allocation": number | null,"certified_held_effect": number | null,"created_at": string,"economic_at": string,"effective_receipt_credit": number | null,"event_position": number,"id": number,"item_id": string,"last_run_id": number | null,"new_bucket": string | null,"new_report_class": string | null,"new_waste_reason": string | null,"old_bucket": string | null,"old_report_class": string | null,"old_waste_reason": string | null,"operation_kind": string,"original_signed_source_credit": number | null,"piece_position": number,"pinned_shift_id": string | null,"pinned_shift_resolved": boolean,"quantity_intent": number,"reclass_value": number | null,"retained_qty": number | null,"source_id": string,"source_kind": string,"updated_at": string
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "basis_qty"?: number,"cap_allocation"?: number | null,"certified_held_effect"?: number | null,"created_at"?: string,"economic_at": string,"effective_receipt_credit"?: number | null,"event_position": number,"id"?: never,"item_id": string,"last_run_id"?: number | null,"new_bucket"?: string | null,"new_report_class"?: string | null,"new_waste_reason"?: string | null,"old_bucket"?: string | null,"old_report_class"?: string | null,"old_waste_reason"?: string | null,"operation_kind": string,"original_signed_source_credit"?: number | null,"piece_position"?: number,"pinned_shift_id"?: string | null,"pinned_shift_resolved"?: boolean,"quantity_intent": number,"reclass_value"?: number | null,"retained_qty"?: number | null,"source_id": string,"source_kind": string,"updated_at"?: string
+                  }
+                  Update: {
+                    "basis_qty"?: number,"cap_allocation"?: number | null,"certified_held_effect"?: number | null,"created_at"?: string,"economic_at"?: string,"effective_receipt_credit"?: number | null,"event_position"?: number,"id"?: never,"item_id"?: string,"last_run_id"?: number | null,"new_bucket"?: string | null,"new_report_class"?: string | null,"new_waste_reason"?: string | null,"old_bucket"?: string | null,"old_report_class"?: string | null,"old_waste_reason"?: string | null,"operation_kind"?: string,"original_signed_source_credit"?: number | null,"piece_position"?: number,"pinned_shift_id"?: string | null,"pinned_shift_resolved"?: boolean,"quantity_intent"?: number,"reclass_value"?: number | null,"retained_qty"?: number | null,"source_id"?: string,"source_kind"?: string,"updated_at"?: string
                   }
                   Relationships: [
                     {
@@ -807,14 +827,14 @@ isOneToOne: true
                   ]
                 },"legacy_certification_splits": {
                   Row: {
-                    "amount": number,"bucket": string,"group_id": number,"line_no": number,"report_class": string | null,"waste_reason": string | null
+                    "amount": number,"bucket": string,"group_id": number,"line_no": number,"locus": string,"report_class": string | null,"waste_reason": string | null
                   }
                   ComputedFields: never
                   Insert: {
-                    "amount": number,"bucket": string,"group_id": number,"line_no": number,"report_class"?: string | null,"waste_reason"?: string | null
+                    "amount": number,"bucket": string,"group_id": number,"line_no": number,"locus": string,"report_class"?: string | null,"waste_reason"?: string | null
                   }
                   Update: {
-                    "amount"?: number,"bucket"?: string,"group_id"?: number,"line_no"?: number,"report_class"?: string | null,"waste_reason"?: string | null
+                    "amount"?: number,"bucket"?: string,"group_id"?: number,"line_no"?: number,"locus"?: string,"report_class"?: string | null,"waste_reason"?: string | null
                   }
                   Relationships: [
                     {
@@ -861,14 +881,14 @@ isOneToOne: true
                   ]
                 },"movement_value_heads": {
                   Row: {
-                    "base_adjustment_total": number,"base_total": number,"base_unit_cost": number,"item_id": string,"last_run_id": number | null,"piece_id": number,"settlement_adjustment_total": number,"updated_at": string
+                    "base_adjustment_total": number,"base_qty": number,"base_total": number,"base_unit_cost": number,"item_id": string,"last_run_id": number | null,"opened_deficit_qty": number,"opened_deficit_value": number,"piece_id": number,"settlement_adjustment_total": number,"updated_at": string
                   }
                   ComputedFields: never
                   Insert: {
-                    "base_adjustment_total"?: number,"base_total"?: number,"base_unit_cost"?: number,"item_id": string,"last_run_id"?: number | null,"piece_id": number,"settlement_adjustment_total"?: number,"updated_at"?: string
+                    "base_adjustment_total"?: number,"base_qty": number,"base_total"?: number,"base_unit_cost"?: number,"item_id": string,"last_run_id"?: number | null,"opened_deficit_qty"?: number,"opened_deficit_value"?: number,"piece_id": number,"settlement_adjustment_total"?: number,"updated_at"?: string
                   }
                   Update: {
-                    "base_adjustment_total"?: number,"base_total"?: number,"base_unit_cost"?: number,"item_id"?: string,"last_run_id"?: number | null,"piece_id"?: number,"settlement_adjustment_total"?: number,"updated_at"?: string
+                    "base_adjustment_total"?: number,"base_qty"?: number,"base_total"?: number,"base_unit_cost"?: number,"item_id"?: string,"last_run_id"?: number | null,"opened_deficit_qty"?: number,"opened_deficit_value"?: number,"piece_id"?: number,"settlement_adjustment_total"?: number,"updated_at"?: string
                   }
                   Relationships: [
                     {
@@ -2793,11 +2813,20 @@ isOneToOne: true
 "accounting_run_assert":
 { Args: { "p_allowed_phases": (string)[],"p_require_historical"?: boolean }; Returns: string
                            },
+"accounting_run_assert_locks":
+{ Args: Record<PropertyKey, never>; Returns: undefined
+                           },
+"accounting_run_cancel":
+{ Args: { "p_run_token": string }; Returns: undefined
+                           },
+"accounting_run_close":
+{ Args: { "p_allowed_phases": (string)[],"p_run_token": string }; Returns: undefined
+                           },
 "accounting_run_enter":
-{ Args: { "p_entry_point": string,"p_require_shifts_lock"?: boolean,"p_require_sync_lock"?: boolean,"p_t_change"?: string }; Returns: string
+{ Args: { "p_entry_point": string }; Returns: string
                            },
 "accounting_run_exit":
-{ Args: { "p_require_publish"?: boolean,"p_run_token": string }; Returns: undefined
+{ Args: { "p_run_token": string }; Returns: undefined
                            },
 "accounting_run_set_phase":
 { Args: { "p_next_phase": string,"p_run_token": string }; Returns: undefined
@@ -3464,7 +3493,7 @@ isOneToOne: true
 { Args: { "p_is_pending": boolean,"p_item_id": string,"p_line_key": number,"p_movement_id": number,"p_note": string,"p_occurred_at": string,"p_quantity": number,"p_shift_id": string,"p_source_id": string,"p_source_type": string,"p_total_cost": number,"p_unit_cost": number }; Returns: undefined
                            },
 "replay_bind_resume":
-{ Args: { "p_item_ids": (string)[],"p_pending": Json }; Returns: undefined
+{ Args: { "p_apply_probe_override"?: boolean,"p_item_ids": (string)[],"p_pending": Json }; Returns: undefined
                            },
 "replay_bounded_sort_edges":
 { Args: { "p_after_at": string,"p_after_id": number,"p_before_at": string,"p_before_id": number,"p_item_id": string,"p_sibling_ids": (string)[] }; Returns: {
